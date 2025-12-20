@@ -1,0 +1,22 @@
+{
+  "name": "claude-code-infinite",
+  "version": "1.0.0",
+  "description": "Wrapper for Claude Code CLI",
+  "main": "dist/index.js",
+  "bin": {
+    "cc-inf": "dist/cli.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js"
+  },
+  "keywords": ["claude", "cli", "ai"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^5.9.3"
+  }
+}
