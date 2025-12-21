@@ -1,6 +1,6 @@
 {
   "name": "claude-code-infinite",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Wrapper for Claude Code CLI",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,7 +17,11 @@
     "start": "node dist/cli.js",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["claude", "cli", "ai"],
+  "keywords": [
+    "claude",
+    "cli",
+    "ai"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crizCraig/claude-code-infinite.git"
