@@ -4,9 +4,7 @@
 
 # Claude Code Infinite
 
-### The ultimate Claude Code upgrade
-
-* Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), the world's premier context-management engine
+* Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), an advanced context-management engine
 * Supports unlimited-length coding sessions using smart memory from MemTree.dev
 * Feels fast and fresh with every message
 * Automatically recalls only the relevant past information
