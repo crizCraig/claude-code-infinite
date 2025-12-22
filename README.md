@@ -6,7 +6,7 @@
 # Claude Code Infinite
 
 * Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), an advanced context-management engine
-* Supports unlimited-length coding sessions using smart memory from MemTree.dev
+* Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
 * Automatically recalls only the relevant past information
 * Allows you to finish your feature without summarizing, compacting, clearing context, or starting a new session
