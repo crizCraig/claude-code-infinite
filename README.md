@@ -4,7 +4,7 @@
 
 # Claude Code Infinite
 
-* Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), an state-of-the-art context-management engine
+* Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), a state-of-the-art context-management engine
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
 * Automatically recalls only the relevant past information
