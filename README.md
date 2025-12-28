@@ -7,8 +7,8 @@
 * Maximize Claude's intelligence with [MemTree.dev](https://memtree.dev), a state-of-the-art context-management engine
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
-* Automatically recalls only the relevant past information
-* Allows you to finish your feature without summarizing, compacting, clearing context, or starting a new session
+* Automatically recalls only relevant past information
+* Allows you to finish your work without summarizing, compacting, clearing context, or starting a new session
 
 ## Requirements
 
