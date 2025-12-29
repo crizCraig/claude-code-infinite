@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
-import { userInfo } from "node:os";
-import * as fs from 'fs';
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { userInfo, homedir } from "node:os";
 
 export interface ClaudeOAuthToken {
   accessToken: string;
@@ -15,79 +16,64 @@ export interface KeychainCredentials {
   claudeAiOauth?: ClaudeOAuthToken;
 }
 
-export function getOAuthToken(debug = false): KeychainCredentials | null {
-  let credentials: KeychainCredentials | null;
+function getCredentialsFromFile(debug = false): KeychainCredentials | null {
+  const credentialsPath = join(homedir(), ".claude", ".credentials.json");
 
-  if (process.platform === "win32") {
+  if (debug) {
+    console.log(`[DEBUG] Looking for credentials at: ${credentialsPath}`);
+  }
 
-    try {
-      if (debug) {
-        console.log(`[DEBUG] Fetching credentials`);
-      }
-
-      // Get credentials from the .claude file
-      let path_to_creds_JSON = `${process.env.USERPROFILE}/.claude/.credentials.json`;
-      credentials = JSON.parse(fs.readFileSync(path_to_creds_JSON, 'utf8')) as KeychainCredentials;
-
-    } catch (error) {
-      console.error("Failed to retrieve credentials:", error);
-      return null;
-    }
-
-  } // platform = "win32"
-
-  else if (process.platform === "linux") {
-
-    try {
-      if (debug) {
-        console.log(`[DEBUG] Fetching credentials`);
-      }
-
-      // Get credentials from the .claude file
-      let path_to_creds_JSON = `${process.env.HOME}/.claude/.credentials.json`;
-      credentials = JSON.parse(fs.readFileSync(path_to_creds_JSON, 'utf8')) as KeychainCredentials;
-
-    } catch (error) {
-      console.error("Failed to retrieve credentials: ", error);
-      return null;
-    }
-
-  } // platform = "linux"
-
-
-  else if (process.platform === "darwin") {
-
-    const username = userInfo().username;
-
-    try {
-      if (debug) {
-        console.log(`[DEBUG] Reading keychain for user: ${username}`);
-      }
-
-      const result = execSync(
-        `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w`,
-        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
-      );
-
-      credentials = JSON.parse(result.trim()) as KeychainCredentials;
-
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("could not be found")) {
-        console.error("No Claude Code credentials found in keychain");
-      } else {
-        console.error("Failed to retrieve credentials from keychain:", error);
-      }
-      return null;
-    }
-  } // platform = "darwin"
-
-  // Other platforms
-  else {
-    console.error("OAuth token extraction is only supported on macOS, Windows and Linux.");
+  if (!existsSync(credentialsPath)) {
+    console.error(`No credentials file found at ${credentialsPath}`);
     return null;
   }
 
-  // Display debug log
+  try {
+    const fileContent = readFileSync(credentialsPath, { encoding: "utf-8" });
+    const credentials = JSON.parse(fileContent) as KeychainCredentials;
+    return credentials;
+  } catch (error) {
+    console.error("Failed to read credentials file:", error);
+    return null;
+  }
+}
+
+function getCredentialsFromMacOSKeychain(debug = false): KeychainCredentials | null {
+  const username = userInfo().username;
+
+  try {
+    if (debug) {
+      console.log(`[DEBUG] Reading keychain for user: ${username}`);
+    }
+
+    const result = execSync(
+      `security find-generic-password -s "Claude Code-credentials" -a "${username}" -w`,
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    return JSON.parse(result.trim()) as KeychainCredentials;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("could not be found")) {
+      console.error("No Claude Code credentials found in keychain");
+    } else {
+      console.error("Failed to retrieve credentials from keychain:", error);
+    }
+    return null;
+  }
+}
+
+export function getOAuthToken(debug = false): KeychainCredentials | null {
+  let credentials: KeychainCredentials | null = null;
+
+  if (process.platform === "darwin") {
+    credentials = getCredentialsFromMacOSKeychain(debug);
+  } else if (process.platform === "win32" || process.platform === "linux") {
+    credentials = getCredentialsFromFile(debug);
+  } else {
+    console.error(`OAuth token extraction is not supported on ${process.platform}`);
+    return null;
+  }
+
   if (debug && credentials?.claudeAiOauth) {
     const token = credentials.claudeAiOauth;
     const now = Date.now();
@@ -95,7 +81,7 @@ export function getOAuthToken(debug = false): KeychainCredentials | null {
     const expiresInMs = expiresAt - now;
     const expiresInMins = Math.round(expiresInMs / 1000 / 60);
 
-    console.log(`[DEBUG] Token retrieved from keychain:`);
+    console.log(`[DEBUG] Token retrieved:`);
     console.log(`  - expiresAt: ${expiresAt} (${new Date(expiresAt).toISOString()})`);
     console.log(`  - now:       ${now} (${new Date(now).toISOString()})`);
     console.log(`  - expires in: ${expiresInMins} minutes (${expiresInMs}ms)`);
@@ -122,4 +108,3 @@ export function isTokenExpired(token: ClaudeOAuthToken, debug = false): boolean 
 
   return expired;
 }
-
