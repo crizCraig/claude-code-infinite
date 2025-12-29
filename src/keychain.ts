@@ -24,14 +24,20 @@ function getCredentialsFromFile(debug = false): KeychainCredentials | null {
   }
 
   if (!existsSync(credentialsPath)) {
-    console.error(`No credentials file found at ${credentialsPath}`);
+    if (debug) {
+      console.log(`[DEBUG] No credentials file found at ${credentialsPath}`);
+    }
     return null;
   }
 
   try {
     const fileContent = readFileSync(credentialsPath, { encoding: "utf-8" });
-    const credentials = JSON.parse(fileContent) as KeychainCredentials;
-    return credentials;
+    const parsed = JSON.parse(fileContent);
+    if (!parsed || typeof parsed !== "object" || !("claudeAiOauth" in parsed)) {
+      console.error("Invalid credentials file: expected JSON object");
+      return null;
+    }
+    return parsed as KeychainCredentials;
   } catch (error) {
     console.error("Failed to read credentials file:", error);
     return null;
@@ -51,7 +57,12 @@ function getCredentialsFromMacOSKeychain(debug = false): KeychainCredentials | n
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     );
 
-    return JSON.parse(result.trim()) as KeychainCredentials;
+    const parsed = JSON.parse(result.trim());
+    if (!parsed || typeof parsed !== "object" || !("claudeAiOauth" in parsed)) {
+      console.error("Invalid keychain credentials: expected JSON object");
+      return null;
+    }
+    return parsed as KeychainCredentials;
   } catch (error) {
     if (error instanceof Error && error.message.includes("could not be found")) {
       console.error("No Claude Code credentials found in keychain");
