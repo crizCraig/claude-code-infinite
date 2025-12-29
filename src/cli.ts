@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from "node:child_process";
+import spawn from "cross-spawn";
 import * as readline from "node:readline";
 import { getOAuthToken, isTokenExpired, type ClaudeOAuthToken } from "./keychain.js";
 import {
