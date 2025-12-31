@@ -1,5 +1,7 @@
 import { execSync } from "node:child_process";
-import { userInfo } from "node:os";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { userInfo, homedir } from "node:os";
 
 export interface ClaudeOAuthToken {
   accessToken: string;
@@ -14,12 +16,35 @@ export interface KeychainCredentials {
   claudeAiOauth?: ClaudeOAuthToken;
 }
 
-export function getOAuthToken(debug = false): KeychainCredentials | null {
-  if (process.platform !== "darwin") {
-    console.error("OAuth token extraction is only supported on macOS");
+function getCredentialsFromFile(debug = false): KeychainCredentials | null {
+  const credentialsPath = join(homedir(), ".claude", ".credentials.json");
+
+  if (debug) {
+    console.log(`[DEBUG] Looking for credentials at: ${credentialsPath}`);
+  }
+
+  if (!existsSync(credentialsPath)) {
+    if (debug) {
+      console.log(`[DEBUG] No credentials file found at ${credentialsPath}`);
+    }
     return null;
   }
 
+  try {
+    const fileContent = readFileSync(credentialsPath, { encoding: "utf-8" });
+    const parsed = JSON.parse(fileContent);
+    if (!parsed || typeof parsed !== "object" || !("claudeAiOauth" in parsed)) {
+      console.error("Invalid credentials file: expected JSON object");
+      return null;
+    }
+    return parsed as KeychainCredentials;
+  } catch (error) {
+    console.error("Failed to read credentials file:", error);
+    return null;
+  }
+}
+
+function getCredentialsFromMacOSKeychain(debug = false): KeychainCredentials | null {
   const username = userInfo().username;
 
   try {
@@ -32,27 +57,12 @@ export function getOAuthToken(debug = false): KeychainCredentials | null {
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     );
 
-    const credentials = JSON.parse(result.trim()) as KeychainCredentials;
-
-    if (debug && credentials?.claudeAiOauth) {
-      const token = credentials.claudeAiOauth;
-      const now = Date.now();
-      const expiresAt = token.expiresAt;
-      const expiresInMs = expiresAt - now;
-      const expiresInMins = Math.round(expiresInMs / 1000 / 60);
-
-      console.log(`[DEBUG] Token retrieved from keychain:`);
-      console.log(`  - expiresAt: ${expiresAt} (${new Date(expiresAt).toISOString()})`);
-      console.log(`  - now:       ${now} (${new Date(now).toISOString()})`);
-      console.log(`  - expires in: ${expiresInMins} minutes (${expiresInMs}ms)`);
-      console.log(`  - subscriptionType: ${token.subscriptionType}`);
-      console.log(`  - rateLimitTier: ${token.rateLimitTier}`);
-      console.log(`  - scopes: ${token.scopes?.join(", ")}`);
-      console.log(`  - accessToken length: ${token.accessToken?.length ?? 0}`);
-      console.log(`  - refreshToken length: ${token.refreshToken?.length ?? 0}`);
+    const parsed = JSON.parse(result.trim());
+    if (!parsed || typeof parsed !== "object" || !("claudeAiOauth" in parsed)) {
+      console.error("Invalid keychain credentials: expected JSON object");
+      return null;
     }
-
-    return credentials;
+    return parsed as KeychainCredentials;
   } catch (error) {
     if (error instanceof Error && error.message.includes("could not be found")) {
       console.error("No Claude Code credentials found in keychain");
@@ -61,6 +71,39 @@ export function getOAuthToken(debug = false): KeychainCredentials | null {
     }
     return null;
   }
+}
+
+export function getOAuthToken(debug = false): KeychainCredentials | null {
+  let credentials: KeychainCredentials | null = null;
+
+  if (process.platform === "darwin") {
+    credentials = getCredentialsFromMacOSKeychain(debug);
+  } else if (process.platform === "win32" || process.platform === "linux") {
+    credentials = getCredentialsFromFile(debug);
+  } else {
+    console.error(`OAuth token extraction is not supported on ${process.platform}`);
+    return null;
+  }
+
+  if (debug && credentials?.claudeAiOauth) {
+    const token = credentials.claudeAiOauth;
+    const now = Date.now();
+    const expiresAt = token.expiresAt;
+    const expiresInMs = expiresAt - now;
+    const expiresInMins = Math.round(expiresInMs / 1000 / 60);
+
+    console.log(`[DEBUG] Token retrieved:`);
+    console.log(`  - expiresAt: ${expiresAt} (${new Date(expiresAt).toISOString()})`);
+    console.log(`  - now:       ${now} (${new Date(now).toISOString()})`);
+    console.log(`  - expires in: ${expiresInMins} minutes (${expiresInMs}ms)`);
+    console.log(`  - subscriptionType: ${token.subscriptionType}`);
+    console.log(`  - rateLimitTier: ${token.rateLimitTier}`);
+    console.log(`  - scopes: ${token.scopes?.join(", ")}`);
+    console.log(`  - accessToken length: ${token.accessToken?.length ?? 0}`);
+    console.log(`  - refreshToken length: ${token.refreshToken?.length ?? 0}`);
+  }
+
+  return credentials;
 }
 
 export function isTokenExpired(token: ClaudeOAuthToken, debug = false): boolean {
@@ -76,4 +119,3 @@ export function isTokenExpired(token: ClaudeOAuthToken, debug = false): boolean 
 
   return expired;
 }
-

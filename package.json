@@ -28,7 +28,11 @@
   },
   "author": "crizCraig",
   "license": "ISC",
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
+  },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^25.0.0",
     "typescript": "^5.9.3"
   }
