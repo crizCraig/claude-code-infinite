@@ -14,14 +14,12 @@
 
 * [node.js 18 or newer](https://nodejs.org/en/download/)
 * [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
+* **Claude Subscription** - optional but highly recommended as this offers up to 1000x cost savings vs Anthropic's API pricing.
 
 > [!NOTE]
-> We recommend using a Claude subscription due to the large cost savings they offer vs their API pricing.
-> 
-> However, if you do not want to buy a Claude Code subscription, choose option 2. "Anthropic Console account".
-> 
-> - Note that you don't need to buy API credits, just login and Claude Code will let you complete the setup wizard. API usage will be billed through https://polychat.co.
-> 
+> If you do not want to buy a Claude Code subscription, then during setup, choose option 2. "Anthropic Console account".
+>
+> Note that you don't need to buy API credits, just login and Claude Code will let you complete the setup wizard. API usage will be billed through https://polychat.co.
 > Then run `/logout` within Claude Code if you are **not** using a Claude subscription
 
 ## Setup
@@ -41,22 +39,21 @@ When you send a message, we retrieve relevant details and summaries from the pri
 
 ## Why it works
 
-LLM capabilities decline exponentially with input (i.e. context) size. 
+LLMs get exponentially dumber as their input grows. 
 
-cite: 
-- 2023 - 2823 citations _Lost in the Middle: How Language Models Use Long Contexts:_ https://arxiv.org/abs/2307.03172
-- by CP Hsieh · 2024 · Cited by 480 · _RULER: What's the Real Context Size of Your Long-Context Language Models?_
- https://arxiv.org/abs/2404.06654
-- chroma
-- others
+References:
+- [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172) (2023)
+- [RULER: What's the Real Context Size of Your Long-Context Language Models?](https://arxiv.org/abs/2404.06654) (2024)
+- [Context Rot](https://research.trychroma.com/context-rot) from Chroma
+  [![Context Rot Video](https://img.youtube.com/vi/TUjQuC4ugak/0.jpg)](https://www.youtube.com/watch?v=TUjQuC4ugak)
 
-Also, this research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks like coding, where relevant context is more dense.
+Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding, where relevant context is more dense.
 
-This is why starting sessions from scratch provides such a significant uplift in ability to accomplish tasks. So what we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k tokens, or 15% of the 200k context-limit. So even with Claude Code Infinite, it's still very fruitful to start new sessions. It's just that when you use Claude Code Infinite, you are getting much higher quality output per session, as without it, the token-usage can balloon past 100k tokens after just a couple file reads.
+This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, or 15% of the standard 200k context-limit, filled precisely with the information relevant to your **last** message. I.e. This is **not** a static summary missing important details. More details [here](https://api.polychat.co/context-memory)
 
 ### Operating System Analogy
 
-It may seem strange that we are advocating for small context windows in a product called Claude Code Infinite. But Infinite is referring to the size of a new memory layer, the MemTree, a layer above the context window. This layer is larger and updated more slowly than the LLMs main input, just like disk is larger and slower than RAM.
+It may seem strange that we are advocating for small context windows in a product called Claude Code Infinite. But Infinite is referring to the size of a new memory layer, the MemTree, which is a layer above the context window. This layer is larger and updated more slowly than the LLMs main input, just as disk is larger + slower than RAM.
 
 So you can think of MemTree as an operating system's virtual memory manager. Just as an OS manages RAM by swapping less-used data to disk, MemTree manages the model's context window by intelligently recalling only the most relevant information from past interactions. This ensures that the model always has access to the most pertinent data without being overwhelmed by the entire history of the conversation.
 
