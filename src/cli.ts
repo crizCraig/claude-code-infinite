@@ -20,17 +20,11 @@ async function promptForApiKey(isLocal: boolean): Promise<string> {
     output: process.stdout,
   });
 
-  if (isLocal) {
-    console.log("\nLocal POLYCHAT_API_KEY not found.");
-    console.log("Please visit: http://local.polychat.co:5173/memtree-api");
-    console.log("to obtain your local API key.\n");
-  } else {
-    console.log("\nPOLYCHAT_API_KEY not found.");
-    console.log(`Please visit: ${POLYCHAT_AUTH_URL}`);
-    console.log("to obtain your API key.\n");
-  }
+  const url = isLocal
+    ? "http://local.polychat.co:5173/memtree-api"
+    : POLYCHAT_AUTH_URL;
 
-  const prompt = isLocal ? "Enter your local POLYCHAT_API_KEY: " : "Enter your POLYCHAT_API_KEY: ";
+  const prompt = `\nEnter your PolyChat API key from ${url}: `;
 
   return new Promise((resolve) => {
     rl.question(prompt, (answer) => {
@@ -110,25 +104,7 @@ async function refreshOAuthToken(debug: boolean): Promise<ClaudeOAuthToken | nul
 }
 
 function printBanner() {
-  const banner = `
-\x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗     ██████╗ ██████╗ ██████╗ ███████╗
-██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝    ██╔════╝██╔═══██╗██╔══██╗██╔════╝
-██║     ██║     ███████║██║   ██║██║  ██║█████╗      ██║     ██║   ██║██║  ██║█████╗
-██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝      ██║     ██║   ██║██║  ██║██╔══╝
-╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗    ╚██████╗╚██████╔╝██████╔╝███████╗
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝     ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
-               \x1b[1;38;2;255;165;0m██╗███╗   ██╗███████╗██╗███╗   ██╗██╗████████╗███████╗
-               ██║████╗  ██║██╔════╝██║████╗  ██║██║╚══██╔══╝██╔════╝
-               ██║██╔██╗ ██║█████╗  ██║██╔██╗ ██║██║   ██║   █████╗
-               ██║██║╚██╗██║██╔══╝  ██║██║╚██╗██║██║   ██║   ██╔══╝
-               ██║██║ ╚████║██║     ██║██║ ╚████║██║   ██║   ███████╗
-               ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝   ╚═╝   ╚══════╝\x1b[0m
-
-        \x1b[1;38;5;48m✦ Infinitely-long coding sessions for Claude, powered by \x1b]8;;https://MemTree.dev\x1b\\MemTree.dev\x1b]8;;\x1b\\\x1b[0m
-           \x1b[1;38;5;87m✦ Get the speed and quality of a fresh chat with every message\x1b[0m
-                  \x1b[1;38;5;87m✦ Retrieves relevant info from all past messages \x1b[0m
-`;
-  console.log(banner);
+  console.log(`\n\x1b[1;38;5;209mClaude Code Infinite:\x1b[0m \x1b[38;5;48mMaximizing Claude's intelligence with context-management from \x1b]8;;https://MemTree.dev\x1b\\MemTree.dev\x1b]8;;\x1b\\\x1b[0m\n`);
 }
 
 async function main() {
@@ -206,7 +182,7 @@ async function main() {
     stdio: "inherit",
   });
 
-  child.on("error", (err) => {
+  child.on("error", (err: Error) => {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       console.error("Could not find 'claude' command. Make sure Claude Code is installed.");
     } else {
@@ -215,7 +191,7 @@ async function main() {
     process.exit(1);
   });
 
-  child.on("exit", (code) => {
+  child.on("exit", (code: number | null) => {
     process.exit(code ?? 0);
   });
 }
