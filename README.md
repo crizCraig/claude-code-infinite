@@ -8,7 +8,7 @@
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
 * Automatically recalls only the relevant past information
-* Allows you to finish your work without summarizing, compacting, clearing context, or starting a new session
+* Allows you to finish your work without summarizing, compacting, or starting a new session
  
 ## Requirements
 
