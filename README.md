@@ -44,8 +44,12 @@ LLMs get exponentially dumber as their input grows.
 References:
 - [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172) (2023)
 - [RULER: What's the Real Context Size of Your Long-Context Language Models?](https://arxiv.org/abs/2404.06654) (2024)
-- [Context Rot](https://research.trychroma.com/context-rot) from Chroma
-  [![Context Rot Video](https://img.youtube.com/vi/TUjQuC4ugak/0.jpg)](https://www.youtube.com/watch?v=TUjQuC4ugak)
+- <a href="https://research.trychroma.com/context-rot" target="_blank" rel="noopener noreferrer">Context Rot from Chroma</a> (2025)
+ 
+<a href="https://www.youtube.com/watch?v=TUjQuC4ugak" target="_blank" rel="noopener noreferrer">
+  <img src="https://img.youtube.com/vi/TUjQuC4ugak/0.jpg" alt="Context Rot Video">
+</a>
+
 
 Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding, where relevant context is more dense.
 
