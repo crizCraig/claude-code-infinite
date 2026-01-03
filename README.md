@@ -53,7 +53,7 @@ References:
 
 Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding.
 
-This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, or 15% of the standard 200k context-limit, filled precisely with the information relevant to your **last** message. I.e. This is **not** a static summary missing important details. More details [here](https://api.polychat.co/context-memory)
+This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, or 15% of the standard 200k context-limit, filled precisely with the information relevant to your **last** message. Read more about how MemTree works [here](https://api.polychat.co/context-memory).
 
 ### Operating System Analogy
 
