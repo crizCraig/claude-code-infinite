@@ -18,7 +18,7 @@
 * A [PolyChat.co](https://polychat.co/pricing) subscription for continued access to the MemTree API after the free trial.
 
 > [!NOTE]
-> If you do not want to buy a Claude Code subscription, then during setup, choose option 2. "Anthropic Console account".
+> If you do not want to buy a Claude Code subscription, choose option 2. "Anthropic Console account", during the Claude Code setup.
 >
 > You don't need to buy API credits, just login and Claude Code will let you complete setup. API usage will be billed through https://polychat.co.
 > Then run `/logout` within Claude Code if you are **not** using a Claude subscription
