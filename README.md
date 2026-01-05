@@ -43,6 +43,10 @@ npm install -g claude-code-infinite
 
 When you send a message, we retrieve relevant details and summaries from the prior messages in your thread. These details and summaries populate a **memory message**. Following the memory message, we append a compressed version of your recent message history. The resulting context-window is dramatically smaller, allowing Claude to process your request with much greater efficacy, lower latency, and reduced cost.
 
+## What this is NOT
+
+This is not a MPC or tool for simply retrieving memories. While we are compatible with all MPC's, tools, and other Anthropic features, these do not prevent your context window from becoming detrimentally large. MCP's and tools are some of the biggest token bloaters and it's exactly these types of messages that get heavily culled during our compression phase.
+
 ## Why it works
 
 LLMs get exponentially dumber as their input grows. 
