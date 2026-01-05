@@ -15,6 +15,7 @@
 * [node.js 18 or newer](https://nodejs.org/en/download/)
 * [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
 * **Claude Subscription** - optional but highly recommended as this offers up to 1000x cost savings vs Anthropic's API pricing.
+* A [PolyChat.co](https://polychat.co/pricing) subscription for continued access PolyChat's MemTree API. We offer a small amount of trial usage when you sign up.
 
 > [!NOTE]
 > If you do not want to buy a Claude Code subscription, then during setup, choose option 2. "Anthropic Console account".
