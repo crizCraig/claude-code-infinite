@@ -35,6 +35,11 @@ npm install -g claude-code-infinite
 
 ## How it works
 
+<table><tr><td>
+<img width="1050" height="445" alt="image" src="https://github.com/user-attachments/assets/d1ab2456-9a64-4118-a72a-b9d133c7c8bd" />
+</td></tr></table>
+
+
 When you send a message, we retrieve relevant details and summaries from the prior messages in your thread. These details and summaries populate a **memory message**. Following the memory message, we append a compressed version of your recent message history. The resulting context-window is dramatically smaller, allowing Claude to process your request with much greater efficacy, lower latency, and reduced cost.
 
 ## Why it works
