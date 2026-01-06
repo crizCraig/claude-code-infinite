@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import spawn from "cross-spawn";
+import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { getOAuthToken, isTokenExpired, type ClaudeOAuthToken } from "./keychain.js";
 import {
@@ -14,6 +15,13 @@ const POLYCHAT_BASE_URL = "https://polychat.co/cc";
 const LOCAL_BASE_URL = "http://localhost:8080/cc";
 const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 
+function openUrl(url: string): void {
+  const platform = process.platform;
+  const command =
+    platform === "darwin" ? "open" : platform === "win32" ? "start" : "xdg-open";
+  exec(`${command} "${url}"`);
+}
+
 async function promptForApiKey(isLocal: boolean): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -24,10 +32,18 @@ async function promptForApiKey(isLocal: boolean): Promise<string> {
     ? "http://local.polychat.co:5173/memtree-api"
     : POLYCHAT_AUTH_URL;
 
-  const prompt = `\nEnter your PolyChat API key from ${url}: `;
+  // Wait for user to press enter before opening the URL
+  await new Promise<void>((resolve) => {
+    rl.question(`\nPress Enter to open PolyChat in your browser...`, () => {
+      resolve();
+    });
+  });
+
+  // Open the URL in the default browser
+  openUrl(url);
 
   return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
+    rl.question("Copy your API key and paste it here: ", (answer) => {
       rl.close();
       resolve(answer.trim());
     });
