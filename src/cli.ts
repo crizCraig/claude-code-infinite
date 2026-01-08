@@ -34,7 +34,7 @@ async function promptForApiKey(isLocal: boolean): Promise<string> {
 
   // Wait for user to press enter before opening the URL
   await new Promise<void>((resolve) => {
-    rl.question(`\nPress Enter to open PolyChat in your browser...`, () => {
+    rl.question(`\nPress Enter to open your browser to obtain your Memtree API key...`, () => {
       resolve();
     });
   });
