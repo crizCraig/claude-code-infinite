@@ -48,7 +48,7 @@ This is not a MPC or tool for simply retrieving memories. While we are compatibl
 
 ## Why it works
 
-LLMs get exponentially dumber as their input grows. 
+LLMs get exponentially less intelligent as their input grows. 
 
 References:
 - [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172) (2023)
