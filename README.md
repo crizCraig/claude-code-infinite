@@ -78,7 +78,7 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 * Add context to your status line to see how MemTree keeps your context small
   ```bash
-  /statusline add context usage
+  /statusline add context % used
   ```
 * You want your fresh session context to be **10k** tokens or less. If your starting context is more than that, consider reducing the size of your custom MCP's and slash commands to ensure Claude performs at its very best
 
