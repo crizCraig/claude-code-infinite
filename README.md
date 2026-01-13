@@ -20,7 +20,8 @@
 > If you do not want to buy a Claude Code subscription, choose option 2. "Anthropic Console account", during the Claude Code setup.
 >
 > You don't need to buy API credits, just login and Claude Code will let you complete setup. Anthropic API usage will be billed through https://polychat.co.
-> Then run `/logout` within Claude Code if you are **not** using a Claude subscription
+>
+> IMPORTANT: Run `/logout` within Claude Code then restart `ccc` if you are **not** using a Claude subscription to avoid 401 errors. (See [Troubleshooting](#troubleshooting).)
 
 ## Setup
 
@@ -75,4 +76,22 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 * If you want your session to apply to many different tasks, we recommend giving the overall high level goal you want for your session in the first message, e.g. "Refactor this project to remove code smells and bugs". Then followup with lower level tasks in subsequent messages.  This as Anthropic models key heavily off the first message. You should also feel free to start new sessions for new tasks. This as the model will continue to have a focused context with your CLAUDE.md and first message always included. Reach out to support@polychat.co if you have any questions or concerns!
 
-* Monitor your context using the `/statusline` command. You want your fresh session context to be 10k tokens or less. If your starting context is more than that, consider reducing the size of your custom MCP's and slash commands.
+* Add context to your status line to see how MemTree keeps your context small
+  ```bash
+  /statusline add context usage
+  ```
+* You want your fresh session context to be **10k** tokens or less. If your starting context is more than that, consider reducing the size of your custom MCP's and slash commands to ensure Claude performs at its very best
+
+* You can resume previous threads with `/resume`
+
+
+## Troubleshooting
+
+### 401 {"detail":"Your session has expired or the token is invalid. Please sign in again."}
+
+This happens when Claude Code is logged in with for API usage (you chose "Anthropic Console account" during setup)
+
+Fix:
+
+1. Run: /logout
+2. Re-run `ccc`
