@@ -90,7 +90,7 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 ### 401 {"detail":"Your session has expired or the token is invalid. Please sign in again."}
 
-This happens if you chose "Anthropic Console account" during setup, i.e. you're not using an Anthropic subscription.
+This happens if you chose "Anthropic Console account" during setup instead of using an Anthropic subscription.
 
 Fix:
 
