@@ -90,9 +90,15 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 ### 401 {"detail":"Your session has expired or the token is invalid. Please sign in again."}
 
-This happens when Claude Code is logged in with for API usage (you chose "Anthropic Console account" during setup)
+This happens if you chose "Anthropic Console account" during setup, i.e. you're not using an Anthropic subscription.
 
 Fix:
 
-1. Run: /logout
+1. Run: `/logout`
 2. Re-run `ccc`
+
+This logs you out of your Anthropic Console account and keeps you in `ccc` which uses PolyChat. If you'd like to use your own API key with PolyChat, login to polychat.co and head over to our [BYOK settings](https://app.polychat.co/api-keys).
+
+## API Rate limit errors
+
+If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions. 
