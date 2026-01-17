@@ -18,8 +18,9 @@ const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 function openUrl(url: string): void {
   const platform = process.platform;
   const command =
-    platform === "darwin" ? "open" : platform === "win32" ? "start" : "xdg-open";
-  exec(`${command} "${url}"`);
+    platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
+
+  platform === "win32" ? exec(`${command} "${url}"`, { shell: 'cmd.exe' }) : exec(`${command} "${url}"`);
 }
 
 async function promptForApiKey(isLocal: boolean): Promise<string> {
