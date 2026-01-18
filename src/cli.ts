@@ -58,13 +58,13 @@ async function refreshOAuthToken(debug: boolean): Promise<ClaudeOAuthToken | nul
   const currentCredentials = getOAuthToken(false);
   const currentExpiry = currentCredentials?.claudeAiOauth?.expiresAt ?? 0;
 
-  // Spawn claude interactively - this triggers the OAuth refresh flow
+  // Spawn claude in background - this triggers the OAuth refresh flow
   if (debug) {
     console.log("[DEBUG] Spawning 'claude' to trigger token refresh...");
   }
 
   const child = spawn("claude", [], {
-    stdio: "inherit",
+    stdio: "ignore",
     detached: false,
   });
 
@@ -128,6 +128,7 @@ async function main() {
   // Check for local mode and debug flag
   const args = process.argv.slice(2);
   const isDebugMode = args.includes("--debug");
+  const forceTokenRefresh = process.env.DEBUG_FORCE_EXPIRED === "1";
   const filteredArgs = args.filter((arg) => arg !== "--debug");
   const isLocalMode = filteredArgs[0] === "local";
   const claudeArgs = isLocalMode ? filteredArgs.slice(1) : filteredArgs;
@@ -151,7 +152,7 @@ async function main() {
     console.log("\x1b[33m   Claude Code is much cheaper with an Anthropic subscription.\x1b[0m");
     console.log("\x1b[33m   MemTree.dev makes it even cheaper by reducing messages sent to Anthropic.\x1b[0m");
     console.log("\x1b[33m   Run '/login' to log in and get discounted rates.\x1b[0m\n");
-  } else if (isTokenExpired(oauthToken, isDebugMode)) {
+  } else if (forceTokenRefresh || isTokenExpired(oauthToken, isDebugMode)) {
     // If token is expired, attempt to refresh it by launching Claude
     const refreshedToken = await refreshOAuthToken(isDebugMode);
     if (!refreshedToken) {
