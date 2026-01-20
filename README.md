@@ -18,11 +18,13 @@
 
 > [!NOTE]
 > #### No Anthropic Subscription
-> If you do not want to buy Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup.
+> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
 >
-> You don't need to buy API credits, just login and Claude Code will let you complete setup. Anthropic API usage will be billed through https://polychat.co.
+> You don't need to buy API credits, just login and Claude Code will let you complete setup.
 >
-> Finally run `/logout` within Claude Code and rerun with `ccc`
+> Lastly run `/logout` within Claude Code and rerun with `ccc`
+
+> Anthropic API usage will then be billed through https://polychat.co.
 
 ## Setup
 
