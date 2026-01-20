@@ -37,7 +37,7 @@ npm install -g claude-code-infinite
   ccc
   ```
 
-This will guide you through setting up your PolyChat key, using this [url](https://polychat.co/auth?memtree=true).
+This will guide you through setting up your PolyChat key, which you can also get [here](https://polychat.co/auth?memtree=true).
 
 ## How it works
 
