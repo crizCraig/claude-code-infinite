@@ -23,8 +23,8 @@
 > You don't need to buy API credits, just login and Claude Code will let you complete setup.
 >
 > Lastly run `/logout` within Claude Code and then run `ccc`
-
-> Anthropic API usage will then be billed through https://polychat.co.
+>
+> Anthropic API usage will now be billed through https://polychat.co.
 
 ## Setup
 
