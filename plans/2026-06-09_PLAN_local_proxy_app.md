@@ -1,5 +1,10 @@
 # PLAN: Local Proxy App ("Claude Code Infinite") — Keep OAuth Tokens on the User's Machine
 
+> **Repo note (moved here 2026-07-04):** this plan originated in the polychat server repo.
+> `polychat/...` paths, `plans/...` links, and commit hashes refer to that repo — main
+> checkout at `~/src/polychat`. Its `plans/2026-06-09_PLAN_local_proxy_app.md` is now a stub
+> tracking the server-side obligations; the local app described here is built in THIS repo.
+
 ## Goal
 
 Anthropic OAuth tokens should never leave the user's machine. Today, Claude Code is pointed
@@ -56,7 +61,8 @@ models or rewrite them server-side), and native-auth pass-through is what makes 
 
 ## Relationship to context monitoring (separate plan)
 
-The [online context-monitoring plan](2026-06-21_PLAN_context_monitoring.md) builds **on top
+The online context-monitoring plan (`~/src/polychat/plans/2026-06-21_PLAN_context_monitoring.md`,
+polychat repo) builds **on top
 of** this proxy — the local app is its interception point for fanning out the with-mem vs
 no-mem legs, grading them, and routing to the winner. Kept as a **separate plan** on purpose:
 this proxy has standalone value (keep OAuth local) and ships first; monitoring is research-
@@ -143,11 +149,12 @@ A small HTTP server + launcher. Responsibilities:
 
 - **Launcher** (`ccc` replacement): start the local server if not running, set
   `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, exec `claude` with passed-through args.
-- **Endpoints** (mirror what Claude Code hits today against polychat — see `cc_api.py`):
+- **Endpoints** (mirror what Claude Code hits today against polychat — see
+  `polychat/cc_api.py` in the polychat repo):
   - `POST /v1/messages` — the main path (compression + forward, SSE streaming pass-through).
   - `POST /v1/messages/count_tokens` — pass through to Anthropic (token counts must reflect
     the compressed payload Claude Code will actually send; may need to compress here too —
-    match current `cc_api.py:375` behavior).
+    match current `polychat/cc_api.py:375` behavior).
   - Catch-all — transparent pass-through to api.anthropic.com.
 - **Auth to Anthropic**: pass through the `Authorization` header Claude Code sends.
   Claude Code owns token storage and refresh; we never persist it.
@@ -159,7 +166,7 @@ A small HTTP server + launcher. Responsibilities:
     and handle 401-expired by telling the user to re-auth in Claude Code.
 - **Auth to polychat**: per-user polychat API key stored in local config
   (`~/.config/claude-code-infinite/config.json` or similar). `ccc login` flow to set it.
-- **Compression decision** (mirror lazy compression, commit fda9991): on tool-result turns,
+- **Compression decision** (mirror lazy compression, polychat commit fda9991): on tool-result turns,
   POST messages to polychat as a fire-and-forget background indexing call — no substitution,
   off the response path so it adds zero latency. This is required, not optional: indexing
   runs continuously (a compression every ~10k tokens of new input) so the index keeps pace
@@ -210,23 +217,23 @@ A small HTTP server + launcher. Responsibilities:
   - TypeScript/Node via npm (`npm i -g claude-code-infinite`) — Claude Code users already
     have Node; easiest distribution and SSE handling.
   - Rust single binary (brew tap + curl installer) — no runtime dependency, best cold-start.
-  - Python via uvx/pipx — fastest to prototype (can share logic with this repo), worst
+  - Python via uvx/pipx — fastest to prototype (can share logic with the polychat repo), worst
     end-user distribution.
-  Recommendation: prototype in Python inside this repo (Phase 1–2), ship TypeScript or Rust
-  for GA (Phase 3).
+  Recommendation: prototype in Python inside the polychat repo (Phase 1–2), ship TypeScript
+  or Rust for GA (Phase 3) in this repo.
 
-### 2. Server changes (this repo)
+### 2. Server changes (polychat repo)
 
 - **Per-user API keys**: `/v1/context_memory` currently authenticates with the single
   `NANOGPT_POLYCHAT_API_KEY` env var and bills to a hard-coded NanoGPT user
-  (`api.py:262`). Add polychat-issued per-user API keys:
+  (`polychat/api.py:262`). Add polychat-issued per-user API keys:
   - New table (or extend `api_keys`) for polychat-issued keys: key hash, user_id, created_at,
     revoked_at. No foreign keys per repo convention.
   - Key issuance UI/endpoint on polychat.co dashboard; `ccc login` can open the browser and
     paste the key (or do a device-code flow later).
   - Resolve user from the API key instead of `x-openwebui-user-*` headers.
 - **Context-memory endpoint parity with /cc**: the local app needs everything
-  `process_context_memory()` does for the cc path (`memory/query_context_mem.py:30`):
+  `process_context_memory()` does for the cc path (`polychat/memory/query_context_mem.py:30`):
   background indexing trigger, index-not-ready behavior (return messages as-is),
   `compression_stats`/`messages_hash` continuity, flattening
   (`flatten_to_single_user_message`). Audit `/v1/context_memory` vs `/cc/v1/messages`
@@ -240,12 +247,12 @@ A small HTTP server + launcher. Responsibilities:
   by shipped client binaries. Version it (`/v1/`, additive changes only) and have the local
   app send its version in a header so old clients can be detected/warned.
 - **Deprecation**: once the local app is GA, sunset the `orig-bearer-token` path in
-  `cc_api.py`/`ccc_api.py` (return an error directing users to install the local app).
+  `polychat/cc_api.py`/`polychat/ccc_api.py` (return an error directing users to install the local app).
 
 ## Phases
 
 ### Phase 1 — Spike: transparent local proxy (no compression) ✅ DONE 2026-06-09
-1. Minimal Python server in this repo (`polychat/local_app/proxy_spike.py`): catch-all that
+1. Minimal Python server in the polychat repo (`polychat/local_app/proxy_spike.py`): catch-all that
    forwards verbatim to api.anthropic.com with SSE streaming pass-through.
 2. Launcher: just `ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude` for the spike; proper
    launcher is Phase 3.
@@ -294,19 +301,19 @@ A small HTTP server + launcher. Responsibilities:
 ### Phase 4 — Usage reporting & cutover
 1. `POST /v1/usage_report` + dashboard wiring.
 2. Migration messaging for existing `orig-bearer-token` users; deprecation window; remove
-   token transit from `cc_api.py`.
+   token transit from `polychat/cc_api.py`.
 
 ## Risks
 
 | Risk | Notes / mitigation |
 |---|---|
 | Anthropic blocks the local app's requests | Phase 1 spike answers this first; keep requests byte-identical to Claude Code's except `messages`. If blocked, the whole approach (and the current server-side one) is dead — find out before building more. |
-| Claude Code doesn't send OAuth to custom base URL | Fallback: keychain read (existing `get_oauth_keycain.py` approach) + local refresh handling. More credential surface, still never leaves the machine. |
+| Claude Code doesn't send OAuth to custom base URL | Fallback: keychain read (existing `polychat/claude_code/bin/get_oauth_keycain.py` approach) + local refresh handling. More credential surface, still never leaves the machine. |
 | Extra latency (local hop + polychat round-trip) | Tool-turn indexing POSTs are fire-and-forget off the response path, so the turns that dominate add zero latency. Blocking compression call only on user turns, where hundreds of ms are acceptable. **Monitoring (separate plan) adds more**: buffer-then-commit holds the user stream for `time-to-generate-n + grade` (seconds) on monitored turns — gate it behind the paid tier / triggered cases, not every turn. |
 | Fan-out doubles calls on the OAuth subscription (monitoring) | The monitoring plan runs two legs + a grader per monitored turn on the user's subscription. Mitigated by: legs are cheap (cached full-context leg + short mem leg, not 2× a big context), serving the mem-leg winner forward can be net-negative tokens vs baseline, and fan-out is *triggered* not blanket. Still a heavier ask than the pure proxy — fold it into the Phase-3 Anthropic conversation honestly. |
 | Upload bandwidth (full history POSTed every tool turn) | Acceptable at first (mirrors what Claude Code sends today). If it matters, later send only messages since the last acked index ping. |
 | Shipped-client contract drift | Version the API, client sends version header, server can return "please update" errors. |
 | Index-not-ready first sessions | Same as today: return messages uncompressed until background index completes. |
 | Users on Windows | Defer; Claude Code credential storage differs. Mac/Linux first. |
-| 1M-context model variants (`[1m]` suffix) | Users can default to e.g. `claude-fable-5[1m]` (settings.json). Compression budgets currently hard-code `model_context_limit_tokens=200_000` (`cc_api.py`), and model-table lookups (pricing/priors/context sizes) may miss suffixed ids. Local app + server must strip/route the `[1m]` suffix and use the real window for budgeting. |
-| OAuth-to-custom-base-URL gets gated by Anthropic later | Works as of 2026-07-03, but treat as unguaranteed (it's a token-exfiltration surface they may close). Fallback already planned: local keychain read (`get_oauth_keycain.py` pattern) — still never leaves the machine. Detect via 401s-with-valid-token or missing Authorization header and switch modes. |
+| 1M-context model variants (`[1m]` suffix) | Users can default to e.g. `claude-fable-5[1m]` (settings.json). Compression budgets currently hard-code `model_context_limit_tokens=200_000` (`polychat/cc_api.py`), and model-table lookups (pricing/priors/context sizes) may miss suffixed ids. Local app + server must strip/route the `[1m]` suffix and use the real window for budgeting. |
+| OAuth-to-custom-base-URL gets gated by Anthropic later | Works as of 2026-07-03, but treat as unguaranteed (it's a token-exfiltration surface they may close). Fallback already planned: local keychain read (`polychat/claude_code/bin/get_oauth_keycain.py` pattern) — still never leaves the machine. Detect via 401s-with-valid-token or missing Authorization header and switch modes. |
