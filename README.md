@@ -16,17 +16,10 @@
 * [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
 * **Claude Subscription** - optional but highly recommended as this offers up to 1000x cost savings vs Anthropic's API pricing
 
-> [!NOTE]
-> #### No Anthropic Subscription
-> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
->
-> You don't need to buy API credits, just login and Claude Code will let you complete setup.
->
-> Lastly run `/logout` within Claude Code and then run `ccc`
->
-> Anthropic API usage will now be billed through https://polychat.co.
-
 ## Setup
+
+> [!TIP]
+> No Anthropic subscription? See [Using Without an Anthropic Subscription](#using-without-an-anthropic-subscription) below.
 
 1. Install with npm
   ```bash
@@ -38,6 +31,19 @@ npm install -g claude-code-infinite
   ```
 
 This will guide you through setting up your PolyChat key, which you can also get [here](https://polychat.co/auth?memtree=true).
+
+## Environments
+
+The tool supports multiple environments:
+
+- **Production** (default): `ccc` - Uses https://polychat.co/cc
+- **Local**: `ccc local` - Uses http://localhost:8080/cc for local development
+- **Staging**: `ccc staging` - Uses https://polychat-staging-421312241218.us-west2.run.app/cc
+
+> [!WARNING]
+> **Staging mode doesn't currently work** as authentication is only done via open-webui. This should be changed to support direct authentication.
+
+Each environment maintains its own separate API key.
 
 ## How it works
 
@@ -105,4 +111,15 @@ This logs you out of your Anthropic Console account and keeps you in `ccc` which
 
 ## API Rate limit errors
 
-If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions. 
+If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions.
+
+## Using Without an Anthropic Subscription
+
+> [!NOTE]
+> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
+>
+> You don't need to buy API credits, just login and Claude Code will let you complete setup.
+>
+> Lastly run `/logout` within Claude Code and then run `ccc`
+>
+> Anthropic API usage will be billed through https://polychat.co.

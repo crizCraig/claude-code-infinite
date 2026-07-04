@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 export interface Config {
   polychatApiKey?: string;
+  stagingPolychatApiKey?: string;
   localPolychatApiKey?: string;
 }
 
@@ -42,6 +43,16 @@ export function getPolychatApiKey(): string | undefined {
 export function setPolychatApiKey(key: string): void {
   const config = loadConfig();
   config.polychatApiKey = key;
+  saveConfig(config);
+}
+
+export function getStagingPolychatApiKey(): string | undefined {
+  return loadConfig().stagingPolychatApiKey;
+}
+
+export function setStagingPolychatApiKey(key: string): void {
+  const config = loadConfig();
+  config.stagingPolychatApiKey = key;
   saveConfig(config);
 }
 

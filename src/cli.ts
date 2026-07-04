@@ -9,9 +9,12 @@ import {
   setPolychatApiKey,
   getLocalPolychatApiKey,
   setLocalPolychatApiKey,
+  getStagingPolychatApiKey,
+  setStagingPolychatApiKey,
 } from "./config.js";
 
 const POLYCHAT_BASE_URL = "https://polychat.co/cc";
+const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app/cc";
 const LOCAL_BASE_URL = "http://localhost:8080/cc";
 const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 
@@ -23,13 +26,13 @@ function openUrl(url: string): void {
   platform === "win32" ? exec(`${command} "${url}"`, { shell: 'cmd.exe' }) : exec(`${command} "${url}"`);
 }
 
-async function promptForApiKey(isLocal: boolean): Promise<string> {
+async function promptForApiKey(mode: 'production' | 'staging' | 'local'): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
-  const url = isLocal
+  const url = mode === 'local'
     ? "http://local.polychat.co:5173/memtree-api"
     : POLYCHAT_AUTH_URL;
 
@@ -125,13 +128,18 @@ function printBanner() {
 }
 
 async function main() {
-  // Check for local mode and debug flag
+  // Check for environment mode and debug flag
   const args = process.argv.slice(2);
   const isDebugMode = args.includes("--debug");
   const forceTokenRefresh = process.env.DEBUG_FORCE_EXPIRED === "1";
   const filteredArgs = args.filter((arg) => arg !== "--debug");
-  const isLocalMode = filteredArgs[0] === "local";
-  const claudeArgs = isLocalMode ? filteredArgs.slice(1) : filteredArgs;
+
+  const mode: 'production' | 'staging' | 'local' =
+    filteredArgs[0] === "local" ? "local" :
+    filteredArgs[0] === "staging" ? "staging" :
+    "production";
+
+  const claudeArgs = mode !== "production" ? filteredArgs.slice(1) : filteredArgs;
 
   printBanner();
 
@@ -139,8 +147,10 @@ async function main() {
     console.log("\x1b[1;36m🔍 DEBUG MODE\x1b[0m\n");
   }
 
-  if (isLocalMode) {
+  if (mode === "local") {
     console.log("\x1b[1;33m🏠 LOCAL MODE\x1b[0m\n");
+  } else if (mode === "staging") {
+    console.log("\x1b[1;35m🚧 STAGING MODE\x1b[0m\n");
   }
 
   // Get OAuth token from keychain (optional - we can work without it)
@@ -165,17 +175,22 @@ async function main() {
     }
   }
 
-  // Get or prompt for Polychat API key (separate keys for local vs production)
-  let polychatApiKey = isLocalMode ? getLocalPolychatApiKey() : getPolychatApiKey();
+  // Get or prompt for Polychat API key (separate keys for each environment)
+  let polychatApiKey =
+    mode === "local" ? getLocalPolychatApiKey() :
+    mode === "staging" ? getStagingPolychatApiKey() :
+    getPolychatApiKey();
 
   if (!polychatApiKey) {
-    polychatApiKey = await promptForApiKey(isLocalMode);
+    polychatApiKey = await promptForApiKey(mode);
     if (!polychatApiKey) {
       console.error("POLYCHAT_API_KEY is required.");
       process.exit(1);
     }
-    if (isLocalMode) {
+    if (mode === "local") {
       setLocalPolychatApiKey(polychatApiKey);
+    } else if (mode === "staging") {
+      setStagingPolychatApiKey(polychatApiKey);
     } else {
       setPolychatApiKey(polychatApiKey);
     }
@@ -188,7 +203,10 @@ async function main() {
     : polychatApiKey;
 
   // Choose base URL based on mode
-  const baseUrl = isLocalMode ? LOCAL_BASE_URL : POLYCHAT_BASE_URL;
+  const baseUrl =
+    mode === "local" ? LOCAL_BASE_URL :
+    mode === "staging" ? STAGING_BASE_URL :
+    POLYCHAT_BASE_URL;
 
   // Spawn claude with the environment variables
   const child = spawn("claude", claudeArgs, {
