@@ -9,8 +9,9 @@
  *
  * - Watcher (while the session runs): fs.watch on the project transcript dir;
  *   on change, scan only newly appended bytes per file (tracked offsets); a
- *   file we've never seen is scanned whole — that's the fork case, since
- *   forking copies history (notice included) into a fresh .jsonl.
+ *   file we've never seen is scanned whole — pre-existing files at startup
+ *   (the recency-guarded sweep may have skipped them) and the fork case,
+ *   since forking copies history (notice included) into a fresh .jsonl.
  * - In-place, length-preserving patches: NO temp+rename while CC runs — a
  *   rename swaps the inode under CC's open append handle and loses subsequent
  *   lines. The affected line is re-serialized without the notice and padded
@@ -30,20 +31,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { NOTICE_OPEN, NOTICE_CLOSE } from "./notices.js";
-
-const NOTICE_SPAN_RE = new RegExp(
-  `${escapeRegExp(NOTICE_OPEN)}[\\s\\S]*?${escapeRegExp(NOTICE_CLOSE)}`,
-  "g"
-);
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function exciseNoticeSpans(text: string): string {
-  return text.replace(NOTICE_SPAN_RE, "");
-}
+import { NOTICE_OPEN, exciseNoticeSpans } from "./notices.js";
 
 /** Claude Code's transcript dir for a working directory (path munged to dashes). */
 export function projectTranscriptDir(cwd: string): string {
@@ -194,15 +182,6 @@ export function startTranscriptScrubber(
 
   /** name → byte offset of the first unscanned line. Unknown file ⇒ 0 (fork case). */
   const offsets = new Map<string, number>();
-  for (const name of fs.readdirSync(dir)) {
-    if (!name.endsWith(".jsonl")) continue;
-    try {
-      // Pre-existing files were cleaned by the startup sweep; track from EOF.
-      offsets.set(name, fs.statSync(path.join(dir, name)).size);
-    } catch {
-      /* raced deletion */
-    }
-  }
 
   const scanning = new Set<string>();
   const rescan = new Set<string>();
@@ -275,6 +254,19 @@ export function startTranscriptScrubber(
     })();
   }
 
+  // Scan pre-existing files from byte 0: the startup sweep skips
+  // recently-modified transcripts (live-session guard), so a leftover notice
+  // from a killed prior session may still be on disk. The in-place patch is
+  // length-preserving and safe on live files, so a one-time full scan per
+  // file is cheap and safe.
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (name.endsWith(".jsonl")) schedule(name);
+    }
+  } catch {
+    /* dir gone */
+  }
+
   const watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
     if (filename) {
       if (filename.endsWith(".jsonl")) schedule(filename);
@@ -311,7 +303,8 @@ export function startTranscriptScrubber(
  * Pass `skipRecentMs` to leave recently-modified files alone: another live
  * session may hold an open append handle on them, and renaming under it loses
  * data. Skipped files still get scrubbed by the watcher's in-place patches
- * and by a later sweep once they've gone quiet.
+ * (which scan pre-existing files from byte 0 at startup) and by a later sweep
+ * once they've gone quiet.
  */
 export async function sweepTranscripts(
   dir: string,

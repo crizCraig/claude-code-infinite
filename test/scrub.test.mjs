@@ -116,6 +116,31 @@ test("watcher scans a brand-new file from byte 0 (fork case)", async () => {
   }
 });
 
+test("watcher scans pre-existing files from byte 0 at startup (sweep-skipped leftovers)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  // A leftover notice from a killed prior session, too fresh for the
+  // recency-guarded startup sweep — the watcher must scrub it anyway.
+  const file = path.join(dir, "session-leftover.jsonl");
+  const content =
+    assistantLine([{ type: "text", text: notice }]) + "\n" +
+    assistantLine([{ type: "text", text: "kept content" }]) + "\n";
+  await fsp.writeFile(file, content);
+
+  const scrubber = startTranscriptScrubber(dir, {});
+  try {
+    await scrubber.idle();
+    const got = await fsp.readFile(file, "utf-8");
+    assert.ok(!got.includes("cc-infinite-notice"), "pre-existing notice scrubbed");
+    assert.equal(Buffer.byteLength(got), Buffer.byteLength(content)); // in-place, padded
+    const lines = got.split("\n").filter((l) => l.trim());
+    assert.deepEqual(JSON.parse(lines[0]).message.content, []);
+    assert.equal(JSON.parse(lines[1]).message.content[0].text, "kept content");
+  } finally {
+    scrubber.close();
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("watcher leaves an incomplete (unterminated) tail line alone", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
   const scrubber = startTranscriptScrubber(dir, {});

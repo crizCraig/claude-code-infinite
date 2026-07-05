@@ -577,7 +577,7 @@ let captureCounter = 0;
 
 /** Test-only diagnostics: dump forwarded bodies for smoke-test inspection. */
 function capture(opts: ProxyOptions, kind: string, body: Buffer): void {
-  const dir = opts.captureDir ?? process.env.CCC_CAPTURE_DIR;
+  const dir = opts.captureDir;
   if (!dir) return;
   try {
     mkdirSync(dir, { recursive: true });

@@ -44,22 +44,46 @@ export function isNoticeText(text: string): boolean {
   );
 }
 
-function isNoticeBlock(part: any): boolean {
+const NOTICE_SPAN_RE = new RegExp(
+  `${escapeRegExp(NOTICE_OPEN)}[\\s\\S]*?${escapeRegExp(NOTICE_CLOSE)}`,
+  "g"
+);
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Remove every complete <cc-infinite-notice>…</cc-infinite-notice> span, keeping surrounding text. */
+export function exciseNoticeSpans(text: string): string {
+  return text.replace(NOTICE_SPAN_RE, "");
+}
+
+/** At least one complete marker span — exact envelope, or a notice CC merged into a real text block. */
+function containsNoticeSpan(text: string): boolean {
+  const open = text.indexOf(NOTICE_OPEN);
+  return open !== -1 && text.indexOf(NOTICE_CLOSE, open) !== -1;
+}
+
+function isNoticeSpanBlock(part: any): boolean {
   return (
     part &&
     typeof part === "object" &&
     part.type === "text" &&
     typeof part.text === "string" &&
-    isNoticeText(part.text)
+    containsNoticeSpan(part.text)
   );
 }
 
 /**
- * Strip pass: remove injected notice blocks from a request's message history.
+ * Strip pass: remove injected notice content from a request's message history.
  * Runs on EVERY /v1/messages and count_tokens body, on all paths, before the
- * dedupe hash. Surviving content is byte-identical to what Anthropic produced
- * (important for replayed thinking-block signatures). Returns the original
- * array untouched when nothing matches, so unmodified bodies stay verbatim.
+ * dedupe hash. Untouched blocks survive byte-identical to what Anthropic
+ * produced (important for replayed thinking-block signatures); a text block
+ * that merely CONTAINS the marker span (e.g. CC merged adjacent text blocks)
+ * has the span excised and the surrounding text kept — any block containing
+ * the marker is proxy-contaminated by definition, so byte-identity doesn't
+ * apply. Returns the original array untouched when nothing matches, so
+ * unmodified bodies stay verbatim.
  */
 export function stripNoticeBlocks(messages: Message[]): {
   messages: Message[];
@@ -73,13 +97,25 @@ export function stripNoticeBlocks(messages: Message[]): {
       continue;
     }
     const content = msg.content;
-    if (typeof content === "string" && isNoticeText(content)) {
-      stripped = true; // notice-only message: drop it entirely
+    if (typeof content === "string" && containsNoticeSpan(content)) {
+      stripped = true;
+      const cleaned = exciseNoticeSpans(content);
+      if (cleaned.trim() !== "") out.push({ ...msg, content: cleaned });
+      // else: notice-only message — drop it entirely
       continue;
     }
-    if (Array.isArray(content) && content.some(isNoticeBlock)) {
+    if (Array.isArray(content) && content.some(isNoticeSpanBlock)) {
       stripped = true;
-      const kept = content.filter((p) => !isNoticeBlock(p));
+      const kept: any[] = [];
+      for (const part of content) {
+        if (!isNoticeSpanBlock(part)) {
+          kept.push(part); // untouched blocks keep their original objects
+          continue;
+        }
+        const cleaned = exciseNoticeSpans(part.text);
+        if (cleaned.trim() !== "") kept.push({ ...part, text: cleaned });
+        // else: block was nothing but the envelope — drop it
+      }
       if (kept.length) out.push({ ...msg, content: kept });
       // else: message was nothing but notices — drop it
       continue;

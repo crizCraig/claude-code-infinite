@@ -49,13 +49,31 @@ test("stripNoticeBlocks returns the same array when nothing matches", () => {
   assert.equal(result.messages, messages); // identity: body stays byte-verbatim
 });
 
-test("stripNoticeBlocks ignores non-assistant messages and non-envelope text", () => {
+test("stripNoticeBlocks ignores non-assistant messages and incomplete spans", () => {
   const messages = [
     { role: "user", content: `quoting ${NOTICE_OPEN}xyz${NOTICE_CLOSE}` },
-    { role: "assistant", content: [{ type: "text", text: `prefix ${notice}` }] },
+    { role: "assistant", content: [{ type: "text", text: `mentions ${NOTICE_OPEN} unclosed` }] },
   ];
   const result = stripNoticeBlocks(messages);
   assert.equal(result.stripped, false);
+  assert.equal(result.messages, messages);
+});
+
+test("stripNoticeBlocks excises a notice CC merged into a real text block", () => {
+  const thinking = { type: "thinking", thinking: "hmm", signature: "sig123" };
+  const messages = [
+    { role: "user", content: "hi" },
+    {
+      role: "assistant",
+      content: [thinking, { type: "text", text: `answer text${notice}` }],
+    },
+    { role: "user", content: "next" },
+  ];
+  const { messages: out, stripped } = stripNoticeBlocks(messages);
+  assert.equal(stripped, true);
+  assert.equal(out.length, 3);
+  assert.equal(out[1].content[0], thinking); // untouched block keeps its object
+  assert.deepEqual(out[1].content[1], { type: "text", text: "answer text" });
 });
 
 function parseEvents(sse) {

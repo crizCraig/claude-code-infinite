@@ -155,9 +155,10 @@ async function main() {
   // in this project may be appending to one, and the sweep's rewrite+rename
   // would swap the inode under its open append handle and lose its remaining
   // history. We can't identify our own session's transcript (claude picks the
-  // session id itself), so the guard applies to the exit sweep too — the
-  // watcher's in-place patches have already scrubbed the live file, and a
-  // later sweep drops any leftover padding once it goes quiet.
+  // session id itself), so the guard applies to the exit sweep too. Skipped
+  // files are still covered: the watcher scans pre-existing transcripts from
+  // byte 0 at startup and patches appends in place, and a later sweep drops
+  // any leftover padding once they go quiet.
   const sweepSkipRecentMs = 5 * 60 * 1000;
   const transcriptDir = projectTranscriptDir(process.cwd());
   await sweepTranscripts(transcriptDir, {
