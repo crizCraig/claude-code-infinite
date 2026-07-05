@@ -188,9 +188,23 @@ A small HTTP server + launcher. Responsibilities:
   turns need this) and fall back to transparent pass-through when it trips. The user must be
   *told* memtree is degraded — silent fallback means they think they're testing memory when
   they aren't (exactly the 2026-07-03 A/B confound, in a new costume). Requirement: an inline
-  message in the Claude Code UI **that the model never sees** — injecting text into the SSE
-  response is off the table because it lands in the transcript and pollutes the next turn's
-  context (and the model would react to it). Candidate mechanisms to spike, in rough order:
+  message in the Claude Code UI **that the model never sees**.
+  - **DECIDED 2026-07-05: inject-and-strip marked notices.** The proxy injects the alert
+    into the response stream as a dedicated `<cc-infinite-notice>…</cc-infinite-notice>`
+    assistant text block (renders inline like normal streamed text, full timing control),
+    and strips marker-matching blocks from assistant history in every subsequent request
+    body before forwarding to Anthropic/polychat — so it lands in the transcript but never
+    reaches the model. Notices are ephemeral timeline moments: the launcher also scrubs
+    them from CC's saved session .jsonl continuously (fs.watch + length-preserving in-place
+    line patches, with exit/startup sweeps as backstop), so they never appear on resume or
+    fork, under `ccc` or vanilla. This supersedes the original "SSE injection is off the
+    table" rule,
+    which assumed no strip pass. Also evaluated and rejected: statusline (user wants inline
+    transcript messages, not status-line text) and hook `systemMessage` (user-visible only
+    and installable via `--settings`, but hooks fire only at event boundaries — can't
+    appear mid-stall). Mechanics, spike list, and risks in
+    `plans/2026-07-05_PLAN_first_user_turn_nonblocking.md`. Original candidates kept below
+    for the record:
   - **statusline** (`statusLine` command in settings.json): CC runs a user script that can
     read a status file the local app maintains (e.g. `~/.config/claude-code-infinite/status`)
     and render "⚠ memtree timing out — passthrough mode". Model never sees statusline content.
@@ -202,6 +216,20 @@ A small HTTP server + launcher. Responsibilities:
     but easy to miss and noisy; last resort or supplement.
   Also record fallback events in the usage report (Phase 4) so degraded sessions are visible
   on the dashboard after the fact.
+- **Slow-first-token reassurance message**: a second inline-message scenario, distinct from
+  the degradation alert above. Trigger: we just ran compress-and-substitute on a new user
+  input turn, and no new tokens have arrived from Anthropic within 10 seconds of forwarding
+  the compressed request. Show a MemTree-branded message to the effect of "✨ Something
+  special is happening — please wait." Rationale: a freshly compressed context can add
+  first-token latency, and without any signal the user reads the stall as a hang; this
+  reframes it as the memory feature working. Same delivery constraint as above — the model
+  must never see it. UPDATED 2026-07-05: delivered via inject-and-strip (see above), which
+  restores the original timer design — at 10s with no first upstream byte, the proxy
+  fabricates the SSE prelude with the notice block and Anthropic's content streams in after
+  it (see `plans/2026-07-05_PLAN_first_user_turn_nonblocking.md`). Clear-on-first-token is
+  moot: the notice is part of the stream, not a separate display surface. Only fires on
+  user turns that compress — pass-through, first-user-turn, and background-index turns keep
+  the plain degradation-alert behavior.
 - **Error responses & retry amplification**: return well-formed Anthropic-shaped error bodies
   on upstream failure. Observed 2026-07-03: against a 401-returning endpoint, `claude -p`
   retried ~9× and hung past 2 minutes rather than failing fast. Retries must not re-trigger
@@ -276,6 +304,51 @@ A small HTTP server + launcher. Responsibilities:
      response headers, or the client receives compressed bytes it can't parse.
 
 ### Phase 2 — Compression integration
+
+> **STATUS 2026-07-04: client side implemented in this repo (TypeScript, shipped as the `ccc`
+> npm package itself — Phase 3's "port to TS" collapsed into this).** `src/proxy.ts` (localhost
+> proxy: user-turn compress+substitute, tool-turn fire-and-forget indexing, count_tokens +
+> catch-all passthrough, raw-byte response piping), `src/memtree.ts` (/v1/context_memory client,
+> per-messages-hash dedupe against retry amplification, `index_only` flag sent for the future
+> server mode, `x-client`/`x-client-version` headers), `src/turns.ts` (turn-detection port with
+> the audit fixes: any tool_result block ⇒ tool turn; text checked after system-reminder
+> stripping; recap fork still counts as user turn), `src/status.ts` + `ccc-statusline` bin
+> (degraded-mode + slow-first-token alerts via status file — model never sees them), `src/cli.ts`
+> (launcher sets only `ANTHROPIC_BASE_URL`; all OAuth env-var/keychain-copy logic removed;
+> keychain.ts retained unused as the designed fallback).
+>
+> Verified end-to-end 2026-07-04 with real `claude -p` sessions: (1) MemTree unreachable →
+> passthrough, session completes, degraded status written; (2) mock MemTree → compressed body
+> (2272→640 bytes, flatten + top-level system) accepted by api.anthropic.com, one compression
+> call despite 3 identical CC requests (dedupe held), status cleared on success.
+>
+> **Blocked on polychat-repo server work:** `/v1/context_memory` (found at api.polychat.co, not
+> polychat.co) returns 401 "Invalid API key" for polychat-issued user keys — it only accepts the
+> shared/NanoGPT/OpenRouter keys (`api.py:302`). Per-user API keys (Phase 2.1), index-only mode,
+> and the flatten/parity audit are the polychat repo's items; until then the client degrades to
+> passthrough in production.
+>
+> **STATUS 2026-07-05 addendum
+> (`plans/2026-07-05_PLAN_first_user_turn_nonblocking.md` implemented — see its STATUS
+> block for verification detail; uncommitted, review pass pending):**
+>
+> - **Compression decision changed**: three-way turn classification. The FIRST user turn of
+>   a session no longer blocks — it backgrounds an `index_only` POST and forwards verbatim
+>   like a tool turn; only user turns with an earlier real user input block-and-substitute
+>   (`hasEarlierNonToolUserMessage` in `src/turns.ts`).
+> - **Alert mechanism decided and replaced**: `src/status.ts`, `src/statusline.ts`, and the
+>   `ccc-statusline` bin above are REMOVED. Alerts are now inject-and-strip inline notices
+>   (`src/notices.ts`): marker-wrapped assistant text blocks injected into the response
+>   stream (fabricated SSE prelude for the 10s ✨ reassurance, end-of-turn append for the
+>   degraded alert, JSON append for non-streaming), stripped from every subsequent
+>   `/v1/messages` + `count_tokens` request body before the dedupe hash, and continuously
+>   scrubbed from CC's session transcripts (`src/scrub.ts`: fs.watch + length-preserving
+>   in-place patches while the session runs, rewrite sweeps at startup/exit). Phase 2
+>   item 3b's statusline/hook-systemMessage spike is thereby superseded.
+> - Item 3b's "verify the notice never enters model context" requirement was met on the
+>   wire: forwarded bodies and MemTree payloads verified notice-free, and a replayed signed
+>   thinking turn with a preceding notice block was accepted by api.anthropic.com after
+>   stripping (signature preserved).
 1. Server: per-user API keys + `/v1/context_memory` parity audit (shared code path with /cc).
 2. Local app: lazy-compression turn detection — fire-and-forget background indexing POSTs
    on tool turns (keeps the index current as the agent runs), blocking `/v1/context_memory`

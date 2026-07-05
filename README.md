@@ -34,16 +34,31 @@ This will guide you through setting up your PolyChat key, which you can also get
 
 ## Environments
 
-The tool supports multiple environments:
+The tool supports multiple environments (this selects the MemTree compression API only — Anthropic traffic always goes directly from your machine to api.anthropic.com):
 
-- **Production** (default): `ccc` - Uses https://polychat.co/cc
-- **Local**: `ccc local` - Uses http://localhost:8080/cc for local development
-- **Staging**: `ccc staging` - Uses https://polychat-staging-421312241218.us-west2.run.app/cc
-
-> [!WARNING]
-> **Staging mode doesn't currently work** as authentication is only done via open-webui. This should be changed to support direct authentication.
+- **Production** (default): `ccc` - Uses https://api.polychat.co
+- **Local**: `ccc local` - Uses http://localhost:8080 for local development
+- **Staging**: `ccc staging` - Uses https://polychat-staging-421312241218.us-west2.run.app
 
 Each environment maintains its own separate API key.
+
+## Privacy & architecture: your Anthropic credentials never leave your machine
+
+`ccc` runs a small proxy on `127.0.0.1` and launches Claude Code with only `ANTHROPIC_BASE_URL` pointed at it. Claude Code keeps its **native login** — token refresh, plan-default model selection, and rate-limit handling behave exactly like vanilla Claude Code, and your OAuth token is sent only to `api.anthropic.com` from your own machine.
+
+```
+Claude Code ──▶ localhost proxy (ccc)
+                  ├──(messages only, MemTree API key)──▶ api.polychat.co /v1/context_memory
+                  │◀──(compressed messages)─────────────┘
+                  └──(compressed messages + your local OAuth token)──▶ api.anthropic.com
+```
+
+- Only message content is sent to MemTree for indexing/compression — never credentials.
+- If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
+
+### Inline notices
+
+The proxy reports MemTree state (e.g. a "⚠ MemTree degraded" alert when a turn ran uncompressed, or a "✨" reassurance while a freshly-compressed request warms up) as inline messages in your Claude Code session. These are injected into the response stream and stripped back out of every subsequent request — the model never sees them, and they are scrubbed from the saved session transcript so resumed or forked sessions stay clean.
 
 ## How it works
 
@@ -98,28 +113,14 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 ## Troubleshooting
 
-### 401 {"detail":"Your session has expired or the token is invalid. Please sign in again."}
+### Anthropic auth errors (401s, login prompts)
 
-This happens if you chose "Anthropic Console account" during setup instead of using an Anthropic subscription.
+`ccc` never touches your Anthropic credentials — Claude Code manages its own login exactly as it does without `ccc`. If you see auth errors, fix them the vanilla way: run `/login` inside Claude Code (or `claude` directly) and re-authenticate.
 
-Fix:
+### MemTree degraded / passthrough mode
 
-1. Run: `/logout`
-2. Re-run `ccc`
-
-This logs you out of your Anthropic Console account and keeps you in `ccc` which uses PolyChat. If you'd like to use your own API key with PolyChat, login to polychat.co and head over to our [BYOK settings](https://app.polychat.co/api-keys).
-
-## API Rate limit errors
-
-If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions.
+If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the compression API is unreachable or your MemTree key is invalid/expired. Your session keeps working uncompressed. Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
 
 ## Using Without an Anthropic Subscription
 
-> [!NOTE]
-> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
->
-> You don't need to buy API credits, just login and Claude Code will let you complete setup.
->
-> Lastly run `/logout` within Claude Code and then run `ccc`
->
-> Anthropic API usage will be billed through https://polychat.co.
+Claude Code works with an Anthropic API key as well as a subscription — set `ANTHROPIC_API_KEY` as you would with vanilla Claude Code and run `ccc` as usual. MemTree compression works the same either way (and saves the most money on API-key billing, since you pay per token).
