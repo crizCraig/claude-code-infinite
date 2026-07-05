@@ -230,7 +230,13 @@ async function handleMessages(
   });
 }
 
-/** count_tokens: strip notices (counts must reflect what we'd forward), pass through. */
+/**
+ * count_tokens: strip notices, pass through. Counting is intentionally done on
+ * the uncompressed conversation even though /v1/messages forwards a compressed
+ * body on followup user turns — the compression result isn't known at count
+ * time, so counts are an upper bound rather than an exact match of what's
+ * forwarded.
+ */
 async function handleCountTokens(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -378,15 +384,20 @@ function forwardWithNotices(
           // Error (or non-SSE after we already started an SSE stream).
           if (preludeSent) {
             // Client stream already open: surface as an in-stream error event.
-            readAll(upstreamRes).then((errBody) => {
-              res.write(
-                sseErrorEvent(
-                  `upstream ${status}: ${errBody.toString("utf-8").slice(0, 300)}`
-                )
-              );
-              res.end();
-              finish();
-            });
+            readAll(upstreamRes)
+              .then((errBody) => {
+                res.write(
+                  sseErrorEvent(
+                    `upstream ${status}: ${errBody.toString("utf-8").slice(0, 300)}`
+                  )
+                );
+                res.end();
+                finish();
+              })
+              .catch(() => {
+                res.destroy();
+                finish();
+              });
             return;
           }
           upstreamStarted = true;
@@ -435,21 +446,26 @@ function forwardWithNotices(
         // the end-of-turn notice to the body if present.
         upstreamStarted = true;
         disarm();
-        readAll(upstreamRes).then((responseBody) => {
-          let outBody = responseBody;
-          if (notice.endOfTurnNotice) {
-            const modified = appendNoticeToJsonBody(
-              responseBody,
-              notice.endOfTurnNotice
-            );
-            if (modified) outBody = modified;
-          }
-          const outHeaders = forwardableResponseHeaders(upstreamRes);
-          outHeaders["content-length"] = String(outBody.length);
-          res.writeHead(status, outHeaders);
-          res.end(outBody);
-          finish();
-        });
+        readAll(upstreamRes)
+          .then((responseBody) => {
+            let outBody = responseBody;
+            if (notice.endOfTurnNotice) {
+              const modified = appendNoticeToJsonBody(
+                responseBody,
+                notice.endOfTurnNotice
+              );
+              if (modified) outBody = modified;
+            }
+            const outHeaders = forwardableResponseHeaders(upstreamRes);
+            outHeaders["content-length"] = String(outBody.length);
+            res.writeHead(status, outHeaders);
+            res.end(outBody);
+            finish();
+          })
+          .catch(() => {
+            res.destroy();
+            finish();
+          });
       }
     );
 
@@ -478,13 +494,21 @@ function passThroughStreaming(
   upstream: Upstream
 ): Promise<void> {
   return new Promise((resolve) => {
+    const headers = forwardableRequestHeaders(req);
+    // The body is piped unmodified here, so keep the client's original
+    // content-length (SKIP_REQUEST_HEADERS strips it for the buffered paths,
+    // which recompute it); dropping it would silently convert the request to
+    // chunked transfer-encoding.
+    if (req.headers["content-length"] !== undefined) {
+      headers["content-length"] = req.headers["content-length"];
+    }
     const upstreamReq = upstream.module.request(
       {
         host: upstream.host,
         port: upstream.port,
         method: req.method,
         path: req.url,
-        headers: forwardableRequestHeaders(req),
+        headers,
       },
       (upstreamRes) => {
         res.writeHead(

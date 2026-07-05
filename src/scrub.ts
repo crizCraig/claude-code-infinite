@@ -166,6 +166,16 @@ export interface ScrubberOptions {
   debug?: boolean;
 }
 
+export interface SweepOptions extends ScrubberOptions {
+  /**
+   * Skip files modified within this many ms. A recently-touched transcript is
+   * likely being appended to by a concurrent ccc/claude session in the same
+   * project — rewrite+rename would swap the inode under that session's open
+   * append handle and silently lose the rest of its history.
+   */
+  skipRecentMs?: number;
+}
+
 export interface TranscriptScrubber {
   close(): void;
   /** Wait for any in-flight scans (test hook). */
@@ -297,10 +307,15 @@ export function startTranscriptScrubber(
  * the marker. Only safe when no session is appending to these files — run it
  * at ccc startup (before launching claude) and after claude exits. Also drops
  * the in-place patches' space padding. Returns the number of files rewritten.
+ *
+ * Pass `skipRecentMs` to leave recently-modified files alone: another live
+ * session may hold an open append handle on them, and renaming under it loses
+ * data. Skipped files still get scrubbed by the watcher's in-place patches
+ * and by a later sweep once they've gone quiet.
  */
 export async function sweepTranscripts(
   dir: string,
-  opts: ScrubberOptions = {}
+  opts: SweepOptions = {}
 ): Promise<number> {
   let entries: string[];
   try {
@@ -313,6 +328,19 @@ export async function sweepTranscripts(
   for (const name of entries) {
     if (!name.endsWith(".jsonl")) continue;
     const filePath = path.join(dir, name);
+    if (opts.skipRecentMs) {
+      try {
+        const { mtimeMs } = await fsp.stat(filePath);
+        if (Date.now() - mtimeMs < opts.skipRecentMs) {
+          if (opts.debug) {
+            console.error(`[ccc scrub] skipping recently-modified ${name} (may be live)`);
+          }
+          continue;
+        }
+      } catch {
+        continue; // raced deletion
+      }
+    }
     let content: string;
     try {
       content = await fsp.readFile(filePath, "utf-8");

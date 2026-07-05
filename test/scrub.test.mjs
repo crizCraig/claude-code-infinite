@@ -165,6 +165,25 @@ test("sweep rewrites files: drops notice-only lines, padding, and empty shells",
   }
 });
 
+test("sweep with skipRecentMs leaves recently-modified files alone (live-session guard)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  try {
+    const live = path.join(dir, "live.jsonl");
+    const quiet = path.join(dir, "quiet.jsonl");
+    const dirty = assistantLine([{ type: "text", text: notice }]) + "\n";
+    await fsp.writeFile(live, dirty); // fresh mtime — a concurrent session may hold an append handle
+    await fsp.writeFile(quiet, dirty);
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    await fsp.utimes(quiet, old, old);
+
+    assert.equal(await sweepTranscripts(dir, { skipRecentMs: 5 * 60 * 1000 }), 1);
+    assert.ok((await fsp.readFile(live, "utf-8")).includes("cc-infinite-notice")); // skipped
+    assert.ok(!(await fsp.readFile(quiet, "utf-8")).includes("cc-infinite-notice")); // swept
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("sweep skips clean files and missing dirs", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
   try {

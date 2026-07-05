@@ -19,6 +19,7 @@
  * - Non-streaming append: push the notice text block onto the JSON `content`.
  */
 
+import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message } from "./turns.js";
 
@@ -125,7 +126,7 @@ export function fabricatedPrelude(model: string, noticeText: string): string {
     sseEvent("message_start", {
       type: "message_start",
       message: {
-        id: "msg_ccinfinite_notice",
+        id: `msg_ccinfinite_${randomUUID()}`,
         type: "message",
         role: "assistant",
         model,

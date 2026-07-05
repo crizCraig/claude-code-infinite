@@ -150,8 +150,20 @@ async function main() {
   // Transcript scrubbing: injected inline notices are ephemeral — remove them
   // from CC's saved .jsonl continuously (watcher) with sweeps as backstop, so
   // resumes/forks are clean under both ccc and vanilla claude.
+  //
+  // Sweeps skip recently-modified transcripts: a concurrent ccc/claude session
+  // in this project may be appending to one, and the sweep's rewrite+rename
+  // would swap the inode under its open append handle and lose its remaining
+  // history. We can't identify our own session's transcript (claude picks the
+  // session id itself), so the guard applies to the exit sweep too — the
+  // watcher's in-place patches have already scrubbed the live file, and a
+  // later sweep drops any leftover padding once it goes quiet.
+  const sweepSkipRecentMs = 5 * 60 * 1000;
   const transcriptDir = projectTranscriptDir(process.cwd());
-  await sweepTranscripts(transcriptDir, { debug: isDebugMode }).catch(() => 0);
+  await sweepTranscripts(transcriptDir, {
+    debug: isDebugMode,
+    skipRecentMs: sweepSkipRecentMs,
+  }).catch(() => 0);
   const scrubber = startTranscriptScrubber(transcriptDir, { debug: isDebugMode });
 
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
@@ -177,8 +189,12 @@ async function main() {
 
   child.on("exit", (code: number | null) => {
     scrubber.close();
-    // Exit sweep: nothing is appending anymore, so rewrite+rename is safe.
-    void sweepTranscripts(transcriptDir, { debug: isDebugMode })
+    // Exit sweep: our child has exited, but other sessions in this project may
+    // still be appending — keep the recent-mtime guard (see above).
+    void sweepTranscripts(transcriptDir, {
+      debug: isDebugMode,
+      skipRecentMs: sweepSkipRecentMs,
+    })
       .catch(() => 0)
       .then(() => {
         proxy.close();
@@ -187,4 +203,7 @@ async function main() {
   });
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

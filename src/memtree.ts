@@ -86,6 +86,11 @@ export class MemtreeClient {
       timeoutMs: this.compressTimeoutMs,
     }).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
+      // Don't cache failures — drop the entry so retries (e.g. Claude Code's
+      // automatic retry of an identical request) hit the server again.
+      if (this.compressCache.get(hash) === promise) {
+        this.compressCache.delete(hash);
+      }
       return null;
     });
 
