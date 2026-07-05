@@ -35,15 +35,6 @@ export function wrapNotice(text: string): string {
   return `${NOTICE_OPEN}${text}${NOTICE_CLOSE}`;
 }
 
-/** Exact marker envelope — the only shape we ever inject as a request-history block. */
-export function isNoticeText(text: string): boolean {
-  return (
-    text.startsWith(NOTICE_OPEN) &&
-    text.endsWith(NOTICE_CLOSE) &&
-    text.length >= NOTICE_OPEN.length + NOTICE_CLOSE.length
-  );
-}
-
 const NOTICE_SPAN_RE = new RegExp(
   `${escapeRegExp(NOTICE_OPEN)}[\\s\\S]*?${escapeRegExp(NOTICE_CLOSE)}`,
   "g"
