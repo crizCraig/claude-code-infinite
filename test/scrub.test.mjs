@@ -4,7 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { wrapNotice } from "../dist/notices.js";
+import { NOTICE_OPEN, wrapNotice } from "../dist/notices.js";
 import {
   scrubLineInPlace,
   startTranscriptScrubber,
@@ -56,6 +56,23 @@ test("scrubLineInPlace: notice merged into a bigger text block is excised", () =
 test("scrubLineInPlace: no marker → null (leave file untouched)", () => {
   assert.equal(scrubLineInPlace(Buffer.from(assistantLine([{ type: "text", text: "hi" }]))), null);
   assert.equal(scrubLineInPlace(Buffer.from("not json at all")), null);
+});
+
+test("scrubLineInPlace: user line quoting the marker → null (assistant-only)", () => {
+  const userLine = JSON.stringify({
+    parentUuid: null,
+    type: "user",
+    message: { role: "user", content: `quoting ${notice}` },
+    uuid: "u2",
+  });
+  assert.equal(scrubLineInPlace(Buffer.from(userLine)), null);
+});
+
+test("scrubLineInPlace: unclosed marker (open tag, no close) → null", () => {
+  const line = Buffer.from(
+    assistantLine([{ type: "text", text: `mentions ${NOTICE_OPEN} unclosed` }])
+  );
+  assert.equal(scrubLineInPlace(line), null);
 });
 
 test("watcher scrubs appended lines in place without disturbing later appends", async () => {
@@ -141,6 +158,30 @@ test("watcher scans pre-existing files from byte 0 at startup (sweep-skipped lef
   }
 });
 
+test("watcher scans large files in bounded windows (lines straddle chunk boundaries)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  const file = path.join(dir, "session-big.jsonl");
+  // > 1 MiB of ~1 KiB lines so several lines straddle the 1 MiB scan window,
+  // a notice near the end, and an incomplete tail line that must survive.
+  const filler = assistantLine([{ type: "text", text: "x".repeat(1024) }]) + "\n";
+  const tail = assistantLine([{ type: "text", text: "tail kept" }]); // no \n yet
+  const content =
+    filler.repeat(1200) + assistantLine([{ type: "text", text: notice }]) + "\n" + tail;
+  await fsp.writeFile(file, content);
+
+  const scrubber = startTranscriptScrubber(dir, {});
+  try {
+    await scrubber.idle();
+    const got = await fsp.readFile(file, "utf-8");
+    assert.ok(!got.includes("cc-infinite-notice"), "notice scrubbed past the first window");
+    assert.equal(Buffer.byteLength(got), Buffer.byteLength(content)); // in-place, padded
+    assert.equal(got.slice(got.lastIndexOf("\n") + 1), tail); // incomplete tail untouched
+  } finally {
+    scrubber.close();
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("watcher leaves an incomplete (unterminated) tail line alone", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
   const scrubber = startTranscriptScrubber(dir, {});
@@ -204,6 +245,43 @@ test("sweep with skipRecentMs leaves recently-modified files alone (live-session
     assert.equal(await sweepTranscripts(dir, { skipRecentMs: 5 * 60 * 1000 }), 1);
     assert.ok((await fsp.readFile(live, "utf-8")).includes("cc-infinite-notice")); // skipped
     assert.ok(!(await fsp.readFile(quiet, "utf-8")).includes("cc-infinite-notice")); // swept
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sweep leaves a user line quoting the marker byte-identical", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  try {
+    const file = path.join(dir, "session-quote.jsonl");
+    const original =
+      JSON.stringify({
+        parentUuid: null,
+        type: "user",
+        message: { role: "user", content: `quoting ${notice}` },
+        uuid: "u2",
+      }) + "\n";
+    await fsp.writeFile(file, original);
+    const before = fs.statSync(file).mtimeMs;
+    assert.equal(await sweepTranscripts(dir, {}), 0);
+    assert.equal(await fsp.readFile(file, "utf-8"), original);
+    assert.equal(fs.statSync(file).mtimeMs, before); // never rewritten
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sweep ignores an unclosed marker (open tag, no close) — no eternal re-sweeps", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  try {
+    const file = path.join(dir, "session-unclosed.jsonl");
+    const original =
+      assistantLine([{ type: "text", text: `mentions ${NOTICE_OPEN} unclosed` }]) + "\n";
+    await fsp.writeFile(file, original);
+    const before = fs.statSync(file).mtimeMs;
+    assert.equal(await sweepTranscripts(dir, {}), 0);
+    assert.equal(await fsp.readFile(file, "utf-8"), original);
+    assert.equal(fs.statSync(file).mtimeMs, before); // untouched
   } finally {
     await fsp.rm(dir, { recursive: true, force: true });
   }

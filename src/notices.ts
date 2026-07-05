@@ -58,8 +58,12 @@ export function exciseNoticeSpans(text: string): string {
   return text.replace(NOTICE_SPAN_RE, "");
 }
 
-/** At least one complete marker span — exact envelope, or a notice CC merged into a real text block. */
-function containsNoticeSpan(text: string): boolean {
+/**
+ * At least one complete marker span — exact envelope, or a notice CC merged
+ * into surrounding text. Works on any raw text (a block's text, a whole
+ * transcript line or file); a bare open tag with no close never matches.
+ */
+export function containsNoticeSpan(text: string): boolean {
   const open = text.indexOf(NOTICE_OPEN);
   return open !== -1 && text.indexOf(NOTICE_CLOSE, open) !== -1;
 }

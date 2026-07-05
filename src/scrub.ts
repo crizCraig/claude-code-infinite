@@ -31,7 +31,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { NOTICE_OPEN, exciseNoticeSpans } from "./notices.js";
+import { NOTICE_OPEN, containsNoticeSpan, exciseNoticeSpans } from "./notices.js";
 
 /** Claude Code's transcript dir for a working directory (path munged to dashes). */
 export function projectTranscriptDir(cwd: string): string {
@@ -48,9 +48,11 @@ export function projectTranscriptDir(cwd: string): string {
 }
 
 /**
- * Deep-remove notice content from a parsed transcript line. Dedicated notice
+ * Deep-remove notice content from a parsed assistant message. Dedicated notice
  * text blocks are removed from their array; text that merely CONTAINS the
  * marker span (e.g. CC merged adjacent text blocks) has the span excised.
+ * Only complete spans count — a bare open tag is left alone — and `changed`
+ * reflects actual mutation, so an untouched line is never reported dirty.
  */
 function scrubObjectInPlace(node: any): boolean {
   let changed = false;
@@ -63,15 +65,20 @@ function scrubObjectInPlace(node: any): boolean {
         !Array.isArray(item) &&
         item.type === "text" &&
         typeof item.text === "string" &&
-        item.text.includes(NOTICE_OPEN)
+        containsNoticeSpan(item.text)
       ) {
-        changed = true;
         const cleaned = exciseNoticeSpans(item.text);
-        if (cleaned.trim() === "") node.splice(i, 1);
-        else item.text = cleaned;
-      } else if (typeof item === "string" && item.includes(NOTICE_OPEN)) {
-        node[i] = exciseNoticeSpans(item);
-        changed = true;
+        if (cleaned !== item.text) {
+          changed = true;
+          if (cleaned.trim() === "") node.splice(i, 1);
+          else item.text = cleaned;
+        }
+      } else if (typeof item === "string" && containsNoticeSpan(item)) {
+        const cleaned = exciseNoticeSpans(item);
+        if (cleaned !== item) {
+          node[i] = cleaned;
+          changed = true;
+        }
       } else if (item && typeof item === "object") {
         changed = scrubObjectInPlace(item) || changed;
       }
@@ -79,9 +86,12 @@ function scrubObjectInPlace(node: any): boolean {
   } else if (node && typeof node === "object") {
     for (const key of Object.keys(node)) {
       const value = node[key];
-      if (typeof value === "string" && value.includes(NOTICE_OPEN)) {
-        node[key] = exciseNoticeSpans(value);
-        changed = true;
+      if (typeof value === "string" && containsNoticeSpan(value)) {
+        const cleaned = exciseNoticeSpans(value);
+        if (cleaned !== value) {
+          node[key] = cleaned;
+          changed = true;
+        }
       } else if (value && typeof value === "object") {
         changed = scrubObjectInPlace(value) || changed;
       }
@@ -97,14 +107,19 @@ function scrubObjectInPlace(node: any): boolean {
  * safely patched — unparseable, or the result wouldn't fit).
  */
 export function scrubLineInPlace(line: Buffer): Buffer | null {
-  if (!line.includes(NOTICE_OPEN)) return null;
+  if (!line.includes(NOTICE_OPEN)) return null; // cheap pre-filter for the common case
+  const text = line.toString("utf-8");
+  if (!containsNoticeSpan(text)) return null; // bare open tag — nothing excisable
   let obj: any;
   try {
-    obj = JSON.parse(line.toString("utf-8"));
+    obj = JSON.parse(text);
   } catch {
     return null;
   }
-  if (!scrubObjectInPlace(obj)) return null;
+  // Only assistant lines carry injected notices; a user message quoting the
+  // marker is never rewritten (mirrors stripNoticeBlocks' request-path rule).
+  if (obj?.type !== "assistant") return null;
+  if (!scrubObjectInPlace(obj.message)) return null;
   const out = Buffer.from(JSON.stringify(obj), "utf-8");
   if (out.length > line.length) return null; // removal only shrinks; belt-and-braces
   return Buffer.concat([out, Buffer.alloc(line.length - out.length, 0x20)]);
@@ -128,7 +143,7 @@ function isEmptyAssistantShell(obj: any): boolean {
 function scrubLineForRewrite(line: string): string | null {
   const hadPadding = / +$/.test(line);
   const trimmed = hadPadding ? line.replace(/ +$/, "") : line;
-  if (!trimmed.includes(NOTICE_OPEN)) {
+  if (!containsNoticeSpan(trimmed)) {
     if (!hadPadding) return line;
     try {
       if (isEmptyAssistantShell(JSON.parse(trimmed))) return null;
@@ -143,7 +158,9 @@ function scrubLineForRewrite(line: string): string | null {
   } catch {
     return trimmed;
   }
-  scrubObjectInPlace(obj);
+  // Never rewrite non-assistant lines (e.g. a user message quoting the marker).
+  if (obj?.type !== "assistant") return line;
+  scrubObjectInPlace(obj.message);
   if (isEmptyAssistantShell(obj)) {
     return null; // the line held nothing but the notice block
   }
@@ -169,6 +186,13 @@ export interface TranscriptScrubber {
   /** Wait for any in-flight scans (test hook). */
   idle(): Promise<void>;
 }
+
+/**
+ * Scan window size. Bounded so the startup byte-0 scans of a project's whole
+ * transcript history never buffer entire files — peak memory per scan is one
+ * window plus the longest carried line.
+ */
+const SCAN_CHUNK_SIZE = 1 << 20; // 1 MiB
 
 /**
  * Watch a project transcript dir and scrub notices from appended lines as
@@ -202,27 +226,47 @@ export function startTranscriptScrubber(
       if (size < start) start = 0; // truncated/replaced — rescan from the top
       if (size <= start) return;
 
-      const buf = Buffer.alloc(size - start);
-      await fd.read(buf, 0, buf.length, start);
+      // Read in bounded windows; a line straddling a window boundary is
+      // carried into the next read so it's still patched as a whole.
+      const chunk = Buffer.alloc(Math.min(SCAN_CHUNK_SIZE, size - start));
+      let carry: Buffer | null = null;
+      let pos = start; // next file offset to read
+      let scannedTo = start; // first byte of the earliest incomplete line
+      while (pos < size) {
+        const { bytesRead } = await fd.read(
+          chunk,
+          0,
+          Math.min(chunk.length, size - pos),
+          pos
+        );
+        if (bytesRead <= 0) break; // raced truncation
+        const bufBase = pos - (carry?.length ?? 0); // file offset of buf[0]
+        const buf: Buffer = carry
+          ? Buffer.concat([carry, chunk.subarray(0, bytesRead)])
+          : chunk.subarray(0, bytesRead);
+        carry = null;
+        pos += bytesRead;
 
-      // Only complete newline-terminated lines are safe to patch.
-      const lastNewline = buf.lastIndexOf(0x0a);
-      if (lastNewline === -1) return;
-
-      let lineStart = 0;
-      while (lineStart <= lastNewline) {
-        const nl = buf.indexOf(0x0a, lineStart);
-        const line = buf.subarray(lineStart, nl);
-        const patched = scrubLineInPlace(line);
-        if (patched) {
-          await fd.write(patched, 0, patched.length, start + lineStart);
-          if (opts.debug) {
-            console.error(`[ccc scrub] patched notice out of ${name} @${start + lineStart}`);
+        // Only complete newline-terminated lines are safe to patch.
+        let lineStart = 0;
+        let nl: number;
+        while ((nl = buf.indexOf(0x0a, lineStart)) !== -1) {
+          const line = buf.subarray(lineStart, nl);
+          const patched = scrubLineInPlace(line);
+          if (patched) {
+            await fd.write(patched, 0, patched.length, bufBase + lineStart);
+            if (opts.debug) {
+              console.error(`[ccc scrub] patched notice out of ${name} @${bufBase + lineStart}`);
+            }
           }
+          lineStart = nl + 1;
         }
-        lineStart = nl + 1;
+        scannedTo = bufBase + lineStart;
+        if (lineStart < buf.length) {
+          carry = Buffer.from(buf.subarray(lineStart)); // copy — chunk is reused
+        }
       }
-      offsets.set(name, start + lastNewline + 1);
+      offsets.set(name, scannedTo);
     } catch (err: any) {
       if (opts.debug) console.error(`[ccc scrub] scan failed for ${name}: ${err?.message}`);
     } finally {
@@ -340,10 +384,12 @@ export async function sweepTranscripts(
     } catch {
       continue;
     }
-    // Marker present, or space-padding from earlier in-place patches (a
-    // compact-JSON line never legitimately ends with a literal space).
+    // Complete marker span present (a bare open tag is never scrubbed, so it
+    // must not trigger endless rewrites), or space-padding from earlier
+    // in-place patches (a compact-JSON line never legitimately ends with a
+    // literal space).
     const needsSweep =
-      content.includes(NOTICE_OPEN) ||
+      containsNoticeSpan(content) ||
       content.includes(" \n") ||
       content.endsWith(" ");
     if (!needsSweep) continue;
@@ -361,6 +407,7 @@ export async function sweepTranscripts(
     }
 
     const output = kept.join("\n") + (endsWithNewline ? "\n" : "");
+    if (output === content) continue; // e.g. only a user line quoting the marker
     const tmpPath = path.join(dir, `.${name}.ccc-scrub-tmp`);
     try {
       await fsp.writeFile(tmpPath, output);
