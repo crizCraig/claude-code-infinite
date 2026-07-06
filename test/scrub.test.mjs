@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +7,6 @@ import { NOTICE_OPEN, wrapNotice } from "../dist/notices.js";
 import {
   scrubLineInPlace,
   startTranscriptScrubber,
-  sweepTranscripts,
   projectTranscriptDir,
 } from "../dist/scrub.js";
 
@@ -133,10 +131,10 @@ test("watcher scans a brand-new file from byte 0 (fork case)", async () => {
   }
 });
 
-test("watcher scans pre-existing files from byte 0 at startup (sweep-skipped leftovers)", async () => {
+test("watcher scans pre-existing files from byte 0 at startup (killed-session leftovers)", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
-  // A leftover notice from a killed prior session, too fresh for the
-  // recency-guarded startup sweep — the watcher must scrub it anyway.
+  // A leftover notice from a killed prior session — the watcher never saw it
+  // land, so the startup scan must scrub it.
   const file = path.join(dir, "session-leftover.jsonl");
   const content =
     assistantLine([{ type: "text", text: notice }]) + "\n" +
@@ -208,96 +206,22 @@ test("watcher leaves an incomplete (unterminated) tail line alone", async () => 
   }
 });
 
-test("sweep rewrites files: drops notice-only lines, padding, and empty shells", async () => {
+test("flush scrubs a just-appended notice without waiting for fs events", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
+  const scrubber = startTranscriptScrubber(dir, {});
   try {
-    const file = path.join(dir, "session-c.jsonl");
-    const keep = assistantLine([{ type: "text", text: "keep me" }]);
-    const noticeOnly = assistantLine([{ type: "text", text: notice }]);
-    // an already-in-place-patched shell: empty content + space padding
-    const padded = assistantLine([]) + "   ";
-    await fsp.writeFile(file, [keep, noticeOnly, padded].join("\n") + "\n");
+    await scrubber.idle(); // startup scan of the (empty) dir
+    // Exit-time shape: the final turn's notice lands right before shutdown.
+    const file = path.join(dir, "session-final.jsonl");
+    const content = assistantLine([{ type: "text", text: notice }]) + "\n";
+    await fsp.writeFile(file, content);
 
-    const cleaned = await sweepTranscripts(dir, {});
-    assert.equal(cleaned, 1);
-    const content = await fsp.readFile(file, "utf-8");
-    assert.ok(!content.includes("cc-infinite-notice"));
-    const lines = content.split("\n").filter((l) => l.length);
-    assert.equal(lines.length, 1);
-    assert.equal(JSON.parse(lines[0]).message.content[0].text, "keep me");
-    assert.ok(content.endsWith("\n"));
+    await scrubber.flush();
+    const got = await fsp.readFile(file, "utf-8");
+    assert.ok(!got.includes("cc-infinite-notice"), "flushed before shutdown");
+    assert.equal(Buffer.byteLength(got), Buffer.byteLength(content)); // in-place, padded
   } finally {
-    await fsp.rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("sweep with skipRecentMs leaves recently-modified files alone (live-session guard)", async () => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
-  try {
-    const live = path.join(dir, "live.jsonl");
-    const quiet = path.join(dir, "quiet.jsonl");
-    const dirty = assistantLine([{ type: "text", text: notice }]) + "\n";
-    await fsp.writeFile(live, dirty); // fresh mtime — a concurrent session may hold an append handle
-    await fsp.writeFile(quiet, dirty);
-    const old = new Date(Date.now() - 10 * 60 * 1000);
-    await fsp.utimes(quiet, old, old);
-
-    assert.equal(await sweepTranscripts(dir, { skipRecentMs: 5 * 60 * 1000 }), 1);
-    assert.ok((await fsp.readFile(live, "utf-8")).includes("cc-infinite-notice")); // skipped
-    assert.ok(!(await fsp.readFile(quiet, "utf-8")).includes("cc-infinite-notice")); // swept
-  } finally {
-    await fsp.rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("sweep leaves a user line quoting the marker byte-identical", async () => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
-  try {
-    const file = path.join(dir, "session-quote.jsonl");
-    const original =
-      JSON.stringify({
-        parentUuid: null,
-        type: "user",
-        message: { role: "user", content: `quoting ${notice}` },
-        uuid: "u2",
-      }) + "\n";
-    await fsp.writeFile(file, original);
-    const before = fs.statSync(file).mtimeMs;
-    assert.equal(await sweepTranscripts(dir, {}), 0);
-    assert.equal(await fsp.readFile(file, "utf-8"), original);
-    assert.equal(fs.statSync(file).mtimeMs, before); // never rewritten
-  } finally {
-    await fsp.rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("sweep ignores an unclosed marker (open tag, no close) — no eternal re-sweeps", async () => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
-  try {
-    const file = path.join(dir, "session-unclosed.jsonl");
-    const original =
-      assistantLine([{ type: "text", text: `mentions ${NOTICE_OPEN} unclosed` }]) + "\n";
-    await fsp.writeFile(file, original);
-    const before = fs.statSync(file).mtimeMs;
-    assert.equal(await sweepTranscripts(dir, {}), 0);
-    assert.equal(await fsp.readFile(file, "utf-8"), original);
-    assert.equal(fs.statSync(file).mtimeMs, before); // untouched
-  } finally {
-    await fsp.rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("sweep skips clean files and missing dirs", async () => {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-scrub-"));
-  try {
-    const file = path.join(dir, "clean.jsonl");
-    const original = assistantLine([{ type: "text", text: "hello" }]) + "\n";
-    await fsp.writeFile(file, original);
-    const before = fs.statSync(file).mtimeMs;
-    assert.equal(await sweepTranscripts(dir, {}), 0);
-    assert.equal(fs.statSync(file).mtimeMs, before); // untouched
-    assert.equal(await sweepTranscripts(path.join(dir, "nope"), {}), 0);
-  } finally {
+    scrubber.close();
     await fsp.rm(dir, { recursive: true, force: true });
   }
 });

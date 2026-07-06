@@ -22,11 +22,7 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { startProxy, MemtreeClient } from "../../dist/index.js";
-import {
-  projectTranscriptDir,
-  startTranscriptScrubber,
-  sweepTranscripts,
-} from "../../dist/scrub.js";
+import { projectTranscriptDir, startTranscriptScrubber } from "../../dist/scrub.js";
 import { NOTICE_OPEN, wrapNotice } from "../../dist/notices.js";
 import { startMockMemtree, startMockAnthropic, startRecorder } from "./servers.mjs";
 
@@ -51,7 +47,6 @@ async function setup(scenario, { failCompress = false, upstreamOrigin } = {}) {
   const proxy = await startProxy({ memtree, debug: true, captureDir, upstreamOrigin });
   const recorder = await startRecorder(proxy.port);
   const transcriptDir = projectTranscriptDir(cwd);
-  await sweepTranscripts(transcriptDir);
   const scrubber = startTranscriptScrubber(transcriptDir, { debug: true });
   return {
     cwd,

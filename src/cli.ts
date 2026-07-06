@@ -16,11 +16,7 @@ import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
 import { MemtreeClient } from "./memtree.js";
-import {
-  projectTranscriptDir,
-  startTranscriptScrubber,
-  sweepTranscripts,
-} from "./scrub.js";
+import { projectTranscriptDir, startTranscriptScrubber } from "./scrub.js";
 import {
   getPolychatApiKey,
   setPolychatApiKey,
@@ -148,23 +144,14 @@ async function main() {
   }
 
   // Transcript scrubbing: injected inline notices are ephemeral — remove them
-  // from CC's saved .jsonl continuously (watcher) with sweeps as backstop, so
-  // resumes/forks are clean under both ccc and vanilla claude.
-  //
-  // Sweeps skip recently-modified transcripts: a concurrent ccc/claude session
-  // in this project may be appending to one, and the sweep's rewrite+rename
-  // would swap the inode under its open append handle and lose its remaining
-  // history. We can't identify our own session's transcript (claude picks the
-  // session id itself), so the guard applies to the exit sweep too. Skipped
-  // files are still covered: the watcher scans pre-existing transcripts from
-  // byte 0 at startup and patches appends in place, and a later sweep drops
-  // any leftover padding once they go quiet.
-  const sweepSkipRecentMs = 5 * 60 * 1000;
+  // from CC's saved .jsonl continuously so resumes/forks are clean under both
+  // ccc and vanilla claude. In-place patches only (the watcher scans
+  // pre-existing transcripts from byte 0 at startup, then patches appends as
+  // they land) — no rewrite+rename pass, ever: we can't identify our own
+  // session's transcript (claude picks the session id itself), and renaming a
+  // file another live session holds an open append handle on silently loses
+  // the rest of its history.
   const transcriptDir = projectTranscriptDir(process.cwd());
-  await sweepTranscripts(transcriptDir, {
-    debug: isDebugMode,
-    skipRecentMs: sweepSkipRecentMs,
-  }).catch(() => 0);
   const scrubber = startTranscriptScrubber(transcriptDir, { debug: isDebugMode });
 
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
@@ -189,18 +176,12 @@ async function main() {
   });
 
   child.on("exit", (code: number | null) => {
-    scrubber.close();
-    // Exit sweep: our child has exited, but other sessions in this project may
-    // still be appending — keep the recent-mtime guard (see above).
-    void sweepTranscripts(transcriptDir, {
-      debug: isDebugMode,
-      skipRecentMs: sweepSkipRecentMs,
-    })
-      .catch(() => 0)
-      .then(() => {
-        proxy.close();
-        process.exit(code ?? 0);
-      });
+    // Final in-place pass: the last turn's notice may have just been appended.
+    void scrubber.flush().then(() => {
+      scrubber.close();
+      proxy.close();
+      process.exit(code ?? 0);
+    });
   });
 }
 

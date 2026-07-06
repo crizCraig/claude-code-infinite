@@ -187,6 +187,16 @@ Mechanics:
   - **Backstop sweeps**: after `claude` exits and at every `ccc` startup (crashed sessions,
     watcher misses, sessions from other project dirs), where nothing is running so plain
     rewrite + atomic rename is fine; locate candidates by grepping for the marker.
+
+    > **Amended 2026-07-06 — sweeps removed.** "Nothing is running" is unknowable: we
+    > can't identify our own session's transcript (claude picks the session id), and an
+    > mtime-quiet file can belong to a live-but-idle concurrent session that resumes
+    > appending after the rename — silently losing the rest of its history. Since the
+    > watcher's in-place patches (plus a byte-0 startup scan of pre-existing files and a
+    > flush() pass at exit) already remove all notice *content*, the sweep only bought
+    > cosmetic cleanup (space padding, empty shells — both harmless to CC) at the price
+    > of a real data-loss window. Rewrite+rename is gone; in-place patching is the only
+    > mechanism.
   On-disk notice lifetime shrinks to ~milliseconds, so resumes and forks are clean under
   BOTH `ccc` and vanilla `claude` — this eliminates the vanilla-resume failure (a "✨"
   prelude text block ahead of a thinking block can 400: the API requires replayed thinking

@@ -25,7 +25,6 @@ export {
 export {
   projectTranscriptDir,
   startTranscriptScrubber,
-  sweepTranscripts,
   scrubLineInPlace,
 } from "./scrub.js";
 export type { TranscriptScrubber, ScrubberOptions } from "./scrub.js";

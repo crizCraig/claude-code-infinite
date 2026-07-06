@@ -7,24 +7,24 @@
  * content to ~/.claude/projects/<project>/<session>.jsonl with no
  * don't-persist channel, so ccc scrubs the marker blocks back out:
  *
- * - Watcher (while the session runs): fs.watch on the project transcript dir;
- *   on change, scan only newly appended bytes per file (tracked offsets); a
- *   file we've never seen is scanned whole — pre-existing files at startup
- *   (the recency-guarded sweep may have skipped them) and the fork case,
- *   since forking copies history (notice included) into a fresh .jsonl.
- * - In-place, length-preserving patches: NO temp+rename while CC runs — a
- *   rename swaps the inode under CC's open append handle and loses subsequent
- *   lines. The affected line is re-serialized without the notice and padded
- *   with trailing spaces to the original byte length, then pwritten at the
- *   same offset. Only complete (newline-terminated) lines are touched — a
- *   tail line still being written is left for the next scan.
- * - Backstop sweeps (startup + after `claude` exits, when nothing is running):
- *   plain rewrite + atomic rename, which also drops padding and now-empty
- *   notice-only lines.
+ * - Watcher: fs.watch on the project transcript dir; on change, scan only
+ *   newly appended bytes per file (tracked offsets); a file we've never seen
+ *   is scanned whole — pre-existing files at startup (a killed prior session
+ *   may have left a notice on disk) and the fork case, since forking copies
+ *   history (notice included) into a fresh .jsonl.
+ * - In-place, length-preserving patches only: NEVER temp+rename — a rename
+ *   swaps the inode under a session's open append handle and loses subsequent
+ *   lines, and there is no reliable way to tell whether some other session
+ *   holds a handle (mtime quietness isn't proof; an idle session can resume
+ *   appending at any time). The affected line is re-serialized without the
+ *   notice and padded with trailing spaces to the original byte length, then
+ *   pwritten at the same offset. Only complete (newline-terminated) lines are
+ *   touched — a tail line still being written is left for the next scan.
  *
- * CC writes one transcript line per assistant content block, so a scrubbed
- * notice line becomes an assistant message with an empty content array — CC
- * merges per-block lines by message id on resume, contributing zero blocks.
+ * The leftovers are harmless: padded lines parse fine, and CC writes one
+ * transcript line per assistant content block, so a scrubbed notice line
+ * becomes an assistant message with an empty content array — CC merges
+ * per-block lines by message id on resume, contributing zero blocks.
  */
 
 import fs from "node:fs";
@@ -125,64 +125,20 @@ export function scrubLineInPlace(line: Buffer): Buffer | null {
   return Buffer.concat([out, Buffer.alloc(line.length - out.length, 0x20)]);
 }
 
-/** An assistant line whose content the scrubber emptied (CC writes one line per block). */
-function isEmptyAssistantShell(obj: any): boolean {
-  return (
-    obj?.type === "assistant" &&
-    Array.isArray(obj?.message?.content) &&
-    obj.message.content.length === 0
-  );
-}
-
-/**
- * Sweep-mode rewrite of one line (rename is allowed, so length may change).
- * Returns the line to keep, or null to drop it (notice-only assistant lines,
- * including shells left behind by earlier in-place patches — identified by
- * their space padding, which only the in-place patcher produces).
- */
-function scrubLineForRewrite(line: string): string | null {
-  const hadPadding = / +$/.test(line);
-  const trimmed = hadPadding ? line.replace(/ +$/, "") : line;
-  if (!containsNoticeSpan(trimmed)) {
-    if (!hadPadding) return line;
-    try {
-      if (isEmptyAssistantShell(JSON.parse(trimmed))) return null;
-    } catch {
-      /* not JSON — keep as-is */
-    }
-    return trimmed;
-  }
-  let obj: any;
-  try {
-    obj = JSON.parse(trimmed);
-  } catch {
-    return trimmed;
-  }
-  // Never rewrite non-assistant lines (e.g. a user message quoting the marker).
-  if (obj?.type !== "assistant") return line;
-  scrubObjectInPlace(obj.message);
-  if (isEmptyAssistantShell(obj)) {
-    return null; // the line held nothing but the notice block
-  }
-  return JSON.stringify(obj);
-}
-
 export interface ScrubberOptions {
   debug?: boolean;
 }
 
-export interface SweepOptions extends ScrubberOptions {
-  /**
-   * Skip files modified within this many ms. A recently-touched transcript is
-   * likely being appended to by a concurrent ccc/claude session in the same
-   * project — rewrite+rename would swap the inode under that session's open
-   * append handle and silently lose the rest of its history.
-   */
-  skipRecentMs?: number;
-}
-
 export interface TranscriptScrubber {
   close(): void;
+  /**
+   * Scan any not-yet-scanned appends across all transcripts now and wait for
+   * the scans to finish (tracked offsets make this cheap). Used as the final
+   * pass after `claude` exits, when the last turn's notice may have just
+   * landed. Never rejects — scan errors are swallowed (the next launch's
+   * byte-0 scan is the backstop).
+   */
+  flush(): Promise<void>;
   /** Wait for any in-flight scans (test hook). */
   idle(): Promise<void>;
 }
@@ -298,25 +254,7 @@ export function startTranscriptScrubber(
     })();
   }
 
-  // Scan pre-existing files from byte 0: the startup sweep skips
-  // recently-modified transcripts (live-session guard), so a leftover notice
-  // from a killed prior session may still be on disk. The in-place patch is
-  // length-preserving and safe on live files, so a one-time full scan per
-  // file is cheap and safe.
-  try {
-    for (const name of fs.readdirSync(dir)) {
-      if (name.endsWith(".jsonl")) schedule(name);
-    }
-  } catch {
-    /* dir gone */
-  }
-
-  const watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
-    if (filename) {
-      if (filename.endsWith(".jsonl")) schedule(filename);
-      return;
-    }
-    // Platform gave no filename: rescan everything we know plus new files.
+  function scheduleAll(): void {
     try {
       for (const name of fs.readdirSync(dir)) {
         if (name.endsWith(".jsonl")) schedule(name);
@@ -324,100 +262,38 @@ export function startTranscriptScrubber(
     } catch {
       /* dir gone */
     }
+  }
+
+  function idle(): Promise<void> {
+    return inFlight === 0
+      ? Promise.resolve()
+      : new Promise((resolve) => idleResolvers.push(resolve));
+  }
+
+  // Scan pre-existing files from byte 0: a killed prior session may have left
+  // a notice on disk. The in-place patch is length-preserving and safe on
+  // live files, so a one-time full scan per file is cheap and safe.
+  scheduleAll();
+
+  const watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+    if (filename && filename.endsWith(".jsonl")) {
+      schedule(filename);
+    } else if (!filename) {
+      // Platform gave no filename: rescan everything we know plus new files.
+      scheduleAll();
+    }
   });
   watcher.on("error", () => {
-    /* watcher death is backstopped by the exit/startup sweeps */
+    /* watcher death leaves any later notices until the next launch's byte-0 scan */
   });
 
   return {
     close: () => watcher.close(),
-    idle: () =>
-      inFlight === 0
-        ? Promise.resolve()
-        : new Promise((resolve) => idleResolvers.push(resolve)),
+    flush: () => {
+      scheduleAll();
+      return idle();
+    },
+    idle,
   };
 }
 
-/**
- * Backstop sweep: full rewrite + atomic rename of any transcript containing
- * the marker. Only safe when no session is appending to these files — run it
- * at ccc startup (before launching claude) and after claude exits. Also drops
- * the in-place patches' space padding. Returns the number of files rewritten.
- *
- * Pass `skipRecentMs` to leave recently-modified files alone: another live
- * session may hold an open append handle on them, and renaming under it loses
- * data. Skipped files still get scrubbed by the watcher's in-place patches
- * (which scan pre-existing files from byte 0 at startup) and by a later sweep
- * once they've gone quiet.
- */
-export async function sweepTranscripts(
-  dir: string,
-  opts: SweepOptions = {}
-): Promise<number> {
-  let entries: string[];
-  try {
-    entries = await fsp.readdir(dir);
-  } catch {
-    return 0; // no transcript dir yet
-  }
-
-  let cleaned = 0;
-  for (const name of entries) {
-    if (!name.endsWith(".jsonl")) continue;
-    const filePath = path.join(dir, name);
-    if (opts.skipRecentMs) {
-      try {
-        const { mtimeMs } = await fsp.stat(filePath);
-        if (Date.now() - mtimeMs < opts.skipRecentMs) {
-          if (opts.debug) {
-            console.error(`[ccc scrub] skipping recently-modified ${name} (may be live)`);
-          }
-          continue;
-        }
-      } catch {
-        continue; // raced deletion
-      }
-    }
-    let content: string;
-    try {
-      content = await fsp.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-    // Complete marker span present (a bare open tag is never scrubbed, so it
-    // must not trigger endless rewrites), or space-padding from earlier
-    // in-place patches (a compact-JSON line never legitimately ends with a
-    // literal space).
-    const needsSweep =
-      containsNoticeSpan(content) ||
-      content.includes(" \n") ||
-      content.endsWith(" ");
-    if (!needsSweep) continue;
-
-    const lines = content.split("\n");
-    // A trailing "" element means the file ended with \n — preserve that.
-    const endsWithNewline = lines[lines.length - 1] === "";
-    if (endsWithNewline) lines.pop();
-
-    const kept: string[] = [];
-    for (const line of lines) {
-      if (line.trim() === "") continue;
-      const scrubbed = scrubLineForRewrite(line);
-      if (scrubbed !== null) kept.push(scrubbed);
-    }
-
-    const output = kept.join("\n") + (endsWithNewline ? "\n" : "");
-    if (output === content) continue; // e.g. only a user line quoting the marker
-    const tmpPath = path.join(dir, `.${name}.ccc-scrub-tmp`);
-    try {
-      await fsp.writeFile(tmpPath, output);
-      await fsp.rename(tmpPath, filePath);
-      cleaned++;
-      if (opts.debug) console.error(`[ccc scrub] swept notices from ${name}`);
-    } catch (err: any) {
-      await fsp.rm(tmpPath, { force: true }).catch(() => {});
-      if (opts.debug) console.error(`[ccc scrub] sweep failed for ${name}: ${err?.message}`);
-    }
-  }
-  return cleaned;
-}
