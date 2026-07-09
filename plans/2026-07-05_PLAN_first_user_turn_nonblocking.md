@@ -76,7 +76,8 @@
 The local proxy currently makes a blocking `/v1/context_memory` call on **every** real user
 turn, including the very first message of a session. On the first turn there is nothing to
 compress — the server has no index yet and returns the messages essentially as-is — so the
-user pays a polychat round trip (worst case the full compress timeout, ~4s) of first-token
+user pays a polychat round trip (worst case the full compress timeout — ~4s at the time of
+this plan, since raised to 15s) of first-token
 latency for a guaranteed no-op substitution. It also flattens a turn that didn't need
 flattening, moving us away from byte-identical-to-vanilla on exactly the turns where vanilla
 behavior is free.

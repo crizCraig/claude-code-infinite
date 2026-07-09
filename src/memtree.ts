@@ -26,8 +26,11 @@ export const CLIENT_VERSION: string = createRequire(import.meta.url)(
   "../package.json"
 ).version;
 
-/** Hard budget for the blocking user-turn compression call (plan: low single-digit seconds). */
-const DEFAULT_COMPRESS_TIMEOUT_MS = 4000;
+// Hard budget for the blocking user-turn compression call. The abort clock covers
+// the ENTIRE fetch — uploading the full conversation (multi-MB on long sessions) plus
+// server-side compression — so this is a circuit breaker for a hung server, not a
+// latency target. Override via CCC_COMPRESS_TIMEOUT_MS (read below).
+const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
 /** Indexing runs off the response path; give it room. */
 const INDEX_TIMEOUT_MS = 120_000;
 const DEDUPE_CACHE_MAX = 64;
