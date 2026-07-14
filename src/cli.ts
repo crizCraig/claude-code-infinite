@@ -15,7 +15,15 @@ import spawn from "cross-spawn";
 import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
-import { MemtreeClient } from "./memtree.js";
+import {
+  createSessionNoticePlugin,
+  supportsMessageDisplay,
+  withSessionNoticePluginArgs,
+  type SessionNoticePlugin,
+} from "./hooks.js";
+import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
+import { RequestLogger } from "./reqlog.js";
+import { sanitizeNoticeDetail } from "./notices.js";
 import { projectTranscriptDir, startTranscriptScrubber } from "./scrub.js";
 import {
   getPolychatApiKey,
@@ -72,10 +80,60 @@ async function promptForApiKey(mode: Mode): Promise<string> {
   });
 }
 
+/**
+ * Startup payment check: GET /v1/context_memory/status and warn if the key is
+ * unpaid, so the user learns why compression/indexing will be off BEFORE the
+ * first degraded turn. The endpoint may not be deployed yet — 404/405/401/503,
+ * network errors, and timeouts all mean "unknown": stay quiet. Bounded by a
+ * short timeout and silent on every error so startup is never gated on it.
+ */
+async function warnIfUnpaid(baseUrl: string, apiKey: string): Promise<void> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "x-client": CLIENT_NAME,
+        "x-client-version": CLIENT_VERSION,
+      },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) return;
+    const status = (await res.json()) as {
+      paid?: boolean;
+      payment_message?: string | null;
+    };
+    if (status?.paid === false) {
+      console.warn(
+        "\x1b[1;33m⚠ MemTree is off — payment required (compression + indexing disabled)." +
+          " Visit polychat.co to enable.\x1b[0m" +
+          (status.payment_message
+            ? `\n${sanitizeNoticeDetail(status.payment_message)}`
+            : "")
+      );
+    }
+  } catch {
+    // status unknown (endpoint missing, network, timeout, bad JSON) — stay quiet
+  }
+}
+
 function printBanner() {
   console.log(
     `\n\x1b[1;38;5;209mClaude Code Infinite:\x1b[0m \x1b[38;5;48mMaximizing Claude's intelligence with context-management from \x1b]8;;https://MemTree.dev\x1b\\MemTree.dev\x1b]8;;\x1b\\\x1b[0m\n`
   );
+}
+
+function isPrintInvocation(args: string[]): boolean {
+  return args.includes("-p") || args.includes("--print");
+}
+
+/** Unknown/old versions get the longstanding Stop fallback only. */
+function installedClaudeSupportsMessageDisplay(): boolean {
+  try {
+    const result = spawn.sync("claude", ["--version"], { encoding: "utf-8" });
+    return supportsMessageDisplay(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+  } catch {
+    return false;
+  }
 }
 
 async function main() {
@@ -129,34 +187,82 @@ async function main() {
     mode === "staging" ? STAGING_BASE_URL :
     POLYCHAT_BASE_URL;
 
+  // Warn about an unpaid key before claude takes over the terminal. Awaited so
+  // the warning can't corrupt the TUI, but bounded (2s) and silent on error —
+  // startup never fails or hangs on polychat availability.
+  await warnIfUnpaid(memtreeBaseUrl, polychatApiKey);
+
+  // Always-on request/timing log (reqlog.ts): one JSONL line per proxied
+  // /v1/messages request and per MemTree call, so incidents can be
+  // reconstructed after the fact without --debug. Never blocks or throws.
+  const reqlog = new RequestLogger();
+
   // Start the local proxy. Claude Code's OAuth token flows through it straight
   // to api.anthropic.com and never reaches polychat.co.
   const memtree = new MemtreeClient({
     baseUrl: memtreeBaseUrl,
     apiKey: polychatApiKey,
     debug: isDebugMode,
+    reqlog,
   });
-  const proxy = await startProxy({ memtree, debug: isDebugMode });
+  const proxy = await startProxy({ memtree, debug: isDebugMode, reqlog });
+
+  // One unobtrusive (dim) line so users can find the log during an incident.
+  console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
 
   if (isDebugMode) {
     console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
     console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);
   }
 
-  // Transcript scrubbing: injected inline notices are ephemeral — remove them
-  // from CC's saved .jsonl continuously so resumes/forks are clean under both
-  // ccc and vanilla claude. In-place patches only (the watcher scans
+  // Legacy transcript cleanup: releases before display-only hooks injected
+  // marker-wrapped assistant blocks. Keep removing those from old/forked
+  // .jsonl files so resumes stay clean. In-place patches only (the watcher scans
   // pre-existing transcripts from byte 0 at startup, then patches appends as
   // they land) — no rewrite+rename pass, ever: we can't identify our own
   // session's transcript (claude picks the session id itself), and renaming a
   // file another live session holds an open append handle on silently loses
   // the rest of its history.
   const transcriptDir = projectTranscriptDir(process.cwd());
-  const scrubber = startTranscriptScrubber(transcriptDir, { debug: isDebugMode });
+  let scrubber;
+  try {
+    scrubber = startTranscriptScrubber(transcriptDir, { debug: isDebugMode });
+  } catch (err) {
+    proxy.close();
+    throw err;
+  }
+
+  // Interactive notices are provided by a minimal, ephemeral plugin. Prepending
+  // --plugin-dir composes with user hooks/settings; adding another --settings
+  // would not, because Claude keeps only its final --settings occurrence.
+  // Print/non-TTY calls are programmatic interfaces: omit all UI hooks so their
+  // stdout/events remain byte-for-byte vanilla.
+  let noticePlugin: SessionNoticePlugin | null = null;
+  let childArgs = [...claudeArgs];
+  if (
+    !isPrintInvocation(claudeArgs) &&
+    process.stdin.isTTY === true &&
+    process.stdout.isTTY === true
+  ) {
+    try {
+      noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
+        messageDisplay: installedClaudeSupportsMessageDisplay(),
+      });
+      // Global option must precede a user-supplied `--`, positional prompt, or
+      // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
+      childArgs = withSessionNoticePluginArgs(childArgs, noticePlugin.dir);
+    } catch (err) {
+      // Notices are optional UI. A full/unwritable temp directory must never
+      // prevent the underlying Claude session from launching.
+      if (isDebugMode) {
+        console.error(`[DEBUG] Notice plugin disabled: ${String(err)}`);
+      }
+    }
+  }
 
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
   // native login and sends its own OAuth bearer to the local base URL.
-  const child = spawn("claude", claudeArgs, {
+  const child = spawn("claude", childArgs, {
     env: {
       ...process.env,
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxy.port}`,
@@ -170,6 +276,7 @@ async function main() {
     } else {
       console.error("Failed to start claude:", err.message);
     }
+    noticePlugin?.close();
     scrubber.close();
     proxy.close();
     process.exit(1);
@@ -178,6 +285,7 @@ async function main() {
   child.on("exit", (code: number | null) => {
     // Final in-place pass: the last turn's notice may have just been appended.
     void scrubber.flush().then(() => {
+      noticePlugin?.close();
       scrubber.close();
       proxy.close();
       process.exit(code ?? 0);

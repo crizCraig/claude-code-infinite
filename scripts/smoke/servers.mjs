@@ -71,8 +71,17 @@ export async function startMockMemtree({ failCompress = false } = {}) {
               `User's current message: ${lastUserText(body.messages)}`,
           },
         ];
+    const usage = {
+      prompt_tokens: indexOnly ? 1_000 : 200_000,
+      completion_tokens: indexOnly ? 1_000 : 100_000,
+      prompt_tokens_details: {
+        // A positive cached-token count is the production API's signal that
+        // indexed history was actually used (rather than a successful no-op).
+        cached_tokens: indexOnly ? 0 : 128,
+      },
+    };
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ messages }));
+    res.end(JSON.stringify({ messages, usage }));
   });
   const port = await listen(server);
   return { port, calls, close: () => server.close() };
@@ -81,7 +90,7 @@ export async function startMockMemtree({ failCompress = false } = {}) {
 /**
  * Mock Anthropic. Streams a scripted SSE answer for stream:true, JSON
  * otherwise. Requests whose body contains stallOn get their response delayed
- * by stallMs (to trip the proxy's 10s ✨ prelude).
+ * by stallMs to verify the proxy does not fabricate or rewrite response bytes.
  */
 export async function startMockAnthropic({
   stallOn = null,

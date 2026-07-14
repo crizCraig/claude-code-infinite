@@ -1,0 +1,237 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { startProxy } from "../dist/proxy.js";
+import { MemtreeClient } from "../dist/memtree.js";
+import { RequestLogger } from "../dist/reqlog.js";
+
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        origin: `http://127.0.0.1:${server.address().port}`,
+        close: () => server.close(),
+      });
+    });
+  });
+}
+
+/** Mock Anthropic upstream: always a 200 non-streaming message. */
+function mockUpstream() {
+  return listen((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const body = JSON.stringify({
+        type: "message",
+        id: "msg_upstream",
+        role: "assistant",
+        model: "claude-x",
+        content: [{ type: "text", text: "upstream answer" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 42, output_tokens: 7 },
+      });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(body)),
+      });
+      res.end(body);
+    });
+  });
+}
+
+/** Mock MemTree server answering every /v1/context_memory POST the same way. */
+async function mockMemtree(status, bodyObj) {
+  const calls = [];
+  const srv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      const body = JSON.stringify(bodyObj);
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(body);
+    });
+  });
+  return { ...srv, calls };
+}
+
+async function postMessages(port, messages) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages }),
+  });
+  return res.json();
+}
+
+/** Followup user turn: an earlier real user input exists → blocking compress. */
+const followupTurn = (question) => [
+  { role: "user", content: "first question" },
+  { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+  { role: "user", content: question },
+];
+
+/** Tool turn: last message is a tool_result wrapper → background index only. */
+const toolTurn = [
+  { role: "user", content: "first question" },
+  { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "x", input: {} }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+];
+
+async function waitFor(cond, timeoutMs = 3000) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** Parsed JSONL records currently in the log file ([] while absent/empty). */
+function readRecords(path) {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf-8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line));
+}
+
+function tempLogPath() {
+  return join(mkdtempSync(join(tmpdir(), "ccc-reqlog-")), "requests.jsonl");
+}
+
+test("proxied /v1/messages requests each append a JSONL record", async () => {
+  const logPath = tempLogPath();
+  const reqlog = new RequestLogger(logPath);
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed" }],
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    reqlog,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog,
+  });
+  try {
+    // Tool turn → forwardRaw path.
+    await postMessages(proxy.port, toolTurn);
+    // Followup user turn → blocking compress → forwardWithNotices path.
+    await postMessages(proxy.port, followupTurn("turn two"));
+
+    // Writes are fire-and-forget; poll until both /v1/messages records plus
+    // the memtree call records (background index + compress) have landed.
+    let records = [];
+    await waitFor(() => {
+      records = readRecords(logPath);
+      return (
+        records.filter((r) => r.kind === "messages").length >= 2 &&
+        records.filter((r) => r.kind === "memtree").length >= 2
+      );
+    });
+
+    const [toolRec, followupRec] = records.filter((r) => r.kind === "messages");
+    assert.equal(toolRec.turnType, "tool");
+    assert.equal(toolRec.model, "claude-x");
+    assert.equal(toolRec.stream, false);
+    assert.equal(toolRec.upstreamStatus, 200);
+    assert.ok(toolRec.requestBytes > 0);
+    assert.equal(toolRec.forwardedBytes, toolRec.requestBytes, "verbatim forward");
+    assert.equal(toolRec.approxInputTokens, Math.round(toolRec.forwardedBytes / 4));
+    assert.ok(typeof toolRec.totalMs === "number");
+    assert.ok(!Number.isNaN(Date.parse(toolRec.ts)), "ts is ISO");
+    assert.equal(toolRec.compress, undefined, "no blocking compress on tool turns");
+
+    assert.equal(followupRec.turnType, "followup-compressed");
+    assert.equal(followupRec.upstreamStatus, 200);
+    assert.ok(followupRec.compress.ok);
+    assert.equal(followupRec.compress.timedOut, false);
+    assert.ok(typeof followupRec.compress.ms === "number");
+    assert.ok(
+      followupRec.forwardedBytes < followupRec.requestBytes,
+      "compressed body forwarded"
+    );
+    // Non-streaming JSON path extracts real usage from the response body.
+    assert.equal(followupRec.usage.input_tokens, 42);
+    assert.equal(followupRec.usage.output_tokens, 7);
+
+    const memtreeRecs = records.filter((r) => r.kind === "memtree");
+    assert.ok(memtreeRecs.some((r) => r.indexOnly === true), "background index logged");
+    assert.ok(memtreeRecs.some((r) => r.indexOnly === false), "compress logged");
+    for (const r of memtreeRecs) {
+      assert.equal(r.ok, true);
+      assert.equal(r.status, 200);
+      assert.ok(r.requestBytes > 0);
+      assert.ok(typeof r.ms === "number");
+    }
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("unwritable log path never breaks proxying", async () => {
+  // A regular FILE where the log's parent dir should be: mkdir and every
+  // append fail. The logger must swallow that and the proxy must still work.
+  const blocker = join(mkdtempSync(join(tmpdir(), "ccc-reqlog-")), "not-a-dir");
+  writeFileSync(blocker, "occupied");
+  const reqlog = new RequestLogger(join(blocker, "requests.jsonl"));
+
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed" }],
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    reqlog,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog,
+  });
+  try {
+    const toolResp = await postMessages(proxy.port, toolTurn);
+    assert.equal(toolResp.content[0].text, "upstream answer");
+    const followupResp = await postMessages(proxy.port, followupTurn("turn two"));
+    assert.equal(followupResp.content[0].text, "upstream answer");
+    // Give the fire-and-forget appends a beat to fail, then prove nothing
+    // was created where the directory should be.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(readFileSync(blocker, "utf-8"), "occupied");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("oversized log rotates to .1 at startup, overwriting any previous .1", () => {
+  const logPath = tempLogPath();
+  writeFileSync(`${logPath}.1`, "old rotation\n");
+  writeFileSync(logPath, Buffer.alloc(21 * 1024 * 1024, 0x61)); // > 20MB
+
+  new RequestLogger(logPath);
+
+  assert.ok(existsSync(`${logPath}.1`));
+  assert.equal(statSync(`${logPath}.1`).size, 21 * 1024 * 1024, "big file became .1");
+  assert.ok(!existsSync(logPath), "fresh log starts on next append");
+});
+
+test("small log is left in place at startup", () => {
+  const logPath = tempLogPath();
+  writeFileSync(logPath, '{"ts":"x"}\n');
+  new RequestLogger(logPath);
+  assert.equal(readFileSync(logPath, "utf-8"), '{"ts":"x"}\n');
+  assert.ok(!existsSync(`${logPath}.1`));
+});

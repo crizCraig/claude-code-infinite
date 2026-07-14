@@ -7,9 +7,9 @@
  *
  * a — first user turn: index_only call + byte-verbatim non-flattened body
  * b — two-user-turn conversation: exactly one blocking compression on turn 2
- * c — degraded alert visible, transcript scrubbed in place, resume clean
- * d — ✨ slow-first-token prelude (mock Anthropic with an 11.5s stall)
- * e — thinking-turn round-trip: inject → strip → Anthropic accepts replay
+ * c — degraded display hook, clean transcript, resume clean
+ * d — stalled upstream stays byte-transparent (no fabricated prelude)
+ * e — legacy marker cleanup: strip → Anthropic accepts thinking replay
  *
  * a/b/c/e talk to real api.anthropic.com with Claude Code's own credentials
  * (small haiku calls). d uses a mock Anthropic upstream.
@@ -21,9 +21,17 @@ import fsp from "node:fs/promises";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
-import { startProxy, MemtreeClient } from "../../dist/index.js";
+import {
+  startProxy,
+  MemtreeClient,
+  terminalSupportsColor,
+} from "../../dist/index.js";
 import { projectTranscriptDir, startTranscriptScrubber } from "../../dist/scrub.js";
-import { NOTICE_OPEN, wrapNotice } from "../../dist/notices.js";
+import {
+  COMPRESSED_NOTICE,
+  NOTICE_OPEN,
+  wrapNotice,
+} from "../../dist/notices.js";
 import { startMockMemtree, startMockAnthropic, startRecorder } from "./servers.mjs";
 
 const MODEL_ARGS = ["--model", "haiku"];
@@ -99,6 +107,23 @@ function runClaude(ctx, args, extraEnv = {}) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function postHook(ctx, input) {
+  const res = await fetch(ctx.proxy.hookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: "smoke-session", ...input }),
+  });
+  return res.status === 204 ? null : res.json();
+}
+
+async function armNotice(ctx, prompt, promptId) {
+  await postHook(ctx, {
+    hook_event_name: "UserPromptSubmit",
+    prompt,
+    prompt_id: promptId,
+  });
+}
 
 async function readTranscripts(dir) {
   let names = [];
@@ -178,7 +203,9 @@ async function scenarioB() {
     const nonIndexAfterTurn1 = ctx.memtreeServer.calls.filter((c) => !c.indexOnly).length;
     check("b", "turn 1 made zero blocking compression calls", nonIndexAfterTurn1 === 0, `got ${nonIndexAfterTurn1}`);
 
-    const r2 = await runClaude(ctx, ["--resume", sid, "What is my favorite color? Answer with the color name only."]);
+    const prompt = "What is my favorite color? Answer with the color name only.";
+    await armNotice(ctx, prompt, "smoke-b-turn2");
+    const r2 = await runClaude(ctx, ["--resume", sid, prompt]);
     await sleep(1500);
     check("b", "turn 2 exits 0", r2.code === 0, r2.stderr.slice(0, 300));
 
@@ -198,6 +225,27 @@ async function scenarioB() {
       /teal/i.test(r2.json?.result ?? ""),
       r2.json?.result
     );
+    check("b", "-p result contains no UI notice", !r2.stdout.includes(COMPRESSED_NOTICE));
+    const hook = await postHook(ctx, {
+      hook_event_name: "MessageDisplay",
+      turn_id: "smoke-b",
+      message_id: "smoke-b-message",
+      index: 0,
+      final: true,
+      delta: "teal",
+      prompt_id: "smoke-b-turn2",
+    });
+    check(
+      "b",
+      "MessageDisplay returns a color-capable, timed display-only compression prefix",
+      hook?.hookSpecificOutput?.displayContent?.startsWith(
+        `${terminalSupportsColor() ? "\x1b[32m" : ""}${COMPRESSED_NOTICE} in `
+      ) &&
+        (terminalSupportsColor()
+          ? hook.hookSpecificOutput.displayContent.includes("\x1b[39m")
+          : !hook.hookSpecificOutput.displayContent.includes("\x1b[")),
+      JSON.stringify(hook)
+    );
     const captures = await readCaptures(ctx.captureDir);
     const flattened = captures.filter((c) => c.body.includes("MEMTREE_COMPRESSED_SENTINEL"));
     check("b", "turn 2 forwarded the flattened compressed body", flattened.length === 1, `got ${flattened.length}`);
@@ -207,31 +255,37 @@ async function scenarioB() {
 }
 
 // --------------------------------------------------------------------------
-// (c) Degraded alert: visible inline, scrubbed from transcript, clean resume
+// (c) Degraded display hook: API/print/transcript remain clean, resume works
 // --------------------------------------------------------------------------
 async function scenarioC() {
-  console.log("\n=== scenario c: degraded alert + transcript scrub + resume ===");
+  console.log("\n=== scenario c: degraded display hook + clean resume ===");
   const ctx = await setup("c", { failCompress: true });
   try {
     const sid = randomUUID();
     const r1 = await runClaude(ctx, ["--session-id", sid, "Reply with exactly: READY"]);
     check("c", "turn 1 exits 0", r1.code === 0, r1.stderr.slice(0, 300));
 
-    const r2 = await runClaude(ctx, ["--resume", sid, "Reply with exactly: DONE"]);
+    const prompt = "Reply with exactly: DONE";
+    await armNotice(ctx, prompt, "smoke-c-turn2");
+    const r2 = await runClaude(ctx, ["--resume", sid, prompt]);
     check("c", "turn 2 (degraded) exits 0", r2.code === 0, r2.stderr.slice(0, 300));
-    // .result is only the LAST text block (= the appended notice on degraded
-    // turns), so scan the full event stream for the real answer.
     check("c", "turn 2 still answered (passthrough)", /DONE/i.test(r2.stdout), r2.json?.result);
-    check(
-      "c",
-      "degraded notice visible in turn 2 output",
-      r2.stdout.includes("MemTree degraded"),
-      `result=${JSON.stringify(r2.json?.result ?? "").slice(0, 300)}`
-    );
+    check("c", "-p output contains no degraded UI notice", !r2.stdout.includes("MemTree degraded"));
+    const hook = await postHook(ctx, {
+      hook_event_name: "MessageDisplay",
+      turn_id: "smoke-c",
+      message_id: "smoke-c-message",
+      index: 0,
+      final: true,
+      delta: "DONE",
+      prompt_id: "smoke-c-turn2",
+    });
+    check("c", "degraded warning is returned only by display hook",
+      hook?.hookSpecificOutput?.displayContent?.includes("MemTree degraded"), JSON.stringify(hook));
     const turn2Session = r2.json?.session_id;
     check("c", "turn 2 reported a session id", Boolean(turn2Session));
 
-    // Watcher scrubs within moments of CC writing the line.
+    // Display hooks never add assistant marker blocks to the transcript.
     let transcripts = {};
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -241,24 +295,11 @@ async function scenarioC() {
       await sleep(100);
     }
     const all = Object.values(transcripts).join("");
-    check("c", "transcripts contain no notice marker after scrub", all.length > 0 && !all.includes(NOTICE_OPEN));
-    check(
-      "c",
-      "scrubbed line is space-padded in place (length preserved)",
-      Object.values(transcripts).some((t) => / +\n/.test(t) || / +$/.test(t)),
-      "no padded line found"
-    );
-    const paddedFile = Object.entries(transcripts).find(([, t]) => / +\n/.test(t) || / +$/.test(t));
-    if (paddedFile) {
-      const lines = paddedFile[1].split("\n").filter((l) => l.trim());
-      check("c", "all scrubbed transcript lines still parse as JSON", lines.every((l) => {
-        try { JSON.parse(l); return true; } catch { return false; }
-      }));
-    }
+    check("c", "transcripts contain no notice marker", all.length > 0 && !all.includes(NOTICE_OPEN));
 
-    // Resume from the scrubbed, padded transcript (vanilla-style --resume).
+    // Resume from the clean transcript (vanilla-style --resume).
     const r3 = await runClaude(ctx, ["--resume", turn2Session ?? sid, "Reply with exactly: FINAL"]);
-    check("c", "resume from scrubbed+padded transcript exits 0", r3.code === 0, r3.stderr.slice(0, 300));
+    check("c", "resume from clean transcript exits 0", r3.code === 0, r3.stderr.slice(0, 300));
     check("c", "resumed turn answered", /FINAL/i.test(r3.stdout), r3.json?.result);
     await sleep(1500);
 
@@ -280,10 +321,10 @@ async function scenarioC() {
 }
 
 // --------------------------------------------------------------------------
-// (d) ✨ slow-first-token prelude via mock Anthropic with an 11.5s stall
+// (d) Stalled upstream remains byte-transparent; no fabricated assistant prelude
 // --------------------------------------------------------------------------
 async function scenarioD() {
-  console.log("\n=== scenario d: ✨ prelude on slow first token (mock upstream) ===");
+  console.log("\n=== scenario d: stalled upstream stays byte-transparent ===");
   const anthropicMock = await startMockAnthropic({
     stallOn: "MEMTREE_COMPRESSED_SENTINEL",
     answer: "MOCK_ANSWER_OK",
@@ -294,12 +335,25 @@ async function scenarioD() {
     const r1 = await runClaude(ctx, ["--session-id", sid, "Turn one. Reply briefly."]);
     check("d", "turn 1 exits 0 against mock upstream", r1.code === 0, r1.stderr.slice(0, 300));
 
-    // Turn 2 compresses (mock memtree OK) → forwarded body carries the
-    // sentinel → mock upstream stalls 11.5s → proxy fabricates the prelude.
-    const r2 = await runClaude(ctx, ["--resume", sid, "Turn two. Reply briefly."]);
+    // Turn 2 compresses, then the mock stalls 11.5s. The proxy must wait and
+    // forward only the real upstream response; there is no safe async UI hook.
+    const prompt = "Turn two. Reply briefly.";
+    await armNotice(ctx, prompt, "smoke-d-turn2");
+    const r2 = await runClaude(ctx, ["--resume", sid, prompt]);
     check("d", "turn 2 exits 0", r2.code === 0, r2.stderr.slice(0, 300));
-    check("d", "✨ notice text present in output", r2.stdout.includes("Something special is happening"), r2.stdout.slice(0, 300));
-    check("d", "upstream answer still streamed in after the prelude", r2.stdout.includes("MOCK_ANSWER_OK"), (r2.json?.result ?? "").slice(0, 300));
+    check("d", "no fabricated ✨ assistant text", !r2.stdout.includes("Something special is happening"), r2.stdout.slice(0, 300));
+    check("d", "real upstream answer arrives unchanged", r2.stdout.includes("MOCK_ANSWER_OK"), (r2.json?.result ?? "").slice(0, 300));
+    const hook = await postHook(ctx, {
+      hook_event_name: "MessageDisplay",
+      turn_id: "smoke-d",
+      message_id: "smoke-d-message",
+      index: 0,
+      final: true,
+      delta: "MOCK_ANSWER_OK",
+      prompt_id: "smoke-d-turn2",
+    });
+    check("d", "success notice is available once answer displays",
+      hook?.hookSpecificOutput?.displayContent?.includes(COMPRESSED_NOTICE), JSON.stringify(hook));
 
     // The notice is scrubbed from the transcript like any other.
     let transcripts = {};
@@ -311,7 +365,7 @@ async function scenarioD() {
       await sleep(100);
     }
     const all = Object.values(transcripts).join("");
-    check("d", "✨ notice scrubbed from transcript", all.length > 0 && !all.includes(NOTICE_OPEN));
+    check("d", "transcript never contains a notice marker", all.length > 0 && !all.includes(NOTICE_OPEN));
   } finally {
     await ctx.cleanup();
     anthropicMock.close();
@@ -319,10 +373,10 @@ async function scenarioD() {
 }
 
 // --------------------------------------------------------------------------
-// (e) Thinking-turn round-trip: inject → strip → Anthropic accepts replay
+// (e) Legacy marker cleanup: strip → Anthropic accepts thinking replay
 // --------------------------------------------------------------------------
 async function scenarioE() {
-  console.log("\n=== scenario e: thinking round-trip through inject→strip ===");
+  console.log("\n=== scenario e: thinking round-trip through legacy strip ===");
   const ctx = await setup("e", { failCompress: true }); // degraded path keeps history intact
   try {
     const sid = randomUUID();
@@ -356,9 +410,9 @@ async function scenarioE() {
     check("e", "recorded the original request", Boolean(recorded));
     const origBody = JSON.parse(recorded.body.toString("utf-8"));
 
-    // Worst-case replay: the ✨ prelude puts the notice BEFORE the thinking
-    // block. Send it through the proxy — the strip pass must restore the
-    // history to byte-identical so Anthropic honors the signature.
+    // Simulate a transcript from an older ccc release, where the fabricated ✨
+    // prelude put a marker before thinking. The compatibility strip must
+    // restore the history so Anthropic honors the signature.
     const crafted = {
       ...origBody,
       stream: false,
@@ -403,11 +457,8 @@ async function scenarioE() {
       viaProxy.status === 200,
       `status=${viaProxy.status} body=${viaProxy.body.slice(0, 300)}`
     );
-    check(
-      "e",
-      "degraded notice appended to the non-streaming JSON response",
-      viaProxy.body.includes("MemTree degraded"),
-    );
+    check("e", "non-streaming Anthropic response contains no injected notice",
+      !viaProxy.body.includes("MemTree degraded") && !viaProxy.body.includes(NOTICE_OPEN));
     await sleep(1000);
     check(
       "e",

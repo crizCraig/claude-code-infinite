@@ -58,7 +58,15 @@ Claude Code ──▶ localhost proxy (ccc)
 
 ### Inline notices
 
-The proxy reports MemTree state (e.g. a "⚠ MemTree degraded" alert when a turn ran uncompressed, or a "✨" reassurance while a freshly-compressed request warms up) as inline messages in your Claude Code session. These are injected into the response stream and stripped back out of every subsequent request — the model never sees them, and they are scrubbed from the saved session transcript so resumed or forked sessions stay clean.
+In interactive sessions, `ccc` reports these MemTree states as display-only lines in Claude Code:
+
+- `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
+- `⚠ MemTree degraded — this turn ran uncompressed` when a blocking compression call fails or times out.
+- `⚠ MemTree is off — payment required…` once when compression and indexing are disabled for payment.
+
+`ccc` installs a minimal session-only Claude Code plugin using the repeatable `--plugin-dir` option. Its `MessageDisplay` hook changes only what the terminal renders and never alters stored assistant content; a `Stop` hook supplies a fallback for tool-only responses. That fallback may be saved by Claude Code as non-model hook UI metadata, but it is excluded from resumed model and recap requests. Notices are never added to Anthropic responses or model context, and `-p`/non-TTY output is left unchanged. Legacy marker cleanup remains for transcripts created by older `ccc` releases. The payment state can also produce a separate terminal warning at startup.
+
+Claude Code currently displays the original assistant text instead of `MessageDisplay` replacements while verbose mode is enabled. Turn verbose mode off to see the inline MemTree line.
 
 ## How it works
 

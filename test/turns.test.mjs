@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   isNonToolUserMessage,
+  lastNonSystemMessage,
   hasEarlierNonToolUserMessage,
 } from "../dist/turns.js";
 
@@ -26,6 +27,20 @@ test("first user turn: single real user message has no earlier user input", () =
 test("followup user turn: earlier real user input detected", () => {
   const messages = [user("first"), assistant("reply"), user("second")];
   assert.equal(hasEarlierNonToolUserMessage(messages), true);
+});
+
+test("trailing ambient system context does not hide the typed user turn", () => {
+  const ambient = {
+    role: "system",
+    content: "The following agent types are no longer available... ambient context",
+  };
+  const first = [user("typed prompt"), ambient];
+  assert.equal(lastNonSystemMessage(first), first[0]);
+  assert.equal(hasEarlierNonToolUserMessage(first), false);
+
+  const followup = [user("old"), assistant("reply"), user("typed prompt"), ambient];
+  assert.equal(lastNonSystemMessage(followup), followup[2]);
+  assert.equal(hasEarlierNonToolUserMessage(followup), true);
 });
 
 test("tool_result wrappers do not count as earlier user input", () => {

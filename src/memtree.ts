@@ -6,7 +6,10 @@
  * - User turns: blocking compression call with a hard timeout; the caller
  *   degrades to transparent pass-through on any failure (including 402 —
  *   compression is the paid feature, the user's own Anthropic call is never
- *   gated on it).
+ *   gated on it). A 402 from either mode additionally records
+ *   payment-required state (paymentRequiredDetail) so the proxy can tell the
+ *   user WHY MemTree is off instead of implying a transient outage; any later
+ *   successful call clears it (the user paid mid-session).
  *
  * Work is deduped per messages hash, not per HTTP attempt, so Claude Code
  * retries cannot amplify into repeated compression/indexing calls.
@@ -14,6 +17,7 @@
 
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import type { RequestLogger } from "./reqlog.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -40,12 +44,56 @@ export interface MemtreeOptions {
   apiKey: string;
   compressTimeoutMs?: number;
   debug?: boolean;
+  /** Always-on JSONL diagnostics; every MemTree call logs one line. */
+  reqlog?: RequestLogger;
 }
 
 export interface CompressResult {
   /** Processed (compressed) messages from the server; system role may be included. */
   messages: Message[];
   usage?: unknown;
+  /** Client-observed latency of the underlying HTTP call (survives retry dedupe). */
+  clientLatencyMs?: number;
+}
+
+function usageRecord(result: CompressResult): Record<string, unknown> | null {
+  return result.usage && typeof result.usage === "object"
+    ? (result.usage as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Whether the server actually used indexed conversation history. A successful
+ * context_memory response is not enough: while an index is still warming, the
+ * endpoint deliberately returns the messages as-is with cached_tokens = 0.
+ */
+export function didMemtreeCompress(result: CompressResult): boolean {
+  const usage = usageRecord(result);
+  if (!usage) return false;
+  const details = usage.prompt_tokens_details;
+  if (!details || typeof details !== "object") return false;
+  const cachedTokens = (details as Record<string, unknown>).cached_tokens;
+  return (
+    typeof cachedTokens === "number" &&
+    Number.isFinite(cachedTokens) &&
+    cachedTokens > 0
+  );
+}
+
+/**
+ * MemTree's informational estimate of the original, pre-consolidation prompt.
+ * Newer servers include images as visual-token estimates and deliberately keep
+ * this value separate from billable Context Memory usage.
+ */
+export function rawPromptTokenCount(
+  result: CompressResult
+): number | undefined {
+  const rawPromptTokens = usageRecord(result)?.raw_prompt_tokens;
+  return typeof rawPromptTokens === "number" &&
+    Number.isFinite(rawPromptTokens) &&
+    rawPromptTokens > 0
+    ? rawPromptTokens
+    : undefined;
 }
 
 export class MemtreeClient {
@@ -53,10 +101,31 @@ export class MemtreeClient {
   private apiKey: string;
   private compressTimeoutMs: number;
   private debug: boolean;
+  private reqlog: RequestLogger | undefined;
   /** messages-hash → in-flight/settled compression promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
   /** messages-hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
+  /** FastAPI `detail` text from the most recent 402, or null while paid. */
+  private unpaidDetail: string | null = null;
+
+  /**
+   * Non-null when the server last answered 402 (unpaid MemTree key): the
+   * server's human-readable detail text. Set by both compression and
+   * background-indexing calls; cleared by any subsequent success.
+   */
+  get paymentRequiredDetail(): string | null {
+    return this.unpaidDetail;
+  }
+
+  /**
+   * The blocking-compress abort budget. Exposed so the proxy's request log
+   * can label a failed compress that consumed (roughly) the whole budget as a
+   * timeout rather than a fast server error.
+   */
+  get compressBudgetMs(): number {
+    return this.compressTimeoutMs;
+  }
 
   constructor(opts: MemtreeOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, "");
@@ -65,6 +134,7 @@ export class MemtreeClient {
       opts.compressTimeoutMs ??
       Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
     this.debug = opts.debug ?? false;
+    this.reqlog = opts.reqlog;
   }
 
   static hashMessages(messages: Message[]): string {
@@ -76,6 +146,8 @@ export class MemtreeClient {
   /**
    * Blocking user-turn compression. Returns null on ANY failure (timeout,
    * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
+   * On 402 the failure is additionally recorded in paymentRequiredDetail so
+   * the caller can distinguish "unpaid" from "outage".
    */
   compress(
     hash: string,
@@ -146,40 +218,74 @@ export class MemtreeClient {
     // Server may ignore this until the index-only endpoint mode ships
     // (plan Phase 2.2); harmless extra field either way.
     if (opts.indexOnly) body.index_only = true;
+    const payload = JSON.stringify(body);
 
     const started = Date.now();
-    const response = await fetch(`${this.baseUrl}/v1/context_memory`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${this.apiKey}`,
-        "content-type": "application/json",
-        "x-client": CLIENT_NAME,
-        "x-client-version": CLIENT_VERSION,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(opts.timeoutMs),
-    });
+    let status: number | undefined;
+    let ok = false;
+    try {
+      const response = await fetch(`${this.baseUrl}/v1/context_memory`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.apiKey}`,
+          "content-type": "application/json",
+          "x-client": CLIENT_NAME,
+          "x-client-version": CLIENT_VERSION,
+        },
+        body: payload,
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+      status = response.status;
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(
-        `context_memory ${response.status}: ${text.slice(0, 300)}`
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        if (response.status === 402) {
+          this.unpaidDetail = extract402Detail(text);
+        }
+        throw new Error(
+          `context_memory ${response.status}: ${text.slice(0, 300)}`
+        );
+      }
+
+      const json = (await response.json()) as CompressResult;
+      if (!Array.isArray(json.messages) || json.messages.length === 0) {
+        throw new Error("context_memory returned no messages");
+      }
+      const clientLatencyMs = Date.now() - started;
+      this.unpaidDetail = null; // a success proves the key is paid (again)
+      ok = true;
+      this.log(
+        `context_memory ok in ${clientLatencyMs}ms ` +
+          `(${messages.length} → ${json.messages.length} messages` +
+          `${opts.indexOnly ? ", index-only" : ""})`
       );
+      return { ...json, clientLatencyMs };
+    } finally {
+      // One JSONL line per MemTree call, success or failure; `status` stays
+      // absent when the call never got a response (network error/timeout).
+      this.reqlog?.log({
+        kind: "memtree",
+        indexOnly: opts.indexOnly === true,
+        ms: Date.now() - started,
+        ok,
+        status,
+        requestBytes: Buffer.byteLength(payload),
+      });
     }
-
-    const json = (await response.json()) as CompressResult;
-    if (!Array.isArray(json.messages) || json.messages.length === 0) {
-      throw new Error("context_memory returned no messages");
-    }
-    this.log(
-      `context_memory ok in ${Date.now() - started}ms ` +
-        `(${messages.length} → ${json.messages.length} messages` +
-        `${opts.indexOnly ? ", index-only" : ""})`
-    );
-    return json;
   }
 
   private log(msg: string) {
     if (this.debug) console.error(`[ccc proxy] ${msg}`);
   }
+}
+
+/** 402 bodies are FastAPI JSON: {"detail": "<human-readable payment text>"}. */
+function extract402Detail(bodyText: string): string {
+  try {
+    const detail = JSON.parse(bodyText)?.detail;
+    if (typeof detail === "string" && detail.trim()) return detail.trim();
+  } catch {
+    // non-JSON 402 body — fall through to the generic text
+  }
+  return "Payment required";
 }

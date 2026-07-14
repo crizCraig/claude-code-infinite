@@ -1,5 +1,13 @@
 # PLAN: Don't Block on the First User Turn — Index Always, Compress Only After
 
+> **NOTICE DELIVERY UPDATE 2026-07-10:** The inject-and-strip design documented
+> below is retained as implementation history, not the live display path. Live
+> notices now use a session-only Claude Code plugin: `MessageDisplay` renders
+> success copy without changing stored/model content, and `Stop.systemMessage`
+> is the tool-only fallback. Anthropic response bytes are never rewritten. The
+> fabricated 10-second SSE prelude is removed. Marker stripping and transcript
+> scrubbing remain only as backward cleanup for already-contaminated sessions.
+
 > Refines the local proxy's compression decision
 > (`plans/2026-06-09_PLAN_local_proxy_app.md`, "Compression decision" section and
 > `src/proxy.ts` `handleMessages`). Client-only change in this repo; no server work required.
@@ -208,6 +216,22 @@ Alert triggers (now fully timer-capable again):
 - **Degraded alert**: on blocking-compression failure, append
   "⚠ MemTree degraded — this turn ran uncompressed" to that turn's response. First user
   turns and background-index failures stay silent (no blocking call to degrade).
+
+  > **Amended 2026-07-07 — 402 (unpaid key) is split out of generic degradation.**
+  > A 402 from the MemTree server records payment-required state on
+  > `MemtreeClient` (`paymentRequiredDetail`, the server's FastAPI `detail`
+  > text) — including on background `index_only` calls, which were previously
+  > swallowed — and any later success clears it. When a blocking compress
+  > degrades while that state is set, the appended notice is payment-specific
+  > ("⚠ MemTree is off — payment required (compression + indexing disabled).
+  > Visit polychat.co to enable." plus the first line of the server detail)
+  > instead of the degraded alert, and it is shown **at most once per proxy
+  > process** — later unpaid turns degrade silently. Non-402 failures keep the
+  > degraded alert on every degraded turn, unchanged. Both notices use the same
+  > marker envelope, so strip/scrub behavior is identical. Separately, `ccc`
+  > startup probes `GET /v1/context_memory/status` and prints a console warning
+  > (with the server's `payment_message`) when `paid=false`; the probe is
+  > bounded and silent on any error, so startup is never gated on polychat.
 - **"✨" reassurance**: restored to the original timer design — if no first upstream byte
   within 10s after forwarding a compressed user turn, inject the fabricated prelude with
   "✨ Something special is happening — please wait…"; Anthropic's content then streams in

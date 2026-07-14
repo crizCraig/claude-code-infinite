@@ -11,12 +11,17 @@
  * - Text is checked after stripping <system-reminder> tags, so standalone
  *   system-reminder messages are not user turns.
  * - The "user stepped away" recap prompt (plain text, no tag) intentionally
- *   counts as a real user turn (decision 2026-07-03).
+ *   counts as a real user turn for compression, but is separately recognized
+ *   so no user-facing MemTree notice is queued for that hidden request.
  */
 
 export type Message = Record<string, any>;
 
 const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+/** Distinctive stable prefix of Claude Code's hidden away-summary prompt. */
+export const AWAY_SUMMARY_PROMPT_PREFIX =
+  "The user stepped away and is coming back. Recap in under 40 words";
 
 export function stripSystemReminderText(text: string): string {
   return text.replace(SYSTEM_REMINDER_RE, "").trim();
@@ -61,15 +66,65 @@ export function isNonToolUserMessage(message: Message | undefined | null): boole
   return contentHasRealText(message.content);
 }
 
+/** True only for Claude Code's hidden away-summary user request. */
+export function isAwaySummaryUserMessage(
+  message: Message | undefined | null
+): boolean {
+  if (!message || message.role !== "user") return false;
+  const content = message.content;
+  if (typeof content === "string") {
+    return content.startsWith(AWAY_SUMMARY_PROMPT_PREFIX);
+  }
+  if (!Array.isArray(content)) return false;
+  const text = content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (part?.type === "text" && typeof part.text === "string") return part.text;
+      return "";
+    })
+    .join("");
+  return text.startsWith(AWAY_SUMMARY_PROMPT_PREFIX);
+}
+
+/** Concatenate plain text fields from a user message for hook correlation. */
+export function userMessageText(message: Message | undefined | null): string {
+  if (!message || message.role !== "user") return "";
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((part: any) => {
+      if (typeof part === "string") return part;
+      return part?.type === "text" && typeof part.text === "string" ? part.text : "";
+    })
+    .join("");
+}
+
 /**
- * True if any message BEFORE the last is a real user input. Distinguishes the
+ * Claude Code may append ambient role=system context after the human message.
+ * Turn classification is based on the last conversation message, not that
+ * trailing metadata.
+ */
+export function lastNonSystemMessage(messages: Message[]): Message | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "system") return messages[i];
+  }
+  return undefined;
+}
+
+/**
+ * True if any message before the effective last non-system message is a real
+ * user input. Distinguishes the
  * first user turn (nothing indexed yet — don't block on compression) from
  * followup user turns (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
  * Synthetic reminder messages and tool_result wrappers don't count, via the
  * same audited isNonToolUserMessage heuristic.
  */
 export function hasEarlierNonToolUserMessage(messages: Message[]): boolean {
-  for (let i = 0; i < messages.length - 1; i++) {
+  let currentIndex = messages.length - 1;
+  while (currentIndex >= 0 && messages[currentIndex]?.role === "system") {
+    currentIndex--;
+  }
+  for (let i = 0; i < currentIndex; i++) {
     if (isNonToolUserMessage(messages[i])) return true;
   }
   return false;

@@ -1,5 +1,11 @@
 # PLAN: Local Proxy App ("Claude Code Infinite") — Keep OAuth Tokens on the User's Machine
 
+> **NOTICE DELIVERY UPDATE 2026-07-10:** Later inject-and-strip sections are
+> historical. The shipped path uses Claude Code display hooks from a temporary
+> session plugin (`MessageDisplay`, with `Stop.systemMessage` fallback), leaves
+> Anthropic response bytes untouched, and does not fabricate a slow-token SSE
+> prelude. Marker stripping/scrubbing remains only for legacy cleanup.
+
 > **Repo note (moved here 2026-07-04):** this plan originated in the polychat server repo.
 > `polychat/...` paths, `plans/...` links, and commit hashes refer to that repo — main
 > checkout at `~/src/polychat`. Its `plans/2026-06-09_PLAN_local_proxy_app.md` is now a stub

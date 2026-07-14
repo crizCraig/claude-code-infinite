@@ -1,9 +1,17 @@
 export { startProxy } from "./proxy.js";
 export type { ProxyOptions, RunningProxy } from "./proxy.js";
-export { MemtreeClient } from "./memtree.js";
+export {
+  didMemtreeCompress,
+  MemtreeClient,
+  rawPromptTokenCount,
+} from "./memtree.js";
 export type { MemtreeOptions, CompressResult } from "./memtree.js";
 export {
   isNonToolUserMessage,
+  isAwaySummaryUserMessage,
+  AWAY_SUMMARY_PROMPT_PREFIX,
+  lastNonSystemMessage,
+  userMessageText,
   hasEarlierNonToolUserMessage,
   stripCcSystemReminders,
   flattenToSingleUserMessage,
@@ -14,14 +22,37 @@ export type { Message } from "./turns.js";
 export {
   NOTICE_OPEN,
   NOTICE_CLOSE,
+  COMPRESSED_NOTICE,
+  MODEL_HIDDEN_NOTICE,
   DEGRADED_NOTICE,
+  PAYMENT_REQUIRED_NOTICE,
   SLOW_FIRST_TOKEN_NOTICE,
+  compressedNoticeText,
+  sanitizeNoticeDetail,
   wrapNotice,
+  exciseKnownLegacyNoticeSpans,
   stripNoticeBlocks,
+  stripNoticeSystem,
   SseNoticeRewriter,
   fabricatedPrelude,
+  insertNoticeBeforeResponseContent,
   appendNoticeToJsonBody,
 } from "./notices.js";
+export type { CompressionNoticeMetrics } from "./notices.js";
+export {
+  NoticeDeliveryQueue,
+  parseNoticeHookInput,
+  createSessionNoticePlugin,
+  supportsMessageDisplay,
+  terminalSupportsColor,
+  withSessionNoticePluginArgs,
+  MESSAGE_DISPLAY_MIN_VERSION,
+} from "./hooks.js";
+export type {
+  NoticeHookInput,
+  NoticeHookOutput,
+  SessionNoticePlugin,
+} from "./hooks.js";
 export {
   projectTranscriptDir,
   startTranscriptScrubber,

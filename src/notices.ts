@@ -1,22 +1,11 @@
 /**
- * Inject-and-strip inline notices
- * (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md, "Inline alert delivery").
+ * MemTree notice copy plus compatibility cleanup for legacy injected markers.
  *
- * The proxy sits on both directions of the wire: it injects user-facing
- * notices into the response stream as a dedicated assistant text block wrapped
- * in <cc-infinite-notice>…</cc-infinite-notice>, and strips marker-matching
- * blocks out of every subsequent request body before forwarding — so notices
- * render inline in the Claude Code UI but never reach the model. The marker
- * string is a stable public contract: resumed sessions must strip correctly
- * across client versions. Never change it.
- *
- * Injection shapes:
- * - Fabricated SSE prelude (slow-first-token "✨"): we emit message_start plus
- *   the notice block at index 0 ourselves, then drop upstream's message_start
- *   and renumber its content block indexes by +1.
- * - End-of-turn SSE append (degraded alert): insert the notice block before
- *   the final message_delta/message_stop, index = max seen + 1.
- * - Non-streaming append: push the notice text block onto the JSON `content`.
+ * Live notices are now rendered through Claude Code's display-only hooks (see
+ * hooks.ts), never as Anthropic assistant content. The marker helpers and old
+ * SSE/JSON rewriters remain exported so existing contaminated transcripts and
+ * integrations can be cleaned safely. The marker is therefore a stable legacy
+ * contract and must not change.
  */
 
 import { randomUUID } from "node:crypto";
@@ -26,10 +15,68 @@ import type { Message } from "./turns.js";
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
 
+export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
+/** @deprecated Present only to recognize old notice copy in callers/tests. */
+export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE =
   "⚠ MemTree degraded — this turn ran uncompressed";
+export const PAYMENT_REQUIRED_NOTICE =
+  "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export const SLOW_FIRST_TOKEN_NOTICE =
   "✨ Something special is happening — please wait…";
+
+const COMPACT_TOKEN_FORMATTER = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+export interface CompressionNoticeMetrics {
+  /** Time spent waiting for the underlying MemTree compression request. */
+  latencyMs: number;
+  /** Best available original-prompt estimate (MemTree raw count or Claude fallback). */
+  originalTokens?: number;
+  /** Full Anthropic input count after compression, from response usage. */
+  consolidatedTokens?: number;
+}
+
+/** Build concise display-only positive copy from validated before/after metrics. */
+export function compressedNoticeText(metrics: CompressionNoticeMetrics): string {
+  const latency = Number.isFinite(metrics.latencyMs)
+    ? ` in ${formatLatency(Math.max(0, metrics.latencyMs))}`
+    : "";
+  const { originalTokens, consolidatedTokens } = metrics;
+  const hasReduction =
+    typeof originalTokens === "number" &&
+    Number.isFinite(originalTokens) &&
+    originalTokens > 0 &&
+    typeof consolidatedTokens === "number" &&
+    Number.isFinite(consolidatedTokens) &&
+    consolidatedTokens >= 0 &&
+    consolidatedTokens < originalTokens;
+  const totals = hasReduction
+    ? ` · ~${formatTokenCount(originalTokens)}` +
+      ` → ${formatTokenCount(consolidatedTokens)} tokens`
+    : "";
+  return `${COMPRESSED_NOTICE}${latency}${totals}`;
+}
+
+function formatTokenCount(tokens: number): string {
+  return COMPACT_TOKEN_FORMATTER.format(tokens).toLowerCase();
+}
+
+function formatLatency(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${Math.round(ms / 100) / 10}s`;
+}
+
+/** Make server-provided detail safe and compact before terminal rendering. */
+export function sanitizeNoticeDetail(text: string, maxLength = 300): string {
+  return text
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
 
 export function wrapNotice(text: string): string {
   return `${NOTICE_OPEN}${text}${NOTICE_CLOSE}`;
@@ -39,6 +86,16 @@ const NOTICE_SPAN_RE = new RegExp(
   `${escapeRegExp(NOTICE_OPEN)}[\\s\\S]*?${escapeRegExp(NOTICE_CLOSE)}`,
   "g"
 );
+const NOTICE_CAPTURE_RE = new RegExp(
+  `${escapeRegExp(NOTICE_OPEN)}([\\s\\S]*?)${escapeRegExp(NOTICE_CLOSE)}`,
+  "g"
+);
+const LEGACY_NOTICE_PREFIXES = [
+  "MemTree working - conversation consolidated",
+  "⚠ MemTree degraded",
+  "⚠ MemTree is off",
+  "✨ Something special is happening",
+];
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -47,6 +104,13 @@ function escapeRegExp(s: string): string {
 /** Remove every complete <cc-infinite-notice>…</cc-infinite-notice> span, keeping surrounding text. */
 export function exciseNoticeSpans(text: string): string {
   return text.replace(NOTICE_SPAN_RE, "");
+}
+
+/** Targeted cleanup for system text, where users may legitimately quote tags. */
+export function exciseKnownLegacyNoticeSpans(text: string): string {
+  return text.replace(NOTICE_CAPTURE_RE, (whole, inner: string) =>
+    LEGACY_NOTICE_PREFIXES.some((prefix) => inner.startsWith(prefix)) ? "" : whole
+  );
 }
 
 /**
@@ -59,20 +123,62 @@ export function containsNoticeSpan(text: string): boolean {
   return open !== -1 && text.indexOf(NOTICE_CLOSE, open) !== -1;
 }
 
-function isNoticeSpanBlock(part: any): boolean {
-  return (
-    part &&
-    typeof part === "object" &&
-    part.type === "text" &&
-    typeof part.text === "string" &&
-    containsNoticeSpan(part.text)
-  );
+interface SanitizedContent {
+  content: any;
+  stripped: boolean;
+  empty: boolean;
+}
+
+function sanitizeContent(content: any, knownLegacyOnly = false): SanitizedContent {
+  const excise = knownLegacyOnly
+    ? exciseKnownLegacyNoticeSpans
+    : exciseNoticeSpans;
+  if (typeof content === "string") {
+    const cleaned = excise(content);
+    if (cleaned === content) {
+      return { content, stripped: false, empty: false };
+    }
+    return { content: cleaned, stripped: true, empty: cleaned.trim() === "" };
+  }
+
+  if (!Array.isArray(content)) {
+    return { content, stripped: false, empty: false };
+  }
+
+  let stripped = false;
+  const kept: any[] = [];
+  for (const part of content) {
+    if (typeof part === "string" && excise(part) !== part) {
+      stripped = true;
+      const cleaned = excise(part);
+      if (cleaned.trim() !== "") kept.push(cleaned);
+      continue;
+    }
+    if (
+      part &&
+      typeof part === "object" &&
+      part.type === "text" &&
+      typeof part.text === "string" &&
+      excise(part.text) !== part.text
+    ) {
+      stripped = true;
+      const cleaned = excise(part.text);
+      if (cleaned.trim() !== "") kept.push({ ...part, text: cleaned });
+      continue;
+    }
+    kept.push(part); // untouched blocks retain object identity/signatures
+  }
+  return stripped
+    ? { content: kept, stripped: true, empty: kept.length === 0 }
+    : { content, stripped: false, empty: false };
 }
 
 /**
- * Strip pass: remove injected notice content from a request's message history.
+ * Strip pass: remove legacy injected notice content from request history.
  * Runs on EVERY /v1/messages and count_tokens body, on all paths, before the
- * dedupe hash. Untouched blocks survive byte-identical to what Anthropic
+ * dedupe hash. Complete marker spans are removed from legacy assistant/system
+ * content, while human user messages are left byte-verbatim even if they quote
+ * the envelope. Bare/incomplete tags are left untouched. Untouched blocks survive byte-identical to what Anthropic
  * produced (important for replayed thinking-block signatures); a text block
  * that merely CONTAINS the marker span (e.g. CC merged adjacent text blocks)
  * has the span excised and the surrounding text kept — any block containing
@@ -87,37 +193,32 @@ export function stripNoticeBlocks(messages: Message[]): {
   let stripped = false;
   const out: Message[] = [];
   for (const msg of messages) {
-    if (msg?.role !== "assistant") {
+    if (msg?.role !== "assistant" && msg?.role !== "system") {
       out.push(msg);
       continue;
     }
-    const content = msg.content;
-    if (typeof content === "string" && containsNoticeSpan(content)) {
-      stripped = true;
-      const cleaned = exciseNoticeSpans(content);
-      if (cleaned.trim() !== "") out.push({ ...msg, content: cleaned });
-      // else: notice-only message — drop it entirely
+    const cleaned = sanitizeContent(msg?.content, msg?.role === "system");
+    if (!cleaned.stripped) {
+      out.push(msg);
       continue;
     }
-    if (Array.isArray(content) && content.some(isNoticeSpanBlock)) {
-      stripped = true;
-      const kept: any[] = [];
-      for (const part of content) {
-        if (!isNoticeSpanBlock(part)) {
-          kept.push(part); // untouched blocks keep their original objects
-          continue;
-        }
-        const cleaned = exciseNoticeSpans(part.text);
-        if (cleaned.trim() !== "") kept.push({ ...part, text: cleaned });
-        // else: block was nothing but the envelope — drop it
-      }
-      if (kept.length) out.push({ ...msg, content: kept });
-      // else: message was nothing but notices — drop it
-      continue;
-    }
-    out.push(msg);
+    stripped = true;
+    if (!cleaned.empty) out.push({ ...msg, content: cleaned.content });
   }
   return stripped ? { messages: out, stripped } : { messages, stripped };
+}
+
+/** Remove legacy complete marker spans from Anthropic's top-level system value. */
+export function stripNoticeSystem(system: any): {
+  system: any;
+  stripped: boolean;
+} {
+  const cleaned = sanitizeContent(system, true);
+  if (!cleaned.stripped) return { system, stripped: false };
+  return {
+    system: cleaned.empty ? undefined : cleaned.content,
+    stripped: true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +274,17 @@ export function fabricatedPrelude(model: string, noticeText: string): string {
 export interface SseRewriteOptions {
   /** Drop upstream message_start and shift content block indexes (prelude case). */
   renumberBy?: number;
+  /** Insert this notice after leading thinking, before the first response block. */
+  beforeResponseNotice?: string;
   /** Inject this notice before the final message_delta/message_stop. */
   endOfTurnNotice?: string;
+  /**
+   * Diagnostics observer: called with every parsed upstream event's data
+   * object BEFORE any rewriting (so it sees message_start even when the
+   * prelude drops it, and original block indexes). Exceptions are swallowed —
+   * observation must never affect the stream.
+   */
+  onEvent?: (data: any) => void;
 }
 
 /**
@@ -186,6 +296,7 @@ export class SseNoticeRewriter {
   private decoder = new StringDecoder("utf8");
   private buf = "";
   private maxIndexSeen = -1;
+  private injectedResponseNotice = false;
   private injectedEndNotice = false;
 
   constructor(private opts: SseRewriteOptions) {}
@@ -193,10 +304,16 @@ export class SseNoticeRewriter {
   push(chunk: Buffer): string {
     this.buf += this.decoder.write(chunk);
     let out = "";
-    let sep: number;
-    while ((sep = this.buf.indexOf("\n\n")) !== -1) {
-      const rawEvent = this.buf.slice(0, sep + 2);
-      this.buf = this.buf.slice(sep + 2);
+    while (true) {
+      const lfSep = this.buf.indexOf("\n\n");
+      const crlfSep = this.buf.indexOf("\r\n\r\n");
+      if (lfSep === -1 && crlfSep === -1) break;
+
+      const useCrlf = crlfSep !== -1 && (lfSep === -1 || crlfSep < lfSep);
+      const sep = useCrlf ? crlfSep : lfSep;
+      const frameEnd = sep + (useCrlf ? 4 : 2);
+      const rawEvent = this.buf.slice(0, frameEnd);
+      this.buf = this.buf.slice(frameEnd);
       out += this.transformEvent(rawEvent);
     }
     return out;
@@ -223,37 +340,104 @@ export class SseNoticeRewriter {
     }
     const type = data?.type;
 
-    if (this.opts.renumberBy) {
-      if (type === "message_start") return ""; // we already sent ours
-      if (
-        (type === "content_block_start" ||
-          type === "content_block_delta" ||
-          type === "content_block_stop") &&
-        typeof data.index === "number"
-      ) {
-        data.index += this.opts.renumberBy;
-        if (data.index > this.maxIndexSeen) this.maxIndexSeen = data.index;
-        return sseEvent(type, data);
+    if (this.opts.onEvent) {
+      try {
+        this.opts.onEvent(data);
+      } catch {
+        // observer must never break the stream
       }
     }
 
-    if (type === "content_block_start" && typeof data.index === "number") {
+    const baseShift = this.opts.renumberBy ?? 0;
+    if (baseShift && type === "message_start") return ""; // fabricated prelude sent ours
+
+    const isContentEvent =
+      type === "content_block_start" ||
+      type === "content_block_delta" ||
+      type === "content_block_stop";
+    if (isContentEvent && typeof data.index === "number") {
+      const originalIndex = data.index;
+      const insertResponseNotice =
+        type === "content_block_start" &&
+        this.opts.beforeResponseNotice !== undefined &&
+        !this.injectedResponseNotice &&
+        !isThinkingBlock(data.content_block);
+
+      if (insertResponseNotice) this.injectedResponseNotice = true;
+
+      const shift = baseShift + (this.injectedResponseNotice ? 1 : 0);
+      if (shift) data.index = originalIndex + shift;
       if (data.index > this.maxIndexSeen) this.maxIndexSeen = data.index;
+
+      const transformed = shift ? sseEvent(type, data) : rawEvent;
+      if (insertResponseNotice) {
+        const noticeIndex = originalIndex + baseShift;
+        if (noticeIndex > this.maxIndexSeen) this.maxIndexSeen = noticeIndex;
+        return (
+          noticeBlockEvents(noticeIndex, this.opts.beforeResponseNotice!) +
+          transformed
+        );
+      }
+      return transformed;
     }
 
-    if (
-      this.opts.endOfTurnNotice &&
-      !this.injectedEndNotice &&
-      (type === "message_delta" || type === "message_stop")
-    ) {
-      this.injectedEndNotice = true;
-      return (
-        noticeBlockEvents(this.maxIndexSeen + 1, this.opts.endOfTurnNotice) +
-        rawEvent
-      );
+    if (type === "message_delta" || type === "message_stop") {
+      let notices = "";
+
+      // A max-token response can end after thinking without ever starting an
+      // answer/tool block. Still surface compression success, after thinking.
+      if (
+        this.opts.beforeResponseNotice !== undefined &&
+        !this.injectedResponseNotice
+      ) {
+        this.injectedResponseNotice = true;
+        const noticeIndex = Math.max(this.maxIndexSeen + 1, baseShift);
+        this.maxIndexSeen = noticeIndex;
+        notices += noticeBlockEvents(
+          noticeIndex,
+          this.opts.beforeResponseNotice
+        );
+      }
+
+      if (this.opts.endOfTurnNotice && !this.injectedEndNotice) {
+        this.injectedEndNotice = true;
+        const noticeIndex = this.maxIndexSeen + 1;
+        this.maxIndexSeen = noticeIndex;
+        notices += noticeBlockEvents(noticeIndex, this.opts.endOfTurnNotice);
+      }
+
+      if (notices) return notices + rawEvent;
     }
 
     return rawEvent;
+  }
+}
+
+function isThinkingBlock(part: any): boolean {
+  return part?.type === "thinking" || part?.type === "redacted_thinking";
+}
+
+/**
+ * Non-streaming success responses: insert a notice after any leading thinking
+ * blocks and before the answer/tool content. Keeping the real answer last is
+ * important for `claude -p --output-format json`, which reports the last text
+ * block as `.result`.
+ */
+export function insertNoticeBeforeResponseContent(
+  body: Buffer,
+  noticeText: string
+): Buffer | null {
+  try {
+    const json = JSON.parse(body.toString("utf-8"));
+    if (json?.type !== "message" || !Array.isArray(json.content)) return null;
+    const firstResponsePart = json.content.findIndex(
+      (part: any) => !isThinkingBlock(part)
+    );
+    const index = firstResponsePart === -1 ? json.content.length : firstResponsePart;
+    json.content.splice(index, 0, { type: "text", text: wrapNotice(noticeText) });
+    return Buffer.from(JSON.stringify(json), "utf-8");
+  } catch {
+    return null;
   }
 }
 
