@@ -65,27 +65,31 @@ models or rewrite them server-side), and native-auth pass-through is what makes 
   OAuth path is already `skip_billing=True`. Usage stats for the dashboard can be reported
   back by the local app (Phase 4).
 
-## Relationship to context monitoring (separate plan)
+## Relationship to context monitoring (implemented 2026-07-14)
 
 The online context-monitoring plan (`~/src/polychat/plans/2026-06-21_PLAN_context_monitoring.md`,
-polychat repo) builds **on top
-of** this proxy — the local app is its interception point for fanning out the with-mem vs
-no-mem legs, grading them, and routing to the winner. Kept as a **separate plan** on purpose:
-this proxy has standalone value (keep OAuth local) and ships first; monitoring is research-
-gated on grader validation and further out, and folding its "doubles calls per turn" story
-into this plan's clean "we only reduce tokens" narrative would muddy the TOS pitch right when
-we may be asking Anthropic for a nod.
+polychat repo) now runs on top of this proxy. The research plan remains separate, but its live
+routing path is implemented here: the local app is the interception point for fanning out the
+with-memory vs no-memory legs, grading them, and routing to the winner.
 
-What monitoring changes about this proxy (so the next agent isn't surprised):
-- **Fan-out**: monitoring issues a second completion (+a grader call) per monitored turn,
-  instead of this plan's single byte-identical forward. Both legs run on the user's OAuth
-  (subagent-shaped); see the monitoring plan for the token economics and the "triggered, not
-  blanket" guardrail that keep it defensible.
+Implemented behavior:
+
+- **Triggered fan-out**: use a conservative whole-memory-request estimate and compare only at
+  or above 50% of the model's effective-context prior. Unknown models compare by default.
+  Qualifying turns issue a second completion plus a structured grader call; all Anthropic calls
+  stay local and reuse Claude Code's incoming auth. Below-gate turns remain single-leg memory.
 - **Buffer-then-commit streaming**: the user-facing stream is held while the first `n` tokens
   of each leg buffer and the grader decides; then the winner's in-flight stream is continued
-  and the loser aborted. This is a distinct response-path mode, not transparent pass-through.
+  and the loser aborted. A and ties prefer memory; only a valid B chooses full history.
+- **Turn-local persistence**: a memory winner replaces the anchored original prefix on later
+  main-thread tool-result and Count Tokens requests for that human turn. Session/model/system/
+  history mismatches fail closed to full context, while original tool history still indexes.
+- **Failure semantics**: grader failure/timeout prefers memory, an unavailable selected arm
+  yields to its healthy peer, downstream cancellation aborts every in-flight call, and a route
+  or success notice requires a complete successful selected response.
 - **Latency**: that hold is *seconds* (generate `n` + grade), not the "hundreds of ms" the
-  compression-only path assumes — see the updated latency risk row.
+  compression-only path assumes. Each decision and both arms' diagnostics are written to the
+  local request JSONL log.
 
 ## TOS / prior-art positioning
 
@@ -388,8 +392,8 @@ A small HTTP server + launcher. Responsibilities:
 |---|---|
 | Anthropic blocks the local app's requests | Phase 1 spike answers this first; keep requests byte-identical to Claude Code's except `messages`. If blocked, the whole approach (and the current server-side one) is dead — find out before building more. |
 | Claude Code doesn't send OAuth to custom base URL | Fallback: keychain read (existing `polychat/claude_code/bin/get_oauth_keycain.py` approach) + local refresh handling. More credential surface, still never leaves the machine. |
-| Extra latency (local hop + polychat round-trip) | Tool-turn indexing POSTs are fire-and-forget off the response path, so the turns that dominate add zero latency. Blocking compression call only on user turns, where hundreds of ms are acceptable. **Monitoring (separate plan) adds more**: buffer-then-commit holds the user stream for `time-to-generate-n + grade` (seconds) on monitored turns — gate it behind the paid tier / triggered cases, not every turn. |
-| Fan-out doubles calls on the OAuth subscription (monitoring) | The monitoring plan runs two legs + a grader per monitored turn on the user's subscription. Mitigated by: legs are cheap (cached full-context leg + short mem leg, not 2× a big context), serving the mem-leg winner forward can be net-negative tokens vs baseline, and fan-out is *triggered* not blanket. Still a heavier ask than the pure proxy — fold it into the Phase-3 Anthropic conversation honestly. |
+| Extra latency (local hop + polychat round-trip) | Tool-turn indexing POSTs are fire-and-forget off the response path, so the turns that dominate add zero latency. Blocking compression runs only on user turns. On gated A/B turns, buffer-then-commit additionally holds the stream for `time-to-generate-n + grade` (seconds); the whole-A 50%-of-effective-context gate keeps this off compact turns. |
+| Fan-out increases calls on the OAuth subscription | A gated turn runs two answer legs + a grader on the user's subscription/API account. Mitigated by cached full context, compact memory context, immediate loser abort, memory persistence through the subsequent tool loop, and triggered rather than blanket fan-out. This remains a heavier ask than the pure proxy and must be described honestly. |
 | Upload bandwidth (full history POSTed every tool turn) | Acceptable at first (mirrors what Claude Code sends today). If it matters, later send only messages since the last acked index ping. |
 | Shipped-client contract drift | Version the API, client sends version header, server can return "please update" errors. |
 | Index-not-ready first sessions | Same as today: return messages uncompressed until background index completes. |

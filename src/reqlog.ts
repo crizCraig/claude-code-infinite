@@ -36,7 +36,12 @@ export function defaultLogPath(): string {
 export type TurnType =
   | "first-user"
   | "tool"
+  | "tool-memory"
   | "followup-compressed"
+  | "followup-ab-pending"
+  | "followup-ab-failed"
+  | "followup-ab-memory"
+  | "followup-ab-full"
   | "followup-degraded"
   | "unparseable";
 
@@ -46,6 +51,49 @@ export interface UsageRecord {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   output_tokens?: number;
+}
+
+export interface ComparisonLegRecord {
+  requestBytes: number;
+  upstreamStatus?: number;
+  ttfbMs?: number;
+  firstContentMs?: number;
+  usage?: UsageRecord;
+  ended?: boolean;
+  error?: string;
+}
+
+export interface ComparisonRecord {
+  attempted: boolean;
+  gateReason:
+    | "forced"
+    | "above-threshold"
+    | "below-threshold"
+    | "sample-no-prior"
+    | "skip-no-prior";
+  /** Conservative estimate for the whole memory-leg request, not tokenizer output. */
+  approxContextTokens: number;
+  contextTokenEstimate: "body-bytes/3";
+  effectiveContextTokens?: number;
+  thresholdTokens?: number;
+  prefixChars?: number;
+  prefixWaitMs?: number;
+  gradeMs?: number;
+  grader?: {
+    model: string;
+    ok: boolean;
+    status?: number;
+    usage?: UsageRecord;
+    error?: string;
+  };
+  verdict?: "A" | "B" | "tie";
+  winner?: "memory" | "full";
+  fallbackReason?: string;
+  memoryLeg?: ComparisonLegRecord;
+  fullLeg?: ComparisonLegRecord;
+  loserAborted?: boolean;
+  clientAborted?: boolean;
+  deliveryOk?: boolean;
 }
 
 /**
@@ -67,6 +115,8 @@ export interface MessagesRecord {
   approxInputTokens?: number;
   /** Present when a blocking MemTree compress was attempted for this turn. */
   compress?: { ms: number; ok: boolean; timedOut: boolean };
+  /** Present when live memory-vs-full routing was eligible for this turn. */
+  comparison?: ComparisonRecord;
   upstreamStatus?: number;
   /** Forward start → first response byte from Anthropic. */
   ttfbMs?: number;

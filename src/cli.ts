@@ -205,7 +205,32 @@ async function main() {
     debug: isDebugMode,
     reqlog,
   });
-  const proxy = await startProxy({ memtree, debug: isDebugMode, reqlog });
+  const abRouting =
+    process.env.CCC_AB_ROUTING === "0"
+      ? undefined
+      : {
+          graderModel: process.env.CCC_AB_GRADER_MODEL,
+          prefixChars:
+            process.env.CCC_AB_PREFIX_TOKENS === undefined
+              ? undefined
+              : Number(process.env.CCC_AB_PREFIX_TOKENS) * 4,
+          prefixTimeoutMs:
+            process.env.CCC_AB_PREFIX_TIMEOUT_MS === undefined
+              ? undefined
+              : Number(process.env.CCC_AB_PREFIX_TIMEOUT_MS),
+          graderTimeoutMs:
+            process.env.CCC_AB_GRADER_TIMEOUT_MS === undefined
+              ? undefined
+              : Number(process.env.CCC_AB_GRADER_TIMEOUT_MS),
+          sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
+          forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
+        };
+  const proxy = await startProxy({
+    memtree,
+    debug: isDebugMode,
+    reqlog,
+    abRouting,
+  });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
@@ -213,6 +238,7 @@ async function main() {
   if (isDebugMode) {
     console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
     console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);
+    console.log(`[DEBUG] A/B memory routing: ${abRouting ? "enabled" : "disabled"}`);
   }
 
   // Legacy transcript cleanup: releases before display-only hooks injected

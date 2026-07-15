@@ -50,17 +50,20 @@ Each environment maintains its own separate API key.
 Claude Code ──▶ localhost proxy (ccc)
                   ├──(messages only, MemTree API key)──▶ api.polychat.co /v1/context_memory
                   │◀──(compressed messages)─────────────┘
-                  └──(compressed messages + your local OAuth token)──▶ api.anthropic.com
+                  ├──(memory leg A + your local OAuth)──▶ api.anthropic.com
+                  ├──(eligible turns: full-history leg B)▶ api.anthropic.com
+                  └──(eligible turns: local A/B grader)──▶ api.anthropic.com
 ```
 
 - Only message content is sent to MemTree for indexing/compression — never credentials.
+- Answer legs and the grader go directly from the local proxy to Anthropic using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
 
 ### Inline notices
 
 In interactive sessions, `ccc` reports these MemTree states as display-only lines in Claude Code:
 
-- `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
+- `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used and the completed memory response was selected. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
 - `⚠ MemTree degraded — this turn ran uncompressed` when a blocking compression call fails or times out.
 - `⚠ MemTree is off — payment required…` once when compression and indexing are disabled for payment.
 
@@ -76,6 +79,30 @@ Claude Code currently displays the original assistant text instead of `MessageDi
 
 
 When you send a message, we retrieve relevant details and summaries from the prior messages in your thread. These details and summaries populate a **memory message**. Following the memory message, we append a compressed version of your recent message history. The resulting context-window is dramatically smaller, allowing Claude to process your request with much greater efficacy, lower latency, and reduced cost.
+
+### Adaptive memory A/B routing
+
+`ccc` now checks whether memory is still the best context for each large follow-up turn:
+
+1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
+2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
+3. It holds the semantic prefix of each answer (about 1,000 tokens), asks a structured Anthropic grader to compare them, continues the winning in-flight stream, and aborts the loser. A and ties select memory; only a materially better B selects full history.
+4. A memory winner remains active through that human turn's tool loop, including matching Count Tokens calls. The original full tool history is still sent to MemTree for background indexing.
+
+Comparison is deliberately fail-safe: grader failure or timeout prefers memory, a failed selected arm falls back to a healthy peer, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response.
+
+Qualifying turns cost more and start streaming later: they make two answer requests plus one grader request on the user's Anthropic subscription or API account, and buffer while the decision is made. The gate avoids that overhead for compact contexts, and the losing answer is aborted immediately after selection.
+
+Advanced/testing controls:
+
+- `CCC_AB_ROUTING=0` disables live A/B routing.
+- `CCC_AB_GRADER_MODEL=<model>` overrides the default grader (`claude-opus-4-8`).
+- `CCC_AB_PREFIX_TOKENS=<n>` changes the answer prefix from its 1,000-token default.
+- `CCC_AB_PREFIX_TIMEOUT_MS=<ms>` and `CCC_AB_GRADER_TIMEOUT_MS=<ms>` change their 30-second defaults.
+- `CCC_AB_SAMPLE_NO_PRIOR=0` skips comparison for models without an effective-context prior.
+- `CCC_AB_FORCE_COMPARISON=1` bypasses the size gate for diagnostics.
+
+Routing decisions, both-leg timings and usage, grader diagnostics, fallbacks, and delivery status are recorded in `~/.claude-code-infinite/logs/requests.jsonl`.
 
 ## What this is NOT
 

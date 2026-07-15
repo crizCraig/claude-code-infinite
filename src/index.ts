@@ -1,6 +1,28 @@
 export { startProxy } from "./proxy.js";
 export type { ProxyOptions, RunningProxy } from "./proxy.js";
 export {
+  abGateDecision,
+  buildFusionGraderBody,
+  buildFusionGraderSystemPrompt,
+  buildFusionGraderUserPrompt,
+  effectiveContextForModel,
+  extractUnfoldedMemory,
+  GRADING_TRUNCATION_MARKER,
+  parseFusionVerdictResponse,
+  resolveAbRoutingOptions,
+  validateFusionVerdict,
+  winnerForVerdict,
+} from "./ab-routing.js";
+export type {
+  AbGradeInput,
+  AbGrader,
+  AbRoutingOptions,
+  AbVerdict,
+  AbWinner,
+  FusionMetrics,
+  FusionVerdict,
+} from "./ab-routing.js";
+export {
   didMemtreeCompress,
   MemtreeClient,
   rawPromptTokenCount,
@@ -8,6 +30,7 @@ export {
 export type { MemtreeOptions, CompressResult } from "./memtree.js";
 export {
   isNonToolUserMessage,
+  isToolResultUserMessage,
   isAwaySummaryUserMessage,
   AWAY_SUMMARY_PROMPT_PREFIX,
   lastNonSystemMessage,

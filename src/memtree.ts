@@ -51,6 +51,12 @@ export interface MemtreeOptions {
 export interface CompressResult {
   /** Processed (compressed) messages from the server; system role may be included. */
   messages: Message[];
+  /**
+   * Optional explicit unfolded index for A/B grading. Older servers omit it;
+   * callers fall back to the first non-system processed message, which is the
+   * current server layout.
+   */
+  unfolded_memory?: string;
   usage?: unknown;
   /** Client-observed latency of the underlying HTTP call (survives retry dedupe). */
   clientLatencyMs?: number;

@@ -59,6 +59,17 @@ function hasToolResultBlock(content: any): boolean {
   );
 }
 
+/** True only for Claude Code's user wrapper carrying one or more tool results. */
+export function isToolResultUserMessage(
+  message: Message | undefined | null
+): boolean {
+  return (
+    !!message &&
+    message.role === "user" &&
+    hasToolResultBlock(message.content)
+  );
+}
+
 /** True if this is a real user instruction (not a tool-result wrapper or synthetic reminder). */
 export function isNonToolUserMessage(message: Message | undefined | null): boolean {
   if (!message || message.role !== "user") return false;
