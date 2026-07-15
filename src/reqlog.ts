@@ -19,6 +19,7 @@
 
 import { appendFile, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { AbGateReason } from "./ab-routing.js";
 import { getConfigDir } from "./config.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
@@ -63,14 +64,18 @@ export interface ComparisonLegRecord {
   error?: string;
 }
 
+/** Outcome of one grader call (also logged under `ComparisonRecord.grader`). */
+export interface GraderDiagnostic {
+  model: string;
+  ok: boolean;
+  status?: number;
+  usage?: UsageRecord;
+  error?: string;
+}
+
 export interface ComparisonRecord {
   attempted: boolean;
-  gateReason:
-    | "forced"
-    | "above-threshold"
-    | "below-threshold"
-    | "sample-no-prior"
-    | "skip-no-prior";
+  gateReason: AbGateReason;
   /** Conservative estimate for the whole memory-leg request, not tokenizer output. */
   approxContextTokens: number;
   contextTokenEstimate: "body-bytes/3";
@@ -79,13 +84,7 @@ export interface ComparisonRecord {
   prefixChars?: number;
   prefixWaitMs?: number;
   gradeMs?: number;
-  grader?: {
-    model: string;
-    ok: boolean;
-    status?: number;
-    usage?: UsageRecord;
-    error?: string;
-  };
+  grader?: GraderDiagnostic;
   verdict?: "A" | "B" | "tie";
   winner?: "memory" | "full";
   fallbackReason?: string;

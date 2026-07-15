@@ -16,6 +16,11 @@ import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
 import {
+  DEFAULT_GRADE_PREFIX_TOKENS,
+  DEFAULT_PREFIX_TIMEOUT_MS,
+  DEFAULT_GRADER_TIMEOUT_MS,
+} from "./ab-routing.js";
+import {
   createSessionNoticePlugin,
   supportsMessageDisplay,
   withSessionNoticePluginArgs,
@@ -41,6 +46,24 @@ const LOCAL_BASE_URL = "http://localhost:8080";
 const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 
 type Mode = "production" | "staging" | "local";
+
+// Parse a CCC_AB_* numeric env var. resolveAbRoutingOptions silently replaces
+// invalid values (NaN, zero, negative) with defaults, so a mistyped tuning
+// knob would otherwise take effect as the default with no indication. Warn on
+// stderr here — where the variable name and raw value are still known — and
+// return undefined so the documented default applies.
+function abEnvPositiveNumber(name: string, fallback: number): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(
+      `\x1b[1;33m⚠ Ignoring ${name}="${raw}" — expected a positive number; using default ${fallback}.\x1b[0m`
+    );
+    return undefined;
+  }
+  return value;
+}
 
 function openUrl(url: string): void {
   const platform = process.platform;
@@ -210,18 +233,21 @@ async function main() {
       ? undefined
       : {
           graderModel: process.env.CCC_AB_GRADER_MODEL,
-          prefixChars:
-            process.env.CCC_AB_PREFIX_TOKENS === undefined
-              ? undefined
-              : Number(process.env.CCC_AB_PREFIX_TOKENS) * 4,
-          prefixTimeoutMs:
-            process.env.CCC_AB_PREFIX_TIMEOUT_MS === undefined
-              ? undefined
-              : Number(process.env.CCC_AB_PREFIX_TIMEOUT_MS),
-          graderTimeoutMs:
-            process.env.CCC_AB_GRADER_TIMEOUT_MS === undefined
-              ? undefined
-              : Number(process.env.CCC_AB_GRADER_TIMEOUT_MS),
+          prefixChars: (() => {
+            const tokens = abEnvPositiveNumber(
+              "CCC_AB_PREFIX_TOKENS",
+              DEFAULT_GRADE_PREFIX_TOKENS
+            );
+            return tokens === undefined ? undefined : tokens * 4;
+          })(),
+          prefixTimeoutMs: abEnvPositiveNumber(
+            "CCC_AB_PREFIX_TIMEOUT_MS",
+            DEFAULT_PREFIX_TIMEOUT_MS
+          ),
+          graderTimeoutMs: abEnvPositiveNumber(
+            "CCC_AB_GRADER_TIMEOUT_MS",
+            DEFAULT_GRADER_TIMEOUT_MS
+          ),
           sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
           forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
         };

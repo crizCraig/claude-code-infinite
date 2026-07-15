@@ -96,6 +96,7 @@ import {
   mergeUsageFromSseEvent,
   type MessagesRecord,
   type ComparisonLegRecord,
+  type GraderDiagnostic,
   type RequestLogger,
   type UsageRecord,
 } from "./reqlog.js";
@@ -1157,14 +1158,6 @@ interface ComparedSseArgs {
   onDeliveryComplete: (winner: AbWinner, ok: boolean) => void;
 }
 
-interface GraderDiagnostic {
-  model: string;
-  ok: boolean;
-  status?: number;
-  usage?: UsageRecord;
-  error?: string;
-}
-
 /** Buffer two live SSE legs, grade their semantic prefixes, then commit one. */
 async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
   const {
@@ -1971,7 +1964,15 @@ class BufferedUpstreamLeg {
         typeof event.index === "number"
       ) {
         const tool = this.toolBlocks.get(event.index);
-        if (tool) tool.json += delta.partial_json;
+        // Tool JSON only feeds the graded semantic prefix (via the
+        // content_block_stop append below, which itself truncates), so stop
+        // accumulating once it can no longer reach the grading window.
+        if (
+          tool &&
+          this.semantic.length + tool.json.length <= this.prefixChars
+        ) {
+          tool.json += delta.partial_json;
+        }
       }
     } else if (
       event?.type === "content_block_stop" &&
@@ -1995,7 +1996,14 @@ class BufferedUpstreamLeg {
   }
 
   private appendSemantic(text: string): void {
-    this.semantic += text;
+    // Grading only ever reads the first prefixChars characters. Keep one
+    // extra character so semanticForGrading() can still detect truncation,
+    // and drop the rest so long responses are not buffered a second time.
+    const capacity = this.prefixChars + 1 - this.semantic.length;
+    if (capacity > 0) {
+      this.semantic +=
+        text.length > capacity ? text.slice(0, capacity) : text;
+    }
     if (this.semantic.length >= this.prefixChars) this.settlePrefix();
   }
 
@@ -2153,6 +2161,15 @@ function forwardRaw(
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
     headers["content-length"] = String(bodyBuffer.length);
+    // The passive observer must be able to decode its copy to verify complete
+    // delivery (message_stop for SSE, complete JSON otherwise). Constrain the
+    // negotiated coding to what the observation decoders support — same idea
+    // as the A/B comparison legs forcing identity — so an upstream choice
+    // like zstd cannot mark a byte-perfectly delivered response as failed.
+    // The bytes written to the client stay exact.
+    headers["accept-encoding"] = observableAcceptEncoding(
+      headers["accept-encoding"]
+    );
     const forwardStarted = Date.now();
     let settled = false;
     let upstreamCompleted = false;
@@ -2549,6 +2566,26 @@ function capture(opts: ProxyOptions, kind: string, body: Buffer): void {
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return readAll(req);
+}
+
+const OBSERVABLE_ENCODINGS = new Set(["gzip", "br", "deflate", "identity"]);
+
+/**
+ * Restrict a client Accept-Encoding value to codings the passive observer can
+ * decode (see createObservationDecoder/decodeForObservation). Client tokens
+ * are kept verbatim (q-values included) so negotiation semantics survive; an
+ * absent header means "anything", so advertise the full supported set, and if
+ * nothing supported remains fall back to identity, which every client accepts.
+ */
+function observableAcceptEncoding(clientValue: string | undefined): string {
+  if (clientValue === undefined) return "gzip, br, deflate";
+  const kept = clientValue
+    .split(",")
+    .map((token) => token.trim())
+    .filter((token) =>
+      OBSERVABLE_ENCODINGS.has(token.split(";", 1)[0].trim().toLowerCase())
+    );
+  return kept.length > 0 ? kept.join(", ") : "identity";
 }
 
 /** Incremental decoder used only to observe a copy of encoded SSE bytes. */
