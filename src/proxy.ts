@@ -2573,17 +2573,23 @@ const OBSERVABLE_ENCODINGS = new Set(["gzip", "br", "deflate", "identity"]);
 /**
  * Restrict a client Accept-Encoding value to codings the passive observer can
  * decode (see createObservationDecoder/decodeForObservation). Client tokens
- * are kept verbatim (q-values included) so negotiation semantics survive; an
- * absent header means "anything", so advertise the full supported set, and if
- * nothing supported remains fall back to identity, which every client accepts.
+ * are kept verbatim (q-values included) so negotiation semantics survive —
+ * except q=0 tokens, which the client explicitly refuses and so cannot count
+ * as an acceptable coding; an absent header means "anything", so advertise
+ * the full supported set, and if nothing supported and acceptable remains
+ * fall back to identity, which every client accepts.
  */
+const REFUSED_Q_ZERO = /;\s*q\s*=\s*0(?:\.0{0,3})?\s*(?:;|$)/i;
+
 function observableAcceptEncoding(clientValue: string | undefined): string {
   if (clientValue === undefined) return "gzip, br, deflate";
   const kept = clientValue
     .split(",")
     .map((token) => token.trim())
-    .filter((token) =>
-      OBSERVABLE_ENCODINGS.has(token.split(";", 1)[0].trim().toLowerCase())
+    .filter(
+      (token) =>
+        OBSERVABLE_ENCODINGS.has(token.split(";", 1)[0].trim().toLowerCase()) &&
+        !REFUSED_Q_ZERO.test(token)
     );
   return kept.length > 0 ? kept.join(", ") : "identity";
 }

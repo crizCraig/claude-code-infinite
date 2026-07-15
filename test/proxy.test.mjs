@@ -1205,6 +1205,42 @@ test("Accept-Encoding and compressed upstream response stay byte-transparent", a
   }
 });
 
+test("Accept-Encoding with only unsupported or q=0 codings falls back to identity", async () => {
+  let acceptedEncoding;
+  const upstream = await listen((req, res) => {
+    acceptedEncoding = req.headers["accept-encoding"];
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: { prompt_tokens_details: { cached_tokens: 0 } },
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two");
+    // zstd is unsupported by the observer and identity;q=0 is explicitly
+    // refused by the client — neither may survive the intersection, so the
+    // forwarded header must fall back to plain identity.
+    const result = await postMessages(proxy.port, followupTurn("turn two"), {
+      "accept-encoding": "zstd, identity;q=0",
+    });
+    assert.equal(result.content[0].text, "upstream answer");
+    assert.equal(acceptedEncoding, "identity");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("402 payment becomes shown only when hook claims it, then later turns stay quiet", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(402, { detail: PAYMENT_DETAIL });

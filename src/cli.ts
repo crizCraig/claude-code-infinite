@@ -19,6 +19,7 @@ import {
   DEFAULT_GRADE_PREFIX_TOKENS,
   DEFAULT_PREFIX_TIMEOUT_MS,
   DEFAULT_GRADER_TIMEOUT_MS,
+  DEFAULT_GRADER_MODEL,
 } from "./ab-routing.js";
 import {
   createSessionNoticePlugin,
@@ -59,6 +60,24 @@ function abEnvPositiveNumber(name: string, fallback: number): number | undefined
   if (!Number.isFinite(value) || value <= 0) {
     console.warn(
       `\x1b[1;33m⚠ Ignoring ${name}="${raw}" — expected a positive number; using default ${fallback}.\x1b[0m`
+    );
+    return undefined;
+  }
+  return value;
+}
+
+// Parse CCC_AB_GRADER_MODEL. resolveAbRoutingOptions only substitutes the
+// default for undefined (`??`), so an empty/whitespace value would flow through
+// as `model: ""` and every grader request would be rejected 400 — silently
+// falling back to memory while still paying the double-leg cost. Warn on
+// stderr and return undefined so the documented default applies.
+function abEnvGraderModel(): string | undefined {
+  const raw = process.env.CCC_AB_GRADER_MODEL;
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === "") {
+    console.warn(
+      `\x1b[1;33m⚠ Ignoring CCC_AB_GRADER_MODEL="${raw}" — expected a model id; using default ${DEFAULT_GRADER_MODEL}.\x1b[0m`
     );
     return undefined;
   }
@@ -232,7 +251,7 @@ async function main() {
     process.env.CCC_AB_ROUTING === "0"
       ? undefined
       : {
-          graderModel: process.env.CCC_AB_GRADER_MODEL,
+          graderModel: abEnvGraderModel(),
           prefixChars: (() => {
             const tokens = abEnvPositiveNumber(
               "CCC_AB_PREFIX_TOKENS",
