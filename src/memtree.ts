@@ -162,13 +162,15 @@ export class MemtreeClient {
   compress(
     hash: string,
     messages: Message[],
-    modelContextLimit: number
+    modelContextLimit: number,
+    signal?: AbortSignal
   ): Promise<CompressResult | null> {
     const cached = this.compressCache.get(hash);
     if (cached) return cached;
 
     const promise = this.callContextMemory(messages, modelContextLimit, {
       timeoutMs: this.compressTimeoutMs,
+      signal,
     }).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's

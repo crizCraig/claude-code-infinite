@@ -179,8 +179,8 @@ export interface RunningProxy {
   close: () => void;
   /**
    * Stop accepting work and give active requests a bounded grace period.
-   * On expiry, speculative shadows are cancelled and their finalizers awaited;
-   * false reports that forced cancellation was required.
+   * On expiry, every accepted request and upstream is cancelled, then request
+   * finalizers are awaited; false reports that forced cancellation was needed.
    */
   drain: (timeoutMs?: number) => Promise<boolean>;
 }
@@ -213,7 +213,7 @@ interface ProxyState {
   mainMemoryRoute?: MainMemoryRoute;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
-  /** Fired by drain after its grace period so speculative work can finalize. */
+  /** Fired by drain after its grace period so every forwarding path can stop. */
   shutdownSignal: AbortSignal;
 }
 
@@ -292,15 +292,26 @@ async function waitForMainNoticeDelivery(
     return;
   }
   let timeout: NodeJS.Timeout | undefined;
+  let onShutdown: (() => void) | undefined;
   try {
     await Promise.race([
       delivery.settled,
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, NOTICE_SETTLE_WAIT_MS);
       }),
+      new Promise<void>((resolve) => {
+        onShutdown = () => resolve();
+        state.shutdownSignal.addEventListener("abort", onShutdown, {
+          once: true,
+        });
+        if (state.shutdownSignal.aborted) onShutdown();
+      }),
     ]);
   } finally {
     if (timeout) clearTimeout(timeout);
+    if (onShutdown) {
+      state.shutdownSignal.removeEventListener("abort", onShutdown);
+    }
   }
 }
 
@@ -329,6 +340,10 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const upstream = resolveUpstream(opts);
   const hookPath = `/_ccc/hooks/${randomBytes(24).toString("hex")}`;
   const activeRequests = new Set<Promise<void>>();
+  const acceptedRequests = new Set<{
+    req: http.IncomingMessage;
+    res: http.ServerResponse;
+  }>();
   const shutdownAbort = new AbortController();
   const state: ProxyState = {
     paymentNoticeShown: false,
@@ -344,6 +359,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     shutdownSignal: shutdownAbort.signal,
   };
   const server = http.createServer((req, res) => {
+    const accepted = { req, res };
+    acceptedRequests.add(accepted);
     const task = handleRequest(req, res, opts, upstream, state, hookPath).catch(
       (err) => {
         try {
@@ -355,9 +372,16 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     );
     activeRequests.add(task);
     void task.then(
-      () => activeRequests.delete(task),
-      () => activeRequests.delete(task)
+      () => {
+        activeRequests.delete(task);
+        acceptedRequests.delete(accepted);
+      },
+      () => {
+        activeRequests.delete(task);
+        acceptedRequests.delete(accepted);
+      }
     );
+    if (shutdownAbort.signal.aborted) cancelAcceptedRequest(accepted);
   });
   // Long-running SSE responses must not be cut by idle timeouts.
   server.requestTimeout = 0;
@@ -399,10 +423,12 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     if (timer) clearTimeout(timer);
     if (completed) return true;
 
-    // The grace period only protects useful late shadow verdicts. Once it
-    // expires, actively cancel speculative work and wait for each handler's
-    // finally-log to run before returning to the caller's RequestLogger flush.
+    // The grace period protects useful in-flight delivery and late shadow
+    // verdicts. Once it expires, signal every forwarding path first so each can
+    // classify the close as proxy-owned, then tear down any request that was
+    // still reading/dispatching before it installed a path-specific listener.
     shutdownAbort.abort();
+    for (const accepted of acceptedRequests) cancelAcceptedRequest(accepted);
     await quiesced;
     return false;
   };
@@ -421,6 +447,21 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       });
     });
   });
+}
+
+/** Final safety net for handlers that have not reached an upstream path yet. */
+function cancelAcceptedRequest(accepted: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+}): void {
+  const { req, res } = accepted;
+  if (!req.complete && !req.destroyed) {
+    // A pass-through upload may not otherwise have an IncomingMessage error
+    // listener; consume this proxy-owned teardown error after body readers see it.
+    req.once("error", () => {});
+    req.destroy(new Error("proxy shutdown"));
+  }
+  if (!res.destroyed && !res.writableEnded) res.destroy();
 }
 
 async function handleRequest(
@@ -443,7 +484,7 @@ async function handleRequest(
   if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
     return handleCountTokens(req, res, opts, upstream, state);
   }
-  return passThroughStreaming(req, res, upstream);
+  return passThroughStreaming(req, res, upstream, state.shutdownSignal);
 }
 
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
@@ -635,7 +676,9 @@ async function handleMessages(
     if (!Array.isArray(body.messages)) throw new Error("no messages array");
   } catch {
     // Not a shape we understand — forward verbatim rather than break the session.
-    return logged(forwardRaw(req, res, rawBody, opts, upstream, rec));
+    return logged(
+      forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
+    );
   }
 
   // Defensive legacy strip pass first: old marker-wrapped notices (including
@@ -746,7 +789,17 @@ async function handleMessages(
     );
     opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
     capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
-    return logged(forwardRaw(req, res, routedBody, opts, upstream, rec));
+    return logged(
+      forwardRaw(
+        req,
+        res,
+        routedBody,
+        opts,
+        upstream,
+        state.shutdownSignal,
+        rec
+      )
+    );
   }
 
   const compressStarted = Date.now();
@@ -756,7 +809,8 @@ async function handleMessages(
   const result = await opts.memtree.compress(
     hash,
     msgsForMemtree,
-    modelContextLimit
+    modelContextLimit,
+    state.shutdownSignal
   );
   const compressMs = Date.now() - compressStarted;
   rec.compress = {
@@ -797,7 +851,17 @@ async function handleMessages(
     } else if (mayQueueNotice && paymentDetail === null) {
       state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
     }
-    return logged(forwardRaw(req, res, forwardBody, opts, upstream, rec));
+    return logged(
+      forwardRaw(
+        req,
+        res,
+        forwardBody,
+        opts,
+        upstream,
+        state.shutdownSignal,
+        rec
+      )
+    );
   }
 
   const processed = result.messages;
@@ -859,7 +923,15 @@ async function handleMessages(
       recordTurn(rec, "followup-compressed", compressedRaw);
       capture(opts, "anthropic-request-memory", compressedRaw);
       return logged(
-        forwardRaw(req, res, compressedRaw, opts, upstream, rec).then(
+        forwardRaw(
+          req,
+          res,
+          compressedRaw,
+          opts,
+          upstream,
+          state.shutdownSignal,
+          rec
+        ).then(
           (delivered) => {
             rec.comparison!.deliveryOk = delivered;
             if (delivered && state.mainRouteEpoch === routeEpoch) {
@@ -1003,7 +1075,15 @@ async function handleMessages(
     });
   }
   return logged(
-    forwardRaw(req, res, compressedRaw, opts, upstream, rec).then(
+    forwardRaw(
+      req,
+      res,
+      compressedRaw,
+      opts,
+      upstream,
+      state.shutdownSignal,
+      rec
+    ).then(
       (delivered) => {
         if (!abRouting || !actuallyCompressed || !delivered) return;
         queueCompressionNotice({
@@ -1431,6 +1511,7 @@ async function handleCountTokens(
     forwardBody,
     opts,
     upstream,
+    state.shutdownSignal,
     undefined,
     (response) => {
       if (countKey === null) return;
@@ -1464,7 +1545,7 @@ interface ComparedSseArgs {
   rec: MessagesRecord;
   /** Request-received timestamp so delivery-complete can stamp rec.totalMs. */
   receivedAt: number;
-  /** Proxy-wide forced-shutdown signal, observed by speculative mode only. */
+  /** Proxy-wide forced-shutdown signal, observed by both comparison modes. */
   shutdownSignal: AbortSignal;
   /** Buffered mode only; speculative mode reports through onDeliveryComplete. */
   onDecision: (winner: AbWinner, selectedAlreadyComplete: boolean) => void;
@@ -1496,6 +1577,7 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
     unfoldedMemory,
     model,
     rec,
+    shutdownSignal,
     onDecision,
     onDeliveryComplete,
   } = args;
@@ -1530,8 +1612,9 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
   });
   const decisionAbort = new AbortController();
   let clientClosed = false;
+  let shutdownCancelled = false;
   const abortAll = () => {
-    if (!res.writableFinished) {
+    if (!res.writableFinished && !shutdownCancelled) {
       clientClosed = true;
       comparison.clientAborted = true;
     }
@@ -1540,8 +1623,26 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
     fullLeg.abort();
   };
   res.once("close", abortAll);
+  const cancelForShutdown = () => {
+    if (shutdownCancelled || res.writableFinished) return;
+    shutdownCancelled = true;
+    comparison.fallbackReason ??= "shutdown-cancelled";
+    comparison.delivered ??= "none";
+    comparison.deliveryOk = false;
+    rec.turnType = "followup-ab-failed";
+    decisionAbort.abort();
+    memoryLeg.abort();
+    fullLeg.abort();
+    // Proxy shutdown is not a downstream/client abort. Remove that classifier
+    // before the shared request registry tears down the response socket.
+    res.off("close", abortAll);
+    if (!res.destroyed && !res.writableEnded) res.destroy();
+  };
+  shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+  if (shutdownSignal.aborted) cancelForShutdown();
 
   try {
+    if (shutdownCancelled) return;
     memoryLeg.start();
     fullLeg.start();
 
@@ -1695,6 +1796,7 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
 
     decisionAbort.abort();
     const delivered = await selected.commitTo(res, notifyDecision);
+    if (shutdownCancelled) return;
     copyWinnerObservation(rec, selected.record);
     comparison.delivered = winner;
     comparison.deliveryOk = delivered;
@@ -1709,6 +1811,7 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
     memoryLeg.abort();
     fullLeg.abort();
     res.off("close", abortAll);
+    shutdownSignal.removeEventListener("abort", cancelForShutdown);
   }
 }
 
@@ -1883,12 +1986,17 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
   };
 
   /**
-   * Abort the shadow leg once it can no longer be spliced in. Before delivery
-   * has committed to A, B is still the only failover candidate — the
-   * pre-commit phase (not the shadow grade) owns its fate until then.
+   * Abort B only after it is no longer needed by either consumer: the shadow
+   * grade has settled and A has reached a clean downstream finish. Until that
+   * point B remains A's mid-stream recovery candidate, even when the verdict
+   * already selected A/tie or grading failed.
    */
   const releaseFullLeg = () => {
     if (
+      shadowSettled &&
+      deliverySettled &&
+      comparison.delivered === "memory" &&
+      comparison.deliveryOk === true &&
       committedLeg === "memory" &&
       !spliceStarted &&
       !pendingDeferredSplice &&
@@ -1898,11 +2006,24 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     }
   };
 
+  const markFullLegNotSse = (): void => {
+    comparison.interrupt = "blocked-full-not-sse";
+    comparison.fallbackReason = "full-leg-not-sse";
+  };
+
   /** Replay B into A's open envelope after the bridge block. */
   const replayFullLeg = (
     startIndex: number,
     kind: "spliced" | "recovered"
   ): void => {
+    // Defense in depth: a JSON message can be healthy for whole-response
+    // failover and grading, but the SSE splice writer cannot embed it in A's
+    // already-open event envelope.
+    if (!fullLeg.isSseResponse()) {
+      markFullLegNotSse();
+      failDelivery();
+      return;
+    }
     const writer = new SseSpliceWriter({ startIndex });
     fullLeg.streamTo({
       write: (chunk) => writeToClient(writer.push(chunk)),
@@ -1924,6 +2045,15 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
 
   const performSplice = (interrupt: ComparisonInterrupt): void => {
     if (spliceStarted || !forwarder || clientClosed) return;
+    // Check before stopping A or fabricating a bridge. A B verdict with a
+    // non-SSE B is safely blocked; recovery has no valid continuation and
+    // must fail the delivery without emitting misleading bridge-only output.
+    if (!fullLeg.isSseResponse()) {
+      pendingDeferredSplice = false;
+      markFullLegNotSse();
+      if (interrupt === "recovered") failDelivery();
+      return;
+    }
     spliceStarted = true;
     pendingDeferredSplice = false;
     comparison.interrupt = interrupt;
@@ -2044,9 +2174,10 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     if (forwarder?.sawMessageStop) {
       // The full message is on the wire; a late upstream hiccup is irrelevant.
       if (!res.destroyed && !res.writableEnded) res.end();
-      void waitForResponseFinishOrClose(res).then((flushed) =>
-        finishDelivery("memory", flushed)
-      );
+      void waitForResponseFinishOrClose(res).then((flushed) => {
+        finishDelivery("memory", flushed);
+        releaseFullLeg();
+      });
       return;
     }
     void recoverFromFullLeg();
@@ -2058,6 +2189,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       // Degenerate upstream (JSON body on a stream request): raw passthrough.
       const ok = await memoryLeg.commitTo(res);
       finishDelivery("memory", ok);
+      releaseFullLeg();
       return;
     }
     comparison.clientTtfbMs = Date.now() - started;
@@ -2279,8 +2411,8 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       if (verdict && winnerForVerdict(verdict.verdict) === "full") {
         attemptInterrupt();
       }
-      // B has served its grading purpose; keep it only if a splice (or a
-      // pending deferred splice / whole-B delivery) is consuming it.
+      // B has served its grading purpose, but remains A's recovery candidate
+      // until A itself has completed cleanly.
       releaseFullLeg();
       return verdict;
     })();
@@ -3263,6 +3395,7 @@ function forwardRaw(
   bodyBuffer: Buffer,
   opts: ProxyOptions,
   upstream: Upstream,
+  shutdownSignal: AbortSignal,
   rec?: MessagesRecord,
   onJsonResponse?: (body: Buffer) => void
 ): Promise<boolean> {
@@ -3285,6 +3418,7 @@ function forwardRaw(
     let protocolComplete = false;
     let successfulStatus = false;
     let clientAborted = false;
+    let shutdownCancelled = false;
     let upstreamReq: http.ClientRequest | undefined;
     let activeUpstreamRes: http.IncomingMessage | undefined;
 
@@ -3293,6 +3427,7 @@ function forwardRaw(
       settled = true;
       res.off("finish", onResponseFinish);
       res.off("close", onResponseClose);
+      shutdownSignal.removeEventListener("abort", cancelForShutdown);
       resolve(ok);
     };
     const maybeSettle = () => {
@@ -3305,7 +3440,7 @@ function forwardRaw(
       maybeSettle();
     };
     const onResponseClose = () => {
-      if (res.writableFinished) return;
+      if (res.writableFinished || shutdownCancelled) return;
       clientAborted = true;
       activeUpstreamRes?.destroy();
       upstreamReq?.destroy();
@@ -3320,8 +3455,24 @@ function forwardRaw(
       }
       maybeSettle();
     };
+    const cancelForShutdown = () => {
+      if (settled || shutdownCancelled) return;
+      shutdownCancelled = true;
+      // Teardown is proxy-owned. Detach the ordinary client-close classifier
+      // before destroying either side of the pipe.
+      res.off("close", onResponseClose);
+      activeUpstreamRes?.destroy();
+      upstreamReq?.destroy();
+      if (!res.destroyed && !res.writableEnded) res.destroy();
+      settle(false);
+    };
     res.once("finish", onResponseFinish);
     res.once("close", onResponseClose);
+    shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+    if (shutdownSignal.aborted) {
+      cancelForShutdown();
+      return;
+    }
 
     upstreamReq = upstream.module.request(
       {
@@ -3543,7 +3694,9 @@ function forwardRaw(
     );
 
     upstreamReq.on("error", (err) => {
-      sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+      if (!shutdownCancelled) {
+        sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+      }
       settle(false);
     });
 
@@ -3575,7 +3728,8 @@ function isCompleteJsonResponse(
 function passThroughStreaming(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  upstream: Upstream
+  upstream: Upstream,
+  shutdownSignal: AbortSignal
 ): Promise<void> {
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
@@ -3586,7 +3740,40 @@ function passThroughStreaming(
     if (req.headers["content-length"] !== undefined) {
       headers["content-length"] = req.headers["content-length"];
     }
-    const upstreamReq = upstream.module.request(
+    let settled = false;
+    let shutdownCancelled = false;
+    let upstreamReq: http.ClientRequest | undefined;
+    let activeUpstreamRes: http.IncomingMessage | undefined;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      res.off("close", onResponseClose);
+      shutdownSignal.removeEventListener("abort", cancelForShutdown);
+      resolve();
+    };
+    const onResponseClose = () => {
+      if (shutdownCancelled) return;
+      activeUpstreamRes?.destroy();
+      upstreamReq?.destroy();
+      settle();
+    };
+    const cancelForShutdown = () => {
+      if (settled || shutdownCancelled) return;
+      shutdownCancelled = true;
+      res.off("close", onResponseClose);
+      activeUpstreamRes?.destroy();
+      upstreamReq?.destroy();
+      if (!res.destroyed && !res.writableEnded) res.destroy();
+      settle();
+    };
+    res.once("close", onResponseClose);
+    shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+    if (shutdownSignal.aborted) {
+      cancelForShutdown();
+      return;
+    }
+
+    upstreamReq = upstream.module.request(
       {
         host: upstream.host,
         port: upstream.port,
@@ -3595,23 +3782,25 @@ function passThroughStreaming(
         headers,
       },
       (upstreamRes) => {
+        activeUpstreamRes = upstreamRes;
         res.writeHead(
           upstreamRes.statusCode ?? 502,
           forwardableResponseHeaders(upstreamRes)
         );
         upstreamRes.pipe(res);
-        upstreamRes.on("end", resolve);
+        upstreamRes.on("end", settle);
         upstreamRes.on("error", () => {
           res.destroy();
-          resolve();
+          settle();
         });
       }
     );
     upstreamReq.on("error", (err) => {
-      sendAnthropicError(res, `upstream connection failed: ${err.message}`);
-      resolve();
+      if (!shutdownCancelled) {
+        sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+      }
+      settle();
     });
-    res.on("close", () => upstreamReq.destroy());
     req.pipe(upstreamReq);
   });
 }

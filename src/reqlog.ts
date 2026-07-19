@@ -88,6 +88,7 @@ export type ComparisonInterrupt =
   | "spliced"
   | "deferred-then-spliced"
   | "blocked-tool-use"
+  | "blocked-full-not-sse"
   | "late-verdict"
   | "recovered";
 

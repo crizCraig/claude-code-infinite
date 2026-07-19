@@ -2189,6 +2189,71 @@ test("speculative: expired drain cancels a stalled shadow and logs before return
   }
 });
 
+test("buffered: expired drain cancels both stalled legs without a client-abort label", async () => {
+  const records = [];
+  let grades = 0;
+  const upstream = await speculativeUpstream({
+    memory: () => {},
+    full: () => {},
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: false,
+      forceComparison: true,
+      prefixChars: 4,
+      prefixTimeoutMs: 60_000,
+      grader: async () => {
+        grades++;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  const clientDone = postStreamingTurn(proxy).then(
+    (response) => response.text().then(() => undefined),
+    () => undefined
+  );
+
+  try {
+    await waitFor(
+      () => upstream.calls.filter(({ body }) => body.stream === true).length === 2
+    );
+    let guard;
+    const complete = await Promise.race([
+      proxy.drain(1),
+      new Promise((_, reject) => {
+        guard = setTimeout(
+          () => reject(new Error("proxy drain did not cancel buffered legs")),
+          1_000
+        );
+      }),
+    ]).finally(() => clearTimeout(guard));
+
+    assert.equal(complete, false, "the grace deadline forced cancellation");
+    const record = records.find(
+      (item) => item.kind === "messages" && item.comparison?.attempted
+    );
+    assert.ok(record, "request finalizer logged before drain returned");
+    assert.equal(record.turnType, "followup-ab-failed");
+    assert.equal(record.comparison.delivered, "none");
+    assert.equal(record.comparison.deliveryOk, false);
+    assert.equal(record.comparison.fallbackReason, "shutdown-cancelled");
+    assert.equal(record.comparison.clientAborted, undefined);
+    assert.equal(grades, 0);
+    await waitFor(
+      () => upstream.closed.has("memory") && upstream.closed.has("full")
+    );
+    await clientDone;
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("speculative: a B verdict splices full history into the live memory stream", async () => {
   const records = [];
   const gradeGate = deferred();
@@ -2348,6 +2413,73 @@ test("speculative: transformed splices discard upstream length metadata", async 
 
     await waitFor(() => speculativeRecord(records) !== undefined);
     assert.equal(speculativeRecord(records).comparison.deliveryOk, true);
+  } finally {
+    gradeGate.resolve();
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: a B verdict cannot splice a non-SSE full leg", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const memory = sseSplit("MEMORY_ANSWER");
+  const fullJson = JSON.stringify({
+    type: "message",
+    content: [{ type: "text", text: "FULL_JSON_ANSWER" }],
+  });
+  const upstream = await speculativeUpstream(
+    {
+      memory: (res) => {
+        memoryRes = res;
+        res.write(memory.head);
+      },
+      full: (res) => res.end(fullJson),
+    },
+    { full: { "content-type": "application/json" } }
+  );
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_ANSWER");
+    gradeGate.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    memoryRes.end(memory.tail);
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /MEMORY_ANSWER/);
+    assert.match(raw, /message_stop/);
+    assert.doesNotMatch(raw, /Correcting course/);
+    assert.doesNotMatch(raw, /FULL_JSON_ANSWER/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-memory");
+    assert.equal(record.comparison.interrupt, "blocked-full-not-sse");
+    assert.equal(record.comparison.fallbackReason, "full-leg-not-sse");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.winner, "full");
+    assert.equal(record.comparison.verdict, "B");
+    assert.equal(record.comparison.deliveryOk, true);
   } finally {
     gradeGate.resolve();
     memoryRes?.destroy();
@@ -2683,6 +2815,137 @@ test("speculative: a memory leg dying mid-stream recovers from the full leg", as
     assert.equal(record.comparison.deliveryOk, true);
   } finally {
     gradeGate.resolve();
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: an early A verdict retains B for later mid-stream recovery", async () => {
+  const records = [];
+  const gradeReturned = deferred();
+  let memoryRes;
+  let fullRes;
+  const full = sseSplit("FULL_ANSWER");
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+    },
+    full: (res) => {
+      fullRes = res;
+      res.write(full.head);
+    },
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        gradeReturned.resolve();
+        return fusionVerdict("A");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    await gradeReturned.promise;
+    // Let the shadow task apply its A verdict before A fails. B must remain
+    // live until A reaches a clean downstream finish, not merely until grade.
+    await new Promise((resolve) => setImmediate(resolve));
+    fullRes.end(full.tail);
+    memoryRes.destroy();
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /MEMORY_HEAD/);
+    assert.match(raw, /cut off/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-recovered");
+    assert.equal(record.comparison.interrupt, "recovered");
+    assert.equal(record.comparison.delivered, "recovered");
+    assert.equal(record.comparison.winner, "memory");
+    assert.equal(record.comparison.verdict, "A");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    memoryRes?.destroy();
+    fullRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: recovery rejects a healthy non-SSE full leg", async () => {
+  const records = [];
+  const gradeReturned = deferred();
+  let memoryRes;
+  const fullJson = JSON.stringify({
+    type: "message",
+    content: [{ type: "text", text: "FULL_JSON_ANSWER" }],
+  });
+  const upstream = await speculativeUpstream(
+    {
+      memory: (res) => {
+        memoryRes = res;
+        res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+      },
+      full: (res) => res.end(fullJson),
+    },
+    { full: { "content-type": "application/json" } }
+  );
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        gradeReturned.resolve();
+        return fusionVerdict("A");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    await gradeReturned.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    memoryRes.destroy();
+    await assert.rejects(() => readRest(reader, acc));
+
+    assert.match(acc.text, /MEMORY_HEAD/);
+    assert.doesNotMatch(acc.text, /cut off/);
+    assert.doesNotMatch(acc.text, /Correcting course/);
+    assert.doesNotMatch(acc.text, /FULL_JSON_ANSWER/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-failed");
+    assert.equal(record.comparison.interrupt, "blocked-full-not-sse");
+    assert.equal(record.comparison.fallbackReason, "full-leg-not-sse");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.winner, "memory");
+    assert.equal(record.comparison.verdict, "A");
+    assert.equal(record.comparison.deliveryOk, false);
+  } finally {
     memoryRes?.destroy();
     proxy.close();
     upstream.close();

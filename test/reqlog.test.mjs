@@ -218,6 +218,70 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
   }
 });
 
+test("proxy drain cancels a stalled raw turn and logs it before returning", async () => {
+  const records = [];
+  let markUpstreamStarted;
+  const upstreamStarted = new Promise((resolve) => {
+    markUpstreamStarted = resolve;
+  });
+  let stalledResponse;
+  const upstream = await listen((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      stalledResponse = res;
+      markUpstreamStarted();
+      // Deliberately never respond. Forced proxy drain owns cancellation.
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "unused" }],
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+  });
+  const clientDone = fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-x",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "first question" }],
+    }),
+  }).then(
+    (response) => response.text().then(() => undefined),
+    () => undefined
+  );
+
+  try {
+    await upstreamStarted;
+    let guard;
+    const complete = await Promise.race([
+      proxy.drain(1),
+      new Promise((_, reject) => {
+        guard = setTimeout(
+          () => reject(new Error("proxy drain did not force-cancel raw request")),
+          1_000
+        );
+      }),
+    ]).finally(() => clearTimeout(guard));
+
+    assert.equal(complete, false, "the grace deadline forced cancellation");
+    const messageRecords = records.filter((record) => record.kind === "messages");
+    assert.equal(messageRecords.length, 1, "request finalizer ran before drain returned");
+    assert.equal(messageRecords[0].turnType, "first-user");
+    assert.equal(typeof messageRecords[0].totalMs, "number");
+    await waitFor(() => stalledResponse.destroyed);
+    await clientDone;
+  } finally {
+    stalledResponse?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("unwritable log path never breaks proxying", async () => {
   // A regular FILE where the log's parent dir should be: mkdir and every
   // append fail. The logger must swallow that and the proxy must still work.
