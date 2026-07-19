@@ -17,7 +17,7 @@
 
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import type { RequestLogger } from "./reqlog.js";
+import type { RequestLogSink } from "./reqlog.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -45,7 +45,7 @@ export interface MemtreeOptions {
   compressTimeoutMs?: number;
   debug?: boolean;
   /** Always-on JSONL diagnostics; every MemTree call logs one line. */
-  reqlog?: RequestLogger;
+  reqlog?: RequestLogSink;
 }
 
 export interface CompressResult {
@@ -107,7 +107,7 @@ export class MemtreeClient {
   private apiKey: string;
   private compressTimeoutMs: number;
   private debug: boolean;
-  private reqlog: RequestLogger | undefined;
+  private reqlog: RequestLogSink | undefined;
   /** messages-hash → in-flight/settled compression promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
   /** messages-hashes already submitted for background indexing. */

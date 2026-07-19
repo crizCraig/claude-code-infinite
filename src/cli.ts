@@ -30,6 +30,7 @@ import {
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail } from "./notices.js";
+import { parseWrapperArgs } from "./cli-args.js";
 import { projectTranscriptDir, startTranscriptScrubber } from "./scrub.js";
 import {
   getPolychatApiKey,
@@ -45,6 +46,8 @@ const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
 const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
+const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
+const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 
 type Mode = "production" | "staging" | "local";
 
@@ -179,14 +182,9 @@ function installedClaudeSupportsMessageDisplay(): boolean {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const isDebugMode = args.includes("--debug");
-  // Research escape hatch: retain the old buffer-both-then-commit A/B mode
-  // instead of the default speculative commit-A-immediately delivery.
-  const isAbBuffered = args.includes("--ab-buffered");
-  const filteredArgs = args.filter(
-    (arg) => arg !== "--debug" && arg !== "--ab-buffered"
-  );
+  const parsedArgs = parseWrapperArgs(process.argv.slice(2));
+  const isDebugMode = parsedArgs.debug;
+  const filteredArgs = parsedArgs.claudeArgs;
 
   const mode: Mode =
     filteredArgs[0] === "local" ? "local" :
@@ -274,7 +272,9 @@ async function main() {
           ),
           sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
           forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
-          speculative: !isAbBuffered,
+          // Buffered delivery is the safe default until real-Claude replay S1
+          // validates spliced assistant transcripts end to end.
+          speculative: parsedArgs.speculativeAb,
         };
   const proxy = await startProxy({
     memtree,
@@ -347,26 +347,36 @@ async function main() {
     stdio: "inherit",
   });
 
+  let shuttingDown = false;
+  const shutdown = async (code: number): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      // Final in-place pass: the last turn's notice may have just been appended.
+      await scrubber.flush();
+    } finally {
+      noticePlugin?.close();
+      scrubber.close();
+      // A speculative response can finish before its shadow grader. Stop new
+      // proxy work and give active handlers a bounded chance to finalize their
+      // verdict records, then wait for scheduled JSONL appends to reach disk.
+      await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+      await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
+      process.exit(code);
+    }
+  };
+
   child.on("error", (err: Error) => {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       console.error("Could not find 'claude' command. Make sure Claude Code is installed.");
     } else {
       console.error("Failed to start claude:", err.message);
     }
-    noticePlugin?.close();
-    scrubber.close();
-    proxy.close();
-    process.exit(1);
+    void shutdown(1);
   });
 
   child.on("exit", (code: number | null) => {
-    // Final in-place pass: the last turn's notice may have just been appended.
-    void scrubber.flush().then(() => {
-      noticePlugin?.close();
-      scrubber.close();
-      proxy.close();
-      process.exit(code ?? 0);
-    });
+    void shutdown(code ?? 0);
   });
 }
 

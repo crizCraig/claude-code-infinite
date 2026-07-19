@@ -69,9 +69,9 @@ export interface AbRoutingOptions {
   /** Debug/test escape hatch; bypasses the effective-context gate. */
   forceComparison?: boolean;
   /**
-   * Speculative delivery (default): commit the memory leg to the client from
-   * its first byte and treat a B verdict as an in-stream interruption. False
-   * retains the legacy buffer-both-then-commit mode (--ab-buffered).
+   * Unsafe research opt-in: commit the memory leg from its first byte and
+   * permit in-stream interruption. Buffered delivery remains the default until
+   * real-Claude transcript replay has been validated end to end.
    */
   speculative?: boolean;
   /** Model-visible bridge text emitted when a B verdict splices mid-message. */
@@ -140,7 +140,7 @@ export function resolveAbRoutingOptions(
       opts.effectiveContextTokens ?? effectiveContextForModel,
     sampleWhenNoPrior: opts.sampleWhenNoPrior ?? true,
     forceComparison: opts.forceComparison ?? false,
-    speculative: opts.speculative ?? true,
+    speculative: opts.speculative ?? false,
     bridgeText:
       typeof opts.bridgeText === "string" && opts.bridgeText.length > 0
         ? opts.bridgeText

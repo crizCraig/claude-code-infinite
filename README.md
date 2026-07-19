@@ -65,6 +65,7 @@ In interactive sessions, `ccc` reports these MemTree states as display-only line
 
 - `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used and the completed memory response was selected. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
 - `⚠ MemTree degraded — this turn ran uncompressed` when a blocking compression call fails or times out.
+- `⚠ MemTree degraded — memory response was interrupted; recovered from full history` when opt-in speculative delivery emitted a compressed-memory prefix before recovering the rest of the turn from the full-history leg.
 - `⚠ MemTree is off — payment required…` once when compression and indexing are disabled for payment.
 
 `ccc` installs a minimal session-only Claude Code plugin using the repeatable `--plugin-dir` option. Its `MessageDisplay` hook changes only what the terminal renders and never alters stored assistant content; a `Stop` hook supplies a fallback for tool-only responses. That fallback may be saved by Claude Code as non-model hook UI metadata, but it is excluded from resumed model and recap requests. Notices are never added to Anthropic responses or model context, and `-p`/non-TTY output is left unchanged. Legacy marker cleanup remains for transcripts created by older `ccc` releases. The payment state can also produce a separate terminal warning at startup.
@@ -86,16 +87,17 @@ When you send a message, we retrieve relevant details and summaries from the pri
 
 1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
 2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
-3. The memory answer streams to the client immediately (speculative delivery — first-token latency is A's own). The semantic prefix of each answer (about 1,000 tokens) is graded in the background by a structured Anthropic grader; A and ties keep memory, and only a materially better B interrupts the in-flight message, visibly correcting course with a short bridge line before continuing from the full-history answer.
+3. By default, both semantic prefixes (about 1,000 tokens each) are buffered while a structured Anthropic grader chooses the response to deliver. A and ties keep memory; only a materially better B selects full history. Experimental speculative delivery can instead stream A immediately and let a B verdict visibly correct course in flight.
 4. A memory winner remains active through that human turn's tool loop, including matching Count Tokens calls. The original full tool history is still sent to MemTree for background indexing.
 
-Comparison is deliberately fail-safe: grader failure or timeout keeps memory (the grader is retried once off the delivery path), a memory arm that dies mid-stream is recovered from the healthy full-history arm, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. Once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
+Comparison is deliberately fail-safe: grader failure or timeout keeps memory; in speculative research mode, a failed grader gets one off-path retry. A memory arm that dies mid-stream is recovered from the healthy full-history arm when doing so is transcript-safe, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. In speculative mode, once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
 
-Qualifying turns cost more: they make two answer requests plus one grader request on the user's Anthropic subscription or API account. The gate avoids that overhead for compact contexts, and the losing answer is aborted right after grading.
+Qualifying turns cost more: they make two answer requests plus one grader attempt on the user's Anthropic subscription or API account. Speculative mode may make a second grader attempt after a retryable failure, for up to four Anthropic requests on that comparison turn. The gate avoids that overhead for compact contexts, and the losing answer is aborted right after grading.
 
 Advanced/testing controls:
 
-- `ccc --ab-buffered` retains the previous buffer-both-then-commit delivery (for research comparison runs); the default is speculative delivery.
+- Buffered, grade-before-delivery A/B routing is the safe default.
+- `ccc --ab-speculative` explicitly enables experimental commit-A-immediately delivery and SSE splicing. Use only for research until the real-Claude replay spike is complete. `--ab-buffered` remains accepted as an explicit/compatibility override.
 
 - `CCC_AB_ROUTING=0` disables live A/B routing.
 - `CCC_AB_GRADER_MODEL=<model>` overrides the default grader (`claude-opus-4-8`).

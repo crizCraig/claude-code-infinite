@@ -11,8 +11,8 @@
 >
 > **STATUS 2026-07-18: IMPLEMENTED (P1–P4 unit/integration).** `src/splice.ts`
 > (event-aligned forwarder + `SseSpliceWriter`), speculative orchestration in
-> `src/proxy.ts` (`forwardSpeculativeSse`; buffered mode retained behind
-> `--ab-buffered`), bookkeeping/notices/reqlog fields, and the P4 fake-upstream
+> `src/proxy.ts` (`forwardSpeculativeSse`; buffered mode remains the safe
+> default and `--ab-speculative` opts in), bookkeeping/notices/reqlog fields, and the P4 fake-upstream
 > scenarios are in. One deviation, made for robustness: an A leg that is
 > healthy but produces NO stream progress within `prefixTimeoutMs` while B is
 > already producing fails over to whole-B (`memory-no-progress-before-commit`)
@@ -20,7 +20,8 @@
 > **Outstanding:** Spike S1 (franken-message replay against real Anthropic
 > with CC headers — needs a live session) and the P4 manual staging pass
 > (yoyo ping TTFT check; forced-B splice UX eyeball). Until S1 passes, splice
-> risk is bounded by the tool_use lockout rules plus `--ab-buffered`.
+> risk is gated behind explicit `--ab-speculative` opt-in in addition to the
+> tool_use lockout rules.
 
 ## Motivation (measured, not hypothetical)
 
@@ -183,8 +184,8 @@ buffering role for B and gains nothing A-specific (A's forwarder wraps its
 observer).
 
 **P3 — bookkeeping:** reqlog fields, turnTypes, notices, route updates,
-`abRouting.speculative` option (default **on**; `--ab-buffered` CLI escape
-hatch retains the old mode for research comparison runs).
+`abRouting.speculative` option (default **off** until S1 passes;
+`--ab-speculative` enables the research mode explicitly).
 
 **P4 — tests + verification:** extend `test/ab-routing.test.mjs` fake-upstream
 harness: slow-B/fast-A (A wins, late verdict logged), B-verdict mid-A-text

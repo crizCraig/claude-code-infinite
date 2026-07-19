@@ -22,9 +22,12 @@ which A/B legs ran. Today that requires tailing
 
 Hard constraint carried forward from repo history: **Anthropic response bytes
 are never rewritten, and no notice may enter stored/model-visible content.**
-The inject-and-strip design is dead; everything below rides the existing
-hook plugin (`createSessionNoticePlugin`, `src/hooks.ts:334`) and the
-randomized localhost hook endpoint (`handleNoticeHook`, `src/proxy.ts:353`).
+The sole explicit response-byte exception is opt-in speculative A/B delivery:
+its SSE splice closes/renumbers blocks and adds a model-visible correction or
+recovery bridge by design. Those bridge blocks are response content, not
+notices; every transparency/MemTree status line below still rides the existing
+hook plugin (`createSessionNoticePlugin`, `src/hooks.ts:334`) and the randomized
+localhost hook endpoint (`handleNoticeHook`, `src/proxy.ts:353`).
 
 ## Current behavior (what the plumbing can and cannot do)
 

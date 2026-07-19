@@ -177,8 +177,16 @@ export interface NoticeRecord {
   via: "MessageDisplay" | "Stop";
 }
 
-export class RequestLogger {
+export type RequestRecord = MessagesRecord | MemtreeRecord | NoticeRecord;
+
+/** Structural logging seam retained for embedders and focused tests. */
+export interface RequestLogSink {
+  log(record: RequestRecord): void;
+}
+
+export class RequestLogger implements RequestLogSink {
   readonly path: string;
+  private readonly pendingWrites = new Set<Promise<void>>();
 
   constructor(filePath?: string) {
     this.path = filePath ?? defaultLogPath();
@@ -191,16 +199,54 @@ export class RequestLogger {
   }
 
   /** Fire-and-forget append of one JSONL line. Never throws, never blocks. */
-  log(record: MessagesRecord | MemtreeRecord | NoticeRecord): void {
+  log(record: RequestRecord): void {
     try {
       const line =
         JSON.stringify({ ts: new Date().toISOString(), ...record }) + "\n";
-      appendFile(this.path, line, () => {
-        // Write errors are swallowed: diagnostics must never break proxying.
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
       });
+      const settle = () => {
+        this.pendingWrites.delete(pending);
+        finish();
+      };
+      this.pendingWrites.add(pending);
+      try {
+        appendFile(this.path, line, settle);
+      } catch {
+        settle();
+      }
     } catch {
       // Serialization/scheduling failure — same policy.
     }
+  }
+
+  /**
+   * Shutdown-only durability seam. Wait for already-scheduled appends without
+   * making normal proxy logging synchronous; false means the bounded wait
+   * expired. Callers should stop request producers before invoking this.
+   */
+  async flush(timeoutMs = 2_000): Promise<boolean> {
+    const boundedMs =
+      Number.isFinite(timeoutMs) && timeoutMs >= 0
+        ? Math.floor(timeoutMs)
+        : 2_000;
+    const deadline = Date.now() + boundedMs;
+    while (this.pendingWrites.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer: NodeJS.Timeout | undefined;
+      const completed = await Promise.race([
+        Promise.allSettled([...this.pendingWrites]).then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), remaining);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!completed) return false;
+    }
+    return true;
   }
 }
 

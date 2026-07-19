@@ -255,6 +255,18 @@ test("unwritable log path never breaks proxying", async () => {
   }
 });
 
+test("RequestLogger.flush waits for scheduled JSONL appends", async () => {
+  const logPath = tempLogPath();
+  const reqlog = new RequestLogger(logPath);
+  reqlog.log({ kind: "notice", event: "claimed", via: "Stop" });
+
+  assert.equal(await reqlog.flush(1_000), true);
+  assert.deepEqual(
+    readRecords(logPath).map(({ ts: _ts, ...record }) => record),
+    [{ kind: "notice", event: "claimed", via: "Stop" }]
+  );
+});
+
 test("oversized log rotates to .1 at startup, overwriting any previous .1", () => {
   const logPath = tempLogPath();
   writeFileSync(`${logPath}.1`, "old rotation\n");

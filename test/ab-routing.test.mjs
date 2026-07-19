@@ -10,6 +10,7 @@ import {
   startProxy,
   MemtreeClient,
 } from "../dist/index.js";
+import { DrainAwareChunkQueue } from "../dist/proxy.js";
 
 function listen(handler) {
   return new Promise((resolve) => {
@@ -341,6 +342,8 @@ test("gate compares at the boundary and samples models without a prior", () => {
   const options = resolveAbRoutingOptions({
     effectiveContextTokens: () => 100_000,
   });
+  assert.equal(options.speculative, false, "buffered delivery is the safe default");
+  assert.equal(resolveAbRoutingOptions({ speculative: true }).speculative, true);
   assert.equal(abGateDecision("m", 49_999, options).compare, false);
   assert.equal(abGateDecision("m", 50_000, options).compare, true);
   const unknown = resolveAbRoutingOptions({
@@ -521,6 +524,7 @@ test("an unarmed local bang-command turn owns its compression notice", async () 
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => fusionVerdict("A"),
@@ -928,6 +932,7 @@ test("prefix timeout keeps a pending preferred memory leg instead of failing it"
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       prefixTimeoutMs: 10,
@@ -1501,6 +1506,7 @@ test("downstream cancellation after commit installs no memory route", async () =
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => fusionVerdict("A"),
@@ -1968,7 +1974,7 @@ function sseTextHead(index, text) {
 }
 
 /** Streaming upstream with per-leg handlers plus JSON tool-turn support. */
-async function speculativeUpstream(handlers) {
+async function speculativeUpstream(handlers, headersByKind = {}) {
   const calls = [];
   const closed = new Set();
   const server = await listen(async (req, res) => {
@@ -1987,11 +1993,57 @@ async function speculativeUpstream(handlers) {
       ? "memory"
       : "full";
     res.on("close", () => closed.add(kind));
-    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      ...(headersByKind[kind] ?? {}),
+    });
     handlers[kind](res);
   });
   return { ...server, calls, closed };
 }
+
+test("speculative replay stops at each slow-sink drain without overtaking", () => {
+  const writes = [];
+  const drains = [];
+  let ends = 0;
+  let writableCallbacks = 0;
+  const queue = new DrainAwareChunkQueue(
+    [Buffer.from("buffered-1"), Buffer.from("buffered-2")],
+    {
+      write: (chunk) => {
+        writes.push(chunk.toString("utf-8"));
+        // Model a slow ServerResponse: the first two accepted writes each
+        // require a distinct drain before another chunk may be submitted.
+        return writes.length > 2;
+      },
+      end: () => ends++,
+      drain: (resume) => drains.push(resume),
+    },
+    () => writableCallbacks++
+  );
+
+  queue.start();
+  assert.deepEqual(writes, ["buffered-1"]);
+  assert.equal(drains.length, 1);
+  assert.equal(queue.write(Buffer.from("live-after-replay")), false);
+  queue.finish();
+  assert.equal(ends, 0);
+
+  drains.shift()();
+  assert.deepEqual(writes, ["buffered-1", "buffered-2"]);
+  assert.equal(drains.length, 1, "exactly one next drain listener is armed");
+  assert.equal(ends, 0);
+
+  drains.shift()();
+  assert.deepEqual(writes, [
+    "buffered-1",
+    "buffered-2",
+    "live-after-replay",
+  ]);
+  assert.equal(drains.length, 0);
+  assert.equal(ends, 1, "end waits until the retained replay has drained");
+  assert.equal(writableCallbacks, 0, "an ending stream is never resumed");
+});
 
 async function readUntil(reader, marker) {
   const acc = { text: "" };
@@ -2017,7 +2069,7 @@ function speculativeRecord(records) {
   );
 }
 
-test("speculative: memory streams immediately and a late B verdict is logged, not applied", async () => {
+test("speculative: graceful drain retains a late verdict after memory delivery", async () => {
   const records = [];
   const releaseFull = deferred();
   let grades = 0;
@@ -2034,6 +2086,7 @@ test("speculative: memory streams immediately and a late B verdict is logged, no
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -2052,9 +2105,19 @@ test("speculative: memory streams immediately and a late B verdict is logged, no
     assert.equal(display.status, 200);
     assert.match(await display.text(), /conversation optimized/);
 
+    let drainSettled = false;
+    const draining = proxy.drain(2_000).then((complete) => {
+      drainSettled = true;
+      return complete;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(drainSettled, false, "shutdown waits for the shadow request");
+
     releaseFull.resolve();
-    await waitFor(() =>
-      records.some((record) => record.comparison?.verdict === "B")
+    assert.equal(await draining, true);
+    assert.ok(
+      records.some((record) => record.comparison?.verdict === "B"),
+      "request finalizer logged the shadow verdict before drain completed"
     );
     const record = speculativeRecord(records);
     assert.equal(record.turnType, "followup-ab-memory");
@@ -2091,6 +2154,7 @@ test("speculative: a B verdict splices full history into the live memory stream"
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -2177,6 +2241,70 @@ test("speculative: a B verdict splices full history into the live memory stream"
   }
 });
 
+test("speculative: transformed splices discard upstream length metadata", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const memoryHead = sseMessageStart + sseTextHead(0, "MEMORY_HEAD");
+  const upstream = await speculativeUpstream(
+    {
+      memory: (res) => {
+        memoryRes = res;
+        res.write(memoryHead);
+      },
+      full: (res) => res.end(sse("FULL_ANSWER")),
+    },
+    {
+      memory: {
+        // Deliberately describes only the unmodified A representation. The
+        // proxy must use its own framing once it can append bridge/B bytes.
+        "content-length": String(Buffer.byteLength(memoryHead) + 4096),
+        etag: '"memory-leg-bytes"',
+        "content-digest": "sha-256=:bWVtb3J5:",
+      },
+    }
+  );
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    assert.equal(response.headers.get("content-length"), null);
+    assert.equal(response.headers.get("etag"), null);
+    assert.equal(response.headers.get("content-digest"), null);
+
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    gradeGate.resolve();
+    const raw = await readRest(reader, acc);
+    assert.match(raw, /Correcting course/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    assert.equal(speculativeRecord(records).comparison.deliveryOk, true);
+  } finally {
+    gradeGate.resolve();
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("speculative: a B verdict during thinking defers until the block closes", async () => {
   const records = [];
   const gradeGate = deferred();
@@ -2211,6 +2339,7 @@ test("speculative: a B verdict during thinking defers until the block closes", a
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -2224,8 +2353,8 @@ test("speculative: a B verdict during thinking defers until the block closes", a
     const reader = response.body.getReader();
     const acc = await readUntil(reader, "mulling it over");
     gradeGate.resolve();
-    // Let the verdict land while A is mid-thinking, then close the block.
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Promise chains applying the verdict drain before the next event-loop turn.
+    await new Promise((resolve) => setImmediate(resolve));
     memoryRes.write(
       sseFrame("content_block_stop", { type: "content_block_stop", index: 1 })
     );
@@ -2284,6 +2413,7 @@ test("speculative: a delivered tool_use block locks out the splice", async () =>
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -2298,7 +2428,7 @@ test("speculative: a delivered tool_use block locks out the splice", async () =>
     const reader = response.body.getReader();
     const acc = await readUntil(reader, '"tool_use"');
     gradeGate.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await new Promise((resolve) => setImmediate(resolve));
     memoryRes.end(
       sseFrame("content_block_delta", {
         type: "content_block_delta",
@@ -2360,6 +2490,7 @@ test("speculative: a memory leg dying mid-stream recovers from the full leg", as
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -2383,7 +2514,10 @@ test("speculative: a memory leg dying mid-stream recovers from the full leg", as
 
     const stop = await claimStop(proxy);
     assert.equal(stop.status, 200);
-    assert.match(await stop.text(), /MemTree degraded/);
+    const recoveryNotice = await stop.text();
+    assert.match(recoveryNotice, /memory response was interrupted/);
+    assert.match(recoveryNotice, /recovered from full history/);
+    assert.doesNotMatch(recoveryNotice, /turn ran uncompressed/);
 
     gradeGate.resolve();
     await waitFor(() => speculativeRecord(records) !== undefined);
@@ -2403,6 +2537,125 @@ test("speculative: a memory leg dying mid-stream recovers from the full leg", as
   }
 });
 
+test("speculative: a terminal A error is suppressed before recovery from B", async () => {
+  const records = [];
+  const terminalGate = deferred();
+  const gradeGate = deferred();
+  const upstream = await speculativeUpstream({
+    memory: async (res) => {
+      res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+      await terminalGate.promise;
+      res.end(
+        sseFrame("error", {
+          type: "error",
+          error: { type: "overloaded_error", message: "try again" },
+        })
+      );
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    terminalGate.resolve();
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /MEMORY_HEAD/);
+    assert.match(raw, /cut off/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+    assert.doesNotMatch(raw, /event: error/);
+    assert.doesNotMatch(raw, /overloaded_error/);
+
+    gradeGate.resolve();
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-recovered");
+    assert.equal(record.comparison.interrupt, "recovered");
+    assert.equal(record.comparison.delivered, "recovered");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    terminalGate.resolve();
+    gradeGate.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: an A socket failure mid-thinking never fabricates a stop", async () => {
+  const records = [];
+  let memoryRes;
+  const thinkingHead =
+    sseMessageStart +
+    sseFrame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" },
+    }) +
+    sseFrame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "still thinking" },
+    });
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(thinkingHead);
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: { speculative: true, forceComparison: true, prefixChars: 4 },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "still thinking");
+    memoryRes.destroy();
+    await assert.rejects(() => readRest(reader, acc));
+
+    assert.match(acc.text, /still thinking/);
+    assert.doesNotMatch(acc.text, /content_block_stop/);
+    assert.doesNotMatch(acc.text, /signature_delta/);
+    assert.doesNotMatch(acc.text, /cut off/);
+    assert.doesNotMatch(acc.text, /FULL_ANSWER/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-failed");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.deliveryOk, false);
+  } finally {
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("speculative: grader 429s twice with one retry and no user impact", async () => {
   const records = [];
   let grades = 0;
@@ -2413,6 +2666,7 @@ test("speculative: grader 429s twice with one retry and no user impact", async (
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       graderRetryMinDelayMs: 1,
@@ -2463,6 +2717,7 @@ test("speculative: client disconnect during a splice tears everything down", asy
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: true,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {

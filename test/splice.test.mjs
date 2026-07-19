@@ -97,6 +97,25 @@ test("scanner yields complete frames only, across chunk boundaries and CRLF", ()
   assert.equal(partial.flush(), "event: message_stop\ndata: {");
 });
 
+test("scanner accepts CR-only and mixed separators and joins data fields", () => {
+  const scanner = new SseFrameScanner();
+  const crOnly =
+    'event: custom\rdata: {"type":"ping",\rdata: "sequence":1}\r\r';
+  const mixed =
+    'event: message_stop\ndata: {"type":"message_stop"}\r\n\n';
+  const frames = scanner.push(Buffer.from(crOnly + mixed));
+
+  assert.equal(frames.map((entry) => entry.raw).join(""), crOnly + mixed);
+  assert.deepEqual(
+    frames.map(({ event, data }) => ({ event, data })),
+    [
+      { event: "custom", data: { type: "ping", sequence: 1 } },
+      { event: "message_stop", data: { type: "message_stop" } },
+    ]
+  );
+  assert.equal(scanner.flush(), "");
+});
+
 test("forwarder forwards events verbatim and tracks block state exactly", () => {
   let written = "";
   const forwarder = new SseEventForwarder({
@@ -179,6 +198,49 @@ test("forwarder reports backpressure from the write callback", () => {
   assert.deepEqual(results, ["write"]);
 });
 
+test("forwarder suppresses a terminal error before signaling recovery", () => {
+  let written = "";
+  let terminal;
+  const forwarder = new SseEventForwarder({
+    write: (bytes) => {
+      written += bytes;
+      return true;
+    },
+    onTerminalError: (fwd, data) => {
+      terminal = { stopped: fwd.isStopped(), data };
+    },
+  });
+  const head =
+    messageStart +
+    frame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }) +
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "partial" },
+    });
+  const error = frame("error", {
+    type: "error",
+    error: { type: "overloaded_error", message: "try again" },
+  });
+
+  forwarder.push(Buffer.from(head + error + messageTail));
+
+  assert.equal(written, head);
+  assert.deepEqual(terminal, {
+    stopped: true,
+    data: {
+      type: "error",
+      error: { type: "overloaded_error", message: "try again" },
+    },
+  });
+  assert.equal(forwarder.sawTerminalError, true);
+  assert.equal(forwarder.sawMessageStop, false);
+});
+
 test("splice writer drops envelope/thinking/pings and renumbers from startIndex", () => {
   const writer = new SseSpliceWriter({ startIndex: 5 });
   const input =
@@ -219,6 +281,23 @@ test("splice writer survives frames split across pushes and orphan indices", () 
     )
   );
   assert.equal(orphan, "");
+  const malformed = writer.push(
+    Buffer.from(
+      frame("content_block_start", {
+        type: "content_block_start",
+        index: "9",
+        content_block: { type: "text", text: "must not escape" },
+      }) +
+        frame("content_block_delta", {
+          type: "content_block_delta",
+          index: -1,
+          delta: { type: "text_delta", text: "must not escape" },
+        })
+    )
+  );
+  assert.equal(malformed, "");
+  assert.equal(writer.push(Buffer.from("data: null\n\n")), "");
+  assert.equal(writer.push(Buffer.from("data: 42\n\n")), "");
   writer.flush();
 });
 

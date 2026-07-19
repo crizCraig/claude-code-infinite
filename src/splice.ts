@@ -24,15 +24,17 @@ export const RECOVERY_BRIDGE_TEXT =
 /** One complete SSE frame: its verbatim bytes plus parsed data (if any). */
 export interface SseFrame {
   raw: string;
-  /** Parsed first data: line; undefined for comment/ping-only or invalid JSON. */
+  /** Last event: field, when one was supplied. */
+  event?: string;
+  /** Parsed, joined data: fields; undefined for no data or invalid JSON. */
   data?: any;
 }
 
 /**
- * Incremental SSE frame splitter — the same boundary machinery
- * SseNoticeRewriter uses (double-LF or double-CRLF separators, multibyte-safe
- * via StringDecoder). Yields only COMPLETE frames; a partial tail stays
- * buffered so callers always operate on exact event boundaries.
+ * Incremental, multibyte-safe SSE frame splitter. Every CRLF, bare CR, or LF
+ * is a line ending, and an empty line dispatches an event; mixed line endings
+ * are therefore accepted as required by the event-stream grammar. Yields only
+ * COMPLETE frames so callers always operate on exact event boundaries.
  */
 export class SseFrameScanner {
   private decoder = new StringDecoder("utf8");
@@ -42,15 +44,11 @@ export class SseFrameScanner {
     this.buf += this.decoder.write(chunk);
     const frames: SseFrame[] = [];
     while (true) {
-      const lfSep = this.buf.indexOf("\n\n");
-      const crlfSep = this.buf.indexOf("\r\n\r\n");
-      if (lfSep === -1 && crlfSep === -1) break;
-      const useCrlf = crlfSep !== -1 && (lfSep === -1 || crlfSep < lfSep);
-      const sep = useCrlf ? crlfSep : lfSep;
-      const frameEnd = sep + (useCrlf ? 4 : 2);
+      const frameEnd = findSseFrameEnd(this.buf);
+      if (frameEnd === -1) break;
       const raw = this.buf.slice(0, frameEnd);
       this.buf = this.buf.slice(frameEnd);
-      frames.push({ raw, data: parseFrameData(raw) });
+      frames.push({ raw, ...parseFrameFields(raw) });
     }
     return frames;
   }
@@ -63,15 +61,29 @@ export class SseFrameScanner {
   }
 }
 
-function parseFrameData(rawEvent: string): any {
-  const dataLine = rawEvent
-    .split("\n")
-    .find((line) => line.startsWith("data:"));
-  if (!dataLine) return undefined;
+/** CRLF is atomic here: a single CRLF must not look like two blank lines. */
+function findSseFrameEnd(input: string): number {
+  const match = /(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)/.exec(input);
+  return match ? match.index + match[0].length : -1;
+}
+
+function parseFrameFields(rawEvent: string): Pick<SseFrame, "event" | "data"> {
+  let event: string | undefined;
+  const dataLines: string[] = [];
+  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
+    if (line === "" || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") dataLines.push(value);
+  }
+  if (dataLines.length === 0) return event === undefined ? {} : { event };
   try {
-    return JSON.parse(dataLine.slice(5).trim());
+    return { event, data: JSON.parse(dataLines.join("\n")) };
   } catch {
-    return undefined;
+    return event === undefined ? {} : { event };
   }
 }
 
@@ -121,6 +133,12 @@ export interface SseForwarderOptions {
    * event boundary (a stop() here discards the rest of the current chunk).
    */
   afterEvent?: (forwarder: SseEventForwarder, data: any) => void;
+  /**
+   * Called instead of writing an upstream terminal error frame. The forwarder
+   * is stopped first, allowing the delivery controller to recover from B
+   * without ever exposing an error followed by a second answer.
+   */
+  onTerminalError?: (forwarder: SseEventForwarder, data: any) => void;
 }
 
 /**
@@ -137,6 +155,7 @@ export class SseEventForwarder {
   /** message_delta forwarded — the message is closing; treat window as shut. */
   sawMessageDelta = false;
   sawMessageStop = false;
+  sawTerminalError = false;
   /** Highest content block index forwarded to the client. */
   maxIndex = -1;
   /** Client-visible answer-text characters delivered (for spliceAtChars). */
@@ -152,6 +171,12 @@ export class SseEventForwarder {
     let writable = true;
     for (const frame of this.scanner.push(chunk)) {
       if (this.stopped) break;
+      if (frame.event === "error" || frame.data?.type === "error") {
+        this.sawTerminalError = true;
+        this.stopped = true;
+        this.opts.onTerminalError?.(this, frame.data);
+        break;
+      }
       this.observe(frame.data);
       if (!this.opts.write(frame.raw)) writable = false;
       if (this.opts.afterEvent) this.opts.afterEvent(this, frame.data);
@@ -235,7 +260,7 @@ export class SseSpliceWriter {
 
   private transform(frame: SseFrame): string {
     const data = frame.data;
-    if (data === undefined) return ""; // comments / keep-alives
+    if (!data || typeof data !== "object" || Array.isArray(data)) return "";
     const type = data.type;
     if (type === "message_start" || type === "ping") return "";
 
@@ -243,7 +268,10 @@ export class SseSpliceWriter {
       type === "content_block_start" ||
       type === "content_block_delta" ||
       type === "content_block_stop";
-    if (isContentEvent && typeof data.index === "number") {
+    if (isContentEvent) {
+      // Malformed content events must never escape with B's original index:
+      // doing so could collide with A or the bridge block on the client wire.
+      if (!Number.isSafeInteger(data.index) || data.index < 0) return "";
       if (type === "content_block_start") {
         if (isThinkingBlockType(data.content_block?.type)) {
           this.droppedIndices.add(data.index);

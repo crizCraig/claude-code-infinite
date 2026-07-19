@@ -26,7 +26,8 @@
  *
  * Every /v1/messages and count_tokens body is run through the legacy notice
  * strip pass before hashing/forwarding. Live notices use Claude Code hooks and
- * the selected upstream response bytes are passed through unchanged.
+ * selected upstream response bytes pass through unchanged in the default
+ * buffered mode. Explicit speculative mode performs documented SSE surgery.
  */
 
 import http from "node:http";
@@ -82,6 +83,7 @@ import {
   DEGRADED_NOTICE,
   FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
+  RECOVERED_NOTICE,
   SseNoticeRewriter,
   compressedNoticeText,
   sanitizeNoticeDetail,
@@ -108,7 +110,7 @@ import {
   type ComparisonInterrupt,
   type ComparisonLegRecord,
   type GraderDiagnostic,
-  type RequestLogger,
+  type RequestLogSink,
   type TurnType,
   type UsageRecord,
 } from "./reqlog.js";
@@ -136,6 +138,21 @@ const SKIP_RESPONSE_HEADERS = new Set([
   "transfer-encoding",
 ]);
 
+// Speculative SSE delivery can splice a second response into the first, so
+// upstream representation metadata is no longer valid for the bytes sent to
+// the client. In particular, retaining content-length disables Node's
+// chunked framing and can truncate the splice at the original leg's length.
+const SKIP_TRANSFORMED_RESPONSE_HEADERS = new Set([
+  "content-length",
+  "content-range",
+  "content-md5",
+  "content-digest",
+  "repr-digest",
+  "digest",
+  "etag",
+  "trailer",
+]);
+
 export interface ProxyOptions {
   memtree: MemtreeClient;
   /**
@@ -148,7 +165,7 @@ export interface ProxyOptions {
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
    * MemTree calls, and successful notice claims; omitted means no logging.
    */
-  reqlog?: RequestLogger;
+  reqlog?: RequestLogSink;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -160,6 +177,8 @@ export interface RunningProxy {
   /** Random per-process endpoint used by the ephemeral Claude plugin. */
   hookUrl: string;
   close: () => void;
+  /** Stop accepting work and wait boundedly for active request finalizers. */
+  drain: (timeoutMs?: number) => Promise<boolean>;
 }
 
 interface Upstream {
@@ -303,6 +322,7 @@ function resolveUpstream(opts: ProxyOptions): Upstream {
 export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const upstream = resolveUpstream(opts);
   const hookPath = `/_ccc/hooks/${randomBytes(24).toString("hex")}`;
+  const activeRequests = new Set<Promise<void>>();
   const state: ProxyState = {
     paymentNoticeShown: false,
     notices: new NoticeDeliveryQueue(),
@@ -316,13 +336,61 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainRouteEpoch: 0,
   };
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, opts, upstream, state, hookPath).catch((err) => {
-      sendAnthropicError(res, `local proxy error: ${err?.message ?? err}`);
-    });
+    const task = handleRequest(req, res, opts, upstream, state, hookPath).catch(
+      (err) => {
+        try {
+          sendAnthropicError(res, `local proxy error: ${err?.message ?? err}`);
+        } catch {
+          // A failed error response must not strand shutdown bookkeeping.
+        }
+      }
+    );
+    activeRequests.add(task);
+    void task.then(
+      () => activeRequests.delete(task),
+      () => activeRequests.delete(task)
+    );
   });
   // Long-running SSE responses must not be cut by idle timeouts.
   server.requestTimeout = 0;
   server.headersTimeout = 60_000;
+
+  let closePromise: Promise<void> | undefined;
+  const beginClose = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closePromise = new Promise((done) => {
+      if (!server.listening) {
+        done();
+        return;
+      }
+      server.close(() => done());
+    });
+    return closePromise;
+  };
+  const drain = async (timeoutMs = 5_000): Promise<boolean> => {
+    const boundedMs =
+      Number.isFinite(timeoutMs) && timeoutMs >= 0
+        ? Math.floor(timeoutMs)
+        : 5_000;
+    const quiesced = (async () => {
+      // Once close completes, every accepted request has entered the tracked
+      // set. Some handlers intentionally outlive their downstream response
+      // while a speculative shadow grade finishes.
+      await beginClose();
+      while (activeRequests.size > 0) {
+        await Promise.allSettled([...activeRequests]);
+      }
+    })();
+    let timer: NodeJS.Timeout | undefined;
+    const completed = await Promise.race([
+      quiesced.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), boundedMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return completed;
+  };
 
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -331,7 +399,10 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       resolve({
         port,
         hookUrl: `http://127.0.0.1:${port}${hookPath}`,
-        close: () => server.close(),
+        close: () => {
+          void beginClose();
+        },
+        drain,
       });
     });
   });
@@ -365,7 +436,7 @@ async function handleNoticeHook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: ProxyState,
-  reqlog: RequestLogger | undefined
+  reqlog: RequestLogSink | undefined
 ): Promise<void> {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
@@ -882,7 +953,7 @@ async function handleMessages(
               );
             } else if (mayQueueNotice && delivered === "recovered") {
               state.notices.queueSuffix(
-                DEGRADED_NOTICE,
+                RECOVERED_NOTICE,
                 undefined,
                 noticePromptId
               );
@@ -1383,10 +1454,10 @@ interface ComparedSseArgs {
 }
 
 /**
- * Live memory-vs-full comparison. Speculative mode (default) commits the
- * memory leg to the client from its first byte and treats a B verdict as an
- * in-stream interruption; buffered mode (--ab-buffered) retains the original
- * hold-both-then-commit behavior for research comparison runs.
+ * Live memory-vs-full comparison. Buffered mode is the safe default and holds
+ * both prefixes until the grader selects a leg. Explicit speculative mode
+ * commits the memory leg from its first byte and treats a B verdict as an
+ * in-stream interruption.
  */
 async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
   if (args.routing.speculative) return forwardSpeculativeSse(args);
@@ -1693,6 +1764,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
   let forwarder: SseEventForwarder | null = null;
   let spliceStarted = false;
   let pendingDeferredSplice = false;
+  let recoveryStarted = false;
   let shadowSettled = false;
   let deliverySettled = false;
   let resolveDelivery!: () => void;
@@ -1776,7 +1848,12 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
    * pre-commit phase (not the shadow grade) owns its fate until then.
    */
   const releaseFullLeg = () => {
-    if (committedLeg === "memory" && !spliceStarted && !pendingDeferredSplice) {
+    if (
+      committedLeg === "memory" &&
+      !spliceStarted &&
+      !pendingDeferredSplice &&
+      !recoveryStarted
+    ) {
       comparison.loserAborted = fullLeg.abort();
     }
   };
@@ -1824,11 +1901,17 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       bridgeIndex,
       interrupt === "recovered" ? RECOVERY_BRIDGE_TEXT : routing.bridgeText
     );
-    writeToClient(head);
-    replayFullLeg(
-      bridgeIndex + 1,
-      interrupt === "recovered" ? "recovered" : "spliced"
-    );
+    const beginReplay = () => {
+      if (clientClosed || res.destroyed || res.writableEnded) return;
+      replayFullLeg(
+        bridgeIndex + 1,
+        interrupt === "recovered" ? "recovered" : "spliced"
+      );
+    };
+    // write(false) accepted the whole fabricated head, but B must remain
+    // private until that head drains or its replay can overtake backpressure.
+    if (writeToClient(head)) beginReplay();
+    else res.once("drain", beginReplay);
   };
 
   /** Apply a B verdict against the interrupt-window table. */
@@ -1881,11 +1964,22 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     if (fwd.openBlock === null) performSplice("deferred-then-spliced");
   };
 
-  /** A died mid-stream: any healthy B content beats a dead turn. */
+  /** A died or emitted a terminal error: healthy B can recover a safe prefix. */
   const recoverFromFullLeg = async (): Promise<void> => {
-    if (!forwarder || forwarder.sawToolUse || forwarder.sawMessageDelta) {
-      // A tool call (or the closing envelope) is already on the wire; a
-      // coherent splice is impossible. The turn fails as it does today.
+    if (recoveryStarted || spliceStarted || clientClosed || deliverySettled) {
+      return;
+    }
+    recoveryStarted = true;
+    if (
+      !forwarder ||
+      forwarder.sawToolUse ||
+      forwarder.sawMessageDelta ||
+      (forwarder.openBlock !== null &&
+        isThinkingBlockType(forwarder.openBlock.type))
+    ) {
+      // A tool call, an unfinished signed-thinking block, or the closing
+      // envelope is already on the wire. Fabricating a stop would produce an
+      // invalid message, so terminate this delivery instead of splicing.
       failDelivery();
       return;
     }
@@ -1931,6 +2025,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     forwarder = new SseEventForwarder({
       write: writeToClient,
       afterEvent: onForwardedEvent,
+      onTerminalError: () => void recoverFromFullLeg(),
     });
     memoryLeg.streamTo({
       write: (chunk) => forwarder!.push(chunk),
@@ -2486,6 +2581,110 @@ interface UpstreamLegSink {
   drain(resume: () => void): void;
 }
 
+/**
+ * Ordered hand-off from a leg's private buffer to its selected downstream
+ * sink. Writable.write(false) still accepts the current chunk, but no later
+ * chunk may be submitted until drain. Keeping that distinction here avoids
+ * replaying up to maxBufferedBytes into ServerResponse's own memory buffer.
+ *
+ * Exported from this internal module solely so the drain state machine can be
+ * tested without depending on operating-system socket buffer sizes.
+ */
+export class DrainAwareChunkQueue {
+  private readonly queue: Buffer[];
+  private started = false;
+  private flushing = false;
+  private waitingForDrain = false;
+  private ending = false;
+  private ended = false;
+
+  constructor(
+    bufferedChunks: Buffer[],
+    private readonly sink: UpstreamLegSink,
+    private readonly onWritable: () => void
+  ) {
+    this.queue = bufferedChunks;
+  }
+
+  start(): void {
+    if (this.started || this.ended) return;
+    this.started = true;
+    this.flush();
+  }
+
+  /** Write live data, retaining it behind any replay already in progress. */
+  write(chunk: Buffer): boolean {
+    if (this.ending || this.ended) return true;
+    if (
+      !this.started ||
+      this.flushing ||
+      this.waitingForDrain ||
+      this.queue.length > 0
+    ) {
+      this.queue.push(chunk);
+      return false;
+    }
+    const writable = this.sink.write(chunk);
+    if (!writable) this.waitForDrain();
+    return writable;
+  }
+
+  /** End only after every accepted/retained chunk has crossed a drain seam. */
+  finish(): void {
+    if (this.ending || this.ended) return;
+    this.ending = true;
+    this.flush();
+  }
+
+  /** Abandon a deselected/client-aborted leg without firing its sink end. */
+  cancel(): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.queue.length = 0;
+  }
+
+  private flush(): void {
+    if (
+      !this.started ||
+      this.flushing ||
+      this.waitingForDrain ||
+      this.ended
+    ) {
+      return;
+    }
+    this.flushing = true;
+    let consumed = 0;
+    while (consumed < this.queue.length) {
+      const writable = this.sink.write(this.queue[consumed]);
+      consumed++;
+      if (!writable) {
+        this.queue.splice(0, consumed);
+        this.flushing = false;
+        this.waitForDrain();
+        return;
+      }
+    }
+    if (consumed > 0) this.queue.splice(0, consumed);
+    this.flushing = false;
+    if (this.ending) {
+      this.ended = true;
+      this.sink.end();
+    } else {
+      this.onWritable();
+    }
+  }
+
+  private waitForDrain(): void {
+    if (this.waitingForDrain || this.ended) return;
+    this.waitingForDrain = true;
+    this.sink.drain(() => {
+      if (this.ended) return;
+      this.waitingForDrain = false;
+      this.flush();
+    });
+  }
+}
+
 /** One in-flight completion whose raw bytes stay private until selected. */
 class BufferedUpstreamLeg {
   readonly record: ComparisonLegRecord;
@@ -2509,7 +2708,7 @@ class BufferedUpstreamLeg {
   private upstreamReq?: http.ClientRequest;
   private upstreamRes?: http.IncomingMessage;
   private clientRes?: http.ServerResponse;
-  private sink?: UpstreamLegSink;
+  private sinkQueue?: DrainAwareChunkQueue;
   private sseObserver?: SseNoticeRewriter;
   private expectsSse = false;
   private sawMessageStop = false;
@@ -2609,7 +2808,10 @@ class BufferedUpstreamLeg {
     if (res.headersSent || !this.upstreamRes) return;
     res.writeHead(
       this.upstreamRes.statusCode ?? 502,
-      forwardableResponseHeaders(this.upstreamRes)
+      forwardableResponseHeaders(
+        this.upstreamRes,
+        SKIP_TRANSFORMED_RESPONSE_HEADERS
+      )
     );
   }
 
@@ -2619,22 +2821,21 @@ class BufferedUpstreamLeg {
    * running, so grading/usage extraction are unaffected.
    */
   streamTo(sink: UpstreamLegSink): void {
-    this.sink = sink;
-    let writable = true;
-    for (const chunk of this.chunks.splice(0)) {
-      if (!sink.write(chunk)) writable = false;
-    }
-    if (this.ended) {
-      sink.end();
-      return;
-    }
-    if (!writable) {
-      this.upstreamRes?.pause();
-      sink.drain(() => this.upstreamRes?.resume());
-    } else {
-      // Undo a buffer-overflow pause now that bytes are draining downstream.
-      this.upstreamRes?.resume();
-    }
+    if (this.sinkQueue) throw new Error(`${this.name} leg already has a sink`);
+    // Freeze live delivery before replay starts so a newly-arriving data event
+    // cannot overtake chunks accumulated during prefix grading.
+    this.upstreamRes?.pause();
+    const queue = new DrainAwareChunkQueue(
+      this.chunks.splice(0),
+      sink,
+      () => {
+        // Also undoes a buffer-overflow pause once the private replay is empty.
+        if (!this.aborted && !this.ended) this.upstreamRes?.resume();
+      }
+    );
+    this.sinkQueue = queue;
+    if (this.ended) queue.finish();
+    queue.start();
   }
 
   hasFailed(): boolean {
@@ -2677,6 +2878,7 @@ class BufferedUpstreamLeg {
   abort(): boolean {
     if (this.aborted || this.ended) return false;
     this.aborted = true;
+    this.sinkQueue?.cancel();
     this.upstreamRes?.destroy();
     this.upstreamReq?.destroy();
     this.settlePrefix();
@@ -2757,11 +2959,8 @@ class BufferedUpstreamLeg {
     if (this.record.ttfbMs === undefined) {
       this.record.ttfbMs = Date.now() - this.startedAt;
     }
-    if (this.sink) {
-      if (!this.sink.write(chunk)) {
-        this.upstreamRes?.pause();
-        this.sink.drain(() => this.upstreamRes?.resume());
-      }
+    if (this.sinkQueue) {
+      if (!this.sinkQueue.write(chunk)) this.upstreamRes?.pause();
     } else if (this.clientRes) {
       if (!this.clientRes.write(chunk)) {
         this.upstreamRes?.pause();
@@ -2891,7 +3090,7 @@ class BufferedUpstreamLeg {
     if (this.clientRes && !this.clientRes.destroyed && !this.clientRes.writableEnded) {
       this.clientRes.end();
     }
-    this.sink?.end();
+    this.sinkQueue?.finish();
     this.settleDone();
   }
 
@@ -2928,7 +3127,7 @@ class BufferedUpstreamLeg {
     if (this.clientRes) this.clientRes.destroy(error);
     // A sink-attached leg leaves the client response to the orchestrator,
     // which may recover the turn from the peer leg instead of destroying it.
-    this.sink?.end();
+    this.sinkQueue?.finish();
     this.settleDone();
   }
 
@@ -3382,11 +3581,18 @@ function forwardableRequestHeaders(
 }
 
 function forwardableResponseHeaders(
-  upstreamRes: http.IncomingMessage
+  upstreamRes: http.IncomingMessage,
+  additionalSkippedHeaders?: ReadonlySet<string>
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(upstreamRes.headers)) {
-    if (SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+    const lowerKey = key.toLowerCase();
+    if (
+      SKIP_RESPONSE_HEADERS.has(lowerKey) ||
+      additionalSkippedHeaders?.has(lowerKey)
+    ) {
+      continue;
+    }
     if (value === undefined) continue;
     out[key] = value;
   }
