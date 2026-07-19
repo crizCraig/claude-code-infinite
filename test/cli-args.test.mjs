@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseWrapperArgs } from "../dist/cli-args.js";
+import {
+  isPrintInvocation,
+  parseWrapperArgs,
+} from "../dist/cli-args.js";
 
 test("ccc wrapper flags are consumed only before --", () => {
   assert.deepEqual(
@@ -41,4 +44,13 @@ test("speculative A/B is explicit opt-in and the last pre-separator mode wins", 
     debug: false,
     speculativeAb: true,
   });
+});
+
+test("Claude print flags are recognized only before --", () => {
+  assert.equal(isPrintInvocation(["-p", "hello"]), true);
+  assert.equal(isPrintInvocation(["--print", "hello"]), true);
+  assert.equal(isPrintInvocation(["-p", "--", "--print"]), true);
+  assert.equal(isPrintInvocation(["--", "-p"]), false);
+  assert.equal(isPrintInvocation(["--", "--print"]), false);
+  assert.equal(isPrintInvocation(["hello", "--", "--print"]), false);
 });

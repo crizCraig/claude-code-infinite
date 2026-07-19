@@ -175,6 +175,212 @@ async function waitFor(cond, timeoutMs = 3000) {
   }
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function within(promise, message, timeoutMs = 1_000) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+test("generic passthrough keeps no-body GET responses byte-transparent", async () => {
+  const payload = Buffer.from([0, 1, 2, 127, 128, 254, 255]);
+  const upstream = await listen((req, res) => {
+    req.resume();
+    req.once("end", () => {
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": String(payload.length),
+      });
+      res.end(payload);
+    });
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: upstream.origin, apiKey: "unused" }),
+    upstreamOrigin: upstream.origin,
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${proxy.port}/healthz?probe=exact`
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), payload);
+    assert.equal(
+      await within(proxy.drain(500), "normal GET passthrough did not drain"),
+      true
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test("forced drain owns passthrough after upstream end but before downstream finish", async () => {
+  const path = "/generic-delayed-finish";
+  const payload = Buffer.from("byte-transparent passthrough");
+  const upstream = await listen((req, res) => {
+    req.resume();
+    req.once("end", () => {
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": String(payload.length),
+      });
+      res.end(payload);
+    });
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: upstream.origin, apiKey: "unused" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const downstreamEndAttempted = deferred();
+  const clientClosed = deferred();
+  const originalEnd = http.ServerResponse.prototype.end;
+  let clientReq;
+  let clientRes;
+  try {
+    // Hold the proxy response at its final end/finish seam. This deterministically
+    // models a final flush retained by a backpressured downstream socket while
+    // still proving that the proxy has consumed upstream through `end`.
+    http.ServerResponse.prototype.end = function (...args) {
+      if (
+        this.req?.socket?.localPort === proxy.port &&
+        this.req?.url === path
+      ) {
+        downstreamEndAttempted.resolve();
+        return this;
+      }
+      return originalEnd.apply(this, args);
+    };
+
+    clientReq = http.get(
+      {
+        host: "127.0.0.1",
+        port: proxy.port,
+        path,
+      },
+      (response) => {
+        clientRes = response;
+        response.on("error", () => {});
+        response.once("close", clientClosed.resolve);
+        response.resume();
+      }
+    );
+    clientReq.on("error", () => {});
+
+    await within(
+      downstreamEndAttempted.promise,
+      "proxy never reached the delayed downstream finish seam"
+    );
+    http.ServerResponse.prototype.end = originalEnd;
+
+    assert.equal(
+      await within(
+        proxy.drain(1),
+        "forced drain lost ownership of delayed passthrough"
+      ),
+      false
+    );
+    await within(clientClosed.promise, "forced drain did not close the client");
+    assert.equal(clientRes.destroyed, true);
+  } finally {
+    http.ServerResponse.prototype.end = originalEnd;
+    clientReq?.destroy();
+    clientRes?.destroy();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test("forced drain owns an early passthrough response until upload completes", async () => {
+  const path = "/generic-early-response";
+  const earlyBody = Buffer.from("request rejected early");
+  const upstreamRequestStarted = deferred();
+  const upstreamSocketClosed = deferred();
+  let upstreamReq;
+  let upstreamSocket;
+  const upstream = await listen((req, res) => {
+    upstreamReq = req;
+    upstreamSocket = req.socket;
+    req.on("error", () => {});
+    upstreamSocket.once("close", upstreamSocketClosed.resolve);
+    req.resume();
+    upstreamRequestStarted.resolve();
+    res.writeHead(413, {
+      "content-type": "text/plain",
+      "content-length": String(earlyBody.length),
+      connection: "keep-alive",
+    });
+    res.end(earlyBody);
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: upstream.origin, apiKey: "unused" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const responseEnded = deferred();
+  const clientClosed = deferred();
+  let clientReq;
+  try {
+    clientReq = http.request(
+      {
+        host: "127.0.0.1",
+        port: proxy.port,
+        path,
+        method: "POST",
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(1024 * 1024),
+        },
+      },
+      (response) => {
+        response.on("error", () => {});
+        response.once("end", responseEnded.resolve);
+        response.resume();
+      }
+    );
+    clientReq.on("error", () => {});
+    clientReq.once("close", clientClosed.resolve);
+    clientReq.write(Buffer.alloc(1024, 7));
+
+    await within(upstreamRequestStarted.promise, "upstream upload never started");
+    await within(responseEnded.promise, "early upstream response never completed");
+    assert.equal(clientReq.writableEnded, false, "test upload is still incomplete");
+    assert.equal(clientReq.destroyed, false, "upload socket remains owned by proxy");
+
+    assert.equal(
+      await within(
+        proxy.drain(1),
+        "forced drain lost ownership of the incomplete upload"
+      ),
+      false
+    );
+    await within(clientClosed.promise, "forced drain did not cancel the upload");
+    await within(
+      upstreamSocketClosed.promise,
+      "forced drain did not close the upstream upload socket"
+    );
+    assert.equal(clientReq.destroyed, true);
+    assert.equal(upstreamReq.complete, false, "upstream upload never completed");
+    assert.equal(upstreamSocket.destroyed, true);
+  } finally {
+    clientReq?.destroy();
+    upstreamReq?.destroy();
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test("rawPromptTokenCount accepts only a positive finite nested usage value", () => {
   const result = (raw_prompt_tokens) => ({
     messages: [{ role: "user", content: "compressed" }],

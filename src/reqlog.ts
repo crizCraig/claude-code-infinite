@@ -46,6 +46,7 @@ export type TurnType =
   | "followup-ab-spliced"
   | "followup-ab-recovered"
   | "followup-degraded"
+  | "followup-client-closed"
   | "unparseable";
 
 /** Real token usage parsed from Anthropic's response, when available. */

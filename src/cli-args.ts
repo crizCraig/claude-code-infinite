@@ -6,6 +6,15 @@ export interface WrapperArgs {
   speculativeAb: boolean;
 }
 
+/** Whether Claude's own print mode was requested before its `--` separator. */
+export function isPrintInvocation(args: string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--") return false;
+    if (arg === "-p" || arg === "--print") return true;
+  }
+  return false;
+}
+
 /**
  * Consume ccc's own flags only before the conventional `--` separator. Values
  * after it are literal Claude arguments/prompts, even when they look like ccc

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { connect } from "node:net";
 import {
   abGateDecision,
   buildFusionGraderBody,
@@ -1298,6 +1299,161 @@ test("native grader reuses incoming Anthropic auth and selects B", async () => {
     proxy.close();
     upstream.close();
     memtreeServer.close();
+  }
+});
+
+test("client close during compression finalizes without launching A/B work", async () => {
+  const compressionStarted = deferred();
+  const releaseCompression = deferred();
+  const records = [];
+  const upstreamCalls = [];
+  let compressionSignal;
+  let graderCalls = 0;
+  let backgroundIndexes = 0;
+  const memtree = {
+    compressBudgetMs: 60_000,
+    paymentRequiredDetail: null,
+    indexInBackground() {
+      backgroundIndexes++;
+    },
+    compress(_hash, _messages, _contextLimit, signal) {
+      compressionSignal = signal;
+      compressionStarted.resolve();
+      return releaseCompression.promise;
+    },
+  };
+  const upstream = await listen(async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString("utf-8"));
+    upstreamCalls.push(body);
+    const response = JSON.stringify({
+      type: "message",
+      content: [{ type: "text", text: "tool response" }],
+    });
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(response)),
+    });
+    res.end(response);
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        graderCalls++;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  let socket;
+  try {
+    await armMainTurn(proxy);
+    const body = Buffer.from(
+      JSON.stringify({
+        model: "claude-test",
+        max_tokens: 64,
+        stream: true,
+        messages: followupMessages,
+      })
+    );
+    socket = connect({ host: "127.0.0.1", port: proxy.port });
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    socket.on("error", () => {});
+    socket.write(
+      Buffer.concat([
+        Buffer.from(
+          "POST /v1/messages HTTP/1.1\r\n" +
+            `Host: 127.0.0.1:${proxy.port}\r\n` +
+            "Content-Type: application/json\r\n" +
+            `Content-Length: ${body.length}\r\n` +
+            "X-Claude-Code-Session-Id: session-ab\r\n" +
+            "Connection: close\r\n\r\n"
+        ),
+        body,
+      ])
+    );
+    await compressionStarted.promise;
+
+    // Half-close only after the complete upload entered compression. With the
+    // server's default non-half-open sockets, our close follows its handling
+    // of the peer EOF and therefore the ServerResponse close notification.
+    const socketClosed = new Promise((resolve) => socket.once("close", resolve));
+    socket.end();
+    await socketClosed;
+    assert.equal(
+      compressionSignal.aborted,
+      false,
+      "one downstream subscriber cannot cancel shared compression"
+    );
+
+    releaseCompression.resolve({
+      messages: [{ role: "user", content: "compressed context and memory" }],
+      unfolded_memory: "the exact unfolded memory",
+      usage: { prompt_tokens_details: { cached_tokens: 123 } },
+    });
+    await waitFor(() => records.some((record) => record.kind === "messages"));
+
+    assert.equal(upstreamCalls.length, 0, "no answer request was launched");
+    assert.equal(graderCalls, 0, "no grader request was launched");
+    assert.equal(backgroundIndexes, 0);
+    const record = records.find((item) => item.kind === "messages");
+    assert.equal(record.turnType, "followup-client-closed");
+    assert.equal(record.forwardedBytes, 0);
+    assert.equal(record.compress.ok, true);
+    assert.equal(typeof record.totalMs, "number");
+    assert.equal((await claimDisplay(proxy)).status, 204, "no notice was queued");
+
+    // A matching tool turn is a black-box route probe: it must retain the
+    // original history because the disconnected follow-up installed no route.
+    const toolMessages = [
+      ...followupMessages,
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "route-probe", name: "read", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "route-probe",
+            content: "result",
+          },
+        ],
+      },
+    ];
+    const probe = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-ab",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 64,
+        stream: false,
+        messages: toolMessages,
+      }),
+    });
+    await probe.text();
+    assert.equal(upstreamCalls.length, 1);
+    assert.deepEqual(upstreamCalls[0].messages, toolMessages);
+    assert.equal(graderCalls, 0);
+    assert.equal(await proxy.drain(500), true, "request handler completed");
+  } finally {
+    releaseCompression.resolve(null);
+    socket?.destroy();
+    proxy.close();
+    upstream.close();
   }
 });
 

@@ -30,7 +30,11 @@ import {
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail } from "./notices.js";
-import { parseWrapperArgs } from "./cli-args.js";
+import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import {
+  createSignalShutdownHandler,
+  exitCodeForChild,
+} from "./cli-lifecycle.js";
 import { projectTranscriptDir, startTranscriptScrubber } from "./scrub.js";
 import {
   getPolychatApiKey,
@@ -166,10 +170,6 @@ function printBanner() {
   console.log(
     `\n\x1b[1;38;5;209mClaude Code Infinite:\x1b[0m \x1b[38;5;48mMaximizing Claude's intelligence with context-management from \x1b]8;;https://MemTree.dev\x1b\\MemTree.dev\x1b]8;;\x1b\\\x1b[0m\n`
   );
-}
-
-function isPrintInvocation(args: string[]): boolean {
-  return args.includes("-p") || args.includes("--print");
 }
 
 /** Unknown/old versions get the longstanding Stop fallback only. */
@@ -369,6 +369,25 @@ async function main() {
     }
   };
 
+  const handleShutdownSignal = createSignalShutdownHandler({
+    forward: (signal) => {
+      // A terminal normally signals the whole foreground process group, while
+      // `kill <ccc-pid>` reaches only this wrapper. Forwarding covers the
+      // latter; duplicate delivery to Claude is harmless.
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        child.kill(signal);
+      } catch {
+        // The child may have exited between the state check and kill().
+      }
+    },
+    shutdown: (code) => void shutdown(code),
+    // A second signal is an explicit escape hatch from bounded cleanup.
+    forceExit: (code) => process.exit(code),
+  });
+  process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
+  process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+
   child.on("error", (err: Error) => {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       console.error("Could not find 'claude' command. Make sure Claude Code is installed.");
@@ -378,8 +397,8 @@ async function main() {
     void shutdown(1);
   });
 
-  child.on("exit", (code: number | null) => {
-    void shutdown(code ?? 0);
+  child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    void shutdown(exitCodeForChild(code, signal));
   });
 }
 

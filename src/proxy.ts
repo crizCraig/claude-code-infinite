@@ -802,16 +802,32 @@ async function handleMessages(
     );
   }
 
+  // The complete request upload can outlive its downstream subscriber while
+  // MemTree compression is in flight. Track that subscriber locally without
+  // feeding its lifetime into MemtreeClient.compress(): compression promises
+  // are hash-deduped and may still be serving another live retry.
+  let downstreamClosedDuringCompression =
+    res.destroyed && !res.writableFinished;
+  const markDownstreamClosedDuringCompression = () => {
+    if (!res.writableFinished) downstreamClosedDuringCompression = true;
+  };
+  res.once("close", markDownstreamClosedDuringCompression);
+
   const compressStarted = Date.now();
   // An active subagent can repeat/embed the human prompt in its own request;
   // producer suppression must also preserve the arm for the later main call.
   if (displayForThisTurn) state.mainPromptArmed = false;
-  const result = await opts.memtree.compress(
-    hash,
-    msgsForMemtree,
-    modelContextLimit,
-    state.shutdownSignal
-  );
+  let result: CompressResult | null;
+  try {
+    result = await opts.memtree.compress(
+      hash,
+      msgsForMemtree,
+      modelContextLimit,
+      state.shutdownSignal
+    );
+  } finally {
+    res.off("close", markDownstreamClosedDuringCompression);
+  }
   const compressMs = Date.now() - compressStarted;
   rec.compress = {
     ms: compressMs,
@@ -821,6 +837,17 @@ async function handleMessages(
     // the AbortSignal timeout, not a fast server error.
     timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
   };
+
+  if (
+    downstreamClosedDuringCompression ||
+    (res.destroyed && !res.writableFinished)
+  ) {
+    recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
+    return logged(Promise.resolve());
+  }
+  // No await occurs between this check and the selected forwarder's call.
+  // Each forwarder installs its own close listener synchronously, so this is
+  // an event-loop-atomic handoff of downstream-close ownership.
 
   if (!result) {
     // MemTree down/slow/402: the user's own Anthropic call is never gated on
@@ -3742,30 +3769,96 @@ function passThroughStreaming(
     }
     let settled = false;
     let shutdownCancelled = false;
+    let incomingUploadEnded = req.readableEnded;
+    let upstreamUploadFinished = false;
+    let upstreamResponseEnded = false;
+    let downstreamFinished = res.writableFinished;
+    let pendingErrorResponse = false;
     let upstreamReq: http.ClientRequest | undefined;
     let activeUpstreamRes: http.IncomingMessage | undefined;
+
     const settle = () => {
       if (settled) return;
       settled = true;
-      res.off("close", onResponseClose);
       shutdownSignal.removeEventListener("abort", cancelForShutdown);
       resolve();
     };
-    const onResponseClose = () => {
-      if (shutdownCancelled) return;
-      activeUpstreamRes?.destroy();
-      upstreamReq?.destroy();
+
+    /** Clean completion owns all four independently asynchronous seams. */
+    const settleIfComplete = () => {
+      if (
+        incomingUploadEnded &&
+        upstreamUploadFinished &&
+        upstreamResponseEnded &&
+        downstreamFinished
+      ) {
+        settle();
+      }
+    };
+
+    /** Every abnormal exit tears down the whole duplex exchange exactly once. */
+    const tearDown = () => {
+      if (settled) return;
+      // An early upstream response can mark ClientRequest/IncomingMessage as
+      // destroyed while their keep-alive socket still awaits the rest of the
+      // upload. Capture both transports before stream teardown and close them
+      // explicitly so server.close() cannot inherit a half-owned connection.
+      const downstreamSocket = req.socket;
+      const upstreamSocket = activeUpstreamRes?.socket ?? upstreamReq?.socket;
+      activeUpstreamRes?.unpipe(res);
+      if (upstreamReq) req.unpipe(upstreamReq);
+      // Mark settled before destroy(): close/error events can fire reentrantly.
       settle();
+      if (!req.destroyed) req.destroy();
+      if (upstreamReq && !upstreamReq.destroyed) upstreamReq.destroy();
+      if (activeUpstreamRes && !activeUpstreamRes.destroyed) {
+        activeUpstreamRes.destroy();
+      }
+      if (!res.destroyed) res.destroy();
+      if (upstreamSocket && !upstreamSocket.destroyed) upstreamSocket.destroy();
+      if (!downstreamSocket.destroyed) downstreamSocket.destroy();
+    };
+
+    const onIncomingEnd = () => {
+      incomingUploadEnded = true;
+      settleIfComplete();
+    };
+    const onIncomingClose = () => {
+      if (settled) return;
+      if (req.complete) {
+        incomingUploadEnded = true;
+        settleIfComplete();
+      } else {
+        tearDown();
+      }
+    };
+    const onDownstreamFinish = () => {
+      downstreamFinished = true;
+      if (pendingErrorResponse) tearDown();
+      else settleIfComplete();
+    };
+    const onResponseClose = () => {
+      if (settled) return;
+      if (res.writableFinished) {
+        downstreamFinished = true;
+        if (pendingErrorResponse) tearDown();
+        else settleIfComplete();
+      } else {
+        tearDown();
+      }
     };
     const cancelForShutdown = () => {
       if (settled || shutdownCancelled) return;
       shutdownCancelled = true;
-      res.off("close", onResponseClose);
-      activeUpstreamRes?.destroy();
-      upstreamReq?.destroy();
-      if (!res.destroyed && !res.writableEnded) res.destroy();
-      settle();
+      tearDown();
     };
+
+    req.once("end", onIncomingEnd);
+    req.once("aborted", tearDown);
+    req.once("error", tearDown);
+    req.once("close", onIncomingClose);
+    res.once("finish", onDownstreamFinish);
+    res.once("error", tearDown);
     res.once("close", onResponseClose);
     shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
     if (shutdownSignal.aborted) {
@@ -3782,26 +3875,63 @@ function passThroughStreaming(
         headers,
       },
       (upstreamRes) => {
+        if (settled) {
+          upstreamRes.destroy();
+          return;
+        }
         activeUpstreamRes = upstreamRes;
-        res.writeHead(
-          upstreamRes.statusCode ?? 502,
-          forwardableResponseHeaders(upstreamRes)
-        );
+        const onUpstreamResponseEnd = () => {
+          upstreamResponseEnded = true;
+          settleIfComplete();
+        };
+        const onUpstreamResponseClose = () => {
+          if (!settled && !upstreamResponseEnded) tearDown();
+        };
+        upstreamRes.once("end", onUpstreamResponseEnd);
+        upstreamRes.once("error", tearDown);
+        upstreamRes.once("aborted", tearDown);
+        upstreamRes.once("close", onUpstreamResponseClose);
+        try {
+          res.writeHead(
+            upstreamRes.statusCode ?? 502,
+            forwardableResponseHeaders(upstreamRes)
+          );
+        } catch {
+          tearDown();
+          return;
+        }
         upstreamRes.pipe(res);
-        upstreamRes.on("end", settle);
-        upstreamRes.on("error", () => {
-          res.destroy();
-          settle();
-        });
       }
     );
-    upstreamReq.on("error", (err) => {
-      if (!shutdownCancelled) {
-        sendAnthropicError(res, `upstream connection failed: ${err.message}`);
-      }
-      settle();
+    upstreamReq.once("finish", () => {
+      upstreamUploadFinished = true;
+      settleIfComplete();
     });
-    req.pipe(upstreamReq);
+    upstreamReq.once("close", () => {
+      if (!settled && !upstreamUploadFinished && !pendingErrorResponse) {
+        tearDown();
+      }
+    });
+    upstreamReq.on("error", (err) => {
+      if (settled) return;
+      if (shutdownCancelled || res.headersSent || res.destroyed) {
+        tearDown();
+        return;
+      }
+      // Preserve the existing Anthropic-shaped 502 when no upstream bytes
+      // were committed. Ownership remains until that response flushes, then
+      // the still-open incoming upload/socket is torn down as one exchange.
+      pendingErrorResponse = true;
+      if (upstreamReq) req.unpipe(upstreamReq);
+      activeUpstreamRes?.unpipe(res);
+      sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+      if (res.writableFinished) onDownstreamFinish();
+    });
+    try {
+      req.pipe(upstreamReq);
+    } catch {
+      tearDown();
+    }
   });
 }
 
