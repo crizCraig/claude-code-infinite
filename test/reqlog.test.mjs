@@ -267,6 +267,55 @@ test("RequestLogger.flush waits for scheduled JSONL appends", async () => {
   );
 });
 
+test("MemtreeClient shutdown aborts and logs background indexes before flush", async () => {
+  const logPath = tempLogPath();
+  const reqlog = new RequestLogger(logPath);
+  let calls = 0;
+  const memtreeSrv = await listen((req, _res) => {
+    calls++;
+    // Consume the request but deliberately never answer. Shutdown must abort
+    // this producer instead of letting its finally-log race a later flush.
+    req.resume();
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    reqlog,
+  });
+
+  try {
+    memtree.indexInBackground("first", toolTurn, 200_000);
+    await waitFor(() => calls === 1);
+
+    assert.equal(await memtree.drainBackground(0), false, "stalled call was aborted");
+    assert.equal(await reqlog.flush(1_000), true);
+    const recordsAtFlush = readRecords(logPath);
+    assert.equal(recordsAtFlush.length, 1);
+    assert.deepEqual(
+      recordsAtFlush.map(({ ts: _ts, ms: _ms, ...record }) => record),
+      [{
+        kind: "memtree",
+        indexOnly: true,
+        ok: false,
+        requestBytes: recordsAtFlush[0].requestBytes,
+      }]
+    );
+
+    // Draining closes the producer lifecycle: even a distinct hash cannot
+    // start a call (and therefore cannot append anything after the flush).
+    memtree.indexInBackground("second", toolTurn, 200_000);
+    assert.equal(
+      await memtree.drainBackground(0),
+      true,
+      "no post-flush producer was accepted"
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(readRecords(logPath), recordsAtFlush);
+  } finally {
+    memtreeSrv.close();
+  }
+});
+
 test("oversized log rotates to .1 at startup, overwriting any previous .1", () => {
   const logPath = tempLogPath();
   writeFileSync(`${logPath}.1`, "old rotation\n");

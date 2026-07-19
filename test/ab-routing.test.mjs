@@ -2137,6 +2137,58 @@ test("speculative: graceful drain retains a late verdict after memory delivery",
   }
 });
 
+test("speculative: expired drain cancels a stalled shadow and logs before returning", async () => {
+  const records = [];
+  let grades = 0;
+  const upstream = await speculativeUpstream({
+    memory: (res) => res.end(sse("MEMORY_ANSWER")),
+    // Keep B open beyond both the test's drain deadline and the configured
+    // prefix window. Forced shutdown must cancel it instead of waiting 30s.
+    full: () => {},
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      prefixTimeoutMs: 60_000,
+      grader: async () => {
+        grades++;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const raw = await (await postStreamingTurn(proxy)).text();
+    assert.match(raw, /MEMORY_ANSWER/);
+    await waitFor(
+      () => upstream.calls.filter(({ body }) => body.stream === true).length === 2
+    );
+
+    assert.equal(await proxy.drain(10), false, "shutdown used forced cancellation");
+    const record = speculativeRecord(records);
+    assert.ok(record, "drain awaited the request logger finalizer");
+    assert.equal(record.turnType, "followup-ab-memory");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.deliveryOk, true);
+    assert.equal(record.comparison.winner, "memory");
+    assert.equal(record.comparison.fallbackReason, "shutdown-shadow-cancelled");
+    assert.equal(record.comparison.clientAborted, undefined);
+    assert.equal(grades, 0, "shutdown happened before B had a gradable prefix");
+    await waitFor(() => upstream.closed.has("full"));
+    assert.ok(upstream.closed.has("full"), "stalled full leg was actively aborted");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("speculative: a B verdict splices full history into the live memory stream", async () => {
   const records = [];
   const gradeGate = deferred();
@@ -2473,6 +2525,107 @@ test("speculative: a delivered tool_use block locks out the splice", async () =>
   }
 });
 
+test("speculative: a partial server_tool_use block locks out a B verdict splice", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(
+        sseMessageStart +
+          sseTextHead(0, "MEMHEAD") +
+          sseFrame("content_block_stop", {
+            type: "content_block_stop",
+            index: 0,
+          }) +
+          sseFrame("content_block_start", {
+            type: "content_block_start",
+            index: 1,
+            content_block: {
+              type: "server_tool_use",
+              id: "srv-1",
+              name: "web_search",
+              input: {},
+            },
+          }) +
+          sseFrame("content_block_delta", {
+            type: "content_block_delta",
+            index: 1,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"query":',
+            },
+          })
+      );
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "input_json_delta");
+    gradeGate.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    memoryRes.end(
+      sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: '"fox"}' },
+      }) +
+        sseFrame("content_block_stop", {
+          type: "content_block_stop",
+          index: 1,
+        }) +
+        sseFrame("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use" },
+          usage: { output_tokens: 2 },
+        }) +
+        sseFrame("message_stop", { type: "message_stop" })
+    );
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /server_tool_use/);
+    assert.match(raw, /input_json_delta/);
+    assert.doesNotMatch(raw, /Correcting course/);
+    assert.doesNotMatch(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+    await waitFor(() => upstream.closed.has("full"), 2_000);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-memory");
+    assert.equal(record.comparison.interrupt, "blocked-tool-use");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.winner, "full");
+    assert.equal(record.comparison.verdict, "B");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    gradeGate.resolve();
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("speculative: a memory leg dying mid-stream recovers from the full leg", async () => {
   const records = [];
   const gradeGate = deferred();
@@ -2649,6 +2802,88 @@ test("speculative: an A socket failure mid-thinking never fabricates a stop", as
     assert.equal(record.comparison.delivered, "memory");
     assert.equal(record.comparison.deliveryOk, false);
   } finally {
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: an A failure mid-server_tool_use never splices recovery", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const structuredHead =
+    sseMessageStart +
+    sseTextHead(0, "MEMHEAD") +
+    sseFrame("content_block_stop", {
+      type: "content_block_stop",
+      index: 0,
+    }) +
+    sseFrame("content_block_start", {
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "server_tool_use",
+        id: "srv-recovery",
+        name: "web_search",
+        input: {},
+      },
+    }) +
+    sseFrame("content_block_delta", {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"query":' },
+    });
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(structuredHead);
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      speculative: true,
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "input_json_delta");
+    memoryRes.destroy();
+    await assert.rejects(() => readRest(reader, acc));
+
+    assert.match(acc.text, /server_tool_use/);
+    assert.match(acc.text, /input_json_delta/);
+    assert.doesNotMatch(
+      acc.text,
+      /"type":"content_block_stop","index":1/,
+      "the partial structured block is never synthetically closed"
+    );
+    assert.doesNotMatch(acc.text, /cut off/);
+    assert.doesNotMatch(acc.text, /FULL_ANSWER/);
+
+    gradeGate.resolve();
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-failed");
+    assert.equal(record.comparison.interrupt, "none");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.deliveryOk, false);
+  } finally {
+    gradeGate.resolve();
     memoryRes?.destroy();
     proxy.close();
     upstream.close();

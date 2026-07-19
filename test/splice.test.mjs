@@ -142,6 +142,7 @@ test("forwarder forwards events verbatim and tracks block state exactly", () => 
   assert.equal(forwarder.textChars, 5);
   assert.equal(forwarder.maxIndex, 0);
   assert.equal(forwarder.sawToolUse, false);
+  assert.equal(forwarder.interruptDisposition(), "splice");
   assert.equal(forwarder.sawMessageStop, false);
 
   forwarder.push(
@@ -153,6 +154,7 @@ test("forwarder forwards events verbatim and tracks block state exactly", () => 
   );
   assert.equal(forwarder.openBlock, null);
   assert.equal(forwarder.sawToolUse, true);
+  assert.equal(forwarder.interruptDisposition(), "blocked");
   assert.equal(forwarder.maxIndex, 1);
   assert.equal(forwarder.sawMessageDelta, true);
   assert.equal(forwarder.sawMessageStop, true);
@@ -196,6 +198,143 @@ test("forwarder reports backpressure from the write callback", () => {
   });
   assert.equal(forwarder.push(Buffer.from(messageStart)), false);
   assert.deepEqual(results, ["write"]);
+});
+
+test("forwarder retains multi-frame chunks across repeated drain seams", () => {
+  const written = [];
+  const observed = [];
+  const forwarder = new SseEventForwarder({
+    write: (bytes) => {
+      written.push(bytes);
+      // Each of the first three submitted frames fills the mock downstream.
+      return written.length > 3;
+    },
+    afterEvent: (_fwd, data) => observed.push(data?.type),
+  });
+  const firstChunk =
+    messageStart +
+    frame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }) +
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "hello" },
+    }) +
+    frame("content_block_stop", { type: "content_block_stop", index: 0 });
+
+  assert.equal(forwarder.push(Buffer.from(firstChunk)), false);
+  assert.deepEqual(observed, ["message_start"]);
+  assert.equal(forwarder.openBlock, null);
+
+  // A defensive second push is accepted but must not even be parsed/observed
+  // until every retained frame ahead of it crosses a drain seam.
+  assert.equal(forwarder.push(Buffer.from(messageTail)), false);
+  assert.equal(forwarder.resumeAfterDrain(), false);
+  assert.deepEqual(observed, ["message_start", "content_block_start"]);
+  assert.deepEqual(forwarder.openBlock, { index: 0, type: "text" });
+
+  assert.equal(forwarder.resumeAfterDrain(), false);
+  assert.equal(forwarder.textChars, 5);
+  assert.deepEqual(observed, [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+  ]);
+
+  assert.equal(forwarder.resumeAfterDrain(), true);
+  assert.deepEqual(observed, [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
+  assert.equal(written.join(""), firstChunk + messageTail);
+  assert.equal(forwarder.openBlock, null);
+  assert.equal(forwarder.sawMessageStop, true);
+});
+
+test("a stop callback on a backpressured frame discards queued tail before bridge", () => {
+  const submitted = [];
+  const blockStop = frame("content_block_stop", {
+    type: "content_block_stop",
+    index: 0,
+  });
+  const structuredTail = frame("content_block_start", {
+    type: "content_block_start",
+    index: 1,
+    content_block: { type: "server_tool_use", id: "srv-1", name: "search" },
+  });
+  const forwarder = new SseEventForwarder({
+    write: (bytes) => {
+      submitted.push(bytes);
+      return false;
+    },
+    afterEvent: (fwd, data) => {
+      if (data?.type !== "content_block_stop") return;
+      assert.equal(submitted.at(-1), blockStop, "stop is submitted first");
+      fwd.stop();
+      submitted.push("BRIDGE_HEAD");
+    },
+  });
+
+  assert.equal(forwarder.push(Buffer.from(blockStop + structuredTail)), false);
+  assert.deepEqual(submitted, [blockStop, "BRIDGE_HEAD"]);
+  assert.equal(forwarder.resumeAfterDrain(), true);
+  assert.equal(forwarder.interruptDisposition(), "splice");
+});
+
+test("structured blocks permanently lock interruption while thinking only defers", () => {
+  const thinking = new SseEventForwarder({ write: () => true });
+  thinking.push(
+    Buffer.from(
+      frame("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "redacted_thinking", data: "opaque" },
+      })
+    )
+  );
+  assert.equal(thinking.interruptDisposition(), "defer");
+  thinking.push(
+    Buffer.from(
+      frame("content_block_stop", { type: "content_block_stop", index: 0 })
+    )
+  );
+  assert.equal(thinking.interruptDisposition(), "splice");
+
+  const structured = new SseEventForwarder({ write: () => true });
+  structured.push(
+    Buffer.from(
+      frame("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "server_tool_use",
+          id: "srv-1",
+          name: "web_search",
+          input: {},
+        },
+      }) +
+        frame("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"query":' },
+        })
+    )
+  );
+  assert.equal(structured.sawToolUse, false);
+  assert.equal(structured.interruptDisposition(), "blocked");
+  structured.push(
+    Buffer.from(
+      frame("content_block_stop", { type: "content_block_stop", index: 0 })
+    )
+  );
+  assert.equal(structured.interruptDisposition(), "blocked");
 });
 
 test("forwarder suppresses a terminal error before signaling recovery", () => {

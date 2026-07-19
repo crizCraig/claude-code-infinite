@@ -177,7 +177,11 @@ export interface RunningProxy {
   /** Random per-process endpoint used by the ephemeral Claude plugin. */
   hookUrl: string;
   close: () => void;
-  /** Stop accepting work and wait boundedly for active request finalizers. */
+  /**
+   * Stop accepting work and give active requests a bounded grace period.
+   * On expiry, speculative shadows are cancelled and their finalizers awaited;
+   * false reports that forced cancellation was required.
+   */
   drain: (timeoutMs?: number) => Promise<boolean>;
 }
 
@@ -209,6 +213,8 @@ interface ProxyState {
   mainMemoryRoute?: MainMemoryRoute;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
+  /** Fired by drain after its grace period so speculative work can finalize. */
+  shutdownSignal: AbortSignal;
 }
 
 interface MainNoticeDelivery {
@@ -323,6 +329,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const upstream = resolveUpstream(opts);
   const hookPath = `/_ccc/hooks/${randomBytes(24).toString("hex")}`;
   const activeRequests = new Set<Promise<void>>();
+  const shutdownAbort = new AbortController();
   const state: ProxyState = {
     paymentNoticeShown: false,
     notices: new NoticeDeliveryQueue(),
@@ -334,6 +341,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       ? resolveAbRoutingOptions(opts.abRouting)
       : undefined,
     mainRouteEpoch: 0,
+    shutdownSignal: shutdownAbort.signal,
   };
   const server = http.createServer((req, res) => {
     const task = handleRequest(req, res, opts, upstream, state, hookPath).catch(
@@ -389,7 +397,14 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       }),
     ]);
     if (timer) clearTimeout(timer);
-    return completed;
+    if (completed) return true;
+
+    // The grace period only protects useful late shadow verdicts. Once it
+    // expires, actively cancel speculative work and wait for each handler's
+    // finally-log to run before returning to the caller's RequestLogger flush.
+    shutdownAbort.abort();
+    await quiesced;
+    return false;
   };
 
   return new Promise((resolve, reject) => {
@@ -891,6 +906,7 @@ async function handleMessages(
         model: String(body.model ?? ""),
         rec,
         receivedAt: received,
+        shutdownSignal: state.shutdownSignal,
         onDecision: (winner, selectedAlreadyComplete) => {
           if (
             state.mainPromptGeneration !== noticePromptGeneration ||
@@ -1448,6 +1464,8 @@ interface ComparedSseArgs {
   rec: MessagesRecord;
   /** Request-received timestamp so delivery-complete can stamp rec.totalMs. */
   receivedAt: number;
+  /** Proxy-wide forced-shutdown signal, observed by speculative mode only. */
+  shutdownSignal: AbortSignal;
   /** Buffered mode only; speculative mode reports through onDeliveryComplete. */
   onDecision: (winner: AbWinner, selectedAlreadyComplete: boolean) => void;
   onDeliveryComplete: (delivered: ComparisonDelivered, ok: boolean) => void;
@@ -1719,6 +1737,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     model,
     rec,
     receivedAt,
+    shutdownSignal,
     onDeliveryComplete,
   } = args;
   const comparison = rec.comparison!;
@@ -1767,6 +1786,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
   let recoveryStarted = false;
   let shadowSettled = false;
   let deliverySettled = false;
+  let shutdownCancelled = false;
   let resolveDelivery!: () => void;
   const deliveryDone = new Promise<void>((r) => (resolveDelivery = r));
 
@@ -1825,7 +1845,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     // res "close" also follows a NORMAL finish; the shadow grade deliberately
     // outlives delivery (late verdicts feed effective-context priors), so
     // only an abnormal close tears everything down.
-    if (res.writableFinished) return;
+    if (res.writableFinished || shutdownCancelled) return;
     if (!deliverySettled) {
       clientClosed = true;
       comparison.clientAborted = true;
@@ -1836,6 +1856,26 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     finishDelivery(currentDeliveredKind(), false);
   };
   res.once("close", abortAll);
+
+  const cancelForShutdown = (): void => {
+    if (shutdownCancelled) return;
+    shutdownCancelled = true;
+    comparison.fallbackReason ??= deliverySettled
+      ? "shutdown-shadow-cancelled"
+      : "shutdown-delivery-cancelled";
+    graderAbort.abort();
+    memoryLeg.abort();
+    fullLeg.abort();
+    if (!deliverySettled) {
+      // This is proxy-owned cancellation, not a client abort. Detach the
+      // close classifier before terminating any still-open downstream body.
+      res.off("close", abortAll);
+      if (!res.destroyed) res.destroy();
+      finishDelivery(currentDeliveredKind(), false);
+    }
+  };
+  shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+  if (shutdownSignal.aborted) cancelForShutdown();
 
   const writeToClient = (bytes: string): boolean => {
     if (res.destroyed || res.writableEnded) return true;
@@ -1930,13 +1970,14 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       comparison.verdictLate = true;
       return;
     }
-    if (forwarder.sawToolUse) {
-      // Claude Code executes every tool_use in the message once it completes;
-      // mixing A's tool call with B's prose would be incoherent. No splice.
+    const disposition = forwarder.interruptDisposition();
+    if (disposition === "blocked") {
+      // Any structured/non-text block can carry state that must not be cut in
+      // half or mixed with B. Keep the established diagnostic for log readers.
       comparison.interrupt = "blocked-tool-use";
       return;
     }
-    if (forwarder.openBlock && isThinkingBlockType(forwarder.openBlock.type)) {
+    if (disposition === "defer") {
       // A partial thinking block lacks its signature_delta; truncating it
       // would poison replay. Wait for the block to close, then re-check.
       pendingDeferredSplice = true;
@@ -1948,7 +1989,8 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
   /** Deferred-splice re-check on the exact event boundary that closed a block. */
   const onForwardedEvent = (fwd: SseEventForwarder): void => {
     if (!pendingDeferredSplice || spliceStarted) return;
-    if (fwd.sawToolUse) {
+    const disposition = fwd.interruptDisposition();
+    if (disposition === "blocked") {
       pendingDeferredSplice = false;
       comparison.interrupt = "blocked-tool-use";
       releaseFullLeg();
@@ -1961,7 +2003,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       releaseFullLeg();
       return;
     }
-    if (fwd.openBlock === null) performSplice("deferred-then-spliced");
+    if (disposition === "splice") performSplice("deferred-then-spliced");
   };
 
   /** A died or emitted a terminal error: healthy B can recover a safe prefix. */
@@ -1972,14 +2014,12 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     recoveryStarted = true;
     if (
       !forwarder ||
-      forwarder.sawToolUse ||
       forwarder.sawMessageDelta ||
-      (forwarder.openBlock !== null &&
-        isThinkingBlockType(forwarder.openBlock.type))
+      forwarder.interruptDisposition() !== "splice"
     ) {
-      // A tool call, an unfinished signed-thinking block, or the closing
-      // envelope is already on the wire. Fabricating a stop would produce an
-      // invalid message, so terminate this delivery instead of splicing.
+      // Structured content, unfinished signed thinking, or the closing
+      // envelope is already on the wire. A synthetic stop would corrupt the
+      // message, so terminate this delivery instead of splicing.
       failDelivery();
       return;
     }
@@ -2027,10 +2067,19 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       afterEvent: onForwardedEvent,
       onTerminalError: () => void recoverFromFullLeg(),
     });
+    const drainForwarder = (resume: () => void): void => {
+      const resumeAfterClientDrain = (): void => {
+        // A raw upstream chunk is not fully consumed until every parsed frame
+        // it owned has crossed its own ServerResponse drain seam.
+        if (!forwarder || forwarder.resumeAfterDrain()) resume();
+        else res.once("drain", resumeAfterClientDrain);
+      };
+      res.once("drain", resumeAfterClientDrain);
+    };
     memoryLeg.streamTo({
       write: (chunk) => forwarder!.push(chunk),
       end: onMemoryStreamEnd,
-      drain: (resume) => res.once("drain", resume),
+      drain: drainForwarder,
     });
     // If the shadow grade already finished (with no B verdict to apply), the
     // deferred release of B lands now that A owns the delivery.
@@ -2211,12 +2260,14 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
   };
 
   try {
-    memoryLeg.start();
-    fullLeg.start();
+    if (!shutdownCancelled) {
+      memoryLeg.start();
+      fullLeg.start();
+    }
 
     const deliveryTask = (async () => {
       const choice = await waitForCommitChoice();
-      if (choice.kind === "closed") return;
+      if (choice.kind === "closed" || shutdownCancelled) return;
       if (choice.kind === "memory") await commitMemory();
       else if (choice.kind === "full") await deliverWholeFullLeg(choice.reason);
       else await deliverBothFailed();
@@ -2249,11 +2300,8 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
     memoryLeg.abort();
     fullLeg.abort();
     res.off("close", abortAll);
+    shutdownSignal.removeEventListener("abort", cancelForShutdown);
   }
-}
-
-function isThinkingBlockType(type: string): boolean {
-  return type === "thinking" || type === "redacted_thinking";
 }
 
 function abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {

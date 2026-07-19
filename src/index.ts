@@ -53,7 +53,12 @@ export {
   CORRECTION_BRIDGE_TEXT,
   RECOVERY_BRIDGE_TEXT,
 } from "./splice.js";
-export type { SseFrame, OpenBlock, SseForwarderOptions } from "./splice.js";
+export type {
+  SseFrame,
+  OpenBlock,
+  SseForwarderOptions,
+  SseInterruptDisposition,
+} from "./splice.js";
 export {
   NOTICE_OPEN,
   NOTICE_CLOSE,

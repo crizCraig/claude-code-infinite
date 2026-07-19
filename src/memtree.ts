@@ -112,6 +112,10 @@ export class MemtreeClient {
   private compressCache = new Map<string, Promise<CompressResult | null>>();
   /** messages-hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
+  /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
+  private backgroundIndexes = new Map<Promise<void>, AbortController>();
+  /** Once draining begins, no later request may create another log producer. */
+  private backgroundClosing = false;
   /** FastAPI `detail` text from the most recent 402, or null while paid. */
   private unpaidDetail: string | null = null;
 
@@ -188,6 +192,7 @@ export class MemtreeClient {
     messages: Message[],
     modelContextLimit: number
   ): void {
+    if (this.backgroundClosing) return;
     if (this.indexedHashes.has(hash)) return;
     this.indexedHashes.add(hash);
     if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
@@ -196,12 +201,55 @@ export class MemtreeClient {
     }
 
     const stripped = stripCcSystemReminders(messages);
-    void this.callContextMemory(stripped, modelContextLimit, {
+    const controller = new AbortController();
+    const operation = this.callContextMemory(stripped, modelContextLimit, {
       timeoutMs: INDEX_TIMEOUT_MS,
       indexOnly: true,
-    }).catch((err) => {
-      this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
-    });
+      signal: controller.signal,
+    })
+      .then(
+        () => undefined,
+        (err) => {
+          this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
+        }
+      )
+      .finally(() => {
+        this.backgroundIndexes.delete(operation);
+      });
+    this.backgroundIndexes.set(operation, controller);
+    void operation;
+  }
+
+  /**
+   * Stop accepting background indexes and wait boundedly for those already in
+   * flight. Calls still running after the grace period are aborted, and this
+   * method does not return until their final request-log records are produced.
+   * The boolean is true for a graceful drain and false when abort was needed.
+   */
+  async drainBackground(timeoutMs = 2_000): Promise<boolean> {
+    this.backgroundClosing = true;
+    if (this.backgroundIndexes.size === 0) return true;
+
+    const boundedMs =
+      Number.isFinite(timeoutMs) && timeoutMs >= 0
+        ? Math.floor(timeoutMs)
+        : 2_000;
+    const pending = [...this.backgroundIndexes.keys()];
+    let timer: NodeJS.Timeout | undefined;
+    const completed = await Promise.race([
+      Promise.allSettled(pending).then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), boundedMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (completed) return true;
+
+    for (const controller of this.backgroundIndexes.values()) {
+      controller.abort();
+    }
+    await Promise.allSettled([...this.backgroundIndexes.keys()]);
+    return false;
   }
 
   private remember(hash: string, promise: Promise<CompressResult | null>) {
@@ -215,7 +263,7 @@ export class MemtreeClient {
   private async callContextMemory(
     messages: Message[],
     modelContextLimit: number,
-    opts: { timeoutMs: number; indexOnly?: boolean }
+    opts: { timeoutMs: number; indexOnly?: boolean; signal?: AbortSignal }
   ): Promise<CompressResult | null> {
     const body: Record<string, unknown> = {
       messages,
@@ -229,6 +277,12 @@ export class MemtreeClient {
     const started = Date.now();
     let status: number | undefined;
     let ok = false;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timeout = setTimeout(abort, opts.timeoutMs);
+    timeout.unref();
+    opts.signal?.addEventListener("abort", abort, { once: true });
+    if (opts.signal?.aborted) abort();
     try {
       const response = await fetch(`${this.baseUrl}/v1/context_memory`, {
         method: "POST",
@@ -239,7 +293,7 @@ export class MemtreeClient {
           "x-client-version": CLIENT_VERSION,
         },
         body: payload,
-        signal: AbortSignal.timeout(opts.timeoutMs),
+        signal: controller.signal,
       });
       status = response.status;
 
@@ -267,6 +321,8 @@ export class MemtreeClient {
       );
       return { ...json, clientLatencyMs };
     } finally {
+      clearTimeout(timeout);
+      opts.signal?.removeEventListener("abort", abort);
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).
       this.reqlog?.log({

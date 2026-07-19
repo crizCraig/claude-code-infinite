@@ -124,6 +124,9 @@ export interface OpenBlock {
   type: string;
 }
 
+/** Whether the client-visible A prefix can be interrupted without corruption. */
+export type SseInterruptDisposition = "splice" | "defer" | "blocked";
+
 export interface SseForwarderOptions {
   /** Write one complete frame's verbatim bytes; false signals backpressure. */
   write: (bytes: string) => boolean;
@@ -150,7 +153,7 @@ export interface SseForwarderOptions {
 export class SseEventForwarder {
   /** The content block currently open on the client stream, if any. */
   openBlock: OpenBlock | null = null;
-  /** A tool_use block reached the client — the interrupt point of no return. */
+  /** Kept as an exact diagnostic even though every structured block locks out. */
   sawToolUse = false;
   /** message_delta forwarded — the message is closing; treat window as shut. */
   sawMessageDelta = false;
@@ -162,31 +165,96 @@ export class SseEventForwarder {
   textChars = 0;
 
   private scanner = new SseFrameScanner();
+  /** Complete frames accepted from an upstream chunk but not submitted yet. */
+  private pendingFrames: SseFrame[] = [];
+  /** Defensive retention if a caller pushes again before honoring false. */
+  private pendingChunks: Buffer[] = [];
+  private waitingForDrain = false;
+  private pumping = false;
+  /** Once structured/non-text content reaches the client, never splice later. */
+  private interruptLocked = false;
   private stopped = false;
 
   constructor(private readonly opts: SseForwarderOptions) {}
 
-  /** Forward complete frames from this chunk; false = backpressure hit. */
+  /**
+   * Accept a chunk and forward its complete frames until backpressure. A false
+   * return means the current frame was accepted by write(), but every later
+   * frame is retained here and MUST wait for resumeAfterDrain().
+   */
   push(chunk: Buffer): boolean {
-    let writable = true;
-    for (const frame of this.scanner.push(chunk)) {
-      if (this.stopped) break;
-      if (frame.event === "error" || frame.data?.type === "error") {
-        this.sawTerminalError = true;
-        this.stopped = true;
-        this.opts.onTerminalError?.(this, frame.data);
-        break;
-      }
-      this.observe(frame.data);
-      if (!this.opts.write(frame.raw)) writable = false;
-      if (this.opts.afterEvent) this.opts.afterEvent(this, frame.data);
+    if (this.stopped) return true;
+    if (this.waitingForDrain || this.pumping) {
+      this.pendingChunks.push(Buffer.from(chunk));
+      return false;
     }
-    return writable;
+    this.pendingFrames.push(...this.scanner.push(chunk));
+    return this.pump();
+  }
+
+  /** Resume retained frames after the downstream emitted one drain event. */
+  resumeAfterDrain(): boolean {
+    if (this.stopped) {
+      this.waitingForDrain = false;
+      this.discardPending();
+      return true;
+    }
+    if (!this.waitingForDrain) return this.pump();
+    this.waitingForDrain = false;
+    return this.pump();
+  }
+
+  /**
+   * Interrupt policy for the exact prefix already submitted to the client.
+   * Text can be closed synthetically, signed thinking must finish naturally,
+   * and every other content block permanently shuts the splice window.
+   */
+  interruptDisposition(): SseInterruptDisposition {
+    if (this.interruptLocked) return "blocked";
+    if (this.openBlock === null || this.openBlock.type === "text") {
+      return "splice";
+    }
+    return isThinkingBlockType(this.openBlock.type) ? "defer" : "blocked";
+  }
+
+  private pump(): boolean {
+    if (this.pumping) return false;
+    this.pumping = true;
+    try {
+      while (!this.stopped) {
+        if (this.pendingFrames.length === 0) {
+          const nextChunk = this.pendingChunks.shift();
+          if (!nextChunk) return true;
+          this.pendingFrames.push(...this.scanner.push(nextChunk));
+          continue;
+        }
+        const frame = this.pendingFrames.shift()!;
+        if (frame.event === "error" || frame.data?.type === "error") {
+          this.sawTerminalError = true;
+          this.stopped = true;
+          this.discardPending();
+          this.opts.onTerminalError?.(this, frame.data);
+          return true;
+        }
+        this.observe(frame.data);
+        const writable = this.opts.write(frame.raw);
+        if (this.opts.afterEvent) this.opts.afterEvent(this, frame.data);
+        if (!writable) {
+          this.waitingForDrain = true;
+          return false;
+        }
+      }
+      this.discardPending();
+      return true;
+    } finally {
+      this.pumping = false;
+    }
   }
 
   /** Stop forwarding permanently; later frames (and partials) are discarded. */
   stop(): void {
     this.stopped = true;
+    this.discardPending();
   }
 
   isStopped(): boolean {
@@ -195,14 +263,22 @@ export class SseEventForwarder {
 
   private observe(data: any): void {
     const type = data?.type;
-    if (type === "content_block_start" && typeof data.index === "number") {
+    if (type === "content_block_start") {
       const blockType =
         typeof data.content_block?.type === "string"
           ? data.content_block.type
           : "unknown";
+      if (!Number.isSafeInteger(data.index) || data.index < 0) {
+        // We cannot fabricate a valid stop index for a malformed open block.
+        this.interruptLocked = true;
+        return;
+      }
       this.openBlock = { index: data.index, type: blockType };
       if (data.index > this.maxIndex) this.maxIndex = data.index;
       if (blockType === "tool_use") this.sawToolUse = true;
+      if (blockType !== "text" && !isThinkingBlockType(blockType)) {
+        this.interruptLocked = true;
+      }
       if (
         blockType === "text" &&
         typeof data.content_block.text === "string"
@@ -224,6 +300,12 @@ export class SseEventForwarder {
       this.sawMessageDelta = true;
       this.sawMessageStop = true;
     }
+  }
+
+  private discardPending(): void {
+    this.pendingFrames.length = 0;
+    this.pendingChunks.length = 0;
+    if (this.stopped) this.scanner.flush();
   }
 }
 

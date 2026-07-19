@@ -47,6 +47,7 @@ const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app
 const LOCAL_BASE_URL = "http://localhost:8080";
 const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
+const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 
 type Mode = "production" | "staging" | "local";
@@ -359,8 +360,10 @@ async function main() {
       scrubber.close();
       // A speculative response can finish before its shadow grader. Stop new
       // proxy work and give active handlers a bounded chance to finalize their
-      // verdict records, then wait for scheduled JSONL appends to reach disk.
+      // verdict records. Background indexing is a separate log producer: stop
+      // and drain it too before waiting for scheduled JSONL appends on disk.
       await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+      await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
       await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
       process.exit(code);
     }
