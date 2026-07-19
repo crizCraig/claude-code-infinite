@@ -43,6 +43,8 @@ export type TurnType =
   | "followup-ab-failed"
   | "followup-ab-memory"
   | "followup-ab-full"
+  | "followup-ab-spliced"
+  | "followup-ab-recovered"
   | "followup-degraded"
   | "unparseable";
 
@@ -73,6 +75,22 @@ export interface GraderDiagnostic {
   error?: string;
 }
 
+/** What the client actually received in speculative mode (vs `winner`). */
+export type ComparisonDelivered =
+  | "memory"
+  | "full"
+  | "spliced"
+  | "recovered"
+  | "none";
+
+export type ComparisonInterrupt =
+  | "none"
+  | "spliced"
+  | "deferred-then-spliced"
+  | "blocked-tool-use"
+  | "late-verdict"
+  | "recovered";
+
 export interface ComparisonRecord {
   attempted: boolean;
   gateReason: AbGateReason;
@@ -85,7 +103,10 @@ export interface ComparisonRecord {
   prefixWaitMs?: number;
   gradeMs?: number;
   grader?: GraderDiagnostic;
+  /** Grader attempts beyond the first (speculative shadow grading only). */
+  graderRetries?: number;
   verdict?: "A" | "B" | "tie";
+  /** What the verdict (or fallback) chose — may differ from `delivered`. */
   winner?: "memory" | "full";
   fallbackReason?: string;
   memoryLeg?: ComparisonLegRecord;
@@ -93,6 +114,16 @@ export interface ComparisonRecord {
   loserAborted?: boolean;
   clientAborted?: boolean;
   deliveryOk?: boolean;
+  /** Speculative delivery fields (absent in buffered mode). */
+  speculative?: boolean;
+  /** Forward start → first response byte written toward the client. */
+  clientTtfbMs?: number;
+  interrupt?: ComparisonInterrupt;
+  /** Client-visible answer-text characters delivered before the splice. */
+  spliceAtChars?: number;
+  /** A B verdict arrived after the interrupt window closed; logged only. */
+  verdictLate?: boolean;
+  delivered?: ComparisonDelivered;
 }
 
 /**
@@ -139,6 +170,13 @@ export interface MemtreeRecord {
   requestBytes: number;
 }
 
+/** A display-only notice was atomically claimed by one Claude Code hook. */
+export interface NoticeRecord {
+  kind: "notice";
+  event: "claimed";
+  via: "MessageDisplay" | "Stop";
+}
+
 export class RequestLogger {
   readonly path: string;
 
@@ -153,7 +191,7 @@ export class RequestLogger {
   }
 
   /** Fire-and-forget append of one JSONL line. Never throws, never blocks. */
-  log(record: MessagesRecord | MemtreeRecord): void {
+  log(record: MessagesRecord | MemtreeRecord | NoticeRecord): void {
     try {
       const line =
         JSON.stringify({ ts: new Date().toISOString(), ...record }) + "\n";

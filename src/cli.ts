@@ -181,7 +181,12 @@ function installedClaudeSupportsMessageDisplay(): boolean {
 async function main() {
   const args = process.argv.slice(2);
   const isDebugMode = args.includes("--debug");
-  const filteredArgs = args.filter((arg) => arg !== "--debug");
+  // Research escape hatch: retain the old buffer-both-then-commit A/B mode
+  // instead of the default speculative commit-A-immediately delivery.
+  const isAbBuffered = args.includes("--ab-buffered");
+  const filteredArgs = args.filter(
+    (arg) => arg !== "--debug" && arg !== "--ab-buffered"
+  );
 
   const mode: Mode =
     filteredArgs[0] === "local" ? "local" :
@@ -234,9 +239,9 @@ async function main() {
   // startup never fails or hangs on polychat availability.
   await warnIfUnpaid(memtreeBaseUrl, polychatApiKey);
 
-  // Always-on request/timing log (reqlog.ts): one JSONL line per proxied
-  // /v1/messages request and per MemTree call, so incidents can be
-  // reconstructed after the fact without --debug. Never blocks or throws.
+  // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
+  // successful notice claims, so incidents can be reconstructed after the
+  // fact without --debug. Never blocks or throws.
   const reqlog = new RequestLogger();
 
   // Start the local proxy. Claude Code's OAuth token flows through it straight
@@ -269,6 +274,7 @@ async function main() {
           ),
           sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
           forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
+          speculative: !isAbBuffered,
         };
   const proxy = await startProxy({
     memtree,

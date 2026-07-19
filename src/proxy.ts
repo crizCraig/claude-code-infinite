@@ -69,6 +69,7 @@ import {
   flattenToSingleUserMessage,
   hasEarlierNonToolUserMessage,
   isAwaySummaryUserMessage,
+  isLocalBashCommandTurn,
   isNonToolUserMessage,
   isToolResultUserMessage,
   lastNonSystemMessage,
@@ -79,6 +80,7 @@ import {
 } from "./turns.js";
 import {
   DEGRADED_NOTICE,
+  FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SseNoticeRewriter,
   compressedNoticeText,
@@ -86,6 +88,13 @@ import {
   stripNoticeBlocks,
   stripNoticeSystem,
 } from "./notices.js";
+import {
+  RECOVERY_BRIDGE_TEXT,
+  SseEventForwarder,
+  SseSpliceWriter,
+  bridgeBlockEvents,
+  contentBlockStopEvent,
+} from "./splice.js";
 import {
   NoticeDeliveryQueue,
   parseNoticeHookInput,
@@ -95,14 +104,18 @@ import {
   mergeUsageFromJsonBody,
   mergeUsageFromSseEvent,
   type MessagesRecord,
+  type ComparisonDelivered,
+  type ComparisonInterrupt,
   type ComparisonLegRecord,
   type GraderDiagnostic,
   type RequestLogger,
+  type TurnType,
   type UsageRecord,
 } from "./reqlog.js";
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
+const NOTICE_SETTLE_WAIT_MS = 1_000;
 const TOKEN_COUNT_CACHE_MAX = 64;
 
 const SKIP_REQUEST_HEADERS = new Set([
@@ -132,8 +145,8 @@ export interface ProxyOptions {
   abRouting?: AbRoutingOptions;
   debug?: boolean;
   /**
-   * Always-on request/timing JSONL log (see reqlog.ts). One line per
-   * /v1/messages request; omitted (e.g. in unit tests) means no logging.
+   * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
+   * MemTree calls, and successful notice claims; omitted means no logging.
    */
   reqlog?: RequestLogger;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
@@ -165,6 +178,8 @@ interface ProxyState {
   mainPromptId?: string;
   mainPromptText?: string;
   mainPromptGeneration: number;
+  /** Matching Stop waits briefly for this response's final notice decision. */
+  mainNoticeDelivery?: MainNoticeDelivery;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
   /** Claude's full-input token estimates, keyed by token-relevant fields. */
@@ -175,6 +190,93 @@ interface ProxyState {
   mainMemoryRoute?: MainMemoryRoute;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
+}
+
+interface MainNoticeDelivery {
+  promptGeneration: number;
+  promptId?: string;
+  pending: number;
+  /** The selected memory response ended upstream, so first display may wait briefly. */
+  firstDisplayCanWait: boolean;
+  settled: Promise<void>;
+  resolve: () => void;
+}
+
+function beginMainNoticeDelivery(
+  state: ProxyState,
+  promptGeneration: number,
+  promptId: string | undefined
+): MainNoticeDelivery {
+  const current = state.mainNoticeDelivery;
+  if (
+    current &&
+    current.promptGeneration === promptGeneration &&
+    current.promptId === promptId
+  ) {
+    current.pending++;
+    return current;
+  }
+  cancelMainNoticeDelivery(state);
+  let resolve!: () => void;
+  const settled = new Promise<void>((done) => {
+    resolve = done;
+  });
+  const delivery: MainNoticeDelivery = {
+    promptGeneration,
+    promptId,
+    pending: 1,
+    firstDisplayCanWait: false,
+    settled,
+    resolve,
+  };
+  state.mainNoticeDelivery = delivery;
+  return delivery;
+}
+
+function settleMainNoticeDelivery(
+  state: ProxyState,
+  delivery: MainNoticeDelivery
+): void {
+  if (delivery.pending > 0) delivery.pending--;
+  if (delivery.pending !== 0) return;
+  delivery.resolve();
+  if (state.mainNoticeDelivery === delivery) {
+    state.mainNoticeDelivery = undefined;
+  }
+}
+
+function cancelMainNoticeDelivery(state: ProxyState): void {
+  const delivery = state.mainNoticeDelivery;
+  if (!delivery) return;
+  state.mainNoticeDelivery = undefined;
+  delivery.pending = 0;
+  delivery.resolve();
+}
+
+async function waitForMainNoticeDelivery(
+  state: ProxyState,
+  promptId: string | undefined
+): Promise<void> {
+  const delivery = state.mainNoticeDelivery;
+  if (
+    !delivery ||
+    (delivery.promptId !== undefined &&
+      promptId !== undefined &&
+      delivery.promptId !== promptId)
+  ) {
+    return;
+  }
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      delivery.settled,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, NOTICE_SETTLE_WAIT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 interface MainMemoryRoute {
@@ -246,7 +348,7 @@ async function handleRequest(
   const url = new URL(req.url ?? "/", `http://127.0.0.1`);
 
   if (url.pathname === hookPath) {
-    return handleNoticeHook(req, res, state);
+    return handleNoticeHook(req, res, state, opts.reqlog);
   }
 
   if (req.method === "POST" && url.pathname === "/v1/messages") {
@@ -262,7 +364,8 @@ async function handleRequest(
 async function handleNoticeHook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  state: ProxyState
+  state: ProxyState,
+  reqlog: RequestLogger | undefined
 ): Promise<void> {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
@@ -300,6 +403,7 @@ async function handleNoticeHook(
 
   if (parsed.hook_event_name === "UserPromptSubmit") {
     if (parsed.agent_id === undefined) {
+      cancelMainNoticeDelivery(state);
       state.mainPromptArmed = true;
       state.mainPromptId = parsed.prompt_id;
       state.mainPromptText = parsed.prompt;
@@ -325,7 +429,18 @@ async function handleNoticeHook(
     return;
   }
 
-  const output = state.notices.claim(parsed);
+  const hookPromptGeneration = state.mainPromptGeneration;
+  const displayWaitsForNotice =
+    parsed.hook_event_name === "MessageDisplay" &&
+    parsed.agent_id === undefined &&
+    parsed.index === 0 &&
+    state.mainNoticeDelivery?.firstDisplayCanWait === true &&
+    (state.mainNoticeDelivery.promptId === undefined ||
+      parsed.prompt_id === undefined ||
+      state.mainNoticeDelivery.promptId === parsed.prompt_id);
+  if (displayWaitsForNotice) {
+    await waitForMainNoticeDelivery(state, parsed.prompt_id);
+  }
   const stopMatchesMainPrompt =
     parsed.hook_event_name === "Stop" &&
     parsed.agent_id === undefined &&
@@ -333,9 +448,29 @@ async function handleNoticeHook(
       parsed.prompt_id === undefined ||
       state.mainPromptId === parsed.prompt_id);
   if (stopMatchesMainPrompt) {
+    await waitForMainNoticeDelivery(state, parsed.prompt_id);
+  }
+  // UserPromptSubmit can run while a display or Stop hook awaits the prior
+  // response. Never let that old hook consume or clear the newer prompt's state.
+  const stopStillMatches =
+    stopMatchesMainPrompt &&
+    state.mainPromptGeneration === hookPromptGeneration;
+  const displayStillMatches =
+    !displayWaitsForNotice ||
+    state.mainPromptGeneration === hookPromptGeneration;
+  const output =
+    (parsed.hook_event_name === "Stop" && !stopStillMatches) ||
+    !displayStillMatches
+      ? null
+      : state.notices.claim(parsed);
+  if (stopStillMatches) {
+    cancelMainNoticeDelivery(state);
     state.mainPromptArmed = false;
     state.mainPromptId = undefined;
     state.mainPromptText = undefined;
+    // Invalidate a response that did not settle within the bounded hook wait.
+    // Otherwise its late callback could enqueue a notice after Stop returned.
+    state.mainPromptGeneration++;
     state.mainRouteEpoch++;
     state.mainMemoryRoute = undefined;
     // A normal main Stop means all child work for the turn has settled. Clear
@@ -346,6 +481,20 @@ async function handleNoticeHook(
     res.writeHead(204);
     res.end();
     return;
+  }
+  if (
+    parsed.hook_event_name === "MessageDisplay" ||
+    parsed.hook_event_name === "Stop"
+  ) {
+    try {
+      reqlog?.log({
+        kind: "notice",
+        event: "claimed",
+        via: parsed.hook_event_name,
+      });
+    } catch {
+      // Custom/test loggers get RequestLogger's never-break-hook policy.
+    }
   }
   const body = Buffer.from(JSON.stringify(output), "utf-8");
   res.writeHead(200, {
@@ -375,11 +524,21 @@ async function handleMessages(
     turnType: "unparseable",
     requestBytes: rawBody.length,
   };
+  let noticeDelivery: MainNoticeDelivery | undefined;
+  const settleNoticeDelivery = () => {
+    if (!noticeDelivery) return;
+    settleMainNoticeDelivery(state, noticeDelivery);
+    noticeDelivery = undefined;
+  };
   const logged = async (forward: Promise<unknown>): Promise<void> => {
     try {
       await forward;
     } finally {
-      rec.totalMs = Date.now() - received;
+      settleNoticeDelivery();
+      // Speculative A/B stamps delivery-complete time itself: its forward
+      // promise intentionally outlives delivery to also capture the shadow
+      // grade, which must not inflate the delivery metric.
+      if (rec.totalMs === undefined) rec.totalMs = Date.now() - received;
       opts.reqlog?.log(rec);
     }
   };
@@ -415,6 +574,7 @@ async function handleMessages(
   const isUserTurn = isNonToolUserMessage(lastMsg);
   const isToolResultTurn = isToolResultUserMessage(lastMsg);
   const isAwaySummary = isAwaySummaryUserMessage(lastMsg);
+  const isLocalBashCommand = isLocalBashCommandTurn(messages);
   const isFollowupUserTurn =
     isUserTurn && hasEarlierNonToolUserMessage(messages);
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
@@ -427,15 +587,23 @@ async function handleMessages(
     routeEpoch = ++state.mainRouteEpoch;
     state.mainMemoryRoute = undefined;
   }
-  const armedMainFollowup =
+  const hookOwnedMainFollowup =
     isFollowupUserTurn &&
     !isAwaySummary &&
     !isSubagentRequest &&
     state.mainPromptArmed &&
     state.mainPromptText !== undefined &&
     userMessageText(lastMsg).includes(state.mainPromptText);
+  // Local `!command` turns do not consistently emit UserPromptSubmit, and the
+  // API history contains bash wrappers rather than the literal typed command.
+  // Their strict main-thread replay shape can safely own its own notice.
+  const localCommandMainFollowup =
+    isFollowupUserTurn &&
+    !isAwaySummary &&
+    !isSubagentRequest &&
+    isLocalBashCommand;
   const displayForThisTurn =
-    armedMainFollowup &&
+    (hookOwnedMainFollowup || localCommandMainFollowup) &&
     state.activeSubagents.size === 0;
   const noticePromptId = state.mainPromptId;
   const noticePromptGeneration = state.mainPromptGeneration;
@@ -565,6 +733,21 @@ async function handleMessages(
   }
   const actuallyCompressed = didMemtreeCompress(result);
   const abRouting = state.abRouting;
+  if (
+    abRouting &&
+    actuallyCompressed &&
+    displayForThisTurn &&
+    state.mainPromptGeneration === noticePromptGeneration
+  ) {
+    // A/B mode intentionally decides success only after complete downstream
+    // delivery. Let a nearly simultaneous display or Stop wait briefly for
+    // that decision instead of racing the late notice callback.
+    noticeDelivery = beginMainNoticeDelivery(
+      state,
+      noticePromptGeneration,
+      noticePromptId
+    );
+  }
   const canRouteAb =
     abRouting !== undefined &&
     actuallyCompressed &&
@@ -636,40 +819,78 @@ async function handleMessages(
             : extractUnfoldedMemory(result.messages),
         model: String(body.model ?? ""),
         rec,
-        onDecision: (winner) => {
+        receivedAt: received,
+        onDecision: (winner, selectedAlreadyComplete) => {
           if (
             state.mainPromptGeneration !== noticePromptGeneration ||
             state.mainRouteEpoch !== routeEpoch
           ) {
             return;
           }
+          if (
+            winner === "memory" &&
+            selectedAlreadyComplete &&
+            noticeDelivery &&
+            state.mainNoticeDelivery === noticeDelivery
+          ) {
+            // The whole selected response ended upstream before any client
+            // bytes. Its first MessageDisplay may make a bounded wait for the
+            // downstream finish and then claim the completed-delivery notice.
+            noticeDelivery.firstDisplayCanWait = true;
+          }
           if (winner === "full") {
             state.mainMemoryRoute = undefined;
           }
         },
-        onDeliveryComplete: (winner, ok) => {
-          if (state.mainRouteEpoch !== routeEpoch) return;
-          if (winner === "memory" && ok) {
-            queueCompressionNotice({
-              state,
-              displayForThisTurn,
-              noticePromptGeneration,
-              noticePromptId,
-              result,
-              compressMs,
-              originalTokenCountKey,
-              rec,
-            });
-            installMainMemoryRoute(
-              state,
-              req,
-              body,
-              messages,
-              compressedBody,
-              routeEpoch
-            );
-          } else {
+        onDeliveryComplete: (delivered, ok) => {
+          // Route/notice bookkeeping is keyed off DELIVERED content, not the
+          // verdict: a late B verdict after a clean memory delivery changes
+          // priors, never the installed route.
+          try {
+            if (state.mainRouteEpoch !== routeEpoch) return;
+            if (delivered === "memory" && ok) {
+              queueCompressionNotice({
+                state,
+                displayForThisTurn,
+                noticePromptGeneration,
+                noticePromptId,
+                result,
+                compressMs,
+                originalTokenCountKey,
+                rec,
+              });
+              installMainMemoryRoute(
+                state,
+                req,
+                body,
+                messages,
+                compressedBody,
+                routeEpoch
+              );
+              return;
+            }
             state.mainMemoryRoute = undefined;
+            const mayQueueNotice =
+              ok &&
+              displayForThisTurn &&
+              state.mainPromptGeneration === noticePromptGeneration;
+            if (mayQueueNotice && delivered === "spliced") {
+              state.notices.queueSuffix(
+                FULL_HISTORY_OVERRIDE_NOTICE,
+                undefined,
+                noticePromptId
+              );
+            } else if (mayQueueNotice && delivered === "recovered") {
+              state.notices.queueSuffix(
+                DEGRADED_NOTICE,
+                undefined,
+                noticePromptId
+              );
+            }
+          } finally {
+            // In speculative mode delivery completes while the shadow grade
+            // is still running; release a waiting display/Stop hook now.
+            settleNoticeDelivery();
           }
         },
       })
@@ -1154,12 +1375,26 @@ interface ComparedSseArgs {
   unfoldedMemory: string;
   model: string;
   rec: MessagesRecord;
-  onDecision: (winner: AbWinner) => void;
-  onDeliveryComplete: (winner: AbWinner, ok: boolean) => void;
+  /** Request-received timestamp so delivery-complete can stamp rec.totalMs. */
+  receivedAt: number;
+  /** Buffered mode only; speculative mode reports through onDeliveryComplete. */
+  onDecision: (winner: AbWinner, selectedAlreadyComplete: boolean) => void;
+  onDeliveryComplete: (delivered: ComparisonDelivered, ok: boolean) => void;
+}
+
+/**
+ * Live memory-vs-full comparison. Speculative mode (default) commits the
+ * memory leg to the client from its first byte and treats a B verdict as an
+ * in-stream interruption; buffered mode (--ab-buffered) retains the original
+ * hold-both-then-commit behavior for research comparison runs.
+ */
+async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
+  if (args.routing.speculative) return forwardSpeculativeSse(args);
+  return forwardBufferedComparedSse(args);
 }
 
 /** Buffer two live SSE legs, grade their semantic prefixes, then commit one. */
-async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
+async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> {
   const {
     req,
     res,
@@ -1355,7 +1590,7 @@ async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
       if (decisionNotified || !selected.isHealthy()) return;
       decisionNotified = true;
       try {
-        onDecision(winner);
+        onDecision(winner, selected.completedSuccessfully());
       } catch {
         // UI/route bookkeeping can never prevent delivery of the chosen response.
       }
@@ -1372,6 +1607,7 @@ async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
     decisionAbort.abort();
     const delivered = await selected.commitTo(res, notifyDecision);
     copyWinnerObservation(rec, selected.record);
+    comparison.delivered = winner;
     comparison.deliveryOk = delivered;
     if (!delivered) rec.turnType = "followup-ab-failed";
     try {
@@ -1385,6 +1621,562 @@ async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
     fullLeg.abort();
     res.off("close", abortAll);
   }
+}
+
+/**
+ * Speculative A/B delivery (plans/2026-07-17_PLAN_speculative_ab_streaming.md):
+ * commit the memory leg (A) to the client from its first sign of stream
+ * progress through an event-aligned forwarder; grade both semantic prefixes
+ * OFF the delivery path; and if the shadow verdict is B while the interrupt
+ * window is still open, splice the full leg (B) into A's message envelope —
+ * closing A's open block, emitting a model-visible bridge text block, and
+ * replaying B's content with renumbered indices. A short answer that finishes
+ * before B can be graded simply stands, and the late verdict is logged for
+ * effective-context priors.
+ */
+async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
+  const {
+    req,
+    res,
+    opts,
+    upstream,
+    routing,
+    memoryBody,
+    fullBody,
+    question,
+    unfoldedMemory,
+    model,
+    rec,
+    receivedAt,
+    onDeliveryComplete,
+  } = args;
+  const comparison = rec.comparison!;
+  comparison.prefixChars = routing.prefixChars;
+  comparison.speculative = true;
+  comparison.interrupt = "none";
+  const memoryRecord: ComparisonLegRecord = { requestBytes: memoryBody.length };
+  const fullRecord: ComparisonLegRecord = { requestBytes: fullBody.length };
+  comparison.memoryLeg = memoryRecord;
+  comparison.fullLeg = fullRecord;
+  rec.turnType = "followup-ab-pending";
+
+  capture(opts, "anthropic-request-memory", memoryBody);
+  capture(opts, "anthropic-request-full", fullBody);
+
+  const started = Date.now();
+  const memoryLeg = new BufferedUpstreamLeg({
+    name: "memory",
+    req,
+    body: memoryBody,
+    upstream,
+    prefixChars: routing.prefixChars,
+    maxBufferedBytes: routing.maxBufferedBytesPerLeg,
+    record: memoryRecord,
+  });
+  const fullLeg = new BufferedUpstreamLeg({
+    name: "full",
+    req,
+    body: fullBody,
+    upstream,
+    prefixChars: routing.prefixChars,
+    maxBufferedBytes: routing.maxBufferedBytesPerLeg,
+    record: fullRecord,
+  });
+
+  // Unlike buffered mode, this controller cancels GRADING only — delivery is
+  // already committed. A client abort still tears down everything.
+  const graderAbort = new AbortController();
+  let clientClosed = false;
+
+  // ---- interrupt-window state machine -------------------------------------
+  let committedLeg: AbWinner | null = null;
+  let forwarder: SseEventForwarder | null = null;
+  let spliceStarted = false;
+  let pendingDeferredSplice = false;
+  let shadowSettled = false;
+  let deliverySettled = false;
+  let resolveDelivery!: () => void;
+  const deliveryDone = new Promise<void>((r) => (resolveDelivery = r));
+
+  const currentDeliveredKind = (): ComparisonDelivered => {
+    if (spliceStarted) {
+      return comparison.interrupt === "recovered" ? "recovered" : "spliced";
+    }
+    if (committedLeg === "full") return "full";
+    if (committedLeg === "memory") return "memory";
+    return "none";
+  };
+
+  const finishDelivery = (delivered: ComparisonDelivered, ok: boolean): void => {
+    if (deliverySettled) return;
+    deliverySettled = true;
+    comparison.delivered = delivered;
+    comparison.deliveryOk = ok;
+    const turnType: TurnType = !ok
+      ? "followup-ab-failed"
+      : delivered === "memory"
+        ? "followup-ab-memory"
+        : delivered === "full"
+          ? "followup-ab-full"
+          : delivered === "spliced"
+            ? "followup-ab-spliced"
+            : delivered === "recovered"
+              ? "followup-ab-recovered"
+              : "followup-ab-failed";
+    recordTurn(
+      rec,
+      turnType,
+      delivered === "memory" || delivered === "none" ? memoryBody : fullBody
+    );
+    copyWinnerObservation(
+      rec,
+      delivered === "memory" || delivered === "none"
+        ? memoryRecord
+        : fullRecord
+    );
+    rec.totalMs = Date.now() - receivedAt;
+    if (opts.debug) {
+      console.error(
+        `[ccc proxy] A/B speculative delivered ${delivered}` +
+          ` (ok=${ok}, interrupt=${comparison.interrupt})`
+      );
+    }
+    try {
+      onDeliveryComplete(delivered, ok);
+    } catch {
+      // Route/notice bookkeeping can never affect delivered bytes.
+    }
+    resolveDelivery();
+  };
+
+  const abortAll = () => {
+    // res "close" also follows a NORMAL finish; the shadow grade deliberately
+    // outlives delivery (late verdicts feed effective-context priors), so
+    // only an abnormal close tears everything down.
+    if (res.writableFinished) return;
+    if (!deliverySettled) {
+      clientClosed = true;
+      comparison.clientAborted = true;
+    }
+    graderAbort.abort();
+    memoryLeg.abort();
+    fullLeg.abort();
+    finishDelivery(currentDeliveredKind(), false);
+  };
+  res.once("close", abortAll);
+
+  const writeToClient = (bytes: string): boolean => {
+    if (res.destroyed || res.writableEnded) return true;
+    return res.write(bytes);
+  };
+
+  /**
+   * Abort the shadow leg once it can no longer be spliced in. Before delivery
+   * has committed to A, B is still the only failover candidate — the
+   * pre-commit phase (not the shadow grade) owns its fate until then.
+   */
+  const releaseFullLeg = () => {
+    if (committedLeg === "memory" && !spliceStarted && !pendingDeferredSplice) {
+      comparison.loserAborted = fullLeg.abort();
+    }
+  };
+
+  /** Replay B into A's open envelope after the bridge block. */
+  const replayFullLeg = (
+    startIndex: number,
+    kind: "spliced" | "recovered"
+  ): void => {
+    const writer = new SseSpliceWriter({ startIndex });
+    fullLeg.streamTo({
+      write: (chunk) => writeToClient(writer.push(chunk)),
+      end: () => {
+        writer.flush();
+        const ok = fullLeg.completedSuccessfully();
+        if (ok) {
+          if (!res.destroyed && !res.writableEnded) res.end();
+        } else if (!res.destroyed) {
+          res.destroy();
+        }
+        void waitForResponseFinishOrClose(res).then((flushed) =>
+          finishDelivery(kind, flushed && ok)
+        );
+      },
+      drain: (resume) => res.once("drain", resume),
+    });
+  };
+
+  const performSplice = (interrupt: ComparisonInterrupt): void => {
+    if (spliceStarted || !forwarder || clientClosed) return;
+    spliceStarted = true;
+    pendingDeferredSplice = false;
+    comparison.interrupt = interrupt;
+    comparison.spliceAtChars = forwarder.textChars;
+    const openBlock = forwarder.openBlock;
+    const bridgeIndex = forwarder.maxIndex + 1;
+    forwarder.stop();
+    comparison.loserAborted = memoryLeg.abort() || undefined;
+    if (opts.debug) {
+      console.error(`[ccc proxy] A/B splice (${interrupt}) at block ${bridgeIndex}`);
+    }
+    let head = "";
+    if (openBlock) head += contentBlockStopEvent(openBlock.index);
+    head += bridgeBlockEvents(
+      bridgeIndex,
+      interrupt === "recovered" ? RECOVERY_BRIDGE_TEXT : routing.bridgeText
+    );
+    writeToClient(head);
+    replayFullLeg(
+      bridgeIndex + 1,
+      interrupt === "recovered" ? "recovered" : "spliced"
+    );
+  };
+
+  /** Apply a B verdict against the interrupt-window table. */
+  const attemptInterrupt = () => {
+    if (
+      clientClosed ||
+      spliceStarted ||
+      pendingDeferredSplice ||
+      committedLeg !== "memory" ||
+      !forwarder
+    ) {
+      return;
+    }
+    if (deliverySettled || forwarder.sawMessageDelta) {
+      comparison.interrupt = "late-verdict";
+      comparison.verdictLate = true;
+      return;
+    }
+    if (forwarder.sawToolUse) {
+      // Claude Code executes every tool_use in the message once it completes;
+      // mixing A's tool call with B's prose would be incoherent. No splice.
+      comparison.interrupt = "blocked-tool-use";
+      return;
+    }
+    if (forwarder.openBlock && isThinkingBlockType(forwarder.openBlock.type)) {
+      // A partial thinking block lacks its signature_delta; truncating it
+      // would poison replay. Wait for the block to close, then re-check.
+      pendingDeferredSplice = true;
+      return;
+    }
+    performSplice("spliced");
+  };
+
+  /** Deferred-splice re-check on the exact event boundary that closed a block. */
+  const onForwardedEvent = (fwd: SseEventForwarder): void => {
+    if (!pendingDeferredSplice || spliceStarted) return;
+    if (fwd.sawToolUse) {
+      pendingDeferredSplice = false;
+      comparison.interrupt = "blocked-tool-use";
+      releaseFullLeg();
+      return;
+    }
+    if (fwd.sawMessageDelta) {
+      pendingDeferredSplice = false;
+      comparison.interrupt = "late-verdict";
+      comparison.verdictLate = true;
+      releaseFullLeg();
+      return;
+    }
+    if (fwd.openBlock === null) performSplice("deferred-then-spliced");
+  };
+
+  /** A died mid-stream: any healthy B content beats a dead turn. */
+  const recoverFromFullLeg = async (): Promise<void> => {
+    if (!forwarder || forwarder.sawToolUse || forwarder.sawMessageDelta) {
+      // A tool call (or the closing envelope) is already on the wire; a
+      // coherent splice is impossible. The turn fails as it does today.
+      failDelivery();
+      return;
+    }
+    pendingDeferredSplice = false;
+    await fullLeg.waitForFallbackEvidence();
+    if (clientClosed || spliceStarted || deliverySettled) return;
+    if (fullLeg.hasHealthyFallbackEvidence()) {
+      performSplice("recovered");
+    } else {
+      failDelivery();
+    }
+  };
+
+  const failDelivery = (): void => {
+    if (!res.destroyed) res.destroy();
+    finishDelivery(committedLeg === "memory" ? "memory" : "none", false);
+  };
+
+  /** A's upstream stream ended — cleanly or not. */
+  const onMemoryStreamEnd = (): void => {
+    if (spliceStarted || clientClosed || deliverySettled) return;
+    if (forwarder?.sawMessageStop) {
+      // The full message is on the wire; a late upstream hiccup is irrelevant.
+      if (!res.destroyed && !res.writableEnded) res.end();
+      void waitForResponseFinishOrClose(res).then((flushed) =>
+        finishDelivery("memory", flushed)
+      );
+      return;
+    }
+    void recoverFromFullLeg();
+  };
+
+  const commitMemory = async (): Promise<void> => {
+    committedLeg = "memory";
+    if (!memoryLeg.isSseResponse()) {
+      // Degenerate upstream (JSON body on a stream request): raw passthrough.
+      const ok = await memoryLeg.commitTo(res);
+      finishDelivery("memory", ok);
+      return;
+    }
+    comparison.clientTtfbMs = Date.now() - started;
+    memoryLeg.sendHeadTo(res);
+    forwarder = new SseEventForwarder({
+      write: writeToClient,
+      afterEvent: onForwardedEvent,
+    });
+    memoryLeg.streamTo({
+      write: (chunk) => forwarder!.push(chunk),
+      end: onMemoryStreamEnd,
+      drain: (resume) => res.once("drain", resume),
+    });
+    // If the shadow grade already finished (with no B verdict to apply), the
+    // deferred release of B lands now that A owns the delivery.
+    if (shadowSettled) releaseFullLeg();
+    await deliveryDone;
+  };
+
+  const deliverWholeFullLeg = async (fallbackReason: string): Promise<void> => {
+    committedLeg = "full";
+    comparison.fallbackReason ??= fallbackReason;
+    comparison.loserAborted = memoryLeg.abort();
+    comparison.clientTtfbMs = Date.now() - started;
+    const ok = await fullLeg.commitTo(res);
+    finishDelivery("full", ok);
+  };
+
+  const deliverBothFailed = async (): Promise<void> => {
+    fullLeg.abort();
+    comparison.fallbackReason ??= "both-legs-failed";
+    // Surface the memory leg's actual error response (or a synthetic 502).
+    await memoryLeg.commitTo(res);
+    finishDelivery("none", false);
+  };
+
+  /**
+   * Pre-commit phase: the client is committed to A at its first sign of
+   * stream progress; until then A can still be swapped for a whole-B
+   * failover. A silent A past the prefix window yields to a producing B.
+   */
+  const waitForCommitChoice = async (): Promise<
+    | { kind: "memory" }
+    | { kind: "full"; reason: string }
+    | { kind: "error" }
+    | { kind: "closed" }
+  > => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        memoryLeg.waitForFallbackEvidence(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, routing.prefixTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (clientClosed) return { kind: "closed" };
+    if (memoryLeg.hasHealthyFallbackEvidence()) return { kind: "memory" };
+    if (memoryLeg.isFallbackEvidenceSettled()) {
+      // A failed (or ended empty) before any client-visible progress: today's
+      // full failover, minus the wait.
+      await fullLeg.waitForFallbackEvidence();
+      if (clientClosed) return { kind: "closed" };
+      return fullLeg.hasHealthyFallbackEvidence()
+        ? { kind: "full", reason: "memory-leg-failed-before-prefix" }
+        : { kind: "error" };
+    }
+    if (fullLeg.hasHealthyFallbackEvidence()) {
+      return { kind: "full", reason: "memory-no-progress-before-commit" };
+    }
+    const responsive = await firstHealthyFallbackEvidence(
+      memoryLeg,
+      fullLeg,
+      graderAbort.signal
+    );
+    if (!responsive || clientClosed) return { kind: "closed" };
+    if (responsive === memoryLeg && memoryLeg.hasHealthyFallbackEvidence()) {
+      return { kind: "memory" };
+    }
+    if (responsive === fullLeg && fullLeg.hasHealthyFallbackEvidence()) {
+      return { kind: "full", reason: "memory-no-progress-before-commit" };
+    }
+    return { kind: "error" };
+  };
+
+  // ---- shadow grading ------------------------------------------------------
+  const shadowGrade = async (): Promise<FusionVerdict | undefined> => {
+    const prefixStarted = Date.now();
+    const prefixesReady = await waitForBothPrefixes(
+      memoryLeg,
+      fullLeg,
+      routing.prefixTimeoutMs,
+      graderAbort.signal
+    );
+    comparison.prefixWaitMs = Date.now() - prefixStarted;
+    if (clientClosed) return undefined;
+
+    let verdict: FusionVerdict | undefined;
+    let fallbackReason: string | undefined;
+    const memoryHealthy = memoryLeg.isHealthy();
+    const fullHealthy = fullLeg.isHealthy();
+    if (!prefixesReady) {
+      const memoryReady = memoryLeg.isPrefixReadyAndHealthy();
+      const fullReady = fullLeg.isPrefixReadyAndHealthy();
+      if (fullReady && !memoryReady) {
+        fallbackReason = "memory-prefix-timeout";
+      } else if (memoryReady) {
+        fallbackReason = "full-prefix-timeout";
+      } else if (
+        !memoryHealthy &&
+        (fullHealthy || (memoryLeg.hasFailed() && !fullLeg.hasFailed()))
+      ) {
+        fallbackReason = "memory-leg-failed-before-prefix";
+      } else {
+        fallbackReason = "prefix-timeout-default-memory";
+      }
+    } else if (!memoryHealthy && fullHealthy) {
+      fallbackReason = "memory-leg-failed";
+    } else if (memoryHealthy && !fullHealthy) {
+      fallbackReason = "full-leg-failed";
+    } else if (!memoryHealthy && !fullHealthy) {
+      fallbackReason = "both-legs-failed";
+    } else {
+      const gradeStarted = Date.now();
+      let attempt = 0;
+      while (true) {
+        const graderDiagnostic: GraderDiagnostic = {
+          model: routing.grader ? "injected" : routing.graderModel,
+          ok: false,
+        };
+        comparison.grader = graderDiagnostic;
+        const gradeOutcome = await gradeComparedPrefixes({
+          req,
+          upstream,
+          routing,
+          input: {
+            question,
+            unfoldedMemory,
+            memoryResponse: memoryLeg.semanticForGrading(),
+            fullResponse: fullLeg.semanticForGrading(),
+            model,
+            signal: graderAbort.signal,
+          },
+          overflow: Promise.race([
+            memoryLeg.bufferOverflow,
+            fullLeg.bufferOverflow,
+          ]),
+          parentSignal: graderAbort.signal,
+          diagnostic: graderDiagnostic,
+        });
+        if (gradeOutcome.verdict) {
+          graderDiagnostic.ok = true;
+          verdict = gradeOutcome.verdict;
+          fallbackReason = undefined;
+          break;
+        }
+        fallbackReason = gradeOutcome.reason ?? "grader-failed";
+        graderDiagnostic.error ??= fallbackReason;
+        // Off the delivery path, a 429 (both legs just saturated the org
+        // limit) or network blip earns one retry with jittered backoff.
+        const retryable =
+          attempt === 0 &&
+          fallbackReason === "grader-failed" &&
+          (graderDiagnostic.status === undefined ||
+            graderDiagnostic.status === 429) &&
+          !graderAbort.signal.aborted;
+        if (!retryable) break;
+        attempt += 1;
+        comparison.graderRetries = attempt;
+        const backoff =
+          routing.graderRetryMinDelayMs +
+          Math.random() *
+            (routing.graderRetryMaxDelayMs - routing.graderRetryMinDelayMs);
+        if (!(await abortableDelay(backoff, graderAbort.signal))) break;
+      }
+      comparison.gradeMs = Date.now() - gradeStarted;
+    }
+    comparison.verdict = verdict?.verdict;
+    comparison.fallbackReason ??= fallbackReason;
+    if (opts.debug) {
+      console.error(
+        `[ccc proxy] A/B shadow grade ` +
+          `${verdict ? `verdict ${verdict.verdict}` : `no verdict`}` +
+          `${fallbackReason ? ` (${fallbackReason})` : ""}`
+      );
+    }
+    return verdict;
+  };
+
+  try {
+    memoryLeg.start();
+    fullLeg.start();
+
+    const deliveryTask = (async () => {
+      const choice = await waitForCommitChoice();
+      if (choice.kind === "closed") return;
+      if (choice.kind === "memory") await commitMemory();
+      else if (choice.kind === "full") await deliverWholeFullLeg(choice.reason);
+      else await deliverBothFailed();
+    })();
+
+    const shadowTask = (async () => {
+      const verdict = await shadowGrade();
+      shadowSettled = true;
+      if (verdict && winnerForVerdict(verdict.verdict) === "full") {
+        attemptInterrupt();
+      }
+      // B has served its grading purpose; keep it only if a splice (or a
+      // pending deferred splice / whole-B delivery) is consuming it.
+      releaseFullLeg();
+      return verdict;
+    })();
+
+    const [, verdict] = await Promise.all([deliveryTask, shadowTask]);
+    comparison.winner =
+      verdict !== undefined
+        ? winnerForVerdict(verdict.verdict)
+        : comparison.delivered === "full"
+          ? "full"
+          : "memory";
+    // The deferred-splice window can outlive the shadow task; wait for the
+    // delivery to settle before tearing the legs down.
+    await deliveryDone;
+  } finally {
+    graderAbort.abort();
+    memoryLeg.abort();
+    fullLeg.abort();
+    res.off("close", abortAll);
+  }
+}
+
+function isThinkingBlockType(type: string): boolean {
+  return type === "thinking" || type === "redacted_thinking";
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function waitForBothPrefixes(
@@ -1680,6 +2472,20 @@ interface BufferedUpstreamLegOptions {
   record: ComparisonLegRecord;
 }
 
+/**
+ * Speculative-mode chunk consumer. Unlike commitTo's raw piping, a sink lets
+ * the orchestrator transform/track bytes (event-aligned forwarding, splice
+ * renumbering) and decide itself how the client response ends.
+ */
+interface UpstreamLegSink {
+  /** Forward one raw chunk; false requests an upstream pause until drain. */
+  write(chunk: Buffer): boolean;
+  /** Upstream ended — cleanly or not; inspect the leg to tell which. */
+  end(): void;
+  /** Register a one-shot resume callback for backpressure release. */
+  drain(resume: () => void): void;
+}
+
 /** One in-flight completion whose raw bytes stay private until selected. */
 class BufferedUpstreamLeg {
   readonly record: ComparisonLegRecord;
@@ -1703,6 +2509,7 @@ class BufferedUpstreamLeg {
   private upstreamReq?: http.ClientRequest;
   private upstreamRes?: http.IncomingMessage;
   private clientRes?: http.ServerResponse;
+  private sink?: UpstreamLegSink;
   private sseObserver?: SseNoticeRewriter;
   private expectsSse = false;
   private sawMessageStop = false;
@@ -1781,8 +2588,53 @@ class BufferedUpstreamLeg {
     );
   }
 
+  completedSuccessfully(): boolean {
+    return this.ended && this.completedNormally && this.isHealthy();
+  }
+
   isPrefixReadyAndHealthy(): boolean {
     return this.prefixSettled && this.isHealthy();
+  }
+
+  waitForResponse(): Promise<void> {
+    return this.responseReady;
+  }
+
+  isSseResponse(): boolean {
+    return this.expectsSse;
+  }
+
+  /** Mirror this leg's upstream status line and headers onto the client. */
+  sendHeadTo(res: http.ServerResponse): void {
+    if (res.headersSent || !this.upstreamRes) return;
+    res.writeHead(
+      this.upstreamRes.statusCode ?? 502,
+      forwardableResponseHeaders(this.upstreamRes)
+    );
+  }
+
+  /**
+   * Speculative delivery: flush already-buffered chunks into the sink, then
+   * hand it every future chunk as it arrives. The passive SSE observer keeps
+   * running, so grading/usage extraction are unaffected.
+   */
+  streamTo(sink: UpstreamLegSink): void {
+    this.sink = sink;
+    let writable = true;
+    for (const chunk of this.chunks.splice(0)) {
+      if (!sink.write(chunk)) writable = false;
+    }
+    if (this.ended) {
+      sink.end();
+      return;
+    }
+    if (!writable) {
+      this.upstreamRes?.pause();
+      sink.drain(() => this.upstreamRes?.resume());
+    } else {
+      // Undo a buffer-overflow pause now that bytes are draining downstream.
+      this.upstreamRes?.resume();
+    }
   }
 
   hasFailed(): boolean {
@@ -1905,7 +2757,12 @@ class BufferedUpstreamLeg {
     if (this.record.ttfbMs === undefined) {
       this.record.ttfbMs = Date.now() - this.startedAt;
     }
-    if (this.clientRes) {
+    if (this.sink) {
+      if (!this.sink.write(chunk)) {
+        this.upstreamRes?.pause();
+        this.sink.drain(() => this.upstreamRes?.resume());
+      }
+    } else if (this.clientRes) {
       if (!this.clientRes.write(chunk)) {
         this.upstreamRes?.pause();
         this.clientRes.once("drain", () => this.upstreamRes?.resume());
@@ -2034,6 +2891,7 @@ class BufferedUpstreamLeg {
     if (this.clientRes && !this.clientRes.destroyed && !this.clientRes.writableEnded) {
       this.clientRes.end();
     }
+    this.sink?.end();
     this.settleDone();
   }
 
@@ -2068,6 +2926,9 @@ class BufferedUpstreamLeg {
     this.settleResponse();
     this.settlePrefix();
     if (this.clientRes) this.clientRes.destroy(error);
+    // A sink-attached leg leaves the client response to the orchestrator,
+    // which may recover the turn from the peer leg instead of destroying it.
+    this.sink?.end();
     this.settleDone();
   }
 

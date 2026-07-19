@@ -32,6 +32,7 @@ export {
   isNonToolUserMessage,
   isToolResultUserMessage,
   isAwaySummaryUserMessage,
+  isLocalBashCommandTurn,
   AWAY_SUMMARY_PROMPT_PREFIX,
   lastNonSystemMessage,
   userMessageText,
@@ -43,11 +44,23 @@ export {
 } from "./turns.js";
 export type { Message } from "./turns.js";
 export {
+  SseFrameScanner,
+  SseEventForwarder,
+  SseSpliceWriter,
+  sseEventBytes,
+  contentBlockStopEvent,
+  bridgeBlockEvents,
+  CORRECTION_BRIDGE_TEXT,
+  RECOVERY_BRIDGE_TEXT,
+} from "./splice.js";
+export type { SseFrame, OpenBlock, SseForwarderOptions } from "./splice.js";
+export {
   NOTICE_OPEN,
   NOTICE_CLOSE,
   COMPRESSED_NOTICE,
   MODEL_HIDDEN_NOTICE,
   DEGRADED_NOTICE,
+  FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SLOW_FIRST_TOKEN_NOTICE,
   compressedNoticeText,

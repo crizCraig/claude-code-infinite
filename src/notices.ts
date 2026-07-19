@@ -20,6 +20,8 @@ export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE =
   "⚠ MemTree degraded — this turn ran uncompressed";
+export const FULL_HISTORY_OVERRIDE_NOTICE =
+  "MemTree · full history overrode memory this turn";
 export const PAYMENT_REQUIRED_NOTICE =
   "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export const SLOW_FIRST_TOKEN_NOTICE =

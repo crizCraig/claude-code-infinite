@@ -4,6 +4,7 @@
  * prompt/schema, runtime validation, and memory extraction.
  */
 
+import { CORRECTION_BRIDGE_TEXT } from "./splice.js";
 import type { Message } from "./turns.js";
 
 export const DEFAULT_GRADE_PREFIX_TOKENS = 1_000;
@@ -15,6 +16,9 @@ export const DEFAULT_GRADER_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 export const DEFAULT_GATE_FRACTION = 0.5;
 export const DEFAULT_GRADER_MODEL = "claude-opus-4-8";
+/** Shadow-grader retry backoff bounds (speculative mode; off the delivery path). */
+export const DEFAULT_GRADER_RETRY_MIN_DELAY_MS = 2_000;
+export const DEFAULT_GRADER_RETRY_MAX_DELAY_MS = 5_000;
 
 const INPUT_EXCERPT_CHARS = 4_000;
 export const GRADING_TRUNCATION_MARKER =
@@ -64,6 +68,16 @@ export interface AbRoutingOptions {
   sampleWhenNoPrior?: boolean;
   /** Debug/test escape hatch; bypasses the effective-context gate. */
   forceComparison?: boolean;
+  /**
+   * Speculative delivery (default): commit the memory leg to the client from
+   * its first byte and treat a B verdict as an in-stream interruption. False
+   * retains the legacy buffer-both-then-commit mode (--ab-buffered).
+   */
+  speculative?: boolean;
+  /** Model-visible bridge text emitted when a B verdict splices mid-message. */
+  bridgeText?: string;
+  graderRetryMinDelayMs?: number;
+  graderRetryMaxDelayMs?: number;
 }
 
 export interface ResolvedAbRoutingOptions {
@@ -77,6 +91,10 @@ export interface ResolvedAbRoutingOptions {
   effectiveContextTokens: (model: string) => number | undefined;
   sampleWhenNoPrior: boolean;
   forceComparison: boolean;
+  speculative: boolean;
+  bridgeText: string;
+  graderRetryMinDelayMs: number;
+  graderRetryMaxDelayMs: number;
 }
 
 export type AbGateReason =
@@ -97,6 +115,10 @@ export interface AbGateDecision {
 export function resolveAbRoutingOptions(
   opts: AbRoutingOptions
 ): ResolvedAbRoutingOptions {
+  const retryMinDelay = positiveInt(
+    opts.graderRetryMinDelayMs,
+    DEFAULT_GRADER_RETRY_MIN_DELAY_MS
+  );
   return {
     grader: opts.grader,
     graderModel: opts.graderModel ?? DEFAULT_GRADER_MODEL,
@@ -118,6 +140,19 @@ export function resolveAbRoutingOptions(
       opts.effectiveContextTokens ?? effectiveContextForModel,
     sampleWhenNoPrior: opts.sampleWhenNoPrior ?? true,
     forceComparison: opts.forceComparison ?? false,
+    speculative: opts.speculative ?? true,
+    bridgeText:
+      typeof opts.bridgeText === "string" && opts.bridgeText.length > 0
+        ? opts.bridgeText
+        : CORRECTION_BRIDGE_TEXT,
+    graderRetryMinDelayMs: retryMinDelay,
+    graderRetryMaxDelayMs: Math.max(
+      retryMinDelay,
+      positiveInt(
+        opts.graderRetryMaxDelayMs,
+        DEFAULT_GRADER_RETRY_MAX_DELAY_MS
+      )
+    ),
   };
 }
 

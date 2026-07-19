@@ -110,6 +110,7 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, {
     messages: [{ role: "user", content: "compressed" }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const memtree = new MemtreeClient({
     baseUrl: memtreeSrv.origin,
@@ -125,16 +126,43 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
     // Tool turn → forwardRaw path.
     await postMessages(proxy.port, toolTurn);
     // Followup user turn → blocking compress → forwardWithNotices path.
+    const armed = await fetch(proxy.hookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "session-log",
+        prompt_id: "prompt-log",
+        prompt: "turn two",
+      }),
+    });
+    assert.equal(armed.status, 204);
     await postMessages(proxy.port, followupTurn("turn two"));
+    const displayed = await fetch(proxy.hookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        hook_event_name: "MessageDisplay",
+        session_id: "session-log",
+        prompt_id: "prompt-log",
+        turn_id: "turn-log",
+        message_id: "message-log",
+        index: 0,
+        final: true,
+        delta: "upstream answer",
+      }),
+    });
+    assert.equal(displayed.status, 200);
 
     // Writes are fire-and-forget; poll until both /v1/messages records plus
-    // the memtree call records (background index + compress) have landed.
+    // MemTree records and the notice-claim record have landed.
     let records = [];
     await waitFor(() => {
       records = readRecords(logPath);
       return (
         records.filter((r) => r.kind === "messages").length >= 2 &&
-        records.filter((r) => r.kind === "memtree").length >= 2
+        records.filter((r) => r.kind === "memtree").length >= 2 &&
+        records.filter((r) => r.kind === "notice").length === 1
       );
     });
 
@@ -172,6 +200,17 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
       assert.ok(r.requestBytes > 0);
       assert.ok(typeof r.ms === "number");
     }
+
+    const [noticeRec] = records.filter((r) => r.kind === "notice");
+    assert.equal(noticeRec.event, "claimed");
+    assert.equal(noticeRec.via, "MessageDisplay");
+    assert.ok(!Number.isNaN(Date.parse(noticeRec.ts)), "notice ts is ISO");
+    assert.deepEqual(Object.keys(noticeRec).sort(), [
+      "event",
+      "kind",
+      "ts",
+      "via",
+    ]);
   } finally {
     proxy.close();
     upstream.close();

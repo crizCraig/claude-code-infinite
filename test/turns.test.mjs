@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   isNonToolUserMessage,
+  isLocalBashCommandTurn,
   lastNonSystemMessage,
   hasEarlierNonToolUserMessage,
 } from "../dist/turns.js";
@@ -66,4 +67,47 @@ test("recap-fork style plain text counts as a real user turn (2026-07-03 decisio
 
 test("empty history", () => {
   assert.equal(hasEarlierNonToolUserMessage([]), false);
+});
+
+test("local bang commands are recognized from Claude Code's replay wrappers", () => {
+  const local = [
+    user("earlier"),
+    assistant("reply"),
+    user("<bash-input>pwd</bash-input>"),
+    user(
+      "<bash-stdout>/tmp/project</bash-stdout>" +
+        "<bash-stderr></bash-stderr>"
+    ),
+    { role: "system", content: "ambient context" },
+  ];
+  assert.equal(isLocalBashCommandTurn(local), true);
+  assert.equal(
+    isLocalBashCommandTurn([
+      userBlocks([{ type: "text", text: "<bash-input>pwd</bash-input>" }]),
+      userBlocks([
+        {
+          type: "text",
+          text:
+            "<bash-stdout>/tmp/project</bash-stdout>" +
+            "<bash-stderr></bash-stderr>",
+        },
+      ]),
+    ]),
+    true
+  );
+  assert.equal(
+    isLocalBashCommandTurn([
+      user("earlier"),
+      assistant("reply"),
+      user("ordinary followup"),
+    ]),
+    false
+  );
+  assert.equal(
+    isLocalBashCommandTurn([
+      user("<bash-input>pwd</bash-input>"),
+      user("unwrapped output"),
+    ]),
+    false
+  );
 });

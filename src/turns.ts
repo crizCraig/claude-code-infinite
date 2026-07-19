@@ -18,6 +18,9 @@
 export type Message = Record<string, any>;
 
 const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+const BASH_INPUT_RE = /^<bash-input>[\s\S]*<\/bash-input>$/;
+const BASH_OUTPUT_RE =
+  /^<bash-stdout>[\s\S]*<\/bash-stdout><bash-stderr>[\s\S]*<\/bash-stderr>$/;
 
 /** Distinctive stable prefix of Claude Code's hidden away-summary prompt. */
 export const AWAY_SUMMARY_PROMPT_PREFIX =
@@ -120,6 +123,38 @@ export function lastNonSystemMessage(messages: Message[]): Message | undefined {
     if (messages[i]?.role !== "system") return messages[i];
   }
   return undefined;
+}
+
+/**
+ * True for Claude Code's local `!command` replay shape. These commands do not
+ * consistently emit UserPromptSubmit, but their stdout is followed by a real
+ * main-thread completion (and therefore can legitimately own a display-only
+ * MemTree notice). Keep the match strict so arbitrary unarmed API traffic does
+ * not acquire notice ownership.
+ */
+export function isLocalBashCommandTurn(messages: Message[]): boolean {
+  let outputIndex = messages.length - 1;
+  while (outputIndex >= 0 && messages[outputIndex]?.role === "system") {
+    outputIndex--;
+  }
+  if (outputIndex < 1) return false;
+  const output = messages[outputIndex];
+  if (
+    output?.role !== "user" ||
+    !BASH_OUTPUT_RE.test(userMessageText(output))
+  ) {
+    return false;
+  }
+
+  let inputIndex = outputIndex - 1;
+  while (inputIndex >= 0 && messages[inputIndex]?.role === "system") {
+    inputIndex--;
+  }
+  const input = messages[inputIndex];
+  return (
+    input?.role === "user" &&
+    BASH_INPUT_RE.test(userMessageText(input))
+  );
 }
 
 /**

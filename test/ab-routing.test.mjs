@@ -224,6 +224,21 @@ async function mockRouterUpstream({
   return { ...server, calls };
 }
 
+function delayedMemoryUpstream(releaseMemoryEnd) {
+  return listen(async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString("utf-8"));
+    const memory = JSON.stringify(body.messages).includes("compressed context");
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    if (!memory) {
+      res.end(sse("FULL_ANSWER"));
+      return;
+    }
+    res.write(sse("MEMORY_ANSWER"));
+    await releaseMemoryEnd.promise;
+    res.end();
+  });
+}
+
 async function postStreamingTurn(proxy, extraHeaders = {}, signal) {
   return fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
     method: "POST",
@@ -242,33 +257,82 @@ async function postStreamingTurn(proxy, extraHeaders = {}, signal) {
   });
 }
 
-async function armMainTurn(proxy) {
+async function postPausedStreamingTurn(proxy) {
+  const body = Buffer.from(
+    JSON.stringify({
+      model: "claude-test",
+      max_tokens: 64,
+      stream: true,
+      messages: followupMessages,
+    })
+  );
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: proxy.port,
+        path: "/v1/messages",
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(body.length),
+          "x-claude-code-session-id": "session-ab",
+        },
+      },
+      (response) => {
+        response.pause();
+        resolve(response);
+      }
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+async function armMainTurn(
+  proxy,
+  prompt = "current question",
+  promptId = "prompt-ab"
+) {
   const response = await fetch(proxy.hookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       hook_event_name: "UserPromptSubmit",
       session_id: "session-ab",
-      prompt_id: "prompt-ab",
-      prompt: "current question",
+      prompt_id: promptId,
+      prompt,
     }),
   });
   assert.equal(response.status, 204);
 }
 
-async function claimDisplay(proxy) {
+async function claimDisplay(proxy, promptId = "prompt-ab") {
   return fetch(proxy.hookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       hook_event_name: "MessageDisplay",
       session_id: "session-ab",
-      prompt_id: "prompt-ab",
+      prompt_id: promptId,
       turn_id: "turn-ab",
       message_id: "message-ab",
       index: 0,
       final: false,
       delta: "answer",
+    }),
+  });
+}
+
+async function claimStop(proxy, includePromptId = true) {
+  return fetch(proxy.hookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      hook_event_name: "Stop",
+      session_id: "session-ab",
+      ...(includePromptId ? { prompt_id: "prompt-ab" } : {}),
+      stop_hook_active: false,
     }),
   });
 }
@@ -370,6 +434,9 @@ for (const [verdict, expected] of [
       memtree,
       upstreamOrigin: upstream.origin,
       abRouting: {
+        // Buffered mode (--ab-buffered): the verdict gates delivery, so B can
+        // still commit whole. Speculative equivalents live further down.
+        speculative: false,
         forceComparison: true,
         prefixChars: 4,
         grader: async (input) => {
@@ -423,6 +490,7 @@ for (const scenario of [
       memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
       upstreamOrigin: upstream.origin,
       abRouting: {
+        speculative: false,
         forceComparison: true,
         prefixChars: 4,
         grader: async () => fusionVerdict(scenario.verdict),
@@ -444,6 +512,251 @@ for (const scenario of [
   });
 }
 
+test("an unarmed local bang-command turn owns its compression notice", async () => {
+  const upstream = await mockRouterUpstream();
+  const memtreeServer = await mockMemtree();
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => fusionVerdict("A"),
+    },
+  });
+  try {
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-ab",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 64,
+        stream: true,
+        messages: [
+          { role: "user", content: "first question" },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "first answer" }],
+          },
+          { role: "user", content: "<bash-input>pwd</bash-input>" },
+          {
+            role: "user",
+            content:
+              "<bash-stdout>/tmp/project</bash-stdout>" +
+              "<bash-stderr></bash-stderr>",
+          },
+        ],
+      }),
+    });
+    assert.match(await response.text(), /MEMORY_ANSWER/);
+    const stop = await claimStop(proxy, false);
+    assert.equal(stop.status, 200);
+    assert.match(await stop.text(), /conversation optimized/);
+    assert.equal((await claimStop(proxy, false)).status, 204);
+    assert.deepEqual(
+      records.filter((record) => record.kind === "notice"),
+      [{ kind: "notice", event: "claimed", via: "Stop" }]
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("first MessageDisplay waits for an already-complete memory winner", async () => {
+  const records = [];
+  let grades = 0;
+  let stalledFull;
+  const upstream = await listen(async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString("utf-8"));
+    const memory = JSON.stringify(body.messages).includes("compressed context");
+    if (!memory) {
+      // Match the incident: B supplies no prefix before the comparison timeout.
+      stalledFull = res;
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.end(sse("M".repeat(8 * 1024 * 1024)));
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      // Buffered-mode-only shape: speculative delivery commits before the
+      // upstream response can complete, so firstDisplayCanWait never arises.
+      speculative: false,
+      forceComparison: true,
+      prefixChars: 4,
+      prefixTimeoutMs: 1_000,
+      grader: async () => {
+        grades++;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  let response;
+  try {
+    await armMainTurn(proxy);
+    response = await postPausedStreamingTurn(proxy);
+
+    let displaySettled = false;
+    const displayPromise = claimDisplay(proxy).then((display) => {
+      displaySettled = true;
+      return display;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(displaySettled, false);
+    const responseBody = readBody(response);
+    response.resume();
+    assert.match((await responseBody).toString("utf-8"), /message_stop/);
+    const display = await displayPromise;
+    assert.equal(display.status, 200);
+    assert.match(await display.text(), /conversation optimized/);
+    assert.equal((await claimDisplay(proxy)).status, 204);
+    assert.equal(grades, 0);
+    await waitFor(() => records.some((record) => record.kind === "messages"));
+    const record = records.find((item) => item.kind === "messages");
+    assert.equal(record.comparison.fallbackReason, "full-prefix-timeout");
+    assert.equal(record.comparison.deliveryOk, true);
+    assert.deepEqual(
+      records.filter((item) => item.kind === "notice"),
+      [{ kind: "notice", event: "claimed", via: "MessageDisplay" }]
+    );
+  } finally {
+    response?.destroy();
+    stalledFull?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("Stop waits for an in-flight A/B delivery before claiming its notice", async () => {
+  const releaseMemoryEnd = deferred();
+  const upstream = await delayedMemoryUpstream(releaseMemoryEnd);
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => fusionVerdict("A"),
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    assert.match(Buffer.from(first.value).toString("utf-8"), /message_stop/);
+
+    const stopResponse = claimStop(proxy);
+    setTimeout(() => releaseMemoryEnd.resolve(), 40);
+    const stop = await stopResponse;
+    assert.equal(stop.status, 200);
+    assert.match(await stop.text(), /conversation optimized/);
+
+    while (!(await reader.read()).done) {
+      // Drain the selected response after its delayed upstream FIN.
+    }
+  } finally {
+    releaseMemoryEnd.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("a timed-out Stop invalidates the eventual late delivery notice", async () => {
+  const releaseMemoryEnd = deferred();
+  const upstream = await delayedMemoryUpstream(releaseMemoryEnd);
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => fusionVerdict("A"),
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.match(Buffer.from(first.value).toString("utf-8"), /message_stop/);
+
+    const stop = await claimStop(proxy);
+    assert.equal(stop.status, 204);
+
+    releaseMemoryEnd.resolve();
+    while (!(await reader.read()).done) {
+      // Drain the response whose notice was invalidated by the Stop timeout.
+    }
+    assert.equal((await claimDisplay(proxy)).status, 204);
+  } finally {
+    releaseMemoryEnd.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("an awaiting old Stop cannot clear a newly submitted prompt", async () => {
+  const releaseMemoryEnd = deferred();
+  const upstream = await delayedMemoryUpstream(releaseMemoryEnd);
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => fusionVerdict("A"),
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const oldResponse = await postStreamingTurn(proxy);
+    const oldReader = oldResponse.body.getReader();
+    const first = await oldReader.read();
+    assert.match(Buffer.from(first.value).toString("utf-8"), /message_stop/);
+
+    const oldStopResponse = claimStop(proxy);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await armMainTurn(proxy, "current question", "prompt-new");
+    const oldStop = await oldStopResponse;
+    assert.equal(oldStop.status, 204);
+
+    releaseMemoryEnd.resolve();
+    while (!(await oldReader.read()).done) {
+      // Drain the superseded response.
+    }
+
+    const newResponse = await postStreamingTurn(proxy);
+    assert.match(await newResponse.text(), /MEMORY_ANSWER/);
+    const newDisplay = await claimDisplay(proxy, "prompt-new");
+    assert.equal(newDisplay.status, 200);
+    assert.match(await newDisplay.text(), /conversation optimized/);
+  } finally {
+    releaseMemoryEnd.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
 test("grader failure defaults to the memory leg", async () => {
   const upstream = await mockRouterUpstream();
   const memtreeServer = await mockMemtree();
@@ -453,6 +766,9 @@ test("grader failure defaults to the memory leg", async () => {
     abRouting: {
       forceComparison: true,
       prefixChars: 4,
+      // Failures are retried once off the delivery path; keep the test fast.
+      graderRetryMinDelayMs: 1,
+      graderRetryMaxDelayMs: 2,
       grader: () => {
         throw new Error("grader unavailable");
       },
@@ -563,6 +879,9 @@ test("prefix timeout selects the ready full leg instead of a stalled memory leg"
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      // Buffered-mode safety net: speculative delivery commits to a leg with
+      // stream progress and rides out slow thinking instead of switching.
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       prefixTimeoutMs: 15,
@@ -836,6 +1155,9 @@ test("a selected leg that fails during grading is replaced by its healthy peer",
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      // Buffered semantics: speculative mode has already streamed A's head,
+      // so the equivalent failure is a recovery splice (tested below).
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -898,6 +1220,9 @@ test("a selected A/B stream must reach message_stop before installing memory", a
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      // Buffered semantics: under speculative delivery a truncated A instead
+      // triggers a recovery splice from the live B leg (tested below).
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => fusionVerdict("A"),
@@ -950,7 +1275,7 @@ test("native grader reuses incoming Anthropic auth and selects B", async () => {
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
-    abRouting: { forceComparison: true, prefixChars: 4 },
+    abRouting: { speculative: false, forceComparison: true, prefixChars: 4 },
   });
   try {
     const response = await postStreamingTurn(proxy, {
@@ -995,7 +1320,7 @@ test("downstream cancellation tears down the native grader request", async () =>
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
-    abRouting: { forceComparison: true, prefixChars: 4 },
+    abRouting: { speculative: false, forceComparison: true, prefixChars: 4 },
   });
   const controller = new AbortController();
   try {
@@ -1021,6 +1346,7 @@ test("request log records gate, both legs, verdict, and selected winner", async 
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => fusionVerdict("B"),
@@ -1066,6 +1392,9 @@ test("buffer-then-commit holds client bytes, continues winner, and aborts loser"
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      // The buffer-both-then-commit contract this test names; speculative
+      // mode intentionally streams A before any verdict.
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => {
@@ -1119,6 +1448,7 @@ test("downstream cancellation aborts both legs and the grader", async () => {
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async ({ signal }) => {
@@ -1445,6 +1775,9 @@ test("a full-context A/B winner leaves subsequent tool turns full-context", asyn
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     abRouting: {
+      // Buffered: B commits whole on its verdict. The speculative equivalent
+      // (splice clears the route) is asserted in the splice test below.
+      speculative: false,
       forceComparison: true,
       prefixChars: 4,
       grader: async () => fusionVerdict("B"),
@@ -1598,6 +1931,573 @@ test("route matching ignores block cache metadata but preserves nested tool data
       /compressed context/
     );
   } finally {
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Speculative delivery (plans/2026-07-17_PLAN_speculative_ab_streaming.md):
+// A streams from its first byte; the grader runs in the shadow; a B verdict
+// interrupts by SSE splice when the window is still open.
+// ---------------------------------------------------------------------------
+
+function sseFrame(type, data) {
+  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+const sseMessageStart = sseFrame("message_start", {
+  type: "message_start",
+  message: { id: "msg_spec", usage: { input_tokens: 10 } },
+});
+
+function sseTextHead(index, text) {
+  return (
+    sseFrame("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    }) +
+    sseFrame("content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text },
+    })
+  );
+}
+
+/** Streaming upstream with per-leg handlers plus JSON tool-turn support. */
+async function speculativeUpstream(handlers) {
+  const calls = [];
+  const closed = new Set();
+  const server = await listen(async (req, res) => {
+    const body = JSON.parse((await readBody(req)).toString("utf-8"));
+    calls.push({ body, url: req.url });
+    if (body.stream !== true) {
+      const response = JSON.stringify({
+        type: "message",
+        content: [{ type: "text", text: "tool response" }],
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(response);
+      return;
+    }
+    const kind = JSON.stringify(body.messages).includes("compressed context")
+      ? "memory"
+      : "full";
+    res.on("close", () => closed.add(kind));
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    handlers[kind](res);
+  });
+  return { ...server, calls, closed };
+}
+
+async function readUntil(reader, marker) {
+  const acc = { text: "" };
+  while (!acc.text.includes(marker)) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error(`stream ended before ${marker}`);
+    acc.text += Buffer.from(value).toString("utf-8");
+  }
+  return acc;
+}
+
+async function readRest(reader, acc = { text: "" }) {
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return acc.text;
+    acc.text += Buffer.from(value).toString("utf-8");
+  }
+}
+
+function speculativeRecord(records) {
+  return records.find(
+    (record) => record.kind === "messages" && record.comparison?.speculative
+  );
+}
+
+test("speculative: memory streams immediately and a late B verdict is logged, not applied", async () => {
+  const records = [];
+  const releaseFull = deferred();
+  let grades = 0;
+  const upstream = await speculativeUpstream({
+    memory: (res) => res.end(sse("MEMORY_ANSWER")),
+    full: async (res) => {
+      await releaseFull.promise;
+      if (!res.destroyed) res.end(sse("FULL_ANSWER"));
+    },
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        grades++;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const raw = await (await postStreamingTurn(proxy)).text();
+    assert.match(raw, /MEMORY_ANSWER/);
+    assert.doesNotMatch(raw, /FULL_ANSWER/);
+    // The client is done before B has even produced a gradable prefix.
+    const display = await claimDisplay(proxy);
+    assert.equal(display.status, 200);
+    assert.match(await display.text(), /conversation optimized/);
+
+    releaseFull.resolve();
+    await waitFor(() =>
+      records.some((record) => record.comparison?.verdict === "B")
+    );
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-memory");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.winner, "full");
+    assert.equal(record.comparison.verdict, "B");
+    assert.equal(record.comparison.verdictLate, true);
+    assert.equal(record.comparison.interrupt, "late-verdict");
+    assert.equal(record.comparison.deliveryOk, true);
+    assert.equal(typeof record.comparison.clientTtfbMs, "number");
+    assert.equal(grades, 1);
+  } finally {
+    releaseFull.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: a B verdict splices full history into the live memory stream", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    gradeGate.resolve();
+    const raw = await readRest(reader, acc);
+
+    // A's head, then its open block closed, bridge at index 1, B's answer
+    // renumbered to index 2, and B's envelope close.
+    assert.match(raw, /MEMORY_HEAD/);
+    assert.match(raw, /"type":"content_block_stop","index":0/);
+    assert.match(raw, /Correcting course/);
+    assert.match(raw, /"type":"content_block_start","index":2/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+    assert.ok(
+      raw.indexOf("Correcting course") < raw.indexOf("FULL_ANSWER"),
+      "bridge precedes the replayed full answer"
+    );
+    await waitFor(() => upstream.closed.has("memory"));
+
+    const stop = await claimStop(proxy);
+    assert.equal(stop.status, 200);
+    assert.match(await stop.text(), /full history overrode memory/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-spliced");
+    assert.equal(record.comparison.interrupt, "spliced");
+    assert.equal(record.comparison.delivered, "spliced");
+    assert.equal(record.comparison.winner, "full");
+    assert.equal(record.comparison.verdict, "B");
+    assert.equal(record.comparison.deliveryOk, true);
+    assert.equal(record.comparison.spliceAtChars, "MEMORY_HEAD".length);
+
+    // Delivered-keyed bookkeeping: the splice cleared the memory route.
+    const toolMessages = [
+      ...followupMessages,
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "post-splice", name: "read", input: {} }],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "post-splice", content: "result" },
+        ],
+      },
+    ];
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-ab",
+      },
+      body: JSON.stringify({
+        model: "claude-test",
+        max_tokens: 64,
+        messages: toolMessages,
+      }),
+    });
+    assert.match(
+      JSON.stringify(upstream.calls.at(-1).body.messages),
+      /first question/
+    );
+    assert.doesNotMatch(
+      JSON.stringify(upstream.calls.at(-1).body.messages),
+      /compressed context/
+    );
+  } finally {
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: a B verdict during thinking defers until the block closes", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(
+        sseMessageStart +
+          sseTextHead(0, "MEMTEXT") +
+          sseFrame("content_block_stop", {
+            type: "content_block_stop",
+            index: 0,
+          }) +
+          sseFrame("content_block_start", {
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "thinking", thinking: "" },
+          }) +
+          sseFrame("content_block_delta", {
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "thinking_delta", thinking: "mulling it over" },
+          })
+      );
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "mulling it over");
+    gradeGate.resolve();
+    // Let the verdict land while A is mid-thinking, then close the block.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    memoryRes.write(
+      sseFrame("content_block_stop", { type: "content_block_stop", index: 1 })
+    );
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /mulling it over/);
+    assert.match(raw, /"type":"content_block_stop","index":1/);
+    assert.match(raw, /Correcting course/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.ok(
+      raw.indexOf('"content_block_stop","index":1') <
+        raw.indexOf("Correcting course"),
+      "the signed thinking block closes before the bridge"
+    );
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-spliced");
+    assert.equal(record.comparison.interrupt, "deferred-then-spliced");
+    assert.equal(record.comparison.delivered, "spliced");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: a delivered tool_use block locks out the splice", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(
+        sseMessageStart +
+          sseTextHead(0, "MEMHEAD") +
+          sseFrame("content_block_stop", {
+            type: "content_block_stop",
+            index: 0,
+          }) +
+          sseFrame("content_block_start", {
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "tool_use", id: "t1", name: "read", input: {} },
+          })
+      );
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, '"tool_use"');
+    gradeGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    memoryRes.end(
+      sseFrame("content_block_delta", {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: "{}" },
+      }) +
+        sseFrame("content_block_stop", {
+          type: "content_block_stop",
+          index: 1,
+        }) +
+        sseFrame("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use" },
+          usage: { output_tokens: 2 },
+        }) +
+        sseFrame("message_stop", { type: "message_stop" })
+    );
+    const raw = await readRest(reader, acc);
+
+    assert.doesNotMatch(raw, /Correcting course/);
+    assert.doesNotMatch(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+    await waitFor(() => upstream.closed.has("full"), 2_000);
+
+    const display = await claimDisplay(proxy);
+    assert.equal(display.status, 200);
+    assert.match(await display.text(), /conversation optimized/);
+
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-memory");
+    assert.equal(record.comparison.interrupt, "blocked-tool-use");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.winner, "full");
+    assert.equal(record.comparison.verdict, "B");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: a memory leg dying mid-stream recovers from the full leg", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+    },
+    full: (res) => res.end(sse("FULL_ANSWER")),
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("A");
+      },
+    },
+  });
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy);
+    const reader = response.body.getReader();
+    const acc = await readUntil(reader, "MEMORY_HEAD");
+    memoryRes.destroy();
+    const raw = await readRest(reader, acc);
+
+    assert.match(raw, /MEMORY_HEAD/);
+    assert.match(raw, /cut off/);
+    assert.match(raw, /FULL_ANSWER/);
+    assert.match(raw, /message_stop/);
+
+    const stop = await claimStop(proxy);
+    assert.equal(stop.status, 200);
+    assert.match(await stop.text(), /MemTree degraded/);
+
+    gradeGate.resolve();
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-recovered");
+    assert.equal(record.comparison.interrupt, "recovered");
+    assert.equal(record.comparison.delivered, "recovered");
+    assert.equal(record.comparison.winner, "memory");
+    assert.equal(record.comparison.verdict, "A");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    gradeGate.resolve();
+    memoryRes?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: grader 429s twice with one retry and no user impact", async () => {
+  const records = [];
+  let grades = 0;
+  const upstream = await mockRouterUpstream();
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      graderRetryMinDelayMs: 1,
+      graderRetryMaxDelayMs: 2,
+      grader: async () => {
+        grades++;
+        throw new Error("429 rate_limit_error");
+      },
+    },
+  });
+  try {
+    const raw = await (await postStreamingTurn(proxy)).text();
+    assert.match(raw, /MEMORY_ANSWER/);
+    assert.doesNotMatch(raw, /FULL_ANSWER/);
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(grades, 2);
+    assert.equal(record.comparison.graderRetries, 1);
+    assert.equal(record.comparison.grader.ok, false);
+    assert.equal(record.comparison.fallbackReason, "grader-failed");
+    assert.equal(record.comparison.delivered, "memory");
+    assert.equal(record.comparison.deliveryOk, true);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeServer.close();
+  }
+});
+
+test("speculative: client disconnect during a splice tears everything down", async () => {
+  const records = [];
+  const gradeGate = deferred();
+  let memoryRes;
+  let fullRes;
+  const upstream = await speculativeUpstream({
+    memory: (res) => {
+      memoryRes = res;
+      res.write(sseMessageStart + sseTextHead(0, "MEMORY_HEAD"));
+    },
+    full: (res) => {
+      fullRes = res;
+      res.write(sseMessageStart + sseTextHead(0, "FULL_HEAD"));
+    },
+  });
+  const memtreeServer = await mockMemtree();
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+    abRouting: {
+      forceComparison: true,
+      prefixChars: 4,
+      grader: async () => {
+        await gradeGate.promise;
+        return fusionVerdict("B");
+      },
+    },
+  });
+  const controller = new AbortController();
+  try {
+    await armMainTurn(proxy);
+    const response = await postStreamingTurn(proxy, {}, controller.signal);
+    const reader = response.body.getReader();
+    await readUntil(reader, "MEMORY_HEAD");
+    gradeGate.resolve();
+    // B's replayed head reaches the client mid-splice, then the client bails.
+    await readUntil(reader, "FULL_HEAD");
+    controller.abort();
+    await readRest(reader).catch(() => {});
+
+    await waitFor(
+      () => upstream.closed.has("memory") && upstream.closed.has("full"),
+      2_000
+    );
+    await waitFor(() => speculativeRecord(records) !== undefined);
+    const record = speculativeRecord(records);
+    assert.equal(record.turnType, "followup-ab-failed");
+    assert.equal(record.comparison.delivered, "spliced");
+    assert.equal(record.comparison.deliveryOk, false);
+    assert.equal(record.comparison.clientAborted, true);
+    assert.equal((await claimDisplay(proxy)).status, 204);
+  } finally {
+    controller.abort();
+    memoryRes?.destroy();
+    fullRes?.destroy();
     proxy.close();
     upstream.close();
     memtreeServer.close();

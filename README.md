@@ -86,14 +86,16 @@ When you send a message, we retrieve relevant details and summaries from the pri
 
 1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
 2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
-3. It holds the semantic prefix of each answer (about 1,000 tokens), asks a structured Anthropic grader to compare them, continues the winning in-flight stream, and aborts the loser. A and ties select memory; only a materially better B selects full history.
+3. The memory answer streams to the client immediately (speculative delivery — first-token latency is A's own). The semantic prefix of each answer (about 1,000 tokens) is graded in the background by a structured Anthropic grader; A and ties keep memory, and only a materially better B interrupts the in-flight message, visibly correcting course with a short bridge line before continuing from the full-history answer.
 4. A memory winner remains active through that human turn's tool loop, including matching Count Tokens calls. The original full tool history is still sent to MemTree for background indexing.
 
-Comparison is deliberately fail-safe: grader failure or timeout prefers memory, a failed selected arm falls back to a healthy peer, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response.
+Comparison is deliberately fail-safe: grader failure or timeout keeps memory (the grader is retried once off the delivery path), a memory arm that dies mid-stream is recovered from the healthy full-history arm, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. Once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
 
-Qualifying turns cost more and start streaming later: they make two answer requests plus one grader request on the user's Anthropic subscription or API account, and buffer while the decision is made. The gate avoids that overhead for compact contexts, and the losing answer is aborted immediately after selection.
+Qualifying turns cost more: they make two answer requests plus one grader request on the user's Anthropic subscription or API account. The gate avoids that overhead for compact contexts, and the losing answer is aborted right after grading.
 
 Advanced/testing controls:
+
+- `ccc --ab-buffered` retains the previous buffer-both-then-commit delivery (for research comparison runs); the default is speculative delivery.
 
 - `CCC_AB_ROUTING=0` disables live A/B routing.
 - `CCC_AB_GRADER_MODEL=<model>` overrides the default grader (`claude-opus-4-8`).
