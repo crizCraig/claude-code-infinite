@@ -27,7 +27,11 @@ export {
   MemtreeClient,
   rawPromptTokenCount,
 } from "./memtree.js";
-export type { MemtreeOptions, CompressResult } from "./memtree.js";
+export type {
+  MemtreeOptions,
+  MemtreeRequestMetadata,
+  CompressResult,
+} from "./memtree.js";
 export {
   isNonToolUserMessage,
   isToolResultUserMessage,

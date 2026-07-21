@@ -11,8 +11,9 @@
  *   user WHY MemTree is off instead of implying a transient outage; any later
  *   successful call clears it (the user paid mid-session).
  *
- * Work is deduped per messages hash, not per HTTP attempt, so Claude Code
- * retries cannot amplify into repeated compression/indexing calls.
+ * Indexing is deduped per messages hash. Compression uses a separate output
+ * identity that also includes model, hard context limit, and tool schemas, so
+ * retries coalesce without sharing a result across different budgets.
  */
 
 import { createHash } from "node:crypto";
@@ -38,6 +39,7 @@ const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
 /** Indexing runs off the response path; give it room. */
 const INDEX_TIMEOUT_MS = 120_000;
 const DEDUPE_CACHE_MAX = 64;
+const MAX_CANONICAL_JSON_DEPTH = 256;
 
 export interface MemtreeOptions {
   baseUrl: string;
@@ -46,6 +48,11 @@ export interface MemtreeOptions {
   debug?: boolean;
   /** Always-on JSONL diagnostics; every MemTree call logs one line. */
   reqlog?: RequestLogSink;
+}
+
+export interface MemtreeRequestMetadata {
+  model?: string;
+  tools?: Record<string, unknown>[];
 }
 
 export interface CompressResult {
@@ -108,7 +115,7 @@ export class MemtreeClient {
   private compressTimeoutMs: number;
   private debug: boolean;
   private reqlog: RequestLogSink | undefined;
-  /** messages-hash → in-flight/settled compression promise (retry dedupe). */
+  /** output-identity hash → in-flight/settled compression promise. */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
   /** messages-hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
@@ -163,25 +170,36 @@ export class MemtreeClient {
     hash: string,
     messages: Message[],
     modelContextLimit: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    metadata: MemtreeRequestMetadata = {}
   ): Promise<CompressResult | null> {
-    const cached = this.compressCache.get(hash);
+    let cacheKey: string;
+    try {
+      cacheKey = compressionCacheKey(hash, modelContextLimit, metadata);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.log(`compression failed: invalid cache identity: ${detail}`);
+      return Promise.resolve(null);
+    }
+    const cached = this.compressCache.get(cacheKey);
     if (cached) return cached;
 
-    const promise = this.callContextMemory(messages, modelContextLimit, {
-      timeoutMs: this.compressTimeoutMs,
-      signal,
-    }).catch((err) => {
+    const promise = this.callContextMemory(
+      messages,
+      modelContextLimit,
+      { timeoutMs: this.compressTimeoutMs, signal },
+      metadata
+    ).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
       // automatic retry of an identical request) hit the server again.
-      if (this.compressCache.get(hash) === promise) {
-        this.compressCache.delete(hash);
+      if (this.compressCache.get(cacheKey) === promise) {
+        this.compressCache.delete(cacheKey);
       }
       return null;
     });
 
-    this.remember(hash, promise);
+    this.remember(cacheKey, promise);
     return promise;
   }
 
@@ -192,7 +210,8 @@ export class MemtreeClient {
   indexInBackground(
     hash: string,
     messages: Message[],
-    modelContextLimit: number
+    modelContextLimit: number,
+    metadata: MemtreeRequestMetadata = {}
   ): void {
     if (this.backgroundClosing) return;
     if (this.indexedHashes.has(hash)) return;
@@ -204,11 +223,16 @@ export class MemtreeClient {
 
     const stripped = stripCcSystemReminders(messages);
     const controller = new AbortController();
-    const operation = this.callContextMemory(stripped, modelContextLimit, {
-      timeoutMs: INDEX_TIMEOUT_MS,
-      indexOnly: true,
-      signal: controller.signal,
-    })
+    const operation = this.callContextMemory(
+      stripped,
+      modelContextLimit,
+      {
+        timeoutMs: INDEX_TIMEOUT_MS,
+        indexOnly: true,
+        signal: controller.signal,
+      },
+      metadata
+    )
       .then(
         () => undefined,
         (err) => {
@@ -254,8 +278,8 @@ export class MemtreeClient {
     return false;
   }
 
-  private remember(hash: string, promise: Promise<CompressResult | null>) {
-    this.compressCache.set(hash, promise);
+  private remember(cacheKey: string, promise: Promise<CompressResult | null>) {
+    this.compressCache.set(cacheKey, promise);
     if (this.compressCache.size > DEDUPE_CACHE_MAX) {
       const first = this.compressCache.keys().next().value;
       if (first !== undefined) this.compressCache.delete(first);
@@ -265,12 +289,17 @@ export class MemtreeClient {
   private async callContextMemory(
     messages: Message[],
     modelContextLimit: number,
-    opts: { timeoutMs: number; indexOnly?: boolean; signal?: AbortSignal }
+    opts: { timeoutMs: number; indexOnly?: boolean; signal?: AbortSignal },
+    metadata: MemtreeRequestMetadata = {}
   ): Promise<CompressResult | null> {
     const body: Record<string, unknown> = {
       messages,
       model_context_limit: modelContextLimit,
     };
+    if (metadata.model !== undefined) body.model = metadata.model;
+    if (!opts.indexOnly && metadata.tools !== undefined) {
+      body.tools = metadata.tools;
+    }
     // Server may ignore this until the index-only endpoint mode ships
     // (plan Phase 2.2); harmless extra field either way.
     if (opts.indexOnly) body.index_only = true;
@@ -341,6 +370,63 @@ export class MemtreeClient {
   private log(msg: string) {
     if (this.debug) console.error(`[ccc proxy] ${msg}`);
   }
+}
+
+function compressionCacheKey(
+  messagesHash: string,
+  modelContextLimit: number,
+  metadata: MemtreeRequestMetadata
+): string {
+  const toolsFingerprint = metadata.tools === undefined
+    ? null
+    : sha256(deterministicJson(metadata.tools));
+  return sha256(JSON.stringify({
+    messagesHash,
+    model: metadata.model ?? null,
+    modelContextLimit,
+    toolsFingerprint,
+  }));
+}
+
+function deterministicJson(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value));
+}
+
+function sortJsonValue(
+  value: unknown,
+  ancestors: WeakSet<object> = new WeakSet<object>(),
+  depth = 0
+): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_CANONICAL_JSON_DEPTH) {
+    throw new RangeError("tool metadata exceeds canonical JSON depth limit");
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError("tool metadata contains a circular reference");
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => sortJsonValue(item, ancestors, depth + 1));
+    }
+
+    const sorted = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = sortJsonValue(
+        (value as Record<string, unknown>)[key],
+        ancestors,
+        depth + 1
+      );
+    }
+    return sorted;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 /** 402 bodies are FastAPI JSON: {"detail": "<human-readable payment text>"}. */

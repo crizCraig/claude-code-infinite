@@ -64,6 +64,7 @@ import {
   MemtreeClient,
   rawPromptTokenCount,
   type CompressResult,
+  type MemtreeRequestMetadata,
 } from "./memtree.js";
 import {
   contextLimitForModel,
@@ -738,6 +739,11 @@ async function handleMessages(
   const noticePromptGeneration = state.mainPromptGeneration;
   const modelContextLimit = contextLimitForModel(body.model);
   const msgsForMemtree = messagesWithSystem(messages, body.system);
+  const memtreeMetadata: MemtreeRequestMetadata = {};
+  if (typeof body.model === "string") memtreeMetadata.model = body.model;
+  if (Array.isArray(body.tools)) {
+    memtreeMetadata.tools = body.tools as Record<string, unknown>[];
+  }
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
   const originalTokenCountKey = tokenCountKey(body, req.headers, req.url);
 
@@ -787,7 +793,12 @@ async function handleMessages(
       routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool",
       routedBody
     );
-    opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+    opts.memtree.indexInBackground(
+      hash,
+      msgsForMemtree,
+      modelContextLimit,
+      memtreeMetadata
+    );
     capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
     return logged(
       forwardRaw(
@@ -823,7 +834,8 @@ async function handleMessages(
       hash,
       msgsForMemtree,
       modelContextLimit,
-      state.shutdownSignal
+      state.shutdownSignal,
+      memtreeMetadata
     );
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);

@@ -48,14 +48,14 @@ Each environment maintains its own separate API key.
 
 ```
 Claude Code ──▶ localhost proxy (ccc)
-                  ├──(messages only, MemTree API key)──▶ api.polychat.co /v1/context_memory
+                  ├──(messages + budgeting metadata, MemTree API key)──▶ api.polychat.co /v1/context_memory
                   │◀──(compressed messages)─────────────┘
                   ├──(memory leg A + your local OAuth)──▶ api.anthropic.com
                   ├──(eligible turns: full-history leg B)▶ api.anthropic.com
                   └──(eligible turns: local A/B grader)──▶ api.anthropic.com
 ```
 
-- Only message content is sent to MemTree for indexing/compression — never credentials.
+- For blocking compression, PolyChat receives the messages, raw model identifier, and tool schemas needed to budget the context. Background indexing sends the messages and model identifier but omits tool schemas. Neither path sends Anthropic credentials.
 - Answer legs and the grader go directly from the local proxy to Anthropic using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
 

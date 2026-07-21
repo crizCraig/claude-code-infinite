@@ -7,8 +7,9 @@
  * ANTHROPIC_BASE_URL set. Auth is untouched by design ("mirror vanilla"):
  * Claude Code keeps its native login — token refresh, plan-default model
  * resolution, and limit handling behave exactly like vanilla — and its OAuth
- * token never leaves this machine. polychat.co only ever sees message content
- * for compression/indexing, authenticated by the user's MemTree API key.
+ * token never leaves this machine. polychat.co receives conversation messages,
+ * the model identifier, and compression-time tool schemas used for budgeting,
+ * authenticated separately by the user's MemTree API key.
  */
 
 import spawn from "cross-spawn";
