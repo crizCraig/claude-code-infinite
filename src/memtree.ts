@@ -48,6 +48,16 @@ export interface MemtreeOptions {
   reqlog?: RequestLogSink;
 }
 
+/**
+ * Request metadata forwarded to the server so it can resolve a model-based
+ * memory budget (e.g. the 500k whole-request target for Fable / Opus 4.8).
+ * Without `model` the server can only apply its static 50k fallback.
+ */
+export interface CompressRequestMeta {
+  model?: string;
+  tools?: unknown[];
+}
+
 export interface CompressResult {
   /** Processed (compressed) messages from the server; system role may be included. */
   messages: Message[];
@@ -163,7 +173,8 @@ export class MemtreeClient {
     hash: string,
     messages: Message[],
     modelContextLimit: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    meta?: CompressRequestMeta
   ): Promise<CompressResult | null> {
     const cached = this.compressCache.get(hash);
     if (cached) return cached;
@@ -171,6 +182,8 @@ export class MemtreeClient {
     const promise = this.callContextMemory(messages, modelContextLimit, {
       timeoutMs: this.compressTimeoutMs,
       signal,
+      model: meta?.model,
+      tools: meta?.tools,
     }).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
@@ -265,7 +278,13 @@ export class MemtreeClient {
   private async callContextMemory(
     messages: Message[],
     modelContextLimit: number,
-    opts: { timeoutMs: number; indexOnly?: boolean; signal?: AbortSignal }
+    opts: {
+      timeoutMs: number;
+      indexOnly?: boolean;
+      signal?: AbortSignal;
+      model?: string;
+      tools?: unknown[];
+    }
   ): Promise<CompressResult | null> {
     const body: Record<string, unknown> = {
       messages,
@@ -274,6 +293,15 @@ export class MemtreeClient {
     // Server may ignore this until the index-only endpoint mode ships
     // (plan Phase 2.2); harmless extra field either way.
     if (opts.indexOnly) body.index_only = true;
+    // Model (and tools, whose serialized size feeds the same budget) let the
+    // server resolve a model-based memory budget instead of its static 50k
+    // fallback. Only meaningful on compression calls: the server's index_only
+    // path returns before budget resolution, so indexing calls skip both and
+    // save the upload bytes (tools schemas run tens of KB per call).
+    if (!opts.indexOnly) {
+      if (opts.model) body.model = opts.model;
+      if (opts.tools && opts.tools.length > 0) body.tools = opts.tools;
+    }
     const payload = JSON.stringify(body);
 
     const started = Date.now();
@@ -334,6 +362,10 @@ export class MemtreeClient {
         ok,
         status,
         requestBytes: Buffer.byteLength(payload),
+        // Present only when the request carried a model for server-side
+        // budget resolution — the client-visible half of the server's
+        // "/v1/context_memory budget" log line.
+        ...(opts.model && !opts.indexOnly ? { model: opts.model } : {}),
       });
     }
   }

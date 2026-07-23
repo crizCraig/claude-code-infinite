@@ -75,6 +75,7 @@ import {
   isToolResultUserMessage,
   lastNonSystemMessage,
   messagesWithSystem,
+  modelForMemtree,
   stripSystemReminderText,
   userMessageText,
   type Message,
@@ -736,7 +737,12 @@ async function handleMessages(
     state.activeSubagents.size === 0;
   const noticePromptId = state.mainPromptId;
   const noticePromptGeneration = state.mainPromptGeneration;
-  const modelContextLimit = contextLimitForModel(body.model);
+  // 1M context arrives as the `context-1m` beta header (Claude Code strips
+  // the `[1m]` model suffix on the wire), so the header must feed the limit.
+  const modelContextLimit = contextLimitForModel(
+    body.model,
+    headerText(req.headers, "anthropic-beta")
+  );
   const msgsForMemtree = messagesWithSystem(messages, body.system);
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
   const originalTokenCountKey = tokenCountKey(body, req.headers, req.url);
@@ -823,7 +829,19 @@ async function handleMessages(
       hash,
       msgsForMemtree,
       modelContextLimit,
-      state.shutdownSignal
+      state.shutdownSignal,
+      {
+        // Model + tools drive the server's model-based memory budget
+        // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
+        // them silently downgrades to the server's static 50k fallback.
+        // `[1m]` is re-attached when the session is 1M-context so the
+        // server's budget telemetry names the variant it actually served.
+        model: modelForMemtree(
+          typeof body.model === "string" ? body.model : undefined,
+          modelContextLimit
+        ),
+        tools: Array.isArray(body.tools) ? body.tools : undefined,
+      }
     );
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);

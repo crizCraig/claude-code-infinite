@@ -299,8 +299,37 @@ export function messagesWithSystem(
   return msgs;
 }
 
-/** Context-window budget for compression; strips the `[1m]` long-context suffix. */
-export function contextLimitForModel(model: string | undefined): number {
+/**
+ * Context-window budget for compression.
+ *
+ * 1M long context is signaled two ways and we must accept both:
+ * - a `[1m]` model-name suffix (our CLI convention), or
+ * - an `anthropic-beta: context-1m-*` header — this is what Claude Code
+ *   actually sends on the wire: it strips the `[1m]` suffix from the model
+ *   field and translates it into the beta flag, so a proxy that only checks
+ *   the model name silently under-reports a 1M session as 200k.
+ */
+export function contextLimitForModel(
+  model: string | undefined,
+  anthropicBeta?: string
+): number {
   if (model && model.includes("[1m]")) return 1_000_000;
+  if (anthropicBeta && anthropicBeta.includes("context-1m")) return 1_000_000;
   return 200_000;
+}
+
+/**
+ * Model name to report to the MemTree server: re-attach the `[1m]` suffix
+ * when the session runs with 1M context but the wire model name is plain
+ * (Claude Code moved the suffix into the beta header). The server resolves
+ * `<model>[1m]` aliases and logs the requested model verbatim, so this keeps
+ * its budget telemetry self-explanatory about the context variant.
+ */
+export function modelForMemtree(
+  model: string | undefined,
+  contextLimit: number
+): string | undefined {
+  if (!model) return undefined;
+  if (contextLimit >= 1_000_000 && !model.includes("[1m]")) return `${model}[1m]`;
+  return model;
 }

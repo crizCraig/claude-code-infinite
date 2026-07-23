@@ -1561,6 +1561,94 @@ test("MemtreeClient records the 402 detail and clears it on a later success", as
   }
 });
 
+test("compress forwards model+tools for server budget resolution; index-only omits them", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const tools = [
+    { name: "Bash", description: "run a command", input_schema: { type: "object" } },
+  ];
+  const post = async (messages) => {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-fable-5",
+        max_tokens: 64,
+        tools,
+        messages,
+      }),
+    });
+    await res.text();
+  };
+  try {
+    // Tool turn → background index_only call: the server's index_only path
+    // returns before budget resolution, so the client saves the upload bytes.
+    await post(toolTurn);
+    await waitFor(() => memtreeSrv.calls.length >= 1);
+    const indexCall = memtreeSrv.calls[0];
+    assert.equal(indexCall.index_only, true);
+    assert.equal(indexCall.model, undefined, "index-only omits model");
+    assert.equal(indexCall.tools, undefined, "index-only omits tools");
+
+    // Followup user turn → blocking compress: model + tools ride along so the
+    // server resolves the model-based budget (500k for Fable / Opus 4.8)
+    // instead of the static 50k fallback.
+    await armMainTurn(proxy, "turn two");
+    await post(followupTurn("turn two"));
+    const compressCall = memtreeSrv.calls.find((c) => c.index_only !== true);
+    assert.ok(compressCall, "blocking compress call reached MemTree");
+    assert.equal(compressCall.model, "claude-fable-5");
+    assert.equal(compressCall.model_context_limit, 200_000);
+    assert.deepEqual(compressCall.tools, tools);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("context-1m beta header yields 1M limit and a [1m]-tagged model", async () => {
+  // Claude Code signals 1M context via `anthropic-beta: context-1m-*` with a
+  // PLAIN model name (it strips the `[1m]` suffix on the wire). The proxy must
+  // read the header — model-name sniffing alone under-reports 1M as 200k, and
+  // the server then clamps a 500k budget down to 200k.
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const post = async (messages) => {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-beta": "context-1m-2025-08-07,other-flag",
+      },
+      body: JSON.stringify({ model: "claude-fable-5", max_tokens: 64, messages }),
+    });
+    await res.text();
+  };
+  try {
+    await post(toolTurn);
+    await waitFor(() => memtreeSrv.calls.length >= 1);
+    await armMainTurn(proxy, "turn two");
+    await post(followupTurn("turn two"));
+    const compressCall = memtreeSrv.calls.find((c) => c.index_only !== true);
+    assert.ok(compressCall, "blocking compress call reached MemTree");
+    assert.equal(compressCall.model_context_limit, 1_000_000);
+    assert.equal(compressCall.model, "claude-fable-5[1m]");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("MemtreeClient falls back to generic detail on a non-JSON 402 body", async () => {
   const srv = await listen((req, res) => {
     req.resume();
