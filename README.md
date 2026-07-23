@@ -7,7 +7,7 @@
 * Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
-* Automatically recalls only the relevant past information
+* Automatically recalls relevant past information using hierarchical RAG
 * Allows you to continue your session without summarizing or compacting
  
 ## Requirements
@@ -30,7 +30,7 @@ npm install -g claude-code-infinite
   ccc
   ```
 
-This will guide you through setting up your PolyChat key, which you can also get [here](https://polychat.co/auth?memtree=true).
+This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
 
 ## Environments
 
@@ -165,3 +165,16 @@ If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notic
 ## Using Without an Anthropic Subscription
 
 Claude Code works with an Anthropic API key as well as a subscription — set `ANTHROPIC_API_KEY` as you would with vanilla Claude Code and run `ccc` as usual. MemTree compression works the same either way (and saves the most money on API-key billing, since you pay per token).
+
+> [!NOTE]
+> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
+>
+> You don't need to buy API credits, just login and Claude Code will let you complete setup.
+>
+> Lastly run `/logout` within Claude Code and then run `ccc`
+>
+> Anthropic API usage will be billed through https://polychat.co.
+
+## API Rate limit errors
+
+If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions.
