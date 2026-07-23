@@ -2,7 +2,7 @@
 export interface WrapperArgs {
   claudeArgs: string[];
   debug: boolean;
-  /** Unsafe research mode; buffered A/B delivery remains the default. */
+  /** Buffered A/B delivery is the default; `--ab-speculative` opts in. */
   speculativeAb: boolean;
 }
 

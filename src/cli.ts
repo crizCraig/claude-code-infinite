@@ -17,9 +17,11 @@ import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
 import {
   DEFAULT_GRADE_PREFIX_TOKENS,
+  DEFAULT_GRADER_MEMORY_TOKENS,
   DEFAULT_PREFIX_TIMEOUT_MS,
   DEFAULT_GRADER_TIMEOUT_MS,
-  DEFAULT_GRADER_MODEL,
+  type AbGrader,
+  type AbVerdict,
 } from "./ab-routing.js";
 import {
   createSessionNoticePlugin,
@@ -74,22 +76,55 @@ function abEnvPositiveNumber(name: string, fallback: number): number | undefined
   return value;
 }
 
-// Parse CCC_AB_GRADER_MODEL. resolveAbRoutingOptions only substitutes the
-// default for undefined (`??`), so an empty/whitespace value would flow through
-// as `model: ""` and every grader request would be rejected 400 — silently
-// falling back to memory while still paying the double-leg cost. Warn on
-// stderr and return undefined so the documented default applies.
+// Parse CCC_AB_GRADER_MODEL. An empty/whitespace value would otherwise flow
+// through as `model: ""` and every grader request would be rejected 400 —
+// silently falling back to memory while still paying the double-leg cost.
+// Warn on stderr and return undefined so automatic selection applies.
 function abEnvGraderModel(): string | undefined {
   const raw = process.env.CCC_AB_GRADER_MODEL;
   if (raw === undefined) return undefined;
   const value = raw.trim();
   if (value === "") {
     console.warn(
-      `\x1b[1;33m⚠ Ignoring CCC_AB_GRADER_MODEL="${raw}" — expected a model id; using default ${DEFAULT_GRADER_MODEL}.\x1b[0m`
+      `\x1b[1;33m⚠ Ignoring CCC_AB_GRADER_MODEL="${raw}" — expected a model id; using automatic selection.\x1b[0m`
     );
     return undefined;
   }
   return value;
+}
+
+// Parse CCC_AB_FORCE_VERDICT (staging escape hatch for the P4 splice-UX
+// eyeball). A|B|tie replaces the real grader with an instant fixed verdict —
+// no grader request is made. `B` forces the mid-stream splice path whenever
+// the verdict lands inside the interrupt window; combine with
+// CCC_AB_FORCE_COMPARISON=1 to also bypass the context-size gate.
+function abEnvForcedGrader(): AbGrader | undefined {
+  const raw = process.env.CCC_AB_FORCE_VERDICT;
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value !== "A" && value !== "B" && value !== "tie") {
+    console.warn(
+      `\x1b[1;33m⚠ Ignoring CCC_AB_FORCE_VERDICT="${raw}" — expected A, B, or tie; using the real grader.\x1b[0m`
+    );
+    return undefined;
+  }
+  const verdict: AbVerdict = value;
+  console.warn(
+    `\x1b[1;33m⚠ CCC_AB_FORCE_VERDICT=${verdict} — A/B grading is bypassed with a fixed verdict (staging only).\x1b[0m`
+  );
+  return async () => ({
+    metrics: {
+      consensus_points: [],
+      contradictions: [],
+      partial_coverage: [],
+      unique_insights_a: [],
+      unique_insights_b: [],
+      blind_spots: [],
+    },
+    verdict,
+    materially_different: verdict !== "tie",
+    reasoning: `Forced by CCC_AB_FORCE_VERDICT=${verdict} for staging.`,
+  });
 }
 
 function openUrl(url: string): void {
@@ -271,10 +306,16 @@ async function main() {
             "CCC_AB_GRADER_TIMEOUT_MS",
             DEFAULT_GRADER_TIMEOUT_MS
           ),
+          graderMemoryChars: (() => {
+            const tokens = abEnvPositiveNumber(
+              "CCC_AB_GRADER_MEMORY_TOKENS",
+              DEFAULT_GRADER_MEMORY_TOKENS
+            );
+            return tokens === undefined ? undefined : tokens * 4;
+          })(),
           sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
           forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
-          // Buffered delivery is the safe default until real-Claude replay S1
-          // validates spliced assistant transcripts end to end.
+          grader: abEnvForcedGrader(),
           speculative: parsedArgs.speculativeAb,
         };
   const proxy = await startProxy({

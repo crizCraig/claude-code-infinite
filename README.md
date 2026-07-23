@@ -87,21 +87,23 @@ When you send a message, we retrieve relevant details and summaries from the pri
 
 1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
 2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
-3. By default, both semantic prefixes (about 1,000 tokens each) are buffered while a structured Anthropic grader chooses the response to deliver. A and ties keep memory; only a materially better B selects full history. Experimental speculative delivery can instead stream A immediately and let a B verdict visibly correct course in flight.
+3. By default, both semantic prefixes (about 1,000 tokens each) are buffered while a structured Anthropic grader chooses the response to deliver. A and ties keep memory; only a materially better B selects full history. `--ab-speculative` instead streams A immediately and lets a B verdict visibly correct course in flight by splicing the full-history answer into the message after a short bridge line.
 4. A memory winner remains active through that human turn's tool loop, including matching Count Tokens calls. The original full tool history is still sent to MemTree for background indexing.
 
-Comparison is deliberately fail-safe: grader failure or timeout keeps memory; in speculative research mode, a failed grader gets one off-path retry. A memory arm that dies mid-stream is recovered from the healthy full-history arm when doing so is transcript-safe, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. In speculative mode, once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
+Comparison is deliberately fail-safe: grader failure or timeout keeps memory; in speculative mode, a failed grader gets one off-path retry. A memory arm that dies mid-stream is recovered from the healthy full-history arm when doing so is transcript-safe, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. In speculative mode, once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
 
 Qualifying turns cost more: they make two answer requests plus one grader attempt on the user's Anthropic subscription or API account. Speculative mode may make a second grader attempt after a retryable failure, for up to four Anthropic requests on that comparison turn. The gate avoids that overhead for compact contexts, and the losing answer is aborted right after grading.
 
 Advanced/testing controls:
 
-- Buffered, grade-before-delivery A/B routing is the safe default.
-- `ccc --ab-speculative` explicitly enables experimental commit-A-immediately delivery and SSE splicing. Use only for research until the real-Claude replay spike is complete. `--ab-buffered` remains accepted as an explicit/compatibility override.
+- Buffered, grade-before-delivery A/B routing is the default.
+- `ccc --ab-speculative` opts into commit-A-immediately delivery with SSE splicing; `ccc --ab-buffered` explicitly selects the default buffered mode. If both flags are supplied before `--`, the last one wins. The transcript-safety question behind speculative mode — whether Anthropic accepts a spliced assistant message replayed as history — was validated by the S1 replay spike (`scripts/spike-s1.mjs`) against real Anthropic with Claude Code's own headers, including the tool-use splice shape.
 
 - `CCC_AB_ROUTING=0` disables live A/B routing.
-- `CCC_AB_GRADER_MODEL=<model>` overrides the default grader (`claude-opus-4-8`).
+- `CCC_AB_FORCE_VERDICT=A|B|tie` replaces the grader with an instant fixed verdict (no grader request). Staging-only: `B` forces the mid-stream splice/correction path so its UX can be eyeballed; combine with `CCC_AB_FORCE_COMPARISON=1` to also bypass the context-size gate.
+- `CCC_AB_GRADER_MODEL=<model>` pins a fixed grader model; by default, each comparison automatically uses a grader from a different model family than its answer legs.
 - `CCC_AB_PREFIX_TOKENS=<n>` changes the answer prefix from its 1,000-token default.
+- `CCC_AB_GRADER_MEMORY_TOKENS=<n>` changes the cap on the memory section of the grader prompt from its 10,000-token default. Oversized memory is excerpted head+tail with an explicit elision marker; Answer A itself always sees the full memory.
 - `CCC_AB_PREFIX_TIMEOUT_MS=<ms>` and `CCC_AB_GRADER_TIMEOUT_MS=<ms>` change their 30-second defaults.
 - `CCC_AB_SAMPLE_NO_PRIOR=0` skips comparison for models without an effective-context prior.
 - `CCC_AB_FORCE_COMPARISON=1` bypasses the size gate for diagnostics.

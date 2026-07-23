@@ -1598,10 +1598,10 @@ interface ComparedSseArgs {
 }
 
 /**
- * Live memory-vs-full comparison. Buffered mode is the safe default and holds
- * both prefixes until the grader selects a leg. Explicit speculative mode
- * commits the memory leg from its first byte and treats a B verdict as an
- * in-stream interruption.
+ * Live memory-vs-full comparison. Buffered mode is the default and holds both
+ * prefixes until the grader selects a leg. Explicit speculative mode commits
+ * the memory leg from its first byte and treats a B verdict as an in-stream
+ * interruption.
  */
 async function forwardComparedSse(args: ComparedSseArgs): Promise<void> {
   if (args.routing.speculative) return forwardSpeculativeSse(args);
@@ -1736,8 +1736,9 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
       fallbackReason = "both-legs-failed";
     } else {
       const gradeStarted = Date.now();
+      const graderModel = routing.graderModelFor(model);
       const graderDiagnostic: GraderDiagnostic = {
-        model: routing.grader ? "injected" : routing.graderModel,
+        model: routing.grader ? "injected" : graderModel,
         ok: false,
       };
       comparison.grader = graderDiagnostic;
@@ -1759,6 +1760,7 @@ async function forwardBufferedComparedSse(args: ComparedSseArgs): Promise<void> 
         ]),
         parentSignal: decisionAbort.signal,
         diagnostic: graderDiagnostic,
+        graderModel,
       });
       comparison.gradeMs = Date.now() - gradeStarted;
       if (gradeOutcome.verdict) {
@@ -2371,10 +2373,11 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
       fallbackReason = "both-legs-failed";
     } else {
       const gradeStarted = Date.now();
+      const graderModel = routing.graderModelFor(model);
       let attempt = 0;
       while (true) {
         const graderDiagnostic: GraderDiagnostic = {
-          model: routing.grader ? "injected" : routing.graderModel,
+          model: routing.grader ? "injected" : graderModel,
           ok: false,
         };
         comparison.grader = graderDiagnostic;
@@ -2396,6 +2399,7 @@ async function forwardSpeculativeSse(args: ComparedSseArgs): Promise<void> {
           ]),
           parentSignal: graderAbort.signal,
           diagnostic: graderDiagnostic,
+          graderModel,
         });
         if (gradeOutcome.verdict) {
           graderDiagnostic.ok = true;
@@ -2573,6 +2577,7 @@ async function gradeComparedPrefixes(args: {
   overflow: Promise<void>;
   parentSignal: AbortSignal;
   diagnostic: GraderDiagnostic;
+  graderModel: string;
 }): Promise<{ verdict?: FusionVerdict; reason?: string }> {
   const {
     req,
@@ -2582,6 +2587,7 @@ async function gradeComparedPrefixes(args: {
     overflow,
     parentSignal,
     diagnostic,
+    graderModel,
   } = args;
   const controller = new AbortController();
   let settleStop!: (kind: "timeout" | "aborted") => void;
@@ -2617,6 +2623,7 @@ async function gradeComparedPrefixes(args: {
             routing,
             input: { ...input, signal: controller.signal },
             diagnostic,
+            graderModel,
           });
     })
     .then((value) => ({ kind: "verdict" as const, value }))
@@ -2662,8 +2669,9 @@ async function gradeWithIncomingAnthropicAuth(args: {
   routing: ResolvedAbRoutingOptions;
   input: AbGradeInput;
   diagnostic: GraderDiagnostic;
+  graderModel: string;
 }): Promise<FusionVerdict> {
-  const { req, upstream, routing, input, diagnostic } = args;
+  const { req, upstream, routing, input, diagnostic, graderModel } = args;
   if (input.signal.aborted) throw new Error("grader aborted");
   const body = Buffer.from(
     JSON.stringify(
@@ -2675,12 +2683,17 @@ async function gradeWithIncomingAnthropicAuth(args: {
           fullResponse: input.fullResponse,
           model: input.model,
         },
-        routing.graderModel,
-        routing.prefixChars
+        graderModel,
+        routing.prefixChars,
+        routing.graderMemoryChars
       )
     ),
     "utf-8"
   );
+  // Recorded before the request goes out so 429s/timeouts still log how big
+  // the attempt was; memoryChars isolates the prompt's only unbounded section.
+  diagnostic.requestBytes = body.length;
+  diagnostic.memoryChars = input.unfoldedMemory.length;
   const headers = forwardableRequestHeaders(req);
   headers["content-type"] = "application/json";
   headers["content-length"] = String(body.length);

@@ -11,17 +11,23 @@
 >
 > **STATUS 2026-07-18: IMPLEMENTED (P1–P4 unit/integration).** `src/splice.ts`
 > (event-aligned forwarder + `SseSpliceWriter`), speculative orchestration in
-> `src/proxy.ts` (`forwardSpeculativeSse`; buffered mode remains the safe
-> default and `--ab-speculative` opts in), bookkeeping/notices/reqlog fields, and the P4 fake-upstream
+> `src/proxy.ts` (`forwardSpeculativeSse`), bookkeeping/notices/reqlog
+> fields, and the P4 fake-upstream
 > scenarios are in. One deviation, made for robustness: an A leg that is
 > healthy but produces NO stream progress within `prefixTimeoutMs` while B is
 > already producing fails over to whole-B (`memory-no-progress-before-commit`)
 > — commit is defined as A's first forwarded event, not its response headers.
-> **Outstanding:** Spike S1 (franken-message replay against real Anthropic
-> with CC headers — needs a live session) and the P4 manual staging pass
-> (yoyo ping TTFT check; forced-B splice UX eyeball). Until S1 passes, splice
-> risk is gated behind explicit `--ab-speculative` opt-in in addition to the
-> tool_use lockout rules.
+> **S1 PASSED (2026-07-19):** `scripts/spike-s1.mjs` runs the franken-message
+> replay headlessly (no interactive CC session needed — real `claude -p`
+> turns supply signed thinking, B text/tool_use, and CC's verbatim
+> headers/body). Both shapes accepted (200) direct to Anthropic AND via the
+> proxy; an altered-history variant also passed, so the thinking signature is
+> not bound to surrounding context. Speculative delivery remains available via
+> `--ab-speculative`; buffered grade-before-delivery was restored as the
+> default on 2026-07-20, with `--ab-buffered` available as an explicit override.
+> **Outstanding:** the P4 manual staging pass (yoyo ping TTFT check;
+> forced-B splice UX eyeball; confirm CC's own transcript re-serialization of
+> a LIVE spliced stream — the one S1 gap the API-check form can't cover).
 
 ## Motivation (measured, not hypothetical)
 
@@ -184,8 +190,8 @@ buffering role for B and gains nothing A-specific (A's forwarder wraps its
 observer).
 
 **P3 — bookkeeping:** reqlog fields, turnTypes, notices, route updates,
-`abRouting.speculative` option (default **off** until S1 passes;
-`--ab-speculative` enables the research mode explicitly).
+`abRouting.speculative` option (`--ab-speculative` enables the mode explicitly;
+buffered delivery remains the default even though S1 has now passed).
 
 **P4 — tests + verification:** extend `test/ab-routing.test.mjs` fake-upstream
 harness: slow-B/fast-A (A wins, late verdict logged), B-verdict mid-A-text
@@ -221,4 +227,5 @@ to eyeball the mid-message correction UX in CC.
   showed CC tolerates block-count variety, but re-verify on CC version bumps.
 - **Double-billing perception**: B still runs to gradable prefix after A
   delivered; that is the existing research cost made intentional. The
-  `--ab-buffered` flag and gate remain the levers if it needs cutting.
+  delivery-mode flags and the comparison gate remain the levers if it needs
+  cutting.

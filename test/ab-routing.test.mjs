@@ -5,7 +5,11 @@ import { connect } from "node:net";
 import {
   abGateDecision,
   buildFusionGraderBody,
+  buildFusionGraderUserPrompt,
+  DEFAULT_GRADER_MEMORY_CHARS,
+  DEFAULT_GRADER_MODEL,
   effectiveContextForModel,
+  graderModelFor,
   parseFusionVerdictResponse,
   resolveAbRoutingOptions,
   startProxy,
@@ -241,7 +245,12 @@ function delayedMemoryUpstream(releaseMemoryEnd) {
   });
 }
 
-async function postStreamingTurn(proxy, extraHeaders = {}, signal) {
+async function postStreamingTurn(
+  proxy,
+  extraHeaders = {},
+  signal,
+  model = "claude-test"
+) {
   return fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
     method: "POST",
     headers: {
@@ -250,7 +259,7 @@ async function postStreamingTurn(proxy, extraHeaders = {}, signal) {
       ...extraHeaders,
     },
     body: JSON.stringify({
-      model: "claude-test",
+      model,
       max_tokens: 64,
       stream: true,
       messages: followupMessages,
@@ -343,7 +352,7 @@ test("gate compares at the boundary and samples models without a prior", () => {
   const options = resolveAbRoutingOptions({
     effectiveContextTokens: () => 100_000,
   });
-  assert.equal(options.speculative, false, "buffered delivery is the safe default");
+  assert.equal(options.speculative, false, "buffered delivery is the default");
   assert.equal(resolveAbRoutingOptions({ speculative: true }).speculative, true);
   assert.equal(abGateDecision("m", 49_999, options).compare, false);
   assert.equal(abGateDecision("m", 50_000, options).compare, true);
@@ -354,6 +363,22 @@ test("gate compares at the boundary and samples models without a prior", () => {
   assert.equal(abGateDecision("m", 1, unknown).compare, true);
   assert.equal(effectiveContextForModel("claude-opus-4-8[1m]"), 143_000);
   assert.equal(effectiveContextForModel("claude-fable-5[1m]"), 158_888);
+});
+
+test("grader model selection avoids the answer legs' model family", () => {
+  assert.equal(graderModelFor("claude-opus-4-8"), "claude-fable-5");
+  assert.equal(graderModelFor("claude-fable-5"), "claude-opus-4-8");
+  assert.equal(graderModelFor("claude-sonnet-5"), "claude-fable-5");
+  assert.equal(graderModelFor("claude-haiku-4-5"), "claude-fable-5");
+  assert.equal(
+    graderModelFor("us.anthropic.claude-opus-4-8-v1:0"),
+    "claude-fable-5"
+  );
+  assert.equal(graderModelFor("claude-unknown"), DEFAULT_GRADER_MODEL);
+
+  const override = resolveAbRoutingOptions({ graderModel: "fixed-grader" });
+  assert.equal(override.graderModelFor("claude-opus-4-8"), "fixed-grader");
+  assert.equal(override.graderModelFor("claude-fable-5"), "fixed-grader");
 });
 
 test("structured grader body and parser preserve the A/B contract", () => {
@@ -384,6 +409,14 @@ test("structured grader body and parser preserve the A/B contract", () => {
   );
   assert.match(body.messages[0].content, /ANSWER A/);
   assert.match(body.messages[0].content, /answer B/);
+  assert.equal(
+    resolveAbRoutingOptions({}).graderMemoryChars,
+    DEFAULT_GRADER_MEMORY_CHARS
+  );
+  assert.equal(
+    resolveAbRoutingOptions({ graderMemoryChars: 8 }).graderMemoryChars,
+    8
+  );
   const parsed = parseFusionVerdictResponse({
     content: [{ type: "text", text: JSON.stringify(fusionVerdict("B")) }],
   });
@@ -1275,26 +1308,83 @@ test("a selected A/B stream must reach message_stop before installing memory", a
   }
 });
 
+test("grader prompt caps the memory section head+tail with an elision marker", () => {
+  const graderInput = (memory) => ({
+    question: "q",
+    unfoldedMemory: memory,
+    memoryResponse: "a",
+    fullResponse: "b",
+    model: "m",
+  });
+
+  // Under the cap: inlined verbatim.
+  const small = buildFusionGraderUserPrompt(graderInput("tiny memory"), 4_000, 40_000);
+  assert.match(small, /tiny memory/);
+  assert.doesNotMatch(small, /elided for grading/);
+
+  // Over the cap: head and tail survive, middle is elided, and the marker
+  // tells the grader that Answer A saw the full memory.
+  const big = `${"H".repeat(30_000)}MIDDLE${"T".repeat(30_000)}`;
+  const capped = buildFusionGraderUserPrompt(graderInput(big), 4_000, 40_000);
+  assert.ok(capped.includes("H".repeat(20_000)));
+  assert.ok(capped.includes("T".repeat(20_000)));
+  assert.doesNotMatch(capped, /MIDDLE/);
+  assert.match(
+    capped,
+    /…\[20006 chars elided for grading — Answer A saw the full memory\]/
+  );
+
+  // The cap flows through buildFusionGraderBody.
+  const body = buildFusionGraderBody(graderInput(big), "grader-model", 4_000, 40_000);
+  assert.match(body.messages[0].content, /elided for grading/);
+  const uncapped = buildFusionGraderBody(graderInput(big), "grader-model", 4_000, 80_000);
+  assert.doesNotMatch(uncapped.messages[0].content, /elided for grading/);
+});
+
 test("native grader reuses incoming Anthropic auth and selects B", async () => {
   const upstream = await mockRouterUpstream({ nativeVerdict: "B" });
   const memtreeServer = await mockMemtree();
+  const records = [];
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: { speculative: false, forceComparison: true, prefixChars: 4 },
   });
   try {
-    const response = await postStreamingTurn(proxy, {
-      authorization: "Bearer oauth-test",
-      "anthropic-beta": "oauth-test-beta",
-      "anthropic-version": "2023-06-01",
-    });
+    const response = await postStreamingTurn(
+      proxy,
+      {
+        authorization: "Bearer oauth-test",
+        "anthropic-beta": "oauth-test-beta",
+        "anthropic-version": "2023-06-01",
+      },
+      undefined,
+      "claude-opus-4-8"
+    );
     assert.match(await response.text(), /FULL_ANSWER/);
     const grader = upstream.calls.find((call) => call.kind === "grader");
     assert.ok(grader);
     assert.equal(grader.headers.authorization, "Bearer oauth-test");
     assert.equal(grader.headers["anthropic-beta"], "oauth-test-beta");
     assert.equal(grader.body.stream, false);
+    assert.equal(grader.body.model, "claude-fable-5");
+    const record = records.find(
+      (item) => item.kind === "messages" && item.comparison?.attempted
+    );
+    assert.equal(record.comparison.grader.model, "claude-fable-5");
+    assert.equal(
+      record.comparison.grader.requestBytes,
+      Buffer.byteLength(JSON.stringify(grader.body), "utf-8"),
+      "grader requestBytes matches the serialized body actually sent"
+    );
+    assert.equal(
+      record.comparison.grader.memoryChars,
+      grader.body.messages[0].content
+        .split("## MEMORY (compressed, curated history) available to Answer A\n")[1]
+        .split("\n\n## ANSWER A")[0].length,
+      "grader memoryChars matches the memory section inlined in the prompt"
+    );
   } finally {
     proxy.close();
     upstream.close();

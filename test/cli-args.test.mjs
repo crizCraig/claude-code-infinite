@@ -24,6 +24,7 @@ test("ccc wrapper flags are consumed only before --", () => {
         "--ab-buffered",
       ],
       debug: true,
+      // Post-separator --ab-buffered is a literal Claude arg, not an override.
       speculativeAb: false,
     }
   );
@@ -31,6 +32,7 @@ test("ccc wrapper flags are consumed only before --", () => {
 
 test("speculative A/B is explicit opt-in and the last pre-separator mode wins", () => {
   assert.equal(parseWrapperArgs([]).speculativeAb, false);
+  assert.equal(parseWrapperArgs(["--ab-buffered"]).speculativeAb, false);
   assert.equal(
     parseWrapperArgs(["--ab-buffered", "--ab-speculative"]).speculativeAb,
     true

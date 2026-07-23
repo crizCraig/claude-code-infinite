@@ -11,11 +11,25 @@ export const DEFAULT_GRADE_PREFIX_TOKENS = 1_000;
 export const APPROX_CHARS_PER_TOKEN = 4;
 export const DEFAULT_GRADE_PREFIX_CHARS =
   DEFAULT_GRADE_PREFIX_TOKENS * APPROX_CHARS_PER_TOKEN;
+/**
+ * Cap for the memory section of the grader prompt — its only unbounded part
+ * (real turns showed it dominating the grader request at ~100k tokens).
+ * Applied as a head+tail excerpt: the curated summary opens the memory and
+ * recency ends it, so both edges carry signal.
+ */
+export const DEFAULT_GRADER_MEMORY_TOKENS = 10_000;
+export const DEFAULT_GRADER_MEMORY_CHARS =
+  DEFAULT_GRADER_MEMORY_TOKENS * APPROX_CHARS_PER_TOKEN;
 export const DEFAULT_PREFIX_TIMEOUT_MS = 30_000;
 export const DEFAULT_GRADER_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 export const DEFAULT_GATE_FRACTION = 0.5;
 export const DEFAULT_GRADER_MODEL = "claude-opus-4-8";
+const GRADER_MODEL_PREFERENCES = [
+  "claude-fable-5",
+  "claude-opus-4-8",
+  "claude-sonnet-5",
+] as const;
 /** Shadow-grader retry backoff bounds (speculative mode; off the delivery path). */
 export const DEFAULT_GRADER_RETRY_MIN_DELAY_MS = 2_000;
 export const DEFAULT_GRADER_RETRY_MAX_DELAY_MS = 5_000;
@@ -69,20 +83,21 @@ export interface AbRoutingOptions {
   /** Debug/test escape hatch; bypasses the effective-context gate. */
   forceComparison?: boolean;
   /**
-   * Unsafe research opt-in: commit the memory leg from its first byte and
-   * permit in-stream interruption. Buffered delivery remains the default until
-   * real-Claude transcript replay has been validated end to end.
+   * Opt in to committing the memory leg from its first byte and permitting an
+   * in-stream interruption. Buffered grade-before-delivery is the default.
    */
   speculative?: boolean;
   /** Model-visible bridge text emitted when a B verdict splices mid-message. */
   bridgeText?: string;
+  /** Cap (chars) for the memory section of the grader prompt. */
+  graderMemoryChars?: number;
   graderRetryMinDelayMs?: number;
   graderRetryMaxDelayMs?: number;
 }
 
 export interface ResolvedAbRoutingOptions {
   grader?: AbGrader;
-  graderModel: string;
+  graderModelFor: (legModel: string) => string;
   prefixChars: number;
   prefixTimeoutMs: number;
   graderTimeoutMs: number;
@@ -93,6 +108,7 @@ export interface ResolvedAbRoutingOptions {
   forceComparison: boolean;
   speculative: boolean;
   bridgeText: string;
+  graderMemoryChars: number;
   graderRetryMinDelayMs: number;
   graderRetryMaxDelayMs: number;
 }
@@ -119,9 +135,13 @@ export function resolveAbRoutingOptions(
     opts.graderRetryMinDelayMs,
     DEFAULT_GRADER_RETRY_MIN_DELAY_MS
   );
+  const graderModelOverride = opts.graderModel;
   return {
     grader: opts.grader,
-    graderModel: opts.graderModel ?? DEFAULT_GRADER_MODEL,
+    graderModelFor:
+      graderModelOverride === undefined
+        ? graderModelFor
+        : () => graderModelOverride,
     prefixChars: positiveInt(opts.prefixChars, DEFAULT_GRADE_PREFIX_CHARS),
     prefixTimeoutMs: positiveInt(
       opts.prefixTimeoutMs,
@@ -145,6 +165,10 @@ export function resolveAbRoutingOptions(
       typeof opts.bridgeText === "string" && opts.bridgeText.length > 0
         ? opts.bridgeText
         : CORRECTION_BRIDGE_TEXT,
+    graderMemoryChars: positiveInt(
+      opts.graderMemoryChars,
+      DEFAULT_GRADER_MEMORY_CHARS
+    ),
     graderRetryMinDelayMs: retryMinDelay,
     graderRetryMaxDelayMs: Math.max(
       retryMinDelay,
@@ -154,6 +178,21 @@ export function resolveAbRoutingOptions(
       )
     ),
   };
+}
+
+/** Select a grader outside the answer legs' per-model rate-limit family. */
+export function graderModelFor(legModel: string): string {
+  const legFamily = modelFamily(legModel);
+  if (legFamily === undefined) return DEFAULT_GRADER_MODEL;
+  return (
+    GRADER_MODEL_PREFERENCES.find(
+      (graderModel) => modelFamily(graderModel) !== legFamily
+    ) ?? DEFAULT_GRADER_MODEL
+  );
+}
+
+function modelFamily(model: string): string | undefined {
+  return model.match(/fable|opus|sonnet|haiku/i)?.[0].toLowerCase();
 }
 
 /**
@@ -223,7 +262,8 @@ export function extractUnfoldedMemory(messages: Message[]): string {
 export function buildFusionGraderBody(
   input: Omit<AbGradeInput, "signal">,
   graderModel: string,
-  prefixChars: number
+  prefixChars: number,
+  memoryChars: number = DEFAULT_GRADER_MEMORY_CHARS
 ): Record<string, unknown> {
   return {
     model: graderModel,
@@ -233,7 +273,7 @@ export function buildFusionGraderBody(
     messages: [
       {
         role: "user",
-        content: buildFusionGraderUserPrompt(input, prefixChars),
+        content: buildFusionGraderUserPrompt(input, prefixChars, memoryChars),
       },
     ],
     output_config: {
@@ -283,10 +323,13 @@ export function buildFusionGraderSystemPrompt(): string {
 
 export function buildFusionGraderUserPrompt(
   input: Omit<AbGradeInput, "signal">,
-  prefixChars: number
+  prefixChars: number,
+  memoryChars: number = DEFAULT_GRADER_MEMORY_CHARS
 ): string {
   const question = tailExcerpt(input.question, INPUT_EXCERPT_CHARS);
-  const memory = input.unfoldedMemory.trim() || "(no memory was available)";
+  const memory =
+    memoryExcerpt(input.unfoldedMemory, memoryChars) ||
+    "(no memory was available)";
   const a = truncateToPrefix(input.memoryResponse, prefixChars);
   const b = truncateToPrefix(input.fullResponse, prefixChars);
   return (
@@ -379,6 +422,24 @@ function tailExcerpt(text: string, maxChars: number): string {
   const normalized = (text || "").trim();
   if (normalized.length <= maxChars) return normalized;
   return `…[earlier turns elided]\n${normalized.slice(-maxChars)}`;
+}
+
+/**
+ * Head+tail excerpt for the grader's memory section. The marker states that
+ * Answer A saw the full memory, so the grader never reads OUR elision as a
+ * gap in A's context when judging coverage.
+ */
+function memoryExcerpt(text: string, maxChars: number): string {
+  const normalized = (text || "").trim();
+  if (normalized.length <= maxChars) return normalized;
+  const head = Math.ceil(maxChars / 2);
+  const tail = maxChars - head;
+  const elided = normalized.length - head - tail;
+  return (
+    normalized.slice(0, head) +
+    `\n…[${elided} chars elided for grading — Answer A saw the full memory]\n` +
+    normalized.slice(-tail)
+  );
 }
 
 function truncateToPrefix(text: string, prefixChars: number): string {

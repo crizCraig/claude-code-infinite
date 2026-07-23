@@ -72,6 +72,10 @@ export interface GraderDiagnostic {
   model: string;
   ok: boolean;
   status?: number;
+  /** Serialized grader request body bytes (native grader only; recorded pre-flight so failures keep it). */
+  requestBytes?: number;
+  /** Unfolded-memory characters available to the grader, PRE-cap — how big the memory really was, not what the excerpt kept. */
+  memoryChars?: number;
   usage?: UsageRecord;
   error?: string;
 }
