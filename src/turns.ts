@@ -252,6 +252,11 @@ function extractTextForFlatten(message: Message): string {
       if (part.text) parts.push(String(part.text));
     } else if (part.type === "thinking") {
       if (part.thinking) parts.push(String(part.thinking));
+    } else if (part.type === "redacted_thinking") {
+      // Opaque encrypted payload — carries no prompt-visible conversation, so
+      // it must not be serialized into the flattened text. contentChars in
+      // memtree.ts counts these blocks as 0 retained chars to match.
+      continue;
     } else {
       parts.push(serializePart(part));
     }

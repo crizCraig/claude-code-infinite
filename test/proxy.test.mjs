@@ -3846,6 +3846,399 @@ test("the same conversation stops probing after a real lost contest", async () =
   }
 });
 
+test("a subagent's lost contest does not end the main conversation's migration", async () => {
+  // Subagent requests carry the SAME x-claude-code-session-id as the main
+  // thread and are distinguished only by x-claude-code-agent-id. A
+  // session-only migration key would let a multi-turn subagent's shallow
+  // legacy index lose a genuine contest within a couple of turns and mark
+  // the shared session complete — permanently skipping the probe for the
+  // main conversation's much deeper, never-contested legacy index.
+  const subQuestion = "subagent turn two";
+  const mainQuestion = "resumed pre-upgrade main turn";
+  let legacyCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const messagesJson = JSON.stringify(payload.messages);
+      const isLegacy = messagesJson.includes('"thinking"');
+      const isMain = messagesJson.includes(mainQuestion);
+      if (isLegacy) legacyCalls += 1;
+      let response;
+      if (isLegacy && isMain) {
+        // The main conversation's deep pre-upgrade legacy index.
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"recovered legacy findings. ".repeat(200)}${mainQuestion}`,
+            },
+          ],
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 100_000 },
+          },
+        };
+      } else if (isLegacy) {
+        // Subagent's legacy leg: a REAL compressed answer that loses to the
+        // subagent's canonical answer on tail size — a genuine lost contest.
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"shallow subagent legacy memory. ".repeat(200)}${subQuestion}`,
+            },
+          ],
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 100_000 },
+          },
+        };
+      } else if (!isMain) {
+        // Subagent's canonical answer: compressed, usable, tiny measured
+        // tail — the strongest migration-ending outcome for ITS conversation.
+        response = {
+          messages: [
+            { role: "system", content: "SYSTEM PROMPT" },
+            {
+              role: "user",
+              content: `${"compressed canonical memory. ".repeat(200)}${subQuestion}`,
+            },
+          ],
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 134_400 },
+          },
+        };
+      } else {
+        // The main conversation's cold canonical index: warm-up no-op.
+        response = {
+          messages: payload.messages,
+          usage: {
+            raw_prompt_tokens: 50_000,
+            prompt_tokens_details: { cached_tokens: 0 },
+          },
+        };
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const subagentTurn = [
+    { role: "user", content: "subagent task prompt" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "sub reasoning", signature: "sub-sig" },
+        { type: "text", text: "subagent first answer" },
+      ],
+    },
+    { role: "user", content: subQuestion },
+  ];
+  const mainTurn = [
+    { role: "user", content: "Audit this codebase for security issues" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "old reasoning", signature: "legacy-sig" },
+        {
+          type: "text",
+          text: `Finding: ${"the audit traced this to the request path. ".repeat(60)}`,
+        },
+      ],
+    },
+    { role: "user", content: mainQuestion },
+  ];
+  try {
+    await postMessages(proxy.port, subagentTurn, {
+      "x-claude-code-session-id": "session-shared",
+      "x-claude-code-agent-id": "agent-worker-1",
+    });
+    assert.equal(legacyCalls, 1, "the subagent's followup probes the legacy shape");
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /compressed canonical memory/,
+      "the subagent's clean canonical answer wins its own contest"
+    );
+
+    await armMainTurn(proxy, mainQuestion, "prompt-main-resumed");
+    await postMessages(proxy.port, mainTurn, {
+      "x-claude-code-session-id": "session-shared",
+    });
+    assert.equal(
+      legacyCalls,
+      2,
+      "the subagent's lost contest must not end the main conversation's probe"
+    );
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered legacy findings/,
+      "the main conversation's deep legacy index must still be probed and win"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("headerless migration keys stay stable per conversation and distinct across identical openers", async () => {
+  // Without the session header the key derives from conversation content.
+  // messages[0] alone collides across conversations that open with identical
+  // user text ("hi"): one conversation's won contest would wrongly end the
+  // other's probe. Folding in messages[1] (the first assistant reply) keeps
+  // the key stable across turns of one conversation while separating
+  // conversations whose openers merely share the first user message.
+  const questionA = "conversation A second question";
+  const questionA2 = "conversation A third question";
+  const questionB = "conversation B second question";
+  let legacyCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const messagesJson = JSON.stringify(payload.messages);
+      const isLegacy = messagesJson.includes('"thinking"');
+      const currentTurn = messagesJson.includes(questionA2)
+        ? questionA2
+        : messagesJson.includes(questionB)
+          ? questionB
+          : questionA;
+      if (isLegacy) legacyCalls += 1;
+      const response = isLegacy
+        ? {
+            // Real compressed legacy answer that loses on tail size: the
+            // strongest migration-ending contest each conversation can have.
+            messages: [
+              {
+                role: "user",
+                content: `${"stale legacy memory. ".repeat(200)}${currentTurn}`,
+              },
+            ],
+            usage: {
+              raw_prompt_tokens: 134_500,
+              prompt_tokens_details: { cached_tokens: 100_000 },
+            },
+          }
+        : {
+            // Canonical: compressed, usable, tiny measured tail — caught up.
+            messages: [
+              { role: "system", content: "SYSTEM PROMPT" },
+              {
+                role: "user",
+                content: `${"compressed canonical memory. ".repeat(200)}${currentTurn}`,
+              },
+            ],
+            usage: {
+              raw_prompt_tokens: 134_500,
+              prompt_tokens_details: { cached_tokens: 134_400 },
+            },
+          };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+    });
+  });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const turnA = [
+    { role: "user", content: "hi" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning A", signature: "sig-a" },
+        { type: "text", text: "hello from conversation A" },
+      ],
+    },
+    { role: "user", content: questionA },
+  ];
+  const turnA2 = [
+    ...turnA,
+    { role: "assistant", content: [{ type: "text", text: "noted" }] },
+    { role: "user", content: questionA2 },
+  ];
+  const turnB = [
+    { role: "user", content: "hi" }, // identical first user message
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning B", signature: "sig-b" },
+        { type: "text", text: "hello from conversation B" },
+      ],
+    },
+    { role: "user", content: questionB },
+  ];
+  try {
+    await armMainTurn(proxy, questionA, "prompt-a1");
+    await postMessages(proxy.port, turnA);
+    assert.equal(legacyCalls, 1, "conversation A's first followup probes");
+
+    await armMainTurn(proxy, questionA2, "prompt-a2");
+    await postMessages(proxy.port, turnA2);
+    assert.equal(
+      legacyCalls,
+      1,
+      "the fallback key is stable across turns: A's ended migration skips A's later probe"
+    );
+
+    await armMainTurn(proxy, questionB, "prompt-b1");
+    await postMessages(proxy.port, turnB);
+    assert.equal(
+      legacyCalls,
+      2,
+      "an identical opening user message must not inherit conversation A's ended migration"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an unmeasured contest (no raw_prompt_tokens anywhere) does not end the migration", async () => {
+  // Both legs return compressed, usable answers whose usage lacks
+  // raw_prompt_tokens, so neither tail is measurable. That makes
+  // isBetterLegacyMemtreeResult return false — but a "win" awarded only
+  // because no measurement exists is no contest, and must not mark the
+  // migration complete: the probe has to stay armed until the tails are
+  // actually measured.
+  const question = "second question";
+  const question2 = "third question";
+  let legacyCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const messagesJson = JSON.stringify(payload.messages);
+      const isLegacy = messagesJson.includes('"thinking"');
+      const currentTurn = messagesJson.includes(question2) ? question2 : question;
+      if (isLegacy) legacyCalls += 1;
+      let response;
+      if (isLegacy && legacyCalls > 1) {
+        // The later, measured deep legacy hit that must still be reachable.
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"recovered legacy findings. ".repeat(200)}${currentTurn}`,
+            },
+          ],
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 100_000 },
+          },
+        };
+      } else if (isLegacy) {
+        // First legacy probe: compressed and usable, but no raw_prompt_tokens.
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"unmeasured legacy memory. ".repeat(200)}${currentTurn}`,
+            },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 90_000 } },
+        };
+      } else if (currentTurn === question) {
+        // First canonical answer: compressed and usable, but no
+        // raw_prompt_tokens — no tail evidence on either side.
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"unmeasured canonical memory. ".repeat(200)}${currentTurn}`,
+            },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 100_000 } },
+        };
+      } else {
+        // Second turn's canonical leg: warm-up no-op, so the measured deep
+        // legacy hit wins outright if the probe is still armed.
+        response = {
+          messages: payload.messages,
+          usage: {
+            raw_prompt_tokens: 50_000,
+            prompt_tokens_details: { cached_tokens: 0 },
+          },
+        };
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const turnOne = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "legacy-sig" },
+        { type: "text", text: "first answer" },
+      ],
+    },
+    { role: "user", content: question },
+  ];
+  const turnTwo = [
+    ...turnOne,
+    { role: "assistant", content: [{ type: "text", text: "second answer" }] },
+    { role: "user", content: question2 },
+  ];
+  try {
+    await armMainTurn(proxy, question);
+    await postMessages(proxy.port, turnOne);
+    assert.equal(legacyCalls, 1, "the first followup probes the legacy shape");
+
+    await armMainTurn(proxy, question2, "prompt-third");
+    await postMessages(proxy.port, turnTwo);
+    assert.equal(
+      legacyCalls,
+      2,
+      "an unmeasured contest must not mark the migration complete"
+    );
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered legacy findings/,
+      "the later measured deep legacy hit must still be reachable and win"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("a failed canonical compress falls back to a usable legacy probe result", async () => {
   // The probe decision used to be gated on a non-null canonical result: when
   // the canonical leg failed (server error/timeout maps to null) the turn

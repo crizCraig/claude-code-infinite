@@ -154,13 +154,16 @@ export interface MessagesRecord {
   approxInputTokens?: number;
   /** Present when a blocking MemTree compress was attempted for this turn. */
   compress?: {
+    /** Overall wall time of the compress step (all concurrent legs). */
     ms: number;
     /** A usable compressed result was obtained (canonical or legacy leg). */
     ok: boolean;
     /**
      * The CANONICAL leg consumed (roughly) the whole compress budget and
-     * returned nothing. Can be true alongside ok/legacyFallback when the
-     * concurrent legacy probe rescued the turn.
+     * returned nothing — measured on that leg's own duration, so a slow
+     * legacy probe never inflates `ms` into a false timeout. Can be true
+     * alongside ok/legacyFallback when the concurrent legacy probe rescued
+     * the turn.
      */
     timedOut: boolean;
     /** Canonical miss recovered from a pre-normalization signed-thinking index. */

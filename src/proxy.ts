@@ -382,9 +382,13 @@ function shouldProbeLegacyMemtree(
 }
 
 /**
- * Migration state is scoped per conversation, not per process: keyed by
- * Claude Code's session header when present, otherwise by the conversation's
- * first message, which is stable across turns of the same conversation.
+ * Migration state is scoped per conversation, not per process — and not per
+ * session either: subagent requests carry the SAME session header as the main
+ * thread, so agent attribution is folded into the key. Otherwise a subagent's
+ * shallow legacy index losing its contest within a couple of turns would mark
+ * the shared session complete and permanently skip the probe for the main
+ * conversation's much deeper, never-contested legacy index. Without the
+ * session header the key falls back to the conversation's own content hash.
  * (Client-side compaction changes that fallback key, which merely re-opens
  * probing — the safe direction.)
  */
@@ -392,11 +396,40 @@ function legacyMigrationKey(
   req: http.IncomingMessage,
   messages: Message[]
 ): string {
+  const agentId = headerText(req.headers, "x-claude-code-agent-id").trim();
+  // A request attributed only via x-claude-code-parent-agent-id is still not
+  // the main thread (hasAgentAttribution accepts either header), and the
+  // parent id would conflate sibling subagents; scope such requests by their
+  // own conversation content instead of ever mapping them to "main".
+  const agent = agentId
+    ? `id:${agentId}`
+    : hasAgentAttribution(req)
+      ? `conv:${conversationContentKey(messages)}`
+      : "main";
   const sessionId = requestSessionId(req);
-  if (sessionId) return `session:${sessionId}`;
-  return messages.length > 0
-    ? `conversation:${routeMessageHash(messages[0])}`
-    : "conversation:empty";
+  if (sessionId) return `session:${sessionId}:agent:${agent}`;
+  return `conversation:${conversationContentKey(messages)}:agent:${agent}`;
+}
+
+/**
+ * Content-derived conversation identity for migration keying. messages[0]
+ * alone collides across conversations that open with identical user text
+ * ("hi"), so fold in messages[1] — the first assistant reply — when present.
+ * Blocking compression only runs on followup user turns, so messages[1]
+ * exists on every keyed turn and is stable once written; the key therefore
+ * stays identical across every turn of one conversation. Conversations whose
+ * first user AND first assistant messages both match still share a key —
+ * nothing later in the transcript is stable across turns (a message-count
+ * bucket would change every turn and break stability), so that residual
+ * collision is accepted: its cost is bounded at one conversation skipping
+ * probes it might still have wanted.
+ */
+function conversationContentKey(messages: Message[]): string {
+  if (messages.length === 0) return "empty";
+  const first = routeMessageHash(messages[0]);
+  return messages.length > 1
+    ? `${first}:${routeMessageHash(messages[1])}`
+    : first;
 }
 
 function markLegacyMigrationComplete(state: ProxyState, key: string): void {
@@ -1025,6 +1058,10 @@ async function handleMessages(
   let result: CompressResult | null;
   let usedLegacyFallback = false;
   let canonicalCompressFailed = false;
+  // Wall time of the canonical leg alone. timedOut must be computed from
+  // this, not the Promise.all wall time: a fast canonical failure (e.g. a
+  // 200ms 5xx) awaited alongside a slow legacy probe is not a timeout.
+  let canonicalCompressMs = 0;
   try {
     const compressMeta = {
       // Model + tools drive the server's model-based memory budget
@@ -1052,13 +1089,20 @@ async function handleMessages(
       legacyHash !== hash &&
       !state.legacyMemtreeMigrationComplete.has(migrationKey);
     const [canonicalResult, legacyResult] = await Promise.all([
-      opts.memtree.compress(
-        hash,
-        msgsForMemtree,
-        modelContextLimit,
-        state.shutdownSignal,
-        compressMeta
-      ),
+      // compress() never rejects, so this .then always runs and records the
+      // canonical leg's own duration for the timedOut heuristic below.
+      opts.memtree
+        .compress(
+          hash,
+          msgsForMemtree,
+          modelContextLimit,
+          state.shutdownSignal,
+          compressMeta
+        )
+        .then((value) => {
+          canonicalCompressMs = Date.now() - compressStarted;
+          return value;
+        }),
       probeLegacy
         ? opts.memtree.compress(
             legacyHash,
@@ -1120,30 +1164,40 @@ async function handleMessages(
         usedLegacyFallback = true;
       } else if (
         didMemtreeCompress(canonicalResult) &&
-        checkCompressedHistory(canonicalResult, msgsForMemtree).usable
+        checkCompressedHistory(canonicalResult, msgsForMemtree).usable &&
+        unindexedPromptTokenCount(canonicalResult) !== undefined &&
+        unindexedPromptTokenCount(legacyResult) !== undefined
       ) {
         // Ending the migration also needs a real contest on the canonical
         // side: a compressed, usable canonical answer that beat the legacy
-        // index it was probed against. An unusable empty-memory canonical
-        // answer must not end it.
+        // index it was probed against, with BOTH tails actually measured.
+        // An unusable empty-memory canonical answer must not end it, and
+        // neither may a "win" isBetterLegacyMemtreeResult awarded only
+        // because raw_prompt_tokens was absent from both responses — an
+        // unmeasured contest is no contest.
         markLegacyMigrationComplete(state, migrationKey);
       }
     }
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);
   }
+  // Overall wall time of the blocking compress step (both concurrent legs) —
+  // what reqlog documents for compress.ms.
   const compressMs = Date.now() - compressStarted;
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
     // Budget-consumed heuristic on the CANONICAL leg: the client maps every
-    // failure to null, so a canonical null that took (roughly) the whole
-    // abort budget was almost certainly the AbortSignal timeout, not a fast
-    // server error. Computed from the canonical outcome rather than the
-    // post-swap result so a legacy-probe rescue (ok stays true) still records
-    // that the canonical leg burned the full budget.
+    // failure to null, so a canonical null whose OWN leg took (roughly) the
+    // whole abort budget was almost certainly the AbortSignal timeout, not a
+    // fast server error. Timed per-leg rather than from the Promise.all wall
+    // time so a slow legacy probe cannot make a fast canonical failure look
+    // like a timeout, and computed from the canonical outcome rather than
+    // the post-swap result so a legacy-probe rescue (ok stays true) still
+    // records that the canonical leg burned the full budget.
     timedOut:
-      canonicalCompressFailed && compressMs >= opts.memtree.compressBudgetMs,
+      canonicalCompressFailed &&
+      canonicalCompressMs >= opts.memtree.compressBudgetMs,
     ...(usedLegacyFallback ? { legacyFallback: true } : {}),
   };
 
