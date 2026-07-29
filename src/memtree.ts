@@ -154,6 +154,15 @@ function contentChars(content: unknown): number {
   }
   if (typeof content !== "object") return String(content).length;
   const block = content as Record<string, unknown>;
+  // Count what flattenToSingleUserMessage actually puts in front of the model:
+  // thinking blocks contribute only their thinking text — the opaque base64
+  // `signature` (and a redacted block's `data`) is dropped, so it must not
+  // count as retained conversation. Legacy-shaped results can echo thinking
+  // blocks whose signatures alone would otherwise satisfy the retained floor.
+  if (block.type === "thinking") {
+    return typeof block.thinking === "string" ? block.thinking.length : 0;
+  }
+  if (block.type === "redacted_thinking") return 0;
   if (typeof block.text === "string") return block.text.length;
   try {
     return JSON.stringify(block)?.length ?? 0;

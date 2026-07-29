@@ -124,6 +124,7 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 const NOTICE_SETTLE_WAIT_MS = 1_000;
 const TOKEN_COUNT_CACHE_MAX = 64;
 const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
+const LEGACY_MIGRATION_SESSIONS_MAX = 64;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -230,8 +231,15 @@ interface ProxyState {
   abRouting?: ResolvedAbRoutingOptions;
   /** A memory winner carried through the current human turn's tool loop. */
   mainMemoryRoute?: MainMemoryRoute;
-  /** Stable normalized MemTree history has caught up with the legacy shape. */
-  legacyMemtreeMigrationComplete: boolean;
+  /**
+   * Conversations whose stable normalized MemTree history has caught up with
+   * the legacy shape. Scoped per session/conversation: the probe leg itself
+   * warms a legacy index server-side, so a fresh post-upgrade conversation
+   * can manufacture "legacy evidence" that proves nothing about a deep
+   * pre-upgrade session /resume'd later in the same process. Bounded like
+   * tokenCounts; evicting an entry merely re-opens that session's probe.
+   */
+  legacyMemtreeMigrationComplete: Set<string>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /** Fired by drain after its grace period so every forwarding path can stop. */
@@ -366,10 +374,42 @@ function shouldProbeLegacyMemtree(
   // Probe on lost content too, or the emptiest answer ends the migration.
   if (!checkCompressedHistory(result, sentMessages).usable) return true;
   const unindexedTokens = unindexedPromptTokenCount(result);
-  return (
-    unindexedTokens !== undefined &&
-    unindexedTokens > LEGACY_PROBE_UNINDEXED_TOKENS
-  );
+  // A server that omits raw_prompt_tokens gives no tail evidence at all; the
+  // absence of a measurement must not count as a caught-up index and end the
+  // migration. Keep probing until the tail is actually measured small.
+  if (unindexedTokens === undefined) return true;
+  return unindexedTokens > LEGACY_PROBE_UNINDEXED_TOKENS;
+}
+
+/**
+ * Migration state is scoped per conversation, not per process: keyed by
+ * Claude Code's session header when present, otherwise by the conversation's
+ * first message, which is stable across turns of the same conversation.
+ * (Client-side compaction changes that fallback key, which merely re-opens
+ * probing — the safe direction.)
+ */
+function legacyMigrationKey(
+  req: http.IncomingMessage,
+  messages: Message[]
+): string {
+  const sessionId = requestSessionId(req);
+  if (sessionId) return `session:${sessionId}`;
+  return messages.length > 0
+    ? `conversation:${routeMessageHash(messages[0])}`
+    : "conversation:empty";
+}
+
+function markLegacyMigrationComplete(state: ProxyState, key: string): void {
+  // Insertion-order bounded like rememberTokenCount. Evicting the oldest
+  // session re-opens its probe (one redundant compress), never the reverse.
+  state.legacyMemtreeMigrationComplete.delete(key);
+  state.legacyMemtreeMigrationComplete.add(key);
+  if (state.legacyMemtreeMigrationComplete.size > LEGACY_MIGRATION_SESSIONS_MAX) {
+    const oldest = state.legacyMemtreeMigrationComplete.values().next().value;
+    if (oldest !== undefined) {
+      state.legacyMemtreeMigrationComplete.delete(oldest);
+    }
+  }
 }
 
 function isBetterLegacyMemtreeResult(
@@ -417,7 +457,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     abRouting: opts.abRouting
       ? resolveAbRoutingOptions(opts.abRouting)
       : undefined,
-    legacyMemtreeMigrationComplete: false,
+    legacyMemtreeMigrationComplete: new Set(),
     mainRouteEpoch: 0,
     shutdownSignal: shutdownAbort.signal,
   };
@@ -825,10 +865,27 @@ async function handleMessages(
   // classification so the retry recompresses instead of degrading to a plain
   // tool turn with full-history passthrough. Successful delivery closes that
   // window, so a stale prompt text cannot keep promoting later tool turns.
+  //
+  // "No installed route" needs one refinement. A route installed at
+  // protocol-complete (message_stop accepted downstream) deliberately survives
+  // a delivery promise that resolves false: Claude can consume message_stop,
+  // abort the SSE response, and immediately send a fast tool request that must
+  // still ride the compressed prefix. But delivered=false equally covers a
+  // client socket that died before the flush, whose retry is the IDENTICAL
+  // compressible body — indistinguishable from the fast-tool abort at delivery
+  // time. The two separate here: a genuine tool turn extends the route's
+  // prefix, while the identical-body retry cannot (empty suffix means
+  // memoryRoutedToolBody would reject it into full-history passthrough — the
+  // exact degradation the mainPromptDelivered window exists to prevent). So
+  // only a route this request could actually ride vetoes recovery
+  // classification.
+  const routeRideableByThisRequest =
+    state.mainMemoryRoute !== undefined &&
+    messages.length > state.mainMemoryRoute.originalPrefixHashes.length;
   const isRecoveryPromptTurn =
     isToolResultTurn &&
     isMainRequest &&
-    !state.mainMemoryRoute &&
+    !routeRideableByThisRequest &&
     (state.mainPromptArmed || !state.mainPromptDelivered) &&
     !!state.mainPromptText &&
     messageCarriesPromptText(lastMsg, state.mainPromptText);
@@ -967,6 +1024,7 @@ async function handleMessages(
   if (displayForThisTurn) state.mainPromptArmed = false;
   let result: CompressResult | null;
   let usedLegacyFallback = false;
+  let canonicalCompressFailed = false;
   try {
     const compressMeta = {
       // Model + tools drive the server's model-based memory budget
@@ -989,8 +1047,10 @@ async function handleMessages(
     // does — so an active migration pays one compress budget, not two, per
     // turn. compress() maps every failure to a resolved null (it never
     // rejects), so neither leg can surface an unhandled rejection.
+    const migrationKey = legacyMigrationKey(req, messages);
     const probeLegacy =
-      legacyHash !== hash && !state.legacyMemtreeMigrationComplete;
+      legacyHash !== hash &&
+      !state.legacyMemtreeMigrationComplete.has(migrationKey);
     const [canonicalResult, legacyResult] = await Promise.all([
       opts.memtree.compress(
         hash,
@@ -1010,6 +1070,7 @@ async function handleMessages(
         : null,
     ]);
     result = canonicalResult;
+    canonicalCompressFailed = canonicalResult === null;
     if (
       canonicalResult === null &&
       legacyResult &&
@@ -1033,20 +1094,20 @@ async function handleMessages(
       legacyResult &&
       didMemtreeCompress(legacyResult)
     ) {
-      // The flag is process-global, so every way of ending the migration
+      // Ending the migration is scoped to this conversation's key, and still
       // requires legacy evidence: the probe leg was consulted this turn and
-      // answered from a real (compressed) legacy index. Without that — fresh
-      // post-upgrade conversations produce warm-up no-ops on the legacy leg —
-      // even a perfect canonical answer proves nothing about a pre-upgrade
-      // session /resume'd later in this run, whose deep signature-keyed
-      // legacy index must stay reachable.
+      // answered from a real (compressed) legacy index. Even so, the probe
+      // itself warms a legacy index server-side, so evidence from one
+      // conversation says nothing about any other — a pre-upgrade session
+      // /resume'd later in this run keeps its own probe armed regardless of
+      // how many fresh conversations have caught up.
       if (!shouldProbeLegacyMemtree(canonicalResult, msgsForMemtree)) {
-        // Compressed, usable, and a small unindexed tail (shouldProbe returns
-        // true for every weaker outcome): the canonical index has caught up
-        // against a real legacy index, so the concurrently fetched legacy
-        // result is deliberately ignored and later turns skip the probe
-        // entirely.
-        state.legacyMemtreeMigrationComplete = true;
+        // Compressed, usable, and a small measured unindexed tail
+        // (shouldProbe returns true for every weaker outcome): the canonical
+        // index has caught up against a real legacy index, so the
+        // concurrently fetched legacy result is deliberately ignored and this
+        // conversation's later turns skip the probe entirely.
+        markLegacyMigrationComplete(state, migrationKey);
       } else if (
         isBetterLegacyMemtreeResult(
           canonicalResult,
@@ -1065,7 +1126,7 @@ async function handleMessages(
         // side: a compressed, usable canonical answer that beat the legacy
         // index it was probed against. An unusable empty-memory canonical
         // answer must not end it.
-        state.legacyMemtreeMigrationComplete = true;
+        markLegacyMigrationComplete(state, migrationKey);
       }
     }
   } finally {
@@ -1075,10 +1136,14 @@ async function handleMessages(
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
-    // Budget-consumed heuristic: the client maps every failure to null, so a
-    // null that took (roughly) the whole abort budget was almost certainly
-    // the AbortSignal timeout, not a fast server error.
-    timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
+    // Budget-consumed heuristic on the CANONICAL leg: the client maps every
+    // failure to null, so a canonical null that took (roughly) the whole
+    // abort budget was almost certainly the AbortSignal timeout, not a fast
+    // server error. Computed from the canonical outcome rather than the
+    // post-swap result so a legacy-probe rescue (ok stays true) still records
+    // that the canonical leg burned the full budget.
+    timedOut:
+      canonicalCompressFailed && compressMs >= opts.memtree.compressBudgetMs,
     ...(usedLegacyFallback ? { legacyFallback: true } : {}),
   };
 
@@ -1315,6 +1380,14 @@ async function handleMessages(
             ) {
               state.mainMemoryRoute = undefined;
             }
+            // When activation already ran at protocol-complete, a
+            // delivered=false settle keeps the route on purpose: it may be
+            // the fast-tool abort (client consumed message_stop, closed the
+            // SSE response, and its tool request must ride the prefix). If it
+            // was instead a socket death before flush, the identical-body
+            // retry cannot ride the route and reclassifies as the recovery
+            // turn (routeRideableByThisRequest above), which bumps the epoch
+            // and rebuilds the route.
           }
         )
       );
@@ -1454,6 +1527,14 @@ async function handleMessages(
     ).then(
       (delivered) => {
         // actuallyCompressed is guaranteed true past the early return above.
+        // A route already installed at protocol-complete deliberately survives
+        // delivered=false: that settle may be the fast-tool abort (client
+        // consumed message_stop, closed the SSE response, and its immediate
+        // tool request must ride the prefix). A socket death before flush
+        // settles identically, but its identical-body retry cannot ride the
+        // route and reclassifies as the recovery turn
+        // (routeRideableByThisRequest above), bumping the epoch and
+        // rebuilding the route.
         if (!delivered) return;
         markMainPromptDelivered();
         // The notice is the only part that stayed A/B-conditional here: the

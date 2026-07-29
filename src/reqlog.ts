@@ -155,7 +155,13 @@ export interface MessagesRecord {
   /** Present when a blocking MemTree compress was attempted for this turn. */
   compress?: {
     ms: number;
+    /** A usable compressed result was obtained (canonical or legacy leg). */
     ok: boolean;
+    /**
+     * The CANONICAL leg consumed (roughly) the whole compress budget and
+     * returned nothing. Can be true alongside ok/legacyFallback when the
+     * concurrent legacy probe rescued the turn.
+     */
     timedOut: boolean;
     /** Canonical miss recovered from a pre-normalization signed-thinking index. */
     legacyFallback?: boolean;
