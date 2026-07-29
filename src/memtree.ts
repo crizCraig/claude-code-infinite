@@ -133,9 +133,9 @@ export function unindexedPromptTokenCount(
 }
 
 /**
- * Minimum conversation content, beyond the current turn, that a compressed
- * response must carry before we will send it to Anthropic in place of the real
- * history.
+ * Minimum conversation content, beyond any verbatim echo of the current turn,
+ * that a compressed response must carry before we will send it to Anthropic in
+ * place of the real history.
  *
  * Sized well below any useful memory (the server's own semantic floor is 15k
  * chars) and well above an empty answer, so this fires only on genuine context
@@ -185,12 +185,95 @@ function conversationChars(messages: Message[] | undefined): number {
 export interface CompressedHistoryCheck {
   /** Non-system conversation characters MemTree actually returned. */
   retainedChars: number;
-  /** Characters in the turn that prompted this request. */
+  /** Characters in the turn that prompted this request (as sent). */
   currentTurnChars: number;
   /** Non-system characters of prior conversation we asked it to compress. */
   priorHistoryChars: number;
   /** False when the response carries no usable prior conversation. */
   usable: boolean;
+}
+
+/**
+ * The rendered text pieces of a content field, mirroring contentChars: plain
+ * strings, `text` blocks, thinking text (signatures dropped), no
+ * redacted_thinking, and JSON serialization for anything else. Used to locate
+ * verbatim echoes of the sent current turn inside a compressed result.
+ */
+function contentTextPieces(content: unknown, out: string[]): void {
+  if (content == null) return;
+  if (typeof content === "string") {
+    if (content) out.push(content);
+    return;
+  }
+  if (Array.isArray(content)) {
+    for (const part of content) contentTextPieces(part, out);
+    return;
+  }
+  if (typeof content !== "object") {
+    out.push(String(content));
+    return;
+  }
+  const block = content as Record<string, unknown>;
+  if (block.type === "thinking") {
+    if (typeof block.thinking === "string" && block.thinking) {
+      out.push(block.thinking);
+    }
+    return;
+  }
+  if (block.type === "redacted_thinking") return;
+  if (typeof block.text === "string") {
+    if (block.text) out.push(block.text);
+    return;
+  }
+  try {
+    const json = JSON.stringify(block);
+    if (json) out.push(json);
+  } catch {
+    // unserializable block contributes nothing, matching contentChars
+  }
+}
+
+/**
+ * Characters of the result body that are a VERBATIM echo of the sent current
+ * turn: result pieces contained in the current turn's text (a full or
+ * truncated echo) plus current-turn pieces embedded whole inside a larger
+ * result piece (memory and echo concatenated into one message). Content the
+ * server rewrote — e.g. a summary of a huge pasted log — deliberately does not
+ * count as echo: rewriting is compression work, and its output is retained
+ * context, not a replay of the input.
+ */
+function echoedCurrentTurnChars(
+  result: CompressResult,
+  currentTurnContent: unknown
+): number {
+  const turnPieces: string[] = [];
+  contentTextPieces(currentTurnContent, turnPieces);
+  if (turnPieces.length === 0) return 0;
+  const turnText = turnPieces.join("");
+
+  const resultPieces: string[] = [];
+  for (const message of result.messages ?? []) {
+    if (message.role === "system") continue;
+    contentTextPieces(message.content, resultPieces);
+  }
+
+  let echoed = 0;
+  // Each sent piece may be credited as embedded-in-result once, or the double
+  // counting could exceed the echo that actually exists.
+  const unmatched = new Set(turnPieces.keys());
+  for (const piece of resultPieces) {
+    if (turnText.includes(piece)) {
+      echoed += piece.length;
+      continue;
+    }
+    for (const index of unmatched) {
+      if (piece.includes(turnPieces[index]!)) {
+        echoed += turnPieces[index]!.length;
+        unmatched.delete(index);
+      }
+    }
+  }
+  return Math.min(echoed, turnText.length);
 }
 
 /**
@@ -204,6 +287,19 @@ export interface CompressedHistoryCheck {
  * reports perfect coverage while returning nothing at all, and the tail metric
  * scores that empty answer as the best possible result. Only the body itself
  * says what the model will actually see.
+ *
+ * "Retained prior conversation" is measured as the result's conversation
+ * characters minus only the part that verbatim-echoes the SENT current turn —
+ * not minus the current turn's full size. A turn the server itself shrank
+ * (e.g. a 100k-char pasted log returned as a 5k summary) leaves no verbatim
+ * echo, so its compressed rendering counts as retained context instead of
+ * sinking the score below zero and disabling compression on exactly the turns
+ * that need it. The failure the floor exists to catch — the server echoing the
+ * current turn back with essentially nothing of the prior conversation — still
+ * scores ~0, because a verbatim echo (whole, truncated, or embedded in a
+ * larger message) is fully subtracted. A rewritten-but-still-empty answer can
+ * in principle slip through; the trade is deliberate, since rewriting proves
+ * the server did compression work rather than dropping context.
  */
 export function checkCompressedHistory(
   result: CompressResult,
@@ -211,19 +307,21 @@ export function checkCompressedHistory(
   minRetainedChars: number = MIN_RETAINED_HISTORY_CHARS
 ): CompressedHistoryCheck {
   const nonSystem = sentMessages.filter((m) => m.role !== "system");
-  const currentTurn = nonSystem.length
-    ? contentChars(nonSystem[nonSystem.length - 1]!.content)
-    : 0;
+  const currentTurnContent = nonSystem.length
+    ? nonSystem[nonSystem.length - 1]!.content
+    : undefined;
+  const currentTurn = contentChars(currentTurnContent);
   const priorHistoryChars = Math.max(
     0,
     conversationChars(sentMessages) - currentTurn
   );
   const retainedChars = conversationChars(result.messages);
+  const echoedChars = echoedCurrentTurnChars(result, currentTurnContent);
   // Nothing meaningful to lose: a short conversation legitimately compresses to
   // roughly itself, and passing it through would be pointless churn.
   const usable =
     priorHistoryChars < minRetainedChars ||
-    retainedChars - currentTurn >= minRetainedChars;
+    retainedChars - echoedChars >= minRetainedChars;
   return { retainedChars, currentTurnChars: currentTurn, priorHistoryChars, usable };
 }
 

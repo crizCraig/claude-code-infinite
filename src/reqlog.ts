@@ -156,7 +156,14 @@ export interface MessagesRecord {
   compress?: {
     /** Overall wall time of the compress step (all concurrent legs). */
     ms: number;
-    /** A usable compressed result was obtained (canonical or legacy leg). */
+    /**
+     * The compress call returned a result (canonical or legacy leg). NOT a
+     * "forwarded compressed history" flag: the proxy can still discard the
+     * result afterwards (no-op response, or indexed-but-empty memory) and
+     * forward the full history — `turnType` (followup-noop /
+     * followup-empty-memory vs followup-compressed) and `history.usable`
+     * record what actually happened.
+     */
     ok: boolean;
     /**
      * The CANONICAL leg consumed (roughly) the whole compress budget and

@@ -3219,6 +3219,93 @@ test("checkCompressedHistory does not count thinking signatures as retained hist
   assert.equal(kept.usable, true, "substantial thinking text is real memory");
 });
 
+test("checkCompressedHistory: a server-shrunk current turn cannot sink the score", () => {
+  // The user pastes a huge log; the server summarizes the log itself AND
+  // returns ample prior-conversation memory. Under the old measurement
+  // (retained − sent-current-turn) this scored 35k − 100k, deeply negative,
+  // and the best compressions were recorded as followup-empty-memory. Only a
+  // VERBATIM echo of the sent turn may be subtracted.
+  const pastedLog =
+    "2026-07-29T10:00:01Z ERROR request failed with ECONNRESET in worker 7\n".repeat(
+      1_450
+    ); // ~100k chars
+  const sent = [
+    { role: "user", content: "Help me debug these crashes" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Sure — paste the logs. ".repeat(200) },
+      ],
+    },
+    { role: "user", content: `Here is the full log:\n${pastedLog}` },
+  ];
+  const shrunkTurn = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        {
+          role: "user",
+          content:
+            `${"Prior context: the user is debugging worker crashes. ".repeat(600)}` + // ~30k memory
+            "Log summary: repeated ECONNRESET failures in worker 7 around 10:00Z.", // ~5k-style rewrite, not verbatim
+        },
+      ],
+      usage: {
+        raw_prompt_tokens: 30_000,
+        prompt_tokens_details: { cached_tokens: 29_000 },
+      },
+    },
+    sent
+  );
+  assert.equal(
+    shrunkTurn.usable,
+    true,
+    "memory plus a rewritten current turn is a usable compression"
+  );
+  assert.ok(shrunkTurn.retainedChars < shrunkTurn.currentTurnChars,
+    "scenario premise: the result is smaller than the sent current turn");
+
+  // Same conversation, but the server echoes only the pasted log back
+  // (truncated) with nothing of the prior conversation: still unusable, even
+  // though the echo is not the complete sent turn.
+  const truncatedEchoOnly = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `Here is the full log:\n${pastedLog}`.slice(0, 40_000) },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 29_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    truncatedEchoOnly.usable,
+    false,
+    "a truncated verbatim echo with no prior conversation is still empty memory"
+  );
+
+  // Verbatim echo embedded in a larger message with no real memory around it
+  // (just sub-floor framing text) is also still empty memory.
+  const framedEchoOnly = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        {
+          role: "user",
+          content: `The user said:\nHere is the full log:\n${pastedLog}`,
+        },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 29_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    framedEchoOnly.usable,
+    false,
+    "an embedded verbatim echo must be fully subtracted"
+  );
+});
+
 test("a fully indexed empty memory forwards real history instead of amnesia", async () => {
   const question = "Now output detailed remediation steps";
   const records = [];
@@ -4327,6 +4414,273 @@ test("a failed canonical compress falls back to a usable legacy probe result", a
       "the turn must not degrade to full-history passthrough"
     );
   } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+/** Legacy-probe MemTree response: compressed and usable (round-4 telemetry tests). */
+const legacyRescueResponse = (question) => ({
+  messages: [
+    {
+      role: "user",
+      content: `${"recovered prior findings. ".repeat(200)}${question}`,
+    },
+  ],
+  usage: {
+    raw_prompt_tokens: 134_500,
+    prompt_tokens_details: { cached_tokens: 100_000 },
+  },
+});
+
+/** History with a signed thinking block so legacyHash !== hash arms the probe. */
+const legacyProbeHistory = (question) => [
+  { role: "user", content: "Audit this codebase for security issues" },
+  {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "reasoning", signature: "sig" },
+      {
+        type: "text",
+        text: `Finding: ${"the audit traced this to the request path. ".repeat(60)}`,
+      },
+    ],
+  },
+  { role: "user", content: question },
+];
+
+test("compress telemetry: a slow legacy rescue is not logged as a timeout", async () => {
+  // Round-4 semantics: compress.timedOut is measured on the CANONICAL leg's
+  // OWN duration, never the Promise.all wall time. A canonical leg that 500s
+  // in milliseconds is a fast server error, not a timeout, no matter how
+  // long the winning legacy probe takes afterwards. The probe delay stays
+  // well under the shared abort budget (both legs abort at compressBudgetMs)
+  // but dwarfs the canonical failure, so the durations are unambiguous.
+  const question = "Now output detailed remediation steps";
+  const BUDGET_MS = 1_500;
+  const LEGACY_DELAY_MS = 300;
+  const records = [];
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      if (isLegacy) {
+        // Slow but comfortably inside the leg's own abort budget.
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(legacyRescueResponse(question)));
+        }, LEGACY_DELAY_MS);
+      } else {
+        // Canonical leg fails immediately — a fast 5xx, not a budget burn.
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: "canonical shape rejected" }));
+      }
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    compressTimeoutMs: BUDGET_MS,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+  });
+  try {
+    await armMainTurn(proxy, question);
+    await postMessages(proxy.port, legacyProbeHistory(question));
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered prior findings/,
+      "the legacy rescue must be the forwarded result"
+    );
+    const turn = records.find((r) => r.kind === "messages");
+    assert.equal(turn.compress.ok, true, "the rescue produced a result");
+    assert.equal(turn.compress.legacyFallback, true);
+    assert.equal(
+      turn.compress.timedOut,
+      false,
+      "a fast canonical 5xx must not be logged as a timeout just because the rescuing legacy leg was slow"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("compress telemetry: a canonical budget burn rescued by legacy still logs the timeout", async () => {
+  // The other half of the per-leg round-4 semantics: timedOut is computed
+  // from the CANONICAL outcome, not the post-swap result. A canonical leg
+  // that hangs until its abort budget expires (compress maps the abort to
+  // null) is a real timeout and must be logged as one even though the fast
+  // legacy probe rescued the turn and kept ok true — deriving timedOut from
+  // the swapped-in result would silently under-report canonical timeouts.
+  const question = "Now output detailed remediation steps";
+  const BUDGET_MS = 300;
+  const records = [];
+  const held = [];
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      if (isLegacy) {
+        // Fast usable rescue, far under the budget.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(legacyRescueResponse(question)));
+      } else {
+        // Canonical leg hangs past the budget; the client's own abort timer
+        // fires at BUDGET_MS and maps the leg to null.
+        held.push(res);
+      }
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    compressTimeoutMs: BUDGET_MS,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+  });
+  try {
+    await armMainTurn(proxy, question);
+    await postMessages(proxy.port, legacyProbeHistory(question));
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered prior findings/,
+      "the legacy rescue must be the forwarded result"
+    );
+    const turn = records.find((r) => r.kind === "messages");
+    assert.equal(turn.compress.ok, true, "the rescue kept the turn compressed");
+    assert.equal(turn.compress.legacyFallback, true);
+    assert.equal(
+      turn.compress.timedOut,
+      true,
+      "the canonical leg burned its whole budget; the legacy rescue must not hide that"
+    );
+  } finally {
+    for (const res of held) res.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("compress telemetry: a budget-burning legacy probe cannot fake a canonical timeout", async () => {
+  // Tripwire for the exact regression round 4 fixed: measuring timedOut from
+  // the Promise.all wall time. Here the canonical leg fails in milliseconds
+  // while the legacy probe hangs until ITS abort fires at the budget, so the
+  // overall wall time is guaranteed to cross compressBudgetMs (asserted
+  // below) — wall-time measurement would log timedOut: true, but the
+  // canonical leg's own fast 5xx means the correct record is false.
+  const question = "Now output detailed remediation steps";
+  const BUDGET_MS = 300;
+  const records = [];
+  const held = [];
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      if (isLegacy) {
+        held.push(res); // burns the whole budget, then aborts to null
+      } else {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: "canonical shape rejected" }));
+      }
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    compressTimeoutMs: BUDGET_MS,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (record) => records.push(structuredClone(record)) },
+  });
+  try {
+    await armMainTurn(proxy, question);
+    await postMessages(proxy.port, legacyProbeHistory(question));
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+
+    const turn = records.find((r) => r.kind === "messages");
+    assert.equal(turn.turnType, "followup-degraded", "no leg produced a result");
+    assert.equal(turn.compress.ok, false);
+    assert.equal(turn.compress.legacyFallback, undefined);
+    // Self-check that this scenario discriminates: the compress step's wall
+    // time really crossed the budget (the legacy abort fires at >= BUDGET_MS
+    // after its timer is set, which is at/after the compress start).
+    assert.ok(
+      turn.compress.ms >= BUDGET_MS,
+      `wall time ${turn.compress.ms}ms must cross the ${BUDGET_MS}ms budget for this test to mean anything`
+    );
+    assert.equal(
+      turn.compress.timedOut,
+      false,
+      "timedOut must track the canonical leg's own fast failure, not the slow legacy probe's wall time"
+    );
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /the audit traced this to the request path/,
+      "with no usable result the turn degrades to full-history passthrough"
+    );
+  } finally {
+    for (const res of held) res.destroy();
     proxy.close();
     upstream.close();
     memtreeSrv.close();
