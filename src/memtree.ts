@@ -234,13 +234,31 @@ function contentTextPieces(content: unknown, out: string[]): void {
 }
 
 /**
+ * Below this length a match between a result piece and the current turn is
+ * treated as coincidence, not echo. Small fragments legitimately recur in both
+ * directions — the current turn quoting a prior message back, memory quoting a
+ * phrase the turn repeats — and counting them as echo would sink genuine
+ * retained history on overlap-heavy turns. Sized well below the shortest
+ * echo worth catching (an empty-memory replay of a >= ~2k-char turn) and above
+ * incidental shared phrases.
+ */
+const ECHO_MIN_PIECE_CHARS = 32;
+
+/**
  * Characters of the result body that are a VERBATIM echo of the sent current
  * turn: result pieces contained in the current turn's text (a full or
  * truncated echo) plus current-turn pieces embedded whole inside a larger
- * result piece (memory and echo concatenated into one message). Content the
- * server rewrote — e.g. a summary of a huge pasted log — deliberately does not
- * count as echo: rewriting is compression work, and its output is retained
- * context, not a replay of the input.
+ * result piece (memory and echo concatenated into one message). EVERY verbatim
+ * copy counts — a result that embeds the turn inside its memory block AND
+ * replays it as the tail is charged for both copies, so the total may exceed
+ * the turn's own length. Over-subtraction fails safe: a verbatim copy of
+ * current-turn content is by definition not prior conversation. Pieces shorter
+ * than ECHO_MIN_PIECE_CHARS never count on either side of the containment
+ * check: tiny fragments shared between the turn and the result (quoted-back
+ * prior messages, repeated pastes) are genuine retained history, not echo.
+ * Content the server rewrote — e.g. a summary of a huge pasted log —
+ * deliberately does not count as echo: rewriting is compression work, and its
+ * output is retained context, not a replay of the input.
  */
 function echoedCurrentTurnChars(
   result: CompressResult,
@@ -258,22 +276,25 @@ function echoedCurrentTurnChars(
   }
 
   let echoed = 0;
-  // Each sent piece may be credited as embedded-in-result once, or the double
-  // counting could exceed the echo that actually exists.
-  const unmatched = new Set(turnPieces.keys());
   for (const piece of resultPieces) {
-    if (turnText.includes(piece)) {
+    if (piece.length >= ECHO_MIN_PIECE_CHARS && turnText.includes(piece)) {
       echoed += piece.length;
       continue;
     }
-    for (const index of unmatched) {
-      if (piece.includes(turnPieces[index]!)) {
-        echoed += turnPieces[index]!.length;
-        unmatched.delete(index);
+    // Each turn piece is credited once per CONTAINING result piece, not once
+    // globally: two result pieces that each carry a verbatim copy are two
+    // echoes, and both must be subtracted or a double echo nets out to the
+    // size of a single one and passes the empty-memory gate.
+    for (const turnPiece of turnPieces) {
+      if (
+        turnPiece.length >= ECHO_MIN_PIECE_CHARS &&
+        piece.includes(turnPiece)
+      ) {
+        echoed += turnPiece.length;
       }
     }
   }
-  return Math.min(echoed, turnText.length);
+  return echoed;
 }
 
 /**
@@ -296,8 +317,13 @@ function echoedCurrentTurnChars(
  * sinking the score below zero and disabling compression on exactly the turns
  * that need it. The failure the floor exists to catch — the server echoing the
  * current turn back with essentially nothing of the prior conversation — still
- * scores ~0, because a verbatim echo (whole, truncated, or embedded in a
- * larger message) is fully subtracted. A rewritten-but-still-empty answer can
+ * scores ~0, because every verbatim echo (whole, truncated, or embedded in a
+ * larger message) is fully subtracted, and a double echo — the turn embedded
+ * in the memory block AND replayed as the tail — is charged for both copies
+ * rather than netting out to a single turn's worth of "retained" text.
+ * Fragments below a small length floor are never counted as echo, so a turn
+ * that quotes prior messages cannot sink the genuine memory that contains
+ * those same fragments. A rewritten-but-still-empty answer can
  * in principle slip through; the trade is deliberate, since rewriting proves
  * the server did compression work rather than dropping context.
  */

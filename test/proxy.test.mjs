@@ -3306,6 +3306,112 @@ test("checkCompressedHistory: a server-shrunk current turn cannot sink the score
   );
 });
 
+test("checkCompressedHistory: a double verbatim echo cannot pass the empty-memory gate", () => {
+  // Identical-body retry shape: the first attempt already indexed the current
+  // turn, so recency-biased memory returns the just-indexed turn (framed)
+  // while the tail replays it verbatim — two copies, zero prior conversation.
+  // Under the old Math.min cap the two copies were clamped to one turn's
+  // worth of echo and the second copy scored as "retained history".
+  const turn = "Retry this exact request body please. ".repeat(139); // ~5.4k chars
+  const sent = [
+    { role: "user", content: "Investigate the flaky deploy" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking into the deploy pipeline now. ".repeat(250) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const doubleEcho = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `Relevant memory:\n${turn}` },
+        { role: "user", content: turn },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    doubleEcho.usable,
+    false,
+    "two verbatim copies of the current turn are still empty memory"
+  );
+
+  // Same shape with genuine memory in place of the embedded copy still passes:
+  // only verbatim copies are subtracted, once per containing piece.
+  const realMemory = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        {
+          role: "user",
+          content: `Relevant memory:\n${"the deploy flaked on worker restarts. ".repeat(80)}`,
+        },
+        { role: "user", content: turn },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    realMemory.usable,
+    true,
+    "genuine memory plus a single tail echo is a usable compression"
+  );
+});
+
+test("checkCompressedHistory: small quoted fragments of the current turn are not echo", () => {
+  // The current turn quotes a short phrase from earlier in the conversation;
+  // genuine memory legitimately contains that same phrase. Fragments below
+  // the echo length floor must not be scored as echo, or overlap-heavy turns
+  // sink usable results — uncapped, now that every copy above the floor is
+  // fully subtracted.
+  const fragment = "ECONNRESET in worker 7"; // 22 chars, below the echo floor
+  const turn =
+    `Why do we keep seeing ${fragment} in the logs? ` +
+    "Give a full root-cause analysis with a timeline. ".repeat(20);
+  const sent = [
+    { role: "user", content: "Help me debug these crashes" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Here is what the logs show so far. ".repeat(200) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  // Genuine memory: a summary just under the retained floor on its own, plus
+  // small pieces that are substrings of the current turn. Counting those
+  // fragments as echo would push the result below the floor.
+  const summary =
+    "Prior discussion covered the crash timeline and mitigation steps. ".repeat(27); // ~1.8k chars
+  const quotedFragments = Array.from({ length: 15 }, () => ({
+    type: "text",
+    text: fragment,
+  }));
+  const overlapHeavy = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        {
+          role: "user",
+          content: [{ type: "text", text: summary }, ...quotedFragments],
+        },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    overlapHeavy.usable,
+    true,
+    "sub-floor fragments shared with the current turn are retained history, not echo"
+  );
+});
+
 test("a fully indexed empty memory forwards real history instead of amnesia", async () => {
   const question = "Now output detailed remediation steps";
   const records = [];
