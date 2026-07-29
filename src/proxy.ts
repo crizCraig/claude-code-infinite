@@ -211,6 +211,14 @@ interface ProxyState {
   mainPromptArmed: boolean;
   mainPromptId?: string;
   mainPromptText?: string;
+  /**
+   * True once the armed prompt's compressible main request has been fully
+   * delivered downstream. The display arm is consumed before forwarding, but
+   * Claude Code retries transient upstream failures (500/529) with the
+   * identical body — recovery-turn classification must survive that retry, so
+   * it corroborates with mainPromptText until delivery actually succeeds.
+   */
+  mainPromptDelivered: boolean;
   mainPromptGeneration: number;
   /** Matching Stop waits briefly for this response's final notice decision. */
   mainNoticeDelivery?: MainNoticeDelivery;
@@ -402,6 +410,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     paymentNoticeShown: false,
     notices: new NoticeDeliveryQueue(),
     mainPromptArmed: false,
+    mainPromptDelivered: true,
     mainPromptGeneration: 0,
     activeSubagents: new Set(),
     tokenCounts: new Map(),
@@ -588,6 +597,7 @@ async function handleNoticeHook(
       state.mainPromptArmed = true;
       state.mainPromptId = parsed.prompt_id;
       state.mainPromptText = parsed.prompt;
+      state.mainPromptDelivered = false;
       state.mainPromptGeneration++;
       state.mainRouteEpoch++;
       state.mainMemoryRoute = undefined;
@@ -649,6 +659,7 @@ async function handleNoticeHook(
     state.mainPromptArmed = false;
     state.mainPromptId = undefined;
     state.mainPromptText = undefined;
+    state.mainPromptDelivered = true;
     // Invalidate a response that did not settle within the bounded hook wait.
     // Otherwise its late callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
@@ -806,11 +817,19 @@ async function handleMessages(
   // history (sticky passthrough until the next pure user turn). Corroborate
   // with the armed hook prompt, and only when no installed route survives to
   // ride -- an active route means the wrapper text matched by accident.
+  //
+  // The arm alone is not enough: it is consumed (for notice dedup) before the
+  // forward, but Claude Code retries a transient upstream failure (500/529)
+  // with the identical body. Until this prompt's compressible request has been
+  // fully delivered (mainPromptDelivered), the prompt text stays valid for
+  // classification so the retry recompresses instead of degrading to a plain
+  // tool turn with full-history passthrough. Successful delivery closes that
+  // window, so a stale prompt text cannot keep promoting later tool turns.
   const isRecoveryPromptTurn =
     isToolResultTurn &&
     isMainRequest &&
     !state.mainMemoryRoute &&
-    state.mainPromptArmed &&
+    (state.mainPromptArmed || !state.mainPromptDelivered) &&
     !!state.mainPromptText &&
     messageCarriesPromptText(lastMsg, state.mainPromptText);
   const isCompressibleUserTurn = isUserTurn || isRecoveryPromptTurn;
@@ -919,6 +938,18 @@ async function handleMessages(
     );
   }
 
+  // Close the recovery-retry window only once this compressible main turn's
+  // response has been fully delivered downstream: a failed forward (500/529)
+  // keeps state.mainPromptDelivered false so the client's identical-body retry
+  // reclassifies as the same user/recovery turn above. Epoch-guarded so a late
+  // completion can never mark a newer prompt's turn as delivered, and an
+  // away-summary request (isMainRequest false) never closes the main window.
+  const markMainPromptDelivered = () => {
+    if (isMainRequest && state.mainRouteEpoch === routeEpoch) {
+      state.mainPromptDelivered = true;
+    }
+  };
+
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
   // feeding its lifetime into MemtreeClient.compress(): compression promises
@@ -979,37 +1010,62 @@ async function handleMessages(
         : null,
     ]);
     result = canonicalResult;
-    if (canonicalResult && legacyHash !== hash) {
+    if (
+      canonicalResult === null &&
+      legacyResult &&
+      didMemtreeCompress(legacyResult) &&
+      checkCompressedHistory(legacyResult, rawMsgsForMemtree).usable
+    ) {
+      // The canonical leg failed (server error/timeout — compress maps every
+      // failure to null) while the concurrent probe returned a compressed,
+      // usable answer that is already paid for. Forward it instead of
+      // degrading to passthrough. The migration flag is untouched: a failed
+      // canonical leg is not a contest.
+      result = legacyResult;
+      usedLegacyFallback = true;
+      if (opts.debug) {
+        console.error(
+          "[ccc proxy] canonical compress failed; using legacy probe result"
+        );
+      }
+    } else if (
+      canonicalResult &&
+      legacyResult &&
+      didMemtreeCompress(legacyResult)
+    ) {
+      // The flag is process-global, so every way of ending the migration
+      // requires legacy evidence: the probe leg was consulted this turn and
+      // answered from a real (compressed) legacy index. Without that — fresh
+      // post-upgrade conversations produce warm-up no-ops on the legacy leg —
+      // even a perfect canonical answer proves nothing about a pre-upgrade
+      // session /resume'd later in this run, whose deep signature-keyed
+      // legacy index must stay reachable.
       if (!shouldProbeLegacyMemtree(canonicalResult, msgsForMemtree)) {
         // Compressed, usable, and a small unindexed tail (shouldProbe returns
-        // true for every weaker outcome): the canonical index has caught up,
-        // so any concurrently fetched legacy result is deliberately ignored
-        // and later turns skip the probe entirely.
+        // true for every weaker outcome): the canonical index has caught up
+        // against a real legacy index, so the concurrently fetched legacy
+        // result is deliberately ignored and later turns skip the probe
+        // entirely.
         state.legacyMemtreeMigrationComplete = true;
-      } else if (legacyResult) {
-        if (
-          isBetterLegacyMemtreeResult(
-            canonicalResult,
-            msgsForMemtree,
-            legacyResult,
-            rawMsgsForMemtree
-          )
-        ) {
-          result = legacyResult;
-          usedLegacyFallback = true;
-        } else if (
-          didMemtreeCompress(canonicalResult) &&
-          checkCompressedHistory(canonicalResult, msgsForMemtree).usable &&
-          didMemtreeCompress(legacyResult)
-        ) {
-          // Ending the migration needs a real contest: a compressed, usable
-          // canonical answer that beat a real legacy index. The flag is
-          // process-global, so a warm-up no-op on either leg (normal for any
-          // conversation started post-upgrade) or an unusable empty-memory
-          // canonical answer must not end it — that would permanently disable
-          // the probe for a pre-upgrade session /resume'd later in this run.
-          state.legacyMemtreeMigrationComplete = true;
-        }
+      } else if (
+        isBetterLegacyMemtreeResult(
+          canonicalResult,
+          msgsForMemtree,
+          legacyResult,
+          rawMsgsForMemtree
+        )
+      ) {
+        result = legacyResult;
+        usedLegacyFallback = true;
+      } else if (
+        didMemtreeCompress(canonicalResult) &&
+        checkCompressedHistory(canonicalResult, msgsForMemtree).usable
+      ) {
+        // Ending the migration also needs a real contest on the canonical
+        // side: a compressed, usable canonical answer that beat the legacy
+        // index it was probed against. An unusable empty-memory canonical
+        // answer must not end it.
+        state.legacyMemtreeMigrationComplete = true;
       }
     }
   } finally {
@@ -1075,7 +1131,9 @@ async function handleMessages(
         upstream,
         state.shutdownSignal,
         rec
-      )
+      ).then((delivered) => {
+        if (delivered) markMainPromptDelivered();
+      })
     );
   }
 
@@ -1128,10 +1186,15 @@ async function handleMessages(
         upstream,
         state.shutdownSignal,
         rec
-      )
+      ).then((delivered) => {
+        if (delivered) markMainPromptDelivered();
+      })
     );
   }
 
+  // Invariant from the early return above: past this point the MemTree result
+  // actually compressed (actuallyCompressed is true) and the retained history
+  // is usable — every remaining path forwards the compressed body.
   const processed = result.messages;
   const systemMsg = processed.find((m) => m.role === "system");
   const compressedBody: Record<string, any> = {
@@ -1152,7 +1215,6 @@ async function handleMessages(
   const abRouting = state.abRouting;
   if (
     abRouting &&
-    actuallyCompressed &&
     displayForThisTurn &&
     state.mainPromptGeneration === noticePromptGeneration
   ) {
@@ -1167,7 +1229,6 @@ async function handleMessages(
   }
   const canRouteAb =
     abRouting !== undefined &&
-    actuallyCompressed &&
     body.stream === true &&
     isMainRequest;
 
@@ -1178,7 +1239,7 @@ async function handleMessages(
   // race the later forwardRaw() delivery promise.
   let routeActivationAttempted = false;
   const activateMainMemoryRoute = () => {
-    if (routeActivationAttempted || !actuallyCompressed) return;
+    if (routeActivationAttempted) return;
     if (!isMainRequest || state.mainRouteEpoch !== routeEpoch) {
       routeActivationAttempted = true;
       return;
@@ -1235,6 +1296,7 @@ async function handleMessages(
         ).then(
           (delivered) => {
             rec.comparison!.deliveryOk = delivered;
+            if (delivered) markMainPromptDelivered();
             if (delivered && state.mainRouteEpoch === routeEpoch) {
               queueCompressionNotice({
                 state,
@@ -1306,6 +1368,9 @@ async function handleMessages(
           // verdict: a late B verdict after a clean memory delivery changes
           // priors, never the installed route.
           try {
+            // Any fully delivered leg (memory, full, spliced, recovered)
+            // completes this turn downstream, ending the recovery-retry window.
+            if (ok) markMainPromptDelivered();
             if (state.mainRouteEpoch !== routeEpoch) return;
             if (delivered === "memory" && ok) {
               queueCompressionNotice({
@@ -1362,7 +1427,8 @@ async function handleMessages(
   // Preserve the legacy embedder contract: without A/B enabled, a long live
   // stream may claim its display notice before message_stop. CLI A/B paths
   // above require complete delivery before queuing the same success notice.
-  if (actuallyCompressed && !abRouting) {
+  // (actuallyCompressed is guaranteed true past the early return above.)
+  if (!abRouting) {
     queueCompressionNotice({
       state,
       displayForThisTurn,
@@ -1387,7 +1453,9 @@ async function handleMessages(
       activateMainMemoryRoute
     ).then(
       (delivered) => {
-        if (!actuallyCompressed || !delivered) return;
+        // actuallyCompressed is guaranteed true past the early return above.
+        if (!delivered) return;
+        markMainPromptDelivered();
         // The notice is the only part that stayed A/B-conditional here: the
         // legacy path already queued it above, before the stream started.
         if (abRouting) {

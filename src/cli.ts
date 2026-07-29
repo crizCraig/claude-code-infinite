@@ -34,7 +34,11 @@ import {
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail } from "./notices.js";
-import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import {
+  isPrintInvocation,
+  parseWrapperArgs,
+  resolveAbRouting,
+} from "./cli-args.js";
 import {
   claudeChildEnv,
   claudeNativeOneMillionContextEnabled,
@@ -297,10 +301,21 @@ async function main() {
   // A/B memory routing is opt-in. Each comparison turn fans out a second
   // full-context leg and blocks on a grader before delivering, which costs a
   // duplicate upstream request and (observed in staging) tens of seconds of
-  // prefix wait — too expensive to pay for unasked. `CCC_AB_ROUTING=0` keeps
-  // working for setups that already disable it explicitly.
+  // prefix wait — too expensive to pay for unasked. Asking means either
+  // `CCC_AB_ROUTING=1` or an explicit `--ab-speculative`/`--ab-buffered`
+  // delivery flag. `CCC_AB_ROUTING=0` keeps working as the explicit disable
+  // and wins over the flags (with a warning instead of a silent no-op).
+  const abDecision = resolveAbRouting(
+    process.env.CCC_AB_ROUTING,
+    parsedArgs.abDeliveryRequested
+  );
+  if (abDecision.warnFlagIgnored) {
+    console.error(
+      "\x1b[1;33m⚠ --ab-speculative/--ab-buffered ignored: CCC_AB_ROUTING=0 disables A/B routing.\x1b[0m"
+    );
+  }
   const abRouting =
-    process.env.CCC_AB_ROUTING !== "1"
+    !abDecision.enabled
       ? undefined
       : {
           graderModel: abEnvGraderModel(),

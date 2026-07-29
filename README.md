@@ -107,7 +107,7 @@ That compressed context stays in force for the rest of the turn: the tool loop i
 
 ### Adaptive memory A/B routing
 
-Opt in with `CCC_AB_ROUTING=1`. When enabled, `ccc` checks whether memory is still the best context for each large follow-up turn:
+Opt in with `CCC_AB_ROUTING=1`, or by passing an explicit delivery flag (`--ab-speculative` / `--ab-buffered`). When enabled, `ccc` checks whether memory is still the best context for each large follow-up turn:
 
 1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
 2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
@@ -121,9 +121,9 @@ Qualifying turns cost more: they make two answer requests plus one grader attemp
 Advanced/testing controls:
 
 - Buffered, grade-before-delivery A/B routing is the default.
-- `ccc --ab-speculative` opts into commit-A-immediately delivery with SSE splicing; `ccc --ab-buffered` explicitly selects the default buffered mode. If both flags are supplied before `--`, the last one wins. The transcript-safety question behind speculative mode — whether Anthropic accepts a spliced assistant message replayed as history — was validated by the S1 replay spike (`scripts/spike-s1.mjs`) against real Anthropic with Claude Code's own headers, including the tool-use splice shape.
+- `ccc --ab-speculative` opts into commit-A-immediately delivery with SSE splicing; `ccc --ab-buffered` explicitly selects the default buffered mode. Passing either flag also enables A/B routing for that run, so `CCC_AB_ROUTING=1` is not additionally required. If both flags are supplied before `--`, the last one wins. The transcript-safety question behind speculative mode — whether Anthropic accepts a spliced assistant message replayed as history — was validated by the S1 replay spike (`scripts/spike-s1.mjs`) against real Anthropic with Claude Code's own headers, including the tool-use splice shape.
 
-- `CCC_AB_ROUTING=1` enables live A/B routing; it is off unless set. A comparison turn costs a duplicate full-context request plus a grader call and blocks delivery on the slower of the two prefixes, so it is opt-in rather than a default tax. `CCC_AB_ROUTING=0` remains accepted for setups that disable it explicitly.
+- `CCC_AB_ROUTING=1` enables live A/B routing; it is off unless set or a delivery flag is passed. A comparison turn costs a duplicate full-context request plus a grader call and blocks delivery on the slower of the two prefixes, so it is opt-in rather than a default tax. `CCC_AB_ROUTING=0` remains accepted for setups that disable it explicitly; it overrides the delivery flags, and `ccc` warns on stderr when a flag is ignored for that reason.
 - `CCC_AB_FORCE_VERDICT=A|B|tie` replaces the grader with an instant fixed verdict (no grader request). Staging-only: `B` forces the mid-stream splice/correction path so its UX can be eyeballed; combine with `CCC_AB_FORCE_COMPARISON=1` to also bypass the context-size gate.
 - `CCC_AB_GRADER_MODEL=<model>` pins a fixed grader model; by default, each comparison automatically uses a grader from a different model family than its answer legs.
 - `CCC_AB_PREFIX_TOKENS=<n>` changes the answer prefix from its 1,000-token default.
