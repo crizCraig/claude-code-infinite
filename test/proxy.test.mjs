@@ -1110,6 +1110,136 @@ test("memory route tolerates Claude 2.1.219 system cache-shape churn", async () 
   }
 });
 
+test("memory route drops stale billing headers when the one-header invariant breaks", async () => {
+  const upstreamBodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  // The compressed system carries TWO recognizable billing-header blocks, so
+  // currentRouteSystem cannot tell which one to rewrite with the current
+  // request's metadata. It must not replay the first request's stale
+  // cch/cc_prev_req attribution on every tool call in the turn.
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "text",
+            text:
+              "x-anthropic-billing-header: cc_version=2.1.219; " +
+              "cc_entrypoint=cli; cch=first;",
+          },
+          {
+            type: "text",
+            text:
+              "x-anthropic-billing-header: cc_version=2.1.219; " +
+              "cc_entrypoint=cli; cch=first-duplicate;",
+          },
+          { type: "text", text: "stable system instructions" },
+        ],
+      },
+      { role: "user", content: "compressed context" },
+    ],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = { "x-claude-code-session-id": "session-header-mismatch" };
+  const billingSystem = (cch, previousRequest) => [
+    {
+      type: "text",
+      text:
+        "x-anthropic-billing-header: cc_version=2.1.219; " +
+        `cc_entrypoint=cli; cch=${cch};` +
+        (previousRequest ? ` cc_prev_req=${previousRequest};` : ""),
+    },
+    { type: "text", text: "stable system instructions" },
+  ];
+  const originalMessages = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    const initialResponse = await fetch(
+      `http://127.0.0.1:${proxy.port}/v1/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({
+          model: "claude-x",
+          max_tokens: 64,
+          system: billingSystem("first"),
+          messages: originalMessages,
+        }),
+      }
+    );
+    await initialResponse.text();
+
+    const toolMessages = [
+      ...structuredClone(originalMessages),
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tool-1", name: "read", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tool-1", content: "ok" }],
+      },
+    ];
+    const toolResponse = await fetch(
+      `http://127.0.0.1:${proxy.port}/v1/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({
+          model: "claude-x",
+          max_tokens: 64,
+          system: billingSystem("second", "req_second"),
+          messages: toolMessages,
+        }),
+      }
+    );
+    await toolResponse.text();
+
+    const routed = upstreamBodies.at(-1);
+    assert.match(
+      JSON.stringify(routed.messages),
+      /compressed context/,
+      "the tool loop still rides the compressed prefix"
+    );
+    assert.doesNotMatch(JSON.stringify(routed.messages), /first question/);
+    assert.doesNotMatch(
+      JSON.stringify(routed.system),
+      /cch=first/,
+      "the ambiguous compressed headers must not replay stale attribution"
+    );
+    assert.doesNotMatch(
+      JSON.stringify(routed.system),
+      /x-anthropic-billing-header/,
+      "no attribution beats wrong attribution when grafting is ambiguous"
+    );
+    assert.match(
+      JSON.stringify(routed.system),
+      /stable system instructions/,
+      "real system instructions survive the header drop"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("typed prompt merged into a tool_result wrapper recompresses instead of sticky passthrough", async () => {
   // The failure this pins down: a prompt typed to recover an interrupted tool
   // loop (or queued mid-turn) is delivered merged into the pending tool_result
@@ -1250,6 +1380,103 @@ test("typed prompt merged into a tool_result wrapper recompresses instead of sti
       memtreeSrv.calls.filter((c) => c.index_only !== true).length,
       compressCallsBefore,
       "a wrapper without the typed text must not be promoted to a user turn"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("prompt substring inside a tool wrapper's system-reminder must not consume the arm", async () => {
+  // Misfire this pins down: a short prompt queued mid-turn ("continue") arms
+  // the hook and clears the route; an intermediate tool_result wrapper whose
+  // appended <system-reminder> (or unrelated mid-sentence text) happens to
+  // contain that substring must stay a plain tool turn. If it were promoted,
+  // it would consume the arm and pay a blocking compress, and the real merged
+  // wrapper arriving next would degrade to sticky full-history passthrough.
+  const upstreamBodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = { "x-claude-code-session-id": "session-reminder-misfire" };
+  const baseMessages = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
+    },
+  ];
+  try {
+    await armMainTurn(proxy, "continue", "prompt-misfire");
+
+    // Intermediate wrapper: the armed text appears only inside an appended
+    // <system-reminder> block and mid-sentence in ordinary trailing text.
+    const decoyWrapper = [
+      ...baseMessages,
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "t1", content: "ok" },
+          {
+            type: "text",
+            text: "<system-reminder>Tests may continue running in the background.</system-reminder>",
+          },
+          { type: "text", text: "The build will continue after this step." },
+        ],
+      },
+    ];
+    await postMessages(proxy.port, decoyWrapper, headers);
+    assert.equal(
+      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
+      0,
+      "reminder/mid-sentence substring must not trigger a blocking compress"
+    );
+    assert.doesNotMatch(
+      JSON.stringify(upstreamBodies.at(-1).messages),
+      /compressed context/,
+      "decoy wrapper forwards as a plain tool turn"
+    );
+
+    // The real merged-prompt wrapper arrives next; the preserved arm must
+    // still promote it to a compressible recovery turn.
+    const recoveryWrapper = [
+      ...baseMessages,
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "t1", content: "ok" },
+          { type: "text", text: "continue" },
+        ],
+      },
+    ];
+    await postMessages(proxy.port, recoveryWrapper, headers);
+    assert.equal(
+      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
+      1,
+      "real merged-prompt wrapper still owns the arm and compresses"
+    );
+    assert.match(
+      JSON.stringify(upstreamBodies.at(-1).messages),
+      /compressed context/,
+      "recovery turn forwards the compressed context"
     );
   } finally {
     proxy.close();
@@ -2019,7 +2246,8 @@ test("Stop-only arm → compress → systemMessage fallback delivers without Mes
       prompt_id: "prompt-stop",
     });
     assert.match(
-      stop.body.systemMessage,
+      // Notice may be ANSI-colored depending on terminal detection; strip codes.
+      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, ""),
       /^✓ MemTree · conversation optimized in (?:\d+ms|\d+(?:\.\d+)?s)$/
     );
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-stop" }))).status, 204);
@@ -2698,9 +2926,15 @@ test("legacy probe prefers the candidate that kept the conversation", async () =
   ];
   let call = 0;
   const memtreeSrv = await listen((req, res) => {
-    req.resume();
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      const body = JSON.stringify(bodies[Math.min(call++, bodies.length - 1)]);
+      call += 1;
+      // The legs run concurrently, so key the answer off the request shape
+      // (only the legacy leg carries thinking blocks), not arrival order.
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      const body = JSON.stringify(bodies[isLegacy ? 1 : 0]);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(body);
     });
@@ -2732,6 +2966,298 @@ test("legacy probe prefers the candidate that kept the conversation", async () =
       JSON.stringify(forwarded.messages),
       /recovered prior findings/,
       "the candidate carrying conversation must win, not the emptier one"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a no-op legacy probe does not end the migration", async () => {
+  // Both indexes are cold on a conversation started post-upgrade, so the
+  // probe's warm-up no-op answer proves nothing about the canonical index.
+  // The flag is process-global: setting it there would permanently disable
+  // the probe for a pre-upgrade session /resume'd later in the same run,
+  // whose deep signature-keyed legacy index would then never be reused.
+  const question2 = "second question";
+  let legacyCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      if (isLegacy) legacyCalls += 1;
+      // Canonical leg always a warm-up no-op; legacy leg a no-op on the first
+      // probe (fresh conversation), then a deep usable hit (resumed session).
+      const response =
+        isLegacy && legacyCalls > 1
+          ? {
+              messages: [
+                {
+                  role: "user",
+                  content: `${"recovered legacy findings. ".repeat(200)}${question2}`,
+                },
+              ],
+              usage: {
+                raw_prompt_tokens: 134_500,
+                prompt_tokens_details: { cached_tokens: 100_000 },
+              },
+            }
+          : {
+              messages: payload.messages,
+              usage: {
+                raw_prompt_tokens: 50_000,
+                prompt_tokens_details: { cached_tokens: 0 },
+              },
+            };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const turnOne = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "legacy-sig" },
+        { type: "text", text: "first answer" },
+      ],
+    },
+    { role: "user", content: "turn two" },
+  ];
+  const turnTwo = [
+    ...turnOne,
+    { role: "assistant", content: [{ type: "text", text: "second answer" }] },
+    { role: "user", content: question2 },
+  ];
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, turnOne);
+    assert.equal(legacyCalls, 1, "the first followup probes the legacy shape");
+
+    await armMainTurn(proxy, question2);
+    await postMessages(proxy.port, turnTwo);
+    assert.equal(
+      legacyCalls,
+      2,
+      "a warm-up no-op on both legs must not mark the migration complete"
+    );
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered legacy findings/,
+      "the later deep legacy hit must still be reachable and win"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an unusable empty canonical answer does not end the migration", async () => {
+  // Both legs compressed but neither carries the conversation, and the
+  // canonical tail is smaller, so the tie-break favors canonical. Per the
+  // shouldProbeLegacyMemtree comment, the emptiest answer must not end the
+  // migration: the probe has to stay armed for the turn where the legacy
+  // index answers with real content.
+  const question = "Now output detailed remediation steps";
+  const question2 = "And harden the request path";
+  let legacyCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const messagesJson = JSON.stringify(payload.messages);
+      const isLegacy = messagesJson.includes('"thinking"');
+      const currentTurn = messagesJson.includes(question2) ? question2 : question;
+      if (isLegacy) legacyCalls += 1;
+      let response;
+      if (!isLegacy) {
+        // Canonical: perfect coverage (tail ~100), zero conversation returned.
+        response = emptyMemoryResponse(currentTurn);
+      } else if (legacyCalls === 1) {
+        // Legacy: also empty, with a LARGER tail, so canonical "wins" the tie.
+        response = {
+          ...emptyMemoryResponse(currentTurn),
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 130_000 },
+          },
+        };
+      } else {
+        response = {
+          messages: [
+            {
+              role: "user",
+              content: `${"recovered prior findings. ".repeat(200)}${currentTurn}`,
+            },
+          ],
+          usage: {
+            raw_prompt_tokens: 134_500,
+            prompt_tokens_details: { cached_tokens: 100_000 },
+          },
+        };
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const turnOne = [
+    { role: "user", content: "Audit this codebase for security issues" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "sig" },
+        {
+          type: "text",
+          text: `Finding: ${"the audit traced this to the request path. ".repeat(60)}`,
+        },
+      ],
+    },
+    { role: "user", content: question },
+  ];
+  const turnTwo = [
+    ...turnOne,
+    { role: "assistant", content: [{ type: "text", text: "noted" }] },
+    { role: "user", content: question2 },
+  ];
+  try {
+    await armMainTurn(proxy, question);
+    await postMessages(proxy.port, turnOne);
+    assert.equal(legacyCalls, 1, "the unusable canonical answer triggers the probe");
+
+    await armMainTurn(proxy, question2);
+    await postMessages(proxy.port, turnTwo);
+    assert.equal(
+      legacyCalls,
+      2,
+      "an empty canonical answer winning an empty tie must not end the migration"
+    );
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered prior findings/,
+      "the legacy index that finally carries the conversation must win"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the legacy probe runs concurrently with the canonical compress", async () => {
+  // During active migration a followup turn pays ONE compress budget, not
+  // two: the legacy leg must start before the canonical result arrives. The
+  // mock holds every answer until both legs are in flight; a serial
+  // implementation never sends the second request and times out the first.
+  const pending = [];
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const isLegacy = JSON.stringify(payload.messages).includes('"thinking"');
+      pending.push({ isLegacy, payload, res });
+      if (pending.length < 2) return;
+      for (const leg of pending) {
+        const response = leg.isLegacy
+          ? {
+              messages: [
+                {
+                  role: "user",
+                  content: `${"recovered prior findings. ".repeat(200)}turn two`,
+                },
+              ],
+              usage: {
+                raw_prompt_tokens: 134_500,
+                prompt_tokens_details: { cached_tokens: 100_000 },
+              },
+            }
+          : {
+              messages: leg.payload.messages,
+              usage: {
+                raw_prompt_tokens: 50_000,
+                prompt_tokens_details: { cached_tokens: 0 },
+              },
+            };
+        leg.res.writeHead(200, { "content-type": "application/json" });
+        leg.res.end(JSON.stringify(response));
+      }
+    });
+  });
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    // Short circuit-breaker: a serial probe deadlocks against the barrier
+    // above and degrades to passthrough instead of hanging the test.
+    compressTimeoutMs: 1_000,
+  });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const messages = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "sig" },
+        { type: "text", text: "first answer" },
+      ],
+    },
+    { role: "user", content: "turn two" },
+  ];
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, messages);
+    assert.equal(pending.length, 2, "both legs were in flight simultaneously");
+    assert.match(
+      JSON.stringify(forwarded.messages),
+      /recovered prior findings/,
+      "the concurrent probe result must still be usable as the winner"
     );
   } finally {
     proxy.close();

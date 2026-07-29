@@ -686,6 +686,41 @@ async function handleNoticeHook(
   res.end(body);
 }
 
+/**
+ * Hook-prompt correlation: true only when the armed typed prompt appears as a
+ * deliberate top-level text block of the user message — the whole block, or
+ * its start/end (Claude Code may append/prepend ambient text around a merged
+ * queued prompt). Matching runs on reminder-stripped block text so a
+ * coincidental substring inside an appended <system-reminder> (or buried
+ * mid-sentence in unrelated text) can never claim or consume the arm.
+ */
+function messageCarriesPromptText(
+  message: Message | undefined | null,
+  promptText: string
+): boolean {
+  const prompt = promptText.trim();
+  if (!prompt) return false;
+  if (!message || message.role !== "user") return false;
+  const content = message.content;
+  const parts: string[] =
+    typeof content === "string"
+      ? [content]
+      : Array.isArray(content)
+        ? content.map((part: any) => {
+            if (typeof part === "string") return part;
+            return part?.type === "text" && typeof part.text === "string"
+              ? part.text
+              : "";
+          })
+        : [];
+  return parts.some((part) => {
+    const text = stripSystemReminderText(part);
+    return (
+      text === prompt || text.startsWith(prompt) || text.endsWith(prompt)
+    );
+  });
+}
+
 /** Buffer + inspect /v1/messages; classify the turn, strip notices, forward. */
 async function handleMessages(
   req: http.IncomingMessage,
@@ -777,7 +812,7 @@ async function handleMessages(
     !state.mainMemoryRoute &&
     state.mainPromptArmed &&
     !!state.mainPromptText &&
-    userMessageText(lastMsg).includes(state.mainPromptText);
+    messageCarriesPromptText(lastMsg, state.mainPromptText);
   const isCompressibleUserTurn = isUserTurn || isRecoveryPromptTurn;
   const isFollowupUserTurn =
     isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
@@ -792,7 +827,7 @@ async function handleMessages(
     !isSubagentRequest &&
     state.mainPromptArmed &&
     state.mainPromptText !== undefined &&
-    userMessageText(lastMsg).includes(state.mainPromptText);
+    messageCarriesPromptText(lastMsg, state.mainPromptText);
   // Local `!command` turns do not consistently emit UserPromptSubmit, and the
   // API history contains bash wrappers rather than the literal typed command.
   // Their strict main-thread replay shape can safely own its own notice.
@@ -914,35 +949,47 @@ async function handleMessages(
       ),
       tools: Array.isArray(body.tools) ? body.tools : undefined,
     };
-    result = await opts.memtree.compress(
-      hash,
-      msgsForMemtree,
-      modelContextLimit,
-      state.shutdownSignal,
-      compressMeta
-    );
-    if (
-      result &&
-      legacyHash !== hash &&
-      !state.legacyMemtreeMigrationComplete &&
-      shouldProbeLegacyMemtree(result, msgsForMemtree)
-    ) {
-      // The first request after this normalization ships may not match an
-      // existing signature-keyed index. The canonical call above starts the
-      // stable replacement index. Until it catches up, compare one lookup with
-      // the untouched shape so a shallow canonical hit cannot hide a much
-      // deeper same-model legacy index.
-      const legacyResult = await opts.memtree.compress(
-        legacyHash,
-        rawMsgsForMemtree,
+    // The first request after this normalization ships may not match an
+    // existing signature-keyed index. The canonical call starts the stable
+    // replacement index. Until it catches up, compare one lookup with the
+    // untouched shape so a shallow canonical hit cannot hide a much deeper
+    // same-model legacy index. Both legs run concurrently — the probe's
+    // inputs never depend on the canonical result, only the decision below
+    // does — so an active migration pays one compress budget, not two, per
+    // turn. compress() maps every failure to a resolved null (it never
+    // rejects), so neither leg can surface an unhandled rejection.
+    const probeLegacy =
+      legacyHash !== hash && !state.legacyMemtreeMigrationComplete;
+    const [canonicalResult, legacyResult] = await Promise.all([
+      opts.memtree.compress(
+        hash,
+        msgsForMemtree,
         modelContextLimit,
         state.shutdownSignal,
         compressMeta
-      );
-      if (legacyResult) {
+      ),
+      probeLegacy
+        ? opts.memtree.compress(
+            legacyHash,
+            rawMsgsForMemtree,
+            modelContextLimit,
+            state.shutdownSignal,
+            compressMeta
+          )
+        : null,
+    ]);
+    result = canonicalResult;
+    if (canonicalResult && legacyHash !== hash) {
+      if (!shouldProbeLegacyMemtree(canonicalResult, msgsForMemtree)) {
+        // Compressed, usable, and a small unindexed tail (shouldProbe returns
+        // true for every weaker outcome): the canonical index has caught up,
+        // so any concurrently fetched legacy result is deliberately ignored
+        // and later turns skip the probe entirely.
+        state.legacyMemtreeMigrationComplete = true;
+      } else if (legacyResult) {
         if (
           isBetterLegacyMemtreeResult(
-            result,
+            canonicalResult,
             msgsForMemtree,
             legacyResult,
             rawMsgsForMemtree
@@ -950,17 +997,20 @@ async function handleMessages(
         ) {
           result = legacyResult;
           usedLegacyFallback = true;
-        } else {
+        } else if (
+          didMemtreeCompress(canonicalResult) &&
+          checkCompressedHistory(canonicalResult, msgsForMemtree).usable &&
+          didMemtreeCompress(legacyResult)
+        ) {
+          // Ending the migration needs a real contest: a compressed, usable
+          // canonical answer that beat a real legacy index. The flag is
+          // process-global, so a warm-up no-op on either leg (normal for any
+          // conversation started post-upgrade) or an unusable empty-memory
+          // canonical answer must not end it — that would permanently disable
+          // the probe for a pre-upgrade session /resume'd later in this run.
           state.legacyMemtreeMigrationComplete = true;
         }
       }
-    } else if (
-      result &&
-      legacyHash !== hash &&
-      didMemtreeCompress(result) &&
-      !shouldProbeLegacyMemtree(result, msgsForMemtree)
-    ) {
-      state.legacyMemtreeMigrationComplete = true;
     }
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);
@@ -1568,13 +1618,24 @@ function currentRouteSystem(
 ): unknown {
   const currentHeaders = routeBillingHeaders(currentSystem);
   const compressedHeaders = routeBillingHeaders(compressedSystem);
-  if (currentHeaders.length !== 1 || compressedHeaders.length !== 1) {
-    return cloneJson(compressedSystem);
+  if (currentHeaders.length === 1 && compressedHeaders.length === 1) {
+    return replaceSingleRouteBillingHeader(
+      cloneJson(compressedSystem),
+      currentHeaders[0]
+    );
   }
-  return replaceSingleRouteBillingHeader(
-    cloneJson(compressedSystem),
-    currentHeaders[0]
-  );
+  // The one-synthetic-header invariant broke (Claude reordered the header
+  // fields, or the compressed system carries duplicate header-like blocks).
+  // Never replay the FIRST request's stale cch/cc_prev_req attribution for
+  // every tool call in the turn: drop the recognizable billing headers from
+  // the routed system instead. Missing attribution is safer than wrong
+  // attribution.
+  const stripped = withoutRouteBillingHeaders(cloneJson(compressedSystem));
+  // JSON.stringify omits undefined-valued keys, so an all-header system is
+  // sent with no `system` field rather than an empty block list.
+  return Array.isArray(stripped) && stripped.length === 0
+    ? undefined
+    : stripped;
 }
 
 function routeBillingHeaders(value: unknown): string[] {
@@ -1643,6 +1704,26 @@ function replaceSingleRouteBillingHeader(
     });
   }
   return value;
+}
+
+/** Remove every recognizable synthetic billing-header block from a system value. */
+function withoutRouteBillingHeaders(value: unknown): unknown {
+  if (typeof value === "string") {
+    return isRouteBillingHeader(value) ? undefined : value;
+  }
+  if (!Array.isArray(value)) return value;
+  return value.filter((item) => {
+    if (typeof item === "string") return !isRouteBillingHeader(item);
+    if (
+      !item ||
+      typeof item !== "object" ||
+      (item as Record<string, unknown>).type !== "text"
+    ) {
+      return true;
+    }
+    const text = (item as Record<string, unknown>).text;
+    return !(typeof text === "string" && isRouteBillingHeader(text));
+  });
 }
 
 /** Ignore only Anthropic content-block cache metadata, never user/tool data. */
