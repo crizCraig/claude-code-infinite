@@ -84,16 +84,21 @@ function usageRecord(result: CompressResult): Record<string, unknown> | null {
  * endpoint deliberately returns the messages as-is with cached_tokens = 0.
  */
 export function didMemtreeCompress(result: CompressResult): boolean {
-  const usage = usageRecord(result);
-  if (!usage) return false;
-  const details = usage.prompt_tokens_details;
-  if (!details || typeof details !== "object") return false;
+  return (cachedPromptTokenCount(result) ?? 0) > 0;
+}
+
+/** Number of original prompt tokens covered by the index MemTree selected. */
+export function cachedPromptTokenCount(
+  result: CompressResult
+): number | undefined {
+  const details = usageRecord(result)?.prompt_tokens_details;
+  if (!details || typeof details !== "object") return undefined;
   const cachedTokens = (details as Record<string, unknown>).cached_tokens;
-  return (
-    typeof cachedTokens === "number" &&
+  return typeof cachedTokens === "number" &&
     Number.isFinite(cachedTokens) &&
-    cachedTokens > 0
-  );
+    cachedTokens >= 0
+    ? cachedTokens
+    : undefined;
 }
 
 /**
@@ -110,6 +115,154 @@ export function rawPromptTokenCount(
     rawPromptTokens > 0
     ? rawPromptTokens
     : undefined;
+}
+
+/**
+ * Tokens after the indexed prefix. This is comparable across legacy signed
+ * and normalized message shapes: unlike cached_tokens, it does not reward the
+ * legacy shape merely for containing opaque signature bytes.
+ */
+export function unindexedPromptTokenCount(
+  result: CompressResult
+): number | undefined {
+  const raw = rawPromptTokenCount(result);
+  const cached = cachedPromptTokenCount(result);
+  return raw === undefined || cached === undefined
+    ? undefined
+    : Math.max(0, raw - cached);
+}
+
+/**
+ * Minimum conversation content, beyond the current turn, that a compressed
+ * response must carry before we will send it to Anthropic in place of the real
+ * history.
+ *
+ * Sized well below any useful memory (the server's own semantic floor is 15k
+ * chars) and well above an empty answer, so this fires only on genuine context
+ * loss and never on a legitimately aggressive compression.
+ */
+export const MIN_RETAINED_HISTORY_CHARS = 2_000;
+
+/** Characters of text/JSON content in an Anthropic content field. */
+function contentChars(content: unknown): number {
+  if (content == null) return 0;
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) {
+    let total = 0;
+    for (const part of content) total += contentChars(part);
+    return total;
+  }
+  if (typeof content !== "object") return String(content).length;
+  const block = content as Record<string, unknown>;
+  if (typeof block.text === "string") return block.text.length;
+  try {
+    return JSON.stringify(block)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Conversation characters in `messages`, ignoring any system entry. */
+function conversationChars(messages: Message[] | undefined): number {
+  let chars = 0;
+  for (const message of messages ?? []) {
+    if (message.role === "system") continue;
+    chars += contentChars(message.content);
+  }
+  return chars;
+}
+
+export interface CompressedHistoryCheck {
+  /** Non-system conversation characters MemTree actually returned. */
+  retainedChars: number;
+  /** Characters in the turn that prompted this request. */
+  currentTurnChars: number;
+  /** Non-system characters of prior conversation we asked it to compress. */
+  priorHistoryChars: number;
+  /** False when the response carries no usable prior conversation. */
+  usable: boolean;
+}
+
+/**
+ * Decide whether a compressed response still contains the conversation.
+ *
+ * This is deliberately NOT derived from `usage`. Every usage-derived signal —
+ * `cached_tokens` and the `raw - cached` tail — measures how much of the prompt
+ * the server's INDEX covered, not how much context it put in the response. A
+ * server that indexes every message and then allocates zero characters to
+ * memory (because fixed system+tool overhead exceeded its whole-request budget)
+ * reports perfect coverage while returning nothing at all, and the tail metric
+ * scores that empty answer as the best possible result. Only the body itself
+ * says what the model will actually see.
+ */
+export function checkCompressedHistory(
+  result: CompressResult,
+  sentMessages: Message[],
+  minRetainedChars: number = MIN_RETAINED_HISTORY_CHARS
+): CompressedHistoryCheck {
+  const nonSystem = sentMessages.filter((m) => m.role !== "system");
+  const currentTurn = nonSystem.length
+    ? contentChars(nonSystem[nonSystem.length - 1]!.content)
+    : 0;
+  const priorHistoryChars = Math.max(
+    0,
+    conversationChars(sentMessages) - currentTurn
+  );
+  const retainedChars = conversationChars(result.messages);
+  // Nothing meaningful to lose: a short conversation legitimately compresses to
+  // roughly itself, and passing it through would be pointless churn.
+  const usable =
+    priorHistoryChars < minRetainedChars ||
+    retainedChars - currentTurn >= minRetainedChars;
+  return { retainedChars, currentTurnChars: currentTurn, priorHistoryChars, usable };
+}
+
+/**
+ * Remove model-specific reasoning blocks from the copy sent to MemTree.
+ *
+ * Claude Code does not reliably replay prior-turn thinking after a model
+ * change or process resume. Thinking text, redacted payloads, and signatures
+ * are required when present in the live Anthropic request, but none is stable
+ * conversation identity for indexing.
+ *
+ * Scope this narrowly to assistant thinking blocks. A field named `signature`
+ * inside tool input/result data can be real user data and must remain intact.
+ * The original request is never mutated and still goes to Anthropic verbatim.
+ */
+export function normalizeMessagesForMemtree(messages: Message[]): Message[] {
+  const normalized: Message[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      normalized.push(message);
+      continue;
+    }
+
+    let changed = false;
+    let removedReasoning = false;
+    const content: unknown[] = [];
+    for (const part of message.content) {
+      if (!isReasoningBlock(part)) {
+        content.push(part);
+        continue;
+      }
+      changed = true;
+      removedReasoning = true;
+    }
+
+    if (removedReasoning && content.length === 0) continue;
+    normalized.push(changed ? { ...message, content } : message);
+  }
+  return normalized;
+}
+
+function isReasoningBlock(value: unknown): value is Record<string, unknown> {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    ((value as Record<string, unknown>).type === "thinking" ||
+      (value as Record<string, unknown>).type === "redacted_thinking")
+  );
 }
 
 export class MemtreeClient {

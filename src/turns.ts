@@ -302,28 +302,54 @@ export function messagesWithSystem(
 /**
  * Context-window budget for compression.
  *
- * 1M long context is signaled two ways and we must accept both:
+ * 1M long context can be selected three ways and we must accept all three:
  * - a `[1m]` model-name suffix (our CLI convention), or
  * - an `anthropic-beta: context-1m-*` header — this is what Claude Code
  *   actually sends on the wire: it strips the `[1m]` suffix from the model
- *   field and translates it into the beta flag, so a proxy that only checks
- *   the model name silently under-reports a 1M session as 200k.
+ *   field and translates it into the beta flag for extended-context models,
+ * - a current model whose API window is natively 1M. Native-1M requests use a
+ *   plain model id and do not need the beta header.
  */
+const NATIVE_ONE_MILLION_MODELS = new Set([
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-fable-5",
+  "claude-mythos-5",
+  "claude-mythos-preview",
+]);
+
+function isNativeOneMillionModel(model: string | undefined): boolean {
+  if (!model) return false;
+  const normalized = model
+    .trim()
+    .toLowerCase()
+    .replace(/(?:\[1m\])+$/i, "")
+    .replace(/-\d{8}$/, "");
+  return NATIVE_ONE_MILLION_MODELS.has(normalized);
+}
+
 export function contextLimitForModel(
   model: string | undefined,
-  anthropicBeta?: string
+  anthropicBeta?: string,
+  nativeOneMillionContext = true
 ): number {
   if (model && model.includes("[1m]")) return 1_000_000;
   if (anthropicBeta && anthropicBeta.includes("context-1m")) return 1_000_000;
+  if (nativeOneMillionContext && isNativeOneMillionModel(model)) {
+    return 1_000_000;
+  }
   return 200_000;
 }
 
 /**
  * Model name to report to the MemTree server: re-attach the `[1m]` suffix
  * when the session runs with 1M context but the wire model name is plain
- * (Claude Code moved the suffix into the beta header). The server resolves
- * `<model>[1m]` aliases and logs the requested model verbatim, so this keeps
- * its budget telemetry self-explanatory about the context variant.
+ * (either because Claude Code moved the suffix into the beta header or because
+ * the model is natively 1M). The server resolves `<model>[1m]` aliases and logs
+ * the requested model verbatim, so this keeps its budget telemetry
+ * self-explanatory about the context variant.
  */
 export function modelForMemtree(
   model: string | undefined,

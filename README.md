@@ -42,9 +42,31 @@ The tool supports multiple environments (this selects the MemTree compression AP
 
 Each environment maintains its own separate API key.
 
+## Claude Code auto-compaction
+
+`ccc` disables Claude Code's automatic conversation compaction for the Claude process it launches. MemTree manages the context sent to the model, so letting Claude Code independently summarize the full local transcript can compact a conversation MemTree already reduced. Manual `/compact` remains available.
+
+Claude Code 2.1.219 also recommends “Resume from summary” for any old session
+above a fixed 100k-token threshold, even when the active model has a 1M window
+and auto-compaction is disabled. `ccc` suppresses that resume-time
+recommendation as well; it does not disable the manual `/compact` command.
+
+To restore Claude Code's native auto-compaction setting for one invocation, use:
+
+```bash
+CCC_AUTO_COMPACT=1 ccc
+```
+
+Claude Code normally treats any custom `ANTHROPIC_BASE_URL` as an unverifiable
+gateway and can therefore account for a resumed native-1M model as if it had a
+200k window. `ccc` identifies its transparent localhost relay as trusted, so
+current native-1M models retain the same context window they have when Claude
+Code connects directly to Anthropic. The official
+`CLAUDE_CODE_DISABLE_1M_CONTEXT=1` switch still forces the legacy 200k behavior.
+
 ## Privacy & architecture: your Anthropic credentials never leave your machine
 
-`ccc` runs a small proxy on `127.0.0.1` and launches Claude Code with only `ANTHROPIC_BASE_URL` pointed at it. Claude Code keeps its **native login** — token refresh, plan-default model selection, and rate-limit handling behave exactly like vanilla Claude Code, and your OAuth token is sent only to `api.anthropic.com` from your own machine.
+`ccc` runs a small proxy on `127.0.0.1` and launches Claude Code with `ANTHROPIC_BASE_URL` pointed at it and automatic compaction disabled. Claude Code keeps its **native login** — token refresh, plan-default model selection, and rate-limit handling behave exactly like vanilla Claude Code, and your OAuth token is sent only to `api.anthropic.com` from your own machine.
 
 ```
 Claude Code ──▶ localhost proxy (ccc)
@@ -81,9 +103,11 @@ Claude Code currently displays the original assistant text instead of `MessageDi
 
 When you send a message, we retrieve relevant details and summaries from the prior messages in your thread. These details and summaries populate a **memory message**. Following the memory message, we append a compressed version of your recent message history. The resulting context-window is dramatically smaller, allowing Claude to process your request with much greater efficacy, lower latency, and reduced cost.
 
+That compressed context stays in force for the rest of the turn: the tool loop it kicks off, and the matching Count Tokens calls, are routed through the same compressed prefix. The Count Tokens part matters — Claude Code sizes its context from those replies, so counting the uncompressed history would make it auto-compact a conversation memory had already shrunk. A mismatched or resumed conversation shape drops the route rather than grafting one session's prefix onto another.
+
 ### Adaptive memory A/B routing
 
-`ccc` now checks whether memory is still the best context for each large follow-up turn:
+Opt in with `CCC_AB_ROUTING=1`. When enabled, `ccc` checks whether memory is still the best context for each large follow-up turn:
 
 1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
 2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
@@ -99,7 +123,7 @@ Advanced/testing controls:
 - Buffered, grade-before-delivery A/B routing is the default.
 - `ccc --ab-speculative` opts into commit-A-immediately delivery with SSE splicing; `ccc --ab-buffered` explicitly selects the default buffered mode. If both flags are supplied before `--`, the last one wins. The transcript-safety question behind speculative mode — whether Anthropic accepts a spliced assistant message replayed as history — was validated by the S1 replay spike (`scripts/spike-s1.mjs`) against real Anthropic with Claude Code's own headers, including the tool-use splice shape.
 
-- `CCC_AB_ROUTING=0` disables live A/B routing.
+- `CCC_AB_ROUTING=1` enables live A/B routing; it is off unless set. A comparison turn costs a duplicate full-context request plus a grader call and blocks delivery on the slower of the two prefixes, so it is opt-in rather than a default tax. `CCC_AB_ROUTING=0` remains accepted for setups that disable it explicitly.
 - `CCC_AB_FORCE_VERDICT=A|B|tie` replaces the grader with an instant fixed verdict (no grader request). Staging-only: `B` forces the mid-stream splice/correction path so its UX can be eyeballed; combine with `CCC_AB_FORCE_COMPARISON=1` to also bypass the context-size gate.
 - `CCC_AB_GRADER_MODEL=<model>` pins a fixed grader model; by default, each comparison automatically uses a grader from a different model family than its answer legs.
 - `CCC_AB_PREFIX_TOKENS=<n>` changes the answer prefix from its 1,000-token default.
@@ -130,7 +154,7 @@ References:
 
 Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding.
 
-This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, or 15% of the standard 200k context-limit, filled precisely with the information relevant to your **last** message. Read more about how MemTree works [here](https://api.polychat.co/context-memory).
+This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, filled precisely with the information relevant to your **last** message. Read more about how MemTree works [here](https://api.polychat.co/context-memory).
 
 ### Operating System Analogy
 

@@ -5,6 +5,7 @@ import {
   isLocalBashCommandTurn,
   lastNonSystemMessage,
   hasEarlierNonToolUserMessage,
+  contextLimitForModel,
 } from "../dist/turns.js";
 
 const user = (text) => ({ role: "user", content: text });
@@ -110,4 +111,41 @@ test("local bang commands are recognized from Claude Code's replay wrappers", ()
     ]),
     false
   );
+});
+
+test("current native models use 1M without a suffix or beta header", () => {
+  for (const model of [
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+  ]) {
+    assert.equal(contextLimitForModel(model), 1_000_000, model);
+  }
+});
+
+test("native 1M inference can be disabled without affecting explicit 1M signals", () => {
+  assert.equal(
+    contextLimitForModel("claude-opus-4-8", undefined, false),
+    200_000
+  );
+  assert.equal(
+    contextLimitForModel("claude-opus-4-8[1m]", undefined, false),
+    1_000_000
+  );
+  assert.equal(
+    contextLimitForModel(
+      "claude-opus-4-6",
+      "context-1m-2025-08-07",
+      false
+    ),
+    1_000_000
+  );
+});
+
+test("legacy models remain 200k unless extended context is selected", () => {
+  assert.equal(contextLimitForModel("claude-opus-4-6"), 200_000);
+  assert.equal(contextLimitForModel("claude-haiku-4-5"), 200_000);
 });

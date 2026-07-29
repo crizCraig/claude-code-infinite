@@ -3,8 +3,10 @@
 /**
  * Claude Code Infinite launcher (plans/2026-06-09_PLAN_local_proxy_app.md).
  *
- * Starts the local proxy on 127.0.0.1 and execs `claude` with only
- * ANTHROPIC_BASE_URL set. Auth is untouched by design ("mirror vanilla"):
+ * Starts the local proxy on 127.0.0.1 and execs `claude` with
+ * ANTHROPIC_BASE_URL pointed at it. Claude Code's automatic compaction is
+ * disabled because MemTree owns context management; manual `/compact` remains
+ * available. Auth is untouched by design ("mirror vanilla"):
  * Claude Code keeps its native login — token refresh, plan-default model
  * resolution, and limit handling behave exactly like vanilla — and its OAuth
  * token never leaves this machine. polychat.co only ever sees message content
@@ -33,6 +35,10 @@ import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail } from "./notices.js";
 import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import {
+  claudeChildEnv,
+  claudeNativeOneMillionContextEnabled,
+} from "./claude-env.js";
 import {
   createSignalShutdownHandler,
   exitCodeForChild,
@@ -286,8 +292,15 @@ async function main() {
     debug: isDebugMode,
     reqlog,
   });
+  const nativeOneMillionContext =
+    claudeNativeOneMillionContextEnabled(process.env);
+  // A/B memory routing is opt-in. Each comparison turn fans out a second
+  // full-context leg and blocks on a grader before delivering, which costs a
+  // duplicate upstream request and (observed in staging) tens of seconds of
+  // prefix wait — too expensive to pay for unasked. `CCC_AB_ROUTING=0` keeps
+  // working for setups that already disable it explicitly.
   const abRouting =
-    process.env.CCC_AB_ROUTING === "0"
+    process.env.CCC_AB_ROUTING !== "1"
       ? undefined
       : {
           graderModel: abEnvGraderModel(),
@@ -323,6 +336,7 @@ async function main() {
     debug: isDebugMode,
     reqlog,
     abRouting,
+    nativeOneMillionContext,
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
@@ -332,6 +346,20 @@ async function main() {
     console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
     console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);
     console.log(`[DEBUG] A/B memory routing: ${abRouting ? "enabled" : "disabled"}`);
+    console.log(
+      `[DEBUG] Claude Code auto-compaction: ${
+        process.env.CCC_AUTO_COMPACT === "1"
+          ? "native setting (CCC_AUTO_COMPACT=1)"
+          : "disabled by ccc"
+      }`
+    );
+    console.log(
+      `[DEBUG] Claude Code native 1M context: ${
+        nativeOneMillionContext
+          ? "enabled through trusted localhost relay"
+          : "disabled by CLAUDE_CODE_DISABLE_1M_CONTEXT"
+      }`
+    );
   }
 
   // Legacy transcript cleanup: releases before display-only hooks injected
@@ -382,10 +410,10 @@ async function main() {
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
   // native login and sends its own OAuth bearer to the local base URL.
   const child = spawn("claude", childArgs, {
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxy.port}`,
-    },
+    env: claudeChildEnv(
+      process.env,
+      `http://127.0.0.1:${proxy.port}`
+    ),
     stdio: "inherit",
   });
 

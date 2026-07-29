@@ -60,9 +60,12 @@ import {
   type ResolvedAbRoutingOptions,
 } from "./ab-routing.js";
 import {
+  checkCompressedHistory,
   didMemtreeCompress,
   MemtreeClient,
+  normalizeMessagesForMemtree,
   rawPromptTokenCount,
+  unindexedPromptTokenCount,
   type CompressResult,
 } from "./memtree.js";
 import {
@@ -120,6 +123,7 @@ const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
 const NOTICE_SETTLE_WAIT_MS = 1_000;
 const TOKEN_COUNT_CACHE_MAX = 64;
+const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -156,6 +160,12 @@ const SKIP_TRANSFORMED_RESPONSE_HEADERS = new Set([
 
 export interface ProxyOptions {
   memtree: MemtreeClient;
+  /**
+   * Treat current native-1M Anthropic model ids as 1M without requiring the
+   * legacy context-1m beta header. Defaults to true. Set false only when the
+   * client deliberately disables native 1M context.
+   */
+  nativeOneMillionContext?: boolean;
   /**
    * Live with-memory vs full-history routing. Omit to retain the legacy
    * single-memory-leg path (useful to embedders/tests); the CLI enables it.
@@ -212,6 +222,8 @@ interface ProxyState {
   abRouting?: ResolvedAbRoutingOptions;
   /** A memory winner carried through the current human turn's tool loop. */
   mainMemoryRoute?: MainMemoryRoute;
+  /** Stable normalized MemTree history has caught up with the legacy shape. */
+  legacyMemtreeMigrationComplete: boolean;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /** Fired by drain after its grace period so every forwarding path can stop. */
@@ -337,6 +349,46 @@ function resolveUpstream(opts: ProxyOptions): Upstream {
   };
 }
 
+function shouldProbeLegacyMemtree(
+  result: CompressResult,
+  sentMessages: Message[]
+): boolean {
+  if (!didMemtreeCompress(result)) return true;
+  // An index that covers everything but returns nothing scores a perfect tail.
+  // Probe on lost content too, or the emptiest answer ends the migration.
+  if (!checkCompressedHistory(result, sentMessages).usable) return true;
+  const unindexedTokens = unindexedPromptTokenCount(result);
+  return (
+    unindexedTokens !== undefined &&
+    unindexedTokens > LEGACY_PROBE_UNINDEXED_TOKENS
+  );
+}
+
+function isBetterLegacyMemtreeResult(
+  canonical: CompressResult,
+  canonicalMessages: Message[],
+  legacy: CompressResult,
+  legacyMessages: Message[]
+): boolean {
+  if (!didMemtreeCompress(legacy)) return false;
+  if (!didMemtreeCompress(canonical)) return true;
+  // Retained conversation dominates tail size: a candidate that kept the
+  // conversation always beats one that dropped it, however well it indexed.
+  const canonicalUsable = checkCompressedHistory(
+    canonical,
+    canonicalMessages
+  ).usable;
+  const legacyUsable = checkCompressedHistory(legacy, legacyMessages).usable;
+  if (canonicalUsable !== legacyUsable) return legacyUsable;
+  const canonicalTail = unindexedPromptTokenCount(canonical);
+  const legacyTail = unindexedPromptTokenCount(legacy);
+  return (
+    canonicalTail !== undefined &&
+    legacyTail !== undefined &&
+    legacyTail < canonicalTail
+  );
+}
+
 export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const upstream = resolveUpstream(opts);
   const hookPath = `/_ccc/hooks/${randomBytes(24).toString("hex")}`;
@@ -356,6 +408,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     abRouting: opts.abRouting
       ? resolveAbRoutingOptions(opts.abRouting)
       : undefined,
+    legacyMemtreeMigrationComplete: false,
     mainRouteEpoch: 0,
     shutdownSignal: shutdownAbort.signal,
   };
@@ -705,15 +758,31 @@ async function handleMessages(
   const isToolResultTurn = isToolResultUserMessage(lastMsg);
   const isAwaySummary = isAwaySummaryUserMessage(lastMsg);
   const isLocalBashCommand = isLocalBashCommandTurn(messages);
-  const isFollowupUserTurn =
-    isUserTurn && hasEarlierNonToolUserMessage(messages);
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
   // attribution before lifecycle-hook state so an agent request cannot claim
   // or consume a main prompt arm even if SubagentStart ordering is delayed.
   const isSubagentRequest = hasAgentAttribution(req);
   const isMainRequest = !isAwaySummary && !isSubagentRequest;
+  // A typed prompt that recovers an interrupted tool loop (or was queued
+  // mid-turn) arrives merged into the pending tool_result wrapper, so it fails
+  // isNonToolUserMessage -- while its UserPromptSubmit hook has already cleared
+  // the route expecting this request to rebuild it. Without this, that clear is
+  // never followed by a rebuild and every later tool turn forwards the full
+  // history (sticky passthrough until the next pure user turn). Corroborate
+  // with the armed hook prompt, and only when no installed route survives to
+  // ride -- an active route means the wrapper text matched by accident.
+  const isRecoveryPromptTurn =
+    isToolResultTurn &&
+    isMainRequest &&
+    !state.mainMemoryRoute &&
+    state.mainPromptArmed &&
+    !!state.mainPromptText &&
+    userMessageText(lastMsg).includes(state.mainPromptText);
+  const isCompressibleUserTurn = isUserTurn || isRecoveryPromptTurn;
+  const isFollowupUserTurn =
+    isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
   let routeEpoch = state.mainRouteEpoch;
-  if (isUserTurn && isMainRequest) {
+  if (isCompressibleUserTurn && isMainRequest) {
     routeEpoch = ++state.mainRouteEpoch;
     state.mainMemoryRoute = undefined;
   }
@@ -737,14 +806,18 @@ async function handleMessages(
     state.activeSubagents.size === 0;
   const noticePromptId = state.mainPromptId;
   const noticePromptGeneration = state.mainPromptGeneration;
-  // 1M context arrives as the `context-1m` beta header (Claude Code strips
-  // the `[1m]` model suffix on the wire), so the header must feed the limit.
+  // Extended 1M context arrives as the `context-1m` beta header (Claude Code
+  // strips the `[1m]` model suffix on the wire). Current native-1M models send
+  // neither, so contextLimitForModel also needs the launcher's native setting.
   const modelContextLimit = contextLimitForModel(
     body.model,
-    headerText(req.headers, "anthropic-beta")
+    headerText(req.headers, "anthropic-beta"),
+    opts.nativeOneMillionContext !== false
   );
-  const msgsForMemtree = messagesWithSystem(messages, body.system);
+  const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
+  const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
+  const legacyHash = MemtreeClient.hashMessages(rawMsgsForMemtree);
   const originalTokenCountKey = tokenCountKey(body, req.headers, req.url);
 
   // UserPromptSubmit clears/arms only a real main-thread human turn. Keep that
@@ -766,12 +839,7 @@ async function handleMessages(
     }
     let routedBody = forwardBody;
     let routedTool = false;
-    if (
-      isToolResultTurn &&
-      isMainRequest &&
-      state.abRouting &&
-      state.mainMemoryRoute
-    ) {
+    if (isToolResultTurn && isMainRequest && state.mainMemoryRoute) {
       const rewritten = memoryRoutedToolBody(
         body,
         messages,
@@ -782,11 +850,19 @@ async function handleMessages(
       if (rewritten) {
         routedBody = rewritten;
         routedTool = true;
+        if (opts.debug) {
+          console.error("[ccc proxy] tool turn matched active memory route");
+        }
       } else {
         // A mismatch means a different/resumed conversation shape. Never risk
         // grafting one session's compressed prefix onto another.
+        if (opts.debug) {
+          console.error("[ccc proxy] tool turn rejected active memory route");
+        }
         state.mainMemoryRoute = undefined;
       }
+    } else if (opts.debug && isToolResultTurn && isMainRequest) {
+      console.error("[ccc proxy] tool turn has no active memory route");
     }
     recordTurn(
       rec,
@@ -824,25 +900,68 @@ async function handleMessages(
   // producer suppression must also preserve the arm for the later main call.
   if (displayForThisTurn) state.mainPromptArmed = false;
   let result: CompressResult | null;
+  let usedLegacyFallback = false;
   try {
+    const compressMeta = {
+      // Model + tools drive the server's model-based memory budget
+      // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
+      // them silently downgrades to the server's static 50k fallback.
+      // `[1m]` is re-attached when the session is 1M-context so the
+      // server's budget telemetry names the variant it actually served.
+      model: modelForMemtree(
+        typeof body.model === "string" ? body.model : undefined,
+        modelContextLimit
+      ),
+      tools: Array.isArray(body.tools) ? body.tools : undefined,
+    };
     result = await opts.memtree.compress(
       hash,
       msgsForMemtree,
       modelContextLimit,
       state.shutdownSignal,
-      {
-        // Model + tools drive the server's model-based memory budget
-        // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
-        // them silently downgrades to the server's static 50k fallback.
-        // `[1m]` is re-attached when the session is 1M-context so the
-        // server's budget telemetry names the variant it actually served.
-        model: modelForMemtree(
-          typeof body.model === "string" ? body.model : undefined,
-          modelContextLimit
-        ),
-        tools: Array.isArray(body.tools) ? body.tools : undefined,
-      }
+      compressMeta
     );
+    if (
+      result &&
+      legacyHash !== hash &&
+      !state.legacyMemtreeMigrationComplete &&
+      shouldProbeLegacyMemtree(result, msgsForMemtree)
+    ) {
+      // The first request after this normalization ships may not match an
+      // existing signature-keyed index. The canonical call above starts the
+      // stable replacement index. Until it catches up, compare one lookup with
+      // the untouched shape so a shallow canonical hit cannot hide a much
+      // deeper same-model legacy index.
+      const legacyResult = await opts.memtree.compress(
+        legacyHash,
+        rawMsgsForMemtree,
+        modelContextLimit,
+        state.shutdownSignal,
+        compressMeta
+      );
+      if (legacyResult) {
+        if (
+          isBetterLegacyMemtreeResult(
+            result,
+            msgsForMemtree,
+            legacyResult,
+            rawMsgsForMemtree
+          )
+        ) {
+          result = legacyResult;
+          usedLegacyFallback = true;
+        } else {
+          state.legacyMemtreeMigrationComplete = true;
+        }
+      }
+    } else if (
+      result &&
+      legacyHash !== hash &&
+      didMemtreeCompress(result) &&
+      !shouldProbeLegacyMemtree(result, msgsForMemtree)
+    ) {
+      state.legacyMemtreeMigrationComplete = true;
+    }
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);
   }
@@ -854,6 +973,7 @@ async function handleMessages(
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
     timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
+    ...(usedLegacyFallback ? { legacyFallback: true } : {}),
   };
 
   if (
@@ -909,6 +1029,59 @@ async function handleMessages(
     );
   }
 
+  const actuallyCompressed = didMemtreeCompress(result);
+  // The legacy probe may have swapped in a result compressed from the untouched
+  // shape; measure retention against whatever we actually sent for the winner.
+  const historyCheck = checkCompressedHistory(
+    result,
+    usedLegacyFallback ? rawMsgsForMemtree : msgsForMemtree
+  );
+  rec.history = {
+    retainedChars: historyCheck.retainedChars,
+    priorHistoryChars: historyCheck.priorHistoryChars,
+    usable: historyCheck.usable,
+  };
+  if (!actuallyCompressed || !historyCheck.usable) {
+    // Two distinct ways to get an unusable answer, one recovery.
+    //
+    // No cached/indexed tokens means the server is still warming an index and
+    // returned the messages as-is. Preserve true passthrough semantics:
+    // flattening that no-op response changes Anthropic's structured
+    // conversation and made the first request disagree with the full-history
+    // tool loop that followed it.
+    //
+    // A fully indexed response that carries no prior conversation is the more
+    // dangerous case: it looks like a perfect compression by every usage-based
+    // measure, so nothing downstream would notice that the model is about to be
+    // asked to continue a conversation it can no longer see. Forwarding the
+    // real history costs context but never silently amnesias the session.
+    if (isMainRequest) state.mainMemoryRoute = undefined;
+    if (actuallyCompressed && opts.debug) {
+      console.error(
+        `[ccc proxy] memory response dropped the conversation ` +
+          `(retained ${historyCheck.retainedChars} of ` +
+          `${historyCheck.priorHistoryChars} prior chars); forwarding history`
+      );
+    }
+    recordTurn(
+      rec,
+      actuallyCompressed ? "followup-empty-memory" : "followup-noop",
+      forwardBody
+    );
+    capture(opts, "anthropic-request", forwardBody);
+    return logged(
+      forwardRaw(
+        req,
+        res,
+        forwardBody,
+        opts,
+        upstream,
+        state.shutdownSignal,
+        rec
+      )
+    );
+  }
+
   const processed = result.messages;
   const systemMsg = processed.find((m) => m.role === "system");
   const compressedBody: Record<string, any> = {
@@ -926,7 +1099,6 @@ async function handleMessages(
         `${compressedRaw.length} body bytes`
     );
   }
-  const actuallyCompressed = didMemtreeCompress(result);
   const abRouting = state.abRouting;
   if (
     abRouting &&
@@ -948,6 +1120,38 @@ async function handleMessages(
     actuallyCompressed &&
     body.stream === true &&
     isMainRequest;
+
+  // Claude can consume message_stop, execute a fast local tool, and close the
+  // SSE response before Node observes the downstream HTTP `finish` event.
+  // Activate the route once the complete Anthropic response has been accepted
+  // by the downstream response, so an immediate tool-result request cannot
+  // race the later forwardRaw() delivery promise.
+  let routeActivationAttempted = false;
+  const activateMainMemoryRoute = () => {
+    if (routeActivationAttempted || !actuallyCompressed) return;
+    if (!isMainRequest || state.mainRouteEpoch !== routeEpoch) {
+      routeActivationAttempted = true;
+      return;
+    }
+    const installed = installMainMemoryRoute(
+      state,
+      req,
+      body,
+      messages,
+      compressedBody,
+      routeEpoch
+    );
+    // Leave this false if installMainMemoryRoute unexpectedly throws: the
+    // delivery-complete fallback then gets one safe retry.
+    routeActivationAttempted = true;
+    if (opts.debug) {
+      console.error(
+        `[ccc proxy] memory route activation: ${
+          installed ? "installed" : "unavailable"
+        }`
+      );
+    }
+  };
 
   if (canRouteAb) {
     // M1c gates on the whole A request. Until count_tokens is available here,
@@ -975,7 +1179,9 @@ async function handleMessages(
           opts,
           upstream,
           state.shutdownSignal,
-          rec
+          rec,
+          undefined,
+          activateMainMemoryRoute
         ).then(
           (delivered) => {
             rec.comparison!.deliveryOk = delivered;
@@ -990,15 +1196,11 @@ async function handleMessages(
                 originalTokenCountKey,
                 rec,
               });
-              installMainMemoryRoute(
-                state,
-                req,
-                body,
-                messages,
-                compressedBody,
-                routeEpoch
-              );
-            } else if (state.mainRouteEpoch === routeEpoch) {
+              activateMainMemoryRoute();
+            } else if (
+              state.mainRouteEpoch === routeEpoch &&
+              !routeActivationAttempted
+            ) {
               state.mainMemoryRoute = undefined;
             }
           }
@@ -1006,6 +1208,9 @@ async function handleMessages(
       );
     }
 
+    // Compared streams retain their stricter selected-delivery invariant:
+    // onDeliveryComplete below owns route installation because the delivered
+    // response may be memory, full history, or a splice of both.
     return logged(
       forwardComparedSse({
         req,
@@ -1101,7 +1306,7 @@ async function handleMessages(
     );
   }
 
-  if (abRouting && isMainRequest) state.mainMemoryRoute = undefined;
+  if (isMainRequest) state.mainMemoryRoute = undefined;
   recordTurn(rec, "followup-compressed", compressedRaw);
   capture(opts, "anthropic-request", compressedRaw);
   // Preserve the legacy embedder contract: without A/B enabled, a long live
@@ -1127,20 +1332,34 @@ async function handleMessages(
       opts,
       upstream,
       state.shutdownSignal,
-      rec
+      rec,
+      undefined,
+      activateMainMemoryRoute
     ).then(
       (delivered) => {
-        if (!abRouting || !actuallyCompressed || !delivered) return;
-        queueCompressionNotice({
-          state,
-          displayForThisTurn,
-          noticePromptGeneration,
-          noticePromptId,
-          result,
-          compressMs,
-          originalTokenCountKey,
-          rec,
-        });
+        if (!actuallyCompressed || !delivered) return;
+        // The notice is the only part that stayed A/B-conditional here: the
+        // legacy path already queued it above, before the stream started.
+        if (abRouting) {
+          queueCompressionNotice({
+            state,
+            displayForThisTurn,
+            noticePromptGeneration,
+            noticePromptId,
+            result,
+            compressMs,
+            originalTokenCountKey,
+            rec,
+          });
+        }
+        // Route the rest of this human turn's tool loop — and the count_tokens
+        // calls Claude Code sizes its context with — through the same compressed
+        // prefix. Without this the tool loop re-sends the full history, so
+        // count_tokens reports the uncompressed conversation and Claude Code
+        // auto-compacts a context that memory had already shrunk.
+        // Retain delivery completion as a defensive retry if protocol-time
+        // route bookkeeping failed unexpectedly.
+        activateMainMemoryRoute();
       }
     )
   );
@@ -1201,8 +1420,8 @@ function installMainMemoryRoute(
   originalMessages: Message[],
   compressedBody: Record<string, any>,
   routeEpoch: number
-): void {
-  if (state.mainRouteEpoch !== routeEpoch) return;
+): boolean {
+  if (state.mainRouteEpoch !== routeEpoch) return false;
   const sessionId = requestSessionId(req);
   if (
     !sessionId ||
@@ -1210,13 +1429,13 @@ function installMainMemoryRoute(
     !Array.isArray(compressedBody.messages)
   ) {
     state.mainMemoryRoute = undefined;
-    return;
+    return false;
   }
   state.mainMemoryRoute = {
     sessionId,
     model: originalBody.model,
     originalSystemHash: routeValueHash(
-      withoutContentBlockCacheControl(originalBody.system)
+      normalizeRouteSystem(originalBody.system)
     ),
     // Include trailing ambient role=system blocks: MemTree consolidated them
     // into compressedBody.system, so treating them as suffix would duplicate
@@ -1230,6 +1449,7 @@ function installMainMemoryRoute(
     ),
     routeEpoch,
   };
+  return true;
 }
 
 function memoryRoutedToolBody(
@@ -1244,7 +1464,7 @@ function memoryRoutedToolBody(
     route.sessionId !== sessionId ||
     route.routeEpoch !== routeEpoch ||
     body.model !== route.model ||
-    routeValueHash(withoutContentBlockCacheControl(body.system)) !==
+    routeValueHash(normalizeRouteSystem(body.system)) !==
       route.originalSystemHash
   ) {
     return null;
@@ -1262,8 +1482,11 @@ function memoryRoutedToolBody(
     ...body,
     messages: [...cloneJson(route.compressedMessages), ...suffix],
   };
-  if (route.hasCompressedSystem) routed.system = cloneJson(route.compressedSystem);
-  else delete routed.system;
+  if (route.hasCompressedSystem) {
+    routed.system = currentRouteSystem(route.compressedSystem, body.system);
+  } else {
+    delete routed.system;
+  }
   return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 
@@ -1285,28 +1508,141 @@ function routeValueHash(value: unknown): string {
 
 function normalizeRouteMessage(message: Message): Message {
   const normalized = cloneJson(message);
-  if (normalized.role === "user" && typeof normalized.content === "string") {
-    normalized.content = [{ type: "text", text: normalized.content }];
-  }
-  normalized.content = normalizeReminderContent(normalized.content);
-  normalized.content = withoutContentBlockCacheControl(normalized.content);
+  normalized.content = normalizeRouteContent(normalized.content);
   return normalized;
 }
 
+/** Canonicalize semantically identical Anthropic content representations. */
+function normalizeRouteContent(content: unknown): unknown {
+  const blocks =
+    typeof content === "string"
+      ? [{ type: "text", text: content }]
+      : content;
+  return withoutContentBlockCacheControl(normalizeReminderContent(blocks));
+}
+
+/**
+ * Claude Code changes request-attribution fields such as `cch` and
+ * `cc_prev_req` during a tool loop. That synthetic top-level system block is
+ * not conversation identity. Ignore exactly one standalone billing block
+ * there, while keeping header-like text in messages fully identity-bearing.
+ */
+function normalizeRouteSystem(system: unknown): unknown {
+  const normalized = normalizeRouteContent(system);
+  const headers = routeBillingHeaders(normalized);
+  if (headers.length !== 1) return normalized;
+  return replaceSingleRouteBillingHeader(
+    normalized,
+    ROUTE_BILLING_HEADER_PLACEHOLDER
+  );
+}
+
 function normalizeReminderContent(content: unknown): unknown {
-  if (typeof content === "string") return stripSystemReminderText(content);
+  if (typeof content === "string") return normalizeRouteText(content);
   if (!Array.isArray(content)) return content;
   return content.map((part) => {
-    if (typeof part === "string") return stripSystemReminderText(part);
+    if (typeof part === "string") return normalizeRouteText(part);
     if (!part || typeof part !== "object") return part;
     const copy = { ...(part as Record<string, unknown>) };
     if (copy.type === "text" && typeof copy.text === "string") {
-      copy.text = stripSystemReminderText(copy.text);
+      copy.text = normalizeRouteText(copy.text);
     } else if (copy.type === "tool_result") {
       copy.content = normalizeReminderContent(copy.content);
     }
     return copy;
   });
+}
+
+const ROUTE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
+const ROUTE_BILLING_HEADER_PLACEHOLDER =
+  "x-anthropic-billing-header: <dynamic>";
+
+function normalizeRouteText(text: string): string {
+  return stripSystemReminderText(text);
+}
+
+/** Preserve Claude's current per-request billing metadata after prefix grafting. */
+function currentRouteSystem(
+  compressedSystem: unknown,
+  currentSystem: unknown
+): unknown {
+  const currentHeaders = routeBillingHeaders(currentSystem);
+  const compressedHeaders = routeBillingHeaders(compressedSystem);
+  if (currentHeaders.length !== 1 || compressedHeaders.length !== 1) {
+    return cloneJson(compressedSystem);
+  }
+  return replaceSingleRouteBillingHeader(
+    cloneJson(compressedSystem),
+    currentHeaders[0]
+  );
+}
+
+function routeBillingHeaders(value: unknown): string[] {
+  if (typeof value === "string") {
+    return isRouteBillingHeader(value) ? [value] : [];
+  }
+  if (!Array.isArray(value)) return [];
+  const headers: string[] = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      if (isRouteBillingHeader(item)) headers.push(item);
+      continue;
+    }
+    if (
+      item &&
+      typeof item === "object" &&
+      (item as Record<string, unknown>).type === "text"
+    ) {
+      const text = (item as Record<string, unknown>).text;
+      if (typeof text === "string" && isRouteBillingHeader(text)) {
+        headers.push(text);
+      }
+    }
+  }
+  return headers;
+}
+
+function isRouteBillingHeader(text: string): boolean {
+  if (
+    /[\r\n]/.test(text) ||
+    !text.startsWith(ROUTE_BILLING_HEADER_PREFIX)
+  ) {
+    return false;
+  }
+  const fields = text.slice(ROUTE_BILLING_HEADER_PREFIX.length).trim();
+  return (
+    /^cc_version=[^;]+;/.test(fields) &&
+    /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields)
+  );
+}
+
+function replaceSingleRouteBillingHeader(
+  value: unknown,
+  replacement: string
+): unknown {
+  if (typeof value === "string") {
+    return isRouteBillingHeader(value) ? replacement : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (typeof item === "string") {
+        return isRouteBillingHeader(item) ? replacement : item;
+      }
+      if (
+        !item ||
+        typeof item !== "object" ||
+        (item as Record<string, unknown>).type !== "text"
+      ) {
+        return item;
+      }
+      const block = item as Record<string, unknown>;
+      return typeof block.text === "string" &&
+        isRouteBillingHeader(block.text)
+        ? { ...block, text: replacement }
+        : item;
+    });
+  }
+  return value;
 }
 
 /** Ignore only Anthropic content-block cache metadata, never user/tool data. */
@@ -1528,7 +1864,6 @@ async function handleCountTokens(
       let countedBody = body;
       const lastMsg = lastNonSystemMessage(body.messages);
       if (
-        state.abRouting &&
         state.mainMemoryRoute &&
         isToolResultUserMessage(lastMsg) &&
         !hasAgentAttribution(req)
@@ -3455,7 +3790,8 @@ function forwardRaw(
   upstream: Upstream,
   shutdownSignal: AbortSignal,
   rec?: MessagesRecord,
-  onJsonResponse?: (body: Buffer) => void
+  onJsonResponse?: (body: Buffer) => void,
+  onProtocolComplete?: () => void
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
@@ -3477,9 +3813,25 @@ function forwardRaw(
     let successfulStatus = false;
     let clientAborted = false;
     let shutdownCancelled = false;
+    let protocolCompleteNotified = false;
     let upstreamReq: http.ClientRequest | undefined;
     let activeUpstreamRes: http.IncomingMessage | undefined;
 
+    const notifyProtocolComplete = () => {
+      if (
+        protocolCompleteNotified ||
+        !successfulStatus ||
+        onProtocolComplete === undefined
+      ) {
+        return;
+      }
+      protocolCompleteNotified = true;
+      try {
+        onProtocolComplete();
+      } catch {
+        // Route/observer bookkeeping can never affect byte delivery.
+      }
+    };
     const settle = (ok: boolean) => {
       if (settled) return;
       settled = true;
@@ -3507,6 +3859,7 @@ function forwardRaw(
     const completeUpstream = (complete: boolean) => {
       upstreamCompleted = true;
       protocolComplete = complete;
+      if (complete && !res.destroyed) notifyProtocolComplete();
       if (res.destroyed && !res.writableFinished) {
         settle(false);
         return;
@@ -3553,7 +3906,6 @@ function forwardRaw(
         let sawMessageStop = false;
         let observerFailed = false;
         const observeSseEvent = (data: any) => {
-          if (data?.type === "message_stop") sawMessageStop = true;
           if (rec) {
             mergeUsageFromSseEvent(data, rec);
             if (
@@ -3562,6 +3914,9 @@ function forwardRaw(
             ) {
               rec.firstContentMs = Date.now() - forwardStarted;
             }
+          }
+          if (data?.type === "message_stop") {
+            sawMessageStop = true;
           }
         };
         const sseObserver = isSse
@@ -3621,13 +3976,14 @@ function forwardRaw(
           });
           res.once("close", () => incrementalDecoder.destroy());
 
-          const forwardEncoded = (chunk: Buffer) => {
+          const forwardEncoded = (chunk: Buffer): boolean => {
             if (res.destroyed || res.writableEnded) {
               upstreamRes.destroy();
-              return;
+              return false;
             }
             if (res.write(chunk)) upstreamRes.resume();
             else res.once("drain", () => upstreamRes.resume());
+            return true;
           };
 
           upstreamRes.on("data", (chunk: Buffer) => {
@@ -3638,10 +3994,12 @@ function forwardRaw(
               return;
             }
             let forwarded = false;
-            const forwardOnce = () => {
-              if (forwarded) return;
+            let accepted = false;
+            const forwardOnce = (): boolean => {
+              if (forwarded) return accepted;
               forwarded = true;
-              forwardEncoded(chunk);
+              accepted = forwardEncoded(chunk);
+              return accepted;
             };
             pendingForward = forwardOnce;
             try {
@@ -3651,7 +4009,14 @@ function forwardRaw(
                   observerFailed = true;
                 }
                 if (pendingForward === forwardOnce) pendingForward = null;
-                forwardOnce();
+                const chunkAccepted = forwardOnce();
+                if (
+                  chunkAccepted &&
+                  !decoderFailed &&
+                  sawMessageStop
+                ) {
+                  notifyProtocolComplete();
+                }
               });
             } catch {
               decoderFailed = true;
@@ -3709,6 +4074,17 @@ function forwardRaw(
 
         upstreamRes.on("data", observeRawChunk);
         upstreamRes.pipe(res);
+        if (isSse && !compressed) {
+          // Registered after pipe(), so this runs only after the raw chunk
+          // containing the complete message_stop frame has been accepted by
+          // ServerResponse. The callback still runs synchronously before a
+          // client can issue the resulting tool request.
+          upstreamRes.on("data", () => {
+            if (sawMessageStop && !observerFailed && !res.destroyed) {
+              notifyProtocolComplete();
+            }
+          });
+        }
         upstreamRes.on("end", () => {
           let observed: Buffer | null = null;
           if (observedChunks) {

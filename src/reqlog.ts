@@ -39,6 +39,9 @@ export type TurnType =
   | "tool"
   | "tool-memory"
   | "followup-compressed"
+  | "followup-noop"
+  /** Indexed response that carried no prior conversation; history forwarded. */
+  | "followup-empty-memory"
   | "followup-ab-pending"
   | "followup-ab-failed"
   | "followup-ab-memory"
@@ -150,7 +153,23 @@ export interface MessagesRecord {
   /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
   approxInputTokens?: number;
   /** Present when a blocking MemTree compress was attempted for this turn. */
-  compress?: { ms: number; ok: boolean; timedOut: boolean };
+  compress?: {
+    ms: number;
+    ok: boolean;
+    timedOut: boolean;
+    /** Canonical miss recovered from a pre-normalization signed-thinking index. */
+    legacyFallback?: boolean;
+  };
+  /**
+   * How much conversation the compressed response actually carried. Recorded
+   * separately from `compress.ok` because a fully indexed response can still
+   * return an empty conversation; this is the field that shows it.
+   */
+  history?: {
+    retainedChars: number;
+    priorHistoryChars: number;
+    usable: boolean;
+  };
   /** Present when live memory-vs-full routing was eligible for this turn. */
   comparison?: ComparisonRecord;
   upstreamStatus?: number;

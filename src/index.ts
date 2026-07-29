@@ -27,11 +27,18 @@ export type {
   FusionVerdict,
 } from "./ab-routing.js";
 export {
+  checkCompressedHistory,
   didMemtreeCompress,
   MemtreeClient,
+  MIN_RETAINED_HISTORY_CHARS,
+  normalizeMessagesForMemtree,
   rawPromptTokenCount,
 } from "./memtree.js";
-export type { MemtreeOptions, CompressResult } from "./memtree.js";
+export type {
+  MemtreeOptions,
+  CompressResult,
+  CompressedHistoryCheck,
+} from "./memtree.js";
 export {
   isNonToolUserMessage,
   isToolResultUserMessage,
