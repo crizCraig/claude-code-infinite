@@ -194,43 +194,91 @@ export interface CompressedHistoryCheck {
 }
 
 /**
- * The rendered text pieces of a content field, mirroring contentChars: plain
- * strings, `text` blocks, thinking text (signatures dropped), no
+ * One rendered text piece of a content field. `joinable` marks plain text —
+ * string content and `text` blocks — that reads as one contiguous passage
+ * when consecutive, so adjacent joinable pieces may be coalesced when hunting
+ * for echoes split across block boundaries. Thinking text and JSON-serialized
+ * blocks are never joinable: they are distinct renderings, and anything
+ * between two text pieces breaks their adjacency.
+ */
+interface TextSegment {
+  text: string;
+  joinable: boolean;
+}
+
+/**
+ * The rendered text segments of a content field, mirroring contentChars:
+ * plain strings, `text` blocks, thinking text (signatures dropped), no
  * redacted_thinking, and JSON serialization for anything else. Used to locate
  * verbatim echoes of the sent current turn inside a compressed result.
  */
-function contentTextPieces(content: unknown, out: string[]): void {
+function contentTextSegments(content: unknown, out: TextSegment[]): void {
   if (content == null) return;
   if (typeof content === "string") {
-    if (content) out.push(content);
+    if (content) out.push({ text: content, joinable: true });
     return;
   }
   if (Array.isArray(content)) {
-    for (const part of content) contentTextPieces(part, out);
+    for (const part of content) contentTextSegments(part, out);
     return;
   }
   if (typeof content !== "object") {
-    out.push(String(content));
+    out.push({ text: String(content), joinable: true });
     return;
   }
   const block = content as Record<string, unknown>;
   if (block.type === "thinking") {
     if (typeof block.thinking === "string" && block.thinking) {
-      out.push(block.thinking);
+      out.push({ text: block.thinking, joinable: false });
     }
     return;
   }
   if (block.type === "redacted_thinking") return;
   if (typeof block.text === "string") {
-    if (block.text) out.push(block.text);
+    if (block.text) out.push({ text: block.text, joinable: true });
     return;
   }
   try {
     const json = JSON.stringify(block);
-    if (json) out.push(json);
+    if (json) out.push({ text: json, joinable: false });
   } catch {
     // unserializable block contributes nothing, matching contentChars
   }
+}
+
+/** The rendered text pieces of a content field, in order. */
+function contentTextPieces(content: unknown, out: string[]): void {
+  const segments: TextSegment[] = [];
+  contentTextSegments(content, segments);
+  for (const segment of segments) out.push(segment.text);
+}
+
+/**
+ * The text pieces of one message's content, grouped into runs of ADJACENT
+ * joinable pieces: consecutive plain-text pieces with nothing rendered
+ * between them form one run, while thinking text and JSON-serialized blocks
+ * each stand alone and break adjacency on both sides. A run's pieces
+ * concatenate to the contiguous passage the model would read, which is where
+ * an echo fragmented across text-block boundaries becomes visible again.
+ */
+function contentTextRuns(content: unknown): string[][] {
+  const segments: TextSegment[] = [];
+  contentTextSegments(content, segments);
+  const runs: string[][] = [];
+  let current: string[] | null = null;
+  for (const segment of segments) {
+    if (segment.joinable) {
+      if (!current) {
+        current = [];
+        runs.push(current);
+      }
+      current.push(segment.text);
+    } else {
+      current = null;
+      runs.push([segment.text]);
+    }
+  }
+  return runs;
 }
 
 /**
@@ -245,18 +293,62 @@ function contentTextPieces(content: unknown, out: string[]): void {
 const ECHO_MIN_PIECE_CHARS = 32;
 
 /**
+ * Echoed characters within one result text: the whole text when it is
+ * contained in the current turn (a full or truncated echo), otherwise every
+ * NON-OVERLAPPING occurrence of each current-turn piece embedded inside it
+ * (memory and echo concatenated into one text). Occurrences are counted, not
+ * merely detected: a single memory blob that carries the turn twice — e.g.
+ * two overlapping index nodes each returning the just-indexed turn — is two
+ * echoes, and both must be subtracted or the second copy scores as retained
+ * prior conversation and passes the empty-memory gate. Texts and turn pieces
+ * shorter than ECHO_MIN_PIECE_CHARS never count on either side of the check.
+ */
+function echoedCharsInText(
+  text: string,
+  turnText: string,
+  turnPieces: string[]
+): number {
+  if (text.length >= ECHO_MIN_PIECE_CHARS && turnText.includes(text)) {
+    return text.length;
+  }
+  let echoed = 0;
+  for (const turnPiece of turnPieces) {
+    if (turnPiece.length < ECHO_MIN_PIECE_CHARS) continue;
+    let idx = text.indexOf(turnPiece);
+    while (idx !== -1) {
+      echoed += turnPiece.length;
+      idx = text.indexOf(turnPiece, idx + turnPiece.length);
+    }
+  }
+  return echoed;
+}
+
+/**
  * Characters of the result body that are a VERBATIM echo of the sent current
- * turn: result pieces contained in the current turn's text (a full or
- * truncated echo) plus current-turn pieces embedded whole inside a larger
- * result piece (memory and echo concatenated into one message). EVERY verbatim
- * copy counts — a result that embeds the turn inside its memory block AND
- * replays it as the tail is charged for both copies, so the total may exceed
- * the turn's own length. Over-subtraction fails safe: a verbatim copy of
- * current-turn content is by definition not prior conversation. Pieces shorter
- * than ECHO_MIN_PIECE_CHARS never count on either side of the containment
- * check: tiny fragments shared between the turn and the result (quoted-back
- * prior messages, repeated pastes) are genuine retained history, not echo.
- * Content the server rewrote — e.g. a summary of a huge pasted log —
+ * turn: result text contained in the current turn's text (a full or
+ * truncated echo) plus current-turn pieces embedded whole inside larger
+ * result text (memory and echo concatenated into one message). EVERY verbatim
+ * copy counts — a result that embeds the turn twice inside one memory blob,
+ * or once in the memory block AND again as a replayed tail, is charged for
+ * both copies, so the total may exceed the turn's own length.
+ * Over-subtraction fails safe: a verbatim copy of current-turn content is by
+ * definition not prior conversation.
+ *
+ * Each message's text is scored per RUN of adjacent plain-text pieces
+ * (contentTextRuns): a run is charged the larger of its coalesced-text echo
+ * and the sum of its individual pieces' echoes. The coalesced check catches
+ * an echo fragmented across consecutive text blocks — sub-floor slivers that
+ * individually dodge the length gate but concatenate back into the turn —
+ * while the per-piece check still catches a truncated-echo block sitting
+ * next to unrelated prose blocks, which coalescing alone would hide inside a
+ * non-matching combined string. Taking the max never double-charges one copy.
+ *
+ * Texts shorter than ECHO_MIN_PIECE_CHARS never count on either side of the
+ * containment check: tiny fragments shared between the turn and the result
+ * (quoted-back prior messages, repeated pastes) are genuine retained history,
+ * not echo — and because quoted fragments in genuine memory are separated by
+ * surrounding prose, coalescing their run does not turn them into echo
+ * either. Content the server rewrote — e.g. a summary of a huge pasted log —
  * deliberately does not count as echo: rewriting is compression work, and its
  * output is retained context, not a replay of the input.
  */
@@ -269,29 +361,24 @@ function echoedCurrentTurnChars(
   if (turnPieces.length === 0) return 0;
   const turnText = turnPieces.join("");
 
-  const resultPieces: string[] = [];
+  let echoed = 0;
   for (const message of result.messages ?? []) {
     if (message.role === "system") continue;
-    contentTextPieces(message.content, resultPieces);
-  }
-
-  let echoed = 0;
-  for (const piece of resultPieces) {
-    if (piece.length >= ECHO_MIN_PIECE_CHARS && turnText.includes(piece)) {
-      echoed += piece.length;
-      continue;
-    }
-    // Each turn piece is credited once per CONTAINING result piece, not once
-    // globally: two result pieces that each carry a verbatim copy are two
-    // echoes, and both must be subtracted or a double echo nets out to the
-    // size of a single one and passes the empty-memory gate.
-    for (const turnPiece of turnPieces) {
-      if (
-        turnPiece.length >= ECHO_MIN_PIECE_CHARS &&
-        piece.includes(turnPiece)
-      ) {
-        echoed += turnPiece.length;
+    for (const run of contentTextRuns(message.content)) {
+      // Each turn copy is charged once per containing text, and occurrences
+      // within one text are each charged (echoedCharsInText): two result
+      // texts that each carry a copy are two echoes, as are two copies
+      // concatenated into one text — all must be subtracted or a double echo
+      // nets out to a single turn's worth and passes the empty-memory gate.
+      let perPiece = 0;
+      for (const piece of run) {
+        perPiece += echoedCharsInText(piece, turnText, turnPieces);
       }
+      const coalesced =
+        run.length > 1
+          ? echoedCharsInText(run.join(""), turnText, turnPieces)
+          : perPiece;
+      echoed += Math.max(coalesced, perPiece);
     }
   }
   return echoed;
@@ -319,11 +406,13 @@ function echoedCurrentTurnChars(
  * current turn back with essentially nothing of the prior conversation — still
  * scores ~0, because every verbatim echo (whole, truncated, or embedded in a
  * larger message) is fully subtracted, and a double echo — the turn embedded
- * in the memory block AND replayed as the tail — is charged for both copies
- * rather than netting out to a single turn's worth of "retained" text.
- * Fragments below a small length floor are never counted as echo, so a turn
- * that quotes prior messages cannot sink the genuine memory that contains
- * those same fragments. A rewritten-but-still-empty answer can
+ * in the memory block AND replayed as the tail, or carried twice within one
+ * memory blob — is charged for every copy rather than netting out to a
+ * single turn's worth of "retained" text. An echo fragmented across
+ * consecutive text blocks is caught by re-checking each run of adjacent
+ * plain-text pieces as one coalesced passage. Fragments below a small length
+ * floor are never counted as echo, so a turn that quotes prior messages
+ * cannot sink the genuine memory that contains those same fragments. A rewritten-but-still-empty answer can
  * in principle slip through; the trade is deliberate, since rewriting proves
  * the server did compression work rather than dropping context.
  */

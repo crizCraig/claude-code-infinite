@@ -3363,6 +3363,80 @@ test("checkCompressedHistory: a double verbatim echo cannot pass the empty-memor
   );
 });
 
+test("checkCompressedHistory: two verbatim copies inside ONE text block cannot pass the empty-memory gate", () => {
+  // Two overlapping index nodes both return the just-indexed turn and the
+  // server concatenates them into a single memory text. Boolean containment
+  // subtracts only one copy and lets the second score as retained prior
+  // conversation; occurrence counting must subtract both.
+  const turn = "Retry this exact request body please. ".repeat(139); // ~5.3k chars
+  const sent = [
+    { role: "user", content: "Investigate the flaky deploy" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking into the deploy pipeline now. ".repeat(250) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const singleBlockDoubleEcho = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `Relevant memory:\n${turn}\n---\n${turn}` },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    singleBlockDoubleEcho.usable,
+    false,
+    "two verbatim copies concatenated into one text block are still empty memory"
+  );
+});
+
+test("checkCompressedHistory: an echo fragmented into sub-floor text blocks cannot pass the empty-memory gate", () => {
+  // The current turn echoed back as many consecutive 31-char text blocks:
+  // each fragment is below the echo length floor, but the blocks are adjacent
+  // with nothing between them, so they coalesce back into the verbatim turn
+  // and must be subtracted in full.
+  const turn = "Retry this exact request body please. ".repeat(139); // ~5.3k chars
+  const sent = [
+    { role: "user", content: "Investigate the flaky deploy" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking into the deploy pipeline now. ".repeat(250) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const fragments = [];
+  for (let i = 0; i < turn.length; i += 31) {
+    fragments.push({ type: "text", text: turn.slice(i, i + 31) });
+  }
+  assert.ok(
+    fragments.every((f) => f.text.length < 32),
+    "scenario premise: every fragment is below the echo floor"
+  );
+  const fragmentedEcho = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: fragments },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    fragmentedEcho.usable,
+    false,
+    "a turn echoed as consecutive sub-floor text blocks is still empty memory"
+  );
+});
+
 test("checkCompressedHistory: small quoted fragments of the current turn are not echo", () => {
   // The current turn quotes a short phrase from earlier in the conversation;
   // genuine memory legitimately contains that same phrase. Fragments below
