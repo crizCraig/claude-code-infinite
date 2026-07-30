@@ -3486,6 +3486,121 @@ test("checkCompressedHistory: small quoted fragments of the current turn are not
   );
 });
 
+test("checkCompressedHistory: a framed AND truncated echo cannot pass the empty-memory gate", () => {
+  // The shape exact matching missed on both sides at once: a framing prefix
+  // means the result text is not a substring of the turn, and truncation
+  // means no whole turn piece occurs in the result text — yet ~40k of the
+  // text is a verbatim echo and there is zero prior conversation. The
+  // probe-and-extend scan must charge the echoed span in full.
+  const pastedLog =
+    "2026-07-29T10:00:01Z ERROR request failed with ECONNRESET in worker 7\n".repeat(
+      1_450
+    ); // ~100k chars
+  const turn = `Here is the full log:\n${pastedLog}`;
+  const sent = [
+    { role: "user", content: "Help me debug these crashes" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Sure — paste the logs. ".repeat(200) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const framedTruncatedEcho = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `The user said:\n${turn.slice(0, 40_000)}` },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 29_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    framedTruncatedEcho.usable,
+    false,
+    "a framed, truncated verbatim echo with no prior conversation is still empty memory"
+  );
+});
+
+test("checkCompressedHistory: a front-truncated echo is caught by the tail probe", () => {
+  // A budget cutoff can also drop the FRONT of the echo: the result carries
+  // framing plus the turn's tail. The head of the turn never appears in the
+  // text, so only a probe anchored at the turn's tail can find the copy.
+  const pastedLog =
+    "2026-07-29T10:00:01Z ERROR request failed with ECONNRESET in worker 7\n".repeat(
+      1_450
+    ); // ~100k chars
+  const turn = `Here is the full log:\n${pastedLog}`;
+  const sent = [
+    { role: "user", content: "Help me debug these crashes" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Sure — paste the logs. ".repeat(200) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const frontTruncatedEcho = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `The user said:\n${turn.slice(-40_000)}` },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 29_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    frontTruncatedEcho.usable,
+    false,
+    "a framed, front-truncated verbatim echo with no prior conversation is still empty memory"
+  );
+});
+
+test("checkCompressedHistory: a fragmented echo plus a distinct truncated copy are both charged", () => {
+  // One run carries the turn twice: reassembled from sub-floor fragments AND
+  // as a separate truncated block. Scoring the run as max(coalesced,
+  // per-piece) charged only the larger copy and let the other copy's
+  // characters score as retained prior conversation; a single masking scan
+  // over the coalesced run must charge each copy once.
+  const turn = "Retry this exact request body please. ".repeat(139); // ~5.4k chars
+  const sent = [
+    { role: "user", content: "Investigate the flaky deploy" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Looking into the deploy pipeline now. ".repeat(250) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const fragments = [];
+  for (let i = 0; i < turn.length; i += 31) {
+    fragments.push({ type: "text", text: turn.slice(i, i + 31) });
+  }
+  const bothCopies = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        {
+          role: "user",
+          content: [...fragments, { type: "text", text: turn.slice(0, 3_000) }],
+        },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    bothCopies.usable,
+    false,
+    "a fragmented copy plus a truncated copy of the turn are still empty memory"
+  );
+});
+
 test("a fully indexed empty memory forwards real history instead of amnesia", async () => {
   const question = "Now output detailed remediation steps";
   const records = [];

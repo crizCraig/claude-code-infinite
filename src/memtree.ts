@@ -282,42 +282,141 @@ function contentTextRuns(content: unknown): string[][] {
 }
 
 /**
- * Below this length a match between a result piece and the current turn is
+ * Below this length a match between result text and the current turn is
  * treated as coincidence, not echo. Small fragments legitimately recur in both
  * directions — the current turn quoting a prior message back, memory quoting a
  * phrase the turn repeats — and counting them as echo would sink genuine
  * retained history on overlap-heavy turns. Sized well below the shortest
  * echo worth catching (an empty-memory replay of a >= ~2k-char turn) and above
- * incidental shared phrases.
+ * incidental shared phrases. Also the length of the head/tail probes in the
+ * echo scan, which is what enforces the floor there: a probe IS a 32-char
+ * verbatim match, so nothing shorter can ever be charged.
  */
 const ECHO_MIN_PIECE_CHARS = 32;
 
+/** A span [start, end) of a run text already charged as echo. */
+interface EchoSpan {
+  start: number;
+  end: number;
+}
+
+/** Whether [start, end) intersects any charged span. */
+function overlapsEchoSpan(
+  spans: EchoSpan[],
+  start: number,
+  end: number
+): boolean {
+  return spans.some((s) => start < s.end && end > s.start);
+}
+
+/** The nearest charged-span start at or after pos: the forward-extension cap. */
+function nextEchoSpanStart(
+  spans: EchoSpan[],
+  pos: number,
+  fallback: number
+): number {
+  let cap = fallback;
+  for (const s of spans) if (s.start >= pos && s.start < cap) cap = s.start;
+  return cap;
+}
+
+/** The nearest charged-span end at or before pos: the backward-extension floor. */
+function prevEchoSpanEnd(spans: EchoSpan[], pos: number): number {
+  let floor = 0;
+  for (const s of spans) if (s.end <= pos && s.end > floor) floor = s.end;
+  return floor;
+}
+
 /**
- * Echoed characters within one result text: the whole text when it is
- * contained in the current turn (a full or truncated echo), otherwise every
- * NON-OVERLAPPING occurrence of each current-turn piece embedded inside it
- * (memory and echo concatenated into one text). Occurrences are counted, not
- * merely detected: a single memory blob that carries the turn twice — e.g.
- * two overlapping index nodes each returning the just-indexed turn — is two
- * echoes, and both must be subtracted or the second copy scores as retained
- * prior conversation and passes the empty-memory gate. Texts and turn pieces
- * shorter than ECHO_MIN_PIECE_CHARS never count on either side of the check.
+ * Echoed characters within one run text (the coalesced passage of adjacent
+ * plain-text pieces the model would read). Two mechanisms, both anchored to
+ * the sent current turn:
+ *
+ * - Whole-text containment: a run text that is itself a verbatim slice of the
+ *   turn — whole, truncated at either end, or cut from the middle — is echo
+ *   in full. Nothing the probe scan could find exceeds that, so it returns
+ *   directly.
+ * - Probe-and-extend masking scan: for every framed or truncated copy, a
+ *   32-char probe from each END of each turn piece (head and tail) is
+ *   searched for in the run text; every hit is extended greedily through the
+ *   piece in the anchored direction (forward from a head hit, backward from a
+ *   tail hit), the extended span is charged and masked so no later probe can
+ *   re-charge it, and scanning continues past the span. Matches are therefore
+ *   non-overlapping, each verbatim copy is charged once, and DISTINCT copies
+ *   — the turn embedded twice in one blob, or reassembled from fragments next
+ *   to a second truncated block — are each charged.
+ *
+ * The scan catches whole, truncated, framed, and framed+truncated echoes; a
+ * copy truncated at BOTH ends and framed (neither probe present) is the one
+ * shape it concedes, traded for staying O(runText x pieces) with no regexes
+ * over untrusted text. Run texts and turn pieces shorter than
+ * ECHO_MIN_PIECE_CHARS never participate, and because every charged span
+ * contains a full 32-char probe, no match shorter than the floor ever counts.
  */
-function echoedCharsInText(
-  text: string,
+function echoedCharsInRunText(
+  runText: string,
   turnText: string,
   turnPieces: string[]
 ): number {
-  if (text.length >= ECHO_MIN_PIECE_CHARS && turnText.includes(text)) {
-    return text.length;
-  }
+  if (runText.length < ECHO_MIN_PIECE_CHARS) return 0;
+  if (turnText.includes(runText)) return runText.length;
+
+  const charged: EchoSpan[] = [];
   let echoed = 0;
-  for (const turnPiece of turnPieces) {
-    if (turnPiece.length < ECHO_MIN_PIECE_CHARS) continue;
-    let idx = text.indexOf(turnPiece);
-    while (idx !== -1) {
-      echoed += turnPiece.length;
-      idx = text.indexOf(turnPiece, idx + turnPiece.length);
+  for (const piece of turnPieces) {
+    if (piece.length < ECHO_MIN_PIECE_CHARS) continue;
+
+    // Head probe: a hit aligns runText[hit] with piece[0]; extend forward.
+    const headProbe = piece.slice(0, ECHO_MIN_PIECE_CHARS);
+    for (let from = 0; ; ) {
+      const hit = runText.indexOf(headProbe, from);
+      if (hit === -1) break;
+      const probeEnd = hit + ECHO_MIN_PIECE_CHARS;
+      if (overlapsEchoSpan(charged, hit, probeEnd)) {
+        from = hit + 1;
+        continue;
+      }
+      const cap = nextEchoSpanStart(charged, probeEnd, runText.length);
+      let end = probeEnd;
+      let p = ECHO_MIN_PIECE_CHARS;
+      while (
+        end < cap &&
+        p < piece.length &&
+        runText.charCodeAt(end) === piece.charCodeAt(p)
+      ) {
+        end += 1;
+        p += 1;
+      }
+      echoed += end - hit;
+      charged.push({ start: hit, end });
+      from = end;
+    }
+
+    // Tail probe: a hit aligns runText[hit + 32] with the piece's end; extend
+    // backward. Catches front-truncated copies, whose head never appears.
+    const tailProbe = piece.slice(piece.length - ECHO_MIN_PIECE_CHARS);
+    for (let from = 0; ; ) {
+      const hit = runText.indexOf(tailProbe, from);
+      if (hit === -1) break;
+      const end = hit + ECHO_MIN_PIECE_CHARS;
+      if (overlapsEchoSpan(charged, hit, end)) {
+        from = hit + 1;
+        continue;
+      }
+      const floor = prevEchoSpanEnd(charged, hit);
+      let start = hit;
+      let p = piece.length - ECHO_MIN_PIECE_CHARS;
+      while (
+        start > floor &&
+        p > 0 &&
+        runText.charCodeAt(start - 1) === piece.charCodeAt(p - 1)
+      ) {
+        start -= 1;
+        p -= 1;
+      }
+      echoed += end - start;
+      charged.push({ start, end });
+      from = end;
     }
   }
   return echoed;
@@ -325,32 +424,34 @@ function echoedCharsInText(
 
 /**
  * Characters of the result body that are a VERBATIM echo of the sent current
- * turn: result text contained in the current turn's text (a full or
- * truncated echo) plus current-turn pieces embedded whole inside larger
- * result text (memory and echo concatenated into one message). EVERY verbatim
- * copy counts — a result that embeds the turn twice inside one memory blob,
- * or once in the memory block AND again as a replayed tail, is charged for
- * both copies, so the total may exceed the turn's own length.
- * Over-subtraction fails safe: a verbatim copy of current-turn content is by
- * definition not prior conversation.
+ * turn. Each message's text is scored per RUN of adjacent plain-text pieces
+ * (contentTextRuns), coalesced into the contiguous passage the model would
+ * read, with one probe-and-extend masking scan per run
+ * (echoedCharsInRunText). Coalescing means an echo fragmented across
+ * consecutive text blocks — sub-floor slivers that individually dodge the
+ * length gate but concatenate back into the turn — is scored as the passage
+ * it reassembles into, and the probes find a copy wherever it sits inside
+ * the run: whole, truncated at either end, framed by non-turn text, or both.
  *
- * Each message's text is scored per RUN of adjacent plain-text pieces
- * (contentTextRuns): a run is charged the larger of its coalesced-text echo
- * and the sum of its individual pieces' echoes. The coalesced check catches
- * an echo fragmented across consecutive text blocks — sub-floor slivers that
- * individually dodge the length gate but concatenate back into the turn —
- * while the per-piece check still catches a truncated-echo block sitting
- * next to unrelated prose blocks, which coalescing alone would hide inside a
- * non-matching combined string. Taking the max never double-charges one copy.
+ * EVERY verbatim copy counts — a result that embeds the turn twice inside
+ * one memory blob, or once in the memory block AND again as a replayed tail,
+ * or reassembled from fragments beside a second truncated block, is charged
+ * for every copy, so the total may exceed the turn's own length. Masking
+ * within a run keeps the charges non-overlapping, so a single copy is never
+ * charged twice, and a double echo can never net out to a single turn's
+ * worth of "retained" text and pass the empty-memory gate. Over-subtraction
+ * fails safe: a verbatim copy of current-turn content is by definition not
+ * prior conversation.
  *
- * Texts shorter than ECHO_MIN_PIECE_CHARS never count on either side of the
- * containment check: tiny fragments shared between the turn and the result
- * (quoted-back prior messages, repeated pastes) are genuine retained history,
- * not echo — and because quoted fragments in genuine memory are separated by
- * surrounding prose, coalescing their run does not turn them into echo
- * either. Content the server rewrote — e.g. a summary of a huge pasted log —
- * deliberately does not count as echo: rewriting is compression work, and its
- * output is retained context, not a replay of the input.
+ * Run texts and turn pieces shorter than ECHO_MIN_PIECE_CHARS never count,
+ * and no charged match is shorter than that floor: tiny fragments shared
+ * between the turn and the result (quoted-back prior messages, repeated
+ * pastes) are genuine retained history, not echo — and because quoted
+ * fragments in genuine memory are separated by surrounding prose, coalescing
+ * their run does not turn them into echo either. Content the server rewrote
+ * — e.g. a summary of a huge pasted log — deliberately does not count as
+ * echo: rewriting is compression work, and its output is retained context,
+ * not a replay of the input.
  */
 function echoedCurrentTurnChars(
   result: CompressResult,
@@ -365,20 +466,7 @@ function echoedCurrentTurnChars(
   for (const message of result.messages ?? []) {
     if (message.role === "system") continue;
     for (const run of contentTextRuns(message.content)) {
-      // Each turn copy is charged once per containing text, and occurrences
-      // within one text are each charged (echoedCharsInText): two result
-      // texts that each carry a copy are two echoes, as are two copies
-      // concatenated into one text — all must be subtracted or a double echo
-      // nets out to a single turn's worth and passes the empty-memory gate.
-      let perPiece = 0;
-      for (const piece of run) {
-        perPiece += echoedCharsInText(piece, turnText, turnPieces);
-      }
-      const coalesced =
-        run.length > 1
-          ? echoedCharsInText(run.join(""), turnText, turnPieces)
-          : perPiece;
-      echoed += Math.max(coalesced, perPiece);
+      echoed += echoedCharsInRunText(run.join(""), turnText, turnPieces);
     }
   }
   return echoed;
