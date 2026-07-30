@@ -300,31 +300,39 @@ interface EchoSpan {
   end: number;
 }
 
-/** Whether [start, end) intersects any charged span. */
+/**
+ * Index of the first charged span with start >= pos. The charged list is kept
+ * sorted by start and its spans are disjoint, so starts and ends are both
+ * strictly increasing and one binary search answers every interval question
+ * in O(log spans) — a probe-dense run text (repeated characters produce a hit
+ * at nearly every offset) used to linear-scan the growing list per hit, which
+ * made the whole scan quadratic in the run length.
+ */
+function echoSpanLowerBound(spans: EchoSpan[], pos: number): number {
+  let lo = 0;
+  let hi = spans.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (spans[mid]!.start < pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Whether [start, end) intersects any charged span. O(log spans). */
 function overlapsEchoSpan(
   spans: EchoSpan[],
   start: number,
   end: number
 ): boolean {
-  return spans.some((s) => start < s.end && end > s.start);
+  const i = echoSpanLowerBound(spans, start);
+  if (i < spans.length && spans[i]!.start < end) return true;
+  return i > 0 && spans[i - 1]!.end > start;
 }
 
-/** The nearest charged-span start at or after pos: the forward-extension cap. */
-function nextEchoSpanStart(
-  spans: EchoSpan[],
-  pos: number,
-  fallback: number
-): number {
-  let cap = fallback;
-  for (const s of spans) if (s.start >= pos && s.start < cap) cap = s.start;
-  return cap;
-}
-
-/** The nearest charged-span end at or before pos: the backward-extension floor. */
-function prevEchoSpanEnd(spans: EchoSpan[], pos: number): number {
-  let floor = 0;
-  for (const s of spans) if (s.end <= pos && s.end > floor) floor = s.end;
-  return floor;
+/** Record [start, end) as charged, keeping the list sorted by start. */
+function chargeEchoSpan(spans: EchoSpan[], start: number, end: number): void {
+  spans.splice(echoSpanLowerBound(spans, start), 0, { start, end });
 }
 
 /**
@@ -346,12 +354,33 @@ function prevEchoSpanEnd(spans: EchoSpan[], pos: number): number {
  *   — the turn embedded twice in one blob, or reassembled from fragments next
  *   to a second truncated block — are each charged.
  *
+ * Pieces are scanned LONGEST FIRST: when one turn piece is a verbatim
+ * substring of a larger one, the larger piece's copy in the run must be
+ * charged whole before the substring's probes can pre-mask its interior — a
+ * substring is never longer than its superset, so descending length order
+ * guarantees it. Interior masks that still arise (shared content between
+ * pieces neither of which contains the other) do not truncate a legitimate
+ * extension either: when the piece keeps matching across an already-charged
+ * span at the aligned offset, the extension steps both cursors past the span
+ * without re-charging it and continues on the far side. Both rules exist
+ * because an interior mask used to cap head extension and floor tail
+ * extension, leaving the region BETWEEN two interior masks uncharged — an
+ * under-count, which is the failure direction this scan must never take.
+ * Skips are attempted only after a segment that charged NEW characters, so a
+ * chain of adjacent masks with nothing new between them ends the extension —
+ * still strictly more coverage than not skipping at all — instead of
+ * re-walking charged territory on every probe hit of a probe-dense run.
+ *
  * The scan catches whole, truncated, framed, and framed+truncated echoes; a
  * copy truncated at BOTH ends and framed (neither probe present) is the one
- * shape it concedes, traded for staying O(runText x pieces) with no regexes
- * over untrusted text. Run texts and turn pieces shorter than
- * ECHO_MIN_PIECE_CHARS never participate, and because every charged span
- * contains a full 32-char probe, no match shorter than the floor ever counts.
+ * shape it concedes, traded for a cheap scan with no regexes over untrusted
+ * text: O(runText x pieces) for the substring searches, plus O(log spans)
+ * per probe hit for the mask bookkeeping (the charged list is kept sorted by
+ * start and binary-searched; see echoSpanLowerBound), plus extension work
+ * bounded by the characters actually matched. Run texts and turn pieces
+ * shorter than ECHO_MIN_PIECE_CHARS never participate, and because every
+ * charged span contains a full 32-char probe, no match shorter than the
+ * floor ever counts.
  */
 function echoedCharsInRunText(
   runText: string,
@@ -363,37 +392,78 @@ function echoedCharsInRunText(
 
   const charged: EchoSpan[] = [];
   let echoed = 0;
-  for (const piece of turnPieces) {
-    if (piece.length < ECHO_MIN_PIECE_CHARS) continue;
-
+  // Longest pieces first, so a piece that is a substring of another can never
+  // pre-mask the interior of its superset's copy (see the function comment).
+  // Sort is stable, so equal-length pieces keep their original order.
+  const pieces = turnPieces
+    .filter((piece) => piece.length >= ECHO_MIN_PIECE_CHARS)
+    .sort((a, b) => b.length - a.length);
+  for (const piece of pieces) {
     // Head probe: a hit aligns runText[hit] with piece[0]; extend forward.
+    // An already-charged span the piece still matches at the aligned offset
+    // is stepped over without re-charging, so an interior mask cannot leave
+    // the rest of a legitimate extension uncharged.
     const headProbe = piece.slice(0, ECHO_MIN_PIECE_CHARS);
     for (let from = 0; ; ) {
       const hit = runText.indexOf(headProbe, from);
       if (hit === -1) break;
-      const probeEnd = hit + ECHO_MIN_PIECE_CHARS;
-      if (overlapsEchoSpan(charged, hit, probeEnd)) {
+      if (overlapsEchoSpan(charged, hit, hit + ECHO_MIN_PIECE_CHARS)) {
         from = hit + 1;
         continue;
       }
-      const cap = nextEchoSpanStart(charged, probeEnd, runText.length);
-      let end = probeEnd;
+      let end = hit + ECHO_MIN_PIECE_CHARS;
       let p = ECHO_MIN_PIECE_CHARS;
-      while (
-        end < cap &&
-        p < piece.length &&
-        runText.charCodeAt(end) === piece.charCodeAt(p)
-      ) {
-        end += 1;
-        p += 1;
+      let segStart = hit;
+      const segments: EchoSpan[] = [];
+      for (;;) {
+        const next = echoSpanLowerBound(charged, end);
+        const cap = next < charged.length ? charged[next]!.start : runText.length;
+        while (
+          end < cap &&
+          p < piece.length &&
+          runText.charCodeAt(end) === piece.charCodeAt(p)
+        ) {
+          end += 1;
+          p += 1;
+        }
+        const progressed = end > segStart;
+        if (progressed) segments.push({ start: segStart, end });
+        if (end !== cap || next >= charged.length) break;
+        // Reached an interior mask. If the piece keeps matching across the
+        // whole masked span, step both cursors past it (it is already
+        // charged); otherwise the extension genuinely ends here. A skip is
+        // attempted only when this segment charged NEW characters (the probe
+        // guarantees that for the first one): a fruitless skip would mean the
+        // extension is re-walking already-charged territory, which later
+        // probes cover anyway, and unbounded re-walking of the charged
+        // prefix is what would make probe-dense (repeated-character) runs
+        // quadratic again.
+        if (!progressed) break;
+        const span = charged[next]!;
+        const len = span.end - span.start;
+        if (p + len > piece.length) break;
+        let matches = true;
+        for (let k = 0; k < len; k += 1) {
+          if (runText.charCodeAt(span.start + k) !== piece.charCodeAt(p + k)) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) break;
+        end = span.end;
+        p += len;
+        segStart = end;
       }
-      echoed += end - hit;
-      charged.push({ start: hit, end });
+      for (const s of segments) {
+        echoed += s.end - s.start;
+        chargeEchoSpan(charged, s.start, s.end);
+      }
       from = end;
     }
 
     // Tail probe: a hit aligns runText[hit + 32] with the piece's end; extend
-    // backward. Catches front-truncated copies, whose head never appears.
+    // backward, stepping over aligned already-charged spans the same way.
+    // Catches front-truncated copies, whose head never appears.
     const tailProbe = piece.slice(piece.length - ECHO_MIN_PIECE_CHARS);
     for (let from = 0; ; ) {
       const hit = runText.indexOf(tailProbe, from);
@@ -403,19 +473,47 @@ function echoedCharsInRunText(
         from = hit + 1;
         continue;
       }
-      const floor = prevEchoSpanEnd(charged, hit);
       let start = hit;
       let p = piece.length - ECHO_MIN_PIECE_CHARS;
-      while (
-        start > floor &&
-        p > 0 &&
-        runText.charCodeAt(start - 1) === piece.charCodeAt(p - 1)
-      ) {
-        start -= 1;
-        p -= 1;
+      let segEnd = end;
+      const segments: EchoSpan[] = [];
+      for (;;) {
+        const prev = echoSpanLowerBound(charged, start) - 1;
+        const floor = prev >= 0 ? charged[prev]!.end : 0;
+        while (
+          start > floor &&
+          p > 0 &&
+          runText.charCodeAt(start - 1) === piece.charCodeAt(p - 1)
+        ) {
+          start -= 1;
+          p -= 1;
+        }
+        const progressed = segEnd > start;
+        if (progressed) segments.push({ start, end: segEnd });
+        if (start !== floor || prev < 0) break;
+        // Same fruitless-skip guard as the forward direction, mirrored.
+        if (!progressed) break;
+        const span = charged[prev]!;
+        const len = span.end - span.start;
+        if (p - len < 0) break;
+        let matches = true;
+        for (let k = 0; k < len; k += 1) {
+          if (
+            runText.charCodeAt(span.start + k) !== piece.charCodeAt(p - len + k)
+          ) {
+            matches = false;
+            break;
+          }
+        }
+        if (!matches) break;
+        start = span.start;
+        p -= len;
+        segEnd = start;
       }
-      echoed += end - start;
-      charged.push({ start, end });
+      for (const s of segments) {
+        echoed += s.end - s.start;
+        chargeEchoSpan(charged, s.start, s.end);
+      }
       from = end;
     }
   }

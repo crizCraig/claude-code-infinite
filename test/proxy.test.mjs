@@ -3601,6 +3601,127 @@ test("checkCompressedHistory: a fragmented echo plus a distinct truncated copy a
   );
 });
 
+test("checkCompressedHistory: substring turn pieces cannot open an uncharged gap inside a bigger echo", () => {
+  // A multi-block turn whose early blocks quote interior spans of a later,
+  // larger block. Each early piece is a verbatim substring of the big piece,
+  // so scanning pieces in message order let the early pieces' probes pre-mask
+  // the INTERIOR of the big piece's single copy in the result: the big
+  // piece's head extension capped at the first interior mask and its tail
+  // extension stopped at the last one, so the region between the two masks
+  // was never charged (~800 of 3,000 chars here). That under-count let an
+  // empty memory — a framed copy of the big block plus a sliver of genuine
+  // text — clear the retained-history gate.
+  const big = Array.from(
+    { length: 60 },
+    (_, i) =>
+      `finding ${String(i).padStart(2, "0")}: unique detail ${i * 7919} traced to module ${i * 31}. `
+  )
+    .join("")
+    .slice(0, 3_000);
+  const turn = [
+    { type: "text", text: big.slice(500, 700) },
+    { type: "text", text: big.slice(1_500, 1_700) },
+    { type: "text", text: big },
+  ];
+  const sent = [
+    { role: "user", content: "Summarize what the audit found" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "The audit surfaced these findings in detail. ".repeat(60) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const genuine = "Prior sessions established these conclusions about the incident. ".repeat(20); // ~1.3k chars, below the gate
+  const maskGap = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `The user said:\n${big}\n\n${genuine}` },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    maskGap.usable,
+    false,
+    "interior spans quoted by earlier turn blocks must not leave a gap uncharged in the big block's echo"
+  );
+
+  // The same result with genuinely enough retained history must still pass:
+  // the fix must charge the big block's copy exactly once, not over-charge.
+  const enough = "Prior sessions established these conclusions about the incident. ".repeat(35); // ~2.3k chars
+  const withRealMemory = checkCompressedHistory(
+    {
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: `The user said:\n${big}\n\n${enough}` },
+      ],
+      usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+    },
+    sent
+  );
+  assert.equal(
+    withRealMemory.usable,
+    true,
+    "genuine memory above the gate beside a single fully-charged echo is usable"
+  );
+});
+
+test("checkCompressedHistory: probe-dense repeated-pattern echoes are charged exactly once per copy", () => {
+  // A 16-char-period blob matches its own 32-char probes at every multiple of
+  // the period, so the scan sees a probe hit at thousands of offsets and each
+  // one consults the charged-span mask. This shape used to linear-scan the
+  // growing span list per hit (quadratic in the run length, synchronous on
+  // the response path); the list is now kept sorted and binary-searched. No
+  // timing is asserted (timing tests flake) — instead assert the charge
+  // accounting stays exact on this shape: two framed copies of the blob are
+  // each charged in full (unusable when the leftover genuine text is below
+  // the gate) and nothing beyond them is charged (usable when it is above).
+  const blob = "0123456789abcdef".repeat(700); // 11,200 chars
+  const turn = `Here is the dump:\n${blob}`;
+  const sent = [
+    { role: "user", content: "Decode this dump for me" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Paste the raw dump and I will decode it. ".repeat(60) },
+      ],
+    },
+    { role: "user", content: turn },
+  ];
+  const doubleCopy = (genuine) => ({
+    messages: [
+      { role: "system", content: "SYSTEM PROMPT" },
+      {
+        role: "user",
+        content: `First copy:\n${blob}\nSecond copy:\n${blob}\n${genuine}`,
+      },
+    ],
+    usage: { prompt_tokens_details: { cached_tokens: 10_000 } },
+  });
+  const belowGate = checkCompressedHistory(
+    doubleCopy("Earlier we established the dump format in detail. ".repeat(31)), // ~1.6k chars
+    sent
+  );
+  assert.equal(
+    belowGate.usable,
+    false,
+    "both repeated-pattern copies must be charged in full"
+  );
+  const aboveGate = checkCompressedHistory(
+    doubleCopy("Earlier we established the dump format in detail. ".repeat(48)), // ~2.4k chars
+    sent
+  );
+  assert.equal(
+    aboveGate.usable,
+    true,
+    "repeated-pattern copies must not be charged more than once each"
+  );
+});
+
 test("a fully indexed empty memory forwards real history instead of amnesia", async () => {
   const question = "Now output detailed remediation steps";
   const records = [];

@@ -11,8 +11,9 @@
  * ccc's loopback server is a transparent relay to api.anthropic.com, so mark
  * that base URL as first-party and preserve vanilla model/context behavior.
  *
- * Claude Code 2.1.219 also offers `/compact` when any resumed session exceeds
- * a fixed 100k-token threshold, regardless of its actual context window or
+ * Claude Code 2.1.219 also presents a "Resume from summary" option (which
+ * internally runs `/compact`) when a resumed session exceeds a fixed
+ * 100k-token threshold, regardless of its actual context window or
  * DISABLE_AUTO_COMPACT. Suppress that ccc-inappropriate recommendation with an
  * effectively unreachable finite threshold; manual `/compact` remains available.
  *
