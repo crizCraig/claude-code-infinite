@@ -371,9 +371,13 @@ function chargeEchoSpan(spans: EchoSpan[], start: number, end: number): void {
  * still strictly more coverage than not skipping at all — instead of
  * re-walking charged territory on every probe hit of a probe-dense run.
  *
- * The scan catches whole, truncated, framed, and framed+truncated echoes; a
- * copy truncated at BOTH ends and framed (neither probe present) is the one
- * shape it concedes, traded for a cheap scan with no regexes over untrusted
+ * The scan catches whole, truncated, framed, and framed+truncated echoes. Two
+ * shapes it concedes: a copy truncated at BOTH ends and framed (neither probe
+ * present), and a copy whose head probe lands inside territory an earlier
+ * piece's extension already charged while its tail is truncated out of the
+ * run (the overlap check rejects every hit). Both require remixed,
+ * mask-geometry-aligned echoes never observed from real servers; the trade
+ * buys a cheap scan with no regexes over untrusted
  * text: O(runText x pieces) for the substring searches, plus O(log spans)
  * per probe hit for the mask bookkeeping (the charged list is kept sorted by
  * start and binary-searched; see echoSpanLowerBound), plus extension work
@@ -646,7 +650,6 @@ export function normalizeMessagesForMemtree(messages: Message[]): Message[] {
       continue;
     }
 
-    let changed = false;
     let removedReasoning = false;
     const content: unknown[] = [];
     for (const part of message.content) {
@@ -654,12 +657,11 @@ export function normalizeMessagesForMemtree(messages: Message[]): Message[] {
         content.push(part);
         continue;
       }
-      changed = true;
       removedReasoning = true;
     }
 
     if (removedReasoning && content.length === 0) continue;
-    normalized.push(changed ? { ...message, content } : message);
+    normalized.push(removedReasoning ? { ...message, content } : message);
   }
   return normalized;
 }
