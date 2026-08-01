@@ -900,6 +900,92 @@ test("memory route survives A/B being disabled, so count_tokens sizes the compre
   }
 });
 
+test("memory route survives a mid-loop model switch", async () => {
+  const upstreamBodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = {
+    "content-type": "application/json",
+    "x-claude-code-session-id": "session-model-switch",
+  };
+  const base = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    const userTurn = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-fable-5",
+        max_tokens: 64,
+        messages: base,
+      }),
+    });
+    await userTurn.json();
+    await waitFor(() => upstreamBodies.length >= 1);
+
+    // Claude Code continues the same turn's tool loop on a different model.
+    const toolTurn = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-5",
+        max_tokens: 64,
+        messages: [
+          ...base,
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }],
+          },
+        ],
+      }),
+    });
+    await toolTurn.json();
+    await waitFor(() => upstreamBodies.length >= 2);
+
+    const routed = upstreamBodies[1];
+    assert.equal(routed.model, "claude-opus-5", "model passes through untouched");
+    assert.equal(
+      routed.messages[0].content,
+      "compressed context",
+      "the tool loop must keep riding the compressed prefix after a model switch"
+    );
+    assert.ok(
+      !JSON.stringify(routed.messages).includes("first question"),
+      "the uncompressed prefix must not be re-sent on the fallback model"
+    );
+    assert.ok(
+      JSON.stringify(routed.messages).includes("tool_result"),
+      "the current turn's tool suffix rides after the compressed prefix"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("memory route tolerates Claude 2.1.219 system cache-shape churn", async () => {
   const upstreamBodies = [];
   const upstream = await listen((req, res) => {

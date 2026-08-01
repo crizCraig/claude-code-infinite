@@ -346,7 +346,6 @@ async function waitForMainNoticeDelivery(
 
 interface MainMemoryRoute {
   sessionId: string;
-  model: string;
   originalSystemHash: string;
   originalPrefixHashes: string[];
   compressedMessages: Message[];
@@ -1676,17 +1675,12 @@ function installMainMemoryRoute(
 ): boolean {
   if (state.mainRouteEpoch !== routeEpoch) return false;
   const sessionId = requestSessionId(req);
-  if (
-    !sessionId ||
-    typeof originalBody.model !== "string" ||
-    !Array.isArray(compressedBody.messages)
-  ) {
+  if (!sessionId || !Array.isArray(compressedBody.messages)) {
     state.mainMemoryRoute = undefined;
     return false;
   }
   state.mainMemoryRoute = {
     sessionId,
-    model: originalBody.model,
     originalSystemHash: routeValueHash(
       normalizeRouteSystem(originalBody.system)
     ),
@@ -1712,11 +1706,15 @@ function memoryRoutedToolBody(
   routeEpoch: number,
   sessionId: string | undefined
 ): Buffer | null {
+  // Model is deliberately not route identity: Claude Code switches models
+  // mid-loop (overload fallback, /model, /fast), and the compressed prefix is
+  // plain message content valid for any model. Session + prefix hashes pin the
+  // conversation; requiring model equality dropped the whole tool loop to
+  // full-history passthrough on every mid-turn switch.
   if (
     !sessionId ||
     route.sessionId !== sessionId ||
     route.routeEpoch !== routeEpoch ||
-    body.model !== route.model ||
     routeValueHash(normalizeRouteSystem(body.system)) !==
       route.originalSystemHash
   ) {
