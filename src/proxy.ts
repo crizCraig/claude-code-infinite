@@ -12,7 +12,11 @@
  *
  * Turn classification for POST /v1/messages:
  * - Tool turn (last message isn't a real user input): background indexing,
- *   forward as-is.
+ *   forward as-is — either riding the active memory route's compressed
+ *   prefix or verbatim. A LARGE main tool turn that misses its route gets
+ *   one best-effort blocking recompression first
+ *   (plans/2026-08-04_PLAN_tool_turn_route_recovery.md); failure degrades
+ *   to the verbatim forward.
  * - First user turn (no earlier real user input): background indexing, forward
  *   as-is — nothing is indexed yet, so blocking would be a guaranteed no-op.
  * - Followup user turn: blocking compress + substitute. In CLI A/B mode, a
@@ -126,6 +130,11 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 const NOTICE_SETTLE_WAIT_MS = 1_000;
 const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
 const LEGACY_MIGRATION_SESSIONS_MAX = 64;
+// Tool-route miss recovery gate: serialized non-system conversation bytes at
+// or above this buy one blocking recompression attempt (~100k–140k tokens
+// under this repo's approximations — a byte gate, not a tokenizer guarantee).
+// Below it, verbatim forwarding is cheap enough to keep.
+const TOOL_RECOMPRESS_MIN_CONVERSATION_BYTES = 400 * 1024;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -173,6 +182,14 @@ export interface ProxyOptions {
    * single-memory-leg path (useful to embedders/tests); the CLI enables it.
    */
   abRouting?: AbRoutingOptions;
+  /**
+   * Best-effort blocking recompression when a large main tool turn misses
+   * its memory route (default true). This is a soft recovery fuse, not a
+   * hard payload cap: MemTree failure still degrades to forwarding the
+   * original body after the configured compress budget. The CLI maps
+   * `CCC_TOOL_ROUTE_RECOVERY=0` to `false` as a temporary kill switch.
+   */
+  toolRouteRecovery?: boolean;
   debug?: boolean;
   /**
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -254,6 +271,16 @@ interface ProxyState {
   legacyMemtreeMigrationComplete: Set<string>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
+  /**
+   * Orders async route decisions that share one epoch. The epoch guards
+   * human-prompt lifecycle (UserPromptSubmit/Stop bump it); this generation is
+   * reserved by every request that may asynchronously install or clear the
+   * route after an await — each normal main followup, plus a route-owning
+   * tool-route recovery. An install or post-await clear whose captured
+   * generation is stale must do nothing, so an older completion can never
+   * erase or overwrite a newer decision.
+   */
+  mainRouteDecisionGeneration: number;
   /** Fired by drain after its grace period so every forwarding path can stop. */
   shutdownSignal: AbortSignal;
 }
@@ -502,6 +529,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       : undefined,
     legacyMemtreeMigrationComplete: new Set(),
     mainRouteEpoch: 0,
+    mainRouteDecisionGeneration: 0,
     shutdownSignal: shutdownAbort.signal,
   };
   const server = http.createServer((req, res) => {
@@ -936,8 +964,20 @@ async function handleMessages(
   const isFollowupUserTurn =
     isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
   let routeEpoch = state.mainRouteEpoch;
-  if (isCompressibleUserTurn && isMainRequest) {
+  let routeDecisionGeneration = state.mainRouteDecisionGeneration;
+  // Only a rebuilder may clear: a main followup enters the blocking
+  // compression path below and installs a fresh route, so its clear is
+  // clear-then-rebuild. A first-user-shaped request (including CC-internal
+  // side calls that never fire UserPromptSubmit) takes the nonblocking path
+  // and cannot rebuild what it clears — the 2026-08-04 incident was exactly
+  // such a clear-without-rebuild hole stranding the next tool turn on a
+  // 2.96MB full-history forward. memoryRoutedToolBody revalidates session,
+  // epoch, system, and every prefix hash before any rewrite, so a retained
+  // route can never graft onto an unrelated request; it can only match its
+  // own conversation's extension or fail closed.
+  if (isFollowupUserTurn && isMainRequest) {
     routeEpoch = ++state.mainRouteEpoch;
+    routeDecisionGeneration = ++state.mainRouteDecisionGeneration;
     state.mainMemoryRoute = undefined;
   }
   const hookOwnedMainFollowup =
@@ -983,40 +1023,99 @@ async function handleMessages(
   rec.stream = body.stream === true;
 
   if (!isFollowupUserTurn) {
-    // Tool turn or FIRST user turn: keep the index fed off the response path;
-    // forward as-is. On the first user turn nothing is indexed yet, so a
-    // blocking compress would be a guaranteed no-op costing first-token
-    // latency (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
+    // Tool turn or FIRST user turn: keep the index fed off the response path
+    // and forward as-is — except a LARGE main tool turn that misses its
+    // memory route, which gets one best-effort blocking recompression below.
+    // On the first user turn nothing is indexed yet, so a blocking compress
+    // would be a guaranteed no-op costing first-token latency
+    // (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
     if (opts.debug && isUserTurn) {
       console.error("[ccc proxy] first user turn: index in background, forward verbatim");
     }
     let routedBody = forwardBody;
     let routedTool = false;
-    if (isToolResultTurn && isMainRequest && state.mainMemoryRoute) {
-      const rewritten = memoryRoutedToolBody(
-        body,
-        messages,
-        state.mainMemoryRoute,
-        state.mainRouteEpoch,
-        requestSessionId(req)
-      );
-      if (rewritten) {
-        routedBody = rewritten;
-        routedTool = true;
-        if (opts.debug) {
-          console.error("[ccc proxy] tool turn matched active memory route");
+    let routeMiss: "missing" | "rejected" | undefined;
+    if (isToolResultTurn && isMainRequest) {
+      const activeRoute = state.mainMemoryRoute;
+      if (activeRoute) {
+        const rewritten = memoryRoutedToolBody(
+          body,
+          messages,
+          activeRoute,
+          state.mainRouteEpoch,
+          requestSessionId(req)
+        );
+        if (rewritten) {
+          routedBody = rewritten;
+          routedTool = true;
+          if (opts.debug) {
+            console.error("[ccc proxy] tool turn matched active memory route");
+          }
+        } else {
+          // A mismatch means a different/resumed conversation shape. Never
+          // risk grafting one session's compressed prefix onto another.
+          // Evict only a same-session mismatch — a real system/prefix/suffix
+          // divergence this request's recovery can rebuild. A request with a
+          // missing or different session id cannot use this slot, but it must
+          // not destroy a route that may still serve its owner.
+          routeMiss = "rejected";
+          const requesterSession = requestSessionId(req);
+          if (
+            requesterSession !== undefined &&
+            activeRoute.sessionId === requesterSession
+          ) {
+            state.mainMemoryRoute = undefined;
+          }
+          if (opts.debug) {
+            console.error("[ccc proxy] tool turn rejected active memory route");
+          }
         }
       } else {
-        // A mismatch means a different/resumed conversation shape. Never risk
-        // grafting one session's compressed prefix onto another.
+        routeMiss = "missing";
         if (opts.debug) {
-          console.error("[ccc proxy] tool turn rejected active memory route");
+          console.error("[ccc proxy] tool turn has no active memory route");
         }
-        state.mainMemoryRoute = undefined;
       }
-    } else if (opts.debug && isToolResultTurn && isMainRequest) {
-      console.error("[ccc proxy] tool turn has no active memory route");
     }
+    if (routeMiss !== undefined) rec.routeMiss = routeMiss;
+
+    if (routeMiss !== undefined && opts.toolRouteRecovery !== false) {
+      // The gate is serialized conversation bytes, not the whole body: a
+      // large top-level/ambient system prompt or tools schema is lifted or
+      // preserved, never reduced as conversation memory, so it must not buy
+      // blocking latency. hasEarlierNonToolUserMessage means a server-side
+      // prefix index plausibly exists.
+      const conversationBytes = Buffer.byteLength(
+        JSON.stringify(messages.filter((m) => m.role !== "system")),
+        "utf-8"
+      );
+      if (
+        hasEarlierNonToolUserMessage(messages) &&
+        conversationBytes >= TOOL_RECOMPRESS_MIN_CONVERSATION_BYTES
+      ) {
+        return logged(
+          recoverToolRouteMiss({
+            opts,
+            state,
+            req,
+            res,
+            upstream,
+            body,
+            messages,
+            forwardBody,
+            msgsForMemtree,
+            rawMsgsForMemtree,
+            hash,
+            legacyHash,
+            modelContextLimit,
+            routeEpoch,
+            rec,
+            conversationBytes,
+          })
+        );
+      }
+    }
+
     recordTurn(
       rec,
       routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool",
@@ -1049,6 +1148,15 @@ async function handleMessages(
     }
   };
 
+  // Post-await route mutations require BOTH guards current: a stale epoch
+  // means a newer human turn owns the route lifecycle; a stale decision
+  // generation means a newer async route owner (another followup, or a
+  // route-owning tool recovery) has since reserved the decision. Either way
+  // this completion lost — it must not erase or overwrite the winner's route.
+  const routeDecisionCurrent = () =>
+    state.mainRouteEpoch === routeEpoch &&
+    state.mainRouteDecisionGeneration === routeDecisionGeneration;
+
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
   // feeding its lifetime into MemtreeClient.compress(): compression promises
@@ -1060,155 +1168,28 @@ async function handleMessages(
   };
   res.once("close", markDownstreamClosedDuringCompression);
 
-  const compressStarted = Date.now();
   // An active subagent can repeat/embed the human prompt in its own request;
   // producer suppression must also preserve the arm for the later main call.
   if (displayForThisTurn) state.mainPromptArmed = false;
-  let result: CompressResult | null;
-  let usedLegacyFallback = false;
-  let canonicalCompressFailed = false;
-  // Wall time of the canonical leg alone. timedOut must be computed from
-  // this, not the Promise.all wall time: a fast canonical failure (e.g. a
-  // 200ms 5xx) awaited alongside a slow legacy probe is not a timeout.
-  let canonicalCompressMs = 0;
+  let compression: BlockingCompressionOutcome;
   try {
-    const compressMeta = {
-      // Model + tools drive the server's model-based memory budget
-      // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
-      // them silently downgrades to the server's static 50k fallback.
-      // `[1m]` is re-attached when the session is 1M-context so the
-      // server's budget telemetry names the variant it actually served.
-      model: modelForMemtree(
-        typeof body.model === "string" ? body.model : undefined,
-        modelContextLimit
-      ),
-      tools: Array.isArray(body.tools) ? body.tools : undefined,
-    };
-    // The first request after this normalization ships may not match an
-    // existing signature-keyed index. The canonical call starts the stable
-    // replacement index. Until it catches up, compare one lookup with the
-    // untouched shape so a shallow canonical hit cannot hide a much deeper
-    // same-model legacy index. Both legs run concurrently — the probe's
-    // inputs never depend on the canonical result, only the decision below
-    // does — so an active migration pays one compress budget, not two, per
-    // turn. compress() maps every failure to a resolved null (it never
-    // rejects), so neither leg can surface an unhandled rejection.
-    const migrationKey = legacyMigrationKey(req, messages);
-    const probeLegacy =
-      legacyHash !== hash &&
-      !state.legacyMemtreeMigrationComplete.has(migrationKey);
-    const [canonicalResult, legacyResult] = await Promise.all([
-      // compress() never rejects, so this .then always runs and records the
-      // canonical leg's own duration for the timedOut heuristic below.
-      opts.memtree
-        .compress(
-          hash,
-          msgsForMemtree,
-          modelContextLimit,
-          state.shutdownSignal,
-          compressMeta
-        )
-        .then((value) => {
-          canonicalCompressMs = Date.now() - compressStarted;
-          return value;
-        }),
-      probeLegacy
-        ? opts.memtree.compress(
-            legacyHash,
-            rawMsgsForMemtree,
-            modelContextLimit,
-            state.shutdownSignal,
-            compressMeta
-          )
-        : null,
-    ]);
-    result = canonicalResult;
-    canonicalCompressFailed = canonicalResult === null;
-    if (
-      canonicalResult === null &&
-      legacyResult &&
-      didMemtreeCompress(legacyResult) &&
-      checkCompressedHistory(legacyResult, rawMsgsForMemtree).usable
-    ) {
-      // The canonical leg failed (server error/timeout — compress maps every
-      // failure to null) while the concurrent probe returned a compressed,
-      // usable answer that is already paid for. Forward it instead of
-      // degrading to passthrough. The migration flag is untouched: a failed
-      // canonical leg is not a contest.
-      result = legacyResult;
-      usedLegacyFallback = true;
-      if (opts.debug) {
-        console.error(
-          "[ccc proxy] canonical compress failed; using legacy probe result"
-        );
-      }
-    } else if (
-      canonicalResult &&
-      legacyResult &&
-      didMemtreeCompress(legacyResult)
-    ) {
-      // Ending the migration is scoped to this conversation's key, and still
-      // requires legacy evidence: the probe leg was consulted this turn and
-      // answered from a real (compressed) legacy index. Even so, the probe
-      // itself warms a legacy index server-side, so evidence from one
-      // conversation says nothing about any other — a pre-upgrade session
-      // /resume'd later in this run keeps its own probe armed regardless of
-      // how many fresh conversations have caught up.
-      if (!shouldProbeLegacyMemtree(canonicalResult, msgsForMemtree)) {
-        // Compressed, usable, and a small measured unindexed tail
-        // (shouldProbe returns true for every weaker outcome): the canonical
-        // index has caught up against a real legacy index, so the
-        // concurrently fetched legacy result is deliberately ignored and this
-        // conversation's later turns skip the probe entirely.
-        markLegacyMigrationComplete(state, migrationKey);
-      } else if (
-        isBetterLegacyMemtreeResult(
-          canonicalResult,
-          msgsForMemtree,
-          legacyResult,
-          rawMsgsForMemtree
-        )
-      ) {
-        result = legacyResult;
-        usedLegacyFallback = true;
-      } else if (
-        didMemtreeCompress(canonicalResult) &&
-        checkCompressedHistory(canonicalResult, msgsForMemtree).usable &&
-        unindexedPromptTokenCount(canonicalResult) !== undefined &&
-        unindexedPromptTokenCount(legacyResult) !== undefined
-      ) {
-        // Ending the migration also needs a real contest on the canonical
-        // side: a compressed, usable canonical answer that beat the legacy
-        // index it was probed against, with BOTH tails actually measured.
-        // An unusable empty-memory canonical answer must not end it, and
-        // neither may a "win" isBetterLegacyMemtreeResult awarded only
-        // because raw_prompt_tokens was absent from both responses — an
-        // unmeasured contest is no contest.
-        markLegacyMigrationComplete(state, migrationKey);
-      }
-    }
+    compression = await runBlockingCompression({
+      opts,
+      state,
+      req,
+      body,
+      messages,
+      msgsForMemtree,
+      rawMsgsForMemtree,
+      hash,
+      legacyHash,
+      modelContextLimit,
+      rec,
+    });
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);
   }
-  // Overall wall time of the blocking compress step (both concurrent legs) —
-  // what reqlog documents for compress.ms.
-  const compressMs = Date.now() - compressStarted;
-  rec.compress = {
-    ms: compressMs,
-    ok: result !== null,
-    // Budget-consumed heuristic on the CANONICAL leg: the client maps every
-    // failure to null, so a canonical null whose OWN leg took (roughly) the
-    // whole abort budget was almost certainly the AbortSignal timeout, not a
-    // fast server error. Timed per-leg rather than from the Promise.all wall
-    // time so a slow legacy probe cannot make a fast canonical failure look
-    // like a timeout, and computed from the canonical outcome rather than
-    // the post-swap result so a legacy-probe rescue (ok stays true) still
-    // records that the canonical leg burned the full budget.
-    timedOut:
-      canonicalCompressFailed &&
-      canonicalCompressMs >= opts.memtree.compressBudgetMs,
-    ...(usedLegacyFallback ? { legacyFallback: true } : {}),
-  };
+  const { result } = compression;
 
   if (
     downstreamClosedDuringCompression ||
@@ -1229,7 +1210,9 @@ async function handleMessages(
     // a payment-specific notice instead of the generic degraded one, at most
     // once per proxy process after it has actually been delivered.
     recordTurn(rec, "followup-degraded", forwardBody);
-    if (isMainRequest) state.mainMemoryRoute = undefined;
+    if (isMainRequest && routeDecisionCurrent()) {
+      state.mainMemoryRoute = undefined;
+    }
     capture(opts, "anthropic-request", forwardBody);
     const paymentDetail = opts.memtree.paymentRequiredDetail;
     const mayQueueNotice =
@@ -1268,10 +1251,7 @@ async function handleMessages(
   const actuallyCompressed = didMemtreeCompress(result);
   // The legacy probe may have swapped in a result compressed from the untouched
   // shape; measure retention against whatever we actually sent for the winner.
-  const historyCheck = checkCompressedHistory(
-    result,
-    usedLegacyFallback ? rawMsgsForMemtree : msgsForMemtree
-  );
+  const historyCheck = checkCompressedHistory(result, compression.winningInput);
   rec.history = {
     retainedChars: historyCheck.retainedChars,
     priorHistoryChars: historyCheck.priorHistoryChars,
@@ -1291,7 +1271,9 @@ async function handleMessages(
     // measure, so nothing downstream would notice that the model is about to be
     // asked to continue a conversation it can no longer see. Forwarding the
     // real history costs context but never silently amnesias the session.
-    if (isMainRequest) state.mainMemoryRoute = undefined;
+    if (isMainRequest && routeDecisionCurrent()) {
+      state.mainMemoryRoute = undefined;
+    }
     if (actuallyCompressed && opts.debug) {
       console.error(
         `[ccc proxy] memory response dropped the conversation ` +
@@ -1323,17 +1305,7 @@ async function handleMessages(
   // Invariant from the early return above: past this point the MemTree result
   // actually compressed (actuallyCompressed is true) and the retained history
   // is usable — every remaining path forwards the compressed body.
-  const processed = result.messages;
-  const systemMsg = processed.find((m) => m.role === "system");
-  const compressedBody: Record<string, any> = {
-    ...body,
-    messages: flattenToSingleUserMessage(processed),
-  };
-  if (systemMsg?.content != null) {
-    compressedBody.system = systemMsg.content;
-  }
-
-  const compressedRaw = Buffer.from(JSON.stringify(compressedBody), "utf-8");
+  const { compressedBody, compressedRaw } = buildCompressedBody(body, result);
   if (opts.debug) {
     console.error(
       `[ccc proxy] user turn compressed: ${forwardBody.length} → ` +
@@ -1368,7 +1340,7 @@ async function handleMessages(
   let routeActivationAttempted = false;
   const activateMainMemoryRoute = () => {
     if (routeActivationAttempted) return;
-    if (!isMainRequest || state.mainRouteEpoch !== routeEpoch) {
+    if (!isMainRequest || !routeDecisionCurrent()) {
       routeActivationAttempted = true;
       return;
     }
@@ -1378,7 +1350,8 @@ async function handleMessages(
       body,
       messages,
       compressedBody,
-      routeEpoch
+      routeEpoch,
+      routeDecisionGeneration
     );
     // Leave this false if installMainMemoryRoute unexpectedly throws: the
     // delivery-complete fallback then gets one safe retry.
@@ -1435,10 +1408,7 @@ async function handleMessages(
                 result,
               });
               activateMainMemoryRoute();
-            } else if (
-              state.mainRouteEpoch === routeEpoch &&
-              !routeActivationAttempted
-            ) {
+            } else if (routeDecisionCurrent() && !routeActivationAttempted) {
               state.mainMemoryRoute = undefined;
             }
             // When activation already ran at protocol-complete, a
@@ -1493,7 +1463,7 @@ async function handleMessages(
             // downstream finish and then claim the completed-delivery notice.
             noticeDelivery.firstDisplayCanWait = true;
           }
-          if (winner === "full") {
+          if (winner === "full" && routeDecisionCurrent()) {
             state.mainMemoryRoute = undefined;
           }
         },
@@ -1505,7 +1475,7 @@ async function handleMessages(
             // Any fully delivered leg (memory, full, spliced, recovered)
             // completes this turn downstream, ending the recovery-retry window.
             if (ok) markMainPromptDelivered();
-            if (state.mainRouteEpoch !== routeEpoch) return;
+            if (!routeDecisionCurrent()) return;
             if (delivered === "memory" && ok) {
               queueCompressionNotice({
                 state,
@@ -1521,7 +1491,8 @@ async function handleMessages(
                 body,
                 messages,
                 compressedBody,
-                routeEpoch
+                routeEpoch,
+                routeDecisionGeneration
               );
               return;
             }
@@ -1553,7 +1524,9 @@ async function handleMessages(
     );
   }
 
-  if (isMainRequest) state.mainMemoryRoute = undefined;
+  if (isMainRequest && routeDecisionCurrent()) {
+    state.mainMemoryRoute = undefined;
+  }
   recordTurn(rec, "followup-compressed", compressedRaw);
   capture(opts, "anthropic-request", compressedRaw);
   // Preserve the legacy embedder contract: without A/B enabled, a long live
@@ -1676,9 +1649,20 @@ function installMainMemoryRoute(
   originalBody: Record<string, any>,
   originalMessages: Message[],
   compressedBody: Record<string, any>,
-  routeEpoch: number
+  routeEpoch: number,
+  decisionGeneration: number
 ): boolean {
-  if (state.mainRouteEpoch !== routeEpoch) return false;
+  // Epoch guards the human-prompt lifecycle; the decision generation orders
+  // async installs that share one epoch (two recoveries, or a recovery vs an
+  // in-flight followup). A stale completion must not overwrite a newer
+  // decision's route — and must not clear it either, hence the early return
+  // before the sessionless-clear below.
+  if (
+    state.mainRouteEpoch !== routeEpoch ||
+    state.mainRouteDecisionGeneration !== decisionGeneration
+  ) {
+    return false;
+  }
   const sessionId = requestSessionId(req);
   if (!sessionId || !Array.isArray(compressedBody.messages)) {
     state.mainMemoryRoute = undefined;
@@ -2003,6 +1987,469 @@ function hasAgentAttribution(req: http.IncomingMessage): boolean {
 function cloneJson<T>(value: T): T {
   if (value === undefined) return value;
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+interface BlockingCompressionOutcome {
+  result: CompressResult | null;
+  usedLegacyFallback: boolean;
+  /**
+   * The exact input shape the winning result must be validated against:
+   * the raw pre-normalization messages when the legacy probe won, the
+   * canonical normalized messages otherwise.
+   */
+  winningInput: Message[];
+}
+
+/**
+ * The complete blocking-compression selection pipeline, shared by the main
+ * followup path and tool-route miss recovery: canonical + legacy probe legs,
+ * conversation-scoped migration bookkeeping, legacy fallback selection, and
+ * the `compress` telemetry record. Callers own downstream-close tracking
+ * (compression promises are hash-deduped and may serve another live retry, so
+ * a per-request disconnect signal must never feed compress()) and all
+ * decisions about the returned result: both
+ * `didMemtreeCompress(result)` and
+ * `checkCompressedHistory(result, winningInput).usable` must hold before the
+ * result may be forwarded or become a route.
+ */
+async function runBlockingCompression(args: {
+  opts: ProxyOptions;
+  state: ProxyState;
+  req: http.IncomingMessage;
+  body: Record<string, any>;
+  messages: Message[];
+  msgsForMemtree: Message[];
+  rawMsgsForMemtree: Message[];
+  hash: string;
+  legacyHash: string;
+  modelContextLimit: number;
+  rec: MessagesRecord;
+}): Promise<BlockingCompressionOutcome> {
+  const {
+    opts,
+    state,
+    req,
+    body,
+    messages,
+    msgsForMemtree,
+    rawMsgsForMemtree,
+    hash,
+    legacyHash,
+    modelContextLimit,
+    rec,
+  } = args;
+  const compressStarted = Date.now();
+  let result: CompressResult | null;
+  let usedLegacyFallback = false;
+  let canonicalCompressFailed = false;
+  // Wall time of the canonical leg alone. timedOut must be computed from
+  // this, not the Promise.all wall time: a fast canonical failure (e.g. a
+  // 200ms 5xx) awaited alongside a slow legacy probe is not a timeout.
+  let canonicalCompressMs = 0;
+  const compressMeta = {
+    // Model + tools drive the server's model-based memory budget
+    // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
+    // them silently downgrades to the server's static 50k fallback.
+    // `[1m]` is re-attached when the session is 1M-context so the
+    // server's budget telemetry names the variant it actually served.
+    model: modelForMemtree(
+      typeof body.model === "string" ? body.model : undefined,
+      modelContextLimit
+    ),
+    tools: Array.isArray(body.tools) ? body.tools : undefined,
+  };
+  // The first request after this normalization ships may not match an
+  // existing signature-keyed index. The canonical call starts the stable
+  // replacement index. Until it catches up, compare one lookup with the
+  // untouched shape so a shallow canonical hit cannot hide a much deeper
+  // same-model legacy index. Both legs run concurrently — the probe's
+  // inputs never depend on the canonical result, only the decision below
+  // does — so an active migration pays one compress budget, not two, per
+  // turn. compress() maps every failure to a resolved null (it never
+  // rejects), so neither leg can surface an unhandled rejection.
+  const migrationKey = legacyMigrationKey(req, messages);
+  const probeLegacy =
+    legacyHash !== hash &&
+    !state.legacyMemtreeMigrationComplete.has(migrationKey);
+  const [canonicalResult, legacyResult] = await Promise.all([
+    // compress() never rejects, so this .then always runs and records the
+    // canonical leg's own duration for the timedOut heuristic below.
+    opts.memtree
+      .compress(
+        hash,
+        msgsForMemtree,
+        modelContextLimit,
+        state.shutdownSignal,
+        compressMeta
+      )
+      .then((value) => {
+        canonicalCompressMs = Date.now() - compressStarted;
+        return value;
+      }),
+    probeLegacy
+      ? opts.memtree.compress(
+          legacyHash,
+          rawMsgsForMemtree,
+          modelContextLimit,
+          state.shutdownSignal,
+          compressMeta
+        )
+      : null,
+  ]);
+  result = canonicalResult;
+  canonicalCompressFailed = canonicalResult === null;
+  if (
+    canonicalResult === null &&
+    legacyResult &&
+    didMemtreeCompress(legacyResult) &&
+    checkCompressedHistory(legacyResult, rawMsgsForMemtree).usable
+  ) {
+    // The canonical leg failed (server error/timeout — compress maps every
+    // failure to null) while the concurrent probe returned a compressed,
+    // usable answer that is already paid for. Forward it instead of
+    // degrading to passthrough. The migration flag is untouched: a failed
+    // canonical leg is not a contest.
+    result = legacyResult;
+    usedLegacyFallback = true;
+    if (opts.debug) {
+      console.error(
+        "[ccc proxy] canonical compress failed; using legacy probe result"
+      );
+    }
+  } else if (
+    canonicalResult &&
+    legacyResult &&
+    didMemtreeCompress(legacyResult)
+  ) {
+    // Ending the migration is scoped to this conversation's key, and still
+    // requires legacy evidence: the probe leg was consulted this turn and
+    // answered from a real (compressed) legacy index. Even so, the probe
+    // itself warms a legacy index server-side, so evidence from one
+    // conversation says nothing about any other — a pre-upgrade session
+    // /resume'd later in this run keeps its own probe armed regardless of
+    // how many fresh conversations have caught up.
+    if (!shouldProbeLegacyMemtree(canonicalResult, msgsForMemtree)) {
+      // Compressed, usable, and a small measured unindexed tail
+      // (shouldProbe returns true for every weaker outcome): the canonical
+      // index has caught up against a real legacy index, so the
+      // concurrently fetched legacy result is deliberately ignored and this
+      // conversation's later turns skip the probe entirely.
+      markLegacyMigrationComplete(state, migrationKey);
+    } else if (
+      isBetterLegacyMemtreeResult(
+        canonicalResult,
+        msgsForMemtree,
+        legacyResult,
+        rawMsgsForMemtree
+      )
+    ) {
+      result = legacyResult;
+      usedLegacyFallback = true;
+    } else if (
+      didMemtreeCompress(canonicalResult) &&
+      checkCompressedHistory(canonicalResult, msgsForMemtree).usable &&
+      unindexedPromptTokenCount(canonicalResult) !== undefined &&
+      unindexedPromptTokenCount(legacyResult) !== undefined
+    ) {
+      // Ending the migration also needs a real contest on the canonical
+      // side: a compressed, usable canonical answer that beat the legacy
+      // index it was probed against, with BOTH tails actually measured.
+      // An unusable empty-memory canonical answer must not end it, and
+      // neither may a "win" isBetterLegacyMemtreeResult awarded only
+      // because raw_prompt_tokens was absent from both responses — an
+      // unmeasured contest is no contest.
+      markLegacyMigrationComplete(state, migrationKey);
+    }
+  }
+  // Overall wall time of the blocking compress step (both concurrent legs) —
+  // what reqlog documents for compress.ms.
+  const compressMs = Date.now() - compressStarted;
+  rec.compress = {
+    ms: compressMs,
+    ok: result !== null,
+    // Budget-consumed heuristic on the CANONICAL leg: the client maps every
+    // failure to null, so a canonical null whose OWN leg took (roughly) the
+    // whole abort budget was almost certainly the AbortSignal timeout, not a
+    // fast server error. Timed per-leg rather than from the Promise.all wall
+    // time so a slow legacy probe cannot make a fast canonical failure look
+    // like a timeout, and computed from the canonical outcome rather than
+    // the post-swap result so a legacy-probe rescue (ok stays true) still
+    // records that the canonical leg burned the full budget.
+    timedOut:
+      canonicalCompressFailed &&
+      canonicalCompressMs >= opts.memtree.compressBudgetMs,
+    ...(usedLegacyFallback ? { legacyFallback: true } : {}),
+  };
+  return {
+    result,
+    usedLegacyFallback,
+    winningInput: usedLegacyFallback ? rawMsgsForMemtree : msgsForMemtree,
+  };
+}
+
+/**
+ * Shared final request shape for a validated compression result: lift any
+ * returned system message to `body.system`, flatten the rest to the single
+ * user message Anthropic receives. Route candidates must be created from this
+ * `compressedBody` — never from raw `result.messages` — so tool-turn rewrites
+ * extend exactly the bytes that were sent.
+ */
+function buildCompressedBody(
+  body: Record<string, any>,
+  result: CompressResult
+): { compressedBody: Record<string, any>; compressedRaw: Buffer } {
+  const processed = result.messages;
+  const systemMsg = processed.find((m) => m.role === "system");
+  const compressedBody: Record<string, any> = {
+    ...body,
+    messages: flattenToSingleUserMessage(processed),
+  };
+  if (systemMsg?.content != null) {
+    compressedBody.system = systemMsg.content;
+  }
+  return {
+    compressedBody,
+    compressedRaw: Buffer.from(JSON.stringify(compressedBody), "utf-8"),
+  };
+}
+
+/**
+ * Best-effort recovery for a large main tool turn whose memory route missed
+ * (missing slot or same-session rejection): one blocking recompression
+ * attempt, sharing the followup path's complete selection pipeline. This is
+ * a soft fuse — any failure, no-op, unusable, or non-shrinking result
+ * degrades to forwarding the original body, never worse than the verbatim
+ * path it replaces. A validated smaller result forwards exactly one
+ * compressed Anthropic leg (never A/B — launching a full-history leg would
+ * defeat the recovery), claims no human-turn state (no notice, no prompt
+ * arm/delivery mutation), and installs a self-healing route at
+ * protocol-complete so the rest of the tool loop rides locally again.
+ */
+async function recoverToolRouteMiss(args: {
+  opts: ProxyOptions;
+  state: ProxyState;
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  upstream: Upstream;
+  body: Record<string, any>;
+  messages: Message[];
+  forwardBody: Buffer;
+  msgsForMemtree: Message[];
+  rawMsgsForMemtree: Message[];
+  hash: string;
+  legacyHash: string;
+  modelContextLimit: number;
+  routeEpoch: number;
+  rec: MessagesRecord;
+  conversationBytes: number;
+}): Promise<void> {
+  const {
+    opts,
+    state,
+    req,
+    res,
+    upstream,
+    body,
+    messages,
+    forwardBody,
+    msgsForMemtree,
+    rawMsgsForMemtree,
+    hash,
+    legacyHash,
+    modelContextLimit,
+    routeEpoch,
+    rec,
+    conversationBytes,
+  } = args;
+
+  const sessionId = requestSessionId(req);
+  // A pending human prompt arm/retry window means a typed prompt may arrive
+  // merged into a tool_result wrapper: recovery-turn classification uses
+  // route absence as a rideability signal, so an intermediate tool wrapper
+  // must not install a route that vetoes the real merged-prompt request.
+  // Captured ONCE here: the attempt stays transform-only even if the window
+  // happens to close before its response settles.
+  const promptWindowPending =
+    state.mainPromptArmed || !state.mainPromptDelivered;
+  const routeOwning = sessionId !== undefined && !promptWindowPending;
+  // Only a route-owning recovery reserves the decision generation. A
+  // transform-only attempt must not advance it — and, reciprocally, its late
+  // completion can never install over (or clear) a route someone else
+  // installed after this miss began, because it never activates at all.
+  const decisionGeneration = routeOwning
+    ? ++state.mainRouteDecisionGeneration
+    : state.mainRouteDecisionGeneration;
+
+  // Same downstream-close tracking as the followup path: compression
+  // promises are hash-deduped and may serve another live retry, so the
+  // subscriber's lifetime is tracked locally, never fed into compress().
+  let downstreamClosedDuringCompression =
+    res.destroyed && !res.writableFinished;
+  const markDownstreamClosed = () => {
+    if (!res.writableFinished) downstreamClosedDuringCompression = true;
+  };
+  res.once("close", markDownstreamClosed);
+  let compression: BlockingCompressionOutcome;
+  try {
+    compression = await runBlockingCompression({
+      opts,
+      state,
+      req,
+      body,
+      messages,
+      msgsForMemtree,
+      rawMsgsForMemtree,
+      hash,
+      legacyHash,
+      modelContextLimit,
+      rec,
+    });
+  } finally {
+    res.off("close", markDownstreamClosed);
+  }
+  const { result } = compression;
+
+  if (
+    downstreamClosedDuringCompression ||
+    (res.destroyed && !res.writableFinished)
+  ) {
+    // The MemTree work keeps its cache/index value, but a dead client gets
+    // no Anthropic request and no route.
+    rec.routeRecovery = { conversationBytes, outcome: "client-closed" };
+    recordTurn(rec, "tool", Buffer.alloc(0));
+    return;
+  }
+
+  const forwardOriginal = () => {
+    capture(opts, "anthropic-request", forwardBody);
+    return forwardRaw(
+      req,
+      res,
+      forwardBody,
+      opts,
+      upstream,
+      state.shutdownSignal,
+      rec
+    ).then(() => undefined);
+  };
+
+  if (!result) {
+    rec.routeRecovery = { conversationBytes, outcome: "failed" };
+    recordTurn(rec, "tool", forwardBody);
+    // An ordinary server/network failure or timeout retains the background
+    // submission: its longer independent budget can still warm the index for
+    // a later turn. An unpaid key (402, possibly set by this very compress)
+    // or a shutting-down proxy gets no retry.
+    if (
+      !state.shutdownSignal.aborted &&
+      opts.memtree.paymentRequiredDetail === null
+    ) {
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+    }
+    return forwardOriginal();
+  }
+
+  // Any non-null response already submitted this history to the server; an
+  // extra indexInBackground for the same request would be a duplicate.
+  const actuallyCompressed = didMemtreeCompress(result);
+  const historyCheck = checkCompressedHistory(result, compression.winningInput);
+  rec.history = {
+    retainedChars: historyCheck.retainedChars,
+    priorHistoryChars: historyCheck.priorHistoryChars,
+    usable: historyCheck.usable,
+  };
+  if (!actuallyCompressed || !historyCheck.usable) {
+    // Index-warming no-op (flattening it would change structured history for
+    // nothing) or an indexed answer that dropped the conversation (amnesia —
+    // fatal for a route). Both preserve the original body.
+    rec.routeRecovery = {
+      conversationBytes,
+      outcome: actuallyCompressed ? "unusable" : "noop",
+    };
+    recordTurn(rec, "tool", forwardBody);
+    return forwardOriginal();
+  }
+
+  const { compressedBody, compressedRaw } = buildCompressedBody(body, result);
+  if (compressedRaw.length >= forwardBody.length) {
+    // The final transformed body is the proof of payload recovery; a result
+    // with no byte gain is not worth a route built on it.
+    rec.routeRecovery = { conversationBytes, outcome: "no-gain" };
+    recordTurn(rec, "tool", forwardBody);
+    return forwardOriginal();
+  }
+
+  rec.routeRecovery = { conversationBytes, outcome: "compressed" };
+  let activationAttempted = false;
+  let installFate: "installed" | "stale" | undefined;
+  const activateRecoveredRoute = () => {
+    if (activationAttempted) return;
+    if (!routeOwning) {
+      activationAttempted = true;
+      return;
+    }
+    if (
+      state.mainRouteEpoch !== routeEpoch ||
+      state.mainRouteDecisionGeneration !== decisionGeneration
+    ) {
+      activationAttempted = true;
+      installFate = "stale";
+      return;
+    }
+    const installed = installMainMemoryRoute(
+      state,
+      req,
+      body,
+      messages,
+      compressedBody,
+      routeEpoch,
+      decisionGeneration
+    );
+    // Leave this false if installMainMemoryRoute unexpectedly throws: the
+    // delivery-complete fallback then gets one safe retry.
+    activationAttempted = true;
+    installFate = installed ? "installed" : "stale";
+    if (opts.debug) {
+      console.error(
+        `[ccc proxy] recovered memory route activation: ${
+          installed ? "installed" : "unavailable"
+        }`
+      );
+    }
+  };
+
+  if (opts.debug) {
+    console.error(
+      `[ccc proxy] tool-route miss recovered: ${forwardBody.length} → ` +
+        `${compressedRaw.length} body bytes`
+    );
+  }
+  recordTurn(rec, "tool-recompressed", compressedRaw);
+  capture(opts, "anthropic-request-memory", compressedRaw);
+  const delivered = await forwardRaw(
+    req,
+    res,
+    compressedRaw,
+    opts,
+    upstream,
+    state.shutdownSignal,
+    rec,
+    undefined,
+    // Protocol-complete (accepted SSE message_stop or a complete 2xx JSON
+    // response) is the real activation point, exactly as on the followup
+    // path, so a fast tool request right after message_stop can ride.
+    activateRecoveredRoute
+  );
+  // Defensive delivery-complete fallback, mirroring the followup path. A
+  // candidate already activated at message_stop deliberately survives a
+  // delivered=false settle (fast-tool abort); an upstream 500/529 or an
+  // incomplete response never reached protocol-complete and never installs.
+  if (delivered) activateRecoveredRoute();
+  rec.routeRecovery.install = !routeOwning
+    ? sessionId === undefined
+      ? "no-session"
+      : "prompt-pending"
+    : installFate ?? "upstream-failed";
 }
 
 /** Stamp the classified turn type and forwarded-size fields on the record. */

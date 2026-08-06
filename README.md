@@ -105,6 +105,8 @@ When you send a message, we retrieve relevant details and summaries from the pri
 
 That compressed context stays in force for the rest of the turn: the tool loop it kicks off, and the matching Count Tokens calls, are routed through the same compressed prefix. The Count Tokens part matters — Claude Code sizes its context from those replies, so counting the uncompressed history would make it auto-compact a conversation memory had already shrunk. A mismatched or resumed conversation shape drops the route rather than grafting one session's prefix onto another.
 
+If a large tool request ever arrives without a usable compressed prefix (for example after an interrupted turn), `ccc` makes one best-effort blocking MemTree recompression before forwarding, then re-installs the compressed prefix for the rest of the tool loop. This is a soft recovery, not a hard cap: if MemTree is unavailable or returns nothing usable within its normal compression budget, the original request is forwarded unchanged. Small tool requests never pay the blocking wait. `CCC_TOOL_ROUTE_RECOVERY=0` temporarily disables the recovery for one invocation; outcomes are recorded in `~/.claude-code-infinite/logs/requests.jsonl` under `routeMiss`/`routeRecovery`.
+
 ### Adaptive memory A/B routing
 
 Opt in with `CCC_AB_ROUTING=1`, or by passing an explicit delivery flag (`--ab-speculative` / `--ab-buffered`). When enabled, `ccc` checks whether memory is still the best context for each large follow-up turn:

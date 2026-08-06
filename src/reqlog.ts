@@ -38,6 +38,8 @@ export type TurnType =
   | "first-user"
   | "tool"
   | "tool-memory"
+  /** Tool-route miss recovered: validated compressed bytes sent to Anthropic. */
+  | "tool-recompressed"
   | "followup-compressed"
   | "followup-noop"
   /** Indexed response that carried no prior conversation; history forwarded. */
@@ -188,6 +190,32 @@ export interface MessagesRecord {
   };
   /** Present when live memory-vs-full routing was eligible for this turn. */
   comparison?: ComparisonRecord;
+  /**
+   * Main tool turns that attempted the local route lookup and missed:
+   * "missing" (no route slot) or "rejected" (route present, identity/hash
+   * mismatch). Absent means there was no applicable miss — hits and non-main
+   * turns never emit it. "none" is deliberately not a value.
+   */
+  routeMiss?: "missing" | "rejected";
+  /** Outcome of a best-effort tool-route miss recovery attempt. */
+  routeRecovery?: {
+    /** Serialized non-system conversation bytes that passed the gate. */
+    conversationBytes: number;
+    outcome:
+      | "compressed"
+      | "failed"
+      | "noop"
+      | "unusable"
+      | "no-gain"
+      | "client-closed";
+    /** Route candidate fate; only "compressed" outcomes carry it. */
+    install?:
+      | "installed"
+      | "stale"
+      | "prompt-pending"
+      | "no-session"
+      | "upstream-failed";
+  };
   upstreamStatus?: number;
   /** Forward start → first response byte from Anthropic. */
   ttfbMs?: number;

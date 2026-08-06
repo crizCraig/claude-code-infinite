@@ -359,6 +359,11 @@ async function main() {
     reqlog,
     abRouting,
     nativeOneMillionContext,
+    // Temporary kill switch for tool-route miss recovery
+    // (plans/2026-08-04_PLAN_tool_turn_route_recovery.md): set
+    // CCC_TOOL_ROUTE_RECOVERY=0 and relaunch to restore the old
+    // background-index/verbatim behavior on route misses.
+    toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
