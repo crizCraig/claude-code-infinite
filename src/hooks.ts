@@ -16,6 +16,7 @@ export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
+const STARTUP_NOTICE_FILE = "startup-notice.json";
 
 type NoticeText = string | (() => string);
 
@@ -153,56 +154,13 @@ export class NoticeDeliveryQueue {
    */
   claim(input: NoticeHookInput): NoticeHookOutput | null {
     if (input.agent_id !== undefined) return null;
-    if (
-      input.hook_event_name !== "MessageDisplay" &&
-      input.hook_event_name !== "Stop"
-    ) {
-      return null;
-    }
-    const pending = this.freshPending();
-    if (!pending) return null;
-    if (
-      pending.promptId !== undefined &&
-      input.prompt_id !== undefined &&
-      pending.promptId !== input.prompt_id
-    ) {
-      return null;
-    }
-
     if (input.hook_event_name === "MessageDisplay") {
-      const prefix = input.index === 0 ? pending.prefix : undefined;
-      const suffix = input.final ? pending.suffix : undefined;
-      if (!prefix && !suffix) return null;
-
-      // Remove before callbacks or response construction so a reentrant/parallel
-      // Stop hook cannot deliver the same notice a second time.
-      if (prefix) delete pending.prefix;
-      if (suffix) delete pending.suffix;
-      this.dropIfEmpty(pending);
-      markDelivered(prefix);
-      markDelivered(suffix);
-
-      let displayContent = input.delta;
-      if (prefix) {
-        // MessageDisplay exposes text rather than a structured style token.
-        // Standard named-color SGR is interpreted by Claude Code on every
-        // supported terminal (and stripped cleanly in monochrome/NO_COLOR).
-        // Reset foreground only so surrounding renderer styles are preserved.
-        const styled = this.styleSuccess(resolveNoticeText(prefix));
-        displayContent = `${styled}\n${displayContent}`;
-      }
-      if (suffix) {
-        const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
-        displayContent = `${displayContent}${separator}${resolveNoticeText(suffix)}`;
-      }
-      return {
-        hookSpecificOutput: {
-          hookEventName: "MessageDisplay",
-          displayContent,
-        },
-      };
+      return this.claimForDisplay(input);
     }
+    if (input.hook_event_name !== "Stop") return null;
 
+    const pending = this.freshPending();
+    if (!pending || !this.promptMatches(pending, input.prompt_id)) return null;
     const prefix = pending.prefix;
     const suffix = pending.suffix;
     if (!prefix && !suffix) return null;
@@ -215,6 +173,56 @@ export class NoticeDeliveryQueue {
     return {
       systemMessage: lines.join("\n"),
     };
+  }
+
+  private claimForDisplay(
+    input: MessageDisplayHookInput
+  ): NoticeHookOutput | null {
+    const pending = this.freshPending();
+    const matched =
+      pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
+    const prefix = matched && input.index === 0 ? matched.prefix : undefined;
+    const suffix = matched && input.final ? matched.suffix : undefined;
+    if (!prefix && !suffix) return null;
+
+    // Remove before callbacks or response construction so a reentrant/parallel
+    // Stop hook cannot deliver the same notice a second time.
+    if (prefix) delete matched!.prefix;
+    if (suffix) delete matched!.suffix;
+    this.dropIfEmpty(matched!);
+    markDelivered(prefix);
+    markDelivered(suffix);
+
+    let displayContent = input.delta;
+    if (prefix) {
+      // MessageDisplay exposes text rather than a structured style token.
+      // Standard named-color SGR is interpreted by Claude Code on every
+      // supported terminal (and stripped cleanly in monochrome/NO_COLOR).
+      // Reset foreground only so surrounding renderer styles are preserved.
+      const styled = this.styleSuccess(resolveNoticeText(prefix));
+      displayContent = `${styled}\n${displayContent}`;
+    }
+    if (suffix) {
+      const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
+      displayContent = `${displayContent}${separator}${resolveNoticeText(suffix)}`;
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: "MessageDisplay",
+        displayContent,
+      },
+    };
+  }
+
+  private promptMatches(
+    pending: PendingNotice,
+    promptId: string | undefined
+  ): boolean {
+    return (
+      pending.promptId === undefined ||
+      promptId === undefined ||
+      pending.promptId === promptId
+    );
   }
 
   private styleSuccess(text: string): string {
@@ -333,7 +341,12 @@ export function withSessionNoticePluginArgs(
  */
 export function createSessionNoticePlugin(
   hookUrl: string,
-  opts: { messageDisplay?: boolean; tempRoot?: string } = {}
+  opts: {
+    messageDisplay?: boolean;
+    tempRoot?: string;
+    /** Session banner, rendered by Claude Code under a "SessionStart:… says:" label. */
+    startupMessage?: string;
+  } = {}
 ): SessionNoticePlugin {
   const url = new URL(hookUrl);
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") {
@@ -357,6 +370,33 @@ export function createSessionNoticePlugin(
   };
   if (opts.messageDisplay !== false) {
     hooks.MessageDisplay = [{ hooks: [hook] }];
+  }
+  if (opts.startupMessage) {
+    // SessionStart accepts only `command`/`mcp_tool` hooks — never `http` —
+    // so the banner is baked into a static file the command simply cats. It
+    // must NOT be `echo`'d: sh and zsh expand backslash escapes, turning the
+    // JSON's \n into a raw newline and silently corrupting the payload.
+    fs.writeFileSync(
+      path.join(hooksDir, STARTUP_NOTICE_FILE),
+      JSON.stringify({ systemMessage: opts.startupMessage }),
+      { mode: 0o600 }
+    );
+    hooks.SessionStart = [
+      {
+        // A compaction continues the same conversation; only real session
+        // starts (fresh, --resume, /clear) re-show the banner.
+        matcher: "startup|resume|clear",
+        hooks: [
+          {
+            type: "command",
+            command: `cat ${singleQuoteForShell(
+              path.join(hooksDir, STARTUP_NOTICE_FILE)
+            )}`,
+            timeout: 5,
+          },
+        ],
+      },
+    ];
   }
 
   fs.writeFileSync(
@@ -383,6 +423,15 @@ export function createSessionNoticePlugin(
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * POSIX single-quoting: everything inside is literal, and an embedded quote is
+ * spliced in as '\''. The mkdtemp path is ours, but quoting keeps a hostile
+ * TMPDIR from turning the hook command into arbitrary shell.
+ */
+function singleQuoteForShell(text: string): string {
+  return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Return true only for known Claude versions that support MessageDisplay. */

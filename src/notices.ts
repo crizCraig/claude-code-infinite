@@ -28,49 +28,24 @@ export const PAYMENT_REQUIRED_NOTICE =
   "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export const SLOW_FIRST_TOKEN_NOTICE =
   "✨ Something special is happening — please wait…";
+export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
 
-const COMPACT_TOKEN_FORMATTER = new Intl.NumberFormat("en-US", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
-
-export interface CompressionNoticeMetrics {
-  /** Time spent waiting for the underlying MemTree compression request. */
-  latencyMs: number;
-  /** Best available original-prompt estimate (MemTree raw count or Claude fallback). */
-  originalTokens?: number;
-  /** Full Anthropic input count after compression, from response usage. */
-  consolidatedTokens?: number;
-}
-
-/** Build concise display-only positive copy from validated before/after metrics. */
-export function compressedNoticeText(metrics: CompressionNoticeMetrics): string {
-  const latency = Number.isFinite(metrics.latencyMs)
-    ? ` in ${formatLatency(Math.max(0, metrics.latencyMs))}`
-    : "";
-  const { originalTokens, consolidatedTokens } = metrics;
-  const hasReduction =
-    typeof originalTokens === "number" &&
-    Number.isFinite(originalTokens) &&
-    originalTokens > 0 &&
-    typeof consolidatedTokens === "number" &&
-    Number.isFinite(consolidatedTokens) &&
-    consolidatedTokens >= 0 &&
-    consolidatedTokens < originalTokens;
-  const totals = hasReduction
-    ? ` · ~${formatTokenCount(originalTokens)}` +
-      ` → ${formatTokenCount(consolidatedTokens)} tokens`
-    : "";
-  return `${COMPRESSED_NOTICE}${latency}${totals}`;
-}
-
-function formatTokenCount(tokens: number): string {
-  return COMPACT_TOKEN_FORMATTER.format(tokens).toLowerCase();
-}
-
-function formatLatency(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${Math.round(ms / 100) / 10}s`;
+/**
+ * Session-start banner delivered inside Claude Code via the SessionStart
+ * hook's systemMessage. Styling mirrors the notice queue's conventions:
+ * named-color SGR only, resetting foreground/intensity rather than issuing a
+ * full reset, so surrounding renderer styles are preserved.
+ *
+ * Leading newlines are load-bearing: Claude Code renders a hook systemMessage
+ * as `<hookName> says: <content>` on one line, so the first breaks the banner
+ * off the label and the second leaves a blank line between them.
+ */
+export function startupNoticeText(color: boolean): string {
+  if (!color) return `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
+  return (
+    "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
+    "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
+  );
 }
 
 /** Make server-provided detail safe and compact before terminal rendering. */

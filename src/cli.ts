@@ -28,12 +28,13 @@ import {
 import {
   createSessionNoticePlugin,
   supportsMessageDisplay,
+  terminalSupportsColor,
   withSessionNoticePluginArgs,
   type SessionNoticePlugin,
 } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
-import { sanitizeNoticeDetail } from "./notices.js";
+import { sanitizeNoticeDetail, startupNoticeText } from "./notices.js";
 import {
   isPrintInvocation,
   parseWrapperArgs,
@@ -47,7 +48,6 @@ import {
   createSignalShutdownHandler,
   exitCodeForChild,
 } from "./cli-lifecycle.js";
-import { projectTranscriptDir, startTranscriptScrubber } from "./scrub.js";
 import {
   getPolychatApiKey,
   setPolychatApiKey,
@@ -213,7 +213,7 @@ async function warnIfUnpaid(baseUrl: string, apiKey: string): Promise<void> {
 
 function printBanner() {
   console.log(
-    `\n\x1b[1;38;5;209mClaude Code Infinite:\x1b[0m \x1b[38;5;48mMaximizing Claude's intelligence with context-management from \x1b]8;;https://MemTree.dev\x1b\\MemTree.dev\x1b]8;;\x1b\\\x1b[0m\n`
+    `\n\x1b[38;5;209m∞\x1b[0m \x1b[1;38;5;209mClaude Code Infinite\x1b[0m \x1b[38;5;209m∞\x1b[0m \x1b[38;5;48mfrom \x1b]8;;https://MemTree.dev\x1b\\MemTree\x1b]8;;\x1b\\\x1b[0m\n`
   );
 }
 
@@ -346,6 +346,13 @@ async function main() {
           grader: abEnvForcedGrader(),
           speculative: parsedArgs.speculativeAb,
         };
+  // Interactive UI only: print/non-TTY invocations are programmatic
+  // interfaces whose output must stay byte-for-byte vanilla, and they get no
+  // notice plugin to deliver a banner anyway.
+  const interactiveUi =
+    !isPrintInvocation(claudeArgs) &&
+    process.stdin.isTTY === true &&
+    process.stdout.isTTY === true;
   const proxy = await startProxy({
     memtree,
     debug: isDebugMode,
@@ -377,23 +384,6 @@ async function main() {
     );
   }
 
-  // Legacy transcript cleanup: releases before display-only hooks injected
-  // marker-wrapped assistant blocks. Keep removing those from old/forked
-  // .jsonl files so resumes stay clean. In-place patches only (the watcher scans
-  // pre-existing transcripts from byte 0 at startup, then patches appends as
-  // they land) — no rewrite+rename pass, ever: we can't identify our own
-  // session's transcript (claude picks the session id itself), and renaming a
-  // file another live session holds an open append handle on silently loses
-  // the rest of its history.
-  const transcriptDir = projectTranscriptDir(process.cwd());
-  let scrubber;
-  try {
-    scrubber = startTranscriptScrubber(transcriptDir, { debug: isDebugMode });
-  } catch (err) {
-    proxy.close();
-    throw err;
-  }
-
   // Interactive notices are provided by a minimal, ephemeral plugin. Prepending
   // --plugin-dir composes with user hooks/settings; adding another --settings
   // would not, because Claude keeps only its final --settings occurrence.
@@ -401,14 +391,11 @@ async function main() {
   // stdout/events remain byte-for-byte vanilla.
   let noticePlugin: SessionNoticePlugin | null = null;
   let childArgs = [...claudeArgs];
-  if (
-    !isPrintInvocation(claudeArgs) &&
-    process.stdin.isTTY === true &&
-    process.stdout.isTTY === true
-  ) {
+  if (interactiveUi) {
     try {
       noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
         messageDisplay: installedClaudeSupportsMessageDisplay(),
+        startupMessage: startupNoticeText(terminalSupportsColor()),
       });
       // Global option must precede a user-supplied `--`, positional prompt, or
       // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
@@ -436,21 +423,15 @@ async function main() {
   const shutdown = async (code: number): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    try {
-      // Final in-place pass: the last turn's notice may have just been appended.
-      await scrubber.flush();
-    } finally {
-      noticePlugin?.close();
-      scrubber.close();
-      // A speculative response can finish before its shadow grader. Stop new
-      // proxy work and give active handlers a bounded chance to finalize their
-      // verdict records. Background indexing is a separate log producer: stop
-      // and drain it too before waiting for scheduled JSONL appends on disk.
-      await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
-      await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-      await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
-      process.exit(code);
-    }
+    noticePlugin?.close();
+    // A speculative response can finish before its shadow grader. Stop new
+    // proxy work and give active handlers a bounded chance to finalize their
+    // verdict records. Background indexing is a separate log producer: stop
+    // and drain it too before waiting for scheduled JSONL appends on disk.
+    await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+    await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
+    await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
+    process.exit(code);
   };
 
   const handleShutdownSignal = createSignalShutdownHandler({

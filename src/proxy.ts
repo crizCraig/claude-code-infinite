@@ -21,8 +21,10 @@
  *   their semantic prefixes, commits the in-flight winner, and aborts the
  *   loser. A memory winner remains the prefix for that turn's tool loop.
  * - MemTree failure/timeout degrades to passthrough. A display-only success
- *   notice is queued only when the memory response is selected; degraded and
- *   unpaid states get their own notices.
+ *   notice is queued only when the memory response is selected AND MemTree's
+ *   index coverage grew since the last announcement (unchanged coverage means
+ *   the turn was appended after an index that learned nothing new); degraded
+ *   and unpaid states get their own notices.
  *
  * Every /v1/messages and count_tokens body is run through the legacy notice
  * strip pass before hashing/forwarding. Live notices use Claude Code hooks and
@@ -60,11 +62,11 @@ import {
   type ResolvedAbRoutingOptions,
 } from "./ab-routing.js";
 import {
+  cachedPromptTokenCount,
   checkCompressedHistory,
   didMemtreeCompress,
   MemtreeClient,
   normalizeMessagesForMemtree,
-  rawPromptTokenCount,
   unindexedPromptTokenCount,
   type CompressResult,
 } from "./memtree.js";
@@ -84,12 +86,12 @@ import {
   type Message,
 } from "./turns.js";
 import {
+  COMPRESSED_NOTICE,
   DEGRADED_NOTICE,
   FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   RECOVERED_NOTICE,
   SseNoticeRewriter,
-  compressedNoticeText,
   sanitizeNoticeDetail,
   stripNoticeBlocks,
   stripNoticeSystem,
@@ -122,7 +124,6 @@ import {
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
 const NOTICE_SETTLE_WAIT_MS = 1_000;
-const TOKEN_COUNT_CACHE_MAX = 64;
 const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
 const LEGACY_MIGRATION_SESSIONS_MAX = 64;
 
@@ -225,19 +226,30 @@ interface ProxyState {
   mainNoticeDelivery?: MainNoticeDelivery;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
-  /** Claude's full-input token estimates, keyed by token-relevant fields. */
-  tokenCounts: Map<string, number>;
   /** Resolved once at startup; absent means single-leg legacy behavior. */
   abRouting?: ResolvedAbRoutingOptions;
   /** A memory winner carried through the current human turn's tool loop. */
   mainMemoryRoute?: MainMemoryRoute;
   /**
+   * Index coverage (MemTree `cached_tokens`) observed on the last compression
+   * this session displayed a notice for. Only a turn whose coverage GREW
+   * indexed newer messages; equal coverage means MemTree re-unfolded the same
+   * index behind the current question and appended this turn verbatim, which
+   * is not something to announce.
+   *
+   * Coverage, not the rendered memory text, is the signal: the server unfolds
+   * the index per question (expanding the sections relevant to it), so the
+   * memory message differs byte-wise on nearly every turn even when nothing
+   * new was indexed.
+   */
+  lastNoticedIndexCoverage?: { sessionId?: string; indexedTokens: number };
+  /**
    * Conversations whose stable normalized MemTree history has caught up with
    * the legacy shape. Scoped per session/conversation: the probe leg itself
    * warms a legacy index server-side, so a fresh post-upgrade conversation
    * can manufacture "legacy evidence" that proves nothing about a deep
-   * pre-upgrade session /resume'd later in the same process. Bounded like
-   * tokenCounts; evicting an entry merely re-opens that session's probe.
+   * pre-upgrade session /resume'd later in the same process. Insertion-order
+   * bounded; evicting an entry merely re-opens that session's probe.
    */
   legacyMemtreeMigrationComplete: Set<string>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
@@ -346,7 +358,6 @@ async function waitForMainNoticeDelivery(
 
 interface MainMemoryRoute {
   sessionId: string;
-  model: string;
   originalSystemHash: string;
   originalPrefixHashes: string[];
   compressedMessages: Message[];
@@ -433,8 +444,8 @@ function conversationContentKey(messages: Message[]): string {
 }
 
 function markLegacyMigrationComplete(state: ProxyState, key: string): void {
-  // Insertion-order bounded like rememberTokenCount. Evicting the oldest
-  // session re-opens its probe (one redundant compress), never the reverse.
+  // Insertion-order bounded. Evicting the oldest session re-opens its probe
+  // (one redundant compress), never the reverse.
   state.legacyMemtreeMigrationComplete.delete(key);
   state.legacyMemtreeMigrationComplete.add(key);
   if (state.legacyMemtreeMigrationComplete.size > LEGACY_MIGRATION_SESSIONS_MAX) {
@@ -486,7 +497,6 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainPromptDelivered: true,
     mainPromptGeneration: 0,
     activeSubagents: new Set(),
-    tokenCounts: new Map(),
     abRouting: opts.abRouting
       ? resolveAbRoutingOptions(opts.abRouting)
       : undefined,
@@ -962,7 +972,6 @@ async function handleMessages(
   const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
   const legacyHash = MemtreeClient.hashMessages(rawMsgsForMemtree);
-  const originalTokenCountKey = tokenCountKey(body, req.headers, req.url);
 
   // UserPromptSubmit clears/arms only a real main-thread human turn. Keep that
   // arm through CC's small first-user probe/retries; consume it only when the
@@ -1419,13 +1428,11 @@ async function handleMessages(
             if (delivered && state.mainRouteEpoch === routeEpoch) {
               queueCompressionNotice({
                 state,
+                req,
                 displayForThisTurn,
                 noticePromptGeneration,
                 noticePromptId,
                 result,
-                compressMs,
-                originalTokenCountKey,
-                rec,
               });
               activateMainMemoryRoute();
             } else if (
@@ -1502,13 +1509,11 @@ async function handleMessages(
             if (delivered === "memory" && ok) {
               queueCompressionNotice({
                 state,
+                req,
                 displayForThisTurn,
                 noticePromptGeneration,
                 noticePromptId,
                 result,
-                compressMs,
-                originalTokenCountKey,
-                rec,
               });
               installMainMemoryRoute(
                 state,
@@ -1558,13 +1563,11 @@ async function handleMessages(
   if (!abRouting) {
     queueCompressionNotice({
       state,
+      req,
       displayForThisTurn,
       noticePromptGeneration,
       noticePromptId,
       result,
-      compressMs,
-      originalTokenCountKey,
-      rec,
     });
   }
   return logged(
@@ -1596,13 +1599,11 @@ async function handleMessages(
         if (abRouting) {
           queueCompressionNotice({
             state,
+            req,
             displayForThisTurn,
             noticePromptGeneration,
             noticePromptId,
             result,
-            compressMs,
-            originalTokenCountKey,
-            rec,
           });
         }
         // Route the rest of this human turn's tool loop — and the count_tokens
@@ -1620,23 +1621,19 @@ async function handleMessages(
 
 function queueCompressionNotice(args: {
   state: ProxyState;
+  req: http.IncomingMessage;
   displayForThisTurn: boolean;
   noticePromptGeneration: number;
   noticePromptId: string | undefined;
   result: CompressResult;
-  compressMs: number;
-  originalTokenCountKey: string | null;
-  rec: MessagesRecord;
 }): void {
   const {
     state,
+    req,
     displayForThisTurn,
     noticePromptGeneration,
     noticePromptId,
     result,
-    compressMs,
-    originalTokenCountKey,
-    rec,
   } = args;
   if (
     !displayForThisTurn ||
@@ -1644,26 +1641,33 @@ function queueCompressionNotice(args: {
   ) {
     return;
   }
-  const memtreeOriginalTokens = rawPromptTokenCount(result);
-  const originalTokensAtCompression =
-    originalTokenCountKey === null
-      ? undefined
-      : state.tokenCounts.get(originalTokenCountKey);
-  state.notices.queuePrefix(
-    () =>
-      compressedNoticeText({
-        latencyMs: result.clientLatencyMs ?? compressMs,
-        originalTokens:
-          memtreeOriginalTokens ??
-          originalTokensAtCompression ??
-          (originalTokenCountKey === null
-            ? undefined
-            : state.tokenCounts.get(originalTokenCountKey)),
-        consolidatedTokens: totalInputTokens(rec.usage),
-      }),
-    undefined,
-    noticePromptId
-  );
+  // Announce only actual (re)indexing, measured as growth in how much of the
+  // original prompt the index covers (`cached_tokens`). Unchanged coverage
+  // means this turn rode the existing index with the new messages appended
+  // after it — MemTree did no new indexing work worth reporting.
+  //
+  // Deliberately NOT keyed on the memory text: the server unfolds the index
+  // against the current question, so its rendering (and length) changes on
+  // nearly every turn regardless of indexing. Coverage is missing only on
+  // servers old enough that `didMemtreeCompress` would have degraded this
+  // turn already; announce rather than suppress on an unknown quantity.
+  const indexedTokens = cachedPromptTokenCount(result);
+  if (indexedTokens !== undefined) {
+    const sessionId = requestSessionId(req);
+    const last = state.lastNoticedIndexCoverage;
+    // Record every observed coverage, announced or not, so a server-side
+    // index rebuild that shrinks coverage re-announces once it grows past
+    // its own new baseline rather than staying silent until it beats the old.
+    state.lastNoticedIndexCoverage = { sessionId, indexedTokens };
+    if (
+      last &&
+      last.sessionId === sessionId &&
+      indexedTokens <= last.indexedTokens
+    ) {
+      return;
+    }
+  }
+  state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
 }
 
 function installMainMemoryRoute(
@@ -1676,17 +1680,12 @@ function installMainMemoryRoute(
 ): boolean {
   if (state.mainRouteEpoch !== routeEpoch) return false;
   const sessionId = requestSessionId(req);
-  if (
-    !sessionId ||
-    typeof originalBody.model !== "string" ||
-    !Array.isArray(compressedBody.messages)
-  ) {
+  if (!sessionId || !Array.isArray(compressedBody.messages)) {
     state.mainMemoryRoute = undefined;
     return false;
   }
   state.mainMemoryRoute = {
     sessionId,
-    model: originalBody.model,
     originalSystemHash: routeValueHash(
       normalizeRouteSystem(originalBody.system)
     ),
@@ -1712,11 +1711,15 @@ function memoryRoutedToolBody(
   routeEpoch: number,
   sessionId: string | undefined
 ): Buffer | null {
+  // Model is deliberately not route identity: Claude Code switches models
+  // mid-loop (overload fallback, /model, /fast), and the compressed prefix is
+  // plain message content valid for any model. Session + prefix hashes pin the
+  // conversation; requiring model equality dropped the whole tool loop to
+  // full-history passthrough on every mid-turn switch.
   if (
     !sessionId ||
     route.sessionId !== sessionId ||
     route.routeEpoch !== routeEpoch ||
-    body.model !== route.model ||
     routeValueHash(normalizeRouteSystem(body.system)) !==
       route.originalSystemHash
   ) {
@@ -2013,40 +2016,6 @@ function recordTurn(
   rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
 }
 
-const TOKEN_GENERATION_ONLY_FIELDS = new Set([
-  "inference_geo",
-  "max_tokens",
-  "metadata",
-  "service_tier",
-  "speed",
-  "stop_sequences",
-  "stream",
-  "temperature",
-  "top_k",
-  "top_p",
-]);
-
-/**
- * Project a Messages request to the Count Tokens request shape. Keeping every
- * unknown field is deliberately conservative: new token-affecting beta fields
- * match automatically, while a future generation-only field merely causes a
- * safe cache miss (and totals are omitted).
- */
-function tokenCountBody(
-  body: Record<string, any>
-): Record<string, unknown> | null {
-  if (typeof body.model !== "string" || !Array.isArray(body.messages)) {
-    return null;
-  }
-  const relevant: Record<string, unknown> = {};
-  for (const field of Object.keys(body).sort()) {
-    if (!TOKEN_GENERATION_ONLY_FIELDS.has(field)) {
-      relevant[field] = body[field];
-    }
-  }
-  return relevant;
-}
-
 function headerText(
   headers: http.IncomingHttpHeaders,
   name: string
@@ -2055,74 +2024,9 @@ function headerText(
   return Array.isArray(value) ? value.join(",") : value ?? "";
 }
 
-function tokenizationHeaders(
-  headers: http.IncomingHttpHeaders
-): Record<string, string> {
-  const beta = headerText(headers, "anthropic-beta")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .sort()
-    .join(",");
-  return {
-    "anthropic-beta": beta,
-    "anthropic-version": headerText(headers, "anthropic-version").trim(),
-  };
-}
-
-/** Stable key shared by Claude's count_tokens and messages request shapes. */
-function tokenCountKey(
-  body: Record<string, any>,
-  headers: http.IncomingHttpHeaders,
-  requestUrl: string | undefined
-): string | null {
-  const relevant = tokenCountBody(body);
-  if (!relevant) return null;
-  const search = new URL(
-    requestUrl ?? "/",
-    "http://127.0.0.1"
-  ).search;
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        body: relevant,
-        headers: tokenizationHeaders(headers),
-        search,
-      })
-    )
-    .digest("hex");
-}
-
-/** Actual full model input: uncached + cache read + cache creation. */
-function totalInputTokens(usage: UsageRecord | undefined): number | undefined {
-  if (typeof usage?.input_tokens !== "number") return undefined;
-  let total = 0;
-  for (const value of [
-    usage.input_tokens,
-    usage.cache_read_input_tokens,
-    usage.cache_creation_input_tokens,
-  ]) {
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-      total += value;
-    }
-  }
-  return total;
-}
-
-function rememberTokenCount(state: ProxyState, key: string, tokens: number): void {
-  state.tokenCounts.delete(key);
-  state.tokenCounts.set(key, tokens);
-  if (state.tokenCounts.size > TOKEN_COUNT_CACHE_MAX) {
-    const oldest = state.tokenCounts.keys().next().value;
-    if (oldest !== undefined) state.tokenCounts.delete(oldest);
-  }
-}
-
 /**
  * count_tokens: strip notices and mirror an active memory route during its
- * tool loop. Retain Claude's full original input count so a later display hook
- * can compare it with Anthropic's actual post-compression usage. The response
- * itself remains byte-transparent.
+ * tool loop. The response itself remains byte-transparent.
  */
 async function handleCountTokens(
   req: http.IncomingMessage,
@@ -2133,7 +2037,6 @@ async function handleCountTokens(
 ): Promise<void> {
   const rawBody = await readBody(req);
   let forwardBody = rawBody;
-  let countKey: string | null = null;
   try {
     const body = JSON.parse(rawBody.toString("utf-8"));
     if (Array.isArray(body.messages)) {
@@ -2145,7 +2048,6 @@ async function handleCountTokens(
         else body.system = strippedSystem.system;
         forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
       }
-      let countedBody = body;
       const lastMsg = lastNonSystemMessage(body.messages);
       if (
         state.mainMemoryRoute &&
@@ -2159,12 +2061,8 @@ async function handleCountTokens(
           state.mainRouteEpoch,
           requestSessionId(req)
         );
-        if (routed) {
-          forwardBody = routed;
-          countedBody = JSON.parse(routed.toString("utf-8"));
-        }
+        if (routed) forwardBody = routed;
       }
-      countKey = tokenCountKey(countedBody, req.headers, req.url);
     }
   } catch {
     // Unknown shape: forward verbatim.
@@ -2176,22 +2074,7 @@ async function handleCountTokens(
     opts,
     upstream,
     state.shutdownSignal,
-    undefined,
-    (response) => {
-      if (countKey === null) return;
-      try {
-        const inputTokens = JSON.parse(response.toString("utf-8"))?.input_tokens;
-        if (
-          typeof inputTokens === "number" &&
-          Number.isFinite(inputTokens) &&
-          inputTokens >= 0
-        ) {
-          rememberTokenCount(state, countKey, inputTokens);
-        }
-      } catch {
-        // A failed/non-JSON count simply means the success notice omits totals.
-      }
-    }
+    undefined
   ).then(() => undefined);
 }
 

@@ -871,6 +871,11 @@ export class MemtreeClient {
     const started = Date.now();
     let status: number | undefined;
     let ok = false;
+    let diagnostics: {
+      indexedTokens?: number;
+      rawPromptTokens?: number;
+      memoryChars?: number;
+    } = {};
     const controller = new AbortController();
     const abort = () => controller.abort();
     const timeout = setTimeout(abort, opts.timeoutMs);
@@ -908,6 +913,19 @@ export class MemtreeClient {
       const clientLatencyMs = Date.now() - started;
       this.unpaidDetail = null; // a success proves the key is paid (again)
       ok = true;
+      diagnostics = {
+        indexedTokens: cachedPromptTokenCount(json),
+        rawPromptTokens: rawPromptTokenCount(json),
+        // Explicit field when the server sends one, else the first non-system
+        // processed message — the current server's memory layout.
+        memoryChars:
+          typeof json.unfolded_memory === "string"
+            ? json.unfolded_memory.length
+            : contentChars(
+                json.messages.find((message) => message?.role !== "system")
+                  ?.content
+              ),
+      };
       this.log(
         `context_memory ok in ${clientLatencyMs}ms ` +
           `(${messages.length} → ${json.messages.length} messages` +
@@ -930,6 +948,7 @@ export class MemtreeClient {
         // budget resolution — the client-visible half of the server's
         // "/v1/context_memory budget" log line.
         ...(opts.model && !opts.indexOnly ? { model: opts.model } : {}),
+        ...diagnostics,
       });
     }
   }

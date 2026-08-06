@@ -80,7 +80,8 @@ export {
   FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SLOW_FIRST_TOKEN_NOTICE,
-  compressedNoticeText,
+  STARTUP_NOTICE,
+  startupNoticeText,
   sanitizeNoticeDetail,
   wrapNotice,
   exciseKnownLegacyNoticeSpans,
@@ -91,7 +92,6 @@ export {
   insertNoticeBeforeResponseContent,
   appendNoticeToJsonBody,
 } from "./notices.js";
-export type { CompressionNoticeMetrics } from "./notices.js";
 export {
   NoticeDeliveryQueue,
   parseNoticeHookInput,
@@ -106,13 +106,6 @@ export type {
   NoticeHookOutput,
   SessionNoticePlugin,
 } from "./hooks.js";
-export {
-  projectTranscriptDir,
-  startTranscriptScrubber,
-  scrubLineInPlace,
-} from "./scrub.js";
-export type { TranscriptScrubber, ScrubberOptions } from "./scrub.js";
-
 // Keychain access is the designed-but-unbuilt fallback in case Anthropic stops
 // sending OAuth to custom base URLs (plan: "Auth to Anthropic"). Not used by
 // the launcher — Claude Code owns its credentials.

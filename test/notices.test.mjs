@@ -5,7 +5,8 @@ import {
   MODEL_HIDDEN_NOTICE,
   NOTICE_OPEN,
   NOTICE_CLOSE,
-  compressedNoticeText,
+  STARTUP_NOTICE,
+  startupNoticeText,
   sanitizeNoticeDetail,
   wrapNotice,
   stripNoticeBlocks,
@@ -21,31 +22,18 @@ const legacyNotice = wrapNotice(
   "MemTree working - conversation consolidated - <model does not see this message>"
 );
 
-test("compressedNoticeText includes latency and only valid reducing totals", () => {
+test("success copy is bare: no latency, no totals", () => {
+  assert.equal(COMPRESSED_NOTICE, "✓ MemTree · conversation optimized");
+});
+
+test("startupNoticeText colored variant strips back to the plain copy", () => {
+  const plain = startupNoticeText(false);
+  // Leading newlines lift the banner off Claude Code's "<Event> says:" label
+  // and leave a blank line between the two.
+  assert.equal(plain, `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`);
   assert.equal(
-    compressedNoticeText({
-      latencyMs: 8_837,
-      originalTokens: 330_272,
-      consolidatedTokens: 94_594,
-    }),
-    "✓ MemTree · conversation optimized in 8.8s · " +
-      "~330.3k → 94.6k tokens"
-  );
-  assert.equal(
-    compressedNoticeText({ latencyMs: 42 }),
-    `${COMPRESSED_NOTICE} in 42ms`
-  );
-  assert.equal(
-    compressedNoticeText({
-      latencyMs: 1_000,
-      originalTokens: 100,
-      consolidatedTokens: 100,
-    }),
-    `${COMPRESSED_NOTICE} in 1s`,
-    "non-reducing or mismatched totals are omitted"
-  );
-  assert.ok(
-    !compressedNoticeText({ latencyMs: 42 }).includes(MODEL_HIDDEN_NOTICE)
+    startupNoticeText(true).replace(/\x1B\[[0-9;]*m/g, ""),
+    plain
   );
 });
 

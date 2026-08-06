@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
+import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -148,6 +149,7 @@ test("hook input validation rejects malformed fields", () => {
   assert.equal(parseNoticeHookInput(display({ delta: 42 })), null);
   assert.equal(parseNoticeHookInput({ hook_event_name: "Stop" }), null);
   assert.equal(parseNoticeHookInput({ ...stop(), hook_event_name: "PreToolUse" }), null);
+
 });
 
 test("version gate is conservative around MessageDisplay introduction", () => {
@@ -182,6 +184,11 @@ test("session plugin contains HTTP hooks and argv prepending preserves user opti
       assert.equal(hook.type, "http");
       assert.equal(hook.url, "http://127.0.0.1:12345/_ccc/hooks/unpredictable");
     }
+    assert.equal(
+      config.hooks.SessionStart,
+      undefined,
+      "no banner requested, so no SessionStart hook is registered"
+    );
     assert.deepEqual(
       withSessionNoticePluginArgs(
         ["--plugin-dir", "/user/plugin", "--", "-literal prompt"],
@@ -201,6 +208,49 @@ test("session plugin contains HTTP hooks and argv prepending preserves user opti
     plugin.close();
     plugin.close();
     await assert.rejects(fsp.stat(dir));
+    await fsp.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("startup banner rides a SessionStart command hook emitting systemMessage JSON", async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-hooks-test-"));
+  // Leading newline and an apostrophe: the newline must survive as a JSON
+  // escape (sh/zsh `echo` would expand it and corrupt the payload), and the
+  // quote exercises shell quoting.
+  const message = "\n·─╼ ∞ MemTree · Infinite Context Enabled ∞ ╾─· it's on";
+  const plugin = createSessionNoticePlugin(
+    "http://127.0.0.1:12345/_ccc/hooks/unpredictable",
+    { tempRoot, startupMessage: message }
+  );
+  try {
+    const config = JSON.parse(
+      await fsp.readFile(path.join(plugin.dir, "hooks", "hooks.json"), "utf-8")
+    );
+    const entry = config.hooks.SessionStart[0];
+    assert.equal(
+      entry.matcher,
+      "startup|resume|clear",
+      "compaction continues the same conversation and must not re-show it"
+    );
+    const hook = entry.hooks[0];
+    assert.equal(
+      hook.type,
+      "command",
+      "SessionStart accepts only command/mcp_tool hooks, never http"
+    );
+    // Every shell Claude Code might use must yield byte-identical valid JSON.
+    for (const shell of ["/bin/sh", "/bin/bash", "/bin/zsh"]) {
+      const stdout = execSync(hook.command, { shell, encoding: "utf-8" });
+      assert.deepEqual(
+        JSON.parse(stdout),
+        { systemMessage: message },
+        `${shell} must not mangle the escaped newline`
+      );
+    }
+  } finally {
+    const dir = plugin.dir;
+    plugin.close();
+    await assert.rejects(fsp.stat(dir), "banner file leaves nothing behind");
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
 });

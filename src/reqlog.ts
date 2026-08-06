@@ -209,6 +209,18 @@ export interface MemtreeRecord {
   /** HTTP status; absent when the call died before a response (network/timeout). */
   status?: number;
   requestBytes: number;
+  /** Model sent for server-side budget resolution (compression calls only). */
+  model?: string;
+  /**
+   * Response diagnostics, present on successful calls that reported usage.
+   * `indexedTokens` (cached_tokens) is the prompt coverage of the index and
+   * drives the success notice: flat coverage across turns means MemTree
+   * indexed nothing new. `memoryChars` moves independently of it because the
+   * index is unfolded per question.
+   */
+  indexedTokens?: number;
+  rawPromptTokens?: number;
+  memoryChars?: number;
 }
 
 /** A display-only notice was atomically claimed by one Claude Code hook. */

@@ -27,21 +27,14 @@ import { AWAY_SUMMARY_PROMPT_PREFIX } from "../dist/turns.js";
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
 
-function assertSuccessNotice(text, answer, tokenSummary) {
+function assertSuccessNotice(text, answer) {
   const colored = text.startsWith(GREEN);
-  assert.ok(
-    text.startsWith(
-      `${colored ? GREEN : ""}${COMPRESSED_NOTICE} in `
-    )
+  assert.equal(
+    text,
+    `${colored ? GREEN : ""}${COMPRESSED_NOTICE}` +
+      `${colored ? DEFAULT_FOREGROUND : ""}\n${answer}`,
+    "the notice is the bare copy: no latency, no token totals"
   );
-  assert.ok(
-    text.endsWith(`${colored ? DEFAULT_FOREGROUND : ""}\n${answer}`)
-  );
-  if (tokenSummary === undefined) {
-    assert.ok(!text.includes(" tokens "), "unknown totals are omitted");
-  } else {
-    assert.ok(text.includes(tokenSummary));
-  }
 }
 
 const PAYMENT_DETAIL =
@@ -86,15 +79,23 @@ function mockUpstream() {
   });
 }
 
-/** Mock MemTree server answering every /v1/context_memory POST the same way. */
+/**
+ * Mock MemTree server for /v1/context_memory POSTs. `bodyObj` is a plain
+ * response object, or a function of (requestBody, callIndex) for tests that
+ * need per-call responses — e.g. a memory message that changes between turns,
+ * since an unchanged memory message no longer re-queues the success notice.
+ */
 async function mockMemtree(status, bodyObj) {
   const calls = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      const body = JSON.stringify(bodyObj);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      calls.push(parsed);
+      const body = JSON.stringify(
+        typeof bodyObj === "function" ? bodyObj(parsed, calls.length - 1) : bodyObj
+      );
       res.writeHead(status, { "content-type": "application/json" });
       res.end(body);
     });
@@ -447,154 +448,7 @@ test("successful compression leaves response untouched and prefixes MessageDispl
   }
 });
 
-test("success notice prefers MemTree raw count over Claude's count", async () => {
-  const countBodies = [];
-  const compressedUsage = {
-    input_tokens: 2,
-    cache_read_input_tokens: 64_063,
-    cache_creation_input_tokens: 30_529,
-    output_tokens: 1,
-  };
-  const upstreamBody = JSON.stringify({
-    ...JSON.parse(UPSTREAM_BODY),
-    usage: compressedUsage,
-  });
-  const upstream = await listen((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      let body = upstreamBody;
-      if (req.url.startsWith("/v1/messages/count_tokens")) {
-        const countBody = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-        countBodies.push(countBody);
-        const compressed = JSON.stringify(countBody.messages).includes(
-          "compressed context"
-        );
-        body = JSON.stringify({
-          input_tokens: compressed ? 94_594 : 330_272,
-        });
-      }
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(body)),
-      });
-      res.end(body);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: {
-      raw_prompt_tokens: 400_000,
-      prompt_tokens_details: { cached_tokens: 123 },
-    },
-  });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
-  const common = {
-    model: "claude-x",
-    system: "system instructions",
-    tools: [{ name: "lookup", input_schema: { type: "object" } }],
-    thinking: { type: "enabled", budget_tokens: 1_024 },
-    messages: followupTurn("turn two"),
-  };
-  try {
-    assert.deepEqual(await postCountTokens(proxy.port, common), {
-      input_tokens: 330_272,
-    });
-    await armMainTurn(proxy, "turn two");
-    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...common, max_tokens: 64 }),
-    });
-    assert.equal(await response.text(), upstreamBody);
-    assert.equal(countBodies.length, 1, "ccc reuses Claude's own count request");
-
-    const hook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      hook.body.hookSpecificOutput.displayContent,
-      "upstream answer",
-      "~400k → 94.6k tokens"
-    );
-    assert.ok(
-      !hook.body.hookSpecificOutput.displayContent.includes("330.3k"),
-      "the server-reported original count is primary"
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
-test("a count finishing after compression is still available at display time", async () => {
-  let markCountStarted;
-  let releaseCount;
-  const countStarted = new Promise((resolve) => {
-    markCountStarted = resolve;
-  });
-  const countGate = new Promise((resolve) => {
-    releaseCount = resolve;
-  });
-  const upstreamBody = JSON.stringify({
-    ...JSON.parse(UPSTREAM_BODY),
-    usage: { input_tokens: 94_594, output_tokens: 1 },
-  });
-  const upstream = await listen((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      if (req.url.startsWith("/v1/messages/count_tokens")) {
-        markCountStarted();
-        void countGate.then(() => {
-          const body = JSON.stringify({ input_tokens: 330_272 });
-          res.writeHead(200, {
-            "content-type": "application/json",
-            "content-length": String(Buffer.byteLength(body)),
-          });
-          res.end(body);
-        });
-        return;
-      }
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(upstreamBody)),
-      });
-      res.end(upstreamBody);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
-  const messages = followupTurn("turn two");
-  let countRequest;
-  try {
-    countRequest = postCountTokens(proxy.port, { model: "claude-x", messages });
-    await countStarted;
-    await armMainTurn(proxy, "turn two");
-    const response = await postMessages(proxy.port, messages);
-    assert.equal(response.content[0].text, "upstream answer");
-
-    releaseCount();
-    assert.deepEqual(await countRequest, { input_tokens: 330_272 });
-    const hook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      hook.body.hookSpecificOutput.displayContent,
-      "upstream answer",
-      "~330.3k → 94.6k tokens"
-    );
-  } finally {
-    releaseCount?.();
-    await countRequest?.catch(() => {});
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
-test("compressed SSE uses MemTree raw totals before the stream ends", async () => {
+test("compressed SSE queues the success notice before the stream ends", async () => {
   const frame = (type, data) =>
     `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
   const streamPrefix =
@@ -716,8 +570,7 @@ test("compressed SSE uses MemTree raw totals before the stream ends", async () =
     );
     assertSuccessNotice(
       hook.body.hookSpecificOutput.displayContent,
-      "streamed answer",
-      "~330.3k → 94.6k tokens"
+      "streamed answer"
     );
 
     releaseStream();
@@ -730,96 +583,6 @@ test("compressed SSE uses MemTree raw totals before the stream ends", async () =
   } finally {
     releaseStream?.();
     await responseDone?.catch(() => {});
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
-test("token counts never cross beta-header or query variants", async () => {
-  let countCalls = 0;
-  const upstream = await listen((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      const isCount = req.url.startsWith("/v1/messages/count_tokens");
-      if (isCount) countCalls++;
-      const body = isCount
-        ? JSON.stringify({ input_tokens: 330_272 })
-        : UPSTREAM_BODY;
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(body)),
-      });
-      res.end(body);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
-  const common = {
-    model: "claude-x",
-    messages: followupTurn("turn two"),
-  };
-  try {
-    await postCountTokens(proxy.port, common, {
-      "anthropic-beta": "tokenizer-variant-a",
-      "anthropic-version": "2023-06-01",
-    });
-    await armMainTurn(proxy, "turn two");
-    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "anthropic-beta": "tokenizer-variant-b",
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({ ...common, max_tokens: 64 }),
-    });
-    await response.text();
-    const hook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      hook.body.hookSpecificOutput.displayContent,
-      "upstream answer"
-    );
-    assert.equal(countCalls, 1, "mismatched count was neither reused nor extended");
-
-    const queryCommon = {
-      model: "claude-x",
-      messages: followupTurn("turn three"),
-    };
-    await postCountTokens(
-      proxy.port,
-      queryCommon,
-      {
-        "anthropic-beta": "same-variant",
-        "anthropic-version": "2023-06-01",
-      },
-      "?tokenizer=variant-a"
-    );
-    await armMainTurn(proxy, "turn three");
-    const queryResponse = await fetch(
-      `http://127.0.0.1:${proxy.port}/v1/messages?tokenizer=variant-b`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "anthropic-beta": "same-variant",
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({ ...queryCommon, max_tokens: 64 }),
-      }
-    );
-    await queryResponse.text();
-    const queryHook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      queryHook.body.hookSpecificOutput.displayContent,
-      "upstream answer"
-    );
-    assert.equal(countCalls, 2, "query-mismatched count was not reused");
-  } finally {
     proxy.close();
     upstream.close();
     memtreeSrv.close();
@@ -892,6 +655,92 @@ test("memory route survives A/B being disabled, so count_tokens sizes the compre
     assert.ok(
       !JSON.stringify(counted.body.messages).includes("first question"),
       "the uncompressed prefix must not be re-counted"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("memory route survives a mid-loop model switch", async () => {
+  const upstreamBodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = {
+    "content-type": "application/json",
+    "x-claude-code-session-id": "session-model-switch",
+  };
+  const base = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    const userTurn = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-fable-5",
+        max_tokens: 64,
+        messages: base,
+      }),
+    });
+    await userTurn.json();
+    await waitFor(() => upstreamBodies.length >= 1);
+
+    // Claude Code continues the same turn's tool loop on a different model.
+    const toolTurn = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-5",
+        max_tokens: 64,
+        messages: [
+          ...base,
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }],
+          },
+        ],
+      }),
+    });
+    await toolTurn.json();
+    await waitFor(() => upstreamBodies.length >= 2);
+
+    const routed = upstreamBodies[1];
+    assert.equal(routed.model, "claude-opus-5", "model passes through untouched");
+    assert.equal(
+      routed.messages[0].content,
+      "compressed context",
+      "the tool loop must keep riding the compressed prefix after a model switch"
+    );
+    assert.ok(
+      !JSON.stringify(routed.messages).includes("first question"),
+      "the uncompressed prefix must not be re-sent on the fallback model"
+    );
+    assert.ok(
+      JSON.stringify(routed.messages).includes("tool_result"),
+      "the current turn's tool suffix rides after the compressed prefix"
     );
   } finally {
     proxy.close();
@@ -1983,72 +1832,6 @@ test("A/B below-threshold dead-before-flush retry still compresses despite the i
   });
 });
 
-test("older MemTree response omits totals when Claude count is unavailable", async () => {
-  const upstream = await mockUpstream();
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
-  try {
-    await armMainTurn(proxy, "turn two");
-    const json = await postMessages(proxy.port, followupTurn("turn two"));
-    assert.equal(json.content[0].text, "upstream answer");
-    const hook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      hook.body.hookSpecificOutput.displayContent,
-      "upstream answer"
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
-test("MemTree raw prompt count supplies totals without Claude count_tokens", async () => {
-  const upstreamBody = JSON.stringify({
-    ...JSON.parse(UPSTREAM_BODY),
-    usage: { input_tokens: 94_849, output_tokens: 1 },
-  });
-  const upstream = await listen((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(upstreamBody)),
-      });
-      res.end(upstreamBody);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: {
-      raw_prompt_tokens: 393_000,
-      prompt_tokens_details: { cached_tokens: 123 },
-    },
-  });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
-  try {
-    await armMainTurn(proxy, "turn two");
-    const json = await postMessages(proxy.port, followupTurn("turn two"));
-    assert.equal(json.content[0].text, "upstream answer");
-
-    const hook = await postHook(proxy, displayHook());
-    assertSuccessNotice(
-      hook.body.hookSpecificOutput.displayContent,
-      "upstream answer",
-      "~393k → 94.8k tokens"
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
 test("successful MemTree no-op does not claim the conversation was compressed", async () => {
   let forwarded;
   const upstream = await listen((req, res) => {
@@ -2555,6 +2338,56 @@ test("new UserPromptSubmit during async compression discards the old turn's noti
   }
 });
 
+test("flat index coverage suppresses the repeat compression notice", async () => {
+  const upstream = await mockUpstream();
+  let indexedTokens = 120_000;
+  // Memory text varies every call the way the real server's per-question
+  // unfolding does, proving the gate is coverage-driven and not text-driven.
+  let call = 0;
+  const memtreeSrv = await mockMemtree(200, () => ({
+    messages: [{ role: "user", content: `unfolded for question #${++call}` }],
+    usage: {
+      prompt_tokens: 200_000,
+      completion_tokens: 100_000,
+      prompt_tokens_details: { cached_tokens: indexedTokens },
+    },
+  }));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    assert.equal(
+      (await postHook(proxy, displayHook({ prompt_id: "prompt-1" }))).status,
+      200,
+      "first indexed turn announces the optimization"
+    );
+
+    // Same coverage, freshly unfolded text: the index learned nothing new, so
+    // this turn was merely appended after it.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal(
+      (await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status,
+      204,
+      "flat coverage stays quiet even though the memory text changed"
+    );
+
+    indexedTokens = 150_000;
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"));
+    assert.equal(
+      (await postHook(proxy, displayHook({ prompt_id: "prompt-3" }))).status,
+      200,
+      "newly indexed messages announce again"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("Stop-only arm → compress → systemMessage fallback delivers without MessageDisplay", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, {
@@ -2575,10 +2408,10 @@ test("Stop-only arm → compress → systemMessage fallback delivers without Mes
       stop_hook_active: false,
       prompt_id: "prompt-stop",
     });
-    assert.match(
+    assert.equal(
       // Notice may be ANSI-colored depending on terminal detection; strip codes.
       stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, ""),
-      /^✓ MemTree · conversation optimized in (?:\d+ms|\d+(?:\.\d+)?s)$/
+      COMPRESSED_NOTICE
     );
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-stop" }))).status, 204);
   } finally {
@@ -2590,14 +2423,16 @@ test("Stop-only arm → compress → systemMessage fallback delivers without Mes
 
 test("subagent traffic cannot clear, overwrite, or claim a pending main notice", async () => {
   const upstream = await mockUpstream();
-  const memtreeSrv = await mockMemtree(200, {
+  // Index coverage grows per call: this test announces two separate main
+  // turns, and flat coverage would suppress the second notice.
+  const memtreeSrv = await mockMemtree(200, (_body, call) => ({
     messages: [{ role: "user", content: "compressed context" }],
     usage: {
       prompt_tokens: 200_000,
       completion_tokens: 100_000,
-      prompt_tokens_details: { cached_tokens: 1 },
+      prompt_tokens_details: { cached_tokens: 1_000 * (call + 1) },
     },
-  });
+  }));
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
   try {
