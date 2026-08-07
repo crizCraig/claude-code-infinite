@@ -194,7 +194,8 @@ export interface MessagesRecord {
    * Main tool turns that attempted the local route lookup and missed:
    * "missing" (no route slot) or "rejected" (a route was present but
    * unusable for this request). "rejected" covers every reason
-   * memoryRoutedToolBody refuses: session-id or epoch mismatch, a changed
+   * memoryRoutedToolBody refuses: a requester whose session id differs from
+   * the route's OR who sends none at all, an epoch mismatch, a changed
    * system/prefix hash, a conversation that shrank below the stored prefix,
    * and an unexpected tool suffix shape — not identity divergence alone.
    * Absent means there was no applicable miss — hits and non-main turns never

@@ -291,6 +291,19 @@ interface ProxyState {
    */
   mainRouteDecisionGeneration: number;
   /**
+   * Reservations taken from mainRouteDecisionGeneration that still block older
+   * holders: in-flight decisions, plus committed ones (an install or a clear
+   * keeps its reservation forever so a slower older decision can never
+   * overwrite it). A decision that ends up mutating nothing removes itself.
+   *
+   * A set rather than "newest wins" on the counter alone, because releases can
+   * arrive out of order: with reservations 6 and 7 live, 6 finishing first
+   * cannot move a counter that reads 7, so its slot would leak and strand
+   * every older holder permanently. Bounded by clearing it on each epoch bump,
+   * where every surviving entry is already epoch-stale.
+   */
+  mainRouteDecisionsLive: Set<number>;
+  /**
    * Epoch-ms deadline until which tool-route miss recovery skips its blocking
    * attempt, set when an attempt returns null. Zero means no cooldown.
    */
@@ -544,6 +557,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     legacyMemtreeMigrationComplete: new Set(),
     mainRouteEpoch: 0,
     mainRouteDecisionGeneration: 0,
+    mainRouteDecisionsLive: new Set(),
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
   };
@@ -992,7 +1006,14 @@ async function handleMessages(
   // own conversation's extension or fail closed.
   if (isFollowupUserTurn && isMainRequest) {
     routeEpoch = ++state.mainRouteEpoch;
+    // Every surviving reservation belongs to the epoch just superseded, so it
+    // can no longer hold anything: dropping them here is what keeps the live
+    // set bounded to one human turn's decisions. This followup then reserves
+    // for the new epoch, and keeps that reservation whether it installs or
+    // clears — either way an older decision must not undo it.
+    state.mainRouteDecisionsLive.clear();
     routeDecisionGeneration = ++state.mainRouteDecisionGeneration;
+    state.mainRouteDecisionsLive.add(routeDecisionGeneration);
     state.mainMemoryRoute = undefined;
   }
   const hookOwnedMainFollowup =
@@ -1199,7 +1220,7 @@ async function handleMessages(
   // this completion lost — it must not erase or overwrite the winner's route.
   const routeDecisionCurrent = () =>
     state.mainRouteEpoch === routeEpoch &&
-    state.mainRouteDecisionGeneration === routeDecisionGeneration;
+    routeDecisionHolds(state, routeDecisionGeneration);
 
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
@@ -1234,6 +1255,7 @@ async function handleMessages(
     res.off("close", markDownstreamClosedDuringCompression);
   }
   const { result } = compression;
+  noteMemtreeHealth(state, result !== null);
 
   if (
     downstreamClosedDuringCompression ||
@@ -1687,6 +1709,49 @@ function queueCompressionNotice(args: {
   state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
 }
 
+/**
+ * Whether the holder of `generation` still owns the route decision: true while
+ * no STRICTLY NEWER reservation is live or committed. The holder's own
+ * reservation never blocks itself, and a newer reservation that ended up
+ * mutating nothing has already removed itself, handing ownership back rather
+ * than stranding everyone older.
+ */
+/**
+ * Record what a blocking compress just proved about MemTree's health: a null
+ * arms the tool-recovery cooldown, any response clears it.
+ *
+ * Called from BOTH blocking paths and, critically, BEFORE either one checks
+ * whether its client is still listening. A null says something about the
+ * server, not about the downstream socket — and the full-budget stall that
+ * produces a null is itself the likeliest reason a client gives up, so
+ * learning only from attempts that outlived their client would blind the
+ * cooldown to exactly the outage it exists to bound. Sharing it with the
+ * followup path matters in both directions: an outage first seen on a human
+ * turn must not cost another full stall on the next tool turn, and a
+ * recovered MemTree must not stay locked out for the rest of the window.
+ */
+/*
+ * Only an actual null counts as ill health. A no-op, unusable, or
+ * non-shrinking answer proves the server is responsive and merely unhelpful
+ * for this history, and the next turn's larger tail may well succeed — so
+ * those keep paying the (fast, already-indexed) round trip rather than
+ * locking recovery out. The asymmetry is deliberate: it trades a bounded
+ * repeat cost against never suppressing a recovery a warming index is about
+ * to make possible.
+ */
+function noteMemtreeHealth(state: ProxyState, responded: boolean): void {
+  state.toolRecoveryCooldownUntil = responded
+    ? 0
+    : Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+}
+
+function routeDecisionHolds(state: ProxyState, generation: number): boolean {
+  for (const live of state.mainRouteDecisionsLive) {
+    if (live > generation) return false;
+  }
+  return true;
+}
+
 function installMainMemoryRoute(
   state: ProxyState,
   req: http.IncomingMessage,
@@ -1703,7 +1768,7 @@ function installMainMemoryRoute(
   // before the sessionless-clear below.
   if (
     state.mainRouteEpoch !== routeEpoch ||
-    state.mainRouteDecisionGeneration !== decisionGeneration
+    !routeDecisionHolds(state, decisionGeneration)
   ) {
     return false;
   }
@@ -2330,21 +2395,18 @@ async function recoverToolRouteMiss(args: {
   const decisionGeneration = routeOwning
     ? ++state.mainRouteDecisionGeneration
     : state.mainRouteDecisionGeneration;
+  if (routeOwning) state.mainRouteDecisionsLive.add(decisionGeneration);
   // A reservation that ends up installing nothing must be RETURNED. It was
   // taken before the outcome was known, and while held it marks stale every
   // concurrent install and post-await clear that captured the previous
   // generation. Failing to release it means a failed/no-op/no-gain/
   // client-closed recovery silently suppresses a concurrent followup's
-  // install, leaving the conversation with no route at all. Release only
-  // while the reservation is still the newest one: if someone reserved after
-  // us, the counter is theirs and must not move.
+  // install, leaving the conversation with no route at all. Dropping our own
+  // entry is unconditional and order-independent: it never moves anyone
+  // else's reservation, so releasing before or after a newer sibling makes no
+  // difference to who holds the decision.
   const releaseRouteDecision = () => {
-    if (
-      routeOwning &&
-      state.mainRouteDecisionGeneration === decisionGeneration
-    ) {
-      state.mainRouteDecisionGeneration = decisionGeneration - 1;
-    }
+    if (routeOwning) state.mainRouteDecisionsLive.delete(decisionGeneration);
   };
 
   // Same downstream-close tracking as the followup path: compression
@@ -2375,6 +2437,7 @@ async function recoverToolRouteMiss(args: {
     res.off("close", markDownstreamClosed);
   }
   const { result } = compression;
+  noteMemtreeHealth(state, result !== null);
 
   if (
     downstreamClosedDuringCompression ||
@@ -2404,12 +2467,6 @@ async function recoverToolRouteMiss(args: {
   if (!result) {
     rec.routeRecovery = { conversationBytes, outcome: "failed" };
     releaseRouteDecision();
-    // Arm the cooldown so a persistent outage costs one blocking stall, not
-    // one per tool turn. Only an actual null does this: a no-op, unusable,
-    // or no-gain answer proves MemTree is responsive and merely unhelpful
-    // for this turn, and the next turn's larger tail may well succeed.
-    state.toolRecoveryCooldownUntil =
-      Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
     recordTurn(rec, "tool", forwardBody);
     // An ordinary server/network failure or timeout retains the background
     // submission: its longer independent budget can still warm the index for
@@ -2426,10 +2483,6 @@ async function recoverToolRouteMiss(args: {
 
   // Any non-null response already submitted this history to the server; an
   // extra indexInBackground for the same request would be a duplicate.
-  //
-  // It also proves MemTree is answering, so any cooldown armed by an earlier
-  // failure has served its purpose and must not suppress the next miss.
-  state.toolRecoveryCooldownUntil = 0;
   const actuallyCompressed = didMemtreeCompress(result);
   const historyCheck = checkCompressedHistory(result, compression.winningInput);
   rec.history = {
@@ -2471,7 +2524,7 @@ async function recoverToolRouteMiss(args: {
     }
     if (
       state.mainRouteEpoch !== routeEpoch ||
-      state.mainRouteDecisionGeneration !== decisionGeneration
+      !routeDecisionHolds(state, decisionGeneration)
     ) {
       activationAttempted = true;
       installFate = "stale";

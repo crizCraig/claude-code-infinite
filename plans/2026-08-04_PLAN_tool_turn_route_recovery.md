@@ -36,7 +36,15 @@ original plan deferred it). Without it, a MemTree outage charges the full
 blocking budget to *every* large tool turn rather than every human turn:
 history grows each turn, so the compress-side hash dedup can never absorb the
 repeat, and the fuse would be strictly worse than the verbatim path it
-replaces. Any non-null response clears the cooldown. Classification gating
+replaces. Any non-null response clears the cooldown. Both signals are read
+from the compress result *before* either blocking path checks whether its
+client is still connected (cycle 2): a null describes the server, not the
+socket, and the full-budget stall that produces one is itself the likeliest
+reason a client gives up — learning only from attempts that outlived their
+client would blind the cooldown to precisely the outage it bounds. For the
+same reason the signal is shared with the followup path, which uses the same
+client and budget, so an outage first seen on a human turn does not cost
+another full stall on the next tool turn. Classification gating
 should make recovery exceptional, while a temporary `CCC_TOOL_ROUTE_RECOVERY=0`
 kill switch provides fast rollback on relaunch. Use the new telemetry to
 revisit the wait budget or cooldown length against real latency data.
@@ -214,6 +222,20 @@ post-await route clear** requires both its captured `mainRouteEpoch` and
 decision generation still to match. This includes the existing degraded,
 no-op, empty-memory, non-A/B, and A/B callback paths, so an older completion
 cannot erase or overwrite a newer decision.
+
+A reservation is taken before its outcome is known, so one that ends up
+mutating nothing must be **returned** (cycle 1) — otherwise a failed, no-op,
+no-gain, or client-closed recovery silently suppresses a concurrent followup's
+install and the conversation ends up with no route at all. Live reservations
+are therefore tracked as a set rather than by comparing against the counter
+(cycle 2): releases can arrive out of order, and a "release only if I am the
+newest" rule cannot move a counter that a newer sibling already advanced, so
+the older reservation's slot leaks and strands every older holder permanently.
+A holder is current while no strictly newer reservation is live; an install or
+clear keeps its reservation forever, which is what stops a slower older
+decision from overwriting it. The set is cleared on each epoch bump, where
+every surviving entry is already epoch-stale — that also bounds its growth to
+one human turn's decisions.
 
 A sessionless or prompt-pending one-shot recovery cannot install a route and
 therefore does not advance the decision generation. Do not bump
