@@ -5292,7 +5292,12 @@ test("small tool turns and disabled recovery never pay the blocking wait", async
       const rec = messageRecords(records)[0];
       assert.equal(rec.turnType, "tool");
       assert.equal(rec.routeMiss, "missing");
-      assert.equal(rec.routeRecovery, undefined);
+      // The kill switch is recorded explicitly so a disabled large miss is
+      // distinguishable in the log from one that was never worth recovering.
+      assert.deepEqual(
+        rec.routeRecovery,
+        options.toolRouteRecovery === false ? { outcome: "disabled" } : undefined
+      );
       assert.equal(rec.compress, undefined, "no blocking compress was attempted");
     } finally {
       proxy.close();
@@ -5585,6 +5590,312 @@ test("recovery launches one compressed leg even with A/B routing enabled", async
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
     assert.equal(rec.comparison, undefined, "recovery never enters A/B");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+// --- ralph-review cycle 1: branches the original suite never exercised ---
+
+test("an amnesiac compressed answer is never installed as a route", async () => {
+  const upstream = await recordingUpstream();
+  // Indexed (cached_tokens present, so didMemtreeCompress is true) but the
+  // conversation is gone. This is the dangerous case: every usage-based
+  // measure calls it a perfect compression, and installing it as a route
+  // would silently amnesia the rest of the tool loop.
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "hi" }],
+    usage: { prompt_tokens_details: { cached_tokens: 999 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const rec = messageRecords(records)[0];
+    assert.equal(rec.routeRecovery.outcome, "unusable");
+    assert.equal(rec.history.usable, false);
+    assert.equal(rec.turnType, "tool", "not forwarded as tool-recompressed");
+    assert.match(
+      JSON.stringify(upstream.seen[0].body.messages),
+      /first question/,
+      "the real history was forwarded, not the amnesiac answer"
+    );
+    // No route: the next tool turn misses rather than riding amnesia.
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records)[1].routeMiss, "missing");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a compression with no byte gain forwards the original body", async () => {
+  const upstream = await recordingUpstream();
+  // Usable and genuinely indexed, but bigger than what it replaces.
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "bloated memory " + "m".repeat(900_000) }],
+    usage: { prompt_tokens_details: { cached_tokens: 999 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const rec = messageRecords(records)[0];
+    assert.equal(rec.routeRecovery.outcome, "no-gain");
+    assert.equal(rec.turnType, "tool");
+    assert.match(JSON.stringify(upstream.seen[0].body.messages), /first question/);
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(
+      messageRecords(records)[1].routeMiss,
+      "missing",
+      "a bigger body is not worth a route built on it"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an upstream failure on the recovered leg installs no route", async () => {
+  // 500 from Anthropic: protocol-complete never fires, delivered is false.
+  const upstream = await listen((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ type: "error" }));
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const rec = messageRecords(records)[0];
+    assert.equal(rec.routeRecovery.outcome, "compressed");
+    assert.equal(rec.routeRecovery.install, "upstream-failed");
+    // A route built on a request the model never answered would splice a
+    // prefix the conversation never actually contained.
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records)[1].routeMiss, "missing");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a failed recovery puts the fuse on cooldown instead of stalling every tool turn", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(500, { error: "down" });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const first = messageRecords(records)[0];
+    assert.equal(first.routeRecovery.outcome, "failed");
+    assert.equal(first.turnType, "tool");
+    const afterFirst = blockingCalls();
+    assert.ok(afterFirst >= 1, "the first miss did attempt a blocking compress");
+
+    // Every tool turn appends a tool_result and rehashes, so compress()'s
+    // dedup can never absorb the repeat: without a cooldown an outage would
+    // charge the full blocking budget to each of these.
+    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), SESSION);
+    await postMessages(proxy.port, extendToolLoop(conversation, "t3"), SESSION);
+    const later = messageRecords(records).slice(1);
+    for (const rec of later) {
+      assert.equal(rec.routeRecovery.outcome, "cooldown");
+      assert.equal(rec.compress, undefined, "no blocking wait was paid");
+      assert.equal(rec.turnType, "tool");
+    }
+    assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
+    assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /first question/);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a large foreign-session rejection is transform-only and spares the owner's route", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : recoveredMemory("AAA")
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const base = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, base, SESSION);
+
+    // Session 2's LARGE tool turn rejects session 1's route. It may be
+    // compressed for its own benefit, but installing would evict the very
+    // route the rejection path deliberately preserved — and the two sessions
+    // would then alternate blocking recompressions forever.
+    await postMessages(proxy.port, largeToolTurn("BBB"), {
+      "x-claude-code-session-id": "session-2",
+    });
+    const foreign = messageRecords(records).at(-1);
+    assert.equal(foreign.routeMiss, "rejected");
+    assert.equal(foreign.turnType, "tool-recompressed", "still gets a smaller body");
+    assert.equal(foreign.routeRecovery.install, "foreign-route");
+
+    // The owner still rides its untouched route.
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a degraded main followup still clears the route it cannot rebuild", async () => {
+  // The inverse of the clear-gating fix: gating the clear on followup turns
+  // must not stop a genuine followup from clearing. A followup whose compress
+  // fails has no compressed prefix, so leaving the previous route installed
+  // would splice a prefix that no longer matches what the model was sent.
+  const upstream = await recordingUpstream();
+  let failCompress = false;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (!parsed.index_only && failCompress) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "down" }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(parsed.index_only ? { ok: true } : recoveredMemory()));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const base = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, base, SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    // Route is live: a small tool turn rides it.
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+
+    failCompress = true;
+    await armMainTurn(proxy, "turn three", "prompt-main-2");
+    await postMessages(proxy.port, followupTurn("turn three"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-degraded");
+
+    // The stale route must be gone: this tool turn was sent full history.
+    await postMessages(
+      proxy.port,
+      extendToolLoop(followupTurn("turn three"), "t9"),
+      SESSION
+    );
+    const after = messageRecords(records).at(-1);
+    assert.equal(after.routeMiss, "missing", "the degraded followup cleared it");
+    assert.notEqual(after.turnType, "tool-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a failed recovery releases the route decision it reserved", async () => {
+  // The reservation is taken BEFORE the outcome is known, and while held it
+  // marks stale every concurrent install. A recovery that installs nothing
+  // must return it, or a concurrent followup's route is silently suppressed
+  // and the conversation ends up with no route at all. Reproduced with
+  // no-hook embedder traffic, where a followup can overlap a tool turn.
+  const upstream = await recordingUpstream();
+  const held = deferred();
+  let followupCompressArrived = false;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const respond = (status, obj) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (parsed.index_only) return respond(200, { ok: true });
+      // The tool recovery (conversation BBB) fails fast.
+      if (JSON.stringify(parsed.messages).includes("BBB")) {
+        return respond(500, { error: "down" });
+      }
+      followupCompressArrived = true;
+      await held.promise; // hold the followup until the recovery has failed
+      return respond(200, recoveredMemory("AAA"));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const base = followupTurn("AAA turn two");
+  try {
+    const followup = postMessages(proxy.port, base, SESSION);
+    // The followup has reserved its generation by the time its compress
+    // reaches the server — the reservation happens before the request is
+    // sent, so arrival is a sound barrier.
+    await waitFor(() => followupCompressArrived);
+
+    // A large tool miss now reserves a NEWER generation, then fails.
+    await postMessages(proxy.port, largeToolTurn("BBB"), SESSION);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "failed");
+
+    held.resolve();
+    await followup;
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // The followup's install must have survived the failed recovery.
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
+    const ride = messageRecords(records).at(-1);
+    assert.equal(
+      ride.turnType,
+      "tool-memory",
+      "the failed recovery released its reservation, so the followup installed"
+    );
   } finally {
     proxy.close();
     upstream.close();

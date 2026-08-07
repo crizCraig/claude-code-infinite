@@ -359,10 +359,14 @@ async function main() {
     reqlog,
     abRouting,
     nativeOneMillionContext,
-    // Temporary kill switch for tool-route miss recovery
+    // Temporary kill switch for tool-route miss RECOVERY only
     // (plans/2026-08-04_PLAN_tool_turn_route_recovery.md): set
-    // CCC_TOOL_ROUTE_RECOVERY=0 and relaunch to restore the old
-    // background-index/verbatim behavior on route misses.
+    // CCC_TOOL_ROUTE_RECOVERY=0 and relaunch to skip the blocking
+    // recompression attempt and forward missed tool turns verbatim with
+    // background indexing, as before. It deliberately does NOT revert the
+    // other half of that change: classification-time clear gating and
+    // same-session-only eviction of a rejected route stay in force, because
+    // those are what stop a side request from stranding the tool loop.
     toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
   });
 

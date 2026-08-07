@@ -766,7 +766,10 @@ export class MemtreeClient {
    * Fire-and-forget background indexing for tool and first-user turns. Keeps
    * the server index fed during tool loops; adds zero latency to the response
    * path. A tool turn whose route-miss recovery got any non-null compress()
-   * response skips this: that call already submitted the same history.
+   * response skips this: that call already submitted the same history. A
+   * recovery that returned null skips it too when the client has already
+   * disconnected, or on shutdown/402 — only an ordinary failure with a live
+   * client keeps the longer-budget background retry.
    */
   indexInBackground(
     hash: string,

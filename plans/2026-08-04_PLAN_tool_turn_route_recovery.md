@@ -28,11 +28,18 @@ still forwards the original body. That preserves today's payload behavior but
 can add latency; it cannot guarantee that an oversized body is never sent while
 MemTree is unavailable.
 
-Initial rollout deliberately reuses the existing compression budget and adds no
-new cooldown/circuit-breaker state. Classification gating should make recovery
-exceptional, while a temporary `CCC_TOOL_ROUTE_RECOVERY=0` kill switch provides
-fast rollback on relaunch. Use the new telemetry to revisit a shorter wait
-budget or failure cooldown if repeated misses occur in practice.
+Initial rollout reuses the existing compression budget. It adds one piece of
+circuit-breaker state — after an attempt returns null, the blocking attempt is
+skipped for `TOOL_RECOVERY_FAILURE_COOLDOWN_MS` (60s), logged as
+`routeRecovery.outcome: "cooldown"` (added in ralph-review cycle 1; the
+original plan deferred it). Without it, a MemTree outage charges the full
+blocking budget to *every* large tool turn rather than every human turn:
+history grows each turn, so the compress-side hash dedup can never absorb the
+repeat, and the fuse would be strictly worse than the verbatim path it
+replaces. Any non-null response clears the cooldown. Classification gating
+should make recovery exceptional, while a temporary `CCC_TOOL_ROUTE_RECOVERY=0`
+kill switch provides fast rollback on relaunch. Use the new telemetry to
+revisit the wait budget or cooldown length against real latency data.
 
 Expose the switch to embedders as `ProxyOptions.toolRouteRecovery?: boolean`
 (default `true`); the CLI maps an environment value of `0` to `false` when the
@@ -402,9 +409,10 @@ designed as a separate feature rather than folded into this recovery patch.
 
 - A hard local payload cap when MemTree is unavailable. Failure still degrades
   to the original body after the configured blocking budget.
-- A new recovery-specific timeout or failure cooldown in the initial patch;
-  telemetry and the kill switch cover rollout, and repeated failures should
-  drive that follow-up with real latency data.
+- A new recovery-specific *timeout*; the shared compression budget still bounds
+  each attempt. (The failure *cooldown* this section originally deferred was
+  added in ralph-review cycle 1 — see the decision summary — because the fuse
+  pays per tool turn, not per human turn.)
 - LRU/multi-slot route storage or subagent route riding.
 - Request-path recovery for a `/count_tokens` route miss. There is no captured
   evidence that such a preflight preceded this incident, and adding it would

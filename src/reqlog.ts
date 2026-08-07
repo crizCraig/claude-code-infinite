@@ -192,27 +192,40 @@ export interface MessagesRecord {
   comparison?: ComparisonRecord;
   /**
    * Main tool turns that attempted the local route lookup and missed:
-   * "missing" (no route slot) or "rejected" (route present, identity/hash
-   * mismatch). Absent means there was no applicable miss — hits and non-main
-   * turns never emit it. "none" is deliberately not a value.
+   * "missing" (no route slot) or "rejected" (a route was present but
+   * unusable for this request). "rejected" covers every reason
+   * memoryRoutedToolBody refuses: session-id or epoch mismatch, a changed
+   * system/prefix hash, a conversation that shrank below the stored prefix,
+   * and an unexpected tool suffix shape — not identity divergence alone.
+   * Absent means there was no applicable miss — hits and non-main turns never
+   * emit it. "none" is deliberately not a value.
    */
   routeMiss?: "missing" | "rejected";
   /** Outcome of a best-effort tool-route miss recovery attempt. */
   routeRecovery?: {
-    /** Serialized non-system conversation bytes that passed the gate. */
-    conversationBytes: number;
+    /**
+     * Serialized non-system conversation bytes that passed the gate. Absent
+     * when the miss was resolved before measuring (kill switch off).
+     */
+    conversationBytes?: number;
     outcome:
       | "compressed"
       | "failed"
       | "noop"
       | "unusable"
       | "no-gain"
-      | "client-closed";
+      | "client-closed"
+      /** Kill switch off: no attempt was made or measured. */
+      | "disabled"
+      /** A recent attempt returned null; the blocking wait was skipped. */
+      | "cooldown";
     /** Route candidate fate; only "compressed" outcomes carry it. */
     install?:
       | "installed"
       | "stale"
       | "prompt-pending"
+      /** The rejected route belongs to another session and was preserved. */
+      | "foreign-route"
       | "no-session"
       | "upstream-failed";
   };
