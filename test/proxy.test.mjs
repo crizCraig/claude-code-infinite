@@ -5539,6 +5539,303 @@ test("a compressed subagent followup installs its own lane and its tool loop rid
   }
 });
 
+test("a newer subagent followup owns its lane when completions reverse", async () => {
+  // Agent followups can install routes now, so they need the same async
+  // decision ordering as main: a slower older compression must not overwrite
+  // the route chosen by a newer request on the same lane.
+  const upstream = await recordingUpstream();
+  const gates = { AAA: deferred(), BBB: deferred() };
+  const arrived = { AAA: false, BBB: false };
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      const marker = JSON.stringify(parsed.messages).includes("BBB") ? "BBB" : "AAA";
+      arrived[marker] = true;
+      await gates[marker].promise;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(recoveredMemory(marker)));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    // A stale-route rejection must stay visible instead of being repaired by
+    // recovery, or the race could pass while still installing the wrong route.
+    toolRouteRecovery: false,
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-race" };
+  const olderMessages = followupTurn("AAA agent followup");
+  const newerMessages = followupTurn("BBB agent followup");
+  try {
+    const older = postMessages(proxy.port, olderMessages, agent);
+    await waitFor(() => arrived.AAA);
+    const newer = postMessages(proxy.port, newerMessages, agent);
+    await waitFor(() => arrived.BBB);
+
+    gates.BBB.resolve();
+    await newer;
+    gates.AAA.resolve();
+    await older;
+
+    await postMessages(
+      proxy.port,
+      extendToolLoop(newerMessages, "agent-race-tool"),
+      agent
+    );
+    const ride = messageRecords(records).at(-1);
+    assert.equal(ride.turnType, "tool-memory", "the newer route survived");
+    const forwarded = JSON.stringify(upstream.seen.at(-1).body.messages);
+    assert.match(forwarded, /BBB recovered memory/);
+    assert.doesNotMatch(forwarded, /AAA recovered memory/);
+  } finally {
+    gates.AAA.resolve();
+    gates.BBB.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a closed newer subagent followup hands its lane decision back", async () => {
+  // Unlike main, an agent followup does not bump the epoch or clear its lane
+  // before compression. If its client disappears before any mutation, its
+  // reservation must be released so an older in-flight followup can still
+  // install instead of being suppressed by a decision that did nothing.
+  const upstream = await recordingUpstream();
+  const gates = { AAA: deferred(), BBB: deferred() };
+  const arrived = { AAA: false, BBB: false };
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      const marker = JSON.stringify(parsed.messages).includes("BBB") ? "BBB" : "AAA";
+      arrived[marker] = true;
+      await gates[marker].promise;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(recoveredMemory(marker)));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    toolRouteRecovery: false,
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-close-race" };
+  const olderMessages = followupTurn("AAA older followup");
+  const newerMessages = followupTurn("BBB abandoned followup");
+  try {
+    const older = postMessages(proxy.port, olderMessages, agent);
+    await waitFor(() => arrived.AAA);
+
+    const newerClientGone = new Promise((resolve, reject) => {
+      const clientReq = http.request({
+        host: "127.0.0.1",
+        port: proxy.port,
+        path: "/v1/messages",
+        method: "POST",
+        headers: { "content-type": "application/json", ...agent },
+      });
+      clientReq.on("error", resolve);
+      clientReq.on("response", (response) => {
+        response.resume();
+        response.on("end", () =>
+          reject(new Error("the abandoned followup unexpectedly completed"))
+        );
+      });
+      clientReq.end(
+        JSON.stringify({
+          model: "claude-x",
+          max_tokens: 64,
+          messages: newerMessages,
+        })
+      );
+      waitFor(() => arrived.BBB).then(
+        () => clientReq.destroy(),
+        reject
+      );
+    });
+    await newerClientGone;
+    gates.BBB.resolve();
+    await within(
+      waitFor(() =>
+        messageRecords(records).some(
+          (record) => record.turnType === "followup-client-closed"
+        )
+      ),
+      "the abandoned followup never released its decision"
+    );
+
+    gates.AAA.resolve();
+    await older;
+    await postMessages(
+      proxy.port,
+      extendToolLoop(olderMessages, "after-abandoned-newer"),
+      agent
+    );
+    assert.equal(
+      messageRecords(records).at(-1).turnType,
+      "tool-memory",
+      "the older followup installed after the no-op newer decision released"
+    );
+  } finally {
+    gates.AAA.resolve();
+    gates.BBB.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an agent followup keeps its reservation through delayed activation", async () => {
+  // Three generations expose the activation seam. BBB finishes compression
+  // while newer CCC still owns the lane, then waits on its upstream response.
+  // CCC abandons without mutation, handing ownership back before BBB activates.
+  // BBB's reservation must survive that wait so still-older AAA cannot later
+  // overwrite the route BBB installs.
+  const upstreamGate = deferred();
+  let candidateReachedUpstream = false;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const forwarded = Buffer.concat(chunks).toString("utf-8");
+      if (forwarded.includes("BBB recovered memory")) {
+        candidateReachedUpstream = true;
+        await upstreamGate.promise;
+      }
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const gates = { AAA: deferred(), BBB: deferred(), CCC: deferred() };
+  const arrived = { AAA: false, BBB: false, CCC: false };
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      const body = JSON.stringify(parsed.messages);
+      const marker = ["CCC", "BBB"].find((item) => body.includes(item)) ?? "AAA";
+      arrived[marker] = true;
+      await gates[marker].promise;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(recoveredMemory(marker)));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    toolRouteRecovery: false,
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-activation-race" };
+  const oldestMessages = followupTurn("AAA oldest followup");
+  const candidateMessages = followupTurn("BBB candidate followup");
+  const abandonedMessages = followupTurn("CCC abandoned followup");
+  let abandonedRequest;
+  try {
+    const oldest = postMessages(proxy.port, oldestMessages, agent);
+    await waitFor(() => arrived.AAA);
+
+    const candidate = postMessages(proxy.port, candidateMessages, agent);
+    await waitFor(() => arrived.BBB);
+
+    const abandonedClientGone = new Promise((resolve, reject) => {
+      abandonedRequest = http.request({
+        host: "127.0.0.1",
+        port: proxy.port,
+        path: "/v1/messages",
+        method: "POST",
+        headers: { "content-type": "application/json", ...agent },
+      });
+      abandonedRequest.on("error", resolve);
+      abandonedRequest.on("response", (response) => {
+        response.resume();
+        response.on("end", () =>
+          reject(new Error("the abandoned followup unexpectedly completed"))
+        );
+      });
+      abandonedRequest.end(
+        JSON.stringify({
+          model: "claude-x",
+          max_tokens: 64,
+          messages: abandonedMessages,
+        })
+      );
+    });
+    await waitFor(() => arrived.CCC);
+
+    // BBB reaches forwarding while CCC's newer reservation is still live.
+    gates.BBB.resolve();
+    await waitFor(() => candidateReachedUpstream);
+
+    // CCC then releases without a route mutation. BBB is now allowed to
+    // activate, but must keep its own generation committed when it does.
+    abandonedRequest.destroy();
+    await abandonedClientGone;
+    gates.CCC.resolve();
+    await within(
+      waitFor(() =>
+        messageRecords(records).some(
+          (record) => record.turnType === "followup-client-closed"
+        )
+      ),
+      "the abandoned newest followup never released"
+    );
+
+    upstreamGate.resolve();
+    await candidate;
+
+    // AAA finishes last. Without BBB's retained reservation, this still-older
+    // completion can overwrite BBB after the newer CCC request has vanished.
+    gates.AAA.resolve();
+    await oldest;
+
+    await postMessages(
+      proxy.port,
+      extendToolLoop(candidateMessages, "after-delayed-activation"),
+      agent
+    );
+    assert.equal(
+      messageRecords(records).at(-1).turnType,
+      "tool-memory",
+      "the route installed by BBB stayed protected from still-older AAA"
+    );
+  } finally {
+    abandonedRequest?.destroy();
+    gates.AAA.resolve();
+    gates.BBB.resolve();
+    gates.CCC.resolve();
+    upstreamGate.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("a same-session subagent reject evicts only its own lane, never main's", async () => {
   // The regression the old subagent carve-out was written to prevent — a
   // same-session subagent reject clearing the main thread's route — must now
@@ -5575,6 +5872,53 @@ test("a same-session subagent reject evicts only its own lane, never main's", as
     // Main's route was never touched: its extension still rides.
     await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("reserved-looking agent ids cannot alias the main route lane", async () => {
+  // The key encoding must distinguish the reserved main lane from an opaque
+  // agent id whose literal value happens to be "main".
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const base = followupTurn("turn two");
+  const reservedLookingAgent = {
+    ...SESSION,
+    "x-claude-code-agent-id": "main",
+  };
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, base, SESSION);
+
+    await postMessages(proxy.port, largeToolTurn("BBB"), reservedLookingAgent);
+    const agentRec = messageRecords(records).at(-1);
+    assert.equal(agentRec.routeLane, "agent");
+    assert.equal(agentRec.routeRecovery.install, "installed");
+
+    await postMessages(proxy.port, extendToolLoop(base, "main-after-agent"), SESSION);
+    assert.equal(
+      messageRecords(records).at(-1).turnType,
+      "tool-memory",
+      "the opaque agent id did not overwrite or evict the reserved main lane"
+    );
   } finally {
     proxy.close();
     upstream.close();
@@ -5731,6 +6075,40 @@ test("a pending human prompt window keeps recovery transform-only", async () => 
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     const rec2 = messageRecords(records)[1];
     assert.equal(rec2.routeMiss, "missing", "no route was installed");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a pending main prompt does not make an agent recovery transform-only", async () => {
+  // The merged-prompt hazard belongs to main. An attributed agent installs in
+  // a disjoint lane, so the main arm must not consume the agent's one attempt
+  // without leaving a route for the rest of its tool loop.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory("AGENT"));
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-during-arm" };
+  const conversation = largeToolTurn("BBB");
+  try {
+    await armMainTurn(proxy, "main prompt still waiting");
+    await postMessages(proxy.port, conversation, agent);
+    const recovered = messageRecords(records).at(-1);
+    assert.equal(recovered.routeRecovery.outcome, "compressed");
+    assert.equal(recovered.routeRecovery.install, "installed");
+
+    await postMessages(proxy.port, extendToolLoop(conversation, "agent-next"), agent);
+    assert.equal(
+      messageRecords(records).at(-1).turnType,
+      "tool-memory",
+      "the agent rides its route while the unrelated main arm remains pending"
+    );
   } finally {
     proxy.close();
     upstream.close();
@@ -6597,6 +6975,83 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
       "cooldown",
       "a memoized answer is not evidence that MemTree is answering now"
     );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a cached legacy rescue cannot hide a live canonical failure from the fuse", async () => {
+  // Warm ONLY the raw signed-thinking hash. Once MemTree is down, the proxy's
+  // normalized canonical leg fails live while the cached legacy result still
+  // rescues delivery. That cached winner must not conceal the current failure
+  // from other lanes' shared recovery cooldown.
+  const upstream = await recordingUpstream();
+  let healthy = true;
+  let blockingCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      blockingCalls++;
+      if (!healthy) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "down" }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(recoveredMemory("LEGACY")));
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const question = "signed-thinking followup";
+  const history = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "legacy-sig" },
+        { type: "text", text: "first answer " + "detail ".repeat(500) },
+      ],
+    },
+    { role: "user", content: question },
+  ];
+
+  // Directly warm the exact raw hash that runBlockingCompression uses for its
+  // legacy leg; the normalized canonical hash remains absent from the cache.
+  const rawHash = MemtreeClient.hashMessages(history);
+  assert.ok(await memtree.compress(rawHash, history, 200_000));
+  assert.equal(blockingCalls, 1);
+
+  healthy = false;
+  const records = [];
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  try {
+    await postMessages(proxy.port, history, SESSION);
+    const rescued = messageRecords(records).at(-1);
+    assert.equal(rescued.compress.legacyFallback, true);
+    assert.equal(rescued.turnType, "followup-compressed");
+    assert.equal(blockingCalls, 2, "only the uncached canonical leg failed live");
+
+    await postMessages(proxy.port, largeToolTurn("CCC"), {
+      ...SESSION,
+      "x-claude-code-agent-id": "agent-after-cached-rescue",
+    });
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "cooldown",
+      "the live canonical failure armed the shared fuse"
+    );
+    assert.equal(blockingCalls, 2, "the fresh lane made no blocking retry");
   } finally {
     proxy.close();
     upstream.close();

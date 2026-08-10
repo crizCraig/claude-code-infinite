@@ -75,13 +75,13 @@ now. Both are resolved by ignoring weak evidence rather than guessing from it:
   lift the cooldown for the same reason. `noteMemtreeHealth` is now
   lane-agnostic. The live-round-trip rule below still applies and is what keeps
   the shared signal honest.
-- **Live round trips only, for the clear direction.** `compress()` memoizes
-  successes by hash and returns them without contacting the server, so
-  Claude Code's automatic retry of an identical body replays an answer
-  recorded before the outage. Clearing on that "proves" health from history.
-  Arming is immune by construction — failures are never cached — so the
-  asymmetry is one-way, and an in-flight leg counts as cached (discarding
-  live evidence only forgoes an optimization).
+- **Live round trips only.** `compress()` memoizes successes by hash and returns
+  them without contacting the server, so cached legs contribute no current
+  health evidence. Any live success clears the cooldown and wins over a
+  simultaneous live failure; with no live success, any live failure arms it.
+  This includes a live canonical failure rescued by a cached legacy result —
+  the cached winner must not conceal current outage evidence. An in-flight leg
+  counts as cached (discarding live evidence only forgoes an optimization).
 
 A shutdown-aborted compress maps to the same null as a server failure and now
 arms nothing, so a drain is not recorded as a MemTree outage. Classification gating
@@ -272,10 +272,10 @@ route by calling `installMainMemoryRoute` with an unavailable identity.
 The existing epoch check protects against a later human-turn invalidation but
 does not order two tool recoveries that start under the same epoch, or a tool
 recovery against an already-running followup. Add a monotonic
-`mainRouteDecisionGeneration` to `ProxyState`. Every identified main request
-that can asynchronously own the route reserves and captures a new generation:
-every normal followup, plus an eligible tool recovery that has a session id and
-no pending human prompt arm/retry window. Every route install **and every
+`mainRouteDecisionGeneration` to `ProxyState`. Every request that can
+asynchronously own a route reserves and captures a new generation: every
+followup on every lane, plus an eligible tool recovery that has a session id
+and no pending **main-lane** prompt arm. Every route install **and every
 post-await route clear** requires both its captured `mainRouteEpoch` and
 decision generation still to match. This includes the existing degraded,
 no-op, empty-memory, non-A/B, and A/B callback paths, so an older completion
@@ -300,14 +300,16 @@ therefore does not advance the decision generation. Do not bump
 `mainRouteEpoch` from a tool recovery, because that epoch also guards human
 prompt delivery/retry state.
 
-Capture whether the recovery is route-owning at its start. If a human prompt
-arm is then pending (`mainPromptArmed`), the attempt is permanently
+Capture whether the recovery is route-owning at its start. If a main request
+sees a pending human prompt arm (`mainPromptArmed`), the attempt is permanently
 transform-only: it reserves no generation and may
 not activate even if that window happens to close before its response. The
 current recovery-turn classifier uses route existence and message-count growth
 as an early rideability signal; an intermediate tool wrapper must not install a
 route that vetoes classification of the later real merged-prompt request. The
 one-shot compressed forward is still allowed and remains prompt-state-neutral.
+An attributed agent uses a disjoint route key, so the main arm does not make
+its recovery transform-only.
 
 The window is the **arm only**, deliberately narrower than the followup path's
 `mainPromptArmed || !mainPromptDelivered` (cycle 3). `mainPromptDelivered`
@@ -514,12 +516,14 @@ shipped as `plans/2026-08-08_PLAN_route_parity_simple.md`. The deferral was
 correct at the time and its cost estimate was largely right: the change did need
 eviction (8-entry LRU) and fallback identity for partially attributed requests
 (`x-claude-code-agent-id` falling back to `x-claude-code-parent-agent-id`, then
-`main`). Two of the feared costs did not materialize. Per-key epochs were
+`main`). Keys are tagged JSON tuples, keeping reserved `main`/`away` lanes
+distinct from opaque agent ids. Per-key epochs were
 unnecessary — a new human turn ends the previous turn's subagents too, so the
-single epoch bump clears the whole map. Prompt ownership and activation ordering
-stayed main-only and needed no per-key generalization; only the decision-live set
-was keyed per lane, so that a subagent's reservation cannot mark a concurrent
-main install stale.
+single epoch bump clears the whole map. Prompt ownership stays main-only, while
+activation ordering is per lane: every followup and route-owning recovery
+reserves its own key, so a subagent's reservation cannot mark a concurrent main
+install stale and reverse-order same-lane completions cannot overwrite newer
+routes.
 
 The rest of the paragraph's reasoning still holds and is worth preserving: the
 cache does **not** subsume Fix 1. A same-session, main-shaped side request

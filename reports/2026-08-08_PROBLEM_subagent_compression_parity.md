@@ -190,4 +190,4 @@ Coverage of the acceptance signals above, as of 2026-08-09:
 | Away-summary reduced rather than verbatim | Covered — "an away-summary followup installs on the away lane and spares main's route" |
 | `count_tokens` for that identity reports the compressed size | **Behaviour shipped, not yet tested.** The `!hasAgentAttribution(req)` gate is gone and `handleCountTokens` keys the same way `/v1/messages` does, but every existing `count_tokens` test drives the main lane. An agent-lane count is unproven. |
 | Main still rides under concurrent subagent traffic; same-session non-main reject does not evict main | Covered — "a same-session subagent reject evicts only its own lane, never main's" |
-| Reqlog distinguishes identity-owned install/ride | Covered — `routeLane` asserted across the lane tests; the "transform-only one-shot" half of this signal no longer applies, since transform-only now survives for `no-session` and `prompt-pending` only |
+| Reqlog distinguishes identity-owned install/ride | Covered — `routeLane` asserted across the lane tests; transform-only now survives only for `no-session` and a `prompt-pending` **main** lane |

@@ -285,9 +285,9 @@ interface ProxyState {
   /**
    * Orders async route decisions that share one epoch. The epoch guards
    * human-prompt lifecycle (UserPromptSubmit/Stop bump it); this generation is
-   * reserved by every request that may asynchronously install or clear the
-   * route after an await — each normal main followup, plus a route-owning
-   * tool-route recovery. An install or post-await clear whose captured
+   * reserved by every request that may asynchronously install or clear its
+   * lane after an await — every followup, plus a route-owning tool-route
+   * recovery. An install or post-await clear whose captured
    * generation is stale must do nothing, so an older completion can never
    * erase or overwrite a newer decision.
    */
@@ -301,9 +301,9 @@ interface ProxyState {
    *
    * Keyed per lane so ordering only applies where writers actually contend: a
    * subagent recovery's reservation must never mark a concurrent main
-   * followup's install stale — they write different entries. Within one lane
-   * writers are serial in practice; the set is the belt-and-braces ordering
-   * for the async completions that share it.
+   * followup's install stale — they write different entries. Within one lane,
+   * followups and recoveries all reserve so reverse-order async completions
+   * cannot overwrite the newest decision.
    *
    * A set rather than "newest wins" on the counter alone, because releases can
    * arrive out of order: with reservations 6 and 7 live, 6 finishing first
@@ -445,11 +445,13 @@ interface MemoryRoute {
 const MEMORY_ROUTE_MAX_LANES = 8;
 
 /**
- * Identity key for a memory-route lane: `"<session> <lane>"` where lane is
- * the away-summary side channel, the requesting agent id (own id first,
- * parent's as fallback), or "main". Keying by identity is what makes lane
- * isolation structural: a request can only ever reach its own lane, so
- * foreign-route defense is unnecessary rather than implemented.
+ * Collision-free identity key for a memory-route lane. The tuple tags reserved
+ * main/away lanes separately from agent ids, so an agent literally named
+ * "main" or "away" cannot alias either reserved lane; JSON array encoding also
+ * prevents delimiter collisions between arbitrary session and agent headers.
+ * Keying by identity is what makes lane isolation structural: a request can
+ * only ever reach its own lane, so foreign-route defense is unnecessary rather
+ * than implemented.
  */
 function routeKeyFor(req: http.IncomingMessage, isAwaySummary: boolean): string {
   const session = requestSessionId(req) ?? "";
@@ -457,8 +459,13 @@ function routeKeyFor(req: http.IncomingMessage, isAwaySummary: boolean): string 
     firstNonEmptyHeader(req, "x-claude-code-agent-id") ??
     firstNonEmptyHeader(req, "x-claude-code-parent-agent-id") ??
     "";
-  const lane = isAwaySummary ? "away" : agent || "main";
-  return `${session} ${lane}`;
+  return JSON.stringify(
+    isAwaySummary
+      ? [session, "away"]
+      : agent
+        ? [session, "agent", agent]
+        : [session, "main"]
+  );
 }
 
 function firstNonEmptyHeader(
@@ -1095,6 +1102,8 @@ async function handleMessages(
     isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
   let routeEpoch = state.mainRouteEpoch;
   let routeDecisionGeneration = state.mainRouteDecisionGeneration;
+  let routeDecisionReserved = false;
+  let routeDecisionCommitted = false;
   // Only a rebuilder may clear: a main followup enters the blocking
   // compression path below and installs a fresh route, so its clear is
   // clear-then-rebuild. A first-user-shaped request (including CC-internal
@@ -1105,20 +1114,26 @@ async function handleMessages(
   // epoch, system, and every prefix hash before any rewrite, so a retained
   // route can never graft onto an unrelated request; it can only match its
   // own conversation's extension or fail closed.
-  if (isFollowupUserTurn && isMainRequest) {
-    routeEpoch = ++state.mainRouteEpoch;
-    // Every surviving reservation belongs to the epoch just superseded, so it
-    // can no longer hold anything: dropping them here is what keeps the live
-    // set bounded to one human turn's decisions. This followup then reserves
-    // for the new epoch, and keeps that reservation whether it installs or
-    // clears — either way an older decision must not undo it.
-    state.routeDecisionsLive.clear();
+  if (isFollowupUserTurn) {
+    if (isMainRequest) {
+      routeEpoch = ++state.mainRouteEpoch;
+      // Every surviving reservation belongs to the epoch just superseded, so
+      // it can no longer hold anything. A new main human turn ends the prior
+      // turn's subagents and clears every lane before this request reserves the
+      // main lane in the new epoch.
+      state.routeDecisionsLive.clear();
+      state.memoryRoutes.clear();
+      state.toolRecoveryAttemptedLanes.clear();
+      // The new main turn has already made its route decision by clearing the
+      // previous epoch, even if its later compression loses the client.
+      routeDecisionCommitted = true;
+    }
+    // Every followup can install or clear its own lane after compression. Give
+    // non-main lanes the same ordering guarantee main already had: a slower
+    // older completion cannot overwrite a newer request on the same key.
     routeDecisionGeneration = ++state.mainRouteDecisionGeneration;
     reserveRouteDecision(state, requestRouteKey, routeDecisionGeneration);
-    // The epoch just bumped, so every entry in the map is stale — a new human
-    // turn ends the previous turn's subagents too.
-    state.memoryRoutes.clear();
-    state.toolRecoveryAttemptedLanes.clear();
+    routeDecisionReserved = true;
   }
   const hookOwnedMainFollowup =
     isFollowupUserTurn &&
@@ -1282,6 +1297,7 @@ async function handleMessages(
             rec,
             conversationBytes,
             routeKey: requestRouteKey,
+            isMainRequest,
           })
         );
       }
@@ -1327,6 +1343,14 @@ async function handleMessages(
   const routeDecisionCurrent = () =>
     state.mainRouteEpoch === routeEpoch &&
     routeDecisionHolds(state, requestRouteKey, routeDecisionGeneration);
+  const commitRouteDecision = () => {
+    if (routeDecisionReserved) routeDecisionCommitted = true;
+  };
+  const releaseUncommittedRouteDecision = () => {
+    if (!routeDecisionReserved || routeDecisionCommitted) return;
+    releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
+    routeDecisionReserved = false;
+  };
 
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
@@ -1357,6 +1381,9 @@ async function handleMessages(
       modelContextLimit,
       rec,
     });
+  } catch (err) {
+    releaseUncommittedRouteDecision();
+    throw err;
   } finally {
     res.off("close", markDownstreamClosedDuringCompression);
   }
@@ -1367,6 +1394,7 @@ async function handleMessages(
     downstreamClosedDuringCompression ||
     (res.destroyed && !res.writableFinished)
   ) {
+    releaseUncommittedRouteDecision();
     recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
     return logged(Promise.resolve());
   }
@@ -1384,6 +1412,9 @@ async function handleMessages(
     recordTurn(rec, "followup-degraded", forwardBody);
     if (routeDecisionCurrent()) {
       state.memoryRoutes.delete(requestRouteKey);
+      commitRouteDecision();
+    } else {
+      releaseUncommittedRouteDecision();
     }
     capture(opts, "anthropic-request", forwardBody);
     const paymentDetail = opts.memtree.paymentRequiredDetail;
@@ -1445,6 +1476,9 @@ async function handleMessages(
     // real history costs context but never silently amnesias the session.
     if (routeDecisionCurrent()) {
       state.memoryRoutes.delete(requestRouteKey);
+      commitRouteDecision();
+    } else {
+      releaseUncommittedRouteDecision();
     }
     if (actuallyCompressed && opts.debug) {
       console.error(
@@ -1477,7 +1511,14 @@ async function handleMessages(
   // Invariant from the early return above: past this point the MemTree result
   // actually compressed (actuallyCompressed is true) and the retained history
   // is usable — every remaining path forwards the compressed body.
-  const { compressedBody, compressedRaw } = buildCompressedBody(body, result);
+  let compressedBody: Record<string, any>;
+  let compressedRaw: Buffer;
+  try {
+    ({ compressedBody, compressedRaw } = buildCompressedBody(body, result));
+  } catch (err) {
+    releaseUncommittedRouteDecision();
+    throw err;
+  }
   if (opts.debug) {
     console.error(
       `[ccc proxy] user turn compressed: ${forwardBody.length} → ` +
@@ -1513,6 +1554,7 @@ async function handleMessages(
   const activateMemoryRoute = () => {
     if (routeActivationAttempted) return;
     if (!routeDecisionCurrent()) {
+      releaseUncommittedRouteDecision();
       routeActivationAttempted = true;
       return;
     }
@@ -1526,6 +1568,7 @@ async function handleMessages(
       routeEpoch,
       routeDecisionGeneration
     );
+    commitRouteDecision();
     // Leave this false if installMemoryRoute unexpectedly throws: the
     // delivery-complete fallback then gets one safe retry.
     routeActivationAttempted = true;
@@ -1583,6 +1626,9 @@ async function handleMessages(
               activateMemoryRoute();
             } else if (routeDecisionCurrent() && !routeActivationAttempted) {
               state.memoryRoutes.delete(requestRouteKey);
+              commitRouteDecision();
+            } else if (!routeActivationAttempted) {
+              releaseUncommittedRouteDecision();
             }
             // When activation already ran at protocol-complete, a
             // delivered=false settle keeps the route on purpose: it may be
@@ -1623,6 +1669,7 @@ async function handleMessages(
             state.mainPromptGeneration !== noticePromptGeneration ||
             state.mainRouteEpoch !== routeEpoch
           ) {
+            releaseUncommittedRouteDecision();
             return;
           }
           if (
@@ -1638,6 +1685,7 @@ async function handleMessages(
           }
           if (winner === "full" && routeDecisionCurrent()) {
             state.memoryRoutes.delete(requestRouteKey);
+            commitRouteDecision();
             // The verdict judged memory WORSE than full context for this
             // turn. Recovery re-compressing the tool loop would override
             // that judgement with an ungraded compress, so the lane's
@@ -1654,7 +1702,10 @@ async function handleMessages(
             // Any fully delivered leg (memory, full, spliced, recovered)
             // completes this turn downstream, ending the recovery-retry window.
             if (ok) markMainPromptDelivered();
-            if (!routeDecisionCurrent()) return;
+            if (!routeDecisionCurrent()) {
+              releaseUncommittedRouteDecision();
+              return;
+            }
             if (delivered === "memory" && ok) {
               queueCompressionNotice({
                 state,
@@ -1674,9 +1725,11 @@ async function handleMessages(
                 routeEpoch,
                 routeDecisionGeneration
               );
+              commitRouteDecision();
               return;
             }
             state.memoryRoutes.delete(requestRouteKey);
+            commitRouteDecision();
             if (delivered === "spliced") {
               // A B-verdict splice is the grader choosing full context over
               // memory mid-stream. Same authority as a full winner above:
@@ -1713,7 +1766,14 @@ async function handleMessages(
 
   if (routeDecisionCurrent()) {
     state.memoryRoutes.delete(requestRouteKey);
+    commitRouteDecision();
   }
+  // If a newer same-lane decision is live, keep this request's reservation
+  // until its protocol-complete activation (or terminal forward failure).
+  // The newer request may still end without mutating anything and hand
+  // ownership back while this response is in flight. Releasing here would let
+  // this request install later with no committed generation protecting that
+  // route from an even older completion.
   recordTurn(rec, "followup-compressed", compressedRaw);
   capture(opts, "anthropic-request", compressedRaw);
   // Preserve the legacy embedder contract: without A/B enabled, a long live
@@ -1752,7 +1812,13 @@ async function handleMessages(
         // route and reclassifies as the recovery turn
         // (routeRideableByThisRequest above), bumping the epoch and
         // rebuilding the route.
-        if (!delivered) return;
+        if (!delivered) {
+          // Protocol-complete activation may already have installed the route
+          // before a fast downstream close. Otherwise this forward made no
+          // route decision, so return an uncommitted agent reservation.
+          if (!routeActivationAttempted) releaseUncommittedRouteDecision();
+          return;
+        }
         markMainPromptDelivered();
         // The notice is the only part that stayed A/B-conditional here: the
         // legacy path already queued it above, before the stream started.
@@ -1831,8 +1897,9 @@ function queueCompressionNotice(args: {
 }
 
 /**
- * Record what a blocking compress just proved about MemTree's health: a null
- * arms the tool-recovery cooldown, any response clears it.
+ * Record what a blocking operation just proved about MemTree's health: an
+ * unopposed live failure arms the tool-recovery cooldown, any live success
+ * clears it, and a cached-only result leaves the prior state untouched.
  *
  * Called from BOTH blocking paths and, critically, BEFORE either one checks
  * whether its client is still listening. A null says something about the
@@ -1844,32 +1911,24 @@ function queueCompressionNotice(args: {
  * turn must not cost another full stall on the next tool turn, and a
  * recovered MemTree must not stay locked out for the rest of the window.
  *
- * Only an actual null counts as ill health. A no-op, unusable, or
- * non-shrinking answer proves the server is responsive and merely unhelpful
- * for this history, and the next turn's larger tail may well succeed — so
- * those keep paying the (fast, already-indexed) round trip rather than
- * locking recovery out. The asymmetry is deliberate: it trades a bounded
- * repeat cost against never suppressing a recovery a warming index is about
- * to make possible.
+ * A live no-op, unusable, or non-shrinking answer still proves the server is
+ * responsive and merely unhelpful for this history, and the next turn's
+ * larger tail may well succeed — so those clear the outage fuse and keep
+ * paying the fast, already-indexed round trip rather than locking recovery
+ * out. The asymmetry trades a bounded repeat cost against never suppressing a
+ * recovery a warming index is about to make possible.
  *
- * Both directions require evidence that is actually ABOUT this proxy's main
- * MemTree path and about its health RIGHT NOW; anything weaker leaves the
- * fuse untouched rather than guessing:
+ * Both directions require evidence about MemTree's health RIGHT NOW; anything
+ * weaker leaves the fuse untouched rather than guessing:
  *
- * - Non-main traffic never WRITES the cooldown (main tool and followup
- *   paths both read it). A subagent may take a transform-only recovery, but
- *   its history can fail (oversized, 413) or succeed for payload reasons of
- *   its own. Letting it write meant one subagent's rejected history could
- *   suppress recovery on a healthy main conversation for a full minute, and
- *   — worse — a continuously running subagent's successes could clear a
- *   cooldown a real outage had just armed, restoring the every-tool-turn
- *   stall the fuse exists to bound.
- * - A cache-served result clears nothing. compress() memoizes successes by
+ * - Every lane contributes the same shared evidence. A live success on either
+ *   canonical or legacy-probe leg clears the cooldown, even if its sibling
+ *   failed; when no live leg succeeds, a live failure arms it.
+ * - Cache-served legs contribute no evidence. compress() memoizes successes by
  *   hash and returns them with zero server contact, so replaying an identical
- *   human turn (Claude Code's automatic retry of a 529'd body is exactly this
- *   case) would otherwise "prove" MemTree is up using an answer recorded
- *   before it went down. Arming is immune — failures are never cached — so
- *   this asymmetry is one-way by construction.
+ *   body cannot "prove" MemTree is up. Conversely, a live canonical failure
+ *   rescued by a cached legacy answer still arms the fuse: the selected answer
+ *   must not hide current outage evidence.
  * - A shutdown abort arms nothing. compress() maps abort to the same null as
  *   a server failure, but a draining proxy says nothing about MemTree; it
  *   would only misattribute the drain in the last records written.
@@ -1878,14 +1937,15 @@ function noteMemtreeHealth(
   state: ProxyState,
   compression: BlockingCompressionOutcome
 ): void {
-  if (compression.result === null) {
+  if (compression.liveHealth === "failure") {
     if (state.shutdownSignal.aborted) return;
     state.toolRecoveryCooldownUntil =
       Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
     return;
   }
-  if (compression.servedFromCache) return;
-  state.toolRecoveryCooldownUntil = 0;
+  if (compression.liveHealth === "success") {
+    state.toolRecoveryCooldownUntil = 0;
+  }
 }
 
 /**
@@ -2288,12 +2348,8 @@ interface BlockingCompressionOutcome {
    * canonical normalized messages otherwise.
    */
   winningInput: Message[];
-  /**
-   * Whether the winning leg was answered from the in-process compress cache
-   * rather than a live round trip. Only meaningful to callers reading the
-   * result as evidence about MemTree's current health.
-   */
-  servedFromCache: boolean;
+  /** Current server-health evidence contributed by this blocking operation. */
+  liveHealth: "success" | "failure" | "none";
 }
 
 /**
@@ -2464,6 +2520,12 @@ async function runBlockingCompression(args: {
   // Overall wall time of the blocking compress step (both concurrent legs) —
   // what reqlog documents for compress.ms.
   const compressMs = Date.now() - compressStarted;
+  const hadLiveSuccess =
+    (!canonicalCached && canonicalResult !== null) ||
+    (probeLegacy && !legacyCached && legacyResult !== null);
+  const hadLiveFailure =
+    (!canonicalCached && canonicalResult === null) ||
+    (probeLegacy && !legacyCached && legacyResult === null);
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
@@ -2484,7 +2546,14 @@ async function runBlockingCompression(args: {
     result,
     usedLegacyFallback,
     winningInput: usedLegacyFallback ? rawMsgsForMemtree : msgsForMemtree,
-    servedFromCache: usedLegacyFallback ? legacyCached : canonicalCached,
+    // A live success is stronger evidence than a simultaneous live failure:
+    // the service answered this proxy now. Cached-only operations leave the
+    // existing fuse state untouched.
+    liveHealth: hadLiveSuccess
+      ? "success"
+      : hadLiveFailure
+        ? "failure"
+        : "none",
   };
 }
 
@@ -2544,6 +2613,7 @@ async function recoverToolRouteMiss(args: {
   rec: MessagesRecord;
   conversationBytes: number;
   routeKey: string;
+  isMainRequest: boolean;
 }): Promise<void> {
   const {
     opts,
@@ -2563,12 +2633,13 @@ async function recoverToolRouteMiss(args: {
     rec,
     conversationBytes,
     routeKey,
+    isMainRequest,
   } = args;
 
   const sessionId = requestSessionId(req);
-  // A pending human prompt arm/retry window means a typed prompt may arrive
+  // A pending MAIN prompt arm/retry window means a typed prompt may arrive
   // merged into a tool_result wrapper: recovery-turn classification uses
-  // route absence as a rideability signal, so an intermediate tool wrapper
+  // route absence as a rideability signal, so an intermediate main wrapper
   // must not install a route that vetoes the real merged-prompt request.
   // Captured ONCE here: the attempt stays transform-only even if the window
   // happens to close before its response settles.
@@ -2595,7 +2666,11 @@ async function recoverToolRouteMiss(args: {
   // unreachable: its client holds no new tool_use to send meanwhile, so no
   // recovery can install a route that would veto the retry's
   // recovery-prompt classification.
-  const promptWindowPending = state.mainPromptArmed;
+  // The armed prompt belongs only to the main lane. An attributed agent's
+  // route cannot veto main's merged-prompt classification, so suppressing the
+  // agent install here would merely strand its tool loop after spending the
+  // lane's one recovery attempt.
+  const promptWindowPending = isMainRequest && state.mainPromptArmed;
   // Every identity owns its own lane now, so the only transform-only reasons
   // left are local to this request: no session id to safely match a later
   // ride against, or the merged-prompt window above. The foreign-owner and
