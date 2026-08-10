@@ -1,7 +1,21 @@
 # Tool-Turn Route Recovery (best-effort recompression + clear gating)
 
-Status: implemented 2026-08-06 (staging smoke + canary rollout pending)
+Status: implemented 2026-08-06; **partially superseded 2026-08-09** by
+`plans/2026-08-08_PLAN_route_parity_simple.md`.
 Scope: client-only changes in this repository; no MemTree server change required.
+
+> **What this document still describes correctly:** the recovery mechanism —
+> the miss classification, the blocking recompress, the smaller-body proof, the
+> failure cooldown, the reservation/activation ordering, and the reqlog shape.
+> That machinery is intact and is now what every lane uses.
+>
+> **What it no longer describes:** the single-slot design wrapped around that
+> mechanism. Routes now live in a small map keyed by request identity
+> (session + `main`/`away`/agent id), so every identity installs and rides its
+> own lane. Consequently the `TOOL_RECOMPRESS_MIN_CONVERSATION_BYTES = 400 * 1024`
+> byte gate, the main-traffic-only restrictions, and the foreign-owner
+> protection described below are all **deleted**. Superseded passages are
+> marked inline.
 
 Incident: 2026-08-04 19:25:24Z, session `3ac71b3f` — one tool turn forwarded
 2.96MB (976,705 input tokens) verbatim after the memory route was cleared by two
@@ -44,7 +58,33 @@ reason a client gives up — learning only from attempts that outlived their
 client would blind the cooldown to precisely the outage it bounds. For the
 same reason the signal is shared with the followup path, which uses the same
 client and budget, so an outage first seen on a human turn does not cost
-another full stall on the next tool turn. Classification gating
+another full stall on the next tool turn.
+
+Sharing that signal made its *provenance* matter, and cycle 3 found two ways
+the shared write admitted evidence that was not about the main path's health
+now. Both are resolved by ignoring weak evidence rather than guessing from it:
+
+- ~~**Main traffic only.**~~ **Superseded 2026-08-09.** The original argument
+  was that only main tool turns read the cooldown, so admitting non-main
+  evidence would let an oversized subagent history arm a 60s cooldown against a
+  healthy main conversation — or let a busy subagent's successes clear a
+  cooldown a real outage had just armed. That reasoning depended on non-main
+  traffic being excluded from recovery. It no longer is: every lane runs the
+  same recovery path, so a subagent's compress failure is evidence about
+  MemTree's health on exactly the terms main's is, and its successes should
+  lift the cooldown for the same reason. `noteMemtreeHealth` is now
+  lane-agnostic. The live-round-trip rule below still applies and is what keeps
+  the shared signal honest.
+- **Live round trips only, for the clear direction.** `compress()` memoizes
+  successes by hash and returns them without contacting the server, so
+  Claude Code's automatic retry of an identical body replays an answer
+  recorded before the outage. Clearing on that "proves" health from history.
+  Arming is immune by construction — failures are never cached — so the
+  asymmetry is one-way, and an in-flight leg counts as cached (discarding
+  live evidence only forgoes an optimization).
+
+A shutdown-aborted compress maps to the same null as a server failure and now
+arms nothing, so a drain is not recorded as a MemTree outage. Classification gating
 should make recovery exceptional, while a temporary `CCC_TOOL_ROUTE_RECOVERY=0`
 kill switch provides fast rollback on relaunch. Use the new telemetry to
 revisit the wait budget or cooldown length against real latency data.
@@ -138,30 +178,48 @@ the local route lookup and before `recordTurn`, background indexing, and
 Attempt recovery only when all conditions hold:
 
 - tool route recovery is enabled;
-- `isToolResultTurn && isMainRequest`;
+- ~~`isToolResultTurn && isMainRequest`~~ → **`isToolResultTurn`, any lane**
+  (superseded 2026-08-09);
 - no local rewrite was produced, because the route was either missing or
   rejected;
 - `hasEarlierNonToolUserMessage(messages)` is true, so a server-side prefix can
   plausibly exist;
-- the serialized non-system conversation `messages` (after notice stripping,
-  excluding top-level and ambient system content, tool schemas, and
-  generation-only fields) are at least
-  `TOOL_RECOMPRESS_MIN_CONVERSATION_BYTES = 400 * 1024` bytes.
+- ~~the serialized non-system conversation `messages` … are at least
+  `TOOL_RECOMPRESS_MIN_CONVERSATION_BYTES = 400 * 1024` bytes.~~
+  **Superseded 2026-08-09: the byte gate is deleted.** In its place, a lane may
+  spend **one** blocking attempt per epoch (`toolRecoveryAttemptedLanes`,
+  cleared with the route map on every epoch bump), any request size.
 
-The threshold is a byte gate, not a tokenizer guarantee. Depending on content,
-400KiB is roughly 100k–140k tokens under the approximations already used in
-this repository. Gate on conversation bytes rather than `forwardBody.length`:
-a large top-level system or `tools` schema with a short transcript is
-lifted/preserved, not reduced as conversation memory, and should not add
-blocking latency. The full post-transform body comparison below is the final
-proof that the actual Anthropic request became smaller.
+> **Superseded 2026-08-09 — why the byte gate went away.** The threshold was a
+> byte gate, not a tokenizer guarantee: 400KiB is roughly 100k–140k tokens under
+> this repository's approximations, measured on conversation bytes rather than
+> `forwardBody.length` so a large system or `tools` schema with a short
+> transcript would not buy blocking latency. It answered "is this miss worth a
+> blocking round trip?" with a constant, and that constant existed because a
+> single slot meant misses were common. With every identity riding its own lane
+> a miss is rare, so the honest budget is the one main already lives by — at
+> most one blocking recompress per (lane, epoch) — which is self-limiting
+> without a threshold and gives every lane parity. `conversationBytes` survives
+> as a reqlog measurement, taken once per attempt rather than to feed a gate.
+> The full post-transform body comparison below is unchanged and is still the
+> final proof that the actual Anthropic request became smaller.
 
-Capture the miss reason before any eviction. On rejection, evict the route only
+Capture the miss reason before any eviction. ~~On rejection, evict the route only
 when the request has the same nonempty session id: that is a real same-session
 system/prefix/suffix mismatch that the recovery can rebuild. A request with a
 missing or different session id cannot use this slot, but it must not destroy a
 route that may still serve its owner. A successful, protocol-complete recovery
-for a different identified session may later replace the single slot normally.
+for a different identified session may later replace the single slot normally.~~
+
+> **Superseded 2026-08-09.** The same-session eviction test protected the one
+> shared slot from a foreign owner. Keying removes the reachability that made
+> the protection necessary: a request can only ever reach its own lane, so a
+> rejection evicts only its own entry and no other identity's route is exposed
+> to it. `routeMissForeignOwner`, `foreignRouteOwner`, and the `"foreign-route"`
+> install fate are deleted. Two identities that collide on a key (siblings
+> sharing only a `parent-agent-id`) are handled by `memoryRoutedToolBody`'s
+> existing content validation, which fails closed — not by a guard.
+
 A route hit remains unchanged and still takes the local, nonblocking
 `tool-memory` path.
 
@@ -243,13 +301,34 @@ therefore does not advance the decision generation. Do not bump
 prompt delivery/retry state.
 
 Capture whether the recovery is route-owning at its start. If a human prompt
-arm/retry window is then pending (`mainPromptArmed || !mainPromptDelivered`),
-the attempt is permanently transform-only: it reserves no generation and may
+arm is then pending (`mainPromptArmed`), the attempt is permanently
+transform-only: it reserves no generation and may
 not activate even if that window happens to close before its response. The
 current recovery-turn classifier uses route existence and message-count growth
 as an early rideability signal; an intermediate tool wrapper must not install a
 route that vetoes classification of the later real merged-prompt request. The
 one-shot compressed forward is still allowed and remains prompt-state-neutral.
+
+The window is the **arm only**, deliberately narrower than the followup path's
+`mainPromptArmed || !mainPromptDelivered` (cycle 3). `mainPromptDelivered`
+means "the response stream flushed", which is strictly stronger than "the
+client received the message": the documented fast-tool abort — Claude consumes
+`message_stop`, drops the SSE, and immediately sends its tool request — is a
+normal success that leaves the flag false until `Stop`. Keying recovery off
+that window meant one such abort plus one later route rejection made every
+subsequent large tool turn transform-only: a full blocking compress per tool
+turn, no route ever installed, and no cooldown to bound it because every
+attempt *succeeded*. Hookless embedders, where nothing sets the flag after the
+first undelivered turn, were stranded the same way.
+
+Dropping that half is safe because the merged-prompt hazard cannot coexist
+with a main tool-result turn: being in recovery at all proves a main response
+reached the client and produced a `tool_use`. The only undelivered prompt that
+could still arrive merged into a tool_result wrapper is one whose request has
+not been classified yet — exactly what the arm marks. An unflushed 5xx retry
+is likewise unreachable, since that client holds no new `tool_use` to send
+meanwhile, so no recovery can install a route that would veto the retry's
+recovery-prompt classification.
 
 ## Fix 4 — make recovery observable
 
@@ -332,11 +411,21 @@ Classification and gates:
   **same session id** and no `UserPromptSubmit`, then verify the next real tool
   turn still logs `tool-memory` and both `/messages` and `/count_tokens` use the
   compressed prefix.
-- Missing route and rejected route each trigger recovery at or above the exact
-  conversation threshold; below-threshold and no-earlier-user requests do not.
-- A large top-level/ambient system or `tools` schema with small conversation
-  history does not trigger.
-- Subagent-attributed and away-summary requests never trigger.
+- ~~Missing route and rejected route each trigger recovery at or above the exact
+  conversation threshold; below-threshold and no-earlier-user requests do not.~~
+  **Superseded 2026-08-09:** missing and rejected each trigger recovery at any
+  size, once per lane per epoch; the second miss in the same epoch logs
+  `routeRecovery.outcome: "spent"` and forwards verbatim. No-earlier-user
+  requests still do not trigger.
+- ~~A large top-level/ambient system or `tools` schema with small conversation
+  history does not trigger.~~ **Superseded 2026-08-09:** no size gate exists to
+  mis-fire, so there is nothing to exclude.
+- ~~Subagent-attributed and away-summary requests never trigger.~~
+  **Superseded 2026-08-09 — inverted.** Both now trigger on their own lane, and
+  that is the acceptance signal the route-parity change exists for: a subagent
+  tool turn after a compressed subagent user turn must log `tool-memory` and
+  forward a routed-size body, and an away-summary must install on the `away`
+  lane while leaving main's entry intact.
 - `CCC_TOOL_ROUTE_RECOVERY=0` preserves current background-index/verbatim
   behavior.
 
@@ -420,12 +509,26 @@ A bounded cache keyed by session and agent identity is technically feasible.
 carry `agent_id`; the previous claim that the hook had no usable session key was
 incorrect.
 
-It is still deferred because it is not needed to close this incident and would
-require per-key epochs, prompt ownership, activation ordering, eviction, and
-fallback identity for partially attributed requests. It also would not solve a
-same-session, main-shaped side request clearing the main entry; Fix 1 is needed
-regardless. The cache's larger payoff is subagent route riding, which should be
-designed as a separate feature rather than folded into this recovery patch.
+~~It is still deferred~~ **Deferral closed 2026-08-09** — the keyed route map
+shipped as `plans/2026-08-08_PLAN_route_parity_simple.md`. The deferral was
+correct at the time and its cost estimate was largely right: the change did need
+eviction (8-entry LRU) and fallback identity for partially attributed requests
+(`x-claude-code-agent-id` falling back to `x-claude-code-parent-agent-id`, then
+`main`). Two of the feared costs did not materialize. Per-key epochs were
+unnecessary — a new human turn ends the previous turn's subagents too, so the
+single epoch bump clears the whole map. Prompt ownership and activation ordering
+stayed main-only and needed no per-key generalization; only the decision-live set
+was keyed per lane, so that a subagent's reservation cannot mark a concurrent
+main install stale.
+
+The rest of the paragraph's reasoning still holds and is worth preserving: the
+cache does **not** subsume Fix 1. A same-session, main-shaped side request
+clearing the main entry is a *clear-without-rebuild* hazard, which keying does
+not address — a request that keys to `main` and cannot rebuild what it clears is
+still a hole, which is why the classification gate remains. What keying did solve
+is the *other* half of that incident, the side request with no agent header that
+could evict main's route: it now lands on the `away` lane instead. And the
+"larger payoff", subagent route riding, is exactly what shipped.
 
 ## Non-goals and residual risk
 
@@ -435,7 +538,9 @@ designed as a separate feature rather than folded into this recovery patch.
   each attempt. (The failure *cooldown* this section originally deferred was
   added in ralph-review cycle 1 — see the decision summary — because the fuse
   pays per tool turn, not per human turn.)
-- LRU/multi-slot route storage or subagent route riding.
+- ~~LRU/multi-slot route storage or subagent route riding.~~ **No longer a
+  non-goal — shipped 2026-08-09** as an 8-entry LRU map keyed by request
+  identity (`plans/2026-08-08_PLAN_route_parity_simple.md`).
 - Request-path recovery for a `/count_tokens` route miss. There is no captured
   evidence that such a preflight preceded this incident, and adding it would
   require caller-specific telemetry plus budget-metadata-safe compression-cache
