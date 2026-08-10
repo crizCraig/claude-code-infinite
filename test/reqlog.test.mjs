@@ -121,6 +121,9 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
     memtree,
     upstreamOrigin: upstream.origin,
     reqlog,
+    // Out of scope: recovery would recompress the small tool turn and change
+    // the verbatim-forward record shape this test asserts on.
+    toolRouteRecovery: false,
   });
   try {
     // Tool turn → forwardRaw path.

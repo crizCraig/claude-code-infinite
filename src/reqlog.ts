@@ -191,22 +191,28 @@ export interface MessagesRecord {
   /** Present when live memory-vs-full routing was eligible for this turn. */
   comparison?: ComparisonRecord;
   /**
-   * Main tool turns that attempted the local route lookup and missed:
-   * "missing" (no route slot) or "rejected" (a route was present but
-   * unusable for this request). "rejected" covers every reason
-   * memoryRoutedToolBody refuses: a requester whose session id differs from
-   * the route's OR who sends none at all, an epoch mismatch, a changed
-   * system/prefix hash, a conversation that shrank below the stored prefix,
-   * and an unexpected tool suffix shape — not identity divergence alone.
-   * Absent means there was no applicable miss — hits and non-main turns never
-   * emit it. "none" is deliberately not a value.
+   * Which memory-route lane this request keys to: the away-summary side
+   * channel, a request carrying agent attribution, or the main thread. This
+   * is what splits verbatim `tool` rows into main-miss vs subagent traffic
+   * when evaluating recovery behaviour after the fact.
+   */
+  routeLane?: "main" | "away" | "agent";
+  /**
+   * Tool turns that missed their lane's route: "missing" (empty lane) or
+   * "rejected" (a route was present in this lane but unusable for this
+   * request). "rejected" covers every reason memoryRoutedToolBody refuses:
+   * an epoch mismatch, a changed system/prefix hash, a conversation that
+   * shrank below the stored prefix, and an unexpected tool suffix shape.
+   * Absent means there was no applicable miss — hits and away-summary turns
+   * never emit it. "none" is deliberately not a value.
    */
   routeMiss?: "missing" | "rejected";
   /** Outcome of a best-effort tool-route miss recovery attempt. */
   routeRecovery?: {
     /**
-     * Serialized non-system conversation bytes that passed the gate. Absent
-     * when the miss was resolved before measuring (kill switch off).
+     * Serialized non-system conversation bytes, measured once per attempt.
+     * Absent when the miss was resolved without an attempt (kill switch off,
+     * cooldown, or a lane that already spent its per-epoch budget).
      */
     conversationBytes?: number;
     outcome:
@@ -219,14 +225,22 @@ export interface MessagesRecord {
       /** Kill switch off: no attempt was made or measured. */
       | "disabled"
       /** A recent attempt returned null; the blocking wait was skipped. */
-      | "cooldown";
+      | "cooldown"
+      /**
+       * This lane already spent its one blocking attempt this epoch; the
+       * miss forwarded verbatim without another attempt.
+       */
+      | "spent"
+      /**
+       * The compressed result could not be serialized (e.g. V8 string-length
+       * limit on a multi-megabyte body). Forwarded the original.
+       */
+      | "build-failed";
     /** Route candidate fate; only "compressed" outcomes carry it. */
     install?:
       | "installed"
       | "stale"
       | "prompt-pending"
-      /** The rejected route belongs to another session and was preserved. */
-      | "foreign-route"
       | "no-session"
       | "upstream-failed";
   };

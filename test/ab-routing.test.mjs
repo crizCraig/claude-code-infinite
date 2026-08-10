@@ -1258,6 +1258,7 @@ test("a selected A/B stream must reach message_stop before installing memory", a
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     abRouting: {
       // Buffered semantics: under speculative delivery a truncated A instead
       // triggers a recovery splice from the live B leg (tested below).
@@ -1406,6 +1407,9 @@ test("client close during compression finalizes without launching A/B work", asy
     indexInBackground() {
       backgroundIndexes++;
     },
+    hasCachedCompress() {
+      return false;
+    },
     compress(_hash, _messages, _contextLimit, signal) {
       compressionSignal = signal;
       compressionStarted.resolve();
@@ -1428,6 +1432,7 @@ test("client close during compression finalizes without launching A/B work", asy
   const proxy = await startProxy({
     memtree,
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
       speculative: true,
@@ -1750,6 +1755,7 @@ test("downstream cancellation after commit installs no memory route", async () =
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
       speculative: true,
@@ -1813,6 +1819,7 @@ test("memory winner is carried through the same session's tool loop", async () =
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     abRouting: {
       forceComparison: true,
       prefixChars: 4,
@@ -1956,6 +1963,7 @@ test("a newer user prompt prevents a stale memory verdict from installing a rout
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     abRouting: {
       forceComparison: true,
       prefixChars: 4,
@@ -2072,6 +2080,7 @@ test("route matching ignores block cache metadata but preserves nested tool data
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     abRouting: {
       forceComparison: true,
       prefixChars: 4,
@@ -2515,6 +2524,7 @@ test("speculative: a B verdict splices full history into the live memory stream"
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: {
       speculative: true,
@@ -3555,6 +3565,7 @@ test("a truncated below-threshold memory stream installs no route or success not
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeServer.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
     abRouting: { effectiveContextTokens: () => 1_000_000 },
   });

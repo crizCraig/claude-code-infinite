@@ -728,6 +728,20 @@ export class MemtreeClient {
   }
 
   /**
+   * Whether compress(hash) would answer without contacting the server: an
+   * already-settled success, or a leg another caller has in flight. Callers
+   * that read a compress result as evidence about the SERVER's health must
+   * consult this first — a memoized answer proves only that the server was
+   * alive whenever that entry was created, which may be many minutes and one
+   * outage ago. In-flight entries count as cached here even though they are
+   * real round trips: conservatively discarding live evidence only forgoes an
+   * optimization, whereas trusting a stale one suppresses a real outage.
+   */
+  hasCachedCompress(hash: string): boolean {
+    return this.compressCache.has(hash);
+  }
+
+  /**
    * Blocking user-turn compression. Returns null on ANY failure (timeout,
    * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
    * On 402 the failure is additionally recorded in paymentRequiredDetail so
