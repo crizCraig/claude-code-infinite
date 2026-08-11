@@ -252,7 +252,7 @@ interface ProxyState {
   abRouting?: ResolvedAbRoutingOptions;
   /**
    * Memory winners carried through the current human turn's tool loops, one
-   * lane per request identity (routeKeyFor). LRU-bounded to
+   * lane per request identity (routeIdentity). LRU-bounded to
    * MEMORY_ROUTE_MAX_LANES; entries with a stale routeEpoch are dropped on
    * access, and every epoch bump clears the whole map — a new human turn ends
    * the previous turn's subagents too.
@@ -444,28 +444,46 @@ interface MemoryRoute {
  */
 const MEMORY_ROUTE_MAX_LANES = 8;
 
+type RouteLane = "main" | "away" | "agent";
+
 /**
- * Collision-free identity key for a memory-route lane. The tuple tags reserved
- * main/away lanes separately from agent ids, so an agent literally named
- * "main" or "away" cannot alias either reserved lane; JSON array encoding also
- * prevents delimiter collisions between arbitrary session and agent headers.
+ * The agent id a request is attributed by, preferring its own id over its
+ * parent's. Absence of both is the definition of main-thread attribution, so
+ * hasAgentAttribution is this same extraction asked as a yes/no question.
+ */
+function agentAttributionId(
+  req: http.IncomingMessage
+): string | undefined {
+  return (
+    firstNonEmptyHeader(req, "x-claude-code-agent-id") ??
+    firstNonEmptyHeader(req, "x-claude-code-parent-agent-id")
+  );
+}
+
+/**
+ * Collision-free identity of a memory-route lane: the label the reqlog reports
+ * and the key every map is addressed by, classified once from the same headers
+ * so the two can never disagree. The tuple tags reserved main/away lanes
+ * separately from agent ids, so an agent literally named "main" or "away"
+ * cannot alias either reserved lane; JSON array encoding also prevents
+ * delimiter collisions between arbitrary session and agent headers.
  * Keying by identity is what makes lane isolation structural: a request can
  * only ever reach its own lane, so foreign-route defense is unnecessary rather
  * than implemented.
  */
-function routeKeyFor(req: http.IncomingMessage, isAwaySummary: boolean): string {
+function routeIdentity(
+  req: http.IncomingMessage,
+  isAwaySummary: boolean
+): { lane: RouteLane; key: string } {
   const session = requestSessionId(req) ?? "";
-  const agent =
-    firstNonEmptyHeader(req, "x-claude-code-agent-id") ??
-    firstNonEmptyHeader(req, "x-claude-code-parent-agent-id") ??
-    "";
-  return JSON.stringify(
-    isAwaySummary
-      ? [session, "away"]
-      : agent
-        ? [session, "agent", agent]
-        : [session, "main"]
-  );
+  const agent = agentAttributionId(req);
+  if (isAwaySummary) {
+    return { lane: "away", key: JSON.stringify([session, "away"]) };
+  }
+  if (agent) {
+    return { lane: "agent", key: JSON.stringify([session, "agent", agent]) };
+  }
+  return { lane: "main", key: JSON.stringify([session, "main"]) };
 }
 
 function firstNonEmptyHeader(
@@ -477,6 +495,24 @@ function firstNonEmptyHeader(
     ? value.find((item) => item.trim() !== "")
     : value;
   return typeof text === "string" && text.trim() ? text.trim() : undefined;
+}
+
+/**
+ * Close the current route epoch and open the next one, returning the new
+ * epoch. Everything keyed to the epoch just superseded goes with it: every
+ * surviving reservation belongs to that closed epoch and can no longer hold
+ * anything, and a new human turn ends the previous turn's subagents too, so
+ * every lane's route and spent-recovery mark is dropped rather than
+ * selectively pruned. Doing all of it here is what makes the sets' documented
+ * bound ("cleared on each epoch bump") true at every bump site rather than
+ * only at the followup one.
+ */
+function bumpRouteEpoch(state: ProxyState): number {
+  const epoch = ++state.mainRouteEpoch;
+  state.routeDecisionsLive.clear();
+  state.memoryRoutes.clear();
+  state.toolRecoveryAttemptedLanes.clear();
+  return epoch;
 }
 
 /**
@@ -836,14 +872,7 @@ async function handleNoticeHook(
       state.mainPromptText = parsed.prompt;
       state.mainPromptDelivered = false;
       state.mainPromptGeneration++;
-      state.mainRouteEpoch++;
-      // Every surviving reservation belongs to the epoch just closed, so it
-      // can no longer mutate anything; dropping it here is what makes the
-      // set's documented bound ("cleared on each epoch bump") true at every
-      // bump site rather than only at the followup one.
-      state.routeDecisionsLive.clear();
-      state.memoryRoutes.clear();
-      state.toolRecoveryAttemptedLanes.clear();
+      bumpRouteEpoch(state);
       state.notices.clearForUserRequest();
     }
     res.writeHead(204);
@@ -906,10 +935,7 @@ async function handleNoticeHook(
     // Invalidate a response that did not settle within the bounded hook wait.
     // Otherwise its late callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
-    state.mainRouteEpoch++;
-    state.routeDecisionsLive.clear();
-    state.memoryRoutes.clear();
-    state.toolRecoveryAttemptedLanes.clear();
+    bumpRouteEpoch(state);
     // A normal main Stop means all child work for the turn has settled. Clear
     // stale lifecycle entries left by a missed SubagentStop hook.
     state.activeSubagents.clear();
@@ -1052,10 +1078,13 @@ async function handleMessages(
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
   // attribution before lifecycle-hook state so an agent request cannot claim
   // or consume a main prompt arm even if SubagentStart ordering is delayed.
-  const isSubagentRequest = hasAgentAttribution(req);
-  const isMainRequest = !isAwaySummary && !isSubagentRequest;
-  const requestRouteKey = routeKeyFor(req, isAwaySummary);
-  rec.routeLane = isAwaySummary ? "away" : isSubagentRequest ? "agent" : "main";
+  const { lane: requestRouteLane, key: requestRouteKey } = routeIdentity(
+    req,
+    isAwaySummary
+  );
+  const isSubagentRequest = requestRouteLane === "agent";
+  const isMainRequest = requestRouteLane === "main";
+  rec.routeLane = requestRouteLane;
   // A typed prompt that recovers an interrupted tool loop (or was queued
   // mid-turn) arrives merged into the pending tool_result wrapper, so it fails
   // isNonToolUserMessage -- while its UserPromptSubmit hook has already cleared
@@ -1102,8 +1131,13 @@ async function handleMessages(
     isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
   let routeEpoch = state.mainRouteEpoch;
   let routeDecisionGeneration = state.mainRouteDecisionGeneration;
-  let routeDecisionReserved = false;
-  let routeDecisionCommitted = false;
+  // Whether this request's route decision is final: either it already made one
+  // (a main followup makes its decision by clearing the previous epoch below,
+  // even if its later compression loses the client) or it has since installed,
+  // cleared, or handed back its reservation. Only a followup ever reserves,
+  // and every path that reaches the reservation-aware helpers below has done
+  // so, so this single flag covers both "reserved" and "committed".
+  let routeDecisionSettled = isMainRequest;
   // Only a rebuilder may clear: a main followup enters the blocking
   // compression path below and installs a fresh route, so its clear is
   // clear-then-rebuild. A first-user-shaped request (including CC-internal
@@ -1116,24 +1150,15 @@ async function handleMessages(
   // own conversation's extension or fail closed.
   if (isFollowupUserTurn) {
     if (isMainRequest) {
-      routeEpoch = ++state.mainRouteEpoch;
-      // Every surviving reservation belongs to the epoch just superseded, so
-      // it can no longer hold anything. A new main human turn ends the prior
-      // turn's subagents and clears every lane before this request reserves the
-      // main lane in the new epoch.
-      state.routeDecisionsLive.clear();
-      state.memoryRoutes.clear();
-      state.toolRecoveryAttemptedLanes.clear();
-      // The new main turn has already made its route decision by clearing the
-      // previous epoch, even if its later compression loses the client.
-      routeDecisionCommitted = true;
+      // Clears every lane before this request reserves the main lane in the
+      // new epoch.
+      routeEpoch = bumpRouteEpoch(state);
     }
     // Every followup can install or clear its own lane after compression. Give
     // non-main lanes the same ordering guarantee main already had: a slower
     // older completion cannot overwrite a newer request on the same key.
     routeDecisionGeneration = ++state.mainRouteDecisionGeneration;
     reserveRouteDecision(state, requestRouteKey, routeDecisionGeneration);
-    routeDecisionReserved = true;
   }
   const hookOwnedMainFollowup =
     isFollowupUserTurn &&
@@ -1195,7 +1220,11 @@ async function handleMessages(
       // Every identity — main, subagent, away — consults its own lane. A
       // request can only ever name its own key, so the old foreign-owner
       // preservation and the subagent carve-out have nothing left to defend.
-      const activeRoute = getMemoryRoute(state, requestRouteKey);
+      // This is the lane lookup already done for rideableCandidate above:
+      // same key, no await and no memoryRoutes mutation in between on this
+      // path (the epoch clear is in the isFollowupUserTurn branch), so a
+      // second getMemoryRoute would only redo its own LRU bookkeeping.
+      const activeRoute = rideableCandidate;
       if (activeRoute) {
         const rewritten = memoryRoutedToolBody(
           body,
@@ -1344,12 +1373,12 @@ async function handleMessages(
     state.mainRouteEpoch === routeEpoch &&
     routeDecisionHolds(state, requestRouteKey, routeDecisionGeneration);
   const commitRouteDecision = () => {
-    if (routeDecisionReserved) routeDecisionCommitted = true;
+    routeDecisionSettled = true;
   };
   const releaseUncommittedRouteDecision = () => {
-    if (!routeDecisionReserved || routeDecisionCommitted) return;
+    if (routeDecisionSettled) return;
     releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
-    routeDecisionReserved = false;
+    routeDecisionSettled = true;
   };
 
   // The complete request upload can outlive its downstream subscriber while
@@ -2321,17 +2350,7 @@ function requestSessionId(req: http.IncomingMessage): string | undefined {
 }
 
 function hasAgentAttribution(req: http.IncomingMessage): boolean {
-  for (const name of [
-    "x-claude-code-agent-id",
-    "x-claude-code-parent-agent-id",
-  ]) {
-    const value = req.headers[name];
-    const present = Array.isArray(value)
-      ? value.some((item) => item.trim() !== "")
-      : typeof value === "string" && value.trim() !== "";
-    if (present) return true;
-  }
-  return false;
+  return agentAttributionId(req) !== undefined;
 }
 
 function cloneJson<T>(value: T): T {
@@ -2843,14 +2862,9 @@ async function recoverToolRouteMiss(args: {
       activationAttempted = true;
       return;
     }
-    if (
-      state.mainRouteEpoch !== routeEpoch ||
-      !routeDecisionHolds(state, routeKey, decisionGeneration)
-    ) {
-      activationAttempted = true;
-      installFate = "stale";
-      return;
-    }
+    // No staleness pre-check: installMemoryRoute applies the identical epoch
+    // and decision-generation guard as its first act, before its sessionless
+    // clear, and a false return classifies as "stale" below.
     const installed = installMemoryRoute(
       state,
       routeKey,
@@ -2962,7 +2976,7 @@ async function handleCountTokens(
       // A tool_result tail is never an away-summary probe, so the lane key
       // only distinguishes main vs agent identity here.
       const countRoute = isToolResultUserMessage(lastMsg)
-        ? getMemoryRoute(state, routeKeyFor(req, false))
+        ? getMemoryRoute(state, routeIdentity(req, false).key)
         : undefined;
       if (countRoute) {
         const routed = memoryRoutedToolBody(
