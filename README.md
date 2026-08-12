@@ -72,13 +72,11 @@ Code connects directly to Anthropic. The official
 Claude Code ──▶ localhost proxy (ccc)
                   ├──(messages only, MemTree API key)──▶ api.polychat.co /v1/context_memory
                   │◀──(compressed messages)─────────────┘
-                  ├──(memory leg A + your local OAuth)──▶ api.anthropic.com
-                  ├──(eligible turns: full-history leg B)▶ api.anthropic.com
-                  └──(eligible turns: local A/B grader)──▶ api.anthropic.com
+                  └──(compressed request + your local OAuth)──▶ api.anthropic.com
 ```
 
 - Only message content is sent to MemTree for indexing/compression — never credentials.
-- Answer legs and the grader go directly from the local proxy to Anthropic using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
+- Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
 
 ### Inline notices
@@ -87,7 +85,6 @@ In interactive sessions, `ccc` reports these MemTree states as display-only line
 
 - `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used and the completed memory response was selected. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
 - `⚠ MemTree degraded — this turn ran uncompressed` when a blocking compression call fails or times out.
-- `⚠ MemTree degraded — memory response was interrupted; recovered from full history` when opt-in speculative delivery emitted a compressed-memory prefix before recovering the rest of the turn from the full-history leg.
 - `⚠ MemTree is off — payment required…` once when compression and indexing are disabled for payment.
 
 `ccc` installs a minimal session-only Claude Code plugin using the repeatable `--plugin-dir` option. Its `MessageDisplay` hook changes only what the terminal renders and never alters stored assistant content; a `Stop` hook supplies a fallback for tool-only responses. That fallback may be saved by Claude Code as non-model hook UI metadata, but it is excluded from resumed model and recap requests. Notices are never added to Anthropic responses or model context, and `-p`/non-TTY output is left unchanged. Legacy marker cleanup remains for transcripts created by older `ccc` releases. The payment state can also produce a separate terminal warning at startup.
@@ -109,34 +106,9 @@ Compressed prefixes are stored per *lane*, not in a single slot: the main thread
 
 If a tool request arrives without a usable compressed prefix (for example after an interrupted turn), `ccc` makes a best-effort blocking MemTree recompression before forwarding, then installs the result as that lane's prefix so the rest of its tool loop rides locally. This is a soft recovery, not a hard cap: if MemTree is unavailable or returns nothing usable within its normal compression budget, the original request is forwarded unchanged, and a failed attempt puts recovery on a brief cooldown so an outage costs one stall rather than one per tool call. Each lane gets **one** blocking attempt per human turn, whatever the request size, so a lane that misses repeatedly forwards verbatim instead of recompressing on every tool call. A request with no session id is compressed without installing, since a route that cannot be matched later must not be stored. `CCC_TOOL_ROUTE_RECOVERY=0` temporarily disables the recovery for one invocation; outcomes are recorded in `~/.claude-code-infinite/logs/requests.jsonl` under `routeLane`/`routeMiss`/`routeRecovery`.
 
-### Adaptive memory A/B routing
+Routing decisions, per-turn timings and usage, recovery outcomes, and delivery status are recorded in `~/.claude-code-infinite/logs/requests.jsonl`.
 
-Opt in with `CCC_AB_ROUTING=1`, or by passing an explicit delivery flag (`--ab-speculative` / `--ab-buffered`). When enabled, `ccc` checks whether memory is still the best context for each large follow-up turn:
-
-1. It estimates the size of the entire compressed request. Below 50% of the model's measured effective-context prior, it sends only the memory request.
-2. Above that gate, it starts two streaming requests concurrently: A uses compressed memory and B uses the full history. Models without a prior are compared by default.
-3. By default, both semantic prefixes (about 1,000 tokens each) are buffered while a structured Anthropic grader chooses the response to deliver. A and ties keep memory; only a materially better B selects full history. `--ab-speculative` instead streams A immediately and lets a B verdict visibly correct course in flight by splicing the full-history answer into the message after a short bridge line.
-4. A memory winner remains active through that human turn's tool loop, including matching Count Tokens calls. The original full tool history is still sent to MemTree for background indexing.
-
-Comparison is deliberately fail-safe: grader failure or timeout keeps memory; in speculative mode, a failed grader gets one off-path retry. A memory arm that dies mid-stream is recovered from the healthy full-history arm when doing so is transcript-safe, and client cancellation aborts both arms and the grader. A route and success notice are installed only after a complete successful response. In speculative mode, once the memory answer has finished — or has started a tool call — a late B verdict is recorded for research but never applied.
-
-Qualifying turns cost more: they make two answer requests plus one grader attempt on the user's Anthropic subscription or API account. Speculative mode may make a second grader attempt after a retryable failure, for up to four Anthropic requests on that comparison turn. The gate avoids that overhead for compact contexts, and the losing answer is aborted right after grading.
-
-Advanced/testing controls:
-
-- Buffered, grade-before-delivery A/B routing is the default.
-- `ccc --ab-speculative` opts into commit-A-immediately delivery with SSE splicing; `ccc --ab-buffered` explicitly selects the default buffered mode. Passing either flag also enables A/B routing for that run, so `CCC_AB_ROUTING=1` is not additionally required. If both flags are supplied before `--`, the last one wins. The transcript-safety question behind speculative mode — whether Anthropic accepts a spliced assistant message replayed as history — was validated by the S1 replay spike (`scripts/spike-s1.mjs`) against real Anthropic with Claude Code's own headers, including the tool-use splice shape.
-
-- `CCC_AB_ROUTING=1` enables live A/B routing; it is off unless set or a delivery flag is passed. A comparison turn costs a duplicate full-context request plus a grader call and blocks delivery on the slower of the two prefixes, so it is opt-in rather than a default tax. `CCC_AB_ROUTING=0` remains accepted for setups that disable it explicitly; it overrides the delivery flags, and `ccc` warns on stderr when a flag is ignored for that reason.
-- `CCC_AB_FORCE_VERDICT=A|B|tie` replaces the grader with an instant fixed verdict (no grader request). Staging-only: `B` forces the mid-stream splice/correction path so its UX can be eyeballed; combine with `CCC_AB_FORCE_COMPARISON=1` to also bypass the context-size gate.
-- `CCC_AB_GRADER_MODEL=<model>` pins a fixed grader model; by default, each comparison automatically uses a grader from a different model family than its answer legs.
-- `CCC_AB_PREFIX_TOKENS=<n>` changes the answer prefix from its 1,000-token default.
-- `CCC_AB_GRADER_MEMORY_TOKENS=<n>` changes the cap on the memory section of the grader prompt from its 10,000-token default. Oversized memory is excerpted head+tail with an explicit elision marker; Answer A itself always sees the full memory.
-- `CCC_AB_PREFIX_TIMEOUT_MS=<ms>` and `CCC_AB_GRADER_TIMEOUT_MS=<ms>` change their 30-second defaults.
-- `CCC_AB_SAMPLE_NO_PRIOR=0` skips comparison for models without an effective-context prior.
-- `CCC_AB_FORCE_COMPARISON=1` bypasses the size gate for diagnostics.
-
-Routing decisions, both-leg timings and usage, grader diagnostics, fallbacks, and delivery status are recorded in `~/.claude-code-infinite/logs/requests.jsonl`.
+Memory quality is evaluated offline: the weekly `memtree-bench` harness replays a fixed scenario through a ccc-wrapped arm and a vanilla Claude Code arm and grades complete outcomes blind against an answer key. (An earlier in-request memory-vs-full A/B comparison with a live grader was removed in 2026-08; it was off by default, and the offline benchmark measures the same question with a stronger instrument.)
 
 ## What this is NOT
 

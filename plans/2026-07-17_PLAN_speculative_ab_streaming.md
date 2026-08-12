@@ -1,5 +1,15 @@
 # PLAN: Speculative A/B Streaming — Commit Memory Immediately, Interrupt by SSE Splice
 
+> **STATUS 2026-08-09: REMOVED.** The entire in-request A/B routing feature —
+> `src/ab-routing.ts`, `src/splice.ts`, buffered and speculative comparison in
+> `src/proxy.ts`, the `--ab-*` flags and every `CCC_AB_*` env var, and the
+> `comparison` reqlog record — was excised. It was off by default, its only
+> consumer was manual experimentation, and MemTree quality is measured by the
+> offline `memtree-bench` harness (arm-vs-arm, blind-graded), which never
+> enabled A/B routing. `scripts/spike-s1.mjs` (the S1 replay spike) was removed
+> with it. This document is retained as the design/validation record; every
+> code reference below points at deleted code and is historical.
+>
 > Refines the live with-memory vs full-history routing
 > (`plans/2026-06-09_PLAN_local_proxy_app.md`; `src/proxy.ts`
 > `forwardComparedSse` / `BufferedUpstreamLeg`, `src/ab-routing.ts`).

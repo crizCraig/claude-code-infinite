@@ -589,7 +589,7 @@ test("compressed SSE queues the success notice before the stream ends", async ()
   }
 });
 
-test("memory route survives A/B being disabled, so count_tokens sizes the compressed context", async () => {
+test("memory route installs on a followup, so count_tokens sizes the compressed context", async () => {
   const seen = [];
   const upstream = await listen((req, res) => {
     const chunks = [];
@@ -615,8 +615,6 @@ test("memory route survives A/B being disabled, so count_tokens sizes the compre
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  // No abRouting: the route that keeps a human turn's tool loop on the
-  // compressed prefix must not be a side effect of the A/B experiment.
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
   const headers = { "x-claude-code-session-id": "session-1" };
   const base = followupTurn("turn two");
@@ -1473,7 +1471,7 @@ test("retried recovery turn after an upstream 529 still compresses instead of st
   }
 });
 
-async function assertFastToolRouteActivation(abRouting, compressed = false) {
+async function assertFastToolRouteActivation(compressed = false) {
   const frame = (type, data) =>
     `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
   const messageStopFrame = frame("message_stop", { type: "message_stop" });
@@ -1535,7 +1533,6 @@ async function assertFastToolRouteActivation(abRouting, compressed = false) {
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
-    abRouting,
   });
   const headers = { "x-claude-code-session-id": "session-fast-tool" };
   const base = followupTurn("turn two");
@@ -1628,20 +1625,14 @@ async function assertFastToolRouteActivation(abRouting, compressed = false) {
 }
 
 test("message_stop activates the memory route before Claude closes the SSE response", async () => {
-  await assertFastToolRouteActivation(undefined);
-});
-
-test("A/B below-threshold delivery activates the route before a fast tool request", async () => {
-  await assertFastToolRouteActivation({
-    effectiveContextTokens: () => 1_000_000,
-  });
+  await assertFastToolRouteActivation();
 });
 
 test("encoded message_stop activates the route before a fast tool request", async () => {
-  await assertFastToolRouteActivation(undefined, true);
+  await assertFastToolRouteActivation(true);
 });
 
-async function assertRetryAfterFailedDeliverySurvivesInstalledRoute(abRouting) {
+async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
   // The failure this pins down: a recovery-prompt turn compresses, the
   // upstream protocol completes (message_stop accepted into ServerResponse,
   // which installs the memory route), but the client connection dies before
@@ -1702,7 +1693,6 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute(abRouting) {
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
-    abRouting,
   });
   const headers = { "x-claude-code-session-id": "session-dead-flush-retry" };
   // Interrupted tool loop: the typed "continue" is merged into the pending
@@ -1835,13 +1825,7 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute(abRouting) {
 }
 
 test("identical-body retry after a dead-before-flush delivery still compresses despite the installed route", async () => {
-  await assertRetryAfterFailedDeliverySurvivesInstalledRoute(undefined);
-});
-
-test("A/B below-threshold dead-before-flush retry still compresses despite the installed route", async () => {
-  await assertRetryAfterFailedDeliverySurvivesInstalledRoute({
-    effectiveContextTokens: () => 1_000_000,
-  });
+  await assertRetryAfterFailedDeliverySurvivesInstalledRoute();
 });
 
 test("successful MemTree no-op does not claim the conversation was compressed", async () => {
@@ -6273,29 +6257,6 @@ test("a human prompt arming during recovery compression prevents stale installat
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
     assert.equal(rec.routeRecovery.install, "stale");
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
-test("recovery launches one compressed leg even with A/B routing enabled", async () => {
-  const upstream = await recordingUpstream();
-  const memtreeSrv = await mockMemtree(200, recoveredMemory());
-  const records = [];
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
-    upstreamOrigin: upstream.origin,
-    reqlog: { log: (r) => records.push(structuredClone(r)) },
-    abRouting: { forceComparison: true },
-  });
-  try {
-    await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 1, "exactly one Anthropic request");
-    const rec = messageRecords(records)[0];
-    assert.equal(rec.turnType, "tool-recompressed");
-    assert.equal(rec.comparison, undefined, "recovery never enters A/B");
   } finally {
     proxy.close();
     upstream.close();

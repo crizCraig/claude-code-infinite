@@ -1,32 +1,6 @@
 export { startProxy } from "./proxy.js";
 export type { ProxyOptions, RunningProxy } from "./proxy.js";
 export {
-  abGateDecision,
-  buildFusionGraderBody,
-  buildFusionGraderSystemPrompt,
-  buildFusionGraderUserPrompt,
-  DEFAULT_GRADER_MEMORY_CHARS,
-  DEFAULT_GRADER_MEMORY_TOKENS,
-  DEFAULT_GRADER_MODEL,
-  effectiveContextForModel,
-  extractUnfoldedMemory,
-  graderModelFor,
-  GRADING_TRUNCATION_MARKER,
-  parseFusionVerdictResponse,
-  resolveAbRoutingOptions,
-  validateFusionVerdict,
-  winnerForVerdict,
-} from "./ab-routing.js";
-export type {
-  AbGradeInput,
-  AbGrader,
-  AbRoutingOptions,
-  AbVerdict,
-  AbWinner,
-  FusionMetrics,
-  FusionVerdict,
-} from "./ab-routing.js";
-export {
   checkCompressedHistory,
   didMemtreeCompress,
   MemtreeClient,
@@ -55,29 +29,11 @@ export {
 } from "./turns.js";
 export type { Message } from "./turns.js";
 export {
-  SseFrameScanner,
-  SseEventForwarder,
-  SseSpliceWriter,
-  sseEventBytes,
-  contentBlockStopEvent,
-  bridgeBlockEvents,
-  CORRECTION_BRIDGE_TEXT,
-  RECOVERY_BRIDGE_TEXT,
-} from "./splice.js";
-export type {
-  SseFrame,
-  OpenBlock,
-  SseForwarderOptions,
-  SseInterruptDisposition,
-} from "./splice.js";
-export {
   NOTICE_OPEN,
   NOTICE_CLOSE,
   COMPRESSED_NOTICE,
   MODEL_HIDDEN_NOTICE,
   DEGRADED_NOTICE,
-  RECOVERED_NOTICE,
-  FULL_HISTORY_OVERRIDE_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SLOW_FIRST_TOKEN_NOTICE,
   STARTUP_NOTICE,

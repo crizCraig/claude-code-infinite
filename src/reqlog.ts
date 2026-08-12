@@ -19,7 +19,6 @@
 
 import { appendFile, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { AbGateReason } from "./ab-routing.js";
 import { getConfigDir } from "./config.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
@@ -44,12 +43,6 @@ export type TurnType =
   | "followup-noop"
   /** Indexed response that carried no prior conversation; history forwarded. */
   | "followup-empty-memory"
-  | "followup-ab-pending"
-  | "followup-ab-failed"
-  | "followup-ab-memory"
-  | "followup-ab-full"
-  | "followup-ab-spliced"
-  | "followup-ab-recovered"
   | "followup-degraded"
   | "followup-client-closed"
   | "unparseable";
@@ -60,81 +53,6 @@ export interface UsageRecord {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   output_tokens?: number;
-}
-
-export interface ComparisonLegRecord {
-  requestBytes: number;
-  upstreamStatus?: number;
-  ttfbMs?: number;
-  firstContentMs?: number;
-  usage?: UsageRecord;
-  ended?: boolean;
-  error?: string;
-}
-
-/** Outcome of one grader call (also logged under `ComparisonRecord.grader`). */
-export interface GraderDiagnostic {
-  model: string;
-  ok: boolean;
-  status?: number;
-  /** Serialized grader request body bytes (native grader only; recorded pre-flight so failures keep it). */
-  requestBytes?: number;
-  /** Unfolded-memory characters available to the grader, PRE-cap — how big the memory really was, not what the excerpt kept. */
-  memoryChars?: number;
-  usage?: UsageRecord;
-  error?: string;
-}
-
-/** What the client actually received in speculative mode (vs `winner`). */
-export type ComparisonDelivered =
-  | "memory"
-  | "full"
-  | "spliced"
-  | "recovered"
-  | "none";
-
-export type ComparisonInterrupt =
-  | "none"
-  | "spliced"
-  | "deferred-then-spliced"
-  | "blocked-tool-use"
-  | "blocked-full-not-sse"
-  | "late-verdict"
-  | "recovered";
-
-export interface ComparisonRecord {
-  attempted: boolean;
-  gateReason: AbGateReason;
-  /** Conservative estimate for the whole memory-leg request, not tokenizer output. */
-  approxContextTokens: number;
-  contextTokenEstimate: "body-bytes/3";
-  effectiveContextTokens?: number;
-  thresholdTokens?: number;
-  prefixChars?: number;
-  prefixWaitMs?: number;
-  gradeMs?: number;
-  grader?: GraderDiagnostic;
-  /** Grader attempts beyond the first (speculative shadow grading only). */
-  graderRetries?: number;
-  verdict?: "A" | "B" | "tie";
-  /** What the verdict (or fallback) chose — may differ from `delivered`. */
-  winner?: "memory" | "full";
-  fallbackReason?: string;
-  memoryLeg?: ComparisonLegRecord;
-  fullLeg?: ComparisonLegRecord;
-  loserAborted?: boolean;
-  clientAborted?: boolean;
-  deliveryOk?: boolean;
-  /** Speculative delivery fields (absent in buffered mode). */
-  speculative?: boolean;
-  /** Forward start → first response byte written toward the client. */
-  clientTtfbMs?: number;
-  interrupt?: ComparisonInterrupt;
-  /** Client-visible answer-text characters delivered before the splice. */
-  spliceAtChars?: number;
-  /** A B verdict arrived after the interrupt window closed; logged only. */
-  verdictLate?: boolean;
-  delivered?: ComparisonDelivered;
 }
 
 /**
@@ -188,8 +106,6 @@ export interface MessagesRecord {
     priorHistoryChars: number;
     usable: boolean;
   };
-  /** Present when live memory-vs-full routing was eligible for this turn. */
-  comparison?: ComparisonRecord;
   /**
    * Which memory-route lane this request keys to: the away-summary side
    * channel, a request carrying agent attribution, or the main thread. This

@@ -18,14 +18,6 @@ import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
 import {
-  DEFAULT_GRADE_PREFIX_TOKENS,
-  DEFAULT_GRADER_MEMORY_TOKENS,
-  DEFAULT_PREFIX_TIMEOUT_MS,
-  DEFAULT_GRADER_TIMEOUT_MS,
-  type AbGrader,
-  type AbVerdict,
-} from "./ab-routing.js";
-import {
   createSessionNoticePlugin,
   supportsMessageDisplay,
   terminalSupportsColor,
@@ -35,11 +27,7 @@ import {
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail, startupNoticeText } from "./notices.js";
-import {
-  isPrintInvocation,
-  parseWrapperArgs,
-  resolveAbRouting,
-} from "./cli-args.js";
+import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
 import {
   claudeChildEnv,
   claudeNativeOneMillionContextEnabled,
@@ -67,75 +55,6 @@ const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 
 type Mode = "production" | "staging" | "local";
-
-// Parse a CCC_AB_* numeric env var. resolveAbRoutingOptions silently replaces
-// invalid values (NaN, zero, negative) with defaults, so a mistyped tuning
-// knob would otherwise take effect as the default with no indication. Warn on
-// stderr here — where the variable name and raw value are still known — and
-// return undefined so the documented default applies.
-function abEnvPositiveNumber(name: string, fallback: number): number | undefined {
-  const raw = process.env[name];
-  if (raw === undefined) return undefined;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    console.warn(
-      `\x1b[1;33m⚠ Ignoring ${name}="${raw}" — expected a positive number; using default ${fallback}.\x1b[0m`
-    );
-    return undefined;
-  }
-  return value;
-}
-
-// Parse CCC_AB_GRADER_MODEL. An empty/whitespace value would otherwise flow
-// through as `model: ""` and every grader request would be rejected 400 —
-// silently falling back to memory while still paying the double-leg cost.
-// Warn on stderr and return undefined so automatic selection applies.
-function abEnvGraderModel(): string | undefined {
-  const raw = process.env.CCC_AB_GRADER_MODEL;
-  if (raw === undefined) return undefined;
-  const value = raw.trim();
-  if (value === "") {
-    console.warn(
-      `\x1b[1;33m⚠ Ignoring CCC_AB_GRADER_MODEL="${raw}" — expected a model id; using automatic selection.\x1b[0m`
-    );
-    return undefined;
-  }
-  return value;
-}
-
-// Parse CCC_AB_FORCE_VERDICT (staging escape hatch for the P4 splice-UX
-// eyeball). A|B|tie replaces the real grader with an instant fixed verdict —
-// no grader request is made. `B` forces the mid-stream splice path whenever
-// the verdict lands inside the interrupt window; combine with
-// CCC_AB_FORCE_COMPARISON=1 to also bypass the context-size gate.
-function abEnvForcedGrader(): AbGrader | undefined {
-  const raw = process.env.CCC_AB_FORCE_VERDICT;
-  if (raw === undefined) return undefined;
-  const value = raw.trim();
-  if (value !== "A" && value !== "B" && value !== "tie") {
-    console.warn(
-      `\x1b[1;33m⚠ Ignoring CCC_AB_FORCE_VERDICT="${raw}" — expected A, B, or tie; using the real grader.\x1b[0m`
-    );
-    return undefined;
-  }
-  const verdict: AbVerdict = value;
-  console.warn(
-    `\x1b[1;33m⚠ CCC_AB_FORCE_VERDICT=${verdict} — A/B grading is bypassed with a fixed verdict (staging only).\x1b[0m`
-  );
-  return async () => ({
-    metrics: {
-      consensus_points: [],
-      contradictions: [],
-      partial_coverage: [],
-      unique_insights_a: [],
-      unique_insights_b: [],
-      blind_spots: [],
-    },
-    verdict,
-    materially_different: verdict !== "tie",
-    reasoning: `Forced by CCC_AB_FORCE_VERDICT=${verdict} for staging.`,
-  });
-}
 
 function openUrl(url: string): void {
   const platform = process.platform;
@@ -298,54 +217,6 @@ async function main() {
   });
   const nativeOneMillionContext =
     claudeNativeOneMillionContextEnabled(process.env);
-  // A/B memory routing is opt-in. Each comparison turn fans out a second
-  // full-context leg and blocks on a grader before delivering, which costs a
-  // duplicate upstream request and (observed in staging) tens of seconds of
-  // prefix wait — too expensive to pay for unasked. Asking means either
-  // `CCC_AB_ROUTING=1` or an explicit `--ab-speculative`/`--ab-buffered`
-  // delivery flag. `CCC_AB_ROUTING=0` keeps working as the explicit disable
-  // and wins over the flags (with a warning instead of a silent no-op).
-  const abDecision = resolveAbRouting(
-    process.env.CCC_AB_ROUTING,
-    parsedArgs.abDeliveryRequested
-  );
-  if (abDecision.warnFlagIgnored) {
-    console.error(
-      "\x1b[1;33m⚠ --ab-speculative/--ab-buffered ignored: CCC_AB_ROUTING=0 disables A/B routing.\x1b[0m"
-    );
-  }
-  const abRouting =
-    !abDecision.enabled
-      ? undefined
-      : {
-          graderModel: abEnvGraderModel(),
-          prefixChars: (() => {
-            const tokens = abEnvPositiveNumber(
-              "CCC_AB_PREFIX_TOKENS",
-              DEFAULT_GRADE_PREFIX_TOKENS
-            );
-            return tokens === undefined ? undefined : tokens * 4;
-          })(),
-          prefixTimeoutMs: abEnvPositiveNumber(
-            "CCC_AB_PREFIX_TIMEOUT_MS",
-            DEFAULT_PREFIX_TIMEOUT_MS
-          ),
-          graderTimeoutMs: abEnvPositiveNumber(
-            "CCC_AB_GRADER_TIMEOUT_MS",
-            DEFAULT_GRADER_TIMEOUT_MS
-          ),
-          graderMemoryChars: (() => {
-            const tokens = abEnvPositiveNumber(
-              "CCC_AB_GRADER_MEMORY_TOKENS",
-              DEFAULT_GRADER_MEMORY_TOKENS
-            );
-            return tokens === undefined ? undefined : tokens * 4;
-          })(),
-          sampleWhenNoPrior: process.env.CCC_AB_SAMPLE_NO_PRIOR !== "0",
-          forceComparison: process.env.CCC_AB_FORCE_COMPARISON === "1",
-          grader: abEnvForcedGrader(),
-          speculative: parsedArgs.speculativeAb,
-        };
   // Interactive UI only: print/non-TTY invocations are programmatic
   // interfaces whose output must stay byte-for-byte vanilla, and they get no
   // notice plugin to deliver a banner anyway.
@@ -357,7 +228,6 @@ async function main() {
     memtree,
     debug: isDebugMode,
     reqlog,
-    abRouting,
     nativeOneMillionContext,
     // Temporary kill switch for tool-route miss RECOVERY only
     // (plans/2026-08-04_PLAN_tool_turn_route_recovery.md): set
@@ -376,7 +246,6 @@ async function main() {
   if (isDebugMode) {
     console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
     console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);
-    console.log(`[DEBUG] A/B memory routing: ${abRouting ? "enabled" : "disabled"}`);
     console.log(
       `[DEBUG] Claude Code auto-compaction: ${
         process.env.CCC_AUTO_COMPACT === "1"
@@ -433,10 +302,10 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     noticePlugin?.close();
-    // A speculative response can finish before its shadow grader. Stop new
-    // proxy work and give active handlers a bounded chance to finalize their
-    // verdict records. Background indexing is a separate log producer: stop
-    // and drain it too before waiting for scheduled JSONL appends on disk.
+    // Stop new proxy work and give active handlers a bounded chance to
+    // finalize their records. Background indexing is a separate log producer:
+    // stop and drain it too before waiting for scheduled JSONL appends on
+    // disk.
     await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
     await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
     await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
