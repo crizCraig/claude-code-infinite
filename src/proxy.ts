@@ -601,8 +601,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     if (timer) clearTimeout(timer);
     if (completed) return true;
 
-    // The grace period protects useful in-flight delivery and late shadow
-    // verdicts. Once it expires, signal every forwarding path first so each can
+    // The grace period protects useful in-flight delivery. Once it
+    // expires, signal every forwarding path first so each can
     // classify the close as proxy-owned, then tear down any request that was
     // still reading/dispatching before it installed a path-specific listener.
     shutdownAbort.abort();
@@ -1186,6 +1186,16 @@ async function handleMessages(
     releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
     routeDecisionSettled = true;
   };
+  // Terminal non-riding outcome: if this request still owns the decision,
+  // clearing the lane IS its decision; otherwise yield to the newer owner.
+  const clearLaneOrYield = () => {
+    if (routeDecisionCurrent()) {
+      state.memoryRoutes.delete(requestRouteKey);
+      commitRouteDecision();
+    } else {
+      releaseUncommittedRouteDecision();
+    }
+  };
 
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
@@ -1245,12 +1255,7 @@ async function handleMessages(
     // a payment-specific notice instead of the generic degraded one, at most
     // once per proxy process after it has actually been delivered.
     recordTurn(rec, "followup-degraded", forwardBody);
-    if (routeDecisionCurrent()) {
-      state.memoryRoutes.delete(requestRouteKey);
-      commitRouteDecision();
-    } else {
-      releaseUncommittedRouteDecision();
-    }
+    clearLaneOrYield();
     capture(opts, "anthropic-request", forwardBody);
     const paymentDetail = opts.memtree.paymentRequiredDetail;
     const mayQueueNotice =
@@ -1309,12 +1314,7 @@ async function handleMessages(
     // measure, so nothing downstream would notice that the model is about to be
     // asked to continue a conversation it can no longer see. Forwarding the
     // real history costs context but never silently amnesias the session.
-    if (routeDecisionCurrent()) {
-      state.memoryRoutes.delete(requestRouteKey);
-      commitRouteDecision();
-    } else {
-      releaseUncommittedRouteDecision();
-    }
+    clearLaneOrYield();
     if (actuallyCompressed && opts.debug) {
       console.error(
         `[ccc proxy] memory response dropped the conversation ` +
@@ -1428,7 +1428,6 @@ async function handleMessages(
       upstream,
       state.shutdownSignal,
       rec,
-      undefined,
       activateMemoryRoute
     ).then(
       (delivered) => {
@@ -1948,7 +1947,6 @@ function cloneJson<T>(value: T): T {
 
 interface BlockingCompressionOutcome {
   result: CompressResult | null;
-  usedLegacyFallback: boolean;
   /**
    * The exact input shape the winning result must be validated against:
    * the raw pre-normalization messages when the legacy probe won, the
@@ -2151,7 +2149,6 @@ async function runBlockingCompression(args: {
   };
   return {
     result,
-    usedLegacyFallback,
     winningInput: usedLegacyFallback ? rawMsgsForMemtree : msgsForMemtree,
     // A live success is stronger evidence than a simultaneous live failure:
     // the service answered this proxy now. Cached-only operations leave the
@@ -2197,8 +2194,7 @@ function buildCompressedBody(
  * a soft fuse — any failure, no-op, unusable, or non-shrinking result
  * degrades to forwarding the original body, never worse than the verbatim
  * path it replaces. A validated smaller result forwards exactly one
- * compressed Anthropic leg (never A/B — launching a full-history leg would
- * defeat the recovery), claims no human-turn state (no notice, no prompt
+ * compressed Anthropic leg, claims no human-turn state (no notice, no prompt
  * arm/delivery mutation), and installs a self-healing route at
  * protocol-complete so the rest of the tool loop rides locally again.
  */
@@ -2253,8 +2249,9 @@ async function recoverToolRouteMiss(args: {
   // The ARM alone, deliberately not the followup path's full
   // `mainPromptArmed || !mainPromptDelivered` window. `mainPromptDelivered`
   // means "the response stream flushed", which is strictly stronger than
-  // "the client got the message": the fast-tool abort documented below at the
-  // A/B settle — Claude consumes message_stop, drops the SSE, and fires its
+  // "the client got the message": the fast-tool abort documented at the
+  // forwardRaw settle in handleMessages — Claude consumes message_stop,
+  // drops the SSE, and fires its
   // tool request — is a normal success that leaves the flag false for the
   // REST of the agent turn (only Stop resets it). Keying recovery off that
   // window meant one such abort plus one later route rejection made every
@@ -2495,7 +2492,6 @@ async function recoverToolRouteMiss(args: {
     upstream,
     state.shutdownSignal,
     rec,
-    undefined,
     // Protocol-complete (accepted SSE message_stop or a complete 2xx JSON
     // response) is the real activation point, exactly as on the followup
     // path, so a fast tool request right after message_stop can ride.
@@ -2605,7 +2601,6 @@ function forwardRaw(
   upstream: Upstream,
   shutdownSignal: AbortSignal,
   rec?: MessagesRecord,
-  onJsonResponse?: (body: Buffer) => void,
   onProtocolComplete?: () => void
 ): Promise<boolean> {
   return new Promise((resolve) => {
@@ -2743,11 +2738,7 @@ function forwardRaw(
           ? createObservationDecoder(contentEncoding)
           : null;
         const observedChunks: Buffer[] | null =
-          onJsonResponse !== undefined ||
-          !isSse ||
-          (compressed && !incrementalDecoder)
-            ? []
-            : null;
+          !isSse || (compressed && !incrementalDecoder) ? [] : null;
         const observeRawChunk = (chunk: Buffer) => {
           if (rec && !sawFirstByte) {
             sawFirstByte = true;
@@ -2847,19 +2838,6 @@ function forwardRaw(
               finished = true;
               pendingFinish = null;
               sseObserver.flush();
-              if (observedChunks && onJsonResponse) {
-                const observed = decodeForObservation(
-                  Buffer.concat(observedChunks),
-                  contentEncoding
-                );
-                if (observed) {
-                  try {
-                    onJsonResponse(observed);
-                  } catch {
-                    // Passive observation must never affect proxying.
-                  }
-                }
-              }
               if (!res.destroyed && !res.writableEnded) res.end();
               completeUpstream(!observerFailed && sawMessageStop);
             };
@@ -2907,13 +2885,6 @@ function forwardRaw(
               Buffer.concat(observedChunks),
               contentEncoding
             );
-            if (observed && onJsonResponse) {
-              try {
-                onJsonResponse(observed);
-              } catch {
-                // Passive observation must never affect the proxied response.
-              }
-            }
             if (rec && observed && !isSse) {
               mergeUsageFromJsonBody(observed, rec);
             }
@@ -3170,18 +3141,11 @@ function forwardableRequestHeaders(
 }
 
 function forwardableResponseHeaders(
-  upstreamRes: http.IncomingMessage,
-  additionalSkippedHeaders?: ReadonlySet<string>
+  upstreamRes: http.IncomingMessage
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(upstreamRes.headers)) {
-    const lowerKey = key.toLowerCase();
-    if (
-      SKIP_RESPONSE_HEADERS.has(lowerKey) ||
-      additionalSkippedHeaders?.has(lowerKey)
-    ) {
-      continue;
-    }
+    if (SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
     if (value === undefined) continue;
     out[key] = value;
   }

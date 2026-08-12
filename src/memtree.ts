@@ -62,9 +62,9 @@ export interface CompressResult {
   /** Processed (compressed) messages from the server; system role may be included. */
   messages: Message[];
   /**
-   * Optional explicit unfolded index for A/B grading. Older servers omit it;
-   * callers fall back to the first non-system processed message, which is the
-   * current server layout.
+   * Optional explicit unfolded index, consumed only by the memoryChars
+   * reqlog diagnostic. Older servers omit it; callers fall back to the first
+   * non-system processed message, which is the current server layout.
    */
   unfolded_memory?: string;
   usage?: unknown;
