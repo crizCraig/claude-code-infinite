@@ -1068,7 +1068,19 @@ async function handleMessages(
     // Consume it here, or a later hookless followup would read THIS
     // boundary's "already wiped" and skip its own turn's re-grant, carrying
     // spent lanes across a human-turn boundary.
-    if (isMainRequest && isUserTurn) {
+    //
+    // Only the armed prompt itself consumes (same prompt-text correlation as
+    // hookOwnedMainFollowup): CC-internal side calls can arrive first-user
+    // shaped on the main key without being the armed prompt, and letting one
+    // of those consume would leave the real followup bumping with keep=false
+    // — a second wipe in the same boundary, re-granting lanes spent moments
+    // earlier. That is the exact double-wipe keepRecoveryBudget closes.
+    if (
+      isMainRequest &&
+      isUserTurn &&
+      state.mainPromptText !== undefined &&
+      messageCarriesPromptText(lastMsg, state.mainPromptText)
+    ) {
       state.recoveryBudgetWipedForBoundary = false;
     }
     let routedBody = forwardBody;
@@ -2488,6 +2500,12 @@ async function recoverToolRouteMiss(args: {
     // failure to null), but a reservation held by a dead attempt suppresses
     // every concurrent install for the rest of the epoch — the same hole the
     // release exists to close. Hand it back before the error propagates.
+    //
+    // Deliberately NOT refunded and no health noted: an unknown throw may be
+    // deterministic, and refunding would let each identical retry pay a fresh
+    // blocking compress — the same loop the keep-spent policy exists to
+    // prevent for pre-forward outcomes. The lane staying spent degrades to
+    // verbatim forwards, the conservative direction.
     releaseOwnReservation();
     throw err;
   } finally {
@@ -2862,10 +2880,13 @@ function forwardRaw(
       upstreamCompleted = true;
       protocolComplete = complete;
       if (complete && !res.destroyed) notifyProtocolComplete();
-      if (res.destroyed && !res.writableFinished) {
+      if (res.destroyed && !res.writableFinished && !shutdownCancelled) {
         // The destroy is client-owned here: upstream ended cleanly (its
         // error/aborted handlers settle synchronously before this can run)
-        // and shutdown teardown detaches this path first. Stamp directly —
+        // and the shutdownCancelled guard excludes the proxy-owned destroy —
+        // on the decoder path, decoder.end() defers finish() a tick, and a
+        // shutdown landing in that gap would otherwise be stamped as a
+        // client abort (onResponseClose has the same guard). Stamp directly —
         // this settle detaches onResponseClose before the 'close' event that
         // normally stamps can fire, and losing that race would misclassify a
         // client abort as "upstream-failed" in the recovery settle.
