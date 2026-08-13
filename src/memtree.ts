@@ -692,6 +692,8 @@ export class MemtreeClient {
   private backgroundClosing = false;
   /** FastAPI `detail` text from the most recent 402, or null while paid. */
   private unpaidDetail: string | null = null;
+  /** hash → whether that hash's most recent live compress failure arms the fuse. */
+  private compressFailureArming = new Map<string, boolean>();
 
   /**
    * Non-null when the server last answered 402 (unpaid MemTree key): the
@@ -742,6 +744,21 @@ export class MemtreeClient {
   }
 
   /**
+   * Fuse classification for the most recent live compress failure of `hash`,
+   * sampled by the caller right after the await (the hasCachedCompress
+   * idiom; the entry is recorded before the failed promise settles null).
+   * Arming failures are evidence about the SERVER's health: no response at
+   * all (network error or the abort-budget timeout), any 5xx, and 402 —
+   * unpaid is global and persistent, so it must keep arming. Any other 4xx
+   * came from a responsive server rejecting this one request and must not
+   * open the shared fuse. Unclassified failures default to arming: muting
+   * the fuse needs positive evidence of a responsive server.
+   */
+  lastCompressFailureArming(hash: string): boolean {
+    return this.compressFailureArming.get(hash) ?? true;
+  }
+
+  /**
    * Blocking user-turn compression. Returns null on ANY failure (timeout,
    * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
    * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -764,6 +781,17 @@ export class MemtreeClient {
       tools: meta?.tools,
     }).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
+      // `status` is absent when the call never got a response (network
+      // error/timeout) — the arming default covers it.
+      const status: number | undefined = err?.status;
+      this.compressFailureArming.set(
+        hash,
+        status === undefined || status >= 500 || status === 402
+      );
+      if (this.compressFailureArming.size > DEDUPE_CACHE_MAX) {
+        const first = this.compressFailureArming.keys().next().value;
+        if (first !== undefined) this.compressFailureArming.delete(first);
+      }
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
       // automatic retry of an identical request) hit the server again.
       if (this.compressCache.get(hash) === promise) {
@@ -920,8 +948,11 @@ export class MemtreeClient {
         if (response.status === 402) {
           this.unpaidDetail = extract402Detail(text);
         }
-        throw new Error(
-          `context_memory ${response.status}: ${text.slice(0, 300)}`
+        // The status rides on the error so compress() can classify the
+        // failure for the fuse without parsing message text.
+        throw Object.assign(
+          new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`),
+          { status: response.status }
         );
       }
 

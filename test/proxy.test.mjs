@@ -7738,3 +7738,125 @@ test("an upstream-failed recovery refunds the lane budget for the retry", async 
     memtreeSrv.close();
   }
 });
+
+test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", async () => {
+  // The fuse is knowledge about MemTree's health. A 400 comes from a
+  // responsive server rejecting one request, so later misses on other lanes
+  // must still get their attempt; a 5xx is the outage signal and keeps
+  // arming exactly as before (as do timeouts, network errors, and 402).
+  const upstream = await recordingUpstream();
+  let failStatus = 400;
+  let blockingCompresses = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      blockingCompresses++;
+      res.writeHead(failStatus, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "no" }));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const lane = (id) => ({ ...SESSION, "x-claude-code-agent-id": id });
+  try {
+    await postMessages(proxy.port, largeToolTurn("BBB"), SESSION);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "failed");
+    assert.equal(blockingCompresses, 1);
+
+    // The 400 armed nothing: a sibling lane's miss still pays its attempt.
+    await postMessages(proxy.port, largeToolTurn("CCC"), lane("agent-4xx-a"));
+    const probe = messageRecords(records).at(-1);
+    assert.equal(
+      probe.routeRecovery.outcome,
+      "failed",
+      "a 4xx must not suppress other lanes' attempts as cooldown"
+    );
+    assert.equal(blockingCompresses, 2, "the sibling's attempt reached MemTree");
+
+    // A 5xx from the same server is the outage class: it arms.
+    failStatus = 500;
+    await postMessages(proxy.port, largeToolTurn("DDD"), lane("agent-4xx-b"));
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "failed");
+    assert.equal(blockingCompresses, 3);
+
+    await postMessages(proxy.port, largeToolTurn("EEE"), lane("agent-4xx-c"));
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "cooldown",
+      "the 500 armed the shared fuse"
+    );
+    assert.equal(blockingCompresses, 3, "the cooldown skip paid nothing");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a compress timeout arms the cooldown", async () => {
+  // No response inside the abort budget is the strongest outage evidence
+  // there is — a stall is exactly what the fuse exists to bound.
+  const upstream = await recordingUpstream();
+  const held = deferred();
+  let blockingCompresses = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      blockingCompresses++;
+      await held.promise;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "late" }));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({
+      baseUrl: memtreeSrv.origin,
+      apiKey: "k",
+      compressTimeoutMs: 100,
+    }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const first = messageRecords(records).at(-1);
+    assert.equal(first.routeRecovery.outcome, "failed");
+    assert.equal(first.compress.timedOut, true, "the abort budget burned");
+    assert.equal(blockingCompresses, 1);
+
+    // The timeout armed the shared fuse: a sibling lane skips its attempt.
+    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), {
+      ...SESSION,
+      "x-claude-code-agent-id": "agent-timeout-probe",
+    });
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "cooldown",
+      "no response at all is outage-class evidence"
+    );
+    assert.equal(blockingCompresses, 1, "no second blocking compress");
+  } finally {
+    held.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});

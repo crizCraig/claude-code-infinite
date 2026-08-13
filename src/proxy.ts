@@ -2227,9 +2227,18 @@ async function runBlockingCompression(args: {
   const hadLiveSuccess =
     (!canonicalCached && canonicalResult !== null) ||
     (probeLegacy && !legacyCached && legacyResult !== null);
+  // Only arming-class live failures (network error, timeout, 5xx, 402) are
+  // fuse evidence. A responsive server's other 4xx failed THIS call but says
+  // nothing about MemTree's health, so it contributes neither failure nor
+  // success — the fuse is untouched.
   const hadLiveFailure =
-    (!canonicalCached && canonicalResult === null) ||
-    (probeLegacy && !legacyCached && legacyResult === null);
+    (!canonicalCached &&
+      canonicalResult === null &&
+      opts.memtree.lastCompressFailureArming(hash)) ||
+    (probeLegacy &&
+      !legacyCached &&
+      legacyResult === null &&
+      opts.memtree.lastCompressFailureArming(legacyHash));
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
