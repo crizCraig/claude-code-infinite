@@ -7860,3 +7860,406 @@ test("a compress timeout arms the cooldown", async () => {
     memtreeSrv.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ralph-review cycles 2+3 (2026-08-13): regression pins for the shipped fixes
+// ---------------------------------------------------------------------------
+
+test("a client closed during the blocking compress refunds the lane budget", async () => {
+  // Cycle-3 fix: a downstream that dies DURING the compress is the same
+  // hazard class as the refunded post-forward fates — no route installed and
+  // the client's identical retry imminent. Before the refund, that retry hit
+  // "spent" and every later tool turn in the epoch forwarded full history.
+  const upstream = await recordingUpstream();
+  const gate = deferred();
+  let compressArrived = false;
+  let blockingCompresses = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      blockingCompresses++;
+      compressArrived = true;
+      // Held long enough for the client to give up; then SUCCEEDS, so the
+      // result lands in the compress cache and the retry pays nothing.
+      await gate.promise;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(recoveredMemory()));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    // Send the large miss, then kill the client while the compress is held.
+    const clientGone = new Promise((resolve) => {
+      const clientReq = http.request({
+        host: "127.0.0.1",
+        port: proxy.port,
+        path: "/v1/messages",
+        method: "POST",
+        headers: { "content-type": "application/json", ...SESSION },
+      });
+      clientReq.on("error", resolve);
+      clientReq.end(
+        JSON.stringify({ model: "claude-x", max_tokens: 64, messages: conversation })
+      );
+      waitFor(() => compressArrived).then(() => clientReq.destroy());
+    });
+    await clientGone;
+    gate.resolve();
+    await within(
+      waitFor(() =>
+        messageRecords(records).some(
+          (r) => r.routeRecovery?.outcome === "client-closed"
+        )
+      ),
+      "the client-closed recovery never settled",
+      4_000
+    );
+    assert.equal(blockingCompresses, 1);
+
+    // The refund lets the identical retry make a REAL attempt — an outcome
+    // with an install fate, not "spent" — served from the compress cache
+    // (client closes are deliberately never fed into compress()).
+    await postMessages(proxy.port, conversation, SESSION);
+    const retry = messageRecords(records).at(-1);
+    assert.equal(retry.routeMiss, "missing");
+    assert.equal(retry.routeRecovery.outcome, "compressed");
+    assert.equal(retry.routeRecovery.install, "installed");
+    assert.equal(
+      blockingCompresses,
+      1,
+      "the retry's recompress was a cache hit"
+    );
+
+    // And the rest of the tool loop rides the recovered route.
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+  } finally {
+    gate.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a mid-stream client abort logs client-aborted and refunds the lane", async () => {
+  // Cycle-2 split the no-install fate by who owned the close, and cycle-3
+  // hardened the stamp against the settle detaching the close listener
+  // first. A client dropping the SSE before message_stop says nothing about
+  // upstream health, so the attempt-rate tripwire must see "client-aborted",
+  // never "upstream-failed" — while the refund treats both alike: no route
+  // was installed and the identical retry is imminent either way.
+  const frame = (type, data) =>
+    `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  let heldStream;
+  let streamedOnce = false;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const forwarded = Buffer.concat(chunks).toString("utf-8");
+      if (!streamedOnce && forwarded.includes("recovered memory")) {
+        // The recovered forward: stream a first frame, never send
+        // message_stop, and hold the socket until the client tears it down —
+        // the abort is deterministic, not a race against the stream's end.
+        streamedOnce = true;
+        heldStream = res;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(
+          frame("message_start", {
+            type: "message_start",
+            message: { id: "msg_held", usage: { input_tokens: 42 } },
+          })
+        );
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  let clientRequest;
+  let clientResponse;
+  try {
+    // The client aborts as soon as the first streamed byte arrives — the
+    // compress succeeded and the forward is live, but protocol-complete
+    // never fires.
+    await new Promise((resolve, reject) => {
+      const body = Buffer.from(
+        JSON.stringify({
+          model: "claude-x",
+          max_tokens: 64,
+          stream: true,
+          messages: conversation,
+        })
+      );
+      clientRequest = http.request(
+        {
+          host: "127.0.0.1",
+          port: proxy.port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(body.length),
+            ...SESSION,
+          },
+        },
+        (response) => {
+          clientResponse = response;
+          response.once("data", () => {
+            response.destroy(); // the mid-stream abort
+            resolve();
+          });
+          response.on("error", () => {});
+        }
+      );
+      clientRequest.once("error", reject);
+      clientRequest.end(body);
+    });
+    await within(
+      waitFor(() =>
+        messageRecords(records).some((r) => r.routeRecovery?.install !== undefined)
+      ),
+      "the aborted recovery never settled",
+      4_000
+    );
+    const aborted = messageRecords(records).find(
+      (r) => r.routeRecovery?.install !== undefined
+    );
+    assert.equal(aborted.routeRecovery.outcome, "compressed");
+    assert.equal(
+      aborted.routeRecovery.install,
+      "client-aborted",
+      "a client-owned close must not be labeled upstream-failed"
+    );
+    assert.equal(aborted.clientAborted, true);
+    const liveCompresses = blockingCalls();
+
+    // The refund: the identical retry re-attempts from the compress cache
+    // and installs against the now-ordinary upstream response.
+    await postMessages(proxy.port, conversation, SESSION);
+    const retry = messageRecords(records).at(-1);
+    assert.equal(retry.routeMiss, "missing");
+    assert.equal(retry.routeRecovery.outcome, "compressed");
+    assert.equal(retry.routeRecovery.install, "installed");
+    assert.equal(
+      blockingCalls(),
+      liveCompresses,
+      "the retry's recompress was a cache hit"
+    );
+
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+  } finally {
+    clientResponse?.destroy();
+    clientRequest?.destroy();
+    heldStream?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a first-user main consumes the boundary wipe so a later hookless followup re-grants", async () => {
+  // Cycle-3 fix: a first-user-shaped main request is its boundary's only
+  // main arrival — no followup bump will ever come to consume the
+  // UserPromptSubmit flag. Left set, a LATER hookless main followup would
+  // read a stale "already wiped", keep its spent lanes spent, and the agent
+  // lane would forward full history across a human-turn boundary.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-first-user" };
+  try {
+    // An agent lane spends its budget in the pre-boundary epoch...
+    await postMessages(proxy.port, largeToolTurn("BBB"), agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+    // ...the hook bump wipes the budget and flags the boundary as wiped...
+    await armMainTurn(proxy, "typed prompt");
+    // ...and the prompt arrives FIRST-USER-shaped: single non-tool user
+    // message, no earlier real user turn, so no followup bump ever comes for
+    // this boundary. The flag must be consumed here.
+    await postMessages(proxy.port, [{ role: "user", content: "typed prompt" }], SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "first-user");
+
+    // The agent spends its re-granted budget inside the new boundary.
+    const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
+    await postMessages(proxy.port, spentAgain, agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+
+    // A hookless-shaped main followup (no UserPromptSubmit fired): its bump
+    // must wipe. The stale flag would have skipped the wipe here.
+    await postMessages(proxy.port, followupTurn("hookless turn two"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // The agent lane's next miss attempts recovery instead of logging
+    // "spent" — the exact regression the consume-once closes.
+    await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
+    const regranted = messageRecords(records).at(-1);
+    assert.equal(regranted.routeMiss, "missing");
+    assert.equal(
+      regranted.routeRecovery.outcome,
+      "compressed",
+      "a stale boundary flag would have kept this lane spent"
+    );
+    assert.equal(regranted.routeRecovery.install, "installed");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+/**
+ * largeToolTurn plus a signed thinking block, so normalization strips it and
+ * legacyHash !== hash arms the legacy probe leg.
+ */
+function largeThinkingToolTurn(marker = "TTT") {
+  return [
+    { role: "user", content: `${marker} first question` },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", signature: "sig" },
+        { type: "text", text: `${marker} ` + "history ".repeat(64 * 1024) },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
+    },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+  ];
+}
+
+test("each compress leg samples its arming class at its own settle", async () => {
+  // Cycle-2 fix: the arming classification is per-hash and a concurrent
+  // same-hash failure of another class may overwrite it, so each leg samples
+  // in its OWN .then. The held legacy probe keeps lane A's Promise.all open
+  // long after its canonical 500 settled; lane B's same-hash 400 then
+  // overwrites the entry inside that window. A late (post-Promise.all) read
+  // would see the non-arming 400 and never arm the fuse.
+  const upstream = await recordingUpstream();
+  const legacyGate = deferred();
+  let legacyArrived = false;
+  let canonicalCalls = 0;
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      if (parsed.index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      // The legacy leg carries the thinking block the canonical shape strips.
+      if (JSON.stringify(parsed.messages).includes('"thinking"')) {
+        legacyArrived = true;
+        await legacyGate.promise;
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "legacy rejected" }));
+      }
+      canonicalCalls++;
+      // First canonical: an arming-class 500. Second (lane B, same hash —
+      // failures are never cached, so it is a live call): a non-arming 400
+      // that overwrites the per-hash classification entry.
+      res.writeHead(canonicalCalls === 1 ? 500 : 400, {
+        "content-type": "application/json",
+      });
+      res.end(JSON.stringify({ error: "no" }));
+    });
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const laneA = { ...SESSION, "x-claude-code-agent-id": "agent-arm-a" };
+  const laneB = { ...SESSION, "x-claude-code-agent-id": "agent-arm-b" };
+  const laneC = { ...SESSION, "x-claude-code-agent-id": "agent-arm-c" };
+  const turn = largeThinkingToolTurn();
+  try {
+    const first = postMessages(proxy.port, turn, laneA);
+    await waitFor(() => canonicalCalls === 1 && legacyArrived);
+    // Let lane A's canonical leg settle client-side — the 500 records its
+    // arming class and the leg's .then samples it — and its failed promise
+    // drop out of the compress cache, so lane B's canonical is a fresh live
+    // call rather than a dedupe join.
+    await new Promise((r) => setTimeout(r, 150));
+
+    const second = postMessages(proxy.port, turn, laneB);
+    await waitFor(() => canonicalCalls === 2);
+    // Give the 400's non-arming class time to overwrite the per-hash entry
+    // while lane A is still parked on the held legacy leg — the exact window
+    // the sample-at-settle contract closes. (Lane B's own legacy leg joins
+    // lane A's in-flight promise, so it was cached at sampling time and
+    // contributes no fuse evidence of its own.)
+    await new Promise((r) => setTimeout(r, 150));
+
+    legacyGate.resolve();
+    await first;
+    await second;
+    for (const settled of messageRecords(records).slice(-2)) {
+      assert.equal(settled.routeRecovery.outcome, "failed");
+    }
+
+    // Lane A's 500 must have armed the shared fuse: the class was read at
+    // the canonical leg's own settle, before lane B's 400 overwrote it.
+    await postMessages(proxy.port, largeToolTurn("CCC"), laneC);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "cooldown",
+      "a post-Promise.all sample would have read the overwriting 400"
+    );
+    assert.equal(canonicalCalls, 2, "the cooldown skip paid nothing");
+  } finally {
+    legacyGate.resolve();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
