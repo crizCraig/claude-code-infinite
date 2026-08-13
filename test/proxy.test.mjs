@@ -5910,16 +5910,29 @@ test("reserved-looking agent ids cannot alias the main route lane", async () => 
   }
 });
 
-test("an away-summary followup installs on the away lane and spares main's route", async () => {
+test("an away-summary followup compresses, stores no route, and spares main's route", async () => {
   // The surviving twin of the 2026-08-04 incident: a hidden away-summary
   // request shares the session and carries no agent header, so under the old
-  // single slot it keyed to main and could evict main's route. It now gets
-  // its own lane.
+  // single slot it keyed to main and could evict main's route. It keys to its
+  // own away lane now — and that lane stores nothing: no request can ever
+  // read an away route (tool turns and count_tokens never classify as away).
+  //
+  // "Stores nothing" is observed through LRU pressure: main's entry is
+  // installed first (oldest), the away request runs second, then 31 agent
+  // lanes install. A stored away route would make 33 entries and push main
+  // past the 32-lane cap; main still riding afterwards proves the away leg
+  // never took a slot.
   const upstream = await recordingUpstream();
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("AAA")
+      ? recoveredMemory("AAA")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
   const records = [];
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
@@ -5943,9 +5956,23 @@ test("an away-summary followup installs on the away lane and spares main's route
     await postMessages(proxy.port, awayMessages, SESSION);
     const away = messageRecords(records).at(-1);
     assert.equal(away.routeLane, "away");
-    assert.equal(away.turnType, "followup-compressed");
+    assert.equal(away.turnType, "followup-compressed", "the away leg still compresses");
 
-    // Main's route survived the side request: its extension still rides.
+    // Fill the map to its cap from distinct agent lanes, newer than main.
+    for (let n = 1; n <= 31; n++) {
+      await postMessages(proxy.port, largeToolTurn("AAA"), {
+        ...SESSION,
+        "x-claude-code-agent-id": `agent-${n}`,
+      });
+      assert.equal(
+        messageRecords(records).at(-1).routeRecovery.install,
+        "installed",
+        `lane agent-${n} installed`
+      );
+    }
+
+    // Main (the oldest entry) survived under the cap: a stored away route
+    // would have evicted it at the 31st agent install.
     await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
   } finally {

@@ -1402,6 +1402,17 @@ async function handleMessages(
       routeActivationAttempted = true;
       return;
     }
+    // Away lane: commit the decision but store nothing. Nothing can ever
+    // read an away route — tool turns and count_tokens can never classify as
+    // away — so storing it would only mislead and burn heap. All the
+    // reservation bookkeeping above and around this stays exactly as for any
+    // lane: it is what stops a stale slow away duplicate from stepping on a
+    // newer one.
+    if (requestRouteLane === "away") {
+      commitRouteDecision();
+      routeActivationAttempted = true;
+      return;
+    }
     const installed = installMemoryRoute(
       state,
       requestRouteKey,
