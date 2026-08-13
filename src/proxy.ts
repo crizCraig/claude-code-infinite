@@ -97,7 +97,6 @@ import {
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
-const NOTICE_SETTLE_WAIT_MS = 1_000;
 const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
 const LEGACY_MIGRATION_SESSIONS_MAX = 64;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
@@ -1088,6 +1087,15 @@ async function handleMessages(
         // exactly the set of misses a switched-on proxy would have fed into
         // the budget below.
         rec.routeRecovery = { outcome: "disabled" };
+      } else if (state.toolRecoveryAttemptedLanes.has(requestRouteKey)) {
+        // This lane already spent its one blocking attempt this epoch;
+        // the rest of its tool loop forwards verbatim (or rides, if the
+        // attempt installed). Checked BEFORE the cooldown so a spent lane
+        // records "spent" even while a cooldown is active: the two gates
+        // are independent facts, and the reqlog acceptance metric (attempts
+        // per lane per turn) needs budget exhaustion visible during
+        // outages, not masked behind "cooldown".
+        rec.routeRecovery = { outcome: "spent" };
       } else if (Date.now() < state.toolRecoveryCooldownUntil) {
         // A recent attempt burned the full compress budget and still
         // failed. Every tool turn appends a tool_result and rehashes, so
@@ -1098,11 +1106,6 @@ async function handleMessages(
         // fuse promises never to be worse than. A cooldown skip does not
         // consume the lane's attempt.
         rec.routeRecovery = { outcome: "cooldown" };
-      } else if (state.toolRecoveryAttemptedLanes.has(requestRouteKey)) {
-        // This lane already spent its one blocking attempt this epoch;
-        // the rest of its tool loop forwards verbatim (or rides, if the
-        // attempt installed).
-        rec.routeRecovery = { outcome: "spent" };
       } else {
         state.toolRecoveryAttemptedLanes.add(requestRouteKey);
         // Serialized non-system conversation bytes, for the record only —

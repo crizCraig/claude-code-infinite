@@ -6391,9 +6391,12 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
 
     // Every tool turn appends a tool_result and rehashes, so compress()'s
     // dedup can never absorb the repeat: without a cooldown an outage would
-    // charge the full blocking budget to each of these.
-    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), SESSION);
-    await postMessages(proxy.port, extendToolLoop(conversation, "t3"), SESSION);
+    // charge the full blocking budget to each of these. Main's own lane spent
+    // its one attempt above and "spent" wins when both gates hold, so the
+    // cooldown is observed from a sibling lane whose budget is intact.
+    const sibling = { ...SESSION, "x-claude-code-agent-id": "agent-fuse-probe" };
+    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), sibling);
+    await postMessages(proxy.port, extendToolLoop(conversation, "t3"), sibling);
     const later = messageRecords(records).slice(1);
     for (const rec of later) {
       assert.equal(rec.routeRecovery.outcome, "cooldown");
@@ -6402,6 +6405,13 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
     }
     assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
     assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /first question/);
+
+    // The spent lane stays visible as budget exhaustion even while the
+    // cooldown is armed: the reqlog acceptance metric needs "spent", not
+    // "cooldown", masking it during outages.
+    await postMessages(proxy.port, extendToolLoop(conversation, "t4"), SESSION);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "spent");
+    assert.equal(blockingCalls(), afterFirst, "a spent skip pays nothing either");
   } finally {
     proxy.close();
     upstream.close();
@@ -6643,7 +6653,13 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
     assert.equal(blockingCompresses, 1);
 
     // The next large miss must ride the cooldown, not pay the budget again.
-    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), SESSION);
+    // The aborted attempt already spent MAIN's lane budget (and "spent" wins
+    // over "cooldown" when both gates hold), so probe from a sibling lane
+    // whose budget is intact — the cooldown is the shared fuse under test.
+    await postMessages(proxy.port, extendToolLoop(conversation, "t2"), {
+      ...SESSION,
+      "x-claude-code-agent-id": "agent-fuse-probe",
+    });
     const next = messageRecords(records).at(-1);
     assert.equal(
       next.routeRecovery.outcome,
@@ -7131,6 +7147,345 @@ test("a fast-tool abort does not strand recovery in transform-only mode", async 
   } finally {
     clientResponse?.destroy();
     clientRequest?.destroy();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// count_tokens lane parity: the preflight mirrors the messages path's
+// identity-keyed route lookup, and only its own lane's route may rewrite it.
+// ---------------------------------------------------------------------------
+
+test("an agent-attributed count_tokens rides its own lane during the tool loop", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-count" };
+  const base = followupTurn("agent turn two");
+  try {
+    // The agent followup compresses and installs the agent lane's route.
+    await postMessages(proxy.port, base, agent);
+    const followup = messageRecords(records).at(-1);
+    assert.equal(followup.turnType, "followup-compressed");
+    assert.equal(followup.routeLane, "agent");
+
+    // The agent's count_tokens preflight for its next tool turn must size the
+    // grafted compressed context, not the full history it never sends.
+    const counted = await postCountTokens(
+      proxy.port,
+      { model: "claude-x", messages: extendToolLoop(base, "c1") },
+      agent
+    );
+    assert.equal(counted.input_tokens, 42, "count response stays transparent");
+    const seenCount = upstream.seen.find((c) => c.isCount);
+    assert.ok(seenCount, "count_tokens reached upstream");
+    assert.match(
+      JSON.stringify(seenCount.body.messages[0].content),
+      /compressed context/,
+      "count_tokens sizes the agent lane's compressed context"
+    );
+    assert.ok(
+      !JSON.stringify(seenCount.body.messages).includes("first question"),
+      "the uncompressed prefix must not be re-counted"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("agent count_tokens without its own route forwards verbatim and spares main's lane", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const base = followupTurn("turn two");
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, base, SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // Same session, agent attribution: the agent lane holds no route, so the
+    // preflight forwards untouched — main's route is not its to graft.
+    await postCountTokens(
+      proxy.port,
+      { model: "claude-x", messages: extendToolLoop(base, "c1") },
+      { ...SESSION, "x-claude-code-agent-id": "agent-observer" }
+    );
+    const seenCount = upstream.seen.find((c) => c.isCount);
+    assert.ok(seenCount, "count_tokens reached upstream");
+    const countedMessages = JSON.stringify(seenCount.body.messages);
+    assert.match(countedMessages, /first question/, "forwarded verbatim");
+    assert.doesNotMatch(
+      countedMessages,
+      /compressed context/,
+      "another lane's route must not rewrite the agent's preflight"
+    );
+
+    // The lookup on the agent's key must not have deleted or reordered away
+    // main's entry: the next MAIN tool turn still rides.
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+    assert.match(
+      JSON.stringify(upstream.seen.at(-1).body.messages),
+      /compressed context/,
+      "main's route survives the foreign-lane count_tokens"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a sibling's count_tokens on the shared parent lane fails closed to verbatim", async () => {
+  // Requests attributed only by x-claude-code-parent-agent-id share one lane.
+  // When sibling A's route is installed there, sibling B's count_tokens (a
+  // different history) must mismatch the stored prefix hashes and forward
+  // verbatim — never crash, never count A's compressed context for B.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const parentLane = { ...SESSION, "x-claude-code-parent-agent-id": "parent-lane" };
+  try {
+    // Sibling A's followup installs the shared parent lane's route.
+    await postMessages(proxy.port, followupTurn("sibling A work"), parentLane);
+    const installed = messageRecords(records).at(-1);
+    assert.equal(installed.turnType, "followup-compressed");
+    assert.equal(installed.routeLane, "agent");
+
+    // Sibling B: same attribution headers, unrelated conversation.
+    const siblingB = [
+      { role: "user", content: "sibling B question" },
+      { role: "assistant", content: [{ type: "text", text: "sibling B answer" }] },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "b1", name: "x", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "b1", content: "ok" }],
+      },
+    ];
+    const counted = await postCountTokens(
+      proxy.port,
+      { model: "claude-x", messages: siblingB },
+      parentLane
+    );
+    assert.equal(counted.input_tokens, 42, "the preflight still completes");
+    const seenCount = upstream.seen.find((c) => c.isCount);
+    assert.ok(seenCount, "count_tokens reached upstream");
+    const countedMessages = JSON.stringify(seenCount.body.messages);
+    assert.match(countedMessages, /sibling B question/, "forwarded verbatim");
+    assert.doesNotMatch(
+      countedMessages,
+      /compressed context/,
+      "sibling A's prefix cannot graft onto sibling B's history"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an unarmed local bang-command turn owns its compression notice", async () => {
+  // Local `!command` turns do not consistently emit UserPromptSubmit, and the
+  // API history carries bash wrappers rather than the literal typed command.
+  // Their strict main-thread replay shape still owns and queues the notice.
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: {
+      prompt_tokens: 200_000,
+      completion_tokens: 100_000,
+      prompt_tokens_details: { cached_tokens: 1 },
+    },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  try {
+    // Deliberately NO armMainTurn: the bash replay shape alone must qualify.
+    await postMessages(
+      proxy.port,
+      [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+        { role: "user", content: "<bash-input>pwd</bash-input>" },
+        {
+          role: "user",
+          content:
+            "<bash-stdout>/tmp/project</bash-stdout>" +
+            "<bash-stderr></bash-stderr>",
+        },
+      ],
+      SESSION
+    );
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    const stop = await postHook(proxy, {
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+    });
+    assert.equal(stop.status, 200, "the unarmed bang turn queued its notice");
+    assert.equal(
+      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, ""),
+      COMPRESSED_NOTICE
+    );
+    assert.equal(
+      (await postHook(proxy, { hook_event_name: "Stop", stop_hook_active: false }))
+        .status,
+      204,
+      "the notice is claimed exactly once"
+    );
+    assert.deepEqual(
+      records.filter((r) => r.kind === "notice"),
+      [{ kind: "notice", event: "claimed", via: "Stop" }]
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("route matching ignores block cache metadata but preserves nested tool data", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    // A stale-route rejection must stay visible instead of being repaired by
+    // recovery, or the nested-data mismatch below would pass while grafting.
+    toolRouteRecovery: false,
+  });
+  const anchored = [
+    { role: "user", content: "first question" },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "seed-tool",
+          name: "seed",
+          input: { cache_control: "domain-value" },
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "seed-tool", content: "seed result" },
+      ],
+    },
+    { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+    { role: "user", content: "turn two" },
+  ];
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, anchored, SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // Claude churns block-level cache_control mid-loop; that is transport
+    // metadata, not conversation identity. The suffix's tool_result carries
+    // nested content blocks (with their own cache metadata) that must survive
+    // the graft byte-for-byte.
+    const churned = structuredClone(anchored);
+    churned[1].content[0].cache_control = { type: "ephemeral", ttl: "1h" };
+    const nestedResult = {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: [
+            {
+              type: "text",
+              text: "nested one",
+              cache_control: { type: "ephemeral" },
+            },
+            { type: "text", text: "nested two" },
+          ],
+        },
+      ],
+    };
+    const ride = [
+      ...churned,
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "read",
+            input: { deep: ["numbers", 1, 2] },
+          },
+        ],
+      },
+      nestedResult,
+    ];
+    await postMessages(proxy.port, ride, SESSION);
+    assert.equal(
+      messageRecords(records).at(-1).turnType,
+      "tool-memory",
+      "cache_control churn alone must not break the match"
+    );
+    const grafted = upstream.seen.at(-1).body.messages;
+    assert.match(JSON.stringify(grafted[0].content), /compressed context/);
+    assert.deepEqual(
+      grafted.at(-1),
+      nestedResult,
+      "nested tool_result content survives the graft untouched"
+    );
+    assert.deepEqual(grafted.at(-2).content[0].input, { deep: ["numbers", 1, 2] });
+
+    // Nested tool DATA is identity: a change inside tool_use.input — even one
+    // spelled "cache_control" — must reject the route and forward verbatim.
+    const changed = structuredClone(ride);
+    changed[1].content[0].input.cache_control = "changed-domain-value";
+    await postMessages(proxy.port, extendToolLoop(changed, "tool-2"), SESSION);
+    const rejected = messageRecords(records).at(-1);
+    assert.equal(rejected.routeMiss, "rejected");
+    const forwarded = JSON.stringify(upstream.seen.at(-1).body.messages);
+    assert.match(forwarded, /first question/, "full history forwards verbatim");
+    assert.doesNotMatch(forwarded, /compressed context/);
+  } finally {
     proxy.close();
     upstream.close();
     memtreeSrv.close();
