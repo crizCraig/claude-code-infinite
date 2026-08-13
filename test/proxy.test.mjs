@@ -8263,3 +8263,89 @@ test("each compress leg samples its arming class at its own settle", async () =>
     memtreeSrv.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ralph-review cycle 4 (2026-08-13): regression pins for the shipped fixes
+//
+// completeUpstream's shutdown guard (!shutdownCancelled) is deliberately not
+// pinned here: the misclassification window is the sub-tick gap between
+// decoder.end() and its deferred finish() inside the proxy's own event-loop
+// turn, which an external test cannot enter deterministically.
+// ---------------------------------------------------------------------------
+
+test("a first-user-shaped side call does not consume the boundary wipe", async () => {
+  // Cycle-4 fix: only the armed prompt itself may consume the
+  // UserPromptSubmit flag (the same prompt-text correlation
+  // hookOwnedMainFollowup uses). A CC-internal side call can arrive
+  // first-user shaped on the main key without being the armed prompt;
+  // letting it consume left the real followup bumping with keep=false — a
+  // second wipe in the same boundary, re-granting lanes spent moments
+  // earlier, the exact double-wipe keepRecoveryBudget closes.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-side-call" };
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  try {
+    // An agent lane spends its budget in the pre-boundary epoch...
+    await postMessages(proxy.port, largeToolTurn("BBB"), agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+    // ...the hook bump wipes the budget and flags the boundary as wiped...
+    await armMainTurn(proxy, "typed prompt");
+    // ...and a CC-internal side call arrives first-user shaped on the main
+    // key WITHOUT carrying the armed prompt. It forwards normally, but the
+    // armed prompt's own arrival is still due — the flag must survive it.
+    await postMessages(proxy.port, [{ role: "user", content: "quota check" }], SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "first-user");
+
+    // The agent spends its re-granted budget inside the new boundary.
+    const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
+    await postMessages(proxy.port, spentAgain, agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+
+    // The REAL armed prompt arrives as its hook-owned followup. Its bump must
+    // read the still-set flag and keep spent lanes spent — under the old
+    // uncorrelated consume, the side call already cleared it and this bump
+    // wiped a second time inside the same boundary.
+    await postMessages(proxy.port, followupTurn("typed prompt"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // The agent lane's next miss forwards verbatim, no second compress — a
+    // consumed flag would have re-granted it a fresh attempt here.
+    const beforeMiss = blockingCalls();
+    await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
+    const spent = messageRecords(records).at(-1);
+    assert.equal(spent.routeMiss, "missing");
+    assert.equal(
+      spent.routeRecovery.outcome,
+      "spent",
+      "a consumed flag would have let the followup re-grant this lane"
+    );
+    assert.equal(spent.turnType, "tool");
+    assert.equal(blockingCalls(), beforeMiss, "the spent lane paid nothing");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
