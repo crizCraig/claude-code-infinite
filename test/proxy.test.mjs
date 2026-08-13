@@ -7491,3 +7491,106 @@ test("route matching ignores block cache metadata but preserves nested tool data
     memtreeSrv.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ralph-review cycle 1 (2026-08-13): decided fixes
+// ---------------------------------------------------------------------------
+
+test("a hook-armed prompt's followup bump keeps spent lanes spent", async () => {
+  // One turn boundary, one budget wipe: UserPromptSubmit already cleared
+  // toolRecoveryAttemptedLanes, so the same prompt's followup bump must not
+  // clear it again — a lane that spent its attempt between the two bumps
+  // would otherwise get a second blocking compress at the same boundary.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-boundary" };
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  try {
+    // The hook bump is this boundary's single budget wipe...
+    await armMainTurn(proxy, "turn two");
+    // ...the agent lane spends its one attempt after it...
+    await postMessages(proxy.port, largeToolTurn("BBB"), agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+    // ...and then the armed prompt's own followup arrives and bumps again.
+    await postMessages(proxy.port, followupTurn("turn two"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // The followup bump cleared the agent's route (new epoch) but kept its
+    // spent mark: the next agent miss forwards verbatim, no second compress.
+    const beforeMiss = blockingCalls();
+    await postMessages(proxy.port, extendToolLoop(largeToolTurn("BBB"), "s1"), agent);
+    const spent = messageRecords(records).at(-1);
+    assert.equal(spent.routeMiss, "missing");
+    assert.equal(spent.routeRecovery.outcome, "spent");
+    assert.equal(spent.turnType, "tool");
+    assert.equal(blockingCalls(), beforeMiss, "the spent lane paid nothing");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a hookless followup bump still re-grants a spent lane's budget", async () => {
+  // Hookless embedders never fire UserPromptSubmit, so the followup bump is
+  // their only per-human-turn wipe. It must keep clearing, or a lane that
+  // spent its attempt would forward full history for the rest of the session.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, (reqBody) =>
+    JSON.stringify(reqBody.messages).includes("BBB")
+      ? recoveredMemory("BBB")
+      : {
+          messages: [
+            { role: "user", content: "compressed context " + "c".repeat(2500) },
+          ],
+          usage: { prompt_tokens_details: { cached_tokens: 123 } },
+        }
+  );
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-hookless" };
+  try {
+    // The agent lane spends its attempt; no hook ever fires.
+    await postMessages(proxy.port, largeToolTurn("BBB"), agent);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+    // A hookless main followup: the arm was never set, so this bump clears.
+    await postMessages(proxy.port, followupTurn("turn two"), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+
+    // The agent lane's next miss attempts again instead of logging "spent".
+    await postMessages(proxy.port, extendToolLoop(largeToolTurn("BBB"), "s1"), agent);
+    const regranted = messageRecords(records).at(-1);
+    assert.equal(regranted.routeMiss, "missing");
+    assert.equal(regranted.routeRecovery.outcome, "compressed");
+    assert.equal(regranted.routeRecovery.install, "installed");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});

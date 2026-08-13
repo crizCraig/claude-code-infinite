@@ -97,6 +97,14 @@ import {
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
+// LEGACY-PROBE SCAFFOLDING — SCHEDULED FOR DELETION 2026-09-15. This
+// threshold, legacyMemtreeMigrationComplete, and the legacy leg in
+// runBlockingCompression exist only so conversations started under the old
+// MemTree naming scheme keep contesting their deeper legacy index while the
+// canonical one catches up. Delete the whole probe once such conversations
+// can no longer be live: it runs a SECOND concurrent compress leg per
+// recovery/followup attempt, so removing it halves the concurrent-compress
+// worst case from 2N to N for an N-agent fan-out.
 const LEGACY_PROBE_UNINDEXED_TOKENS = 10_000;
 const LEGACY_MIGRATION_SESSIONS_MAX = 64;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
@@ -260,7 +268,9 @@ interface ProxyState {
    * epoch. Replaces the old 400KiB byte gate with the budget main already
    * lives by: the followup path pays exactly one blocking compress per human
    * turn, so every lane gets the same self-limiting deal. Cleared alongside
-   * memoryRoutes on every epoch bump.
+   * memoryRoutes on every epoch bump — except the followup-path bump of a
+   * prompt the hook already armed, which keeps the set so one turn boundary
+   * grants each lane one attempt, not two (see bumpRouteEpoch).
    */
   toolRecoveryAttemptedLanes: Set<string>;
   /**
@@ -351,12 +361,23 @@ function firstNonEmptyHeader(
  * selectively pruned. Doing all of it here is what makes the sets' documented
  * bound ("cleared on each epoch bump") true at every bump site rather than
  * only at the followup one.
+ *
+ * keepRecoveryBudget skips only the spent-recovery wipe, for the followup
+ * bump of a prompt whose UserPromptSubmit bump already wiped it: one turn
+ * boundary otherwise wipes twice milliseconds apart, re-granting a lane that
+ * spent its blocking attempt in between. Hookless embedders (no
+ * UserPromptSubmit ever fires) must never pass true — their followup bump is
+ * the only per-human-turn re-grant, without which a spent lane would forward
+ * full history forever.
  */
-function bumpRouteEpoch(state: ProxyState): number {
+function bumpRouteEpoch(
+  state: ProxyState,
+  keepRecoveryBudget = false
+): number {
   const epoch = ++state.mainRouteEpoch;
   state.routeDecisionsLive.clear();
   state.memoryRoutes.clear();
-  state.toolRecoveryAttemptedLanes.clear();
+  if (!keepRecoveryBudget) state.toolRecoveryAttemptedLanes.clear();
   return epoch;
 }
 
@@ -956,8 +977,12 @@ async function handleMessages(
   if (isFollowupUserTurn) {
     if (isMainRequest) {
       // Clears every lane before this request reserves the main lane in the
-      // new epoch.
-      routeEpoch = bumpRouteEpoch(state);
+      // new epoch. An armed prompt's UserPromptSubmit bump wiped the recovery
+      // budget for this turn boundary milliseconds ago (the arm is still set
+      // here — it is consumed below, after this bump), so keep a lane spent
+      // since then spent; a hookless followup (arm never set) must still
+      // clear, being its embedder's only per-human-turn re-grant.
+      routeEpoch = bumpRouteEpoch(state, state.mainPromptArmed);
     }
     // Every followup can install or clear its own lane after compression. Give
     // non-main lanes the same ordering guarantee main already had: a slower

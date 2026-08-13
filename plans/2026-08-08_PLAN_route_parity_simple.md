@@ -12,7 +12,9 @@ only main-lane recovery installation; live health evidence is aggregated across
 canonical and legacy legs so a cached rescue cannot hide a live failure;
 and a verdict-driven full-context outcome (A/B `full` winner, B-verdict splice)
 marks its lane's blocking budget spent, so recovery cannot re-litigate a grade
-that just rejected memory. New reqlog values: `routeLane`, recovery outcome
+that just rejected memory *(superseded 2026-08-13: the in-request A/B routing
+was removed in 6defd26, so this budget mark no longer exists)*. New reqlog
+values: `routeLane`, recovery outcome
 `"spent"`; removed: install fates `"subagent"`/`"foreign-route"`.
 **Supersedes for implementation purposes:** `plans/2026-08-08_PLAN_universal_compression_parity_opus.md`
 (kept for its measurements; this plan is the smaller thing to actually build)
@@ -207,6 +209,17 @@ many lines; 2–4 are deletions plus one field.
 
 ## Honest risks
 
+- **Recovery volume has no global bound** *(added 2026-08-13)*. The honest
+  worst case: an N-agent fan-out whose lanes all miss at once is N concurrent
+  blocking recovery compresses — 2N while the legacy probe still runs its
+  second leg (scheduled for deletion 2026-09-15, see
+  `LEGACY_PROBE_UNINDEXED_TOKENS`) — each up to
+  `DEFAULT_COMPRESS_TIMEOUT_MS` = 15s, with no global concurrency bound.
+  Decision: watch rather than pre-limit. The concrete tripwire: if reqlog
+  `routeRecovery.outcome` counts ever show more than one attempt per lane per
+  human message in production, add the already-designed hard limit — a small
+  global in-flight semaphore, with excess misses forwarding verbatim without
+  spending their lane's budget.
 - **Latency on small misses.** Removing the gate means a genuine miss on a tiny
   body can now cost a MemTree round trip that buys nothing. The one-attempt
   budget bounds it to once per lane per human turn, and the not-smaller check
