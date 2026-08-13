@@ -5955,7 +5955,7 @@ test("an away-summary followup installs on the away lane and spares main's route
   }
 });
 
-test("the route map is LRU-bounded: a ninth lane evicts the oldest", async () => {
+test("the route map is LRU-bounded: a 33rd lane evicts the oldest", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
@@ -5969,8 +5969,8 @@ test("the route map is LRU-bounded: a ninth lane evicts the oldest", async () =>
     "x-claude-code-agent-id": `agent-${n}`,
   });
   try {
-    // Nine distinct lanes each recover and install, in order.
-    for (let n = 1; n <= 9; n++) {
+    // 33 distinct lanes each recover and install, in order.
+    for (let n = 1; n <= 33; n++) {
       await postMessages(proxy.port, largeToolTurn("AAA"), laneHeaders(n));
       assert.equal(
         messageRecords(records).at(-1).routeRecovery.install,
@@ -5979,7 +5979,7 @@ test("the route map is LRU-bounded: a ninth lane evicts the oldest", async () =>
       );
     }
 
-    // agent-1 was the least recently used entry, so the ninth install
+    // agent-1 was the least recently used entry, so the 33rd install
     // evicted it: its extension misses (and its budget is already spent).
     await postMessages(
       proxy.port,

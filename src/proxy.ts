@@ -293,11 +293,12 @@ interface MemoryRoute {
 }
 
 /**
- * Bound on concurrently held route lanes. A route entry is 0.4–4 MB of heap;
- * 8 is generous for one session's fan-out (main + away + a handful of live
- * subagents) and the cap is enforced by LRU eviction, not assumed.
+ * Bound on concurrently held route lanes. A route entry is 0.4–4 MB of heap,
+ * so 32 lanes is honestly ~128 MB worst case — accepted so a wide agent
+ * fan-out (main + away + dozens of live subagents) cannot LRU-evict main's
+ * route mid-turn; the cap is enforced by LRU eviction, not assumed.
  */
-const MEMORY_ROUTE_MAX_LANES = 8;
+const MEMORY_ROUTE_MAX_LANES = 32;
 
 type RouteLane = "main" | "away" | "agent";
 
