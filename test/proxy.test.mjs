@@ -5330,10 +5330,13 @@ test("a small tool-route miss attempts recovery once; the second miss is spent",
       "the small miss was worth exactly one blocking attempt"
     );
 
-    // An identical repost cannot extend the installed route (empty suffix),
-    // so it rejects — and the lane's budget is already spent: verbatim
-    // forward, no second blocking compress.
-    await postMessages(proxy.port, smallishToolTurn, SESSION);
+    // A same-length body whose tool_result diverged is a genuine mismatch
+    // (an identical repost would be a "replay" now), so it rejects — and the
+    // lane's budget is already spent: verbatim forward, no second blocking
+    // compress.
+    const diverged = structuredClone(smallishToolTurn);
+    diverged[3].content[0].content = "divergent result";
+    await postMessages(proxy.port, diverged, SESSION);
     const rec2 = messageRecords(records)[1];
     assert.equal(rec2.routeMiss, "rejected");
     assert.equal(rec2.turnType, "tool");
@@ -5845,9 +5848,12 @@ test("a same-session subagent reject evicts only its own lane, never main's", as
       "installed"
     );
 
-    // An identical repost cannot extend the subagent route (empty suffix):
-    // rejected, and the eviction lands on the SUBAGENT lane only.
-    await postMessages(proxy.port, largeToolTurn("BBB"), agent);
+    // A divergent same-lane body (an identical repost would be a "replay"
+    // now) is a genuine mismatch: rejected, and the eviction lands on the
+    // SUBAGENT lane only.
+    const diverged = structuredClone(largeToolTurn("BBB"));
+    diverged[3].content[0].content = "divergent result";
+    await postMessages(proxy.port, diverged, agent);
     const rejected = messageRecords(records).at(-1);
     assert.equal(rejected.routeLane, "agent");
     assert.equal(rejected.routeMiss, "rejected");
@@ -7615,6 +7621,117 @@ test("a hookless followup bump still re-grants a spent lane's budget", async () 
     assert.equal(regranted.routeMiss, "missing");
     assert.equal(regranted.routeRecovery.outcome, "compressed");
     assert.equal(regranted.routeRecovery.install, "installed");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an identical tool-body retry is a replay: verbatim forward, route retained", async () => {
+  // A recovery-installed route's prefix IS the tool body that installed it.
+  // Claude Code retries a request whose socket died before the flush with the
+  // identical body; the empty suffix cannot ride, but this is a client retry,
+  // not a divergence — the route must survive so the next real tool turn
+  // rides instead of paying a rebuild.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    assert.equal(
+      messageRecords(records).at(-1).routeRecovery.install,
+      "installed"
+    );
+
+    await postMessages(proxy.port, conversation, SESSION);
+    const replay = messageRecords(records).at(-1);
+    assert.equal(replay.routeMiss, "replay");
+    assert.equal(replay.turnType, "tool");
+    assert.equal(
+      replay.routeRecovery,
+      undefined,
+      "a replay neither attempts recovery nor spends budget"
+    );
+    assert.match(
+      JSON.stringify(upstream.seen.at(-1).body.messages),
+      /first question/,
+      "the retry forwards verbatim"
+    );
+
+    // The route survived the replay: the next real tool turn rides it.
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an upstream-failed recovery refunds the lane budget for the retry", async () => {
+  // A 529 on the recovered leg means the compress succeeded but no route was
+  // installed and the model never answered — the client's identical-body
+  // retry is coming. Refunding the lane (epoch-guarded) lets that retry
+  // re-attempt, and its recompress is a compress-cache hit. Reject-deletes
+  // deliberately do NOT refund: see the sibling-eviction test above.
+  let failFirst = true;
+  const seen = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      if (failFirst) {
+        failFirst = false;
+        res.writeHead(529, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ type: "error" }));
+      }
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const conversation = largeToolTurn();
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  try {
+    await postMessages(proxy.port, conversation, SESSION);
+    const first = messageRecords(records).at(-1);
+    assert.equal(first.routeRecovery.outcome, "compressed");
+    assert.equal(first.routeRecovery.install, "upstream-failed");
+    const liveCompresses = blockingCalls();
+
+    // The identical retry re-attempts (budget refunded), served from the
+    // compress cache, and installs against the now-healthy upstream.
+    await postMessages(proxy.port, conversation, SESSION);
+    const retry = messageRecords(records).at(-1);
+    assert.equal(retry.routeMiss, "missing");
+    assert.equal(retry.routeRecovery.outcome, "compressed");
+    assert.equal(retry.routeRecovery.install, "installed");
+    assert.equal(
+      blockingCalls(),
+      liveCompresses,
+      "the retry's recompress was a cache hit"
+    );
+
+    // And the rest of the tool loop rides the recovered route.
+    await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
   } finally {
     proxy.close();
     upstream.close();

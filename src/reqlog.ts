@@ -114,15 +114,18 @@ export interface MessagesRecord {
    */
   routeLane?: "main" | "away" | "agent";
   /**
-   * Tool turns that missed their lane's route: "missing" (empty lane) or
+   * Tool turns that missed their lane's route: "missing" (empty lane),
    * "rejected" (a route was present in this lane but unusable for this
-   * request). "rejected" covers every reason memoryRoutedToolBody refuses:
+   * request), or "replay" (the body was an exact replay of the request that
+   * installed the route — a client retry after a pre-flush socket death —
+   * forwarded verbatim with the route retained and no recovery attempt).
+   * "rejected" covers every OTHER reason memoryRoutedToolBody refuses:
    * an epoch mismatch, a changed system/prefix hash, a conversation that
    * shrank below the stored prefix, and an unexpected tool suffix shape.
    * Absent means there was no applicable miss — hits and away-summary turns
    * never emit it. "none" is deliberately not a value.
    */
-  routeMiss?: "missing" | "rejected";
+  routeMiss?: "missing" | "rejected" | "replay";
   /** Outcome of a best-effort tool-route miss recovery attempt. */
   routeRecovery?: {
     /**

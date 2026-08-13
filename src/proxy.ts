@@ -1046,7 +1046,7 @@ async function handleMessages(
     }
     let routedBody = forwardBody;
     let routedTool = false;
-    let routeMiss: "missing" | "rejected" | undefined;
+    let routeMiss: "missing" | "rejected" | "replay" | undefined;
     if (isToolResultTurn) {
       // Every identity — main, subagent, away — consults its own lane. A
       // request can only ever name its own key, so the old foreign-owner
@@ -1069,6 +1069,27 @@ async function handleMessages(
           routedTool = true;
           if (opts.debug) {
             console.error("[ccc proxy] tool turn matched active memory route");
+          }
+        } else if (
+          isRouteInstallReplay(
+            body,
+            messages,
+            activeRoute,
+            state.mainRouteEpoch,
+            requestSessionId(req)
+          )
+        ) {
+          // An exact replay of the request that installed this route: the
+          // client's socket died before the response flushed and it retried
+          // the identical body. Not a divergence — forward verbatim but KEEP
+          // the route, so the next real tool turn (whose suffix extends the
+          // prefix) still rides. Deleting here would spend a rebuild on a
+          // route that was never wrong.
+          routeMiss = "replay";
+          if (opts.debug) {
+            console.error(
+              "[ccc proxy] tool turn replayed the route-installing request"
+            );
           }
         } else {
           // A mismatch means a different/resumed conversation shape, or two
@@ -1094,7 +1115,10 @@ async function handleMessages(
     if (routeMiss !== undefined) rec.routeMiss = routeMiss;
 
     if (
-      routeMiss !== undefined &&
+      // A "replay" is not a miss to recover from: its route is intact and
+      // the verbatim forward IS the retry's payload, so it neither attempts
+      // nor spends the lane's budget.
+      (routeMiss === "missing" || routeMiss === "rejected") &&
       // Cheap shape check: without an earlier real user message no
       // server-side prefix can exist, so the miss is unrecoverable by
       // construction and not worth an attempt or a record.
@@ -1734,6 +1758,41 @@ function memoryRoutedToolBody(
     delete routed.system;
   }
   return Buffer.from(JSON.stringify(routed), "utf-8");
+}
+
+/**
+ * Whether a tool-turn body is an exact replay of the request that installed
+ * the route: identical message count and every identity input
+ * memoryRoutedToolBody validates — session, epoch, system hash, and each
+ * prefix message hash. Claude Code retries a request whose socket died before
+ * the response flushed with the IDENTICAL body; that retry cannot ride (its
+ * suffix is empty) but it is a client retry, not a divergence. Anything else
+ * — any differing hash, or a body shorter than the prefix — is a genuine
+ * mismatch and keeps reject-and-rebuild semantics.
+ */
+function isRouteInstallReplay(
+  body: Record<string, any>,
+  messages: Message[],
+  route: MemoryRoute,
+  routeEpoch: number,
+  sessionId: string | undefined
+): boolean {
+  if (
+    !sessionId ||
+    route.sessionId !== sessionId ||
+    route.routeEpoch !== routeEpoch ||
+    routeValueHash(normalizeRouteSystem(body.system)) !==
+      route.originalSystemHash ||
+    messages.length !== route.originalPrefixHashes.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Ignore cache-control churn when matching Claude's next tool-loop request. */
@@ -2551,6 +2610,20 @@ async function recoverToolRouteMiss(args: {
   // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
   // it must stop suppressing whoever is still trying to install.
   if (rec.routeRecovery.install !== "installed") releaseOwnReservation();
+  // An upstream 5xx/529 burned the compressed forward AFTER a healthy
+  // compress: no route exists and the client retries the identical body, so
+  // refund the lane's blocking budget — epoch-guarded, so a late settle
+  // cannot re-grant a later human turn's lane. The retry's recompress is a
+  // compress-cache hit, so the re-attempt is cheap. Deliberately NOT
+  // refunded on reject-deletes: siblings sharing a parent-agent fallback
+  // lane genuinely mismatch each other every turn, and refunding those would
+  // be one real blocking compress per tool step forever.
+  if (
+    rec.routeRecovery.install === "upstream-failed" &&
+    state.mainRouteEpoch === routeEpoch
+  ) {
+    state.toolRecoveryAttemptedLanes.delete(routeKey);
+  }
 }
 
 /** Stamp the classified turn type and forwarded-size fields on the record. */
