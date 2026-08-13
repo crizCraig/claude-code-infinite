@@ -744,9 +744,12 @@ export class MemtreeClient {
   }
 
   /**
-   * Fuse classification for the most recent live compress failure of `hash`,
-   * sampled by the caller right after the await (the hasCachedCompress
-   * idiom; the entry is recorded before the failed promise settles null).
+   * Fuse classification for the most recent live compress failure of `hash`.
+   * The entry is recorded before the failed promise settles null, and a
+   * concurrent same-hash retry MAY overwrite it with a different class — so
+   * callers must sample at their own leg's settle (a .then on the compress
+   * promise), not after awaiting other work; only that keeps the read paired
+   * with the failure it describes.
    * Arming failures are evidence about the SERVER's health: no response at
    * all (network error or the abort-budget timeout), any 5xx, and 402 —
    * unpaid is global and persistent, so it must keep arming. Any other 4xx

@@ -79,9 +79,11 @@ Three consequences fall out for free:
   key, so there is nothing to protect it from and no eviction ping-pong to
   prevent.
 
-Bound the map: **8 entries, LRU by last touch**, and drop entries whose
-`routeEpoch` is stale on every access. A route entry is 0.4–4 MB of heap; 8 is
-generous for one session's fan-out and the cap must be enforced, not assumed.
+Bound the map: **32 entries, LRU by last touch** *(raised from 8 on
+2026-08-13: a wide fan-out plus per-lane recovery installs could evict main's
+route mid-turn at 8; do not shrink it back)*, and drop entries whose
+`routeEpoch` is stale on every access. A route entry is 0.4–4 MB of heap; the
+cap must be enforced, not assumed.
 
 Every existing `state.mainMemoryRoute` read/write becomes a get/set/delete on
 `routeKey(...)`. That is 14 sites, all listed by
@@ -187,13 +189,16 @@ many lines; 2–4 are deletions plus one field.
 - Same-session subagent *reject* does not evict main's entry. (This is the
   regression the old carve-out was written to prevent — it must now hold
   structurally.)
-- Away-summary request installs on the `away` lane and leaves main's entry
-  intact; a following main tool turn still rides.
+- Away-summary request leaves main's entry intact; a following main tool turn
+  still rides. *(Superseded 2026-08-13: the away lane commits its decision but
+  stores nothing — no tool turn or count_tokens can ever classify as away, so
+  an away route is write-only heap. Do not restore the install.)*
 - Small tool-route miss (well under the old 400KiB) now attempts recovery once,
   and the second consecutive miss in the same epoch does **not** attempt again.
 - Recovery whose result is not smaller than the original forwards the original
   and installs nothing.
-- LRU cap: 9 distinct lanes in one session leaves 8 entries.
+- LRU cap: 33 distinct lanes in one session leaves 32 entries *(rescaled
+  2026-08-13 with the cap raise)*.
 - Existing epoch/decision-generation tests in `test/proxy.test.mjs` and
   `test/ab-routing.test.mjs` pass unedited after phase 1.
 

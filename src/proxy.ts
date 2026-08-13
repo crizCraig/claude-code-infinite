@@ -188,6 +188,15 @@ interface ProxyState {
   notices: NoticeDeliveryQueue;
   /** Armed only by a main-thread UserPromptSubmit hook. */
   mainPromptArmed: boolean;
+  /**
+   * True from a UserPromptSubmit bump until the first main-followup bump
+   * consumes it. The followup's single-wipe decision keys off THIS flag, not
+   * off mainPromptArmed: the arm can outlive its boundary (a followup with
+   * active subagents never consumes it, and a missed Stop never clears it),
+   * and trusting it would let a later hookless boundary inherit spent lanes
+   * from the previous human turn.
+   */
+  recoveryBudgetWipedForBoundary: boolean;
   mainPromptId?: string;
   mainPromptText?: string;
   /**
@@ -546,6 +555,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     paymentNoticeShown: false,
     notices: new NoticeDeliveryQueue(),
     mainPromptArmed: false,
+    recoveryBudgetWipedForBoundary: false,
     mainPromptDelivered: true,
     mainPromptGeneration: 0,
     activeSubagents: new Set(),
@@ -735,6 +745,7 @@ async function handleNoticeHook(
       state.mainPromptDelivered = false;
       state.mainPromptGeneration++;
       bumpRouteEpoch(state);
+      state.recoveryBudgetWipedForBoundary = true;
       state.notices.clearForUserRequest();
     }
     res.writeHead(204);
@@ -773,6 +784,9 @@ async function handleNoticeHook(
     // delivery callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
     bumpRouteEpoch(state);
+    // The boundary this flag described is over; a followup arriving before
+    // the next UserPromptSubmit is a new hookless boundary and must wipe.
+    state.recoveryBudgetWipedForBoundary = false;
     // A normal main Stop means all child work for the turn has settled. Clear
     // stale lifecycle entries left by a missed SubagentStop hook.
     state.activeSubagents.clear();
@@ -978,12 +992,14 @@ async function handleMessages(
   if (isFollowupUserTurn) {
     if (isMainRequest) {
       // Clears every lane before this request reserves the main lane in the
-      // new epoch. An armed prompt's UserPromptSubmit bump wiped the recovery
-      // budget for this turn boundary milliseconds ago (the arm is still set
-      // here — it is consumed below, after this bump), so keep a lane spent
-      // since then spent; a hookless followup (arm never set) must still
-      // clear, being its embedder's only per-human-turn re-grant.
-      routeEpoch = bumpRouteEpoch(state, state.mainPromptArmed);
+      // new epoch. If this boundary's UserPromptSubmit bump already wiped the
+      // recovery budget milliseconds ago, keep a lane spent since then spent.
+      // Consume-once: the flag (not the arm, which can outlive its boundary)
+      // is what proves the wipe was THIS boundary's, and a hookless followup
+      // (flag never set) must still clear, being its embedder's only
+      // per-human-turn re-grant.
+      routeEpoch = bumpRouteEpoch(state, state.recoveryBudgetWipedForBoundary);
+      state.recoveryBudgetWipedForBoundary = false;
     }
     // Every followup can install or clear its own lane after compression. Give
     // non-main lanes the same ordering guarantee main already had: a slower
@@ -1196,7 +1212,11 @@ async function handleMessages(
       routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool",
       routedBody
     );
-    opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+    // A replay is byte-identical to the request whose recovery already
+    // submitted this exact history; re-indexing it buys nothing.
+    if (routeMiss !== "replay") {
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+    }
     capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
     return logged(
       forwardRaw(
@@ -2098,6 +2118,8 @@ async function runBlockingCompression(args: {
   let result: CompressResult | null;
   let usedLegacyFallback = false;
   let canonicalCompressFailed = false;
+  let canonicalFailureArming = false;
+  let legacyFailureArming = false;
   // Wall time of the canonical leg alone. timedOut must be computed from
   // this, not the Promise.all wall time: a fast canonical failure (e.g. a
   // 200ms 5xx) awaited alongside a slow legacy probe is not a timeout.
@@ -2144,16 +2166,30 @@ async function runBlockingCompression(args: {
       )
       .then((value) => {
         canonicalCompressMs = Date.now() - compressStarted;
+        // Sample the arming classification at THIS leg's settle: waiting for
+        // the slower leg would let a concurrent same-hash failure of another
+        // class overwrite the per-hash entry before it is read.
+        if (value === null) {
+          canonicalFailureArming = opts.memtree.lastCompressFailureArming(hash);
+        }
         return value;
       }),
     probeLegacy
-      ? opts.memtree.compress(
-          legacyHash,
-          rawMsgsForMemtree,
-          modelContextLimit,
-          state.shutdownSignal,
-          compressMeta
-        )
+      ? opts.memtree
+          .compress(
+            legacyHash,
+            rawMsgsForMemtree,
+            modelContextLimit,
+            state.shutdownSignal,
+            compressMeta
+          )
+          .then((value) => {
+            if (value === null) {
+              legacyFailureArming =
+                opts.memtree.lastCompressFailureArming(legacyHash);
+            }
+            return value;
+          })
       : null,
   ]);
   result = canonicalResult;
@@ -2232,13 +2268,11 @@ async function runBlockingCompression(args: {
   // nothing about MemTree's health, so it contributes neither failure nor
   // success — the fuse is untouched.
   const hadLiveFailure =
-    (!canonicalCached &&
-      canonicalResult === null &&
-      opts.memtree.lastCompressFailureArming(hash)) ||
+    (!canonicalCached && canonicalResult === null && canonicalFailureArming) ||
     (probeLegacy &&
       !legacyCached &&
       legacyResult === null &&
-      opts.memtree.lastCompressFailureArming(legacyHash));
+      legacyFailureArming);
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
@@ -2614,21 +2648,28 @@ async function recoverToolRouteMiss(args: {
     ? sessionId === undefined
       ? "no-session"
       : "prompt-pending"
-    : installFate ?? "upstream-failed";
+    : // No install fate means protocol-complete never fired. Split by who
+      // owned the close: a client mid-stream abort is not evidence about
+      // upstream health, and the attempt-rate tripwire needs to count the
+      // two separately.
+      installFate ?? (rec.clientAborted ? "client-aborted" : "upstream-failed");
   // A reservation that lost its race (stale) or never reached
   // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
   // it must stop suppressing whoever is still trying to install.
   if (rec.routeRecovery.install !== "installed") releaseOwnReservation();
-  // An upstream 5xx/529 burned the compressed forward AFTER a healthy
-  // compress: no route exists and the client retries the identical body, so
-  // refund the lane's blocking budget — epoch-guarded, so a late settle
-  // cannot re-grant a later human turn's lane. The retry's recompress is a
-  // compress-cache hit, so the re-attempt is cheap. Deliberately NOT
+  // A failed forward AFTER a healthy compress — upstream 5xx/529 or a client
+  // mid-stream abort — left no route and the client retries the identical
+  // body, so refund the lane's blocking budget — epoch-guarded, so a late
+  // settle cannot re-grant a later human turn's lane. The retry's recompress
+  // is a compress-cache hit, so the re-attempt is cheap. Deliberately NOT
   // refunded on reject-deletes: siblings sharing a parent-agent fallback
   // lane genuinely mismatch each other every turn, and refunding those would
-  // be one real blocking compress per tool step forever.
+  // be one real blocking compress per tool step forever. The two refunded
+  // fates are split in reqlog so the attempt-rate tripwire can tell client
+  // behavior from upstream health; the refund itself treats them alike.
   if (
-    rec.routeRecovery.install === "upstream-failed" &&
+    (rec.routeRecovery.install === "upstream-failed" ||
+      rec.routeRecovery.install === "client-aborted") &&
     state.mainRouteEpoch === routeEpoch
   ) {
     state.toolRecoveryAttemptedLanes.delete(routeKey);
@@ -2784,6 +2825,9 @@ function forwardRaw(
     const onResponseClose = () => {
       if (res.writableFinished || shutdownCancelled) return;
       clientAborted = true;
+      // Observability only: lets callers (and reqlog consumers) tell a
+      // client-owned close from an upstream failure after the settle.
+      if (rec) rec.clientAborted = true;
       activeUpstreamRes?.destroy();
       upstreamReq?.destroy();
       settle(false);

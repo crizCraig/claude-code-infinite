@@ -120,8 +120,10 @@ export interface MessagesRecord {
    * installed the route — a client retry after a pre-flush socket death —
    * forwarded verbatim with the route retained and no recovery attempt).
    * "rejected" covers every OTHER reason memoryRoutedToolBody refuses:
-   * an epoch mismatch, a changed system/prefix hash, a conversation that
-   * shrank below the stored prefix, and an unexpected tool suffix shape.
+   * a changed system/prefix hash, a conversation that shrank below the
+   * stored prefix, and an unexpected tool suffix shape. (An epoch-stale
+   * route never reaches rejection: getMemoryRoute drops it on lookup, so
+   * that case logs "missing".)
    * Absent means there was no applicable miss — hits and away-summary turns
    * never emit it. "none" is deliberately not a value.
    */
@@ -161,9 +163,23 @@ export interface MessagesRecord {
       | "stale"
       | "prompt-pending"
       | "no-session"
-      | "upstream-failed";
+      /**
+       * The recovered forward never reached protocol-complete and the
+       * downstream client had NOT aborted: an upstream 5xx/529 or a
+       * truncated upstream stream. Refunds the lane's blocking budget.
+       */
+      | "upstream-failed"
+      /**
+       * The downstream client aborted mid-stream before protocol-complete.
+       * Also refunds (like upstream-failed, no route exists and the client's
+       * identical-body retry is imminent), but split out so attempt-rate
+       * tripwires can tell client behavior from upstream health.
+       */
+      | "client-aborted";
   };
   upstreamStatus?: number;
+  /** The downstream client aborted before the response finished. */
+  clientAborted?: true;
   /** Forward start → first response byte from Anthropic. */
   ttfbMs?: number;
   /** Forward start → first upstream content_block_delta (SSE only). */
