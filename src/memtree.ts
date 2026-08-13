@@ -787,6 +787,12 @@ export class MemtreeClient {
       // `status` is absent when the call never got a response (network
       // error/timeout) — the arming default covers it.
       const status: number | undefined = err?.status;
+      // Delete-before-set so a re-failure moves to the back of the FIFO;
+      // Map.set on an existing key keeps its old insertion position, which
+      // would leave a fresh classification first in eviction order — under
+      // churn it could be evicted before the failing leg samples it and the
+      // sample would default to arming.
+      this.compressFailureArming.delete(hash);
       this.compressFailureArming.set(
         hash,
         status === undefined || status >= 500 || status === 402

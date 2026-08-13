@@ -189,12 +189,15 @@ interface ProxyState {
   /** Armed only by a main-thread UserPromptSubmit hook. */
   mainPromptArmed: boolean;
   /**
-   * True from a UserPromptSubmit bump until the first main-followup bump
-   * consumes it. The followup's single-wipe decision keys off THIS flag, not
-   * off mainPromptArmed: the arm can outlive its boundary (a followup with
-   * active subagents never consumes it, and a missed Stop never clears it),
-   * and trusting it would let a later hookless boundary inherit spent lanes
-   * from the previous human turn.
+   * True from a UserPromptSubmit bump until the boundary's own main request
+   * consumes it: a followup bump reads it to skip the second wipe, and a
+   * first-user-shaped main request (new conversation — no followup bump will
+   * come) clears it without bumping. A matching Stop also clears. The
+   * single-wipe decision keys off THIS flag, not off mainPromptArmed: the
+   * arm can outlive its boundary (a followup with active subagents never
+   * consumes it, and a missed Stop never clears it), and trusting it would
+   * let a later hookless boundary inherit spent lanes from the previous
+   * human turn.
    */
   recoveryBudgetWipedForBoundary: boolean;
   mainPromptId?: string;
@@ -1060,6 +1063,14 @@ async function handleMessages(
     if (opts.debug && isUserTurn) {
       console.error("[ccc proxy] first user turn: index in background, forward verbatim");
     }
+    // A first-user-shaped main request is its boundary's only main arrival —
+    // no followup bump will ever come to consume the UserPromptSubmit flag.
+    // Consume it here, or a later hookless followup would read THIS
+    // boundary's "already wiped" and skip its own turn's re-grant, carrying
+    // spent lanes across a human-turn boundary.
+    if (isMainRequest && isUserTurn) {
+      state.recoveryBudgetWipedForBoundary = false;
+    }
     let routedBody = forwardBody;
     let routedTool = false;
     let routeMiss: "missing" | "rejected" | "replay" | undefined;
@@ -1212,8 +1223,12 @@ async function handleMessages(
       routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool",
       routedBody
     );
-    // A replay is byte-identical to the request whose recovery already
-    // submitted this exact history; re-indexing it buys nothing.
+    // A replay matched the stored route's prefix hashes, which are
+    // normalization-tolerant — attribution/cache-control churn can make its
+    // bytes (and even its MemTree hash) differ from the installer's, so the
+    // indexedHashes dedupe would NOT absorb this resubmit. The skip is still
+    // sound: a live route proves the installer's compress() submitted this
+    // history in this process, so re-indexing buys nothing.
     if (routeMiss !== "replay") {
       opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
     }
@@ -2492,6 +2507,17 @@ async function recoverToolRouteMiss(args: {
     // no Anthropic request and no route.
     rec.routeRecovery = { conversationBytes, outcome: "client-closed" };
     releaseOwnReservation();
+    // Same hazard class as the refunded post-forward fates ("upstream-failed"
+    // / "client-aborted"): no route was installed and the client's identical
+    // retry is imminent. Without a refund, the retry hits "spent" and every
+    // subsequent tool turn in the epoch forwards full history. The retry's
+    // recompress is a compress-cache hit (client closes are deliberately
+    // never fed into compress()), so the re-attempt is cheap. Epoch-guarded
+    // like the other refunds so a late settle cannot re-grant a later human
+    // turn's lane.
+    if (state.mainRouteEpoch === routeEpoch) {
+      state.toolRecoveryAttemptedLanes.delete(routeKey);
+    }
     recordTurn(rec, "tool", Buffer.alloc(0));
     return;
   }
@@ -2837,6 +2863,14 @@ function forwardRaw(
       protocolComplete = complete;
       if (complete && !res.destroyed) notifyProtocolComplete();
       if (res.destroyed && !res.writableFinished) {
+        // The destroy is client-owned here: upstream ended cleanly (its
+        // error/aborted handlers settle synchronously before this can run)
+        // and shutdown teardown detaches this path first. Stamp directly —
+        // this settle detaches onResponseClose before the 'close' event that
+        // normally stamps can fire, and losing that race would misclassify a
+        // client abort as "upstream-failed" in the recovery settle.
+        clientAborted = true;
+        if (rec) rec.clientAborted = true;
         settle(false);
         return;
       }
