@@ -2720,23 +2720,37 @@ async function recoverToolRouteMiss(args: {
   // forwardRaw, and this is the "one safe retry" its comment promises — if
   // it escaped here, the settle logic below would be skipped and the lane's
   // reservation stranded for the rest of the epoch. With no install fate the
-  // fallback below still labels, releases, and refunds.
+  // fallback below still labels ("activation-error" for this corner) and
+  // releases; no refund, since the delivered client will not retry.
+  let activationRetryThrew = false;
   if (delivered) {
     try {
       activateRecoveredRoute();
     } catch {
-      /* fate/release/refund handled by the settle logic below */
+      // Fate/release handled by the settle logic below. Remember the throw:
+      // this is a fully delivered response with no route, which must not be
+      // labeled (or refunded) as an upstream failure.
+      activationRetryThrew = true;
     }
   }
   rec.routeRecovery.install = !routeOwning
     ? sessionId === undefined
       ? "no-session"
       : "prompt-pending"
-    : // No install fate means protocol-complete never fired. Split by who
-      // owned the close: a client mid-stream abort is not evidence about
-      // upstream health, and the attempt-rate tripwire needs to count the
-      // two separately.
-      installFate ?? (rec.clientAborted ? "client-aborted" : "upstream-failed");
+    : // No install fate normally means protocol-complete never fired —
+      // split by who owned the close: a client mid-stream abort is not
+      // evidence about upstream health, and the attempt-rate tripwire needs
+      // to count the two separately. The one exception is a delivered
+      // response whose route bookkeeping threw at both activation attempts:
+      // label it distinctly so it neither pollutes the upstream-failure
+      // metric nor triggers the refund (the client got its answer and no
+      // retry is coming).
+      installFate ??
+      (activationRetryThrew
+        ? "activation-error"
+        : rec.clientAborted
+          ? "client-aborted"
+          : "upstream-failed");
   // A reservation that lost its race (stale) or never reached
   // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
   // it must stop suppressing whoever is still trying to install.

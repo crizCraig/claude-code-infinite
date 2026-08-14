@@ -8286,9 +8286,30 @@ test("each compress leg samples its arming class at its own settle", async () =>
     legacyGate.resolve();
     await first;
     await Promise.all(seconds);
-    for (const settled of messageRecords(records)) {
-      assert.equal(settled.routeRecovery.outcome, "failed");
+    // Lane A and the one lane whose canonical went live both classified
+    // before the fuse could arm, so they must have settled "failed". A
+    // straggler retry-loop lane, though, may reach classification only
+    // AFTER legacyGate.resolve() let lane A's settle arm the fuse — under
+    // load its record is legitimately "cooldown", which is consistent with
+    // (and caused by) exactly the arming this test pins. Under the
+    // regression (post-Promise.all sampling reads the 400) no record can be
+    // "cooldown" at all, so admitting it here gives the regression nothing.
+    const preProbe = messageRecords(records);
+    assert.equal(
+      preProbe[0].routeRecovery.outcome,
+      "failed",
+      "lane A's live 500 must settle failed"
+    );
+    for (const settled of preProbe.slice(1)) {
+      assert.ok(
+        ["failed", "cooldown"].includes(settled.routeRecovery.outcome),
+        `unexpected outcome ${settled.routeRecovery.outcome}`
+      );
     }
+    assert.ok(
+      preProbe.slice(1).some((s) => s.routeRecovery.outcome === "failed"),
+      "the live 400 lane must settle failed"
+    );
 
     // Lane A's 500 must have armed the shared fuse: the class was read at
     // the canonical leg's own settle, before lane B's 400 overwrote it.

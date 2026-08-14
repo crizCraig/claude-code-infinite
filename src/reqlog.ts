@@ -170,6 +170,15 @@ export interface MessagesRecord {
        */
       | "upstream-failed"
       /**
+       * The response was fully delivered but route bookkeeping threw at
+       * BOTH the protocol-complete attempt and the delivered-settle retry,
+       * so no route exists. Releases the lane's reservation but does NOT
+       * refund: the upstream served the turn and the client will not retry,
+       * so this is not upstream-health evidence and a refund would buy a
+       * blocking recompress nothing is coming back for.
+       */
+      | "activation-error"
+      /**
        * The downstream client aborted mid-stream before protocol-complete.
        * Also refunds (like upstream-failed, no route exists and the client's
        * identical-body retry is imminent), but split out so attempt-rate
