@@ -165,8 +165,11 @@ export interface MessagesRecord {
       | "no-session"
       /**
        * The recovered forward never reached protocol-complete and the
-       * downstream client had NOT aborted: an upstream 5xx/529 or a
-       * truncated upstream stream. Refunds the lane's blocking budget.
+       * downstream client had NOT aborted. Typically an upstream 5xx/529
+       * or a truncated upstream stream, but any non-2xx of the compressed
+       * forward lands here — including a plain 4xx, which is deliberately
+       * non-arming for the fuse — as does proxy-shutdown teardown of an
+       * in-flight recovery. Refunds the lane's blocking budget.
        */
       | "upstream-failed"
       /**
@@ -177,13 +180,15 @@ export interface MessagesRecord {
        * sub-case the client got its complete answer — a fast-tool abort
        * after message_stop lands here, not in "client-aborted" — so no
        * identical-body retry is coming, and the throw is not
-       * upstream-health evidence. A socket that dies before the accepted
-       * message_stop bytes flush lands here too and DOES retry the
-       * identical body; that retry finds its lane spent until the next
-       * human-turn re-grant — a bounded degradation accepted because the
-       * two closes are indistinguishable at settle time and refunding both
-       * would fund one blocking recompress per tool turn under a
-       * deterministic activation throw.
+       * upstream-health evidence. Rarer closes land here too: a socket
+       * that dies before the accepted message_stop bytes flush (which
+       * DOES retry the identical body) and an upstream-owned error
+       * arriving after the data chunk that carried message_stop. A retry
+       * finds its lane spent until the next human-turn re-grant — a
+       * bounded degradation accepted because the closes are
+       * indistinguishable at settle time and refunding them would fund
+       * one blocking recompress per tool turn under a deterministic
+       * activation throw.
        */
       | "activation-error"
       /**

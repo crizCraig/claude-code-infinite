@@ -2723,15 +2723,17 @@ async function recoverToolRouteMiss(args: {
   // Set when either activation attempt throws. Protocol-complete firing
   // means the upstream served the complete turn and the proxy accepted the
   // message_stop bytes into the response — not that the client received
-  // them. A throw there followed by a client-owned close must NOT fall
-  // through to "client-aborted": in the common sub-case (fast-tool abort)
+  // them. A throw there must NOT fall through to "client-aborted" or
+  // "upstream-failed" at settle: in the common sub-case (fast-tool abort)
   // the client consumed its answer and no identical-body retry is coming.
-  // A socket that dies before the queued bytes flush is indistinguishable
-  // at settle time and DOES retry the identical body; it loses the refund —
-  // an accepted, bounded degradation (lane stays spent until the next
-  // human-turn re-grant), because refunding both sub-cases would fund one
-  // blocking recompress per tool turn under a deterministic activation
-  // throw.
+  // The close is not always client-owned — an upstream socket error after
+  // the data chunk carrying message_stop lands here too — and a socket
+  // that dies before the queued bytes flush DOES retry the identical body.
+  // Those rarer closes lose the refund — an accepted, bounded degradation
+  // (lane stays spent until the next human-turn re-grant), because the
+  // closes are indistinguishable at settle time and refunding them would
+  // fund one blocking recompress per tool turn under a deterministic
+  // activation throw.
   let activationThrew = false;
   const delivered = await forwardRaw(
     req,
@@ -2789,9 +2791,10 @@ async function recoverToolRouteMiss(args: {
       // pollutes the upstream-failure metric nor triggers the refund. In
       // the common sub-case the client got its answer (a fast-tool abort
       // consumed message_stop first) and no identical-body retry is coming;
-      // the rare pre-flush socket death does retry and eats the spent lane
-      // — see the activationThrew comment above for why that trade-off is
-      // deliberate.
+      // the rarer closes — a pre-flush socket death (which does retry and
+      // eats the spent lane) or an upstream-owned error after the accepted
+      // message_stop chunk — land here too. See the activationThrew comment
+      // above for why that trade-off is deliberate.
       installFate ??
       (activationThrew
         ? "activation-error"
