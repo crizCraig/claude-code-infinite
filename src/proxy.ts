@@ -1562,7 +1562,23 @@ async function handleMessages(
       upstream,
       state.shutdownSignal,
       rec,
-      activateMemoryRoute
+      // Wrapped like the recovery twin's protocol-complete callback — not
+      // for behavior (forwardRaw's notify catch swallows a throw either
+      // way, and routeActivationAttempted stays false so the
+      // delivered-settle retry below still gets its one safe attempt) but
+      // for observability: a bare throw here otherwise leaves zero trace,
+      // unlike the recovery path's "activation-error" install fate.
+      () => {
+        try {
+          activateMemoryRoute();
+        } catch (err) {
+          if (opts.debug) {
+            console.error(
+              `[ccc proxy] followup route activation threw at protocol-complete: ${err}`
+            );
+          }
+        }
+      }
     ).then(
       (delivered) => {
         // actuallyCompressed is guaranteed true past the early return above.
@@ -1593,8 +1609,13 @@ async function handleMessages(
         // and strand the uncommitted reservation, so release it instead.
         try {
           activateMemoryRoute();
-        } catch {
+        } catch (err) {
           if (!routeActivationAttempted) releaseUncommittedRouteDecision();
+          if (opts.debug) {
+            console.error(
+              `[ccc proxy] followup route activation retry threw: ${err}`
+            );
+          }
         }
       }
     )
@@ -2700,10 +2721,17 @@ async function recoverToolRouteMiss(args: {
   // human turn without cross-referencing reqlog.
   capture(opts, "anthropic-request-memory-tool", compressedRaw);
   // Set when either activation attempt throws. Protocol-complete firing
-  // means the upstream served the complete turn, so a throw there followed
-  // by a fast-tool abort must NOT fall through to "client-aborted": the
-  // client consumed its answer through message_stop, no identical-body
-  // retry is coming, and the refund rationale does not hold.
+  // means the upstream served the complete turn and the proxy accepted the
+  // message_stop bytes into the response — not that the client received
+  // them. A throw there followed by a client-owned close must NOT fall
+  // through to "client-aborted": in the common sub-case (fast-tool abort)
+  // the client consumed its answer and no identical-body retry is coming.
+  // A socket that dies before the queued bytes flush is indistinguishable
+  // at settle time and DOES retry the identical body; it loses the refund —
+  // an accepted, bounded degradation (lane stays spent until the next
+  // human-turn re-grant), because refunding both sub-cases would fund one
+  // blocking recompress per tool turn under a deterministic activation
+  // throw.
   let activationThrew = false;
   const delivered = await forwardRaw(
     req,
@@ -2758,9 +2786,12 @@ async function recoverToolRouteMiss(args: {
       // upstream served to protocol-complete whose route bookkeeping threw
       // at an activation attempt (the protocol-complete attempt, the
       // delivered retry, or both): label it distinctly so it neither
-      // pollutes the upstream-failure metric nor triggers the refund — the
-      // client got its answer (even a fast-tool abort here consumed
-      // message_stop first) and no identical-body retry is coming.
+      // pollutes the upstream-failure metric nor triggers the refund. In
+      // the common sub-case the client got its answer (a fast-tool abort
+      // consumed message_stop first) and no identical-body retry is coming;
+      // the rare pre-flush socket death does retry and eats the spent lane
+      // — see the activationThrew comment above for why that trade-off is
+      // deliberate.
       installFate ??
       (activationThrew
         ? "activation-error"

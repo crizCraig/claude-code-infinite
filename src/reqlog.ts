@@ -173,11 +173,17 @@ export interface MessagesRecord {
        * The upstream served the turn to protocol-complete but route
        * bookkeeping threw at an activation attempt (the protocol-complete
        * attempt, the delivered-settle retry, or both), so no route exists.
-       * Releases the lane's reservation but does NOT refund: the client got
-       * its complete answer — a fast-tool abort after message_stop lands
-       * here, not in "client-aborted" — so no identical-body retry is
-       * coming, and the throw is not upstream-health evidence; a refund
-       * would buy a blocking recompress nothing is coming back for.
+       * Releases the lane's reservation but does NOT refund. In the common
+       * sub-case the client got its complete answer — a fast-tool abort
+       * after message_stop lands here, not in "client-aborted" — so no
+       * identical-body retry is coming, and the throw is not
+       * upstream-health evidence. A socket that dies before the accepted
+       * message_stop bytes flush lands here too and DOES retry the
+       * identical body; that retry finds its lane spent until the next
+       * human-turn re-grant — a bounded degradation accepted because the
+       * two closes are indistinguishable at settle time and refunding both
+       * would fund one blocking recompress per tool turn under a
+       * deterministic activation throw.
        */
       | "activation-error"
       /**
