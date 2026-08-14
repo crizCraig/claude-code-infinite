@@ -1075,6 +1075,18 @@ async function handleMessages(
     // of those consume would leave the real followup bumping with keep=false
     // — a second wipe in the same boundary, re-granting lanes spent moments
     // earlier. That is the exact double-wipe keepRecoveryBudget closes.
+    //
+    // Two residual gaps are accepted (cycle-5 review), both bounded to one
+    // boundary and both degrading toward verbatim forwards:
+    // - A transformed prompt (slash-command expansion, hook-wrapped text)
+    //   fails the correlation and never consumes; a later hookless followup
+    //   then keeps last boundary's spent lanes spent for one turn. Stop's
+    //   clear-and-regrant converges it. Clearing on ANY first-user arrival
+    //   would re-open the double-wipe above — don't.
+    // - A side call that echoes the typed prompt verbatim passes the
+    //   correlation and consumes, re-admitting the double-wipe for that
+    //   narrow window. Text correlation cannot distinguish it; cost is one
+    //   extra blocking compress, capped by the per-lane budget.
     if (
       isMainRequest &&
       isUserTurn &&

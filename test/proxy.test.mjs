@@ -5657,6 +5657,13 @@ test("a closed newer subagent followup hands its lane decision back", async () =
       );
     });
     await newerClientGone;
+    // clientReq.destroy() resolves the client-LOCAL 'error' immediately; the
+    // proxy observes the close only when the socket teardown reaches its res
+    // 'close' listener. If the gate resolves before that, compression settles
+    // with the client still apparently live and the followup logs a normal
+    // record — "followup-client-closed" then never arrives, which was this
+    // test's historic ~1-in-5 flake. Let the close propagate first.
+    await new Promise((r) => setTimeout(r, 150));
     gates.BBB.resolve();
     await within(
       waitFor(() =>
@@ -5664,7 +5671,10 @@ test("a closed newer subagent followup hands its lane decision back", async () =
           (record) => record.turnType === "followup-client-closed"
         )
       ),
-      "the abandoned followup never released its decision"
+      "the abandoned followup never released its decision",
+      // waitFor's own 3s budget, not within's 1s default: the record can
+      // legitimately trail the gate under full-suite event-loop load.
+      3_000
     );
 
     gates.AAA.resolve();
