@@ -5793,6 +5793,12 @@ test("an agent followup keeps its reservation through delayed activation", async
     // activate, but must keep its own generation committed when it does.
     abandonedRequest.destroy();
     await abandonedClientGone;
+    // Same race as the deflaked lane-handback test: destroy() resolves the
+    // client-LOCAL error immediately, but the proxy observes the close only
+    // at its res 'close' listener. Let the teardown propagate before letting
+    // compression settle, or CCC forwards as live and the asserted
+    // "followup-client-closed" record never arrives.
+    await new Promise((r) => setTimeout(r, 150));
     gates.CCC.resolve();
     await within(
       waitFor(() =>
@@ -6684,6 +6690,10 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
       waitFor(() => compressArrived).then(() => clientReq.destroy());
     });
     await clientGone;
+    // Let the socket teardown reach the proxy's res 'close' listener before
+    // compression settles (same race as the deflaked lane-handback test);
+    // otherwise the outcome is "failed" instead of "client-closed".
+    await new Promise((r) => setTimeout(r, 150));
     held.resolve();
     await within(
       waitFor(() =>
@@ -7926,6 +7936,11 @@ test("a client closed during the blocking compress refunds the lane budget", asy
       waitFor(() => compressArrived).then(() => clientReq.destroy());
     });
     await clientGone;
+    // Let the close propagate to the proxy's res 'close' listener before the
+    // compress settles (same race as the deflaked lane-handback test);
+    // otherwise recovery forwards as live, logs "compressed", and the refund
+    // assertions below fail.
+    await new Promise((r) => setTimeout(r, 150));
     gate.resolve();
     await within(
       waitFor(() =>
@@ -8235,37 +8250,60 @@ test("each compress leg samples its arming class at its own settle", async () =>
   try {
     const first = postMessages(proxy.port, turn, laneA);
     await waitFor(() => canonicalCalls === 1 && legacyArrived);
-    // Let lane A's canonical leg settle client-side — the 500 records its
-    // arming class and the leg's .then samples it — and its failed promise
-    // drop out of the compress cache, so lane B's canonical is a fresh live
-    // call rather than a dedupe join.
-    await new Promise((r) => setTimeout(r, 150));
-
-    const second = postMessages(proxy.port, turn, laneB);
-    await waitFor(() => canonicalCalls === 2);
+    // Lane B's canonical must be a LIVE call, which requires lane A's failed
+    // canonical to have settled client-side first (failures are deleted from
+    // the dedupe cache at settle; an in-flight promise is joined). That
+    // settle is not externally observable and a fixed sleep here was
+    // load-sensitive: a post arriving too early joins the dedupe and can
+    // never go live, timing the test out. Post and re-post from FRESH lanes
+    // instead — each lane brings its own recovery budget, while the compress
+    // hash the dedupe and arming entry key on depends only on the shared
+    // turn body — until one lands live at the server.
+    const seconds = [postMessages(proxy.port, turn, laneB)];
+    for (let tries = 0; canonicalCalls < 2 && tries < 20; tries++) {
+      await new Promise((r) => setTimeout(r, 150));
+      if (canonicalCalls < 2) {
+        seconds.push(
+          postMessages(proxy.port, turn, {
+            ...SESSION,
+            "x-claude-code-agent-id": `agent-arm-b${tries}`,
+          })
+        );
+      }
+    }
+    await waitFor(() => canonicalCalls >= 2);
     // Give the 400's non-arming class time to overwrite the per-hash entry
     // while lane A is still parked on the held legacy leg — the exact window
     // the sample-at-settle contract closes. (Lane B's own legacy leg joins
     // lane A's in-flight promise, so it was cached at sampling time and
-    // contributes no fuse evidence of its own.)
+    // contributes no fuse evidence of its own.) This window is deliberately
+    // a fixed sleep: if it ever proves too short under load, the failure
+    // direction is a weaker pin — regressed post-Promise.all sampling would
+    // read the not-yet-overwritten 500 and still pass — never a flake of the
+    // fixed code.
     await new Promise((r) => setTimeout(r, 150));
 
     legacyGate.resolve();
     await first;
-    await second;
-    for (const settled of messageRecords(records).slice(-2)) {
+    await Promise.all(seconds);
+    for (const settled of messageRecords(records)) {
       assert.equal(settled.routeRecovery.outcome, "failed");
     }
 
     // Lane A's 500 must have armed the shared fuse: the class was read at
     // the canonical leg's own settle, before lane B's 400 overwrote it.
+    const callsBeforeProbe = canonicalCalls;
     await postMessages(proxy.port, largeToolTurn("CCC"), laneC);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
       "cooldown",
       "a post-Promise.all sample would have read the overwriting 400"
     );
-    assert.equal(canonicalCalls, 2, "the cooldown skip paid nothing");
+    assert.equal(
+      canonicalCalls,
+      callsBeforeProbe,
+      "the cooldown skip paid nothing"
+    );
   } finally {
     legacyGate.resolve();
     proxy.close();

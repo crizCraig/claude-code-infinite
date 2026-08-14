@@ -1087,6 +1087,17 @@ async function handleMessages(
     //   correlation and consumes, re-admitting the double-wipe for that
     //   narrow window. Text correlation cannot distinguish it; cost is one
     //   extra blocking compress, capped by the per-lane budget.
+    // - (cycle-6 review) The rideability veto below is length-only: a
+    //   straggler recovery can install an old-history route on the main lane
+    //   after the prompt-boundary bump, and a merged-prompt wrapper longer
+    //   than that stale prefix is vetoed out of recovery classification. If
+    //   its ride then hash-mismatches, it rejects into tool recovery with
+    //   the prompt window still pending and the arm never consumed on that
+    //   path, so the rest of the turn runs transform-only-then-spent. Same
+    //   envelope as the two gaps above: one boundary, verbatim-forward
+    //   degradation, converged by Stop's clear-and-regrant. In the common
+    //   sub-case the hashes match and the wrapper simply rides with the
+    //   prompt in the suffix, which is correct.
     if (
       isMainRequest &&
       isUserTurn &&
@@ -1577,8 +1588,14 @@ async function handleMessages(
         // count_tokens reports the uncompressed conversation and Claude Code
         // auto-compacts a context that memory had already shrunk.
         // Retain delivery completion as a defensive retry if protocol-time
-        // route bookkeeping failed unexpectedly.
-        activateMemoryRoute();
+        // route bookkeeping failed unexpectedly. Guarded like the recovery
+        // twin: a repeat throw here would reject inside this settle callback
+        // and strand the uncommitted reservation, so release it instead.
+        try {
+          activateMemoryRoute();
+        } catch {
+          if (!routeActivationAttempted) releaseUncommittedRouteDecision();
+        }
       }
     )
   );
@@ -2699,7 +2716,18 @@ async function recoverToolRouteMiss(args: {
   // candidate already activated at message_stop deliberately survives a
   // delivered=false settle (fast-tool abort); an upstream 500/529 or an
   // incomplete response never reached protocol-complete and never installs.
-  if (delivered) activateRecoveredRoute();
+  // Swallow a repeat throw: the protocol-complete attempt is guarded inside
+  // forwardRaw, and this is the "one safe retry" its comment promises — if
+  // it escaped here, the settle logic below would be skipped and the lane's
+  // reservation stranded for the rest of the epoch. With no install fate the
+  // fallback below still labels, releases, and refunds.
+  if (delivered) {
+    try {
+      activateRecoveredRoute();
+    } catch {
+      /* fate/release/refund handled by the settle logic below */
+    }
+  }
   rec.routeRecovery.install = !routeOwning
     ? sessionId === undefined
       ? "no-session"
