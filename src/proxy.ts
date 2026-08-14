@@ -2699,6 +2699,12 @@ async function recoverToolRouteMiss(args: {
   // must be able to tell a recovered tool request from a normal compressed
   // human turn without cross-referencing reqlog.
   capture(opts, "anthropic-request-memory-tool", compressedRaw);
+  // Set when either activation attempt throws. Protocol-complete firing
+  // means the upstream served the complete turn, so a throw there followed
+  // by a fast-tool abort must NOT fall through to "client-aborted": the
+  // client consumed its answer through message_stop, no identical-body
+  // retry is coming, and the refund rationale does not hold.
+  let activationThrew = false;
   const delivered = await forwardRaw(
     req,
     res,
@@ -2710,19 +2716,27 @@ async function recoverToolRouteMiss(args: {
     // Protocol-complete (accepted SSE message_stop or a complete 2xx JSON
     // response) is the real activation point, exactly as on the followup
     // path, so a fast tool request right after message_stop can ride.
-    activateRecoveredRoute
+    () => {
+      try {
+        activateRecoveredRoute();
+      } catch {
+        // forwardRaw's own guard would swallow this anyway; catching here
+        // records that a route was earned but its bookkeeping threw, which
+        // the settle label below must be able to tell apart from a
+        // mid-stream abort or an upstream failure.
+        activationThrew = true;
+      }
+    }
   );
   // Defensive delivery-complete fallback, mirroring the followup path. A
   // candidate already activated at message_stop deliberately survives a
   // delivered=false settle (fast-tool abort); an upstream 500/529 or an
   // incomplete response never reached protocol-complete and never installs.
-  // Swallow a repeat throw: the protocol-complete attempt is guarded inside
-  // forwardRaw, and this is the "one safe retry" its comment promises — if
-  // it escaped here, the settle logic below would be skipped and the lane's
-  // reservation stranded for the rest of the epoch. With no install fate the
-  // fallback below still labels ("activation-error" for this corner) and
-  // releases; no refund, since the delivered client will not retry.
-  let activationRetryThrew = false;
+  // Swallow a repeat throw: if it escaped here, the settle logic below
+  // would be skipped and the lane's reservation stranded for the rest of
+  // the epoch. With no install fate the fallback below still labels
+  // ("activation-error" for this corner) and releases; no refund, since
+  // the delivered client will not retry.
   if (delivered) {
     try {
       activateRecoveredRoute();
@@ -2730,7 +2744,7 @@ async function recoverToolRouteMiss(args: {
       // Fate/release handled by the settle logic below. Remember the throw:
       // this is a fully delivered response with no route, which must not be
       // labeled (or refunded) as an upstream failure.
-      activationRetryThrew = true;
+      activationThrew = true;
     }
   }
   rec.routeRecovery.install = !routeOwning
@@ -2740,13 +2754,15 @@ async function recoverToolRouteMiss(args: {
     : // No install fate normally means protocol-complete never fired —
       // split by who owned the close: a client mid-stream abort is not
       // evidence about upstream health, and the attempt-rate tripwire needs
-      // to count the two separately. The one exception is a delivered
-      // response whose route bookkeeping threw at both activation attempts:
-      // label it distinctly so it neither pollutes the upstream-failure
-      // metric nor triggers the refund (the client got its answer and no
-      // retry is coming).
+      // to count the two separately. The one exception is a turn the
+      // upstream served to protocol-complete whose route bookkeeping threw
+      // at an activation attempt (the protocol-complete attempt, the
+      // delivered retry, or both): label it distinctly so it neither
+      // pollutes the upstream-failure metric nor triggers the refund — the
+      // client got its answer (even a fast-tool abort here consumed
+      // message_stop first) and no identical-body retry is coming.
       installFate ??
-      (activationRetryThrew
+      (activationThrew
         ? "activation-error"
         : rec.clientAborted
           ? "client-aborted"

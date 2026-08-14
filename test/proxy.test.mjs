@@ -8294,21 +8294,23 @@ test("each compress leg samples its arming class at its own settle", async () =>
     // (and caused by) exactly the arming this test pins. Under the
     // regression (post-Promise.all sampling reads the 400) no record can be
     // "cooldown" at all, so admitting it here gives the regression nothing.
+    // No positional assumptions: records are ordered by response-settle
+    // time, and lane A's record push can race a straggler's verbatim
+    // forward at the shared upstream — so count outcomes instead of
+    // indexing. Lane A structurally cannot record "cooldown" (it passed
+    // the fuse gate before any arming evidence existed) and the live-400
+    // lane entered compress before arming was possible, so correct code
+    // always yields at least two "failed" records.
     const preProbe = messageRecords(records);
-    assert.equal(
-      preProbe[0].routeRecovery.outcome,
-      "failed",
-      "lane A's live 500 must settle failed"
-    );
-    for (const settled of preProbe.slice(1)) {
+    for (const settled of preProbe) {
       assert.ok(
         ["failed", "cooldown"].includes(settled.routeRecovery.outcome),
         `unexpected outcome ${settled.routeRecovery.outcome}`
       );
     }
     assert.ok(
-      preProbe.slice(1).some((s) => s.routeRecovery.outcome === "failed"),
-      "the live 400 lane must settle failed"
+      preProbe.filter((s) => s.routeRecovery.outcome === "failed").length >= 2,
+      "lane A's live 500 and the live-400 lane must both settle failed"
     );
 
     // Lane A's 500 must have armed the shared fuse: the class was read at
