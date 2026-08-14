@@ -160,6 +160,16 @@ export interface ProxyOptions {
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
   captureDir?: string;
+  /**
+   * Test-only fault-injection seam: invoked inside installMemoryRoute after
+   * its guards pass, immediately before the route is stored. Throwing here
+   * simulates route bookkeeping failing (the cloneJson/JSON.stringify
+   * calls), which no natural input can trigger — every install input has
+   * already survived JSON.parse. Exists solely so the "activation-error"
+   * install fate (label precedence over clientAborted, release without
+   * refund) is pinnable by tests. Undefined in production.
+   */
+  routeInstallFault?: () => void;
 }
 
 export interface RunningProxy {
@@ -292,6 +302,8 @@ interface ProxyState {
   toolRecoveryCooldownUntil: number;
   /** Fired by drain after its grace period so every forwarding path can stop. */
   shutdownSignal: AbortSignal;
+  /** Test-only fault-injection seam; see ProxyOptions.routeInstallFault. */
+  routeInstallFault?: () => void;
 }
 
 interface MemoryRoute {
@@ -570,6 +582,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     toolRecoveryAttemptedLanes: new Set(),
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
+    routeInstallFault: opts.routeInstallFault,
   };
   const server = http.createServer((req, res) => {
     const accepted = { req, res };
@@ -1795,6 +1808,11 @@ function installMemoryRoute(
     state.memoryRoutes.delete(key);
     return false;
   }
+  // Test-only fault-injection seam (undefined in production): placed after
+  // every guard and before the store, exactly where the route object's
+  // cloneJson/hash construction could throw, so tests can reach the
+  // "activation-error" settle label. See ProxyOptions.routeInstallFault.
+  state.routeInstallFault?.();
   setMemoryRoute(state, key, {
     sessionId,
     originalSystemHash: routeValueHash(

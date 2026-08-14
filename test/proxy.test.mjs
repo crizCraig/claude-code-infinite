@@ -8108,6 +8108,79 @@ test("a mid-stream client abort logs client-aborted and refunds the lane", async
   }
 });
 
+test("a route bookkeeping throw labels activation-error and keeps the lane spent", async () => {
+  // The third no-install fate. The upstream serves the recovered forward to
+  // protocol-complete and the client receives its complete answer, but route
+  // bookkeeping throws at BOTH activation attempts (the protocol-complete
+  // callback and the delivered-settle retry) — injected via the test-only
+  // routeInstallFault seam, which fires after installMemoryRoute's guards and
+  // immediately before the store. The settle must label "activation-error",
+  // never "upstream-failed" (the model answered) or "client-aborted" (the
+  // client stayed to delivery). Unlike those two fates it must NOT refund the
+  // lane budget — a deterministic bookkeeping throw would otherwise fund one
+  // blocking recompress per tool turn — while still releasing the lane's
+  // reservation so the next miss classifies cleanly instead of erroring.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    routeInstallFault: () => {
+      throw new Error("injected");
+    },
+  });
+  const conversation = largeToolTurn();
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  try {
+    const answer = await postMessages(proxy.port, conversation, SESSION);
+    assert.equal(answer.id, "msg_upstream", "the client got its full answer");
+    await waitFor(() =>
+      messageRecords(records).some((r) => r.routeRecovery?.install !== undefined)
+    );
+    const first = messageRecords(records)[0];
+    assert.equal(first.turnType, "tool-recompressed");
+    assert.equal(first.routeMiss, "missing");
+    assert.equal(first.routeRecovery.outcome, "compressed");
+    assert.equal(
+      first.routeRecovery.install,
+      "activation-error",
+      "a delivered turn whose bookkeeping threw is neither upstream-failed nor client-aborted"
+    );
+    assert.ok(!first.clientAborted, "the client stayed connected to delivery");
+    const liveCompresses = blockingCalls();
+
+    // NO refund: the identical-shape retry on the same lane and epoch finds
+    // the budget still consumed. The empty lane (nothing installed → not a
+    // "replay") logs a plain missing miss, classifies "spent" — the
+    // released reservation is what lets it reach that label at all — and
+    // forwards the original history without paying a second blocking
+    // compress.
+    await postMessages(proxy.port, conversation, SESSION);
+    await waitFor(() => messageRecords(records).length >= 2);
+    const retry = messageRecords(records).at(-1);
+    assert.equal(retry.routeMiss, "missing", "the throw left no route behind");
+    assert.equal(
+      retry.routeRecovery.outcome,
+      "spent",
+      "activation-error must not refund the lane budget"
+    );
+    assert.equal(retry.routeRecovery.conversationBytes, undefined);
+    assert.equal(retry.turnType, "tool");
+    assert.equal(blockingCalls(), liveCompresses, "a spent skip pays nothing");
+    assert.match(
+      JSON.stringify(upstream.seen.at(-1).body.messages),
+      /first question/,
+      "the spent miss forwards the original history verbatim"
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("a first-user main consumes the boundary wipe so a later hookless followup re-grants", async () => {
   // Cycle-3 fix: a first-user-shaped main request is its boundary's only
   // main arrival — no followup bump will ever come to consume the
