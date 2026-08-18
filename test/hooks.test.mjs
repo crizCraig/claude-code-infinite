@@ -57,19 +57,22 @@ test("MessageDisplay resolves late success metrics when the notice is claimed", 
 });
 
 test("MessageDisplay appends warnings only on final; Stop is no-duplicate fallback", () => {
-  const queue = new NoticeDeliveryQueue();
+  const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   queue.queueSuffix("⚠ MemTree degraded — this turn ran uncompressed");
   assert.equal(queue.claim(display({ final: false })), null);
   assert.deepEqual(queue.claim(display({ index: 1, final: true, delta: "done" })), {
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
-      displayContent: "done\n⚠ MemTree degraded — this turn ran uncompressed",
+      displayContent:
+        "done\n\x1b[33m⚠ MemTree degraded — this turn ran uncompressed\x1b[39m",
     },
   });
   assert.equal(queue.claim(stop()), null);
 
   queue.queueSuffix("⚠ fallback");
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ fallback" });
+  assert.deepEqual(queue.claim(stop()), {
+    systemMessage: "\x1b[33m⚠ fallback\x1b[39m",
+  });
   assert.equal(queue.claim(stop()), null);
 });
 
@@ -99,7 +102,7 @@ test("prompt_id prevents an unrelated display or Stop from claiming", () => {
 
 test("payment callback runs only when a hook claims the notice", () => {
   let delivered = 0;
-  const queue = new NoticeDeliveryQueue();
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
   queue.queueSuffix("payment", () => delivered++);
   queue.clearForUserRequest();
   assert.equal(delivered, 0);
@@ -133,6 +136,11 @@ test("success color follows terminal capability and monochrome conventions", () 
   assert.equal(
     plain.claim(display()).hookSpecificOutput.displayContent,
     "✓ success\nanswer"
+  );
+  plain.queueSuffix("⚠ warning");
+  assert.equal(
+    plain.claim(display({ final: true })).hookSpecificOutput.displayContent,
+    "answer\n⚠ warning"
   );
 
   const greenFallback = new NoticeDeliveryQueue(undefined, undefined, true);

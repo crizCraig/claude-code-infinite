@@ -15,6 +15,7 @@ import path from "node:path";
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
+const ANSI_YELLOW = "\x1b[33m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
 const STARTUP_NOTICE_FILE = "startup-notice.json";
 
@@ -116,7 +117,7 @@ export class NoticeDeliveryQueue {
   constructor(
     private readonly ttlMs = DEFAULT_NOTICE_TTL_MS,
     private readonly now: () => number = Date.now,
-    private readonly colorSuccess = terminalSupportsColor()
+    private readonly color = terminalSupportsColor()
   ) {}
 
   /** Replace stale delivery state when a new main human prompt is submitted. */
@@ -169,7 +170,7 @@ export class NoticeDeliveryQueue {
     markDelivered(suffix);
     const lines: string[] = [];
     if (prefix) lines.push(this.styleSuccess(resolveNoticeText(prefix)));
-    if (suffix) lines.push(resolveNoticeText(suffix));
+    if (suffix) lines.push(this.styleWarning(resolveNoticeText(suffix)));
     return {
       systemMessage: lines.join("\n"),
     };
@@ -204,7 +205,8 @@ export class NoticeDeliveryQueue {
     }
     if (suffix) {
       const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
-      displayContent = `${displayContent}${separator}${resolveNoticeText(suffix)}`;
+      const styled = this.styleWarning(resolveNoticeText(suffix));
+      displayContent = `${displayContent}${separator}${styled}`;
     }
     return {
       hookSpecificOutput: {
@@ -226,9 +228,16 @@ export class NoticeDeliveryQueue {
   }
 
   private styleSuccess(text: string): string {
-    return this.colorSuccess
-      ? `${ANSI_GREEN}${text}${ANSI_DEFAULT_FOREGROUND}`
-      : text;
+    return this.style(text, ANSI_GREEN);
+  }
+
+  /** Warnings get the same own-line treatment as success, in yellow. */
+  private styleWarning(text: string): string {
+    return this.style(text, ANSI_YELLOW);
+  }
+
+  private style(text: string, sgr: string): string {
+    return this.color ? `${sgr}${text}${ANSI_DEFAULT_FOREGROUND}` : text;
   }
 
   private freshPending(): PendingNotice | null {
