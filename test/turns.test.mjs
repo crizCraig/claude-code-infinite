@@ -127,6 +127,23 @@ test("current native models use 1M without a suffix or beta header", () => {
   }
 });
 
+test("point releases of native-1M models keep the 1M window", () => {
+  // Fable 5.1 shipped as "claude-fable-5-1": before this it fell through to
+  // 200k and the server clamped its 500k budget to the 200k window.
+  for (const model of [
+    "claude-fable-5-1",
+    "claude-fable-5-1-20260901",
+    "claude-fable-5-1[1m]",
+    "claude-opus-5-1",
+    "CLAUDE-FABLE-5-1",
+  ]) {
+    assert.equal(contextLimitForModel(model), 1_000_000, model);
+  }
+  // A different family is not a variant of a native-1M model.
+  assert.equal(contextLimitForModel("claude-fable-4"), 200_000);
+  assert.equal(contextLimitForModel("claude-opus-4-6-1"), 200_000);
+});
+
 test("native 1M inference can be disabled without affecting explicit 1M signals", () => {
   assert.equal(
     contextLimitForModel("claude-opus-4-8", undefined, false),

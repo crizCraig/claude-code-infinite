@@ -321,6 +321,7 @@ const NATIVE_ONE_MILLION_MODELS = new Set([
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-fable-5",
+  "claude-fable-5-1",
   "claude-mythos-5",
   "claude-mythos-preview",
 ]);
@@ -332,7 +333,15 @@ function isNativeOneMillionModel(model: string | undefined): boolean {
     .toLowerCase()
     .replace(/(?:\[1m\])+$/i, "")
     .replace(/-\d{8}$/, "");
-  return NATIVE_ONE_MILLION_MODELS.has(normalized);
+  if (NATIVE_ONE_MILLION_MODELS.has(normalized)) return true;
+  // Point releases / variants of a native-1M model (e.g. "claude-fable-5-1"
+  // before it was listed, or a future "claude-opus-5-1") keep the 1M window,
+  // mirroring the server's "dated/variant id of a known model" rule. Without
+  // this the server clamps their 500k budget to a 200k window.
+  for (const base of NATIVE_ONE_MILLION_MODELS) {
+    if (normalized.startsWith(`${base}-`)) return true;
+  }
+  return false;
 }
 
 export function contextLimitForModel(
