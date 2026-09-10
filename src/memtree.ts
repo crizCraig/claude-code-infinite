@@ -215,7 +215,7 @@ function conversationChars(messages: Message[] | undefined): number {
 }
 
 export interface CompressedHistoryCheck {
-  /** Non-system conversation characters MemTree actually returned. */
+  /** Flattened conversation characters, falling back to structured messages. */
   retainedChars: number;
   /** Characters in the turn that prompted this request (as sent). */
   currentTurnChars: number;
@@ -672,11 +672,18 @@ export function checkCompressedHistory(
   const measuredMessages = flattened ?? result.messages;
   const retainedChars = conversationChars(measuredMessages);
   const echoedChars = echoedCurrentTurnChars(measuredMessages, currentTurnContent);
+  // Require the original structured check too: rendering can reformat current
+  // tool/text blocks enough to hide a verbatim echo in the flattened text.
+  const structuredHistoryChars = flattened
+    ? conversationChars(result.messages) -
+      echoedCurrentTurnChars(result.messages, currentTurnContent)
+    : retainedChars - echoedChars;
   // Nothing meaningful to lose: a short conversation legitimately compresses to
   // roughly itself, and passing it through would be pointless churn.
   const usable =
     priorHistoryChars < minRetainedChars ||
-    retainedChars - echoedChars >= minRetainedChars;
+    (structuredHistoryChars >= minRetainedChars &&
+      retainedChars - echoedChars >= minRetainedChars);
   return { retainedChars, currentTurnChars: currentTurn, priorHistoryChars, usable };
 }
 
