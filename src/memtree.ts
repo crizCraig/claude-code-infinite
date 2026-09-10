@@ -1003,7 +1003,13 @@ export class MemtreeClient {
       }
 
       const json = (await response.json()) as CompressResult;
-      if (!Array.isArray(json.messages) || json.messages.length === 0) {
+      // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
+      // true }` by contract: the server skips compression and returns no
+      // messages. Only a compress call needs a non-empty conversation back.
+      if (
+        !opts.indexOnly &&
+        (!Array.isArray(json.messages) || json.messages.length === 0)
+      ) {
         throw new Error("context_memory returned no messages");
       }
       const clientLatencyMs = Date.now() - started;

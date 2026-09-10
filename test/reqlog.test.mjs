@@ -242,6 +242,66 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
   }
 });
 
+test("an index-only ack with no messages is logged as ok, not as a failure", async () => {
+  // The real server answers index_only with `{messages: [], usage: zeros,
+  // index_only: true}`; the compress-path "returned no messages" guard must
+  // not fire on it, or every background index is logged ok:false forever.
+  const logPath = tempLogPath();
+  const reqlog = new RequestLogger(logPath);
+  const upstream = await mockUpstream();
+  const memtreeSrv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      const body = parsed.index_only
+        ? {
+            messages: [],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            index_only: true,
+          }
+        : { messages: [{ role: "user", content: "compressed" }], usage: {} };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+  });
+  // Debug lines go to console.error; capture them to assert none is a failure.
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args.join(" "));
+  const memtree = new MemtreeClient({
+    baseUrl: memtreeSrv.origin,
+    apiKey: "k",
+    reqlog,
+    debug: true,
+  });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    reqlog,
+    toolRouteRecovery: false,
+  });
+  try {
+    await postMessages(proxy.port, toolTurn);
+    await waitFor(() =>
+      readRecords(logPath).some((r) => r.kind === "memtree" && r.indexOnly === true)
+    );
+    const [rec] = readRecords(logPath).filter((r) => r.kind === "memtree");
+    assert.equal(rec.indexOnly, true);
+    assert.equal(rec.status, 200);
+    assert.equal(rec.ok, true, "index-only ack must not be recorded as a failure");
+    assert.ok(
+      !logs.some((l) => l.includes("background indexing failed")),
+      `no failure log expected, got: ${logs.join(" | ")}`
+    );
+  } finally {
+    console.error = originalError;
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("proxy drain cancels a stalled raw turn and logs it before returning", async () => {
   const records = [];
   let markUpstreamStarted;
