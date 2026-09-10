@@ -44,15 +44,36 @@ function mockUpstream() {
   });
 }
 
-/** Mock MemTree server answering every /v1/context_memory POST the same way. */
+/**
+ * Mock MemTree server answering every /v1/context_memory POST the same way.
+ * Mirrors the real server's flatten contract (same as the proxy suite's
+ * withServerFlatten): when the request asks `flatten: true`, the response
+ * carries `flattened_messages` derived from its single user message.
+ */
 async function mockMemtree(status, bodyObj) {
   const calls = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      const body = JSON.stringify(bodyObj);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      calls.push(parsed);
+      const nonSystem = Array.isArray(bodyObj?.messages)
+        ? bodyObj.messages.filter((m) => m?.role !== "system")
+        : [];
+      const withFlatten =
+        parsed?.flatten === true &&
+        nonSystem.length === 1 &&
+        nonSystem[0].role === "user" &&
+        typeof nonSystem[0].content === "string"
+          ? {
+              ...bodyObj,
+              flattened_messages: [
+                { role: "user", content: nonSystem[0].content },
+              ],
+            }
+          : bodyObj;
+      const body = JSON.stringify(withFlatten);
       res.writeHead(status, { "content-type": "application/json" });
       res.end(body);
     });

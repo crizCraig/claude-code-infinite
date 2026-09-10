@@ -43,6 +43,11 @@ export type TurnType =
   | "followup-noop"
   /** Indexed response that carried no prior conversation; history forwarded. */
   | "followup-empty-memory"
+  /**
+   * Compressed result carried no server `flattened_messages` (pre-flatten
+   * server or malformed field); history forwarded.
+   */
+  | "followup-no-flatten"
   | "followup-degraded"
   | "followup-client-closed"
   | "unparseable";
@@ -77,7 +82,7 @@ export interface MessagesRecord {
     /** Overall wall time of the compress step (all concurrent legs). */
     ms: number;
     /**
-     * The compress call returned a result (canonical or legacy leg). NOT a
+     * The compress call returned a result. NOT a
      * "forwarded compressed history" flag: the proxy can still discard the
      * result afterwards (no-op response, or indexed-but-empty memory) and
      * forward the full history — `turnType` (followup-noop /
@@ -86,15 +91,10 @@ export interface MessagesRecord {
      */
     ok: boolean;
     /**
-     * The CANONICAL leg consumed (roughly) the whole compress budget and
-     * returned nothing — measured on that leg's own duration, so a slow
-     * legacy probe never inflates `ms` into a false timeout. Can be true
-     * alongside ok/legacyFallback when the concurrent legacy probe rescued
-     * the turn.
+     * The compress call consumed (roughly) the whole compress budget and
+     * returned nothing.
      */
     timedOut: boolean;
-    /** Canonical miss recovered from a pre-normalization signed-thinking index. */
-    legacyFallback?: boolean;
   };
   /**
    * How much conversation the compressed response actually carried. Recorded
@@ -141,6 +141,11 @@ export interface MessagesRecord {
       | "failed"
       | "noop"
       | "unusable"
+      /**
+       * Compressed result carried no server `flattened_messages`
+       * (pre-flatten server or malformed field). Forwarded the original.
+       */
+      | "no-flatten"
       | "no-gain"
       | "client-closed"
       /** Kill switch off: no attempt was made or measured. */

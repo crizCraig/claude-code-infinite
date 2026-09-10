@@ -6,8 +6,8 @@ import {
   lastNonSystemMessage,
   hasEarlierNonToolUserMessage,
   contextLimitForModel,
-  flattenToSingleUserMessage,
 } from "../dist/turns.js";
+import { serverFlattenedMessages } from "../dist/memtree.js";
 
 const user = (text) => ({ role: "user", content: text });
 const userBlocks = (blocks) => ({ role: "user", content: blocks });
@@ -168,48 +168,52 @@ test("legacy models remain 200k unless extended context is selected", () => {
   assert.equal(contextLimitForModel("claude-haiku-4-5"), 200_000);
 });
 
-test("flatten never leaks redacted_thinking payloads into the prompt text", () => {
-  const payload = "T1BBUVVF".repeat(300); // opaque base64-ish bytes
-  const messages = [
-    { role: "user", content: "what did the audit find?" },
-    {
-      role: "assistant",
-      content: [
-        { type: "redacted_thinking", data: payload },
-        { type: "thinking", thinking: "recall the findings", signature: "U0lHTg==" },
-        { type: "text", text: "Three critical issues." },
-      ],
-    },
-  ];
-  const [flat] = flattenToSingleUserMessage(messages);
-  assert.equal(flat.role, "user");
-  assert.equal(typeof flat.content, "string");
-  assert.ok(!flat.content.includes(payload), "redacted data must not leak");
-  assert.ok(!flat.content.includes("redacted_thinking"));
-  assert.ok(flat.content.includes("recall the findings"));
-  assert.ok(flat.content.includes("Three critical issues."));
+// The flatten FORMAT (headers, closed record, live tail, escaping,
+// redacted_thinking exclusion) is implemented and tested server-side only
+// (polychat/memory/flatten_messages.py). The client's job is to accept the
+// server's flatten verbatim when it is well-formed and reject anything else
+// into full-history degrade — that contract is what these tests pin.
+
+test("serverFlattenedMessages accepts exactly one string-content user message", () => {
+  const flat = serverFlattenedMessages({
+    messages: [{ role: "user", content: "ignored structured form" }],
+    flattened_messages: [{ role: "user", content: "[USER]\nhello" }],
+  });
+  assert.deepEqual(flat, [{ role: "user", content: "[USER]\nhello" }]);
 });
 
-test("a message with only redacted_thinking content flattens to a well-formed entry", () => {
-  const redactedOnly = {
-    role: "assistant",
-    content: [{ type: "redacted_thinking", data: "REDACTED".repeat(50) }],
+test("serverFlattenedMessages returns a fresh array, not the result's own", () => {
+  const result = {
+    messages: [],
+    flattened_messages: [{ role: "user", content: "conversation" }],
   };
+  const flat = serverFlattenedMessages(result);
+  assert.notEqual(flat, result.flattened_messages);
+  assert.notEqual(flat[0], result.flattened_messages[0]);
+});
 
-  // Sole message: falls back to the standard placeholder.
-  assert.deepEqual(flattenToSingleUserMessage([redactedOnly]), [
-    { role: "user", content: "(no content)" },
-  ]);
-
-  // Within a conversation: the empty extraction is skipped entirely — no
-  // dangling "[ASSISTANT]" header and no payload bytes.
-  const [flat] = flattenToSingleUserMessage([
-    { role: "user", content: "first question" },
-    redactedOnly,
-    { role: "user", content: "second question" },
-  ]);
-  assert.ok(!flat.content.includes("ASSISTANT"));
-  assert.ok(!flat.content.includes("REDACTED"));
-  assert.ok(flat.content.includes("[USER]\nfirst question"));
-  assert.ok(flat.content.includes("[USER]\nsecond question"));
+test("serverFlattenedMessages rejects pre-flatten and malformed responses", () => {
+  const base = { messages: [{ role: "user", content: "hi" }] };
+  // Pre-flatten server: field absent entirely.
+  assert.equal(serverFlattenedMessages({ ...base }), null);
+  // Wrong shapes: never "repair" locally — the client has no flatten of its
+  // own, so every one of these must degrade to forwarding real history.
+  for (const flattened_messages of [
+    "not an array",
+    [],
+    [
+      { role: "user", content: "two" },
+      { role: "user", content: "messages" },
+    ],
+    [{ role: "assistant", content: "wrong role" }],
+    [{ role: "user", content: [{ type: "text", text: "block content" }] }],
+    [{ role: "user", content: "" }],
+    [null],
+  ]) {
+    assert.equal(
+      serverFlattenedMessages({ ...base, flattened_messages }),
+      null,
+      `should reject ${JSON.stringify(flattened_messages)}`
+    );
+  }
 });

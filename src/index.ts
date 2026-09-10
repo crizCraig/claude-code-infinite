@@ -7,6 +7,7 @@ export {
   MIN_RETAINED_HISTORY_CHARS,
   normalizeMessagesForMemtree,
   rawPromptTokenCount,
+  serverFlattenedMessages,
 } from "./memtree.js";
 export type {
   MemtreeOptions,
@@ -23,7 +24,6 @@ export {
   userMessageText,
   hasEarlierNonToolUserMessage,
   stripCcSystemReminders,
-  flattenToSingleUserMessage,
   messagesWithSystem,
   contextLimitForModel,
 } from "./turns.js";

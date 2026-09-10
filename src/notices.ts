@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message } from "./turns.js";
+import { UPGRADE_COMMAND, type UpdateAvailable } from "./update-check.js";
 
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
@@ -36,11 +37,31 @@ export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
  * as `<hookName> says: <content>` on one line, so the first breaks the banner
  * off the label and the second leaves a blank line between them.
  */
-export function startupNoticeText(color: boolean): string {
-  if (!color) return `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
+export function startupNoticeText(
+  color: boolean,
+  update: UpdateAvailable | null = null
+): string {
+  const banner = color
+    ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
+      "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
+    : `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
+  return update ? `${banner}\n${updateNoticeText(update, color)}` : banner;
+}
+
+/**
+ * One line under the banner when npm has a newer release. Versions come from
+ * the registry document and are re-validated here so a hostile or malformed
+ * response can never inject terminal controls into the hook payload.
+ */
+export function updateNoticeText(update: UpdateAvailable, color: boolean): string {
+  const latest = sanitizeNoticeDetail(update.latest, 40);
+  const current = sanitizeNoticeDetail(update.current, 40);
+  const plain =
+    `↑ claude-code-infinite ${latest} available (you have ${current}) — ${UPGRADE_COMMAND}`;
+  if (!color) return plain;
   return (
-    "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
-    "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
+    `\x1b[33m↑ claude-code-infinite ${latest} available\x1b[39m ` +
+    `\x1b[2m(you have ${current})\x1b[22m — \x1b[1m${UPGRADE_COMMAND}\x1b[22m`
   );
 }
 

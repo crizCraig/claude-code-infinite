@@ -62,6 +62,24 @@ export interface CompressResult {
   /** Processed (compressed) messages from the server; system role may be included. */
   messages: Message[];
   /**
+   * The server-side flatten of `messages`: exactly one user message whose
+   * string content is the whole compressed conversation, produced by the
+   * server's `flatten_to_single_user_message` (the single implementation of
+   * the flatten format). Returned when the request asked for `flatten: true`;
+   * pre-flatten servers omit it. The client treats these bytes as opaque —
+   * it no longer has a flatten of its own — so a result without this field
+   * cannot be forwarded compressed (see serverFlattenedMessages).
+   */
+  flattened_messages?: Message[];
+  /**
+   * Explicit server verdict on whether the conversation was rewritten. False
+   * on a passthrough (request already under the model budget, or no index
+   * yet), where `messages` is the conversation as-is and the server also
+   * omits `flattened_messages`. Older servers omit this field; callers fall
+   * back to the cached_tokens heuristic (see didMemtreeCompress).
+   */
+  compressed?: boolean;
+  /**
    * Optional explicit unfolded index, consumed only by the memoryChars
    * reqlog diagnostic. Older servers omit it; callers fall back to the first
    * non-system processed message, which is the current server layout.
@@ -72,6 +90,28 @@ export interface CompressResult {
   clientLatencyMs?: number;
 }
 
+/**
+ * The server-flattened single user message of a compressed result, or null
+ * when the server did not provide a valid one (a pre-flatten server, or a
+ * malformed field). The flatten format lives server-side ONLY — the client
+ * must never re-derive or post-process it — so a null here means the result
+ * cannot be forwarded in compressed form and the caller degrades to the
+ * original history. Returns a fresh single-message array so callers may
+ * embed it in a request body without sharing structure with the result.
+ */
+export function serverFlattenedMessages(
+  result: CompressResult
+): Message[] | null {
+  const flattened = result.flattened_messages;
+  if (!Array.isArray(flattened) || flattened.length !== 1) return null;
+  const only = flattened[0] as Record<string, unknown> | undefined;
+  if (!only || typeof only !== "object" || only.role !== "user") return null;
+  if (typeof only.content !== "string" || only.content.length === 0) {
+    return null;
+  }
+  return [{ role: "user", content: only.content }];
+}
+
 function usageRecord(result: CompressResult): Record<string, unknown> | null {
   return result.usage && typeof result.usage === "object"
     ? (result.usage as Record<string, unknown>)
@@ -79,11 +119,17 @@ function usageRecord(result: CompressResult): Record<string, unknown> | null {
 }
 
 /**
- * Whether the server actually used indexed conversation history. A successful
- * context_memory response is not enough: while an index is still warming, the
- * endpoint deliberately returns the messages as-is with cached_tokens = 0.
+ * Whether the server actually rewrote the conversation. A successful
+ * context_memory response is not enough: the endpoint returns the messages
+ * as-is while an index is still warming AND whenever the request already fits
+ * the model budget. The server's explicit `compressed` verdict is
+ * authoritative. The cached_tokens fallback only covers servers that predate
+ * it: cached_tokens is a billing prediction, not a compression signal, and is
+ * > 0 on most under-budget passthroughs — so on such servers those turns are
+ * flattened and Anthropic's prefix cache misses every human turn.
  */
 export function didMemtreeCompress(result: CompressResult): boolean {
+  if (typeof result.compressed === "boolean") return result.compressed;
   return (cachedPromptTokenCount(result) ?? 0) > 0;
 }
 
@@ -118,21 +164,6 @@ export function rawPromptTokenCount(
 }
 
 /**
- * Tokens after the indexed prefix. This is comparable across legacy signed
- * and normalized message shapes: unlike cached_tokens, it does not reward the
- * legacy shape merely for containing opaque signature bytes.
- */
-export function unindexedPromptTokenCount(
-  result: CompressResult
-): number | undefined {
-  const raw = rawPromptTokenCount(result);
-  const cached = cachedPromptTokenCount(result);
-  return raw === undefined || cached === undefined
-    ? undefined
-    : Math.max(0, raw - cached);
-}
-
-/**
  * Minimum conversation content, beyond any verbatim echo of the current turn,
  * that a compressed response must carry before we will send it to Anthropic in
  * place of the real history.
@@ -154,12 +185,11 @@ function contentChars(content: unknown): number {
   }
   if (typeof content !== "object") return String(content).length;
   const block = content as Record<string, unknown>;
-  // Count what flattenToSingleUserMessage actually puts in front of the model:
+  // Count what the server flatten actually puts in front of the model:
   // thinking blocks contribute only their thinking text (the opaque base64
   // `signature` is dropped) and redacted_thinking blocks are skipped entirely,
-  // so neither may count as retained conversation. Legacy-shaped results can
-  // echo thinking blocks whose signatures alone would otherwise satisfy the
-  // retained floor.
+  // so neither may count as retained conversation: an echoed thinking block's
+  // signature alone must not satisfy the retained floor.
   if (block.type === "thinking") {
     return typeof block.thinking === "string" ? block.thinking.length : 0;
   }
@@ -921,6 +951,13 @@ export class MemtreeClient {
     if (!opts.indexOnly) {
       if (opts.model) body.model = opts.model;
       if (opts.tools && opts.tools.length > 0) body.tools = opts.tools;
+      // Ask the server for its canonical single-user-message flatten of the
+      // compressed result. The flatten format (closed transcript container,
+      // per-human-turn headers, live-tail framing, header escaping) lives
+      // server-side only; the client forwards `flattened_messages` verbatim
+      // and never re-derives it. Pre-flatten servers ignore the field and
+      // omit `flattened_messages`, which degrades to passthrough upstream.
+      body.flatten = true;
     }
     const payload = JSON.stringify(body);
 

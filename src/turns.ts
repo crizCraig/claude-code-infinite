@@ -229,65 +229,12 @@ function stripPart(part: any): any {
   return part;
 }
 
-function serializePart(part: any): string {
-  try {
-    return JSON.stringify(part, null, 2);
-  } catch {
-    return String(part);
-  }
-}
-
-function extractTextForFlatten(message: Message): string {
-  const content = message.content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const part of content) {
-    if (typeof part === "string") {
-      parts.push(part);
-      continue;
-    }
-    if (!part || typeof part !== "object") continue;
-    if (part.type === "text") {
-      if (part.text) parts.push(String(part.text));
-    } else if (part.type === "thinking") {
-      if (part.thinking) parts.push(String(part.thinking));
-    } else if (part.type === "redacted_thinking") {
-      // Opaque encrypted payload — carries no prompt-visible conversation, so
-      // it must not be serialized into the flattened text. contentChars in
-      // memtree.ts counts these blocks as 0 retained chars to match.
-      continue;
-    } else {
-      parts.push(serializePart(part));
-    }
-  }
-  return parts.join("\n\n");
-}
-
-/**
- * Flatten processed (compressed) messages into a single user message, as if
- * starting a fresh conversation with full context. System messages are
- * excluded — the caller sends them via Anthropic's top-level system param.
- * Port of server flatten_to_single_user_message.
- */
-export function flattenToSingleUserMessage(messages: Message[]): Message[] {
-  const nonSystem = messages.filter((m) => (m.role ?? "user") !== "system");
-
-  if (nonSystem.length === 1) {
-    const text = extractTextForFlatten(nonSystem[0]);
-    return [{ role: "user", content: text || "(no content)" }];
-  }
-
-  const parts: string[] = [];
-  for (const msg of nonSystem) {
-    const role = String(msg.role ?? "user").toUpperCase();
-    const text = extractTextForFlatten(msg);
-    if (text) parts.push(`[${role}]\n${text}`);
-  }
-
-  if (!parts.length) return [{ role: "user", content: "(no content)" }];
-  return [{ role: "user", content: parts.join("\n\n") }];
-}
+// The client-side flatten port (flattenToSingleUserMessage /
+// extractTextForFlatten) was deleted per the 2026-08-09 consolidation
+// decision: the flatten format is implemented ONCE, server-side, in
+// polychat/memory/flatten_messages.py. The client requests it with
+// `flatten: true` and forwards `flattened_messages` verbatim
+// (serverFlattenedMessages in memtree.ts); it never re-derives the format.
 
 /**
  * Build the message list sent to /v1/context_memory: the Anthropic top-level

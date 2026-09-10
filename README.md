@@ -162,19 +162,15 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the compression API is unreachable or your MemTree key is invalid/expired. Your session keeps working uncompressed. Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
 
-## Using Without an Anthropic Subscription
+## Upgrading
 
-Claude Code works with an Anthropic API key as well as a subscription — set `ANTHROPIC_API_KEY` as you would with vanilla Claude Code and run `ccc` as usual. MemTree compression works the same either way (and saves the most money on API-key billing, since you pay per token).
+`ccc` checks npm at startup (bounded to two seconds, silent if offline) and, when a
+newer release exists, shows one line under the MemTree banner inside Claude Code with
+the upgrade command. Upgrading is never automatic:
 
-> [!NOTE]
-> To use without an Anthropic subscription, choose option 2. "Anthropic Console account", during the Claude Code setup. (Running `/logout` will also bring you back to this setup.)
->
-> You don't need to buy API credits, just login and Claude Code will let you complete setup.
->
-> Lastly run `/logout` within Claude Code and then run `ccc`
->
-> Anthropic API usage will be billed through https://polychat.co.
+```bash
+npm install -g claude-code-infinite
+```
 
-## API Rate limit errors
+Set `CCC_SKIP_UPDATE_CHECK=1` to disable the check (air-gapped or CI runs).
 
-If you hit your Anthropic subscription's rate limits, you can still continue by running `/logout` and restarting `ccc`. This will bill tokens through your PolyChat subscription. Remember that you can use the `/resume` slash command to resume previous sessions.

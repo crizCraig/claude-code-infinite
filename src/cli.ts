@@ -27,6 +27,7 @@ import {
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail, startupNoticeText } from "./notices.js";
+import { checkForUpdate } from "./update-check.js";
 import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
 import {
   claudeChildEnv,
@@ -199,8 +200,19 @@ async function main() {
 
   // Warn about an unpaid key before claude takes over the terminal. Awaited so
   // the warning can't corrupt the TUI, but bounded (2s) and silent on error —
-  // startup never fails or hangs on polychat availability.
-  await warnIfUnpaid(memtreeBaseUrl, polychatApiKey);
+  // startup never fails or hangs on polychat availability. The npm update
+  // check runs concurrently under the same bound; its result goes into the
+  // SessionStart banner below, since the TUI covers this terminal within a
+  // second. Both resolve rather than reject, so Promise.all cannot throw.
+  const [, updateAvailable] = await Promise.all([
+    warnIfUnpaid(memtreeBaseUrl, polychatApiKey),
+    checkForUpdate({ currentVersion: CLIENT_VERSION }),
+  ]);
+  if (isDebugMode && updateAvailable) {
+    console.log(
+      `[DEBUG] Update available: ${updateAvailable.current} → ${updateAvailable.latest}`
+    );
+  }
 
   // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
   // successful notice claims, so incidents can be reconstructed after the
@@ -273,7 +285,7 @@ async function main() {
     try {
       noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
         messageDisplay: installedClaudeSupportsMessageDisplay(),
-        startupMessage: startupNoticeText(terminalSupportsColor()),
+        startupMessage: startupNoticeText(terminalSupportsColor(), updateAvailable),
       });
       // Global option must precede a user-supplied `--`, positional prompt, or
       // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
