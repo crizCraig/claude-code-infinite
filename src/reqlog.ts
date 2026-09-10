@@ -121,7 +121,8 @@ export interface MessagesRecord {
    * forwarded verbatim with the route retained and no recovery attempt).
    * "rejected" covers every OTHER reason memoryRoutedToolBody refuses:
    * a changed system/prefix hash, a conversation that shrank below the
-   * stored prefix, and an unexpected tool suffix shape. (An epoch-stale
+   * stored prefix, an unexpected tool suffix shape, or an assembled route
+   * estimated to exceed the destination context window. (An epoch-stale
    * route never reaches rejection: getMemoryRoute drops it on lookup, so
    * that case logs "missing".)
    * Absent means there was no applicable miss — hits and away-summary turns

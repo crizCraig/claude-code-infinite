@@ -100,7 +100,8 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 // timeout budget), suppress the blocking attempt for this long. The followup
 // path pays a failed compress at most once per HUMAN turn; the fuse sits on
 // the tool loop and would otherwise pay it once per TOOL turn — and history
-// grows every turn, so compress()'s hash dedup never absorbs the repeat.
+// grows every turn, so compress()'s complete-request dedup never absorbs the
+// repeat.
 // Long enough that a real outage costs one stall, short enough that a
 // transient blip does not disable recovery for a working session.
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
@@ -266,15 +267,18 @@ interface ProxyState {
    */
   routeDecisionsLive: Map<string, Set<number>>;
   /**
-   * Route lanes that have spent their one blocking recompression attempt this
-   * epoch. Replaces the old 400KiB byte gate with the budget main already
+   * Route lanes that have spent their blocking recompression attempt this
+   * epoch, including the capacity it targeted and whether it is still live.
+   * An oversized route at a strictly smaller capacity gets one new attempt;
+   * unchanged retries and concurrent requests never re-grant it.
+   * Replaces the old 400KiB byte gate with the budget main already
    * lives by: the followup path pays exactly one blocking compress per human
    * turn, so every lane gets the same self-limiting deal. Cleared alongside
    * memoryRoutes on every epoch bump — except the followup-path bump of a
-   * prompt the hook already armed, which keeps the set so one turn boundary
+   * prompt the hook already armed, which keeps the budget so one turn boundary
    * grants each lane one attempt, not two (see bumpRouteEpoch).
    */
-  toolRecoveryAttemptedLanes: Set<string>;
+  toolRecoveryAttemptedLanes: Map<string, ToolRecoveryAttempt>;
   /**
    * Epoch-ms deadline until which tool-route miss recovery skips its blocking
    * attempt, set when an attempt returns null. Zero means no cooldown.
@@ -294,6 +298,11 @@ interface MemoryRoute {
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
   routeEpoch: number;
+}
+
+interface ToolRecoveryAttempt {
+  modelContextLimit: number;
+  inFlight: boolean;
 }
 
 /**
@@ -452,7 +461,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainRouteEpoch: 0,
     mainRouteDecisionGeneration: 0,
     routeDecisionsLive: new Map(),
-    toolRecoveryAttemptedLanes: new Set(),
+    toolRecoveryAttemptedLanes: new Map(),
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
     routeInstallFault: opts.routeInstallFault,
@@ -1011,7 +1020,9 @@ async function handleMessages(
           state.mainRouteEpoch,
           requestSessionId(req)
         );
-        if (rewritten) {
+        const overContextWindow = rewritten !== null &&
+          routedBodyExceedsContext(body, rewritten, modelContextLimit);
+        if (rewritten && !overContextWindow) {
           routedBody = rewritten;
           routedTool = true;
           if (opts.debug) {
@@ -1046,8 +1057,13 @@ async function handleMessages(
           // always carries this requester's session id — installMemoryRoute
           // derives both from the same request — so this is by construction a
           // same-session divergence: evict, and let recovery rebuild it.
+          // A matching route that outgrew the request's resolved window must
+          // also rebuild; a smaller window can re-grant a spent attempt.
           routeMiss = "rejected";
           state.memoryRoutes.delete(requestRouteKey);
+          if (overContextWindow) {
+            regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
+          }
           if (opts.debug) {
             console.error("[ccc proxy] tool turn rejected active memory route");
           }
@@ -1074,8 +1090,9 @@ async function handleMessages(
       // No byte gate. The old 400KiB threshold answered "is this miss worth
       // a blocking round trip?" with a latency guess; the answer main
       // already lives by is a budget: at most ONE blocking recompress per
-      // (lane, epoch), the same single blocking compress the followup path
-      // pays per human turn. Self-limiting without a constant, and the
+      // (lane, epoch), with a new allowance if its route no longer fits a
+      // smaller context window. The followup path similarly pays once per
+      // human turn. The budget bounds the wait, and the
       // no-gain check in recovery still guarantees the payload never gets
       // worse than verbatim.
       if (opts.toolRouteRecovery === false) {
@@ -1104,7 +1121,8 @@ async function handleMessages(
         // consume the lane's attempt.
         rec.routeRecovery = { outcome: "cooldown" };
       } else {
-        state.toolRecoveryAttemptedLanes.add(requestRouteKey);
+        const recoveryAttempt = { modelContextLimit, inFlight: true };
+        state.toolRecoveryAttemptedLanes.set(requestRouteKey, recoveryAttempt);
         // Serialized non-system conversation bytes, for the record only —
         // computed here, once per lane per epoch, never on the misses that
         // skip the attempt: keeping the multi-megabyte stringify off every
@@ -1131,6 +1149,9 @@ async function handleMessages(
             conversationBytes,
             routeKey: requestRouteKey,
             isMainRequest,
+            recoveryAttempt,
+          }).finally(() => {
+            recoveryAttempt.inFlight = false;
           })
         );
       }
@@ -1768,6 +1789,33 @@ function memoryRoutedToolBody(
   return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 
+/** Size the assembled input (including system/tools) and reserve output room. */
+function routedBodyExceedsContext(
+  body: Record<string, any>,
+  routedBody: Buffer,
+  modelContextLimit: number
+): boolean {
+  const outputTokens = typeof body.max_tokens === "number" &&
+    Number.isFinite(body.max_tokens) ? Math.max(0, body.max_tokens) : 0;
+  // This is the existing local byte estimate, not a tokenizer or a hard cap.
+  // Recovery remains best-effort and never calls the provider to count tokens.
+  return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
+}
+
+function regrantSmallerWindowRecovery(
+  state: ProxyState,
+  key: string,
+  modelContextLimit: number
+): void {
+  const previous = state.toolRecoveryAttemptedLanes.get(key);
+  if (previous && !previous.inFlight && modelContextLimit < previous.modelContextLimit) {
+    // The route has already been evicted. Keeping no spent mark lets an
+    // outage cooldown defer this allowance without losing it; the next actual
+    // attempt records the smaller capacity before it awaits anything.
+    state.toolRecoveryAttemptedLanes.delete(key);
+  }
+}
+
 /**
  * Whether a tool-turn body is an exact replay of the request that installed
  * the route: identical message count and every identity input
@@ -2094,7 +2142,11 @@ async function runBlockingCompression(args: {
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
-  const cached = opts.memtree.hasCachedCompress(hash);
+  const cached = opts.memtree.hasCachedCompress(
+    hash,
+    modelContextLimit,
+    compressMeta
+  );
   // compress() maps every failure to a resolved null (it never rejects).
   const result = await opts.memtree.compress(
     hash,
@@ -2104,10 +2156,11 @@ async function runBlockingCompression(args: {
     compressMeta
   );
   const compressMs = Date.now() - compressStarted;
-  // Sampled at this call's settle, before a concurrent same-hash failure of
-  // another class can overwrite the per-hash entry.
+  // Sampled at this call's settle, before a concurrent same-request failure of
+  // another class can overwrite the complete-key entry.
   const failureArming =
-    result === null && opts.memtree.lastCompressFailureArming(hash);
+    result === null &&
+    opts.memtree.lastCompressFailureArming(hash, modelContextLimit, compressMeta);
   const hadLiveSuccess = !cached && result !== null;
   // Only arming-class live failures (network error, timeout, 5xx, 402) are
   // fuse evidence. A responsive server's other 4xx failed THIS call but says
@@ -2194,6 +2247,7 @@ async function recoverToolRouteMiss(args: {
   conversationBytes: number;
   routeKey: string;
   isMainRequest: boolean;
+  recoveryAttempt: ToolRecoveryAttempt;
 }): Promise<void> {
   const {
     opts,
@@ -2212,6 +2266,7 @@ async function recoverToolRouteMiss(args: {
     conversationBytes,
     routeKey,
     isMainRequest,
+    recoveryAttempt,
   } = args;
 
   const sessionId = requestSessionId(req);
@@ -2472,6 +2527,11 @@ async function recoverToolRouteMiss(args: {
     // delivery-complete fallback then gets one safe retry.
     activationAttempted = true;
     installFate = installed ? "installed" : "stale";
+    // A tool continuation can arrive after message_stop while this HTTP
+    // stream is still draining. Its route is already complete, so a smaller
+    // window may buy recovery now. Mutate only this attempt's object: a late
+    // transport settle must not release a newer attempt in the same lane.
+    if (installed) recoveryAttempt.inFlight = false;
     if (opts.debug) {
       console.error(
         `[ccc proxy] recovered memory route activation: ${

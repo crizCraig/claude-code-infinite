@@ -11,8 +11,10 @@
  *   user WHY MemTree is off instead of implying a transient outage; any later
  *   successful call clears it (the user paid mid-session).
  *
- * Work is deduped per messages hash, not per HTTP attempt, so Claude Code
- * retries cannot amplify into repeated compression/indexing calls.
+ * Compression work is deduped per complete request key, while background
+ * indexing is deduped per messages hash. Claude Code retries therefore cannot
+ * amplify identical HTTP calls, and budget-changing inputs never reuse a
+ * stale compression result.
  */
 
 import { createHash } from "node:crypto";
@@ -554,6 +556,21 @@ function echoedCharsInRunText(
   return echoed;
 }
 
+/** Append text nested inside tool_result blocks as rendered by a flattened response. */
+function appendRenderedToolResultTextPieces(
+  content: unknown,
+  pieces: string[]
+): void {
+  if (!Array.isArray(content)) return;
+  for (const part of content) {
+    if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+    const block = part as Record<string, unknown>;
+    if (block.type === "tool_result") {
+      contentTextPieces(block.content, pieces);
+    }
+  }
+}
+
 /**
  * Characters of the result body that are a VERBATIM echo of the sent current
  * turn. Each message's text is scored per RUN of adjacent plain-text pieces
@@ -586,16 +603,17 @@ function echoedCharsInRunText(
  * not a replay of the input.
  */
 function echoedCurrentTurnChars(
-  result: CompressResult,
+  messages: Message[] | undefined,
   currentTurnContent: unknown
 ): number {
   const turnPieces: string[] = [];
   contentTextPieces(currentTurnContent, turnPieces);
   if (turnPieces.length === 0) return 0;
   const turnText = turnPieces.join("");
+  appendRenderedToolResultTextPieces(currentTurnContent, turnPieces);
 
   let echoed = 0;
-  for (const message of result.messages ?? []) {
+  for (const message of messages ?? []) {
     if (message.role === "system") continue;
     for (const run of contentTextRuns(message.content)) {
       echoed += echoedCharsInRunText(run.join(""), turnText, turnPieces);
@@ -650,8 +668,10 @@ export function checkCompressedHistory(
     0,
     conversationChars(sentMessages) - currentTurn
   );
-  const retainedChars = conversationChars(result.messages);
-  const echoedChars = echoedCurrentTurnChars(result, currentTurnContent);
+  const flattened = serverFlattenedMessages(result);
+  const measuredMessages = flattened ?? result.messages;
+  const retainedChars = conversationChars(measuredMessages);
+  const echoedChars = echoedCurrentTurnChars(measuredMessages, currentTurnContent);
   // Nothing meaningful to lose: a short conversation legitimately compresses to
   // roughly itself, and passing it through would be pointless churn.
   const usable =
@@ -706,15 +726,23 @@ function isReasoningBlock(value: unknown): value is Record<string, unknown> {
   );
 }
 
+function transmittedModel(model: string | undefined): string | undefined {
+  return typeof model === "string" && model.length > 0 ? model : undefined;
+}
+
+function transmittedTools(tools: unknown[] | undefined): unknown[] | undefined {
+  return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
+}
+
 export class MemtreeClient {
   private baseUrl: string;
   private apiKey: string;
   private compressTimeoutMs: number;
   private debug: boolean;
   private reqlog: RequestLogSink | undefined;
-  /** messages-hash → in-flight/settled compression promise (retry dedupe). */
+  /** Complete compression request key → in-flight/settled promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
-  /** messages-hashes already submitted for background indexing. */
+  /** Message hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
   /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
   private backgroundIndexes = new Map<Promise<void>, AbortController>();
@@ -722,7 +750,7 @@ export class MemtreeClient {
   private backgroundClosing = false;
   /** FastAPI `detail` text from the most recent 402, or null while paid. */
   private unpaidDetail: string | null = null;
-  /** hash → whether that hash's most recent live compress failure arms the fuse. */
+  /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
 
   /**
@@ -760,7 +788,7 @@ export class MemtreeClient {
   }
 
   /**
-   * Whether compress(hash) would answer without contacting the server: an
+   * Whether compress(hash, limit, meta) would answer without contacting the server: an
    * already-settled success, or a leg another caller has in flight. Callers
    * that read a compress result as evidence about the SERVER's health must
    * consult this first — a memoized answer proves only that the server was
@@ -769,14 +797,18 @@ export class MemtreeClient {
    * real round trips: conservatively discarding live evidence only forgoes an
    * optimization, whereas trusting a stale one suppresses a real outage.
    */
-  hasCachedCompress(hash: string): boolean {
-    return this.compressCache.has(hash);
+  hasCachedCompress(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): boolean {
+    return this.compressCache.has(this.compressKey(hash, modelContextLimit, meta));
   }
 
   /**
    * Fuse classification for the most recent live compress failure of `hash`.
    * The entry is recorded before the failed promise settles null, and a
-   * concurrent same-hash retry MAY overwrite it with a different class — so
+   * concurrent same-request retry MAY overwrite it with a different class — so
    * callers must sample at their own leg's settle (a .then on the compress
    * promise), not after awaiting other work; only that keeps the read paired
    * with the failure it describes.
@@ -787,8 +819,16 @@ export class MemtreeClient {
    * open the shared fuse. Unclassified failures default to arming: muting
    * the fuse needs positive evidence of a responsive server.
    */
-  lastCompressFailureArming(hash: string): boolean {
-    return this.compressFailureArming.get(hash) ?? true;
+  lastCompressFailureArming(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): boolean {
+    return (
+      this.compressFailureArming.get(
+        this.compressKey(hash, modelContextLimit, meta)
+      ) ?? true
+    );
   }
 
   /**
@@ -804,7 +844,8 @@ export class MemtreeClient {
     signal?: AbortSignal,
     meta?: CompressRequestMeta
   ): Promise<CompressResult | null> {
-    const cached = this.compressCache.get(hash);
+    const cacheKey = this.compressKey(hash, modelContextLimit, meta);
+    const cached = this.compressCache.get(cacheKey);
     if (cached) return cached;
 
     const promise = this.callContextMemory(messages, modelContextLimit, {
@@ -822,9 +863,9 @@ export class MemtreeClient {
       // would leave a fresh classification first in eviction order — under
       // churn it could be evicted before the failing leg samples it and the
       // sample would default to arming.
-      this.compressFailureArming.delete(hash);
+      this.compressFailureArming.delete(cacheKey);
       this.compressFailureArming.set(
-        hash,
+        cacheKey,
         status === undefined || status >= 500 || status === 402
       );
       if (this.compressFailureArming.size > DEDUPE_CACHE_MAX) {
@@ -833,13 +874,13 @@ export class MemtreeClient {
       }
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
       // automatic retry of an identical request) hit the server again.
-      if (this.compressCache.get(hash) === promise) {
-        this.compressCache.delete(hash);
+      if (this.compressCache.get(cacheKey) === promise) {
+        this.compressCache.delete(cacheKey);
       }
       return null;
     });
 
-    this.remember(hash, promise);
+    this.remember(cacheKey, promise);
     return promise;
   }
 
@@ -917,8 +958,22 @@ export class MemtreeClient {
     return false;
   }
 
-  private remember(hash: string, promise: Promise<CompressResult | null>) {
-    this.compressCache.set(hash, promise);
+  private compressKey(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): string {
+    const model = transmittedModel(meta?.model);
+    const tools = transmittedTools(meta?.tools);
+    const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
+    const toolsHash = createHash("sha256").update(toolsJson).digest("hex");
+    return createHash("sha256")
+      .update(JSON.stringify([hash, model ?? null, modelContextLimit, toolsHash]))
+      .digest("hex");
+  }
+
+  private remember(cacheKey: string, promise: Promise<CompressResult | null>) {
+    this.compressCache.set(cacheKey, promise);
     if (this.compressCache.size > DEDUPE_CACHE_MAX) {
       const first = this.compressCache.keys().next().value;
       if (first !== undefined) this.compressCache.delete(first);
@@ -949,8 +1004,10 @@ export class MemtreeClient {
     // path returns before budget resolution, so indexing calls skip both and
     // save the upload bytes (tools schemas run tens of KB per call).
     if (!opts.indexOnly) {
-      if (opts.model) body.model = opts.model;
-      if (opts.tools && opts.tools.length > 0) body.tools = opts.tools;
+      const model = transmittedModel(opts.model);
+      const tools = transmittedTools(opts.tools);
+      if (model !== undefined) body.model = model;
+      if (tools !== undefined) body.tools = tools;
       // Ask the server for its canonical single-user-message flatten of the
       // compressed result. The flatten format (closed transcript container,
       // per-human-turn headers, live-tail framing, header escaping) lives
