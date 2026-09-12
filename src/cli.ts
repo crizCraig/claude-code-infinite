@@ -29,6 +29,7 @@ import { RequestLogger } from "./reqlog.js";
 import { sanitizeNoticeDetail, startupNoticeText } from "./notices.js";
 import { checkForUpdate } from "./update-check.js";
 import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import {
   claudeChildEnv,
   claudeNativeOneMillionContextEnabled,
@@ -151,6 +152,13 @@ async function main() {
   const parsedArgs = parseWrapperArgs(process.argv.slice(2));
   const isDebugMode = parsedArgs.debug;
   const filteredArgs = parsedArgs.claudeArgs;
+
+  // `ccc fetch <memtree-url>`: read one of the user's MemTree pages with the
+  // stored key and print it. No proxy, no Claude — an agent's escape hatch
+  // when it is not running inside a ccc session.
+  if (filteredArgs[0] === "fetch") {
+    process.exit(await runMemtreeFetchCommand(filteredArgs.slice(1)));
+  }
 
   const mode: Mode =
     filteredArgs[0] === "local" ? "local" :

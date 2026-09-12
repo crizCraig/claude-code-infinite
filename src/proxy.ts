@@ -72,7 +72,7 @@ import {
   type Message,
 } from "./turns.js";
 import {
-  COMPRESSED_NOTICE,
+  compressedNoticeText,
   DEGRADED_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SseNoticeRewriter,
@@ -585,6 +585,9 @@ async function handleRequest(
     return handleNoticeHook(req, res, state, opts.reqlog);
   }
 
+  if (req.method === "GET" && url.pathname.startsWith(MEMTREE_PASSTHROUGH_PREFIX)) {
+    return handleMemTreePassthrough(req, res, opts, url);
+  }
   if (req.method === "POST" && url.pathname === "/v1/messages") {
     return handleMessages(req, res, opts, upstream, state);
   }
@@ -592,6 +595,44 @@ async function handleRequest(
     return handleCountTokens(req, res, opts, upstream, state);
   }
   return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+
+/** Loopback prefix for reading the user's own MemTree pages through this proxy. */
+const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
+/** `<request id>` or `<request id>.json`; nothing that could walk the upstream path. */
+const MEMTREE_PASSTHROUGH_TARGET_RE = /^[A-Za-z0-9-]+(\.json)?$/;
+
+/**
+ * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own
+ * MemTree page with their key. Claude Code's child env already carries this
+ * server as ANTHROPIC_BASE_URL, so an agent inside a ccc session needs no key
+ * handling — the polychat page's 401 body points here first. The upstream
+ * response is relayed as-is (status, content type, body); the key never
+ * leaves this process.
+ */
+async function handleMemTreePassthrough(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  opts: ProxyOptions,
+  url: URL
+): Promise<void> {
+  const target = url.pathname.slice(MEMTREE_PASSTHROUGH_PREFIX.length);
+  if (!MEMTREE_PASSTHROUGH_TARGET_RE.test(target)) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "Not Found" }));
+    return;
+  }
+  try {
+    const upstream = await opts.memtree.fetchMemTree(
+      `/usage/memtree/${target}${url.search}`,
+      req.headers.accept ?? "application/json"
+    );
+    res.writeHead(upstream.status, { "content-type": upstream.contentType });
+    res.end(upstream.body);
+  } catch (err) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: `MemTree fetch failed: ${String(err)}` }));
+  }
 }
 
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
@@ -1600,7 +1641,11 @@ function queueCompressionNotice(args: {
       return;
     }
   }
-  state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
+  state.notices.queuePrefix(
+    compressedNoticeText(result.memtreeUrl),
+    undefined,
+    noticePromptId
+  );
 }
 
 /**

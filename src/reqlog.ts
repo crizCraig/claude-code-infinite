@@ -241,6 +241,8 @@ export interface MemtreeRecord {
   indexedTokens?: number;
   rawPromptTokens?: number;
   memoryChars?: number;
+  /** The per-request MemTree page the server stamped on the response, if any. */
+  memtreeUrl?: string;
 }
 
 /** A display-only notice was atomically claimed by one Claude Code hook. */

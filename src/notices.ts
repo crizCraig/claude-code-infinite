@@ -17,6 +17,15 @@ export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
 
 export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
+
+/**
+ * The success notice with this turn's MemTree page appended when the server
+ * sent one, so the user (or an agent reading the transcript) can open the
+ * tree that was just served. Falls back to the bare notice.
+ */
+export function compressedNoticeText(memtreeUrl?: string): string {
+  return memtreeUrl ? `${COMPRESSED_NOTICE} · ${memtreeUrl}` : COMPRESSED_NOTICE;
+}
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE =
