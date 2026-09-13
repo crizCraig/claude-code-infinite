@@ -26,10 +26,10 @@
 npm install -g claude-code-infinite
   ```
 
-Or straight from GitHub (needs `git` and Node ≥ 18):
+Or straight from GitHub (no git needed, Node ≥ 18):
 
 ```bash
-npm install -g github:crizCraig/claude-code-infinite
+npm install -g https://github.com/crizCraig/claude-code-infinite/tarball/main
 ```
 2. Run Claude Code Infinite with
   ```bash
