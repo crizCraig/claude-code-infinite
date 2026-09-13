@@ -7,8 +7,8 @@
 * Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
-* Automatically recalls relevant past information using hierarchical RAG
-* Allows you to continue your session without summarizing or compacting
+* Automatically recalls relevant past information
+* Never compact again
  
 ## Requirements
 
