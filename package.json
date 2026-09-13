@@ -1,6 +1,6 @@
 {
   "name": "claude-code-infinite",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "Wrapper for Claude Code CLI",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
