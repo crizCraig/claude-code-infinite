@@ -12,12 +12,11 @@
     "dist"
   ],
   "scripts": {
-    "build": "npx --yes --package typescript@^5.9 tsc && chmod +x dist/cli.js",
+    "build": "tsc && chmod +x dist/cli.js",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "test": "npm run build && node --test test/*.test.mjs",
-    "prepublishOnly": "npm run build",
-    "prepare": "npm run build"
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "claude",

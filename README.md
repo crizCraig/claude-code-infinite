@@ -26,7 +26,7 @@
 npm install -g claude-code-infinite
   ```
 
-Or straight from GitHub (builds on install; needs `git` and Node ≥ 18):
+Or straight from GitHub (needs `git` and Node ≥ 18):
 
 ```bash
 npm install -g github:crizCraig/claude-code-infinite
