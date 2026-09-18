@@ -18,7 +18,8 @@ import { startProxy } from "./proxy.js";
 import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
-import { sanitizeNoticeDetail, startupNoticeText } from "./notices.js";
+import { startupNoticeText } from "./notices.js";
+import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
 import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
@@ -32,6 +33,10 @@ const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
+// Payment gate: how long "subscribe now" waits for the Stripe webhook to flip
+// the key to paid, and how often it re-asks the status probe meanwhile.
+const SUBSCRIBE_WAIT_MS = 180_000;
+const SUBSCRIBE_POLL_MS = 3_000;
 function openUrl(url) {
     const platform = process.platform;
     const command = platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
@@ -59,13 +64,13 @@ async function promptForApiKey(mode) {
     });
 }
 /**
- * Startup payment check: GET /v1/context_memory/status and warn if the key is
- * unpaid, so the user learns why compression/indexing will be off BEFORE the
- * first degraded turn. The endpoint may not be deployed yet — 404/405/401/503,
- * network errors, and timeouts all mean "unknown": stay quiet. Bounded by a
- * short timeout and silent on every error so startup is never gated on it.
+ * Startup payment check: GET /v1/context_memory/status, so an unpaid key is
+ * handled BEFORE the first degraded turn. The endpoint may not be deployed
+ * yet — 404/405/401/503, network errors, timeouts and unexpected bodies all
+ * mean "unknown" (null): the caller stays quiet. Bounded by a short timeout
+ * and never throws, so startup is never gated on polychat availability.
  */
-async function warnIfUnpaid(baseUrl, apiKey) {
+async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000) {
     try {
         const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
             headers: {
@@ -73,22 +78,63 @@ async function warnIfUnpaid(baseUrl, apiKey) {
                 "x-client": CLIENT_NAME,
                 "x-client-version": CLIENT_VERSION,
             },
-            signal: AbortSignal.timeout(2000),
+            signal: AbortSignal.timeout(timeoutMs),
         });
         if (!res.ok)
-            return;
-        const status = (await res.json());
-        if (status?.paid === false) {
-            console.warn("\x1b[1;33m⚠ MemTree is off — payment required (compression + indexing disabled)." +
-                " Visit polychat.co to enable.\x1b[0m" +
-                (status.payment_message
-                    ? `\n${sanitizeNoticeDetail(status.payment_message)}`
-                    : ""));
-        }
+            return null;
+        return parsePaymentStatus(await res.json());
     }
     catch {
-        // status unknown (endpoint missing, network, timeout, bad JSON) — stay quiet
+        return null;
     }
+}
+/**
+ * Interactive gate for an unpaid key. The TUI covers the terminal within a
+ * second of launch, so a printed warning is never read; instead stop here
+ * until the user picks: subscribe now (open the checkout link, then wait for
+ * the webhook to flip the key to paid), use claude without MemTree (launch
+ * uncompressed, the in-session notice still fires), or quit.
+ */
+async function runPaymentGate(status, recheck) {
+    let current = status;
+    for (;;) {
+        console.warn(`\x1b[1;33m${formatPaymentNotice(current)}\x1b[0m\n`);
+        const choice = parsePaymentChoice(await askLine(PAYMENT_GATE_PROMPT));
+        if (choice === "quit")
+            process.exit(0);
+        if (choice === "continue") {
+            console.log("\nStarting claude without MemTree.\n");
+            return;
+        }
+        openUrl(current.url ?? FALLBACK_SUBSCRIBE_URL);
+        console.log("\nOpened the subscribe page. Waiting for payment to complete…");
+        const paid = await waitUntilPaid(recheck, SUBSCRIBE_WAIT_MS, SUBSCRIBE_POLL_MS);
+        if (paid) {
+            console.log("\x1b[1;32m✓ MemTree is on — thank you.\x1b[0m\n");
+            return;
+        }
+        console.warn("\nStill unpaid.\n");
+    }
+}
+/** Poll the status probe until it reports paid, or give up after `totalMs`. */
+async function waitUntilPaid(recheck, totalMs, everyMs) {
+    const deadline = Date.now() + totalMs;
+    while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, everyMs));
+        const status = await recheck();
+        if (status?.paid === true)
+            return true;
+    }
+    return false;
+}
+function askLine(question) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise((resolve) => {
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
 }
 function printBanner() {
     console.log(`\n\x1b[38;5;209m∞\x1b[0m \x1b[1;38;5;209mClaude Code Infinite\x1b[0m \x1b[38;5;209m∞\x1b[0m \x1b[38;5;48mfrom \x1b]8;;https://MemTree.dev\x1b\\MemTree\x1b]8;;\x1b\\\x1b[0m\n`);
@@ -145,16 +191,30 @@ async function main() {
     const memtreeBaseUrl = mode === "local" ? LOCAL_BASE_URL :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
-    // Warn about an unpaid key before claude takes over the terminal. Awaited so
-    // the warning can't corrupt the TUI, but bounded (2s) and silent on error —
-    // startup never fails or hangs on polychat availability. The npm update
-    // check runs concurrently under the same bound; its result goes into the
-    // SessionStart banner below, since the TUI covers this terminal within a
-    // second. Both resolve rather than reject, so Promise.all cannot throw.
-    const [, updateAvailable] = await Promise.all([
-        warnIfUnpaid(memtreeBaseUrl, polychatApiKey),
+    // Interactive UI only: print/non-TTY invocations are programmatic
+    // interfaces whose output must stay byte-for-byte vanilla, and they get no
+    // notice plugin to deliver a banner anyway.
+    const interactiveUi = !isPrintInvocation(claudeArgs) &&
+        process.stdin.isTTY === true &&
+        process.stdout.isTTY === true;
+    // Check the key's payment status before claude takes over the terminal.
+    // Bounded (2s) and null on error — startup never fails or hangs on polychat
+    // availability. The npm update check runs concurrently under the same
+    // bound; its result goes into the SessionStart banner below, since the TUI
+    // covers this terminal within a second. Both resolve rather than reject, so
+    // Promise.all cannot throw.
+    const [paymentStatus, updateAvailable] = await Promise.all([
+        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey),
         checkForUpdate({ currentVersion: CLIENT_VERSION }),
     ]);
+    if (paymentStatus?.paid === false) {
+        if (interactiveUi) {
+            await runPaymentGate(paymentStatus, () => fetchPaymentStatus(memtreeBaseUrl, polychatApiKey));
+        }
+        else {
+            console.warn(`\x1b[1;33m${formatPaymentNotice(paymentStatus)}\x1b[0m`);
+        }
+    }
     if (isDebugMode && updateAvailable) {
         console.log(`[DEBUG] Update available: ${updateAvailable.current} → ${updateAvailable.latest}`);
     }
@@ -171,12 +231,6 @@ async function main() {
         reqlog,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
-    // Interactive UI only: print/non-TTY invocations are programmatic
-    // interfaces whose output must stay byte-for-byte vanilla, and they get no
-    // notice plugin to deliver a banner anyway.
-    const interactiveUi = !isPrintInvocation(claudeArgs) &&
-        process.stdin.isTTY === true &&
-        process.stdout.isTTY === true;
     const proxy = await startProxy({
         memtree,
         debug: isDebugMode,
