@@ -32,11 +32,14 @@ export declare function parsePaymentStatus(body: unknown): PaymentStatus | null;
 /** First `/payment?…` link in a payment prompt, or null. */
 export declare function extractPaymentUrl(message: string | null): string | null;
 /**
- * Terminal text for an unpaid key: headline, then the server's prompt with
- * markdown headings stripped and newlines kept (no truncation — the URL must
- * survive intact), then the subscribe link on its own line.
+ * Terminal text for an unpaid key: the headline and one line with the
+ * recommended plan (when the server's prose names one) and the subscribe
+ * link. The full server message is deliberately not echoed — it is several
+ * paragraphs written for a chat window, and the prompt below is the point.
  */
 export declare function formatPaymentNotice(status: PaymentStatus): string;
+/** "Starter plan, $5/month" from the recommender's prose, or null. */
+export declare function extractRecommendedPlan(message: string | null): string | null;
 /** Map a prompt answer to a choice. Enter (empty) or `s` subscribes. */
 export declare function parsePaymentChoice(answer: string): PaymentChoice;
 //# sourceMappingURL=payment-gate.d.ts.map

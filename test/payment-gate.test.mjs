@@ -4,6 +4,7 @@ import {
   FALLBACK_SUBSCRIBE_URL,
   PAYMENT_GATE_HEADLINE,
   extractPaymentUrl,
+  extractRecommendedPlan,
   formatPaymentNotice,
   parsePaymentChoice,
   parsePaymentStatus,
@@ -53,26 +54,29 @@ test("extractPaymentUrl only matches /payment? links", () => {
   assert.equal(extractPaymentUrl(`x ${URL} y`), URL);
 });
 
-test("notice keeps newlines and the full url, strips markdown headings", () => {
+test("notice is two lines: headline, then plan and full url", () => {
   const text = formatPaymentNotice(parsePaymentStatus({ paid: false, payment_message: MESSAGE }));
-  assert.ok(text.startsWith(PAYMENT_GATE_HEADLINE));
-  assert.ok(text.includes(`Subscribe: ${URL}`));
-  assert.ok(!text.includes("#"), text);
-  assert.ok(text.includes("Subscription Plans\nYour usage exceeds"));
+  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  Starter plan, $5/month: ${URL}`);
+  assert.ok(!text.includes("Subscription Plans"));
 });
 
-test("notice scrubs control characters but keeps newlines", () => {
-  const text = formatPaymentNotice({
-    paid: false,
-    message: "line one[31m\nline two\ttabbed",
-    url: null,
-  });
-  assert.ok(text.includes("line one [31m\nline two tabbed"), text);
+test("plan line is dropped when the server prose names none", () => {
+  const text = formatPaymentNotice({ paid: false, message: "Please pay.", url: URL });
+  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  ${URL}`);
+});
+
+test("extractRecommendedPlan scrubs control characters and tolerates no emoji", () => {
+  assert.equal(
+    extractRecommendedPlan("we recommend Pro plan for $20/month\u001b[0m"),
+    "Pro plan, $20/month"
+  );
+  assert.equal(extractRecommendedPlan("no plan here"), null);
+  assert.equal(extractRecommendedPlan(null), null);
 });
 
 test("notice without a message or url still points at pricing", () => {
   const text = formatPaymentNotice({ paid: false, message: null, url: null });
-  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n\nSubscribe: ${FALLBACK_SUBSCRIBE_URL}`);
+  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  ${FALLBACK_SUBSCRIBE_URL}`);
 });
 
 test("Enter subscribes, c continues, q quits, anything else continues", () => {
