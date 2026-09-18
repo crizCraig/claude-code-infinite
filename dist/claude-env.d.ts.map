@@ -1,0 +1,1 @@
+{"version":3,"file":"claude-env.d.ts","sourceRoot":"","sources":["../src/claude-env.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;;;;;;;;;GAqBG;AACH,wBAAgB,cAAc,CAC5B,SAAS,EAAE,MAAM,CAAC,UAAU,EAC5B,gBAAgB,EAAE,MAAM,GACvB,MAAM,CAAC,UAAU,CAoBnB;AAOD;;;;GAIG;AACH,wBAAgB,oCAAoC,CAClD,SAAS,EAAE,MAAM,CAAC,UAAU,GAC3B,OAAO,CAET"}

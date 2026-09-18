@@ -1,0 +1,297 @@
+/**
+ * Turn detection and message-shaping helpers, ported from the polychat server
+ * (memory/preserve_last_user_message.py, memory/v2/consume.py,
+ * llm_api/extract_text.py) per plans/2026-06-09_PLAN_local_proxy_app.md.
+ *
+ * Audit notes vs the server heuristic (plan "Turn detection nuances"):
+ * - A message containing ANY tool_result block is treated as a tool turn, even
+ *   with trailing text blocks (Claude Code appends system-reminder text blocks
+ *   after tool_results; the server's all-blocks-are-tool_results check counted
+ *   those as user turns).
+ * - Text is checked after stripping <system-reminder> tags, so standalone
+ *   system-reminder messages are not user turns.
+ * - The "user stepped away" recap prompt (plain text, no tag) intentionally
+ *   counts as a real user turn for compression, but is separately recognized
+ *   so no user-facing MemTree notice is queued for that hidden request.
+ */
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+const BASH_INPUT_RE = /^<bash-input>[\s\S]*<\/bash-input>$/;
+const BASH_OUTPUT_RE = /^<bash-stdout>[\s\S]*<\/bash-stdout><bash-stderr>[\s\S]*<\/bash-stderr>$/;
+/** Distinctive stable prefix of Claude Code's hidden away-summary prompt. */
+export const AWAY_SUMMARY_PROMPT_PREFIX = "The user stepped away and is coming back. Recap in under 40 words";
+export function stripSystemReminderText(text) {
+    return text.replace(SYSTEM_REMINDER_RE, "").trim();
+}
+function contentHasRealText(content) {
+    if (typeof content === "string") {
+        return stripSystemReminderText(content).length > 0;
+    }
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            if (typeof part === "string" && stripSystemReminderText(part)) {
+                return true;
+            }
+            if (part &&
+                typeof part === "object" &&
+                part.type === "text" &&
+                typeof part.text === "string" &&
+                stripSystemReminderText(part.text)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+function hasToolResultBlock(content) {
+    return (Array.isArray(content) &&
+        content.some((part) => part && typeof part === "object" && part.type === "tool_result"));
+}
+/** True only for Claude Code's user wrapper carrying one or more tool results. */
+export function isToolResultUserMessage(message) {
+    return (!!message &&
+        message.role === "user" &&
+        hasToolResultBlock(message.content));
+}
+/** True if this is a real user instruction (not a tool-result wrapper or synthetic reminder). */
+export function isNonToolUserMessage(message) {
+    if (!message || message.role !== "user")
+        return false;
+    if (hasToolResultBlock(message.content))
+        return false;
+    return contentHasRealText(message.content);
+}
+/** True only for Claude Code's hidden away-summary user request. */
+export function isAwaySummaryUserMessage(message) {
+    if (!message || message.role !== "user")
+        return false;
+    const content = message.content;
+    if (typeof content === "string") {
+        return content.startsWith(AWAY_SUMMARY_PROMPT_PREFIX);
+    }
+    if (!Array.isArray(content))
+        return false;
+    const text = content
+        .map((part) => {
+        if (typeof part === "string")
+            return part;
+        if (part?.type === "text" && typeof part.text === "string")
+            return part.text;
+        return "";
+    })
+        .join("");
+    return text.startsWith(AWAY_SUMMARY_PROMPT_PREFIX);
+}
+/** Concatenate plain text fields from a user message for hook correlation. */
+export function userMessageText(message) {
+    if (!message || message.role !== "user")
+        return "";
+    if (typeof message.content === "string")
+        return message.content;
+    if (!Array.isArray(message.content))
+        return "";
+    return message.content
+        .map((part) => {
+        if (typeof part === "string")
+            return part;
+        return part?.type === "text" && typeof part.text === "string" ? part.text : "";
+    })
+        .join("");
+}
+/**
+ * Claude Code may append ambient role=system context after the human message.
+ * Turn classification is based on the last conversation message, not that
+ * trailing metadata.
+ */
+export function lastNonSystemMessage(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.role !== "system")
+            return messages[i];
+    }
+    return undefined;
+}
+/**
+ * True for Claude Code's local `!command` replay shape. These commands do not
+ * consistently emit UserPromptSubmit, but their stdout is followed by a real
+ * main-thread completion (and therefore can legitimately own a display-only
+ * MemTree notice). Keep the match strict so arbitrary unarmed API traffic does
+ * not acquire notice ownership.
+ */
+export function isLocalBashCommandTurn(messages) {
+    let outputIndex = messages.length - 1;
+    while (outputIndex >= 0 && messages[outputIndex]?.role === "system") {
+        outputIndex--;
+    }
+    if (outputIndex < 1)
+        return false;
+    const output = messages[outputIndex];
+    if (output?.role !== "user" ||
+        !BASH_OUTPUT_RE.test(userMessageText(output))) {
+        return false;
+    }
+    let inputIndex = outputIndex - 1;
+    while (inputIndex >= 0 && messages[inputIndex]?.role === "system") {
+        inputIndex--;
+    }
+    const input = messages[inputIndex];
+    return (input?.role === "user" &&
+        BASH_INPUT_RE.test(userMessageText(input)));
+}
+/**
+ * True if any message before the effective last non-system message is a real
+ * user input. Distinguishes the
+ * first user turn (nothing indexed yet — don't block on compression) from
+ * followup user turns (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
+ * Synthetic reminder messages and tool_result wrappers don't count, via the
+ * same audited isNonToolUserMessage heuristic.
+ */
+export function hasEarlierNonToolUserMessage(messages) {
+    let currentIndex = messages.length - 1;
+    while (currentIndex >= 0 && messages[currentIndex]?.role === "system") {
+        currentIndex--;
+    }
+    for (let i = 0; i < currentIndex; i++) {
+        if (isNonToolUserMessage(messages[i]))
+            return true;
+    }
+    return false;
+}
+/**
+ * Remove Claude Code <system-reminder> snippets before sending messages to the
+ * indexing endpoint (mirrors server strip_cc_system_reminders — reminders churn
+ * on /resume and would cause indexing inconsistencies).
+ */
+export function stripCcSystemReminders(messages) {
+    const result = [];
+    for (const msg of messages) {
+        const content = msg.content;
+        if (typeof content === "string") {
+            const cleaned = stripSystemReminderText(content);
+            if (cleaned)
+                result.push({ ...msg, content: cleaned });
+        }
+        else if (Array.isArray(content)) {
+            const cleanedParts = [];
+            for (const part of content) {
+                const cleaned = stripPart(part);
+                if (cleaned !== null)
+                    cleanedParts.push(cleaned);
+            }
+            if (cleanedParts.length)
+                result.push({ ...msg, content: cleanedParts });
+        }
+        else {
+            result.push(msg);
+        }
+    }
+    return result;
+}
+function stripPart(part) {
+    if (typeof part === "string") {
+        const cleaned = stripSystemReminderText(part);
+        return cleaned ? cleaned : null;
+    }
+    if (part && typeof part === "object") {
+        if (part.type === "text" && typeof part.text === "string") {
+            const cleaned = stripSystemReminderText(part.text);
+            return cleaned ? { ...part, text: cleaned } : null;
+        }
+        if (part.type === "tool_result") {
+            const inner = part.content;
+            if (typeof inner === "string") {
+                const cleaned = stripSystemReminderText(inner);
+                return { ...part, content: cleaned };
+            }
+            if (Array.isArray(inner)) {
+                const cleanedInner = inner
+                    .map((p) => stripPart(p))
+                    .filter((p) => p !== null);
+                return { ...part, content: cleanedInner };
+            }
+        }
+    }
+    return part;
+}
+// The client-side flatten port (flattenToSingleUserMessage /
+// extractTextForFlatten) was deleted per the 2026-08-09 consolidation
+// decision: the flatten format is implemented ONCE, server-side, in
+// polychat/memory/flatten_messages.py. The client requests it with
+// `flatten: true` and forwards `flattened_messages` verbatim
+// (serverFlattenedMessages in memtree.ts); it never re-derives the format.
+/**
+ * Build the message list sent to /v1/context_memory: the Anthropic top-level
+ * `system` param becomes a leading system-role message (mirrors cc_api.py).
+ */
+export function messagesWithSystem(messages, system) {
+    const msgs = messages.map((m) => ({ ...m }));
+    if (system != null && (typeof system === "string" ? system : system.length)) {
+        msgs.unshift({ role: "system", content: system });
+    }
+    return msgs;
+}
+/**
+ * Context-window budget for compression.
+ *
+ * 1M long context can be selected three ways and we must accept all three:
+ * - a `[1m]` model-name suffix (our CLI convention), or
+ * - an `anthropic-beta: context-1m-*` header — this is what Claude Code
+ *   actually sends on the wire: it strips the `[1m]` suffix from the model
+ *   field and translates it into the beta flag for extended-context models,
+ * - a current model whose API window is natively 1M. Native-1M requests use a
+ *   plain model id and do not need the beta header.
+ */
+const NATIVE_ONE_MILLION_MODELS = new Set([
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+]);
+function isNativeOneMillionModel(model) {
+    if (!model)
+        return false;
+    const normalized = model
+        .trim()
+        .toLowerCase()
+        .replace(/(?:\[1m\])+$/i, "")
+        .replace(/-\d{8}$/, "");
+    if (NATIVE_ONE_MILLION_MODELS.has(normalized))
+        return true;
+    // Point releases / variants of a native-1M model (e.g. "claude-fable-5-1"
+    // before it was listed, or a future "claude-opus-5-1") keep the 1M window,
+    // mirroring the server's "dated/variant id of a known model" rule. Without
+    // this the server clamps their 500k budget to a 200k window.
+    for (const base of NATIVE_ONE_MILLION_MODELS) {
+        if (normalized.startsWith(`${base}-`))
+            return true;
+    }
+    return false;
+}
+export function contextLimitForModel(model, anthropicBeta, nativeOneMillionContext = true) {
+    if (model && model.includes("[1m]"))
+        return 1_000_000;
+    if (anthropicBeta && anthropicBeta.includes("context-1m"))
+        return 1_000_000;
+    if (nativeOneMillionContext && isNativeOneMillionModel(model)) {
+        return 1_000_000;
+    }
+    return 200_000;
+}
+/**
+ * Model name to report to the MemTree server: re-attach the `[1m]` suffix
+ * when the session runs with 1M context but the wire model name is plain
+ * (either because Claude Code moved the suffix into the beta header or because
+ * the model is natively 1M). The server resolves `<model>[1m]` aliases and logs
+ * the requested model verbatim, so this keeps its budget telemetry
+ * self-explanatory about the context variant.
+ */
+export function modelForMemtree(model, contextLimit) {
+    if (!model)
+        return undefined;
+    if (contextLimit >= 1_000_000 && !model.includes("[1m]"))
+        return `${model}[1m]`;
+    return model;
+}
+//# sourceMappingURL=turns.js.map

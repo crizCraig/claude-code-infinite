@@ -1,8 +1,8 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
+# Build output — dist/ is committed while installs come from GitHub (npm publish
+# unavailable); untrack it again once claude-code-infinite@1.0.13 is on npm.
 
 # IDE
 .idea/

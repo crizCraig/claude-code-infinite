@@ -4,6 +4,12 @@ set -e
 # Ensure we're in the project directory
 cd "$(dirname "$0")"
 
+# Publish from main only: npm version commits and tags the *current* branch.
+if [[ "$(git branch --show-current)" != "main" ]]; then
+    echo "Error: publish.sh must run on main (currently on '$(git branch --show-current)')."
+    exit 1
+fi
+
 # Check for uncommitted changes
 if ! git diff-index --quiet HEAD --; then
     echo "Error: You have uncommitted changes. Commit them first."

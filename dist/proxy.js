@@ -1,0 +1,2704 @@
+/**
+ * Claude Code Infinite local proxy (plans/2026-06-09_PLAN_local_proxy_app.md,
+ * refined by plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
+ *
+ * Claude Code points ANTHROPIC_BASE_URL at this 127.0.0.1 server. We never
+ * read, store, or refresh credentials: Claude Code keeps its native login and
+ * sends its own OAuth bearer here, and we forward its headers and query string
+ * verbatim to api.anthropic.com (the anthropic-beta flag list churns across CC
+ * versions — never reconstruct it). Only the `messages` body is ever altered
+ * (compression, plus defensive removal of legacy notice markers);
+ * auth, identity, and routing are never touched.
+ *
+ * Turn classification for POST /v1/messages:
+ * - Tool turn (last message isn't a real user input): background indexing,
+ *   forward as-is — either riding its lane's memory route (routes live in a
+ *   small map keyed by request identity: session + main/away/agent-id) or
+ *   verbatim. A miss buys ONE best-effort blocking recompression per lane
+ *   per epoch, any size (plans/2026-08-04_PLAN_tool_turn_route_recovery.md,
+ *   plans/2026-08-08_PLAN_route_parity_simple.md); failure degrades to the
+ *   verbatim forward. Every identity installs into its own lane — isolation
+ *   is structural, not defended.
+ * - First user turn (no earlier real user input): background indexing, forward
+ *   as-is — nothing is indexed yet, so blocking would be a guaranteed no-op.
+ * - Followup user turn: blocking compress + substitute. The compressed body
+ *   remains the prefix for that turn's tool loop.
+ * - MemTree failure/timeout degrades to passthrough. A display-only success
+ *   notice is queued only when the memory response is selected AND MemTree's
+ *   index coverage grew since the last announcement (unchanged coverage means
+ *   the turn was appended after an index that learned nothing new); degraded
+ *   and unpaid states get their own notices.
+ *
+ * Every /v1/messages and count_tokens body is run through the legacy notice
+ * strip pass before hashing/forwarding. Live notices use Claude Code hooks and
+ * upstream response bytes pass through to the client unchanged.
+ */
+import http from "node:http";
+import https from "node:https";
+import { createHash, randomBytes } from "node:crypto";
+import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, normalizeMessagesForMemtree, serverFlattenedMessages, } from "./memtree.js";
+import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
+import { COMPRESSED_NOTICE, DEGRADED_NOTICE, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
+import { NoticeDeliveryQueue, parseNoticeHookInput, } from "./hooks.js";
+import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
+const DEFAULT_UPSTREAM = "https://api.anthropic.com";
+const HOOK_BODY_LIMIT = 64 * 1024;
+// After a recovery attempt returns null (MemTree down, 5xx, or a burned
+// timeout budget), suppress the blocking attempt for this long. The followup
+// path pays a failed compress at most once per HUMAN turn; the fuse sits on
+// the tool loop and would otherwise pay it once per TOOL turn — and history
+// grows every turn, so compress()'s complete-request dedup never absorbs the
+// repeat.
+// Long enough that a real outage costs one stall, short enough that a
+// transient blip does not disable recovery for a working session.
+const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
+const SKIP_REQUEST_HEADERS = new Set([
+    "host",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "content-length", // recomputed for buffered/modified bodies
+]);
+const SKIP_RESPONSE_HEADERS = new Set([
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+]);
+/**
+ * Bound on concurrently held route lanes. A route entry is 0.4–4 MB of heap,
+ * so 32 lanes is honestly ~128 MB worst case — accepted so a wide agent
+ * fan-out (main + away + dozens of live subagents) cannot LRU-evict main's
+ * route mid-turn; the cap is enforced by LRU eviction, not assumed.
+ */
+const MEMORY_ROUTE_MAX_LANES = 32;
+/**
+ * The agent id a request is attributed by, preferring its own id over its
+ * parent's. Absence of both is the definition of main-thread attribution, so
+ * hasAgentAttribution is this same extraction asked as a yes/no question.
+ */
+function agentAttributionId(req) {
+    return (firstNonEmptyHeader(req, "x-claude-code-agent-id") ??
+        firstNonEmptyHeader(req, "x-claude-code-parent-agent-id"));
+}
+/**
+ * Collision-free identity of a memory-route lane: the label the reqlog reports
+ * and the key every map is addressed by, classified once from the same headers
+ * so the two can never disagree. The tuple tags reserved main/away lanes
+ * separately from agent ids, so an agent literally named "main" or "away"
+ * cannot alias either reserved lane; JSON array encoding also prevents
+ * delimiter collisions between arbitrary session and agent headers.
+ * Keying by identity is what makes lane isolation structural: a request can
+ * only ever reach its own lane, so foreign-route defense is unnecessary rather
+ * than implemented.
+ */
+function routeIdentity(req, isAwaySummary) {
+    const session = requestSessionId(req) ?? "";
+    const agent = agentAttributionId(req);
+    if (isAwaySummary) {
+        return { lane: "away", key: JSON.stringify([session, "away"]) };
+    }
+    if (agent) {
+        return { lane: "agent", key: JSON.stringify([session, "agent", agent]) };
+    }
+    return { lane: "main", key: JSON.stringify([session, "main"]) };
+}
+function firstNonEmptyHeader(req, name) {
+    const value = req.headers[name];
+    const text = Array.isArray(value)
+        ? value.find((item) => item.trim() !== "")
+        : value;
+    return typeof text === "string" && text.trim() ? text.trim() : undefined;
+}
+/**
+ * Close the current route epoch and open the next one, returning the new
+ * epoch. Everything keyed to the epoch just superseded goes with it: every
+ * surviving reservation belongs to that closed epoch and can no longer hold
+ * anything, and a new human turn ends the previous turn's subagents too, so
+ * every lane's route and spent-recovery mark is dropped rather than
+ * selectively pruned. Doing all of it here is what makes the sets' documented
+ * bound ("cleared on each epoch bump") true at every bump site rather than
+ * only at the followup one.
+ *
+ * keepRecoveryBudget skips only the spent-recovery wipe, for the followup
+ * bump of a prompt whose UserPromptSubmit bump already wiped it: one turn
+ * boundary otherwise wipes twice milliseconds apart, re-granting a lane that
+ * spent its blocking attempt in between. Hookless embedders (no
+ * UserPromptSubmit ever fires) must never pass true — their followup bump is
+ * the only per-human-turn re-grant, without which a spent lane would forward
+ * full history forever.
+ */
+function bumpRouteEpoch(state, keepRecoveryBudget = false) {
+    const epoch = ++state.mainRouteEpoch;
+    state.routeDecisionsLive.clear();
+    state.memoryRoutes.clear();
+    if (!keepRecoveryBudget)
+        state.toolRecoveryAttemptedLanes.clear();
+    return epoch;
+}
+/**
+ * Lane lookup with the two map invariants applied on every access: an entry
+ * whose epoch is stale is dropped (a new human turn ended the previous turn's
+ * subagents too), and a hit is re-inserted to keep Map iteration order the
+ * LRU order that eviction in setMemoryRoute relies on.
+ */
+function getMemoryRoute(state, key) {
+    const route = state.memoryRoutes.get(key);
+    if (!route)
+        return undefined;
+    if (route.routeEpoch !== state.mainRouteEpoch) {
+        state.memoryRoutes.delete(key);
+        return undefined;
+    }
+    state.memoryRoutes.delete(key);
+    state.memoryRoutes.set(key, route);
+    return route;
+}
+function setMemoryRoute(state, key, route) {
+    state.memoryRoutes.delete(key);
+    state.memoryRoutes.set(key, route);
+    while (state.memoryRoutes.size > MEMORY_ROUTE_MAX_LANES) {
+        const oldest = state.memoryRoutes.keys().next().value;
+        if (oldest === undefined)
+            break;
+        state.memoryRoutes.delete(oldest);
+    }
+}
+function resolveUpstream(opts) {
+    const url = new URL(opts.upstreamOrigin ?? DEFAULT_UPSTREAM);
+    const secure = url.protocol === "https:";
+    return {
+        module: secure ? https : http,
+        host: url.hostname,
+        port: url.port ? Number(url.port) : secure ? 443 : 80,
+    };
+}
+export function startProxy(opts) {
+    const upstream = resolveUpstream(opts);
+    const hookPath = `/_ccc/hooks/${randomBytes(24).toString("hex")}`;
+    const activeRequests = new Set();
+    const acceptedRequests = new Set();
+    const shutdownAbort = new AbortController();
+    const state = {
+        paymentNoticeShown: false,
+        notices: new NoticeDeliveryQueue(),
+        mainPromptArmed: false,
+        recoveryBudgetWipedForBoundary: false,
+        mainPromptDelivered: true,
+        mainPromptGeneration: 0,
+        activeSubagents: new Set(),
+        memoryRoutes: new Map(),
+        mainRouteEpoch: 0,
+        mainRouteDecisionGeneration: 0,
+        routeDecisionsLive: new Map(),
+        toolRecoveryAttemptedLanes: new Map(),
+        toolRecoveryCooldownUntil: 0,
+        shutdownSignal: shutdownAbort.signal,
+        routeInstallFault: opts.routeInstallFault,
+    };
+    const server = http.createServer((req, res) => {
+        const accepted = { req, res };
+        acceptedRequests.add(accepted);
+        const task = handleRequest(req, res, opts, upstream, state, hookPath).catch((err) => {
+            try {
+                sendAnthropicError(res, `local proxy error: ${err?.message ?? err}`);
+            }
+            catch {
+                // A failed error response must not strand shutdown bookkeeping.
+            }
+        });
+        activeRequests.add(task);
+        void task.then(() => {
+            activeRequests.delete(task);
+            acceptedRequests.delete(accepted);
+        }, () => {
+            activeRequests.delete(task);
+            acceptedRequests.delete(accepted);
+        });
+        if (shutdownAbort.signal.aborted)
+            cancelAcceptedRequest(accepted);
+    });
+    // Long-running SSE responses must not be cut by idle timeouts.
+    server.requestTimeout = 0;
+    server.headersTimeout = 60_000;
+    let closePromise;
+    const beginClose = () => {
+        if (closePromise)
+            return closePromise;
+        closePromise = new Promise((done) => {
+            if (!server.listening) {
+                done();
+                return;
+            }
+            server.close(() => done());
+        });
+        return closePromise;
+    };
+    const drain = async (timeoutMs = 5_000) => {
+        const boundedMs = Number.isFinite(timeoutMs) && timeoutMs >= 0
+            ? Math.floor(timeoutMs)
+            : 5_000;
+        const quiesced = (async () => {
+            // Once close completes, every accepted request has entered the tracked
+            // set.
+            await beginClose();
+            while (activeRequests.size > 0) {
+                await Promise.allSettled([...activeRequests]);
+            }
+        })();
+        let timer;
+        const completed = await Promise.race([
+            quiesced.then(() => true),
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve(false), boundedMs);
+            }),
+        ]);
+        if (timer)
+            clearTimeout(timer);
+        if (completed)
+            return true;
+        // The grace period protects useful in-flight delivery. Once it
+        // expires, signal every forwarding path first so each can
+        // classify the close as proxy-owned, then tear down any request that was
+        // still reading/dispatching before it installed a path-specific listener.
+        shutdownAbort.abort();
+        for (const accepted of acceptedRequests)
+            cancelAcceptedRequest(accepted);
+        await quiesced;
+        return false;
+    };
+    return new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            const port = server.address().port;
+            resolve({
+                port,
+                hookUrl: `http://127.0.0.1:${port}${hookPath}`,
+                close: () => {
+                    void beginClose();
+                },
+                drain,
+            });
+        });
+    });
+}
+/** Final safety net for handlers that have not reached an upstream path yet. */
+function cancelAcceptedRequest(accepted) {
+    const { req, res } = accepted;
+    if (!req.complete && !req.destroyed) {
+        // A pass-through upload may not otherwise have an IncomingMessage error
+        // listener; consume this proxy-owned teardown error after body readers see it.
+        req.once("error", () => { });
+        req.destroy(new Error("proxy shutdown"));
+    }
+    if (!res.destroyed && !res.writableEnded)
+        res.destroy();
+}
+async function handleRequest(req, res, opts, upstream, state, hookPath) {
+    const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+    if (url.pathname === hookPath) {
+        return handleNoticeHook(req, res, state, opts.reqlog);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/messages") {
+        return handleMessages(req, res, opts, upstream, state);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+        return handleCountTokens(req, res, opts, upstream, state);
+    }
+    return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+/** Serve only validated Claude hook POSTs on the randomized localhost path. */
+async function handleNoticeHook(req, res, state, reqlog) {
+    if (req.method !== "POST") {
+        res.writeHead(405, { allow: "POST" });
+        res.end();
+        return;
+    }
+    const declaredLength = Number(req.headers["content-length"] ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > HOOK_BODY_LIMIT) {
+        res.writeHead(413);
+        res.end();
+        req.resume();
+        return;
+    }
+    const raw = await readBody(req);
+    if (raw.length > HOOK_BODY_LIMIT) {
+        res.writeHead(413);
+        res.end();
+        return;
+    }
+    let input;
+    try {
+        input = JSON.parse(raw.toString("utf-8"));
+    }
+    catch {
+        res.writeHead(400);
+        res.end();
+        return;
+    }
+    const parsed = parseNoticeHookInput(input);
+    if (!parsed) {
+        res.writeHead(400);
+        res.end();
+        return;
+    }
+    if (parsed.hook_event_name === "UserPromptSubmit") {
+        if (parsed.agent_id === undefined) {
+            state.mainPromptArmed = true;
+            state.mainPromptId = parsed.prompt_id;
+            state.mainPromptText = parsed.prompt;
+            state.mainPromptDelivered = false;
+            state.mainPromptGeneration++;
+            bumpRouteEpoch(state);
+            state.recoveryBudgetWipedForBoundary = true;
+            state.notices.clearForUserRequest();
+        }
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    if (parsed.hook_event_name === "SubagentStart") {
+        state.activeSubagents.add(parsed.agent_id);
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    if (parsed.hook_event_name === "SubagentStop") {
+        state.activeSubagents.delete(parsed.agent_id);
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    const stopMatchesMainPrompt = parsed.hook_event_name === "Stop" &&
+        parsed.agent_id === undefined &&
+        (state.mainPromptId === undefined ||
+            parsed.prompt_id === undefined ||
+            state.mainPromptId === parsed.prompt_id);
+    const output = parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
+        ? null
+        : state.notices.claim(parsed);
+    if (stopMatchesMainPrompt) {
+        state.mainPromptArmed = false;
+        state.mainPromptId = undefined;
+        state.mainPromptText = undefined;
+        state.mainPromptDelivered = true;
+        // Invalidate a response still in flight at Stop. Otherwise its late
+        // delivery callback could enqueue a notice after Stop returned.
+        state.mainPromptGeneration++;
+        bumpRouteEpoch(state);
+        // The boundary this flag described is over; a followup arriving before
+        // the next UserPromptSubmit is a new hookless boundary and must wipe.
+        state.recoveryBudgetWipedForBoundary = false;
+        // A normal main Stop means all child work for the turn has settled. Clear
+        // stale lifecycle entries left by a missed SubagentStop hook.
+        state.activeSubagents.clear();
+    }
+    if (!output) {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    if (parsed.hook_event_name === "MessageDisplay" ||
+        parsed.hook_event_name === "Stop") {
+        try {
+            reqlog?.log({
+                kind: "notice",
+                event: "claimed",
+                via: parsed.hook_event_name,
+            });
+        }
+        catch {
+            // Custom/test loggers get RequestLogger's never-break-hook policy.
+        }
+    }
+    const body = Buffer.from(JSON.stringify(output), "utf-8");
+    res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+    });
+    res.end(body);
+}
+/**
+ * Hook-prompt correlation: true only when the armed typed prompt appears as a
+ * deliberate top-level text block of the user message — the whole block, or
+ * its start/end (Claude Code may append/prepend ambient text around a merged
+ * queued prompt). Matching runs on reminder-stripped block text so a
+ * coincidental substring inside an appended <system-reminder> (or buried
+ * mid-sentence in unrelated text) can never claim or consume the arm.
+ */
+function messageCarriesPromptText(message, promptText) {
+    const prompt = promptText.trim();
+    if (!prompt)
+        return false;
+    if (!message || message.role !== "user")
+        return false;
+    const content = message.content;
+    const parts = typeof content === "string"
+        ? [content]
+        : Array.isArray(content)
+            ? content.map((part) => {
+                if (typeof part === "string")
+                    return part;
+                return part?.type === "text" && typeof part.text === "string"
+                    ? part.text
+                    : "";
+            })
+            : [];
+    return parts.some((part) => {
+        const text = stripSystemReminderText(part);
+        return (text === prompt || text.startsWith(prompt) || text.endsWith(prompt));
+    });
+}
+/** Buffer + inspect /v1/messages; classify the turn, strip notices, forward. */
+async function handleMessages(req, res, opts, upstream, state) {
+    const received = Date.now();
+    const rawBody = await readBody(req);
+    // One request-log record per /v1/messages, filled in as the request flows
+    // through the forward path and written exactly once when the response is
+    // done (success or failure) — always on, so a stalled turn leaves a trace.
+    const rec = {
+        kind: "messages",
+        turnType: "unparseable",
+        requestBytes: rawBody.length,
+    };
+    const logged = async (forward) => {
+        try {
+            await forward;
+        }
+        finally {
+            if (rec.totalMs === undefined)
+                rec.totalMs = Date.now() - received;
+            opts.reqlog?.log(rec);
+        }
+    };
+    let body;
+    try {
+        body = JSON.parse(rawBody.toString("utf-8"));
+        if (!Array.isArray(body.messages))
+            throw new Error("no messages array");
+    }
+    catch {
+        // Not a shape we understand — forward verbatim rather than break the session.
+        return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
+    }
+    // Defensive legacy strip pass first: old marker-wrapped notices (including
+    // one copied into an away-summary or top-level system prompt) must never
+    // reach Anthropic or MemTree. Hook-delivered notices never enter this body.
+    const stripped = stripNoticeBlocks(body.messages);
+    const strippedSystem = stripNoticeSystem(body.system);
+    let forwardBody = rawBody;
+    if (stripped.stripped || strippedSystem.stripped) {
+        body.messages = stripped.messages;
+        if (strippedSystem.system === undefined)
+            delete body.system;
+        else
+            body.system = strippedSystem.system;
+        forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
+        if (opts.debug)
+            console.error("[ccc proxy] stripped legacy notice span(s) from request");
+    }
+    const messages = body.messages;
+    // CC 2.1.207 appends ambient role=system blocks after the typed prompt. Use
+    // the last non-system conversation message for classification while keeping
+    // every system block in the body sent to MemTree/Anthropic.
+    const lastMsg = lastNonSystemMessage(messages);
+    const isUserTurn = isNonToolUserMessage(lastMsg);
+    const isToolResultTurn = isToolResultUserMessage(lastMsg);
+    const isAwaySummary = isAwaySummaryUserMessage(lastMsg);
+    const isLocalBashCommand = isLocalBashCommandTurn(messages);
+    // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
+    // attribution before lifecycle-hook state so an agent request cannot claim
+    // or consume a main prompt arm even if SubagentStart ordering is delayed.
+    const { lane: requestRouteLane, key: requestRouteKey } = routeIdentity(req, isAwaySummary);
+    const isSubagentRequest = requestRouteLane === "agent";
+    const isMainRequest = requestRouteLane === "main";
+    rec.routeLane = requestRouteLane;
+    // A typed prompt that recovers an interrupted tool loop (or was queued
+    // mid-turn) arrives merged into the pending tool_result wrapper, so it fails
+    // isNonToolUserMessage -- while its UserPromptSubmit hook has already cleared
+    // the route expecting this request to rebuild it. Without this, that clear is
+    // never followed by a rebuild and every later tool turn forwards the full
+    // history (sticky passthrough until the next pure user turn). Corroborate
+    // with the armed hook prompt, and only when no installed route survives to
+    // ride -- an active route means the wrapper text matched by accident.
+    //
+    // The arm alone is not enough: it is consumed (for notice dedup) before the
+    // forward, but Claude Code retries a transient upstream failure (500/529)
+    // with the identical body. Until this prompt's compressible request has been
+    // fully delivered (mainPromptDelivered), the prompt text stays valid for
+    // classification so the retry recompresses instead of degrading to a plain
+    // tool turn with full-history passthrough. Successful delivery closes that
+    // window, so a stale prompt text cannot keep promoting later tool turns.
+    //
+    // "No installed route" needs one refinement. A route installed at
+    // protocol-complete (message_stop accepted downstream) deliberately survives
+    // a delivery promise that resolves false: Claude can consume message_stop,
+    // abort the SSE response, and immediately send a fast tool request that must
+    // still ride the compressed prefix. But delivered=false equally covers a
+    // client socket that died before the flush, whose retry is the IDENTICAL
+    // compressible body — indistinguishable from the fast-tool abort at delivery
+    // time. The two separate here: a genuine tool turn extends the route's
+    // prefix, while the identical-body retry cannot (empty suffix means
+    // memoryRoutedToolBody would reject it into full-history passthrough — the
+    // exact degradation the mainPromptDelivered window exists to prevent). So
+    // only a route this request could actually ride vetoes recovery
+    // classification.
+    const rideableCandidate = getMemoryRoute(state, requestRouteKey);
+    const routeRideableByThisRequest = rideableCandidate !== undefined &&
+        messages.length > rideableCandidate.originalPrefixHashes.length;
+    const isRecoveryPromptTurn = isToolResultTurn &&
+        isMainRequest &&
+        !routeRideableByThisRequest &&
+        (state.mainPromptArmed || !state.mainPromptDelivered) &&
+        !!state.mainPromptText &&
+        messageCarriesPromptText(lastMsg, state.mainPromptText);
+    const isCompressibleUserTurn = isUserTurn || isRecoveryPromptTurn;
+    const isFollowupUserTurn = isCompressibleUserTurn && hasEarlierNonToolUserMessage(messages);
+    let routeEpoch = state.mainRouteEpoch;
+    let routeDecisionGeneration = state.mainRouteDecisionGeneration;
+    // Whether this request's route decision is final: either it already made one
+    // (a main followup makes its decision by clearing the previous epoch below,
+    // even if its later compression loses the client) or it has since installed,
+    // cleared, or handed back its reservation. Only a followup ever reserves,
+    // and every path that reaches the reservation-aware helpers below has done
+    // so, so this single flag covers both "reserved" and "committed".
+    let routeDecisionSettled = isMainRequest;
+    // Only a rebuilder may clear: a main followup enters the blocking
+    // compression path below and installs a fresh route, so its clear is
+    // clear-then-rebuild. A first-user-shaped request (including CC-internal
+    // side calls that never fire UserPromptSubmit) takes the nonblocking path
+    // and cannot rebuild what it clears — the 2026-08-04 incident was exactly
+    // such a clear-without-rebuild hole stranding the next tool turn on a
+    // 2.96MB full-history forward. memoryRoutedToolBody revalidates session,
+    // epoch, system, and every prefix hash before any rewrite, so a retained
+    // route can never graft onto an unrelated request; it can only match its
+    // own conversation's extension or fail closed.
+    if (isFollowupUserTurn) {
+        if (isMainRequest) {
+            // Clears every lane before this request reserves the main lane in the
+            // new epoch. If this boundary's UserPromptSubmit bump already wiped the
+            // recovery budget milliseconds ago, keep a lane spent since then spent.
+            // Consume-once: the flag (not the arm, which can outlive its boundary)
+            // is what proves the wipe was THIS boundary's, and a hookless followup
+            // (flag never set) must still clear, being its embedder's only
+            // per-human-turn re-grant.
+            routeEpoch = bumpRouteEpoch(state, state.recoveryBudgetWipedForBoundary);
+            state.recoveryBudgetWipedForBoundary = false;
+        }
+        // Every followup can install or clear its own lane after compression. Give
+        // non-main lanes the same ordering guarantee main already had: a slower
+        // older completion cannot overwrite a newer request on the same key.
+        routeDecisionGeneration = ++state.mainRouteDecisionGeneration;
+        reserveRouteDecision(state, requestRouteKey, routeDecisionGeneration);
+    }
+    const hookOwnedMainFollowup = isFollowupUserTurn &&
+        !isAwaySummary &&
+        !isSubagentRequest &&
+        state.mainPromptArmed &&
+        state.mainPromptText !== undefined &&
+        messageCarriesPromptText(lastMsg, state.mainPromptText);
+    // Local `!command` turns do not consistently emit UserPromptSubmit, and the
+    // API history contains bash wrappers rather than the literal typed command.
+    // Their strict main-thread replay shape can safely own its own notice.
+    const localCommandMainFollowup = isFollowupUserTurn &&
+        !isAwaySummary &&
+        !isSubagentRequest &&
+        isLocalBashCommand;
+    const displayForThisTurn = (hookOwnedMainFollowup || localCommandMainFollowup) &&
+        state.activeSubagents.size === 0;
+    const noticePromptId = state.mainPromptId;
+    const noticePromptGeneration = state.mainPromptGeneration;
+    // Extended 1M context arrives as the `context-1m` beta header (Claude Code
+    // strips the `[1m]` model suffix on the wire). Current native-1M models send
+    // neither, so contextLimitForModel also needs the launcher's native setting.
+    const modelContextLimit = contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false);
+    const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
+    const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
+    const hash = MemtreeClient.hashMessages(msgsForMemtree);
+    // UserPromptSubmit clears/arms only a real main-thread human turn. Keep that
+    // arm through CC's small first-user probe/retries; consume it only when the
+    // actual followup request reaches the compression branch below. Hidden
+    // away-summary requests neither produce notices nor mutate a concurrently
+    // armed human turn.
+    if (typeof body.model === "string")
+        rec.model = body.model;
+    rec.stream = body.stream === true;
+    if (!isFollowupUserTurn) {
+        // Tool turn or FIRST user turn: keep the index fed off the response path
+        // and forward as-is — except a tool turn that misses its lane's memory
+        // route, which gets one best-effort blocking recompression below (once
+        // per lane per epoch).
+        // On the first user turn nothing is indexed yet, so a blocking compress
+        // would be a guaranteed no-op costing first-token latency
+        // (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
+        if (opts.debug && isUserTurn) {
+            console.error("[ccc proxy] first user turn: index in background, forward verbatim");
+        }
+        // A first-user-shaped main request is its boundary's only main arrival —
+        // no followup bump will ever come to consume the UserPromptSubmit flag.
+        // Consume it here, or a later hookless followup would read THIS
+        // boundary's "already wiped" and skip its own turn's re-grant, carrying
+        // spent lanes across a human-turn boundary.
+        //
+        // Only the armed prompt itself consumes (same prompt-text correlation as
+        // hookOwnedMainFollowup): CC-internal side calls can arrive first-user
+        // shaped on the main key without being the armed prompt, and letting one
+        // of those consume would leave the real followup bumping with keep=false
+        // — a second wipe in the same boundary, re-granting lanes spent moments
+        // earlier. That is the exact double-wipe keepRecoveryBudget closes.
+        //
+        // Two residual gaps are accepted (cycle-5 review), both bounded to one
+        // boundary and both degrading toward verbatim forwards:
+        // - A transformed prompt (slash-command expansion, hook-wrapped text)
+        //   fails the correlation and never consumes; a later hookless followup
+        //   then keeps last boundary's spent lanes spent for one turn. Stop's
+        //   clear-and-regrant converges it. Clearing on ANY first-user arrival
+        //   would re-open the double-wipe above — don't.
+        // - A side call that echoes the typed prompt verbatim passes the
+        //   correlation and consumes, re-admitting the double-wipe for that
+        //   narrow window. Text correlation cannot distinguish it; cost is one
+        //   extra blocking compress, capped by the per-lane budget.
+        // - (cycle-6 review) The rideability veto below is length-only: a
+        //   straggler recovery can install an old-history route on the main lane
+        //   after the prompt-boundary bump, and a merged-prompt wrapper longer
+        //   than that stale prefix is vetoed out of recovery classification. If
+        //   its ride then hash-mismatches, it rejects into tool recovery with
+        //   the prompt window still pending and the arm never consumed on that
+        //   path, so the rest of the turn runs transform-only-then-spent. Same
+        //   envelope as the two gaps above: one boundary, verbatim-forward
+        //   degradation, converged by Stop's clear-and-regrant. In the common
+        //   sub-case the hashes match and the wrapper simply rides with the
+        //   prompt in the suffix, which is correct.
+        if (isMainRequest &&
+            isUserTurn &&
+            state.mainPromptText !== undefined &&
+            messageCarriesPromptText(lastMsg, state.mainPromptText)) {
+            state.recoveryBudgetWipedForBoundary = false;
+        }
+        let routedBody = forwardBody;
+        let routedTool = false;
+        let routeMiss;
+        if (isToolResultTurn) {
+            // Every identity — main, subagent, away — consults its own lane. A
+            // request can only ever name its own key, so the old foreign-owner
+            // preservation and the subagent carve-out have nothing left to defend.
+            // This is the lane lookup already done for rideableCandidate above:
+            // same key, no await and no memoryRoutes mutation in between on this
+            // path (the epoch clear is in the isFollowupUserTurn branch), so a
+            // second getMemoryRoute would only redo its own LRU bookkeeping.
+            const activeRoute = rideableCandidate;
+            if (activeRoute) {
+                const rewritten = memoryRoutedToolBody(body, messages, activeRoute, state.mainRouteEpoch, requestSessionId(req));
+                const overContextWindow = rewritten !== null &&
+                    routedBodyExceedsContext(body, rewritten, modelContextLimit);
+                if (rewritten && !overContextWindow) {
+                    routedBody = rewritten;
+                    routedTool = true;
+                    if (opts.debug) {
+                        console.error("[ccc proxy] tool turn matched active memory route");
+                    }
+                }
+                else if (isRouteInstallReplay(body, messages, activeRoute, state.mainRouteEpoch, requestSessionId(req))) {
+                    // An exact replay of the request that installed this route: the
+                    // client's socket died before the response flushed and it retried
+                    // the identical body. Not a divergence — forward verbatim but KEEP
+                    // the route, so the next real tool turn (whose suffix extends the
+                    // prefix) still rides. Deleting here would spend a rebuild on a
+                    // route that was never wrong.
+                    routeMiss = "replay";
+                    if (opts.debug) {
+                        console.error("[ccc proxy] tool turn replayed the route-installing request");
+                    }
+                }
+                else {
+                    // A mismatch means a different/resumed conversation shape, or two
+                    // requesters colliding on one lane (children sharing only a
+                    // parent-agent-id land on the same key; their prefix hashes
+                    // disagree and the loser lands here). A route stored under this key
+                    // always carries this requester's session id — installMemoryRoute
+                    // derives both from the same request — so this is by construction a
+                    // same-session divergence: evict, and let recovery rebuild it.
+                    // A matching route that outgrew the request's resolved window must
+                    // also rebuild; a smaller window can re-grant a spent attempt.
+                    routeMiss = "rejected";
+                    state.memoryRoutes.delete(requestRouteKey);
+                    if (overContextWindow) {
+                        regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
+                    }
+                    if (opts.debug) {
+                        console.error("[ccc proxy] tool turn rejected active memory route");
+                    }
+                }
+            }
+            else {
+                routeMiss = "missing";
+                if (opts.debug) {
+                    console.error("[ccc proxy] tool turn has no active memory route");
+                }
+            }
+        }
+        if (routeMiss !== undefined)
+            rec.routeMiss = routeMiss;
+        if (
+        // A "replay" is not a miss to recover from: its route is intact and
+        // the verbatim forward IS the retry's payload, so it neither attempts
+        // nor spends the lane's budget.
+        (routeMiss === "missing" || routeMiss === "rejected") &&
+            // Cheap shape check: without an earlier real user message no
+            // server-side prefix can exist, so the miss is unrecoverable by
+            // construction and not worth an attempt or a record.
+            hasEarlierNonToolUserMessage(messages)) {
+            // No byte gate. The old 400KiB threshold answered "is this miss worth
+            // a blocking round trip?" with a latency guess; the answer main
+            // already lives by is a budget: at most ONE blocking recompress per
+            // (lane, epoch), with a new allowance if its route no longer fits a
+            // smaller context window. The followup path similarly pays once per
+            // human turn. The budget bounds the wait, and the
+            // no-gain check in recovery still guarantees the payload never gets
+            // worse than verbatim.
+            if (opts.toolRouteRecovery === false) {
+                // Under the kill switch no attempt ever runs and no lane is ever
+                // marked spent, so every shape-eligible miss records "disabled" —
+                // exactly the set of misses a switched-on proxy would have fed into
+                // the budget below.
+                rec.routeRecovery = { outcome: "disabled" };
+            }
+            else if (state.toolRecoveryAttemptedLanes.has(requestRouteKey)) {
+                // This lane already spent its one blocking attempt this epoch;
+                // the rest of its tool loop forwards verbatim (or rides, if the
+                // attempt installed). Checked BEFORE the cooldown so a spent lane
+                // records "spent" even while a cooldown is active: the two gates
+                // are independent facts, and the reqlog acceptance metric (attempts
+                // per lane per turn) needs budget exhaustion visible during
+                // outages, not masked behind "cooldown".
+                rec.routeRecovery = { outcome: "spent" };
+            }
+            else if (Date.now() < state.toolRecoveryCooldownUntil) {
+                // A recent attempt burned the full compress budget and still
+                // failed. Every tool turn appends a tool_result and rehashes, so
+                // compress() dedup can never absorb the repeat: without this
+                // cooldown a MemTree outage would add the whole blocking budget
+                // to EVERY large tool turn for the rest of the session — dozens
+                // per human turn, strictly worse than the verbatim path this
+                // fuse promises never to be worse than. A cooldown skip does not
+                // consume the lane's attempt.
+                rec.routeRecovery = { outcome: "cooldown" };
+            }
+            else {
+                const recoveryAttempt = { modelContextLimit, inFlight: true };
+                state.toolRecoveryAttemptedLanes.set(requestRouteKey, recoveryAttempt);
+                // Serialized non-system conversation bytes, for the record only —
+                // computed here, once per lane per epoch, never on the misses that
+                // skip the attempt: keeping the multi-megabyte stringify off every
+                // other miss is what made deleting the byte gate affordable.
+                const conversationBytes = Buffer.byteLength(JSON.stringify(messages.filter((m) => m.role !== "system")), "utf-8");
+                return logged(recoverToolRouteMiss({
+                    opts,
+                    state,
+                    req,
+                    res,
+                    upstream,
+                    body,
+                    messages,
+                    forwardBody,
+                    msgsForMemtree,
+                    hash,
+                    modelContextLimit,
+                    routeEpoch,
+                    rec,
+                    conversationBytes,
+                    routeKey: requestRouteKey,
+                    isMainRequest,
+                    recoveryAttempt,
+                }).finally(() => {
+                    recoveryAttempt.inFlight = false;
+                }));
+            }
+        }
+        recordTurn(rec, routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool", routedBody);
+        // A replay matched the stored route's prefix hashes, which are
+        // normalization-tolerant — attribution/cache-control churn can make its
+        // bytes (and even its MemTree hash) differ from the installer's, so the
+        // indexedHashes dedupe would NOT absorb this resubmit. The skip is still
+        // sound: a live route proves the installer's compress() submitted this
+        // history in this process, so re-indexing buys nothing.
+        if (routeMiss !== "replay") {
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+        }
+        capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
+        return logged(forwardRaw(req, res, routedBody, opts, upstream, state.shutdownSignal, rec));
+    }
+    // Close the recovery-retry window only once this compressible main turn's
+    // response has been fully delivered downstream: a failed forward (500/529)
+    // keeps state.mainPromptDelivered false so the client's identical-body retry
+    // reclassifies as the same user/recovery turn above. Epoch-guarded so a late
+    // completion can never mark a newer prompt's turn as delivered, and an
+    // away-summary request (isMainRequest false) never closes the main window.
+    const markMainPromptDelivered = () => {
+        if (isMainRequest && state.mainRouteEpoch === routeEpoch) {
+            state.mainPromptDelivered = true;
+        }
+    };
+    // Post-await route mutations require BOTH guards current: a stale epoch
+    // means a newer human turn owns the route lifecycle; a stale decision
+    // generation means a newer async route owner (another followup, or a
+    // route-owning tool recovery) has since reserved the decision. Either way
+    // this completion lost — it must not erase or overwrite the winner's route.
+    const routeDecisionCurrent = () => state.mainRouteEpoch === routeEpoch &&
+        routeDecisionHolds(state, requestRouteKey, routeDecisionGeneration);
+    const commitRouteDecision = () => {
+        routeDecisionSettled = true;
+    };
+    const releaseUncommittedRouteDecision = () => {
+        if (routeDecisionSettled)
+            return;
+        releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
+        routeDecisionSettled = true;
+    };
+    // Terminal non-riding outcome: if this request still owns the decision,
+    // clearing the lane IS its decision; otherwise yield to the newer owner.
+    const clearLaneOrYield = () => {
+        if (routeDecisionCurrent()) {
+            state.memoryRoutes.delete(requestRouteKey);
+            commitRouteDecision();
+        }
+        else {
+            releaseUncommittedRouteDecision();
+        }
+    };
+    // The complete request upload can outlive its downstream subscriber while
+    // MemTree compression is in flight. Track that subscriber locally without
+    // feeding its lifetime into MemtreeClient.compress(): compression promises
+    // are hash-deduped and may still be serving another live retry.
+    let downstreamClosedDuringCompression = res.destroyed && !res.writableFinished;
+    const markDownstreamClosedDuringCompression = () => {
+        if (!res.writableFinished)
+            downstreamClosedDuringCompression = true;
+    };
+    res.once("close", markDownstreamClosedDuringCompression);
+    // An active subagent can repeat/embed the human prompt in its own request;
+    // producer suppression must also preserve the arm for the later main call.
+    if (displayForThisTurn)
+        state.mainPromptArmed = false;
+    let compression;
+    try {
+        compression = await runBlockingCompression({
+            opts,
+            state,
+            body,
+            msgsForMemtree,
+            hash,
+            modelContextLimit,
+            rec,
+        });
+    }
+    catch (err) {
+        releaseUncommittedRouteDecision();
+        throw err;
+    }
+    finally {
+        res.off("close", markDownstreamClosedDuringCompression);
+    }
+    const { result } = compression;
+    noteMemtreeHealth(state, compression);
+    if (downstreamClosedDuringCompression ||
+        (res.destroyed && !res.writableFinished)) {
+        releaseUncommittedRouteDecision();
+        recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
+        return logged(Promise.resolve());
+    }
+    // No await occurs between this check and the selected forwarder's call.
+    // Each forwarder installs its own close listener synchronously, so this is
+    // an event-loop-atomic handoff of downstream-close ownership.
+    if (!result) {
+        // MemTree down/slow/402: the user's own Anthropic call is never gated on
+        // it. Degrade to passthrough and queue a display-only hook notice for a
+        // visible turn. The hidden away-summary request deliberately stays quiet.
+        // Unpaid key (402, from this compress OR an earlier background index) gets
+        // a payment-specific notice instead of the generic degraded one, at most
+        // once per proxy process after it has actually been delivered.
+        recordTurn(rec, "followup-degraded", forwardBody);
+        clearLaneOrYield();
+        capture(opts, "anthropic-request", forwardBody);
+        const paymentDetail = opts.memtree.paymentRequiredDetail;
+        const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
+        if (mayQueueNotice && paymentDetail !== null && !state.paymentNoticeShown) {
+            const detailFirstLine = sanitizeNoticeDetail(paymentDetail.split(/[\r\n]/, 1)[0]);
+            state.notices.queueSuffix(detailFirstLine
+                ? `${PAYMENT_REQUIRED_NOTICE}\n${detailFirstLine}`
+                : PAYMENT_REQUIRED_NOTICE, () => {
+                state.paymentNoticeShown = true;
+            }, noticePromptId);
+        }
+        else if (mayQueueNotice && paymentDetail === null) {
+            state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+        }
+        return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            if (delivered)
+                markMainPromptDelivered();
+        }));
+    }
+    const actuallyCompressed = didMemtreeCompress(result);
+    const historyCheck = checkCompressedHistory(result, msgsForMemtree);
+    rec.history = {
+        retainedChars: historyCheck.retainedChars,
+        priorHistoryChars: historyCheck.priorHistoryChars,
+        usable: historyCheck.usable,
+    };
+    if (!actuallyCompressed || !historyCheck.usable) {
+        // Two distinct ways to get an unusable answer, one recovery.
+        //
+        // No cached/indexed tokens means the server is still warming an index and
+        // returned the messages as-is. Preserve true passthrough semantics:
+        // flattening that no-op response changes Anthropic's structured
+        // conversation and made the first request disagree with the full-history
+        // tool loop that followed it.
+        //
+        // A fully indexed response that carries no prior conversation is the more
+        // dangerous case: it looks like a perfect compression by every usage-based
+        // measure, so nothing downstream would notice that the model is about to be
+        // asked to continue a conversation it can no longer see. Forwarding the
+        // real history costs context but never silently amnesias the session.
+        clearLaneOrYield();
+        if (actuallyCompressed && opts.debug) {
+            console.error(`[ccc proxy] memory response dropped the conversation ` +
+                `(retained ${historyCheck.retainedChars} of ` +
+                `${historyCheck.priorHistoryChars} prior chars); forwarding history`);
+        }
+        recordTurn(rec, actuallyCompressed ? "followup-empty-memory" : "followup-noop", forwardBody);
+        capture(opts, "anthropic-request", forwardBody);
+        return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            if (delivered)
+                markMainPromptDelivered();
+        }));
+    }
+    // Invariant from the early return above: past this point the MemTree result
+    // actually compressed (actuallyCompressed is true) and the retained history
+    // is usable — every remaining path forwards the compressed body.
+    let built;
+    try {
+        built = buildCompressedBody(body, result);
+    }
+    catch (err) {
+        releaseUncommittedRouteDecision();
+        throw err;
+    }
+    if (built === null) {
+        // The server compressed but returned no usable `flattened_messages`
+        // (pre-flatten server, or a malformed field). The flatten format lives
+        // server-side only — the client deliberately has no local fallback, that
+        // drift is what caused the append/adherence regressions — so forward the
+        // real history instead, exactly like the unusable branch above.
+        clearLaneOrYield();
+        if (opts.debug) {
+            console.error("[ccc proxy] compressed result carried no server flatten; " +
+                "forwarding history");
+        }
+        recordTurn(rec, "followup-no-flatten", forwardBody);
+        capture(opts, "anthropic-request", forwardBody);
+        return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            if (delivered)
+                markMainPromptDelivered();
+        }));
+    }
+    const { compressedBody, compressedRaw } = built;
+    if (opts.debug) {
+        console.error(`[ccc proxy] user turn compressed: ${forwardBody.length} → ` +
+            `${compressedRaw.length} body bytes`);
+    }
+    // Claude can consume message_stop, execute a fast local tool, and close the
+    // SSE response before Node observes the downstream HTTP `finish` event.
+    // Activate the route once the complete Anthropic response has been accepted
+    // by the downstream response, so an immediate tool-result request cannot
+    // race the later forwardRaw() delivery promise.
+    let routeActivationAttempted = false;
+    const activateMemoryRoute = () => {
+        if (routeActivationAttempted)
+            return;
+        if (!routeDecisionCurrent()) {
+            releaseUncommittedRouteDecision();
+            routeActivationAttempted = true;
+            return;
+        }
+        // Away lane: commit the decision but store nothing. Nothing can ever
+        // read an away route — tool turns and count_tokens can never classify as
+        // away — so storing it would only mislead and burn heap. All the
+        // reservation bookkeeping above and around this stays exactly as for any
+        // lane: it is what stops a stale slow away duplicate from stepping on a
+        // newer one.
+        if (requestRouteLane === "away") {
+            commitRouteDecision();
+            routeActivationAttempted = true;
+            return;
+        }
+        const installed = installMemoryRoute(state, requestRouteKey, req, body, messages, compressedBody, routeEpoch, routeDecisionGeneration);
+        commitRouteDecision();
+        // Leave this false if installMemoryRoute unexpectedly throws: the
+        // delivery-complete fallback then gets one safe retry.
+        routeActivationAttempted = true;
+        if (opts.debug) {
+            console.error(`[ccc proxy] memory route activation: ${installed ? "installed" : "unavailable"}`);
+        }
+    };
+    if (routeDecisionCurrent()) {
+        state.memoryRoutes.delete(requestRouteKey);
+        commitRouteDecision();
+    }
+    // If a newer same-lane decision is live, keep this request's reservation
+    // until its protocol-complete activation (or terminal forward failure).
+    // The newer request may still end without mutating anything and hand
+    // ownership back while this response is in flight. Releasing here would let
+    // this request install later with no committed generation protecting that
+    // route from an even older completion.
+    recordTurn(rec, "followup-compressed", compressedRaw);
+    capture(opts, "anthropic-request", compressedRaw);
+    // Queue the success notice before the stream starts: a long live stream may
+    // claim its display notice before message_stop.
+    // (actuallyCompressed is guaranteed true past the early return above.)
+    queueCompressionNotice({
+        state,
+        req,
+        displayForThisTurn,
+        noticePromptGeneration,
+        noticePromptId,
+        result,
+    });
+    return logged(forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
+    // Wrapped like the recovery twin's protocol-complete callback — not
+    // for behavior (forwardRaw's notify catch swallows a throw either
+    // way, and routeActivationAttempted stays false so the
+    // delivered-settle retry below still gets its one safe attempt) but
+    // for observability: a bare throw here otherwise leaves zero trace,
+    // unlike the recovery path's "activation-error" install fate.
+    () => {
+        try {
+            activateMemoryRoute();
+        }
+        catch (err) {
+            if (opts.debug) {
+                console.error(`[ccc proxy] followup route activation threw at protocol-complete: ${err}`);
+            }
+        }
+    }).then((delivered) => {
+        // actuallyCompressed is guaranteed true past the early return above.
+        // A route already installed at protocol-complete deliberately survives
+        // delivered=false: that settle may be the fast-tool abort (client
+        // consumed message_stop, closed the SSE response, and its immediate
+        // tool request must ride the prefix). A socket death before flush
+        // settles identically, but its identical-body retry cannot ride the
+        // route and reclassifies as the recovery turn
+        // (routeRideableByThisRequest above), bumping the epoch and
+        // rebuilding the route.
+        if (!delivered) {
+            // Protocol-complete activation may already have installed the route
+            // before a fast downstream close. Otherwise this forward made no
+            // route decision, so return an uncommitted agent reservation.
+            if (!routeActivationAttempted)
+                releaseUncommittedRouteDecision();
+            return;
+        }
+        markMainPromptDelivered();
+        // Route the rest of this human turn's tool loop — and the count_tokens
+        // calls Claude Code sizes its context with — through the same compressed
+        // prefix. Without this the tool loop re-sends the full history, so
+        // count_tokens reports the uncompressed conversation and Claude Code
+        // auto-compacts a context that memory had already shrunk.
+        // Retain delivery completion as a defensive retry if protocol-time
+        // route bookkeeping failed unexpectedly. Guarded like the recovery
+        // twin: a repeat throw here would reject inside this settle callback
+        // and strand the uncommitted reservation, so release it instead.
+        try {
+            activateMemoryRoute();
+        }
+        catch (err) {
+            if (!routeActivationAttempted)
+                releaseUncommittedRouteDecision();
+            if (opts.debug) {
+                console.error(`[ccc proxy] followup route activation retry threw: ${err}`);
+            }
+        }
+    }));
+}
+function queueCompressionNotice(args) {
+    const { state, req, displayForThisTurn, noticePromptGeneration, noticePromptId, result, } = args;
+    if (!displayForThisTurn ||
+        state.mainPromptGeneration !== noticePromptGeneration) {
+        return;
+    }
+    // Announce only actual (re)indexing, measured as growth in how much of the
+    // original prompt the index covers (`cached_tokens`). Unchanged coverage
+    // means this turn rode the existing index with the new messages appended
+    // after it — MemTree did no new indexing work worth reporting.
+    //
+    // Deliberately NOT keyed on the memory text: the server unfolds the index
+    // against the current question, so its rendering (and length) changes on
+    // nearly every turn regardless of indexing. Coverage is missing only on
+    // servers old enough that `didMemtreeCompress` would have degraded this
+    // turn already; announce rather than suppress on an unknown quantity.
+    const indexedTokens = cachedPromptTokenCount(result);
+    if (indexedTokens !== undefined) {
+        const sessionId = requestSessionId(req);
+        const last = state.lastNoticedIndexCoverage;
+        // Record every observed coverage, announced or not, so a server-side
+        // index rebuild that shrinks coverage re-announces once it grows past
+        // its own new baseline rather than staying silent until it beats the old.
+        state.lastNoticedIndexCoverage = { sessionId, indexedTokens };
+        if (last &&
+            last.sessionId === sessionId &&
+            indexedTokens <= last.indexedTokens) {
+            return;
+        }
+    }
+    state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
+}
+/**
+ * Record what a blocking operation just proved about MemTree's health: an
+ * unopposed live failure arms the tool-recovery cooldown, any live success
+ * clears it, and a cached-only result leaves the prior state untouched.
+ *
+ * Called from BOTH blocking paths and, critically, BEFORE either one checks
+ * whether its client is still listening. A null says something about the
+ * server, not about the downstream socket — and the full-budget stall that
+ * produces a null is itself the likeliest reason a client gives up, so
+ * learning only from attempts that outlived their client would blind the
+ * cooldown to exactly the outage it exists to bound. Sharing it with the
+ * followup path matters in both directions: an outage first seen on a human
+ * turn must not cost another full stall on the next tool turn, and a
+ * recovered MemTree must not stay locked out for the rest of the window.
+ *
+ * A live no-op, unusable, or non-shrinking answer still proves the server is
+ * responsive and merely unhelpful for this history, and the next turn's
+ * larger tail may well succeed — so those clear the outage fuse and keep
+ * paying the fast, already-indexed round trip rather than locking recovery
+ * out. The asymmetry trades a bounded repeat cost against never suppressing a
+ * recovery a warming index is about to make possible.
+ *
+ * Both directions require evidence about MemTree's health RIGHT NOW; anything
+ * weaker leaves the fuse untouched rather than guessing:
+ *
+ * - Every lane contributes the same shared evidence. A live success clears
+ *   the cooldown; a live failure arms it.
+ * - Cache-served calls contribute no evidence. compress() memoizes successes
+ *   by hash and returns them with zero server contact, so replaying an
+ *   identical body cannot "prove" MemTree is up.
+ * - A shutdown abort arms nothing. compress() maps abort to the same null as
+ *   a server failure, but a draining proxy says nothing about MemTree; it
+ *   would only misattribute the drain in the last records written.
+ */
+function noteMemtreeHealth(state, compression) {
+    if (compression.liveHealth === "failure") {
+        if (state.shutdownSignal.aborted)
+            return;
+        state.toolRecoveryCooldownUntil =
+            Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+        return;
+    }
+    if (compression.liveHealth === "success") {
+        state.toolRecoveryCooldownUntil = 0;
+    }
+}
+/**
+ * Whether the holder of `generation` still owns the route decision: true while
+ * no STRICTLY NEWER reservation is live or committed. The holder's own
+ * reservation never blocks itself, and a newer reservation that ended up
+ * mutating nothing has already removed itself, handing ownership back rather
+ * than stranding everyone older.
+ */
+function routeDecisionHolds(state, key, generation) {
+    const live = state.routeDecisionsLive.get(key);
+    if (!live)
+        return true;
+    for (const reserved of live) {
+        if (reserved > generation)
+            return false;
+    }
+    return true;
+}
+function reserveRouteDecision(state, key, generation) {
+    let live = state.routeDecisionsLive.get(key);
+    if (!live) {
+        live = new Set();
+        state.routeDecisionsLive.set(key, live);
+    }
+    live.add(generation);
+}
+function releaseRouteDecision(state, key, generation) {
+    const live = state.routeDecisionsLive.get(key);
+    if (!live)
+        return;
+    live.delete(generation);
+    if (live.size === 0)
+        state.routeDecisionsLive.delete(key);
+}
+function installMemoryRoute(state, key, req, originalBody, originalMessages, compressedBody, routeEpoch, decisionGeneration) {
+    // Epoch guards the human-prompt lifecycle; the decision generation orders
+    // async installs that share one epoch (two recoveries, or a recovery vs an
+    // in-flight followup). A stale completion must not overwrite a newer
+    // decision's route — and must not clear it either, hence the early return
+    // before the sessionless-clear below.
+    if (state.mainRouteEpoch !== routeEpoch ||
+        !routeDecisionHolds(state, key, decisionGeneration)) {
+        return false;
+    }
+    const sessionId = requestSessionId(req);
+    if (!sessionId || !Array.isArray(compressedBody.messages)) {
+        state.memoryRoutes.delete(key);
+        return false;
+    }
+    // Test-only fault-injection seam (undefined in production): placed after
+    // every guard and before the store, exactly where the route object's
+    // cloneJson/hash construction could throw, so tests can reach the
+    // "activation-error" settle label. See ProxyOptions.routeInstallFault.
+    state.routeInstallFault?.();
+    setMemoryRoute(state, key, {
+        sessionId,
+        originalSystemHash: routeValueHash(normalizeRouteSystem(originalBody.system)),
+        // Include trailing ambient role=system blocks: MemTree consolidated them
+        // into compressedBody.system, so treating them as suffix would duplicate
+        // those instructions on every tool request.
+        originalPrefixHashes: originalMessages.map(routeMessageHash),
+        compressedMessages: cloneJson(compressedBody.messages),
+        compressedSystem: cloneJson(compressedBody.system),
+        hasCompressedSystem: Object.prototype.hasOwnProperty.call(compressedBody, "system"),
+        routeEpoch,
+    });
+    return true;
+}
+function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
+    // Model is deliberately not route identity: Claude Code switches models
+    // mid-loop (overload fallback, /model, /fast), and the compressed prefix is
+    // plain message content valid for any model. Session + prefix hashes pin the
+    // conversation; requiring model equality dropped the whole tool loop to
+    // full-history passthrough on every mid-turn switch.
+    if (!sessionId ||
+        route.sessionId !== sessionId ||
+        route.routeEpoch !== routeEpoch ||
+        routeValueHash(normalizeRouteSystem(body.system)) !==
+            route.originalSystemHash) {
+        return null;
+    }
+    const prefixLength = route.originalPrefixHashes.length;
+    if (messages.length <= prefixLength)
+        return null;
+    for (let i = 0; i < prefixLength; i++) {
+        if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
+            return null;
+        }
+    }
+    const suffix = messages.slice(prefixLength);
+    if (!validToolRouteSuffix(suffix))
+        return null;
+    const routed = {
+        ...body,
+        messages: [...cloneJson(route.compressedMessages), ...suffix],
+    };
+    if (route.hasCompressedSystem) {
+        routed.system = currentRouteSystem(route.compressedSystem, body.system);
+    }
+    else {
+        delete routed.system;
+    }
+    return Buffer.from(JSON.stringify(routed), "utf-8");
+}
+/** Size the assembled input (including system/tools) and reserve output room. */
+function routedBodyExceedsContext(body, routedBody, modelContextLimit) {
+    const outputTokens = typeof body.max_tokens === "number" &&
+        Number.isFinite(body.max_tokens) ? Math.max(0, body.max_tokens) : 0;
+    // This is the existing local byte estimate, not a tokenizer or a hard cap.
+    // Recovery remains best-effort and never calls the provider to count tokens.
+    return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
+}
+function regrantSmallerWindowRecovery(state, key, modelContextLimit) {
+    const previous = state.toolRecoveryAttemptedLanes.get(key);
+    if (previous && !previous.inFlight && modelContextLimit < previous.modelContextLimit) {
+        // The route has already been evicted. Keeping no spent mark lets an
+        // outage cooldown defer this allowance without losing it; the next actual
+        // attempt records the smaller capacity before it awaits anything.
+        state.toolRecoveryAttemptedLanes.delete(key);
+    }
+}
+/**
+ * Whether a tool-turn body is an exact replay of the request that installed
+ * the route: identical message count and every identity input
+ * memoryRoutedToolBody validates — session, epoch, system hash, and each
+ * prefix message hash. Claude Code retries a request whose socket died before
+ * the response flushed with the IDENTICAL body; that retry cannot ride (its
+ * suffix is empty) but it is a client retry, not a divergence. Anything else
+ * — any differing hash, or a body shorter than the prefix — is a genuine
+ * mismatch and keeps reject-and-rebuild semantics.
+ */
+function isRouteInstallReplay(body, messages, route, routeEpoch, sessionId) {
+    if (!sessionId ||
+        route.sessionId !== sessionId ||
+        route.routeEpoch !== routeEpoch ||
+        routeValueHash(normalizeRouteSystem(body.system)) !==
+            route.originalSystemHash ||
+        messages.length !== route.originalPrefixHashes.length) {
+        return false;
+    }
+    for (let i = 0; i < messages.length; i++) {
+        if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+/** Ignore cache-control churn when matching Claude's next tool-loop request. */
+function routeMessageHash(message) {
+    return routeValueHash(normalizeRouteMessage(message));
+}
+function routeValueHash(value) {
+    return createHash("sha256")
+        .update(JSON.stringify({
+        present: value !== undefined,
+        value: stableRouteValue(value),
+    }))
+        .digest("hex");
+}
+function normalizeRouteMessage(message) {
+    const normalized = cloneJson(message);
+    normalized.content = normalizeRouteContent(normalized.content);
+    return normalized;
+}
+/** Canonicalize semantically identical Anthropic content representations. */
+function normalizeRouteContent(content) {
+    const blocks = typeof content === "string"
+        ? [{ type: "text", text: content }]
+        : content;
+    return withoutContentBlockCacheControl(normalizeReminderContent(blocks));
+}
+/**
+ * Claude Code changes request-attribution fields such as `cch` and
+ * `cc_prev_req` during a tool loop. That synthetic top-level system block is
+ * not conversation identity. Ignore exactly one standalone billing block
+ * there, while keeping header-like text in messages fully identity-bearing.
+ */
+function normalizeRouteSystem(system) {
+    const normalized = normalizeRouteContent(system);
+    const headers = routeBillingHeaders(normalized);
+    if (headers.length !== 1)
+        return normalized;
+    return replaceSingleRouteBillingHeader(normalized, ROUTE_BILLING_HEADER_PLACEHOLDER);
+}
+function normalizeReminderContent(content) {
+    if (typeof content === "string")
+        return normalizeRouteText(content);
+    if (!Array.isArray(content))
+        return content;
+    return content.map((part) => {
+        if (typeof part === "string")
+            return normalizeRouteText(part);
+        if (!part || typeof part !== "object")
+            return part;
+        const copy = { ...part };
+        if (copy.type === "text" && typeof copy.text === "string") {
+            copy.text = normalizeRouteText(copy.text);
+        }
+        else if (copy.type === "tool_result") {
+            copy.content = normalizeReminderContent(copy.content);
+        }
+        return copy;
+    });
+}
+const ROUTE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
+const ROUTE_BILLING_HEADER_PLACEHOLDER = "x-anthropic-billing-header: <dynamic>";
+function normalizeRouteText(text) {
+    return stripSystemReminderText(text);
+}
+/** Preserve Claude's current per-request billing metadata after prefix grafting. */
+function currentRouteSystem(compressedSystem, currentSystem) {
+    const currentHeaders = routeBillingHeaders(currentSystem);
+    const compressedHeaders = routeBillingHeaders(compressedSystem);
+    if (currentHeaders.length === 1 && compressedHeaders.length === 1) {
+        return replaceSingleRouteBillingHeader(cloneJson(compressedSystem), currentHeaders[0]);
+    }
+    // The one-synthetic-header invariant broke (Claude reordered the header
+    // fields, or the compressed system carries duplicate header-like blocks).
+    // Never replay the FIRST request's stale cch/cc_prev_req attribution for
+    // every tool call in the turn: drop the recognizable billing headers from
+    // the routed system instead. Missing attribution is safer than wrong
+    // attribution.
+    const stripped = withoutRouteBillingHeaders(cloneJson(compressedSystem));
+    // JSON.stringify omits undefined-valued keys, so an all-header system is
+    // sent with no `system` field rather than an empty block list.
+    return Array.isArray(stripped) && stripped.length === 0
+        ? undefined
+        : stripped;
+}
+function routeBillingHeaders(value) {
+    if (typeof value === "string") {
+        return isRouteBillingHeader(value) ? [value] : [];
+    }
+    if (!Array.isArray(value))
+        return [];
+    const headers = [];
+    for (const item of value) {
+        if (typeof item === "string") {
+            if (isRouteBillingHeader(item))
+                headers.push(item);
+            continue;
+        }
+        if (item &&
+            typeof item === "object" &&
+            item.type === "text") {
+            const text = item.text;
+            if (typeof text === "string" && isRouteBillingHeader(text)) {
+                headers.push(text);
+            }
+        }
+    }
+    return headers;
+}
+function isRouteBillingHeader(text) {
+    if (/[\r\n]/.test(text) ||
+        !text.startsWith(ROUTE_BILLING_HEADER_PREFIX)) {
+        return false;
+    }
+    const fields = text.slice(ROUTE_BILLING_HEADER_PREFIX.length).trim();
+    return (/^cc_version=[^;]+;/.test(fields) &&
+        /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields));
+}
+function replaceSingleRouteBillingHeader(value, replacement) {
+    if (typeof value === "string") {
+        return isRouteBillingHeader(value) ? replacement : value;
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => {
+            if (typeof item === "string") {
+                return isRouteBillingHeader(item) ? replacement : item;
+            }
+            if (!item ||
+                typeof item !== "object" ||
+                item.type !== "text") {
+                return item;
+            }
+            const block = item;
+            return typeof block.text === "string" &&
+                isRouteBillingHeader(block.text)
+                ? { ...block, text: replacement }
+                : item;
+        });
+    }
+    return value;
+}
+/** Remove every recognizable synthetic billing-header block from a system value. */
+function withoutRouteBillingHeaders(value) {
+    if (typeof value === "string") {
+        return isRouteBillingHeader(value) ? undefined : value;
+    }
+    if (!Array.isArray(value))
+        return value;
+    return value.filter((item) => {
+        if (typeof item === "string")
+            return !isRouteBillingHeader(item);
+        if (!item ||
+            typeof item !== "object" ||
+            item.type !== "text") {
+            return true;
+        }
+        const text = item.text;
+        return !(typeof text === "string" && isRouteBillingHeader(text));
+    });
+}
+/** Ignore only Anthropic content-block cache metadata, never user/tool data. */
+function withoutContentBlockCacheControl(content) {
+    if (Array.isArray(content)) {
+        return content.map((part) => withoutContentBlockCacheControl(part));
+    }
+    if (!content || typeof content !== "object")
+        return content;
+    const { cache_control: _cacheControl, ...block } = content;
+    return block;
+}
+function stableRouteValue(value) {
+    if (Array.isArray(value))
+        return value.map(stableRouteValue);
+    if (!value || typeof value !== "object")
+        return value;
+    const out = {};
+    for (const key of Object.keys(value).sort()) {
+        out[key] = stableRouteValue(value[key]);
+    }
+    return out;
+}
+function validToolRouteSuffix(messages) {
+    if (!messages.length || messages.some(isNonToolUserMessage))
+        return false;
+    const toolUses = new Set();
+    const toolResults = [];
+    for (const message of messages) {
+        if (!Array.isArray(message?.content))
+            continue;
+        for (const part of message.content) {
+            if (!part || typeof part !== "object")
+                continue;
+            if (part.type === "tool_use" && typeof part.id === "string") {
+                toolUses.add(part.id);
+            }
+            else if (part.type === "tool_result" &&
+                typeof part.tool_use_id === "string") {
+                toolResults.push(part.tool_use_id);
+            }
+        }
+    }
+    return (toolUses.size > 0 &&
+        toolResults.length > 0 &&
+        toolResults.every((id) => toolUses.has(id)));
+}
+function requestSessionId(req) {
+    const value = req.headers["x-claude-code-session-id"];
+    const text = Array.isArray(value) ? value[0] : value;
+    return typeof text === "string" && text.trim() ? text.trim() : undefined;
+}
+function hasAgentAttribution(req) {
+    return agentAttributionId(req) !== undefined;
+}
+function cloneJson(value) {
+    if (value === undefined)
+        return value;
+    return JSON.parse(JSON.stringify(value));
+}
+/**
+ * The blocking-compression step, shared by the main followup path and
+ * tool-route miss recovery: the compress call plus the `compress` telemetry
+ * record. Callers own downstream-close tracking (compression promises are
+ * hash-deduped and may serve another live retry, so a per-request disconnect
+ * signal must never feed compress()) and all decisions about the returned
+ * result: both `didMemtreeCompress(result)` and
+ * `checkCompressedHistory(result, msgsForMemtree).usable` must hold before
+ * the result may be forwarded or become a route.
+ */
+async function runBlockingCompression(args) {
+    const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } = args;
+    const compressStarted = Date.now();
+    const compressMeta = {
+        // Model + tools drive the server's model-based memory budget
+        // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
+        // them silently downgrades to the server's static 50k fallback.
+        // `[1m]` is re-attached when the session is 1M-context so the
+        // server's budget telemetry names the variant it actually served.
+        model: modelForMemtree(typeof body.model === "string" ? body.model : undefined, modelContextLimit),
+        tools: Array.isArray(body.tools) ? body.tools : undefined,
+    };
+    // Sampled BEFORE the call, while it still describes this call: after the
+    // await the hash is in the cache regardless of who put it there.
+    const cached = opts.memtree.hasCachedCompress(hash, modelContextLimit, compressMeta);
+    // compress() maps every failure to a resolved null (it never rejects).
+    const result = await opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta);
+    const compressMs = Date.now() - compressStarted;
+    // Sampled at this call's settle, before a concurrent same-request failure of
+    // another class can overwrite the complete-key entry.
+    const failureArming = result === null &&
+        opts.memtree.lastCompressFailureArming(hash, modelContextLimit, compressMeta);
+    const hadLiveSuccess = !cached && result !== null;
+    // Only arming-class live failures (network error, timeout, 5xx, 402) are
+    // fuse evidence. A responsive server's other 4xx failed THIS call but says
+    // nothing about MemTree's health, so it contributes neither failure nor
+    // success — the fuse is untouched.
+    const hadLiveFailure = !cached && result === null && failureArming;
+    rec.compress = {
+        ms: compressMs,
+        ok: result !== null,
+        // Budget-consumed heuristic: the client maps every failure to null, so a
+        // null that took (roughly) the whole abort budget was almost certainly
+        // the AbortSignal timeout, not a fast server error.
+        timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
+    };
+    return {
+        result,
+        // Cached-only operations leave the existing fuse state untouched.
+        liveHealth: hadLiveSuccess
+            ? "success"
+            : hadLiveFailure
+                ? "failure"
+                : "none",
+    };
+}
+/**
+ * Shared final request shape for a validated compression result: lift any
+ * returned system message to `body.system`, and forward the SERVER's flatten
+ * of the compressed conversation as the single user message Anthropic
+ * receives. The flatten format (closed transcript container, per-human-turn
+ * headers, live-tail framing, header escaping) lives server-side only; the
+ * client forwards `flattened_messages` verbatim and never re-derives it.
+ * Returns null when the server provided no usable flatten (a pre-flatten
+ * server, or a malformed field) — callers degrade to forwarding the original
+ * history. Route candidates must be created from this `compressedBody` —
+ * never from raw `result.messages` — so tool-turn rewrites extend exactly
+ * the bytes that were sent.
+ */
+function buildCompressedBody(body, result) {
+    const flattened = serverFlattenedMessages(result);
+    if (flattened === null)
+        return null;
+    const systemMsg = result.messages.find((m) => m.role === "system");
+    const compressedBody = {
+        ...body,
+        messages: flattened,
+    };
+    if (systemMsg?.content != null) {
+        compressedBody.system = systemMsg.content;
+    }
+    return {
+        compressedBody,
+        compressedRaw: Buffer.from(JSON.stringify(compressedBody), "utf-8"),
+    };
+}
+/**
+ * Best-effort recovery for a large main tool turn whose memory route missed
+ * (missing slot or same-session rejection): one blocking recompression
+ * attempt, sharing the followup path's complete selection pipeline. This is
+ * a soft fuse — any failure, no-op, unusable, or non-shrinking result
+ * degrades to forwarding the original body, never worse than the verbatim
+ * path it replaces. A validated smaller result forwards exactly one
+ * compressed Anthropic leg, claims no human-turn state (no notice, no prompt
+ * arm/delivery mutation), and installs a self-healing route at
+ * protocol-complete so the rest of the tool loop rides locally again.
+ */
+async function recoverToolRouteMiss(args) {
+    const { opts, state, req, res, upstream, body, messages, forwardBody, msgsForMemtree, hash, modelContextLimit, routeEpoch, rec, conversationBytes, routeKey, isMainRequest, recoveryAttempt, } = args;
+    const sessionId = requestSessionId(req);
+    // A pending MAIN prompt arm/retry window means a typed prompt may arrive
+    // merged into a tool_result wrapper: recovery-turn classification uses
+    // route absence as a rideability signal, so an intermediate main wrapper
+    // must not install a route that vetoes the real merged-prompt request.
+    // Captured ONCE here: the attempt stays transform-only even if the window
+    // happens to close before its response settles.
+    // The ARM alone, deliberately not the followup path's full
+    // `mainPromptArmed || !mainPromptDelivered` window. `mainPromptDelivered`
+    // means "the response stream flushed", which is strictly stronger than
+    // "the client got the message": the fast-tool abort documented at the
+    // forwardRaw settle in handleMessages — Claude consumes message_stop,
+    // drops the SSE, and fires its
+    // tool request — is a normal success that leaves the flag false for the
+    // REST of the agent turn (only Stop resets it). Keying recovery off that
+    // window meant one such abort plus one later route rejection made every
+    // subsequent large tool turn transform-only: a full blocking compress per
+    // tool turn, no route ever installed, and no cooldown to bound it because
+    // every attempt succeeded — the exact per-tool-turn cost this fuse exists
+    // to prevent. Hookless embedders, where nothing ever sets the flag, were
+    // stranded the same way from the first request.
+    //
+    // Dropping that half is safe because the merged-prompt hazard it guarded
+    // cannot coexist with a main tool-result turn. Being here at all proves a
+    // main response reached the client and produced a tool_use; the only
+    // undelivered prompt that could still arrive merged into a tool_result
+    // wrapper is one whose request has not been classified yet, and that is
+    // precisely what the arm marks. An unflushed retry (5xx) is likewise
+    // unreachable: its client holds no new tool_use to send meanwhile, so no
+    // recovery can install a route that would veto the retry's
+    // recovery-prompt classification.
+    // The armed prompt belongs only to the main lane. An attributed agent's
+    // route cannot veto main's merged-prompt classification, so suppressing the
+    // agent install here would merely strand its tool loop after spending the
+    // lane's one recovery attempt.
+    const promptWindowPending = isMainRequest && state.mainPromptArmed;
+    // Every identity owns its own lane now, so the only transform-only reasons
+    // left are local to this request: no session id to safely match a later
+    // ride against, or the merged-prompt window above. The foreign-owner and
+    // subagent carve-outs are gone because the hazard they defended against is
+    // structurally unreachable — a request's key can only name its own lane.
+    const routeOwning = sessionId !== undefined && !promptWindowPending;
+    // Only a route-owning recovery reserves the decision generation. A
+    // transform-only attempt must not advance it — and, reciprocally, its late
+    // completion can never install over (or clear) a route someone else
+    // installed after this miss began, because it never activates at all.
+    const decisionGeneration = routeOwning
+        ? ++state.mainRouteDecisionGeneration
+        : state.mainRouteDecisionGeneration;
+    if (routeOwning)
+        reserveRouteDecision(state, routeKey, decisionGeneration);
+    // A reservation that ends up installing nothing must be RETURNED. It was
+    // taken before the outcome was known, and while held it marks stale every
+    // concurrent install and post-await clear that captured the previous
+    // generation. Failing to release it means a failed/no-op/no-gain/
+    // client-closed recovery silently suppresses a concurrent followup's
+    // install, leaving the conversation with no route at all. Dropping our own
+    // entry is unconditional and order-independent: it never moves anyone
+    // else's reservation, so releasing before or after a newer sibling makes no
+    // difference to who holds the decision.
+    const releaseOwnReservation = () => {
+        if (routeOwning)
+            releaseRouteDecision(state, routeKey, decisionGeneration);
+    };
+    // Same downstream-close tracking as the followup path: compression
+    // promises are hash-deduped and may serve another live retry, so the
+    // subscriber's lifetime is tracked locally, never fed into compress().
+    let downstreamClosedDuringCompression = res.destroyed && !res.writableFinished;
+    const markDownstreamClosed = () => {
+        if (!res.writableFinished)
+            downstreamClosedDuringCompression = true;
+    };
+    res.once("close", markDownstreamClosed);
+    let compression;
+    try {
+        compression = await runBlockingCompression({
+            opts,
+            state,
+            body,
+            msgsForMemtree,
+            hash,
+            modelContextLimit,
+            rec,
+        });
+    }
+    catch (err) {
+        // Nothing in the pipeline is expected to throw (compress() maps every
+        // failure to null), but a reservation held by a dead attempt suppresses
+        // every concurrent install for the rest of the epoch — the same hole the
+        // release exists to close. Hand it back before the error propagates.
+        //
+        // Deliberately NOT refunded and no health noted: an unknown throw may be
+        // deterministic, and refunding would let each identical retry pay a fresh
+        // blocking compress — the same loop the keep-spent policy exists to
+        // prevent for pre-forward outcomes. The lane staying spent degrades to
+        // verbatim forwards, the conservative direction.
+        releaseOwnReservation();
+        throw err;
+    }
+    finally {
+        res.off("close", markDownstreamClosed);
+    }
+    const { result } = compression;
+    // Every lane writes the shared cooldown now: with subagents on the same
+    // recovery path, a subagent's compress failure is the same evidence about
+    // MemTree's health as main's, and its successes clear the cooldown too.
+    noteMemtreeHealth(state, compression);
+    if (downstreamClosedDuringCompression ||
+        (res.destroyed && !res.writableFinished)) {
+        // The MemTree work keeps its cache/index value, but a dead client gets
+        // no Anthropic request and no route.
+        rec.routeRecovery = { conversationBytes, outcome: "client-closed" };
+        releaseOwnReservation();
+        // Same hazard class as the refunded post-forward fates ("upstream-failed"
+        // / "client-aborted"): no route was installed and the client's identical
+        // retry is imminent. Without a refund, the retry hits "spent" and every
+        // subsequent tool turn in the epoch forwards full history. The retry's
+        // recompress is a compress-cache hit (client closes are deliberately
+        // never fed into compress()), so the re-attempt is cheap. Epoch-guarded
+        // like the other refunds so a late settle cannot re-grant a later human
+        // turn's lane.
+        if (state.mainRouteEpoch === routeEpoch) {
+            state.toolRecoveryAttemptedLanes.delete(routeKey);
+        }
+        recordTurn(rec, "tool", Buffer.alloc(0));
+        return;
+    }
+    const forwardOriginal = () => {
+        capture(opts, "anthropic-request", forwardBody);
+        return forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then(() => undefined);
+    };
+    if (!result) {
+        rec.routeRecovery = { conversationBytes, outcome: "failed" };
+        releaseOwnReservation();
+        recordTurn(rec, "tool", forwardBody);
+        // An ordinary server/network failure or timeout retains the background
+        // submission: its longer independent budget can still warm the index for
+        // a later turn. An unpaid key (402, possibly set by this very compress)
+        // or a shutting-down proxy gets no retry.
+        if (!state.shutdownSignal.aborted &&
+            opts.memtree.paymentRequiredDetail === null) {
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+        }
+        return forwardOriginal();
+    }
+    // Any non-null response already submitted this history to the server; an
+    // extra indexInBackground for the same request would be a duplicate.
+    const actuallyCompressed = didMemtreeCompress(result);
+    const historyCheck = checkCompressedHistory(result, msgsForMemtree);
+    rec.history = {
+        retainedChars: historyCheck.retainedChars,
+        priorHistoryChars: historyCheck.priorHistoryChars,
+        usable: historyCheck.usable,
+    };
+    if (!actuallyCompressed || !historyCheck.usable) {
+        // Index-warming no-op (flattening it would change structured history for
+        // nothing) or an indexed answer that dropped the conversation (amnesia —
+        // fatal for a route). Both preserve the original body.
+        rec.routeRecovery = {
+            conversationBytes,
+            outcome: actuallyCompressed ? "unusable" : "noop",
+        };
+        releaseOwnReservation();
+        recordTurn(rec, "tool", forwardBody);
+        return forwardOriginal();
+    }
+    // Serializing the compressed body is the one synchronous step here that can
+    // realistically throw: these are the multi-megabyte payloads that court
+    // V8's string-length ceiling, which is exactly why this fuse exists. A
+    // throw would otherwise escape as a proxy 500 AND strand the reservation,
+    // turning a recoverable tool turn into a failed one. Degrade instead — the
+    // original body is still forwardable.
+    let built;
+    try {
+        built = buildCompressedBody(body, result);
+    }
+    catch (err) {
+        rec.routeRecovery = { conversationBytes, outcome: "build-failed" };
+        releaseOwnReservation();
+        recordTurn(rec, "tool", forwardBody);
+        if (opts.debug) {
+            console.error(`[ccc proxy] recovered body build failed: ${err?.message ?? err}`);
+        }
+        return forwardOriginal();
+    }
+    if (built === null) {
+        // The server compressed but returned no usable `flattened_messages`
+        // (pre-flatten server, or a malformed field). The client never re-derives
+        // the flatten locally — that drifted from the server's canonical format
+        // once already — so degrade to the original body, same envelope as every
+        // other non-forwardable recovery outcome.
+        rec.routeRecovery = { conversationBytes, outcome: "no-flatten" };
+        releaseOwnReservation();
+        recordTurn(rec, "tool", forwardBody);
+        if (opts.debug) {
+            console.error("[ccc proxy] recovered result carried no server flatten; " +
+                "forwarding original body");
+        }
+        return forwardOriginal();
+    }
+    const { compressedBody, compressedRaw } = built;
+    if (compressedRaw.length >= forwardBody.length) {
+        // The final transformed body is the proof of payload recovery; a result
+        // with no byte gain is not worth a route built on it.
+        rec.routeRecovery = { conversationBytes, outcome: "no-gain" };
+        releaseOwnReservation();
+        recordTurn(rec, "tool", forwardBody);
+        return forwardOriginal();
+    }
+    rec.routeRecovery = { conversationBytes, outcome: "compressed" };
+    let activationAttempted = false;
+    let installFate;
+    const activateRecoveredRoute = () => {
+        if (activationAttempted)
+            return;
+        if (!routeOwning) {
+            activationAttempted = true;
+            return;
+        }
+        // No staleness pre-check: installMemoryRoute applies the identical epoch
+        // and decision-generation guard as its first act, before its sessionless
+        // clear, and a false return classifies as "stale" below.
+        const installed = installMemoryRoute(state, routeKey, req, body, messages, compressedBody, routeEpoch, decisionGeneration);
+        // Leave this false if installMemoryRoute unexpectedly throws: the
+        // delivery-complete fallback then gets one safe retry.
+        activationAttempted = true;
+        installFate = installed ? "installed" : "stale";
+        // A tool continuation can arrive after message_stop while this HTTP
+        // stream is still draining. Its route is already complete, so a smaller
+        // window may buy recovery now. Mutate only this attempt's object: a late
+        // transport settle must not release a newer attempt in the same lane.
+        if (installed)
+            recoveryAttempt.inFlight = false;
+        if (opts.debug) {
+            console.error(`[ccc proxy] recovered memory route activation: ${installed ? "installed" : "unavailable"}`);
+        }
+    };
+    if (opts.debug) {
+        console.error(`[ccc proxy] tool-route miss recovered: ${forwardBody.length} → ` +
+            `${compressedRaw.length} body bytes`);
+    }
+    recordTurn(rec, "tool-recompressed", compressedRaw);
+    // Tagged as a TOOL memory leg, not a followup one: capture-based tooling
+    // must be able to tell a recovered tool request from a normal compressed
+    // human turn without cross-referencing reqlog.
+    capture(opts, "anthropic-request-memory-tool", compressedRaw);
+    // Set when either activation attempt throws. Protocol-complete firing
+    // means the upstream served the complete turn and the proxy accepted the
+    // message_stop bytes into the response — not that the client received
+    // them. A throw there must NOT fall through to "client-aborted" or
+    // "upstream-failed" at settle: in the common sub-case (fast-tool abort)
+    // the client consumed its answer and no identical-body retry is coming.
+    // The close is not always client-owned — an upstream socket error after
+    // the data chunk carrying message_stop lands here too — and a socket
+    // that dies before the queued bytes flush DOES retry the identical body.
+    // Those rarer closes lose the refund — an accepted, bounded degradation
+    // (lane stays spent until the next human-turn re-grant), because the
+    // closes are indistinguishable at settle time and refunding them would
+    // fund one blocking recompress per tool turn under a deterministic
+    // activation throw.
+    let activationThrew = false;
+    const delivered = await forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
+    // Protocol-complete (accepted SSE message_stop or a complete 2xx JSON
+    // response) is the real activation point, exactly as on the followup
+    // path, so a fast tool request right after message_stop can ride.
+    () => {
+        try {
+            activateRecoveredRoute();
+        }
+        catch {
+            // forwardRaw's own guard would swallow this anyway; catching here
+            // records that a route was earned but its bookkeeping threw, which
+            // the settle label below must be able to tell apart from a
+            // mid-stream abort or an upstream failure.
+            activationThrew = true;
+        }
+    });
+    // Defensive delivery-complete fallback, mirroring the followup path. A
+    // candidate already activated at message_stop deliberately survives a
+    // delivered=false settle (fast-tool abort); an upstream 500/529 or an
+    // incomplete response never reached protocol-complete and never installs.
+    // Swallow a repeat throw: if it escaped here, the settle logic below
+    // would be skipped and the lane's reservation stranded for the rest of
+    // the epoch. With no install fate the fallback below still labels
+    // ("activation-error" for this corner) and releases; no refund, since
+    // the delivered client will not retry.
+    if (delivered) {
+        try {
+            activateRecoveredRoute();
+        }
+        catch {
+            // Fate/release handled by the settle logic below. Remember the throw:
+            // this is a fully delivered response with no route, which must not be
+            // labeled (or refunded) as an upstream failure.
+            activationThrew = true;
+        }
+    }
+    rec.routeRecovery.install = !routeOwning
+        ? sessionId === undefined
+            ? "no-session"
+            : "prompt-pending"
+        : // No install fate normally means protocol-complete never fired —
+            // split by who owned the close: a client mid-stream abort is not
+            // evidence about upstream health, and the attempt-rate tripwire needs
+            // to count the two separately. The one exception is a turn the
+            // upstream served to protocol-complete whose route bookkeeping threw
+            // at an activation attempt (the protocol-complete attempt, the
+            // delivered retry, or both): label it distinctly so it neither
+            // pollutes the upstream-failure metric nor triggers the refund. In
+            // the common sub-case the client got its answer (a fast-tool abort
+            // consumed message_stop first) and no identical-body retry is coming;
+            // the rarer closes — a pre-flush socket death (which does retry and
+            // eats the spent lane) or an upstream-owned error after the accepted
+            // message_stop chunk — land here too. See the activationThrew comment
+            // above for why that trade-off is deliberate.
+            installFate ??
+                (activationThrew
+                    ? "activation-error"
+                    : rec.clientAborted
+                        ? "client-aborted"
+                        : "upstream-failed");
+    // A reservation that lost its race (stale) or never reached
+    // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
+    // it must stop suppressing whoever is still trying to install.
+    if (rec.routeRecovery.install !== "installed")
+        releaseOwnReservation();
+    // A failed forward AFTER a healthy compress — upstream 5xx/529 or a client
+    // mid-stream abort — left no route and the client retries the identical
+    // body, so refund the lane's blocking budget — epoch-guarded, so a late
+    // settle cannot re-grant a later human turn's lane. The retry's recompress
+    // is a compress-cache hit, so the re-attempt is cheap. Deliberately NOT
+    // refunded on reject-deletes: siblings sharing a parent-agent fallback
+    // lane genuinely mismatch each other every turn, and refunding those would
+    // be one real blocking compress per tool step forever. The two refunded
+    // fates are split in reqlog so the attempt-rate tripwire can tell client
+    // behavior from upstream health; the refund itself treats them alike.
+    if ((rec.routeRecovery.install === "upstream-failed" ||
+        rec.routeRecovery.install === "client-aborted") &&
+        state.mainRouteEpoch === routeEpoch) {
+        state.toolRecoveryAttemptedLanes.delete(routeKey);
+    }
+}
+/** Stamp the classified turn type and forwarded-size fields on the record. */
+function recordTurn(rec, turnType, forwardBody) {
+    rec.turnType = turnType;
+    rec.forwardedBytes = forwardBody.length;
+    rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
+}
+function headerText(headers, name) {
+    const value = headers[name];
+    return Array.isArray(value) ? value.join(",") : value ?? "";
+}
+/**
+ * count_tokens: strip notices and mirror an active memory route during its
+ * tool loop. The response itself remains byte-transparent.
+ */
+async function handleCountTokens(req, res, opts, upstream, state) {
+    const rawBody = await readBody(req);
+    let forwardBody = rawBody;
+    try {
+        const body = JSON.parse(rawBody.toString("utf-8"));
+        if (Array.isArray(body.messages)) {
+            const stripped = stripNoticeBlocks(body.messages);
+            const strippedSystem = stripNoticeSystem(body.system);
+            if (stripped.stripped || strippedSystem.stripped) {
+                body.messages = stripped.messages;
+                if (strippedSystem.system === undefined)
+                    delete body.system;
+                else
+                    body.system = strippedSystem.system;
+                forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
+            }
+            const lastMsg = lastNonSystemMessage(body.messages);
+            // A tool_result tail is never an away-summary probe, so the lane key
+            // only distinguishes main vs agent identity here.
+            const countRoute = isToolResultUserMessage(lastMsg)
+                ? getMemoryRoute(state, routeIdentity(req, false).key)
+                : undefined;
+            if (countRoute) {
+                const routed = memoryRoutedToolBody(body, body.messages, countRoute, state.mainRouteEpoch, requestSessionId(req));
+                if (routed)
+                    forwardBody = routed;
+            }
+        }
+    }
+    catch {
+        // Unknown shape: forward verbatim.
+    }
+    return forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, undefined).then(() => undefined);
+}
+/**
+ * Forward a buffered request and pipe the response back byte-for-byte. A
+ * passive observer parses copies of SSE/JSON chunks for request logging and
+ * completion validation; its output is discarded and can never change the
+ * client response.
+ */
+function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
+    return new Promise((resolve) => {
+        const headers = forwardableRequestHeaders(req);
+        headers["content-length"] = String(bodyBuffer.length);
+        // The passive observer must be able to decode its copy to verify complete
+        // delivery (message_stop for SSE, complete JSON otherwise). Constrain the
+        // negotiated coding to what the observation decoders support, so an
+        // upstream choice like zstd cannot mark a byte-perfectly delivered
+        // response as failed.
+        // The bytes written to the client stay exact.
+        headers["accept-encoding"] = observableAcceptEncoding(headers["accept-encoding"]);
+        const forwardStarted = Date.now();
+        let settled = false;
+        let upstreamCompleted = false;
+        let responseFinished = false;
+        let protocolComplete = false;
+        let successfulStatus = false;
+        let clientAborted = false;
+        let shutdownCancelled = false;
+        let protocolCompleteNotified = false;
+        let upstreamReq;
+        let activeUpstreamRes;
+        const notifyProtocolComplete = () => {
+            if (protocolCompleteNotified ||
+                !successfulStatus ||
+                onProtocolComplete === undefined) {
+                return;
+            }
+            protocolCompleteNotified = true;
+            try {
+                onProtocolComplete();
+            }
+            catch {
+                // Route/observer bookkeeping can never affect byte delivery.
+            }
+        };
+        const settle = (ok) => {
+            if (settled)
+                return;
+            settled = true;
+            res.off("finish", onResponseFinish);
+            res.off("close", onResponseClose);
+            shutdownSignal.removeEventListener("abort", cancelForShutdown);
+            resolve(ok);
+        };
+        const maybeSettle = () => {
+            if (upstreamCompleted && responseFinished) {
+                settle(successfulStatus && protocolComplete && !clientAborted);
+            }
+        };
+        const onResponseFinish = () => {
+            responseFinished = true;
+            maybeSettle();
+        };
+        const onResponseClose = () => {
+            if (res.writableFinished || shutdownCancelled)
+                return;
+            clientAborted = true;
+            // Observability only: lets callers (and reqlog consumers) tell a
+            // client-owned close from an upstream failure after the settle.
+            if (rec)
+                rec.clientAborted = true;
+            activeUpstreamRes?.destroy();
+            upstreamReq?.destroy();
+            settle(false);
+        };
+        const completeUpstream = (complete) => {
+            upstreamCompleted = true;
+            protocolComplete = complete;
+            if (complete && !res.destroyed)
+                notifyProtocolComplete();
+            if (res.destroyed && !res.writableFinished && !shutdownCancelled) {
+                // The destroy is client-owned here: upstream ended cleanly (its
+                // error/aborted handlers settle synchronously before this can run)
+                // and the shutdownCancelled guard excludes the proxy-owned destroy —
+                // on the decoder path, decoder.end() defers finish() a tick, and a
+                // shutdown landing in that gap would otherwise be stamped as a
+                // client abort (onResponseClose has the same guard). Stamp directly —
+                // this settle detaches onResponseClose before the 'close' event that
+                // normally stamps can fire, and losing that race would misclassify a
+                // client abort as "upstream-failed" in the recovery settle.
+                clientAborted = true;
+                if (rec)
+                    rec.clientAborted = true;
+                settle(false);
+                return;
+            }
+            maybeSettle();
+        };
+        const cancelForShutdown = () => {
+            if (settled || shutdownCancelled)
+                return;
+            shutdownCancelled = true;
+            // Teardown is proxy-owned. Detach the ordinary client-close classifier
+            // before destroying either side of the pipe.
+            res.off("close", onResponseClose);
+            activeUpstreamRes?.destroy();
+            upstreamReq?.destroy();
+            if (!res.destroyed && !res.writableEnded)
+                res.destroy();
+            settle(false);
+        };
+        res.once("finish", onResponseFinish);
+        res.once("close", onResponseClose);
+        shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+        if (shutdownSignal.aborted) {
+            cancelForShutdown();
+            return;
+        }
+        upstreamReq = upstream.module.request({
+            host: upstream.host,
+            port: upstream.port,
+            method: req.method,
+            path: req.url, // path + query string verbatim (?beta=true etc.)
+            headers,
+        }, (upstreamRes) => {
+            activeUpstreamRes = upstreamRes;
+            const contentType = String(upstreamRes.headers["content-type"] ?? "");
+            const isSse = contentType.includes("text/event-stream");
+            const contentEncoding = String(upstreamRes.headers["content-encoding"] ?? "identity").trim().toLowerCase();
+            const compressed = contentEncoding !== "" && contentEncoding !== "identity";
+            let sawFirstByte = false;
+            let sawMessageStop = false;
+            let observerFailed = false;
+            const observeSseEvent = (data) => {
+                if (rec) {
+                    mergeUsageFromSseEvent(data, rec);
+                    if (rec.firstContentMs === undefined &&
+                        data?.type === "content_block_delta") {
+                        rec.firstContentMs = Date.now() - forwardStarted;
+                    }
+                }
+                if (data?.type === "message_stop") {
+                    sawMessageStop = true;
+                }
+            };
+            const sseObserver = isSse
+                ? new SseNoticeRewriter({
+                    onEvent: observeSseEvent,
+                })
+                : null;
+            const incrementalDecoder = sseObserver && compressed
+                ? createObservationDecoder(contentEncoding)
+                : null;
+            const observedChunks = !isSse || (compressed && !incrementalDecoder) ? [] : null;
+            const observeRawChunk = (chunk) => {
+                if (rec && !sawFirstByte) {
+                    sawFirstByte = true;
+                    rec.ttfbMs = Date.now() - forwardStarted;
+                }
+                if (sseObserver && !compressed)
+                    sseObserver.push(chunk);
+                if (observedChunks)
+                    observedChunks.push(Buffer.from(chunk));
+            };
+            if (rec) {
+                rec.upstreamStatus = upstreamRes.statusCode ?? 502;
+            }
+            successfulStatus =
+                typeof upstreamRes.statusCode === "number" &&
+                    upstreamRes.statusCode >= 200 &&
+                    upstreamRes.statusCode < 300;
+            res.writeHead(upstreamRes.statusCode ?? 502, forwardableResponseHeaders(upstreamRes));
+            if (incrementalDecoder && sseObserver) {
+                // Gate each encoded SSE chunk on locally decoding its copy. This
+                // guarantees message_start usage is recorded before the identical
+                // gzip/Brotli/deflate bytes can trigger Claude's MessageDisplay hook.
+                // Only the original bytes are written to the client.
+                let decoderFailed = false;
+                let pendingForward = null;
+                let pendingFinish = null;
+                incrementalDecoder.on("data", (chunk) => {
+                    if (!decoderFailed)
+                        sseObserver.push(chunk);
+                });
+                incrementalDecoder.on("error", () => {
+                    decoderFailed = true;
+                    observerFailed = true;
+                    const forward = pendingForward;
+                    pendingForward = null;
+                    forward?.();
+                    const finish = pendingFinish;
+                    pendingFinish = null;
+                    finish?.();
+                });
+                res.once("close", () => incrementalDecoder.destroy());
+                const forwardEncoded = (chunk) => {
+                    if (res.destroyed || res.writableEnded) {
+                        upstreamRes.destroy();
+                        return false;
+                    }
+                    if (res.write(chunk))
+                        upstreamRes.resume();
+                    else
+                        res.once("drain", () => upstreamRes.resume());
+                    return true;
+                };
+                upstreamRes.on("data", (chunk) => {
+                    upstreamRes.pause();
+                    observeRawChunk(chunk);
+                    if (decoderFailed) {
+                        forwardEncoded(chunk);
+                        return;
+                    }
+                    let forwarded = false;
+                    let accepted = false;
+                    const forwardOnce = () => {
+                        if (forwarded)
+                            return accepted;
+                        forwarded = true;
+                        accepted = forwardEncoded(chunk);
+                        return accepted;
+                    };
+                    pendingForward = forwardOnce;
+                    try {
+                        incrementalDecoder.write(chunk, (err) => {
+                            if (err) {
+                                decoderFailed = true;
+                                observerFailed = true;
+                            }
+                            if (pendingForward === forwardOnce)
+                                pendingForward = null;
+                            const chunkAccepted = forwardOnce();
+                            if (chunkAccepted &&
+                                !decoderFailed &&
+                                sawMessageStop) {
+                                notifyProtocolComplete();
+                            }
+                        });
+                    }
+                    catch {
+                        decoderFailed = true;
+                        observerFailed = true;
+                        if (pendingForward === forwardOnce)
+                            pendingForward = null;
+                        forwardOnce();
+                    }
+                });
+                upstreamRes.on("end", () => {
+                    let finished = false;
+                    const finish = () => {
+                        if (finished)
+                            return;
+                        finished = true;
+                        pendingFinish = null;
+                        sseObserver.flush();
+                        if (!res.destroyed && !res.writableEnded)
+                            res.end();
+                        completeUpstream(!observerFailed && sawMessageStop);
+                    };
+                    if (decoderFailed) {
+                        finish();
+                        return;
+                    }
+                    try {
+                        pendingFinish = finish;
+                        incrementalDecoder.end(finish);
+                    }
+                    catch {
+                        finish();
+                    }
+                });
+                upstreamRes.on("error", () => {
+                    incrementalDecoder.destroy();
+                    res.destroy();
+                    settle(false);
+                });
+                upstreamRes.on("aborted", () => {
+                    incrementalDecoder.destroy();
+                    res.destroy();
+                    settle(false);
+                });
+                return;
+            }
+            upstreamRes.on("data", observeRawChunk);
+            upstreamRes.pipe(res);
+            if (isSse && !compressed) {
+                // Registered after pipe(), so this runs only after the raw chunk
+                // containing the complete message_stop frame has been accepted by
+                // ServerResponse. The callback still runs synchronously before a
+                // client can issue the resulting tool request.
+                upstreamRes.on("data", () => {
+                    if (sawMessageStop && !observerFailed && !res.destroyed) {
+                        notifyProtocolComplete();
+                    }
+                });
+            }
+            upstreamRes.on("end", () => {
+                let observed = null;
+                if (observedChunks) {
+                    observed = decodeForObservation(Buffer.concat(observedChunks), contentEncoding);
+                    if (rec && observed && !isSse) {
+                        mergeUsageFromJsonBody(observed, rec);
+                    }
+                }
+                if (isSse) {
+                    if (compressed && !incrementalDecoder) {
+                        if (observed)
+                            sseObserver?.push(observed);
+                        else
+                            observerFailed = true;
+                    }
+                    sseObserver?.flush();
+                    completeUpstream(!observerFailed && sawMessageStop);
+                }
+                else {
+                    completeUpstream(observed !== null && isCompleteJsonResponse(req.url, observed));
+                }
+            });
+            upstreamRes.on("error", () => {
+                res.destroy();
+                settle(false);
+            });
+            upstreamRes.on("aborted", () => {
+                res.destroy();
+                settle(false);
+            });
+        });
+        upstreamReq.on("error", (err) => {
+            if (!shutdownCancelled) {
+                sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+            }
+            settle(false);
+        });
+        upstreamReq.end(bodyBuffer);
+    });
+}
+function isCompleteJsonResponse(requestUrl, body) {
+    try {
+        const parsed = JSON.parse(body.toString("utf-8"));
+        const pathname = new URL(requestUrl ?? "/", "http://127.0.0.1").pathname;
+        if (pathname.endsWith("/count_tokens")) {
+            return (typeof parsed?.input_tokens === "number" &&
+                Number.isFinite(parsed.input_tokens) &&
+                parsed.input_tokens >= 0);
+        }
+        return parsed?.type === "message" && Array.isArray(parsed.content);
+    }
+    catch {
+        return false;
+    }
+}
+/** Transparent streaming passthrough for everything else. */
+function passThroughStreaming(req, res, upstream, shutdownSignal) {
+    return new Promise((resolve) => {
+        const headers = forwardableRequestHeaders(req);
+        // The body is piped unmodified here, so keep the client's original
+        // content-length (SKIP_REQUEST_HEADERS strips it for the buffered paths,
+        // which recompute it); dropping it would silently convert the request to
+        // chunked transfer-encoding.
+        if (req.headers["content-length"] !== undefined) {
+            headers["content-length"] = req.headers["content-length"];
+        }
+        let settled = false;
+        let shutdownCancelled = false;
+        let incomingUploadEnded = req.readableEnded;
+        let upstreamUploadFinished = false;
+        let upstreamResponseEnded = false;
+        let downstreamFinished = res.writableFinished;
+        let pendingErrorResponse = false;
+        let upstreamReq;
+        let activeUpstreamRes;
+        const settle = () => {
+            if (settled)
+                return;
+            settled = true;
+            shutdownSignal.removeEventListener("abort", cancelForShutdown);
+            resolve();
+        };
+        /** Clean completion owns all four independently asynchronous seams. */
+        const settleIfComplete = () => {
+            if (incomingUploadEnded &&
+                upstreamUploadFinished &&
+                upstreamResponseEnded &&
+                downstreamFinished) {
+                settle();
+            }
+        };
+        /** Every abnormal exit tears down the whole duplex exchange exactly once. */
+        const tearDown = () => {
+            if (settled)
+                return;
+            // An early upstream response can mark ClientRequest/IncomingMessage as
+            // destroyed while their keep-alive socket still awaits the rest of the
+            // upload. Capture both transports before stream teardown and close them
+            // explicitly so server.close() cannot inherit a half-owned connection.
+            const downstreamSocket = req.socket;
+            const upstreamSocket = activeUpstreamRes?.socket ?? upstreamReq?.socket;
+            activeUpstreamRes?.unpipe(res);
+            if (upstreamReq)
+                req.unpipe(upstreamReq);
+            // Mark settled before destroy(): close/error events can fire reentrantly.
+            settle();
+            if (!req.destroyed)
+                req.destroy();
+            if (upstreamReq && !upstreamReq.destroyed)
+                upstreamReq.destroy();
+            if (activeUpstreamRes && !activeUpstreamRes.destroyed) {
+                activeUpstreamRes.destroy();
+            }
+            if (!res.destroyed)
+                res.destroy();
+            if (upstreamSocket && !upstreamSocket.destroyed)
+                upstreamSocket.destroy();
+            if (!downstreamSocket.destroyed)
+                downstreamSocket.destroy();
+        };
+        const onIncomingEnd = () => {
+            incomingUploadEnded = true;
+            settleIfComplete();
+        };
+        const onIncomingClose = () => {
+            if (settled)
+                return;
+            if (req.complete) {
+                incomingUploadEnded = true;
+                settleIfComplete();
+            }
+            else {
+                tearDown();
+            }
+        };
+        const onDownstreamFinish = () => {
+            downstreamFinished = true;
+            if (pendingErrorResponse)
+                tearDown();
+            else
+                settleIfComplete();
+        };
+        const onResponseClose = () => {
+            if (settled)
+                return;
+            if (res.writableFinished) {
+                downstreamFinished = true;
+                if (pendingErrorResponse)
+                    tearDown();
+                else
+                    settleIfComplete();
+            }
+            else {
+                tearDown();
+            }
+        };
+        const cancelForShutdown = () => {
+            if (settled || shutdownCancelled)
+                return;
+            shutdownCancelled = true;
+            tearDown();
+        };
+        req.once("end", onIncomingEnd);
+        req.once("aborted", tearDown);
+        req.once("error", tearDown);
+        req.once("close", onIncomingClose);
+        res.once("finish", onDownstreamFinish);
+        res.once("error", tearDown);
+        res.once("close", onResponseClose);
+        shutdownSignal.addEventListener("abort", cancelForShutdown, { once: true });
+        if (shutdownSignal.aborted) {
+            cancelForShutdown();
+            return;
+        }
+        upstreamReq = upstream.module.request({
+            host: upstream.host,
+            port: upstream.port,
+            method: req.method,
+            path: req.url,
+            headers,
+        }, (upstreamRes) => {
+            if (settled) {
+                upstreamRes.destroy();
+                return;
+            }
+            activeUpstreamRes = upstreamRes;
+            const onUpstreamResponseEnd = () => {
+                upstreamResponseEnded = true;
+                settleIfComplete();
+            };
+            const onUpstreamResponseClose = () => {
+                if (!settled && !upstreamResponseEnded)
+                    tearDown();
+            };
+            upstreamRes.once("end", onUpstreamResponseEnd);
+            upstreamRes.once("error", tearDown);
+            upstreamRes.once("aborted", tearDown);
+            upstreamRes.once("close", onUpstreamResponseClose);
+            try {
+                res.writeHead(upstreamRes.statusCode ?? 502, forwardableResponseHeaders(upstreamRes));
+            }
+            catch {
+                tearDown();
+                return;
+            }
+            upstreamRes.pipe(res);
+        });
+        upstreamReq.once("finish", () => {
+            upstreamUploadFinished = true;
+            settleIfComplete();
+        });
+        upstreamReq.once("close", () => {
+            if (!settled && !upstreamUploadFinished && !pendingErrorResponse) {
+                tearDown();
+            }
+        });
+        upstreamReq.on("error", (err) => {
+            if (settled)
+                return;
+            if (shutdownCancelled || res.headersSent || res.destroyed) {
+                tearDown();
+                return;
+            }
+            // Preserve the existing Anthropic-shaped 502 when no upstream bytes
+            // were committed. Ownership remains until that response flushes, then
+            // the still-open incoming upload/socket is torn down as one exchange.
+            pendingErrorResponse = true;
+            if (upstreamReq)
+                req.unpipe(upstreamReq);
+            activeUpstreamRes?.unpipe(res);
+            sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+            if (res.writableFinished)
+                onDownstreamFinish();
+        });
+        try {
+            req.pipe(upstreamReq);
+        }
+        catch {
+            tearDown();
+        }
+    });
+}
+function forwardableRequestHeaders(req) {
+    const out = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+        if (SKIP_REQUEST_HEADERS.has(key.toLowerCase()))
+            continue;
+        if (value === undefined)
+            continue;
+        out[key] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    return out;
+}
+function forwardableResponseHeaders(upstreamRes) {
+    const out = {};
+    for (const [key, value] of Object.entries(upstreamRes.headers)) {
+        if (SKIP_RESPONSE_HEADERS.has(key.toLowerCase()))
+            continue;
+        if (value === undefined)
+            continue;
+        out[key] = value;
+    }
+    return out;
+}
+/** Well-formed Anthropic-shaped error body so Claude Code fails fast, not weird. */
+function sendAnthropicError(res, message) {
+    if (res.headersSent) {
+        res.destroy();
+        return;
+    }
+    const payload = JSON.stringify({
+        type: "error",
+        error: { type: "api_error", message },
+    });
+    res.writeHead(502, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(payload)),
+    });
+    res.end(payload);
+}
+let captureCounter = 0;
+/** Test-only diagnostics: dump forwarded bodies for smoke-test inspection. */
+function capture(opts, kind, body) {
+    const dir = opts.captureDir;
+    if (!dir)
+        return;
+    try {
+        mkdirSync(dir, { recursive: true });
+        const name = `${String(++captureCounter).padStart(4, "0")}-${kind}.json`;
+        writeFileSync(join(dir, name), body);
+    }
+    catch {
+        // diagnostics only — never break the proxy path
+    }
+}
+function readBody(req) {
+    return readAll(req);
+}
+const OBSERVABLE_ENCODINGS = new Set(["gzip", "br", "deflate", "identity"]);
+/**
+ * Restrict a client Accept-Encoding value to codings the passive observer can
+ * decode (see createObservationDecoder/decodeForObservation). Client tokens
+ * are kept verbatim (q-values included) so negotiation semantics survive —
+ * except q=0 tokens, which the client explicitly refuses and so cannot count
+ * as an acceptable coding; an absent header means "anything", so advertise
+ * the full supported set, and if nothing supported and acceptable remains
+ * fall back to identity, which every client accepts.
+ */
+const REFUSED_Q_ZERO = /;\s*q\s*=\s*0(?:\.0{0,3})?\s*(?:;|$)/i;
+function observableAcceptEncoding(clientValue) {
+    if (clientValue === undefined)
+        return "gzip, br, deflate";
+    const kept = clientValue
+        .split(",")
+        .map((token) => token.trim())
+        .filter((token) => OBSERVABLE_ENCODINGS.has(token.split(";", 1)[0].trim().toLowerCase()) &&
+        !REFUSED_Q_ZERO.test(token));
+    return kept.length > 0 ? kept.join(", ") : "identity";
+}
+/** Incremental decoder used only to observe a copy of encoded SSE bytes. */
+function createObservationDecoder(encoding) {
+    if (encoding === "gzip")
+        return createGunzip();
+    if (encoding === "br")
+        return createBrotliDecompress();
+    if (encoding === "deflate")
+        return createInflate();
+    return null;
+}
+/** Decode a response copy for diagnostics without ever touching forwarded bytes. */
+function decodeForObservation(body, encoding) {
+    try {
+        if (!encoding || encoding === "identity")
+            return body;
+        if (encoding === "gzip")
+            return gunzipSync(body);
+        if (encoding === "br")
+            return brotliDecompressSync(body);
+        if (encoding === "deflate")
+            return inflateSync(body);
+    }
+    catch {
+        // Diagnostics only. Unknown/corrupt encodings do not affect proxying.
+    }
+    return null;
+}
+function readAll(stream) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        stream.on("data", (c) => chunks.push(c));
+        stream.on("end", () => resolve(Buffer.concat(chunks)));
+        stream.on("error", reject);
+    });
+}
+//# sourceMappingURL=proxy.js.map

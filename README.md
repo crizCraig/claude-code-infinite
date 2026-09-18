@@ -7,8 +7,8 @@
 * Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
-* Automatically recalls relevant past information using hierarchical RAG
-* Allows you to continue your session without summarizing or compacting
+* Automatically recalls relevant past information
+* Never compact again
  
 ## Requirements
 
@@ -21,10 +21,13 @@
 > [!TIP]
 > No Anthropic subscription? See [Using Without an Anthropic Subscription](#using-without-an-anthropic-subscription) below.
 
-1. Install with npm
+1. Install (Node ≥ 18; no git needed)
   ```bash
-npm install -g claude-code-infinite
+  npm install -g https://github.com/crizCraig/claude-code-infinite/tarball/main
   ```
+  The npm package (`npm install -g claude-code-infinite`) is temporarily behind — the
+  version there still uses the retired `/cc` proxy. It will be current again shortly;
+  until then install from the GitHub tarball above.
 2. Run Claude Code Infinite with
   ```bash
   ccc
@@ -171,6 +174,9 @@ the upgrade command. Upgrading is never automatic:
 ```bash
 npm install -g claude-code-infinite
 ```
+
+(While the npm package is behind — see Install above — upgrade with the GitHub tarball
+command instead.)
 
 Set `CCC_SKIP_UPDATE_CHECK=1` to disable the check (air-gapped or CI runs).
 
