@@ -13,6 +13,8 @@
  * choice. The prompt loop itself is in cli.ts.
  */
 export declare const FALLBACK_SUBSCRIBE_URL = "https://polychat.co/pricing";
+/** Query flag on the checkout link so the server's success page says "go back to your terminal". */
+export declare const CHECKOUT_SOURCE_PARAM = "source=ccc";
 export declare const PAYMENT_GATE_HEADLINE = "\u26A0 MemTree is off \u2014 payment required (compression + indexing disabled).";
 export declare const PAYMENT_GATE_PROMPT = "[Enter] subscribe now   [c] use claude without MemTree   [q] quit: ";
 export type PaymentStatus = {
@@ -29,6 +31,8 @@ export type PaymentChoice = "subscribe" | "continue" | "quit";
  * stays quiet, exactly like a network error.
  */
 export declare function parsePaymentStatus(body: unknown): PaymentStatus | null;
+/** Append `source=ccc` to a checkout link (idempotent). */
+export declare function withCheckoutSource(url: string): string;
 /** First `/payment?…` link in a payment prompt, or null. */
 export declare function extractPaymentUrl(message: string | null): string | null;
 /**
