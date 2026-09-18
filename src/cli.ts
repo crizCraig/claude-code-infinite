@@ -148,7 +148,9 @@ async function runPaymentGate(
 ): Promise<void> {
   let current = status;
   for (;;) {
-    console.warn(`\x1b[1;33m${formatPaymentNotice(current)}\x1b[0m\n`);
+    console.warn(
+      `\x1b[1;33m${formatPaymentNotice(current, { hyperlinks: true })}\x1b[0m\n`
+    );
     const choice = parsePaymentChoice(await askLine(PAYMENT_GATE_PROMPT));
     if (choice === "quit") process.exit(0);
     if (choice === "continue") {

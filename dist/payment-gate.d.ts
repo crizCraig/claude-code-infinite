@@ -37,7 +37,11 @@ export declare function extractPaymentUrl(message: string | null): string | null
  * link. The full server message is deliberately not echoed — it is several
  * paragraphs written for a chat window, and the prompt below is the point.
  */
-export declare function formatPaymentNotice(status: PaymentStatus): string;
+export declare function formatPaymentNotice(status: PaymentStatus, options?: {
+    hyperlinks?: boolean;
+}): string;
+/** OSC 8 terminal hyperlink: `text` shown, `url` opened on click. */
+export declare function hyperlink(text: string, url: string): string;
 /** "Starter plan, $5/month" from the recommender's prose, or null. */
 export declare function extractRecommendedPlan(message: string | null): string | null;
 /** Map a prompt answer to a choice. Enter (empty) or `s` subscribes. */
