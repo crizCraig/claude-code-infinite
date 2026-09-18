@@ -9,6 +9,7 @@ import {
   hyperlink,
   parsePaymentChoice,
   parsePaymentStatus,
+  withCheckoutSource,
 } from "../dist/payment-gate.js";
 
 const URL =
@@ -30,7 +31,13 @@ test("unpaid body without payment_url falls back to the link inside the message"
   const status = parsePaymentStatus({ paid: false, payment_message: MESSAGE });
   assert.equal(status.paid, false);
   assert.equal(status.message, MESSAGE);
-  assert.equal(status.url, URL);
+  assert.equal(status.url, `${URL}&source=ccc`);
+});
+
+test("withCheckoutSource appends source=ccc once, with ? or &", () => {
+  assert.equal(withCheckoutSource("https://x/payment?a=1"), "https://x/payment?a=1&source=ccc");
+  assert.equal(withCheckoutSource("https://x/payment"), "https://x/payment?source=ccc");
+  assert.equal(withCheckoutSource("https://x/payment?source=ccc"), "https://x/payment?source=ccc");
 });
 
 test("server payment_url wins over the message link", () => {
@@ -39,7 +46,7 @@ test("server payment_url wins over the message link", () => {
     payment_message: MESSAGE,
     payment_url: "https://app.polychat.co/payment?user_id=x",
   });
-  assert.equal(status.url, "https://app.polychat.co/payment?user_id=x");
+  assert.equal(status.url, "https://app.polychat.co/payment?user_id=x&source=ccc");
 });
 
 test("bodies without a boolean paid are unknown (null)", () => {
@@ -57,14 +64,17 @@ test("extractPaymentUrl only matches /payment? links", () => {
 
 test("notice is two lines: headline, then plan and full url", () => {
   const text = formatPaymentNotice(parsePaymentStatus({ paid: false, payment_message: MESSAGE }));
-  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  Starter plan, $5/month: ${URL}`);
+  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  Starter plan, $5/month: ${URL}&source=ccc`);
   assert.ok(!text.includes("Subscription Plans"));
 });
 
 test("interactive notice hides the url behind an OSC 8 link on the plan name", () => {
   const status = parsePaymentStatus({ paid: false, payment_message: MESSAGE });
   const text = formatPaymentNotice(status, { hyperlinks: true });
-  assert.equal(text, `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Starter plan, $5/month", URL)}`);
+  assert.equal(
+    text,
+    `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Starter plan, $5/month", `${URL}&source=ccc`)}`
+  );
   assert.ok(text.includes(URL), "the url is still inside the escape sequence");
   const noPlan = formatPaymentNotice({ paid: false, message: null, url: URL }, { hyperlinks: true });
   assert.equal(noPlan, `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Subscribe", URL)}`);
