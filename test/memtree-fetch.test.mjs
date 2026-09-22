@@ -23,6 +23,15 @@ test("page and .json MemTree URLs both resolve to the .json form, query intact",
     memtreeJsonUrl(`https://api.polychat.co/usage/memtree/${ID}?share=tok`).search,
     "?share=tok"
   );
+  // The short spelling the server stamps on responses.
+  assert.equal(
+    memtreeJsonUrl("https://app.polychat.co/m/0f1c2d3e4a5b").href,
+    "https://app.polychat.co/m/0f1c2d3e4a5b.json"
+  );
+  assert.equal(
+    memtreeJsonUrl("https://app.polychat.co/m/0f1c2d3e4a5b.json?share=tok").href,
+    "https://app.polychat.co/m/0f1c2d3e4a5b.json?share=tok"
+  );
 });
 
 test("non-MemTree URLs are rejected rather than fetched", () => {
@@ -30,6 +39,8 @@ test("non-MemTree URLs are rejected rather than fetched", () => {
   assert.equal(memtreeJsonUrl("https://api.polychat.co/usage?request=x"), null);
   assert.equal(memtreeJsonUrl(`https://api.polychat.co/usage/memtree/${ID}/block/0`), null);
   assert.equal(memtreeJsonUrl(`https://api.polychat.co/usage/memtree/../${ID}`), null);
+  assert.equal(memtreeJsonUrl("https://app.polychat.co/m/"), null);
+  assert.equal(memtreeJsonUrl("https://app.polychat.co/mx/0f1c2d3e4a5b"), null);
   assert.equal(memtreeJsonUrl(`ftp://api.polychat.co/usage/memtree/${ID}`), null);
 });
 
@@ -96,10 +107,10 @@ test("fetch sends the bearer key, prints the body, and maps outcomes to exit cod
   assert.equal(await runMemtreeFetchCommand(["https://x.y/z"], deps), 2);
 });
 
-test("the success notice carries the MemTree link only when the server sent one", () => {
+test("the success line carries the MemTree link only when there is one to show", () => {
   assert.equal(compressedNoticeText(undefined), COMPRESSED_NOTICE);
   assert.equal(
-    compressedNoticeText(`https://api.polychat.co/usage/memtree/${ID}`),
-    `${COMPRESSED_NOTICE} · https://api.polychat.co/usage/memtree/${ID}`
+    compressedNoticeText("https://app.polychat.co/m/0f1c2d3e4a5b"),
+    `${COMPRESSED_NOTICE} · https://app.polychat.co/m/0f1c2d3e4a5b`
   );
 });

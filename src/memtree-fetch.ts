@@ -2,7 +2,8 @@
  * `ccc fetch <memtree-url>`: print one of the user's MemTree pages as JSON,
  * authenticated with the key ccc already stores.
  *
- * The polychat MemTree page (`/usage/memtree/<id>`) answers an unauthenticated
+ * The polychat MemTree page (`/m/<short id>`, or the canonical
+ * `/usage/memtree/<request id>`) answers an unauthenticated
  * agent with a 401 that lists, in order: the loopback proxy of a running ccc
  * session, this command, and the raw key. This is the middle option — for an
  * agent on the user's machine when no ccc session is running. The tree is
@@ -20,8 +21,11 @@ import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
 
 export type FetchMode = "production" | "staging" | "local";
 
-/** `/usage/memtree/<request id>` with or without the `.json` suffix. */
-const MEMTREE_PATH_RE = /^\/usage\/memtree\/([A-Za-z0-9-]+)(\.json)?$/;
+/**
+ * `/m/<short id>` or `/usage/memtree/<request id>`, with or without the
+ * `.json` suffix. The server serves both spellings of either id.
+ */
+const MEMTREE_PATH_RE = /^(\/m|\/usage\/memtree)\/([A-Za-z0-9-]+)(\.json)?$/;
 const STAGING_HOST_PREFIX = "polychat-staging";
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
 const ERROR_BODY_PREVIEW_CHARS = 1000;
@@ -101,7 +105,7 @@ export function memtreeJsonUrl(raw: string): URL | null {
   if (!match || (url.protocol !== "https:" && url.protocol !== "http:")) {
     return null;
   }
-  url.pathname = `/usage/memtree/${match[1]}.json`;
+  url.pathname = `${match[1]}/${match[2]}.json`;
   return url;
 }
 
