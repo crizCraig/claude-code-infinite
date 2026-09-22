@@ -52,7 +52,7 @@ export interface MemtreeOptions {
 
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
- * memory budget (e.g. the 500k whole-request target for Fable / Opus 4.8).
+ * memory budget (e.g. the 800k whole-request target for Fable / Opus 5).
  * Without `model` the server can only apply its static 50k fallback.
  */
 export interface CompressRequestMeta {

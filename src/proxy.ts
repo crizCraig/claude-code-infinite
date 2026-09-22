@@ -2175,7 +2175,7 @@ async function runBlockingCompression(args: {
   const compressStarted = Date.now();
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
-    // (e.g. 500k whole-request target for Fable / Opus 4.8). Omitting
+    // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
     // them silently downgrades to the server's static 50k fallback.
     // `[1m]` is re-attached when the session is 1M-context so the
     // server's budget telemetry names the variant it actually served.
