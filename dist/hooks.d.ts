@@ -8,8 +8,32 @@
  * that never render text (for example, a tool-only response).
  */
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
+/** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
+export declare const TRAILER_LABEL = "\u221E MemTree \u00B7";
+export declare const TRAILER_NEW_LABEL = "\u221E MemTree \u00B7 new index \u00B7";
 export declare const DEFAULT_NOTICE_TTL_MS: number;
 type NoticeText = string | (() => string);
+/**
+ * Resolves the link appended to the success line for a session at claim
+ * time, or undefined when there is none. Evaluated lazily so the newest
+ * value (for example a MemTree page whose index finished during the tool
+ * loop) is what the user sees. The link is rendered unstyled after the
+ * styled text: Claude Code linkifies bare URLs and would swallow a trailing
+ * SGR reset into the link text.
+ */
+type LinkResolver = (sessionId: string | undefined) => SuccessLink | undefined;
+/** A link to show on the success line, shown once per distinct `key`. */
+export interface SuccessLink {
+    /** What makes this link news — e.g. the index it stands for, not its URL. */
+    key: string;
+    link: string;
+}
+/**
+ * Where the trailer (`∞ MemTree · <link>`) is shown: under every finished
+ * assistant message (with Stop as the fallback for a turn that rendered no
+ * text), or on Stop only, once per turn.
+ */
+export type TrailerPlacement = "message" | "stop";
 interface ColorCapableStream {
     hasColors?: (count?: number, env?: NodeJS.ProcessEnv) => boolean;
 }
@@ -68,9 +92,34 @@ export declare class NoticeDeliveryQueue {
     private readonly now;
     private readonly color;
     private pending;
+    private link;
+    /** Key of the last link shown; the same key is not repeated. */
+    private lastLinkKey;
+    private trailer;
+    private trailerPlacement;
+    /** Key of the last trailer shown; a different key is announced as new. */
+    private lastTrailerKey;
+    /** Whether a trailer was rendered under a message since the last Stop. */
+    private trailerShownThisTurn;
     constructor(ttlMs?: number, now?: () => number, color?: boolean);
     /** Replace stale delivery state when a new main human prompt is submitted. */
     clearForUserRequest(): void;
+    /**
+     * Install the per-session link that rides the success line, shown once per
+     * change: `<success text> · <link>`. Unlike prefix/suffix notices it is
+     * not per-prompt; it describes the conversation's current state whenever a
+     * success line is next shown.
+     */
+    setLink(resolve: LinkResolver | null): void;
+    /** Whether the next success line would carry a link not shown before. */
+    linkPending(sessionId: string | undefined): boolean;
+    /**
+     * Install the trailer: the newest link for the session, shown after every
+     * message (or on every Stop), the first time under a new `key` marked as
+     * new. Not once-per-key like the success-line link: the point is that the
+     * link is always at the bottom of the screen.
+     */
+    setTrailer(resolve: LinkResolver | null, placement?: TrailerPlacement): void;
     queuePrefix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
     queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
     /**
@@ -83,6 +132,22 @@ export declare class NoticeDeliveryQueue {
     private styleSuccess;
     /** Warnings get the same own-line treatment as success, in yellow. */
     private styleWarning;
+    /**
+     * The success line, with the session's not-yet-shown link (if any) after
+     * a separator — `✓ … optimized · <link>`. Claiming the link here marks it
+     * shown, so it rides exactly one success line.
+     */
+    private renderSuccess;
+    /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */
+    private resolveLink;
+    /**
+     * The trailer line for this session, or undefined when there is no link.
+     * The first time a key is seen the label says so in green; afterwards the
+     * label is dim. The URL stays bare either way (linkifier-safe). Rendering
+     * marks the key as seen. Resolver failures never break a hook.
+     */
+    private renderTrailer;
+    private styleDim;
     private style;
     private freshPending;
     private dropIfEmpty;

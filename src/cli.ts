@@ -36,7 +36,7 @@ import {
   type PaymentStatus,
 } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
-import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import { isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import {
   claudeChildEnv,
@@ -330,6 +330,9 @@ async function main() {
     // same-session-only eviction of a rejected route stay in force, because
     // those are what stop a side request from stranding the tool loop.
     toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
+    // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
+    // link is shown while the placement is being tried out; see ProxyOptions.
+    memtreeLinkPlacement: memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK),
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
@@ -441,3 +444,4 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+

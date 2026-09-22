@@ -31,4 +31,21 @@ export function parseWrapperArgs(args) {
     }
     return { claudeArgs, debug };
 }
+export const MEMTREE_LINK_PLACEMENTS = [
+    "message",
+    "stop",
+    "success",
+    "off",
+];
+/**
+ * `CCC_MEMTREE_LINK`: where the MemTree page link is shown (see
+ * ProxyOptions.memtreeLinkPlacement). Unset or unknown values fall back to
+ * the proxy's default placement.
+ */
+export function memtreeLinkPlacementFromEnv(value) {
+    const normalized = value?.trim().toLowerCase();
+    return MEMTREE_LINK_PLACEMENTS.includes(normalized ?? "")
+        ? normalized
+        : undefined;
+}
 //# sourceMappingURL=cli-args.js.map

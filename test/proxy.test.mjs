@@ -85,7 +85,8 @@ function mockUpstream() {
  * need per-call responses — e.g. a memory message that changes between turns,
  * since an unchanged memory message no longer re-queues the success notice.
  */
-async function mockMemtree(status, bodyObj) {
+/** `headers` (object, or `(body, call) => object`) adds response headers per call. */
+async function mockMemtree(status, bodyObj, headers = {}) {
   const calls = [];
   const srv = await listen((req, res) => {
     const chunks = [];
@@ -96,7 +97,9 @@ async function mockMemtree(status, bodyObj) {
       const resolved =
         typeof bodyObj === "function" ? bodyObj(parsed, calls.length - 1) : bodyObj;
       const body = JSON.stringify(withServerFlatten(resolved, parsed));
-      res.writeHead(status, { "content-type": "application/json" });
+      const extra =
+        typeof headers === "function" ? headers(parsed, calls.length - 1) : headers;
+      res.writeHead(status, { "content-type": "application/json", ...extra });
       res.end(body);
     });
   });
@@ -2473,6 +2476,301 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
       200,
       "newly indexed messages announce again"
     );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "");
+
+// The server stamps its short spelling of the page (/m/<leading hex of the
+// id>) and the completed index the turn was compressed against.
+const PAGE_URL_1 = "https://app.polychat.co/m/ea18af90658b";
+const PAGE_URL_2 = "https://app.polychat.co/m/0f1c2d3e4a5b";
+const PAGE_URL_3 = "https://app.polychat.co/m/a1b2c3d40000";
+const compressedOnce = {
+  messages: [{ role: "user", content: "compressed context" }],
+  usage: {
+    prompt_tokens: 200_000,
+    completion_tokens: 100_000,
+    prompt_tokens_details: { cached_tokens: 1 },
+  },
+};
+const stopHook = (prompt_id) => ({
+  hook_event_name: "Stop",
+  stop_hook_active: false,
+  ...(prompt_id ? { prompt_id } : {}),
+});
+const successLine = (link) => `${COMPRESSED_NOTICE} · ${link}`;
+/** Page + served-index headers for one compress call. */
+const pageHeaders = (url, index) => ({
+  "x-polychat-memtree-url": url,
+  ...(index ? { "x-polychat-memtree-index": index } : {}),
+});
+
+test("the first success line links the page; later ones only when a new index was served", async () => {
+  const upstream = await mockUpstream();
+  // Turn two and three compress against the same index; turn four against a
+  // newer one (the tool loop's index finished in between).
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
+    const rendered = first.body.hookSpecificOutput.displayContent;
+    assert.equal(stripAnsi(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
+    assert.match(rendered, /\x1b\[39m https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
+      "the link follows the SGR reset, bare, so a linkifier cannot swallow it");
+    assert.equal(
+      (await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }))).status,
+      204
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    // Same index, flat coverage: nothing to announce — no line at all.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index, flat coverage: the line comes back with the new page.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"));
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3" }));
+    assert.equal(
+      stripAnsi(next.body.hookSpecificOutput.displayContent),
+      `${successLine(PAGE_URL_3)}\nupstream answer`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a tool-only turn's Stop fallback carries the success line with its link", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_2, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const stop = await postHook(proxy, stopHook("prompt-1"));
+    assert.equal(stripAnsi(stop.body.systemMessage), successLine(PAGE_URL_2));
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a page without a served index (older server, index-only ack) is never linked", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(
+    200,
+    (body) =>
+      body.index_only
+        ? { messages: [], usage: {}, index_only: true }
+        : compressedOnce,
+    (body) => pageHeaders(body.index_only ? PAGE_URL_3 : PAGE_URL_1, undefined)
+  );
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await postMessages(proxy.port, toolTurn);
+    await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
+    assert.equal(
+      stripAnsi(first.body.hookSpecificOutput.displayContent),
+      `${COMPRESSED_NOTICE}\nupstream answer`,
+      "a page that may still be building gets no link"
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+const trailerNew = (link) => `∞ MemTree · new index · ${link}`;
+const trailerSame = (link) => `∞ MemTree · ${link}`;
+
+test("default placement: the link trails every finished message, marked when the index is new", async () => {
+  const upstream = await mockUpstream();
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    // First index in use: the success line stays plain; the trailer under the
+    // same message announces the new index — no waiting for a later turn.
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    const rendered = first.body.hookSpecificOutput.displayContent;
+    assert.equal(
+      stripAnsi(rendered),
+      `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
+    );
+    assert.ok(rendered.endsWith(`\x1b[39m ${PAGE_URL_1}`), "URL bare after the reset");
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    // Same index next turn: no success line, trailer still there, dim label.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
+    const same = await postHook(
+      proxy,
+      displayHook({ prompt_id: "prompt-2", index: 1, final: true, delta: "done" })
+    );
+    const sameRendered = same.body.hookSpecificOutput.displayContent;
+    assert.equal(stripAnsi(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
+    assert.match(sameRendered, /\x1b\[2m∞ MemTree ·\x1b\[22m /, "unchanged index is dim");
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index: marked again.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"));
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
+    assert.equal(
+      stripAnsi(next.body.hookSpecificOutput.displayContent),
+      `upstream answer\n\n${trailerNew(PAGE_URL_3)}`
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("default placement: a turn with no rendered message gets the trailer from Stop", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const stop = await postHook(proxy, stopHook("prompt-1"));
+    assert.equal(
+      stripAnsi(stop.body.systemMessage),
+      `${COMPRESSED_NOTICE}\n${trailerNew(PAGE_URL_1)}`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 200, "every Stop without a message repeats it");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("placements 'stop' and 'off'", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const onStop = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "stop",
+  });
+  const off = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "off",
+  });
+  try {
+    await armMainTurn(onStop, "turn two", "prompt-1");
+    await postMessages(onStop.port, followupTurn("turn two"));
+    const shown = await postHook(onStop, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal(stripAnsi((await postHook(onStop, stopHook("prompt-1"))).body.systemMessage), trailerNew(PAGE_URL_1));
+
+    await armMainTurn(off, "turn two", "prompt-1");
+    await postMessages(off.port, followupTurn("turn two"));
+    const plain = await postHook(off, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(stripAnsi(plain.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal((await postHook(off, stopHook("prompt-1"))).status, 204);
+  } finally {
+    onStop.close();
+    off.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("GET /memtree/<id>[.json] relays the user's page with the key, either id spelling", async () => {
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  const memtreeSrv = await listen((req, res) => {
+    pageGets.push({
+      url: req.url,
+      accept: req.headers.accept,
+      authorization: req.headers.authorization,
+    });
+    const json = req.url.includes(".json");
+    res.writeHead(200, {
+      "content-type": json ? "application/json" : "text/html; charset=utf-8",
+    });
+    res.end(json ? JSON.stringify({ nodes: [] }) : "<html>tree</html>");
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const get = (path, accept) =>
+    fetch(`http://127.0.0.1:${proxy.port}${path}`, { headers: accept ? { accept } : {} });
+  try {
+    const html = await get("/memtree/ea18af90658b", "text/html");
+    assert.equal(html.status, 200);
+    assert.equal(await html.text(), "<html>tree</html>");
+    assert.deepEqual(pageGets.at(-1), {
+      url: "/usage/memtree/ea18af90658b",
+      accept: "text/html",
+      authorization: "Bearer secret-key",
+    });
+
+    const json = await get("/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok");
+    assert.equal(json.status, 200);
+    assert.equal(
+      pageGets.at(-1).url,
+      "/usage/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok"
+    );
+
+    // Bad shapes never reach the server. (fetch normalizes a literal `..`;
+    // the encoded form reaches the handler.)
+    const before = pageGets.length;
+    assert.equal((await get("/memtree/ea18af90%2F..%2Fx")).status, 404);
+    assert.equal(pageGets.length, before);
   } finally {
     proxy.close();
     upstream.close();

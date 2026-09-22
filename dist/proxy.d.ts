@@ -34,6 +34,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { MemtreeClient } from "./memtree.js";
+import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -57,6 +58,18 @@ export interface ProxyOptions {
      * MemTree calls, and successful notice claims; omitted means no logging.
      */
     reqlog?: RequestLogSink;
+    /**
+     * Where the MemTree page link is shown (default "message"):
+     * - "message": `∞ MemTree · <url>` under every finished assistant message,
+     *   Stop as the fallback for a turn that rendered none; the first message
+     *   after a newly finished index came into use says "new index".
+     * - "stop": the same trailer, on Stop only, once per turn.
+     * - "success": appended to the `✓ MemTree · conversation optimized` line,
+     *   once per new index, nothing otherwise.
+     * - "off": no link anywhere (the page still reaches the request log).
+     * The CLI maps `CCC_MEMTREE_LINK` onto this.
+     */
+    memtreeLinkPlacement?: MemtreeLinkPlacement;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */

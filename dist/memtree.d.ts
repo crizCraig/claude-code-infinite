@@ -30,7 +30,7 @@ export interface MemtreeOptions {
 }
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
- * memory budget (e.g. the 500k whole-request target for Fable / Opus 4.8).
+ * memory budget (e.g. the 800k whole-request target for Fable / Opus 5).
  * Without `model` the server can only apply its static 50k fallback.
  */
 export interface CompressRequestMeta {
@@ -67,6 +67,17 @@ export interface CompressResult {
     usage?: unknown;
     /** Client-observed latency of the underlying HTTP call (survives retry dedupe). */
     clientLatencyMs?: number;
+    /**
+     * The per-request MemTree page (`X-Polychat-Memtree-Url`), when the server
+     * sent one. `.json` on the same path is the machine-readable tree.
+     */
+    memtreeUrl?: string;
+    /**
+     * The completed index this turn was compressed against
+     * (`X-Polychat-Memtree-Index`); absent on index-only acks and servers that
+     * predate it. A new value means a new index finished and is now in use.
+     */
+    memtreeIndex?: string;
 }
 /**
  * The server-flattened single user message of a compressed result, or null
@@ -193,6 +204,17 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /**
+     * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
+     * polychat host with this client's key. Backs the loopback `/memtree/*`
+     * passthrough, so an agent inside a ccc session reads the user's own tree
+     * through ANTHROPIC_BASE_URL without ever handling the key.
+     */
+    fetchMemTree(pathAndQuery: string, accept?: string): Promise<{
+        status: number;
+        contentType: string;
+        body: Buffer;
+    }>;
     constructor(opts: MemtreeOptions);
     static hashMessages(messages: Message[]): string;
     /**

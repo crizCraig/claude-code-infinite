@@ -72,7 +72,7 @@ import {
   type Message,
 } from "./turns.js";
 import {
-  compressedNoticeText,
+  COMPRESSED_NOTICE,
   DEGRADED_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   SseNoticeRewriter,
@@ -84,6 +84,7 @@ import {
   NoticeDeliveryQueue,
   parseNoticeHookInput,
 } from "./hooks.js";
+import type { MemtreeLinkPlacement } from "./cli-args.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -146,6 +147,18 @@ export interface ProxyOptions {
    * MemTree calls, and successful notice claims; omitted means no logging.
    */
   reqlog?: RequestLogSink;
+  /**
+   * Where the MemTree page link is shown (default "message"):
+   * - "message": `∞ MemTree · <url>` under every finished assistant message,
+   *   Stop as the fallback for a turn that rendered none; the first message
+   *   after a newly finished index came into use says "new index".
+   * - "stop": the same trailer, on Stop only, once per turn.
+   * - "success": appended to the `✓ MemTree · conversation optimized` line,
+   *   once per new index, nothing otherwise.
+   * - "off": no link anywhere (the page still reaches the request log).
+   * The CLI maps `CCC_MEMTREE_LINK` onto this.
+   */
+  memtreeLinkPlacement?: MemtreeLinkPlacement;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -179,6 +192,19 @@ interface Upstream {
   module: typeof http | typeof https;
   host: string;
   port: number;
+}
+
+/**
+ * A MemTree page the server stamped on a main-conversation compress, with
+ * the completed index that turn was compressed against. The page shows that
+ * index until the request's own tree is built, so it is safe to link at once.
+ */
+interface MemtreePage {
+  sessionId?: string;
+  url: string;
+  /** `X-Polychat-Memtree-Index`: what the link is news about. */
+  index: string;
+  seq: number;
 }
 
 /** Per-server mutable state (one server per ccc process). */
@@ -234,6 +260,15 @@ interface ProxyState {
    * new was indexed.
    */
   lastNoticedIndexCoverage?: { sessionId?: string; indexedTokens: number };
+  /**
+   * The newest MemTree page for this conversation, linked from the success
+   * line once per new served index. `seq` orders calls by submission so a
+   * slow older call that settles after a newer one cannot roll the link back
+   * to a staler tree.
+   */
+  latestMemtreeUrl?: MemtreePage;
+  /** Submission counter behind the pages' `seq`. */
+  memtreeCallSeq: number;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /**
@@ -465,7 +500,9 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
     routeInstallFault: opts.routeInstallFault,
+    memtreeCallSeq: 0,
   };
+  installMemtreeLink(state, opts.memtreeLinkPlacement ?? "message");
   const server = http.createServer((req, res) => {
     const accepted = { req, res };
     acceptedRequests.add(accepted);
@@ -599,7 +636,11 @@ async function handleRequest(
 
 /** Loopback prefix for reading the user's own MemTree pages through this proxy. */
 const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
-/** `<request id>` or `<request id>.json`; nothing that could walk the upstream path. */
+/**
+ * `<request id>` or `<request id>.json`; nothing that could walk the upstream
+ * path. The id is the request UUID or the server's short form of it (leading
+ * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
+ */
 const MEMTREE_PASSTHROUGH_TARGET_RE = /^[A-Za-z0-9-]+(\.json)?$/;
 
 /**
@@ -1279,6 +1320,10 @@ async function handleMessages(
   // An active subagent can repeat/embed the human prompt in its own request;
   // producer suppression must also preserve the arm for the later main call.
   if (displayForThisTurn) state.mainPromptArmed = false;
+  // The hidden away-summary request compresses too, but its page is not the
+  // conversation the user is looking at.
+  const linkSeq =
+    isMainRequest && !isAwaySummary ? nextMemtreeCallSeq(state) : undefined;
   let compression: BlockingCompressionOutcome;
   try {
     compression = await runBlockingCompression({
@@ -1298,6 +1343,9 @@ async function handleMessages(
   }
   const { result } = compression;
   noteMemtreeHealth(state, compression);
+  if (linkSeq !== undefined) {
+    noteMemtreePage(state, linkSeq, requestSessionId(req), result);
+  }
 
   if (
     downstreamClosedDuringCompression ||
@@ -1625,9 +1673,13 @@ function queueCompressionNotice(args: {
   // nearly every turn regardless of indexing. Coverage is missing only on
   // servers old enough that `didMemtreeCompress` would have degraded this
   // turn already; announce rather than suppress on an unknown quantity.
+  //
+  // A newly ready MemTree page also earns the line: the link rides only the
+  // success line (never its own message), so a finished index is announced
+  // on the next compressed turn even when coverage stayed flat.
   const indexedTokens = cachedPromptTokenCount(result);
+  const sessionId = requestSessionId(req);
   if (indexedTokens !== undefined) {
-    const sessionId = requestSessionId(req);
     const last = state.lastNoticedIndexCoverage;
     // Record every observed coverage, announced or not, so a server-side
     // index rebuild that shrinks coverage re-announces once it grows past
@@ -1636,16 +1688,77 @@ function queueCompressionNotice(args: {
     if (
       last &&
       last.sessionId === sessionId &&
-      indexedTokens <= last.indexedTokens
+      indexedTokens <= last.indexedTokens &&
+      !state.notices.linkPending(sessionId)
     ) {
       return;
     }
   }
-  state.notices.queuePrefix(
-    compressedNoticeText(result.memtreeUrl),
-    undefined,
-    noticePromptId
-  );
+  state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
+}
+
+/**
+ * The link on the success line: the newest page for the hook's session,
+ * exactly as the server stamped it, keyed by the index it was compressed
+ * against so it is announced once per newly finished index. The server hands
+ * out its short spelling (`/m/<leading hex of the request id>`), which is
+ * permanent — it outlives this proxy — and fits a terminal line.
+ */
+function installMemtreeLink(
+  state: ProxyState,
+  placement: MemtreeLinkPlacement
+): void {
+  const resolve = (sessionId: string | undefined) => {
+    const latest = state.latestMemtreeUrl;
+    if (!latest) return undefined;
+    // A page from another Claude Code session sharing this proxy is not this
+    // conversation's; only an attributed mismatch disqualifies it.
+    if (
+      latest.sessionId !== undefined &&
+      sessionId !== undefined &&
+      latest.sessionId !== sessionId
+    ) {
+      return undefined;
+    }
+    return { key: latest.index, link: latest.url };
+  };
+  switch (placement) {
+    case "success":
+      state.notices.setLink(resolve);
+      break;
+    case "message":
+    case "stop":
+      state.notices.setTrailer(resolve, placement);
+      break;
+    case "off":
+      break;
+  }
+}
+
+function nextMemtreeCallSeq(state: ProxyState): number {
+  return ++state.memtreeCallSeq;
+}
+
+/**
+ * Adopt a compress response's MemTree page as the conversation's newest,
+ * unless a call submitted later already reported one. Only a response that
+ * names the index it was compressed against counts: that index is complete,
+ * so the page shows a tree right away, and its identity is what makes the
+ * link worth announcing. A response without it (pre-view server, failed or
+ * uncompressed call) changes nothing.
+ */
+function noteMemtreePage(
+  state: ProxyState,
+  seq: number,
+  sessionId: string | undefined,
+  result: CompressResult | null
+): void {
+  const url = result?.memtreeUrl;
+  const index = result?.memtreeIndex;
+  if (!url || !index) return;
+  const latest = state.latestMemtreeUrl;
+  if (latest && latest.seq >= seq) return;
+  state.latestMemtreeUrl = { sessionId, url, index, seq };
 }
 
 /**
@@ -2386,6 +2499,7 @@ async function recoverToolRouteMiss(args: {
     if (!res.writableFinished) downstreamClosedDuringCompression = true;
   };
   res.once("close", markDownstreamClosed);
+  const linkSeq = isMainRequest ? nextMemtreeCallSeq(state) : undefined;
   let compression: BlockingCompressionOutcome;
   try {
     compression = await runBlockingCompression({
@@ -2418,6 +2532,9 @@ async function recoverToolRouteMiss(args: {
   // recovery path, a subagent's compress failure is the same evidence about
   // MemTree's health as main's, and its successes clear the cooldown too.
   noteMemtreeHealth(state, compression);
+  if (linkSeq !== undefined) {
+    noteMemtreePage(state, linkSeq, requestSessionId(req), result);
+  }
 
   if (
     downstreamClosedDuringCompression ||

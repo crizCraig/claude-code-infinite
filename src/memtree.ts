@@ -95,6 +95,12 @@ export interface CompressResult {
    * sent one. `.json` on the same path is the machine-readable tree.
    */
   memtreeUrl?: string;
+  /**
+   * The completed index this turn was compressed against
+   * (`X-Polychat-Memtree-Index`); absent on index-only acks and servers that
+   * predate it. A new value means a new index finished and is now in use.
+   */
+  memtreeIndex?: string;
 }
 
 /**
@@ -1064,6 +1070,7 @@ export class MemtreeClient {
       rawPromptTokens?: number;
       memoryChars?: number;
       memtreeUrl?: string;
+      memtreeIndex?: string;
     } = {};
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -1113,10 +1120,13 @@ export class MemtreeClient {
       // body byte; absent on servers that predate the view.
       const memtreeUrl =
         response.headers.get("x-polychat-memtree-url") ?? undefined;
+      const memtreeIndex =
+        response.headers.get("x-polychat-memtree-index") ?? undefined;
       this.unpaidDetail = null; // a success proves the key is paid (again)
       ok = true;
       diagnostics = {
         ...(memtreeUrl ? { memtreeUrl } : {}),
+        ...(memtreeIndex ? { memtreeIndex } : {}),
         indexedTokens: cachedPromptTokenCount(json),
         rawPromptTokens: rawPromptTokenCount(json),
         // Explicit field when the server sends one, else the first non-system
@@ -1134,7 +1144,12 @@ export class MemtreeClient {
           `(${messages.length} → ${json.messages.length} messages` +
           `${opts.indexOnly ? ", index-only" : ""})`
       );
-      return { ...json, clientLatencyMs, ...(memtreeUrl ? { memtreeUrl } : {}) };
+      return {
+        ...json,
+        clientLatencyMs,
+        ...(memtreeUrl ? { memtreeUrl } : {}),
+        ...(memtreeIndex ? { memtreeIndex } : {}),
+      };
     } finally {
       clearTimeout(timeout);
       opts.signal?.removeEventListener("abort", abort);

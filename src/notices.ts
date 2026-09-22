@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message } from "./turns.js";
+import { TRAILER_LABEL, TRAILER_NEW_LABEL } from "./hooks.js";
 import { UPGRADE_COMMAND, type UpdateAvailable } from "./update-check.js";
 
 export const NOTICE_OPEN = "<cc-infinite-notice>";
@@ -19,12 +20,22 @@ export const NOTICE_CLOSE = "</cc-infinite-notice>";
 export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
 
 /**
- * The success notice with this turn's MemTree page appended when the server
- * sent one, so the user (or an agent reading the transcript) can open the
- * tree that was just served. Falls back to the bare notice.
+ * The success line with the newest ready MemTree page for this conversation
+ * appended, when the client has one it has not shown yet — plain text form
+ * (monochrome rendering, docs, tests). The hook renderer styles the text and
+ * leaves the URL bare so Claude Code's linkifier gets a clean link.
  */
 export function compressedNoticeText(memtreeUrl?: string): string {
   return memtreeUrl ? `${COMPRESSED_NOTICE} · ${memtreeUrl}` : COMPRESSED_NOTICE;
+}
+/**
+ * The trailer under a finished assistant message naming the newest MemTree
+ * page for the conversation, plain-text form. `isNew` marks the first message
+ * after a newly finished index came into use; the hook renderer styles that
+ * case green and the unchanged case dim, with the URL bare either way.
+ */
+export function memtreeTrailerText(memtreeUrl: string, isNew: boolean): string {
+  return `${isNew ? TRAILER_NEW_LABEL : TRAILER_LABEL} ${memtreeUrl}`;
 }
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";

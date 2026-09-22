@@ -21,7 +21,8 @@ import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
-import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import { isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv } from "./cli-args.js";
+import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, } from "./config.js";
@@ -153,6 +154,12 @@ async function main() {
     const parsedArgs = parseWrapperArgs(process.argv.slice(2));
     const isDebugMode = parsedArgs.debug;
     const filteredArgs = parsedArgs.claudeArgs;
+    // `ccc fetch <memtree-url>`: read one of the user's MemTree pages with the
+    // stored key and print it. No proxy, no Claude — an agent's escape hatch
+    // when it is not running inside a ccc session.
+    if (filteredArgs[0] === "fetch") {
+        process.exit(await runMemtreeFetchCommand(filteredArgs.slice(1)));
+    }
     const mode = filteredArgs[0] === "local" ? "local" :
         filteredArgs[0] === "staging" ? "staging" :
             "production";
@@ -245,6 +252,9 @@ async function main() {
         // same-session-only eviction of a rejected route stay in force, because
         // those are what stop a side request from stranding the tool loop.
         toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
+        // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
+        // link is shown while the placement is being tried out; see ProxyOptions.
+        memtreeLinkPlacement: memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK),
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);

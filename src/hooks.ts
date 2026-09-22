@@ -13,13 +13,41 @@ import os from "node:os";
 import path from "node:path";
 
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
+/** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
+export const TRAILER_LABEL = "∞ MemTree ·";
+export const TRAILER_NEW_LABEL = "∞ MemTree · new index ·";
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
+const ANSI_DIM = "\x1b[2m";
+const ANSI_NORMAL_INTENSITY = "\x1b[22m";
 const STARTUP_NOTICE_FILE = "startup-notice.json";
 
 type NoticeText = string | (() => string);
+/**
+ * Resolves the link appended to the success line for a session at claim
+ * time, or undefined when there is none. Evaluated lazily so the newest
+ * value (for example a MemTree page whose index finished during the tool
+ * loop) is what the user sees. The link is rendered unstyled after the
+ * styled text: Claude Code linkifies bare URLs and would swallow a trailing
+ * SGR reset into the link text.
+ */
+type LinkResolver = (sessionId: string | undefined) => SuccessLink | undefined;
+
+/** A link to show on the success line, shown once per distinct `key`. */
+export interface SuccessLink {
+  /** What makes this link news — e.g. the index it stands for, not its URL. */
+  key: string;
+  link: string;
+}
+
+/**
+ * Where the trailer (`∞ MemTree · <link>`) is shown: under every finished
+ * assistant message (with Stop as the fallback for a turn that rendered no
+ * text), or on Stop only, once per turn.
+ */
+export type TrailerPlacement = "message" | "stop";
 
 interface ColorCapableStream {
   hasColors?: (count?: number, env?: NodeJS.ProcessEnv) => boolean;
@@ -113,6 +141,15 @@ export type NoticeHookOutput = MessageDisplayHookOutput | StopHookOutput;
  */
 export class NoticeDeliveryQueue {
   private pending: PendingNotice | null = null;
+  private link: LinkResolver | null = null;
+  /** Key of the last link shown; the same key is not repeated. */
+  private lastLinkKey: string | null = null;
+  private trailer: LinkResolver | null = null;
+  private trailerPlacement: TrailerPlacement = "message";
+  /** Key of the last trailer shown; a different key is announced as new. */
+  private lastTrailerKey: string | null = null;
+  /** Whether a trailer was rendered under a message since the last Stop. */
+  private trailerShownThisTurn = false;
 
   constructor(
     private readonly ttlMs = DEFAULT_NOTICE_TTL_MS,
@@ -123,6 +160,35 @@ export class NoticeDeliveryQueue {
   /** Replace stale delivery state when a new main human prompt is submitted. */
   clearForUserRequest(): void {
     this.pending = null;
+  }
+
+  /**
+   * Install the per-session link that rides the success line, shown once per
+   * change: `<success text> · <link>`. Unlike prefix/suffix notices it is
+   * not per-prompt; it describes the conversation's current state whenever a
+   * success line is next shown.
+   */
+  setLink(resolve: LinkResolver | null): void {
+    this.link = resolve;
+  }
+
+  /** Whether the next success line would carry a link not shown before. */
+  linkPending(sessionId: string | undefined): boolean {
+    return this.resolveLink(sessionId) !== undefined;
+  }
+
+  /**
+   * Install the trailer: the newest link for the session, shown after every
+   * message (or on every Stop), the first time under a new `key` marked as
+   * new. Not once-per-key like the success-line link: the point is that the
+   * link is always at the bottom of the screen.
+   */
+  setTrailer(
+    resolve: LinkResolver | null,
+    placement: TrailerPlacement = "message"
+  ): void {
+    this.trailer = resolve;
+    this.trailerPlacement = placement;
   }
 
   queuePrefix(
@@ -161,16 +227,24 @@ export class NoticeDeliveryQueue {
     if (input.hook_event_name !== "Stop") return null;
 
     const pending = this.freshPending();
-    if (!pending || !this.promptMatches(pending, input.prompt_id)) return null;
-    const prefix = pending.prefix;
-    const suffix = pending.suffix;
-    if (!prefix && !suffix) return null;
-    this.pending = null;
+    const matched =
+      pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
+    const prefix = matched?.prefix;
+    const suffix = matched?.suffix;
+    // Stop is the turn's last hook: the trailer lands here when the turn
+    // rendered no message to carry it ("message"), or always ("stop").
+    const trailerDue =
+      this.trailerPlacement === "stop" || !this.trailerShownThisTurn;
+    const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
+    this.trailerShownThisTurn = false;
+    if (!prefix && !suffix && trailer === undefined) return null;
+    if (prefix || suffix) this.pending = null;
     markDelivered(prefix);
     markDelivered(suffix);
     const lines: string[] = [];
-    if (prefix) lines.push(this.styleSuccess(resolveNoticeText(prefix)));
+    if (prefix) lines.push(this.renderSuccess(prefix, input.session_id));
     if (suffix) lines.push(this.styleWarning(resolveNoticeText(suffix)));
+    if (trailer !== undefined) lines.push(trailer);
     return {
       systemMessage: lines.join("\n"),
     };
@@ -184,13 +258,18 @@ export class NoticeDeliveryQueue {
       pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
     const prefix = matched && input.index === 0 ? matched.prefix : undefined;
     const suffix = matched && input.final ? matched.suffix : undefined;
-    if (!prefix && !suffix) return null;
+    const trailer =
+      input.final && this.trailerPlacement === "message"
+        ? this.renderTrailer(input.session_id)
+        : undefined;
+    if (trailer !== undefined) this.trailerShownThisTurn = true;
+    if (!prefix && !suffix && trailer === undefined) return null;
 
     // Remove before callbacks or response construction so a reentrant/parallel
     // Stop hook cannot deliver the same notice a second time.
     if (prefix) delete matched!.prefix;
     if (suffix) delete matched!.suffix;
-    this.dropIfEmpty(matched!);
+    if (matched) this.dropIfEmpty(matched);
     markDelivered(prefix);
     markDelivered(suffix);
 
@@ -200,13 +279,18 @@ export class NoticeDeliveryQueue {
       // Standard named-color SGR is interpreted by Claude Code on every
       // supported terminal (and stripped cleanly in monochrome/NO_COLOR).
       // Reset foreground only so surrounding renderer styles are preserved.
-      const styled = this.styleSuccess(resolveNoticeText(prefix));
+      const styled = this.renderSuccess(prefix, input.session_id);
       displayContent = `${styled}\n${displayContent}`;
     }
     if (suffix) {
       const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
       const styled = this.styleWarning(resolveNoticeText(suffix));
       displayContent = `${displayContent}${separator}${styled}`;
+    }
+    if (trailer !== undefined) {
+      // A blank line keeps the trailer apart from the answer above it.
+      const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
+      displayContent = `${displayContent}${separator}\n${trailer}`;
     }
     return {
       hookSpecificOutput: {
@@ -234,6 +318,61 @@ export class NoticeDeliveryQueue {
   /** Warnings get the same own-line treatment as success, in yellow. */
   private styleWarning(text: string): string {
     return this.style(text, ANSI_YELLOW);
+  }
+
+  /**
+   * The success line, with the session's not-yet-shown link (if any) after
+   * a separator — `✓ … optimized · <link>`. Claiming the link here marks it
+   * shown, so it rides exactly one success line.
+   */
+  private renderSuccess(
+    prefix: PendingNoticePart,
+    sessionId: string | undefined
+  ): string {
+    const text = resolveNoticeText(prefix);
+    const link = this.resolveLink(sessionId);
+    if (link === undefined) return this.styleSuccess(text);
+    this.lastLinkKey = link.key;
+    return `${this.styleSuccess(`${text} ·`)} ${link.link}`;
+  }
+
+  /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */
+  private resolveLink(sessionId: string | undefined): SuccessLink | undefined {
+    if (!this.link) return undefined;
+    let link: SuccessLink | undefined;
+    try {
+      link = this.link(sessionId);
+    } catch {
+      return undefined;
+    }
+    return link?.link && link.key && link.key !== this.lastLinkKey ? link : undefined;
+  }
+
+  /**
+   * The trailer line for this session, or undefined when there is no link.
+   * The first time a key is seen the label says so in green; afterwards the
+   * label is dim. The URL stays bare either way (linkifier-safe). Rendering
+   * marks the key as seen. Resolver failures never break a hook.
+   */
+  private renderTrailer(sessionId: string | undefined): string | undefined {
+    if (!this.trailer) return undefined;
+    let link: SuccessLink | undefined;
+    try {
+      link = this.trailer(sessionId);
+    } catch {
+      return undefined;
+    }
+    if (!link?.link || !link.key) return undefined;
+    const isNew = link.key !== this.lastTrailerKey;
+    this.lastTrailerKey = link.key;
+    const label = isNew
+      ? this.styleSuccess(TRAILER_NEW_LABEL)
+      : this.styleDim(TRAILER_LABEL);
+    return `${label} ${link.link}`;
+  }
+
+  private styleDim(text: string): string {
+    return this.color ? `${ANSI_DIM}${text}${ANSI_NORMAL_INTENSITY}` : text;
   }
 
   private style(text: string, sgr: string): string {

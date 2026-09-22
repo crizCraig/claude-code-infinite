@@ -12,6 +12,20 @@ import { type UpdateAvailable } from "./update-check.js";
 export declare const NOTICE_OPEN = "<cc-infinite-notice>";
 export declare const NOTICE_CLOSE = "</cc-infinite-notice>";
 export declare const COMPRESSED_NOTICE = "\u2713 MemTree \u00B7 conversation optimized";
+/**
+ * The success line with the newest ready MemTree page for this conversation
+ * appended, when the client has one it has not shown yet — plain text form
+ * (monochrome rendering, docs, tests). The hook renderer styles the text and
+ * leaves the URL bare so Claude Code's linkifier gets a clean link.
+ */
+export declare function compressedNoticeText(memtreeUrl?: string): string;
+/**
+ * The trailer under a finished assistant message naming the newest MemTree
+ * page for the conversation, plain-text form. `isNew` marks the first message
+ * after a newly finished index came into use; the hook renderer styles that
+ * case green and the unchanged case dim, with the URL bare either way.
+ */
+export declare function memtreeTrailerText(memtreeUrl: string, isNew: boolean): string;
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export declare const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn ran uncompressed";

@@ -663,6 +663,27 @@ export class MemtreeClient {
     get compressBudgetMs() {
         return this.compressTimeoutMs;
     }
+    /**
+     * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
+     * polychat host with this client's key. Backs the loopback `/memtree/*`
+     * passthrough, so an agent inside a ccc session reads the user's own tree
+     * through ANTHROPIC_BASE_URL without ever handling the key.
+     */
+    async fetchMemTree(pathAndQuery, accept = "application/json") {
+        const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
+            headers: {
+                authorization: `Bearer ${this.apiKey}`,
+                accept,
+                "x-client": CLIENT_NAME,
+                "x-client-version": CLIENT_VERSION,
+            },
+        });
+        return {
+            status: response.status,
+            contentType: response.headers.get("content-type") ?? "application/octet-stream",
+            body: Buffer.from(await response.arrayBuffer()),
+        };
+    }
     constructor(opts) {
         this.baseUrl = opts.baseUrl.replace(/\/$/, "");
         this.apiKey = opts.apiKey;
@@ -906,9 +927,15 @@ export class MemtreeClient {
                 throw new Error("context_memory returned no messages");
             }
             const clientLatencyMs = Date.now() - started;
+            // The per-request MemTree page, stamped by the server before the first
+            // body byte; absent on servers that predate the view.
+            const memtreeUrl = response.headers.get("x-polychat-memtree-url") ?? undefined;
+            const memtreeIndex = response.headers.get("x-polychat-memtree-index") ?? undefined;
             this.unpaidDetail = null; // a success proves the key is paid (again)
             ok = true;
             diagnostics = {
+                ...(memtreeUrl ? { memtreeUrl } : {}),
+                ...(memtreeIndex ? { memtreeIndex } : {}),
                 indexedTokens: cachedPromptTokenCount(json),
                 rawPromptTokens: rawPromptTokenCount(json),
                 // Explicit field when the server sends one, else the first non-system
@@ -921,7 +948,12 @@ export class MemtreeClient {
             this.log(`context_memory ok in ${clientLatencyMs}ms ` +
                 `(${messages.length} → ${json.messages.length} messages` +
                 `${opts.indexOnly ? ", index-only" : ""})`);
-            return { ...json, clientLatencyMs };
+            return {
+                ...json,
+                clientLatencyMs,
+                ...(memtreeUrl ? { memtreeUrl } : {}),
+                ...(memtreeIndex ? { memtreeIndex } : {}),
+            };
         }
         finally {
             clearTimeout(timeout);

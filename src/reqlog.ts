@@ -243,6 +243,8 @@ export interface MemtreeRecord {
   memoryChars?: number;
   /** The per-request MemTree page the server stamped on the response, if any. */
   memtreeUrl?: string;
+  /** The completed index the turn was compressed against, if the server said. */
+  memtreeIndex?: string;
 }
 
 /** A display-only notice was atomically claimed by one Claude Code hook. */

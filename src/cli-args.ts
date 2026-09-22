@@ -38,3 +38,25 @@ export function parseWrapperArgs(args: string[]): WrapperArgs {
 
   return { claudeArgs, debug };
 }
+
+export type MemtreeLinkPlacement = "message" | "stop" | "success" | "off";
+export const MEMTREE_LINK_PLACEMENTS: readonly MemtreeLinkPlacement[] = [
+  "message",
+  "stop",
+  "success",
+  "off",
+];
+
+/**
+ * `CCC_MEMTREE_LINK`: where the MemTree page link is shown (see
+ * ProxyOptions.memtreeLinkPlacement). Unset or unknown values fall back to
+ * the proxy's default placement.
+ */
+export function memtreeLinkPlacementFromEnv(
+  value: string | undefined
+): MemtreeLinkPlacement | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return (MEMTREE_LINK_PLACEMENTS as readonly string[]).includes(normalized ?? "")
+    ? (normalized as MemtreeLinkPlacement)
+    : undefined;
+}
