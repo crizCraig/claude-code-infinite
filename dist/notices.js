@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { TRAILER_LABEL, TRAILER_NEW_LABEL } from "./hooks.js";
+import { TRAILER_LABEL } from "./hooks.js";
 import { UPGRADE_COMMAND } from "./update-check.js";
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
@@ -25,13 +25,15 @@ export function compressedNoticeText(memtreeUrl) {
 }
 /**
  * The trailer under a finished assistant message naming the newest MemTree
- * page for the conversation, plain-text form. `isNew` marks the first message
- * after a newly finished index came into use; the hook renderer styles that
- * case green and the unchanged case dim, with the URL bare either way.
+ * page for the conversation, plain-text form. The hook renderer styles the
+ * label green the first time an index is shown and dim afterwards, with the
+ * URL bare either way.
  */
-export function memtreeTrailerText(memtreeUrl, isNew) {
-    return `${isNew ? TRAILER_NEW_LABEL : TRAILER_LABEL} ${memtreeUrl}`;
+export function memtreeTrailerText(memtreeUrl, note) {
+    return `${TRAILER_LABEL} ${memtreeUrl}${note ? ` ${note}` : ""}`;
 }
+/** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
+export const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE = "⚠ MemTree degraded — this turn ran uncompressed";
@@ -197,6 +199,33 @@ export function stripNoticeSystem(system) {
 function sseEvent(type, data) {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
+/** content_block_start/delta/stop triple for a plain text block. */
+export function textBlockEvents(index, text) {
+    return (sseEvent("content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: { type: "text", text: "" },
+    }) +
+        sseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: { type: "text_delta", text },
+        }) +
+        sseEvent("content_block_stop", { type: "content_block_stop", index }));
+}
+/**
+ * Claude Code keeps at most this many characters of a recap (the joined text
+ * of the reply), truncating the end. Checked against Claude Code 2.1.278.
+ */
+export const RECAP_MAX_CHARS = 400;
+/**
+ * The recap's link line, or undefined when it would not fit under Claude
+ * Code's cap and would come back clipped mid-URL.
+ */
+export function recapLinkText(link, streamedTextChars, note) {
+    const text = `\n${TRAILER_LABEL} ${link}${note ? ` ${note}` : ""}`;
+    return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
+}
 /** content_block_start/delta/stop triple for a notice text block. */
 export function noticeBlockEvents(index, noticeText) {
     return (sseEvent("content_block_start", {
@@ -245,6 +274,8 @@ export class SseNoticeRewriter {
     maxIndexSeen = -1;
     injectedResponseNotice = false;
     injectedEndNotice = false;
+    injectedEndText = false;
+    streamedTextChars = 0;
     constructor(opts) {
         this.opts = opts;
     }
@@ -293,6 +324,11 @@ export class SseNoticeRewriter {
                 // observer must never break the stream
             }
         }
+        if (type === "content_block_delta" &&
+            data.delta?.type === "text_delta" &&
+            typeof data.delta.text === "string") {
+            this.streamedTextChars += data.delta.text.length;
+        }
         const baseShift = this.opts.renumberBy ?? 0;
         if (baseShift && type === "message_start")
             return ""; // fabricated prelude sent ours
@@ -338,6 +374,21 @@ export class SseNoticeRewriter {
                 const noticeIndex = this.maxIndexSeen + 1;
                 this.maxIndexSeen = noticeIndex;
                 notices += noticeBlockEvents(noticeIndex, this.opts.endOfTurnNotice);
+            }
+            if (this.opts.endOfTurnText && !this.injectedEndText) {
+                this.injectedEndText = true;
+                let text;
+                try {
+                    text = this.opts.endOfTurnText(this.streamedTextChars);
+                }
+                catch {
+                    text = undefined; // a formatter must never break the stream
+                }
+                if (text) {
+                    const index = this.maxIndexSeen + 1;
+                    this.maxIndexSeen = index;
+                    notices += textBlockEvents(index, text);
+                }
             }
             if (notices)
                 return notices + rawEvent;

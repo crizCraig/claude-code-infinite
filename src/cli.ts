@@ -17,6 +17,8 @@ import spawn from "cross-spawn";
 import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { startProxy } from "./proxy.js";
+import { MemtreeLinkStore } from "./memtree-links.js";
+import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
   createSessionNoticePlugin,
   supportsMessageDisplay,
@@ -316,6 +318,7 @@ async function main() {
   });
   const nativeOneMillionContext =
     claudeNativeOneMillionContextEnabled(process.env);
+  const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
   const proxy = await startProxy({
     memtree,
     debug: isDebugMode,
@@ -332,7 +335,9 @@ async function main() {
     toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
     // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
     // link is shown while the placement is being tried out; see ProxyOptions.
-    memtreeLinkPlacement: memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK),
+    memtreeLinkPlacement,
+    memtreeLinkStore: new MemtreeLinkStore(),
+    transcriptUsage: new ClaudeTranscriptUsage(),
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
@@ -369,6 +374,7 @@ async function main() {
       noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
         messageDisplay: installedClaudeSupportsMessageDisplay(),
         startupMessage: startupNoticeText(terminalSupportsColor(), updateAvailable),
+        resumeLink: memtreeLinkPlacement !== "off",
       });
       // Global option must precede a user-supplied `--`, positional prompt, or
       // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.

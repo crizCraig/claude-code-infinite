@@ -16,6 +16,7 @@
  * amplify identical HTTP calls, and budget-changing inputs never reuse a
  * stale compression result.
  */
+import type { MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
@@ -36,6 +37,18 @@ export interface MemtreeOptions {
 export interface CompressRequestMeta {
     model?: string;
     tools?: unknown[];
+    /**
+     * Explicit whole-request target (server `compression_target_tokens`),
+     * overriding the model-based budget. Set by `/memtree-compact` so a session
+     * is compressed even while it would still fit the model's window.
+     */
+    compressionTargetTokens?: number;
+    /**
+     * Each assistant message's response usage (output, thinking, input), keyed
+     * by its position in the messages sent. Archived by the server for the
+     * MemTree page; never hashed, never part of the compression cache key.
+     */
+    messageUsage?: MessageUsage;
 }
 export interface CompressResult {
     /** Processed (compressed) messages from the server; system role may be included. */

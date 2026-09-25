@@ -35,6 +35,8 @@
  */
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
+import type { MemtreeLinkStore } from "./memtree-links.js";
+import type { TranscriptUsageSource } from "./transcript-usage.js";
 import { type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -59,10 +61,12 @@ export interface ProxyOptions {
      */
     reqlog?: RequestLogSink;
     /**
-     * Where the MemTree page link is shown (default "message"):
-     * - "message": `∞ MemTree · <url>` under every finished assistant message,
+     * Where the MemTree page link is shown (default "turn"):
+     * - "turn": `• MemTree · <url>` once at the end of a user turn (Stop), and
+     *   only when the index behind the link changed since it was last shown.
+     * - "message": `• MemTree · <url>` under every finished assistant message,
      *   Stop as the fallback for a turn that rendered none; the first message
-     *   after a newly finished index came into use says "new index".
+     *   after a newly finished index came into use is green, later ones dim.
      * - "stop": the same trailer, on Stop only, once per turn.
      * - "success": appended to the `✓ MemTree · conversation optimized` line,
      *   once per new index, nothing otherwise.
@@ -70,6 +74,18 @@ export interface ProxyOptions {
      * The CLI maps `CCC_MEMTREE_LINK` onto this.
      */
     memtreeLinkPlacement?: MemtreeLinkPlacement;
+    /**
+     * Where the newest page per session is persisted so a resumed session can
+     * show its link (SessionStart hook). Omitted means no persistence (tests);
+     * the CLI passes the default store under ~/.claude-code-infinite.
+     */
+    memtreeLinkStore?: MemtreeLinkStore;
+    /**
+     * Per-response token usage (thinking share on the MemTree page), read from
+     * Claude Code's transcript. Omitted means none is sent (tests); the CLI
+     * passes the reader for ~/.claude/projects.
+     */
+    transcriptUsage?: TranscriptUsageSource;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -98,4 +114,6 @@ export interface RunningProxy {
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
+/** Default `/memtree-compact` target: the server's own static fallback budget. */
+export declare const MEMTREE_COMPACT_DEFAULT_TOKENS = 50000;
 //# sourceMappingURL=proxy.d.ts.map

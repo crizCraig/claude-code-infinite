@@ -16,6 +16,7 @@
  * bytes/4 chars→tokens proxy, NOT real tokenizer output — exact usage, when
  * the response format lets us extract it cheaply, lands under `usage`.
  */
+import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
 /** Rough bytes→tokens estimate (bytes/4). Label the result approximate. */
 export declare function approxTokensFromBytes(bytes: number): number;
 export declare function defaultLogPath(): string;
@@ -28,7 +29,18 @@ export type TurnType = "first-user" | "tool" | "tool-memory"
  * Compressed result carried no server `flattened_messages` (pre-flatten
  * server or malformed field); history forwarded.
  */
- | "followup-no-flatten" | "followup-degraded" | "followup-client-closed" | "unparseable";
+ | "followup-no-flatten" | "followup-degraded"
+/**
+ * A fork of the main conversation (the away recap) rode the main thread's
+ * last compressed prefix: same bytes the main thread sent, so Anthropic's
+ * prompt cache hits, and no MemTree call was made.
+ */
+ | "fork-memory"
+/**
+ * Claude Code's own side request (the security monitor): forwarded
+ * untouched, no MemTree call, main-thread route state left alone.
+ */
+ | "side-request" | "followup-client-closed" | "unparseable";
 /** Real token usage parsed from Anthropic's response, when available. */
 export interface UsageRecord {
     input_tokens?: number;
@@ -49,6 +61,19 @@ export interface MessagesRecord {
     requestBytes: number;
     model?: string;
     stream?: boolean;
+    /**
+     * What Claude Code's billing header says about this request (see
+     * cc-request.ts). Logged to measure which request kinds lack
+     * `cc_turn_origin` before any of them are kept away from MemTree.
+     */
+    client?: ClaudeCodeRequestInfo;
+    /**
+     * For a request shaped like Claude Code's security monitor (billing header,
+     * no turn origin, no tools): whether its `<transcript>` block has the known
+     * format. `ok: false` means it was handled as an ordinary request, and is
+     * the signal that Claude Code changed the format.
+     */
+    transcript?: TranscriptShape;
     /** Body bytes actually sent to Anthropic (after notice strip / compression). */
     forwardedBytes?: number;
     /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
@@ -105,6 +130,12 @@ export interface MessagesRecord {
      * never emit it. "none" is deliberately not a value.
      */
     routeMiss?: "missing" | "rejected" | "replay";
+    /**
+     * Why a fork of the main conversation (away recap) did not ride the main
+     * thread's last prefix and fell back to its own compression; absent when it
+     * rode (turnType "fork-memory") or was not a fork.
+     */
+    forkMiss?: "no-route" | "session" | "system" | "prefix" | "too-large";
     /** Outcome of a best-effort tool-route miss recovery attempt. */
     routeRecovery?: {
         /**

@@ -34,6 +34,7 @@ test("Claude print flags are recognized only before --", () => {
 });
 
 test("CCC_MEMTREE_LINK picks a known placement, anything else means default", () => {
+  assert.equal(memtreeLinkPlacementFromEnv("turn"), "turn");
   assert.equal(memtreeLinkPlacementFromEnv("message"), "message");
   assert.equal(memtreeLinkPlacementFromEnv(" Stop "), "stop");
   assert.equal(memtreeLinkPlacementFromEnv("success"), "success");

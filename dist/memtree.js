@@ -744,6 +744,8 @@ export class MemtreeClient {
             signal,
             model: meta?.model,
             tools: meta?.tools,
+            compressionTargetTokens: meta?.compressionTargetTokens,
+            messageUsage: meta?.messageUsage,
         }).catch((err) => {
             this.log(`compression failed: ${err?.message ?? err}`);
             // `status` is absent when the call never got a response (network
@@ -844,7 +846,13 @@ export class MemtreeClient {
         const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
         const toolsHash = createHash("sha256").update(toolsJson).digest("hex");
         return createHash("sha256")
-            .update(JSON.stringify([hash, model ?? null, modelContextLimit, toolsHash]))
+            .update(JSON.stringify([
+            hash,
+            model ?? null,
+            modelContextLimit,
+            toolsHash,
+            meta?.compressionTargetTokens ?? null,
+        ]))
             .digest("hex");
     }
     remember(cacheKey, promise) {
@@ -876,6 +884,15 @@ export class MemtreeClient {
                 body.model = model;
             if (tools !== undefined)
                 body.tools = tools;
+            if (opts.compressionTargetTokens !== undefined) {
+                body.compression_target_tokens = opts.compressionTargetTokens;
+            }
+            // Compress calls only: the server adds the thinking tokens (stripped
+            // from `messages` above) to its budget, since a passthrough forwards
+            // them, and archives the counts for the MemTree page's thinking share.
+            if (opts.messageUsage && Object.keys(opts.messageUsage).length) {
+                body.message_usage = opts.messageUsage;
+            }
             // Ask the server for its canonical single-user-message flatten of the
             // compressed result. The flatten format (closed transcript container,
             // per-human-turn headers, live-tail framing, header escaping) lives

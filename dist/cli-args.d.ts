@@ -11,7 +11,7 @@ export declare function isPrintInvocation(args: string[]): boolean;
  * flags.
  */
 export declare function parseWrapperArgs(args: string[]): WrapperArgs;
-export type MemtreeLinkPlacement = "message" | "stop" | "success" | "off";
+export type MemtreeLinkPlacement = "turn" | "message" | "stop" | "success" | "off";
 export declare const MEMTREE_LINK_PLACEMENTS: readonly MemtreeLinkPlacement[];
 /**
  * `CCC_MEMTREE_LINK`: where the MemTree page link is shown (see

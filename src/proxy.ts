@@ -74,6 +74,8 @@ import {
 import {
   COMPRESSED_NOTICE,
   DEGRADED_NOTICE,
+  NOT_COMPRESSED_NOTE,
+  recapLinkText,
   PAYMENT_REQUIRED_NOTICE,
   SseNoticeRewriter,
   sanitizeNoticeDetail,
@@ -82,9 +84,24 @@ import {
 } from "./notices.js";
 import {
   NoticeDeliveryQueue,
+  MEMTREE_COMPACT_COMMAND,
+  MEMTREE_HELP_COMMAND,
+  TRAILER_LABEL,
+  isMemtreeViewCommand,
+  sessionCommandArgs,
   parseNoticeHookInput,
+  type SessionStartHookInput,
 } from "./hooks.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
+import type { MemtreeLinkStore } from "./memtree-links.js";
+import {
+  describeClaudeCodeRequest,
+  inspectMonitorTranscript,
+  isClaudeCodeSideRequest,
+  sessionTag,
+  type ClaudeCodeRequestInfo,
+} from "./cc-request.js";
+import type { TranscriptUsageSource } from "./transcript-usage.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -148,10 +165,12 @@ export interface ProxyOptions {
    */
   reqlog?: RequestLogSink;
   /**
-   * Where the MemTree page link is shown (default "message"):
-   * - "message": `∞ MemTree · <url>` under every finished assistant message,
+   * Where the MemTree page link is shown (default "turn"):
+   * - "turn": `• MemTree · <url>` once at the end of a user turn (Stop), and
+   *   only when the index behind the link changed since it was last shown.
+   * - "message": `• MemTree · <url>` under every finished assistant message,
    *   Stop as the fallback for a turn that rendered none; the first message
-   *   after a newly finished index came into use says "new index".
+   *   after a newly finished index came into use is green, later ones dim.
    * - "stop": the same trailer, on Stop only, once per turn.
    * - "success": appended to the `✓ MemTree · conversation optimized` line,
    *   once per new index, nothing otherwise.
@@ -159,6 +178,18 @@ export interface ProxyOptions {
    * The CLI maps `CCC_MEMTREE_LINK` onto this.
    */
   memtreeLinkPlacement?: MemtreeLinkPlacement;
+  /**
+   * Where the newest page per session is persisted so a resumed session can
+   * show its link (SessionStart hook). Omitted means no persistence (tests);
+   * the CLI passes the default store under ~/.claude-code-infinite.
+   */
+  memtreeLinkStore?: MemtreeLinkStore;
+  /**
+   * Per-response token usage (thinking share on the MemTree page), read from
+   * Claude Code's transcript. Omitted means none is sent (tests); the CLI
+   * passes the reader for ~/.claude/projects.
+   */
+  transcriptUsage?: TranscriptUsageSource;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -204,6 +235,12 @@ interface MemtreePage {
   url: string;
   /** `X-Polychat-Memtree-Index`: what the link is news about. */
   index: string;
+  /**
+   * Whether the call behind the page actually compressed. False means the
+   * conversation fit the model's budget and went out whole; the trailer says
+   * so, since the link alone reads as "MemTree rewrote this turn".
+   */
+  compressed: boolean;
   seq: number;
 }
 
@@ -248,6 +285,15 @@ interface ProxyState {
    */
   memoryRoutes: Map<string, MemoryRoute>;
   /**
+   * The main lane's most recently installed route, kept across epoch bumps
+   * (Stop and UserPromptSubmit clear memoryRoutes). Read only by forks of the
+   * main conversation, the away recap, which Claude Code sends after Stop:
+   * they extend the same history, so they can send the exact compressed
+   * prefix the main thread last sent and hit Anthropic's prompt cache.
+   * Never read by tool turns, which keep their epoch-scoped lane routes.
+   */
+  lastMainRoute?: MemoryRoute;
+  /**
    * Index coverage (MemTree `cached_tokens`) observed on the last compression
    * this session displayed a notice for. Only a turn whose coverage GREW
    * indexed newer messages; equal coverage means MemTree re-unfolded the same
@@ -269,6 +315,14 @@ interface ProxyState {
   latestMemtreeUrl?: MemtreePage;
   /** Submission counter behind the pages' `seq`. */
   memtreeCallSeq: number;
+  memtreeLinkStore?: MemtreeLinkStore;
+  memtreeLinkPlacement: MemtreeLinkPlacement;
+  /**
+   * `/memtree-compact` targets by Claude Code session: every compression for
+   * that session asks the server for this whole-request size instead of the
+   * model-based budget, so it stays compressed while it would still fit.
+   */
+  compactTargets: Map<string, number>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /**
@@ -501,8 +555,11 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     shutdownSignal: shutdownAbort.signal,
     routeInstallFault: opts.routeInstallFault,
     memtreeCallSeq: 0,
+    memtreeLinkStore: opts.memtreeLinkStore,
+    memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
+    compactTargets: new Map(),
   };
-  installMemtreeLink(state, opts.memtreeLinkPlacement ?? "message");
+  installMemtreeLink(state, state.memtreeLinkPlacement);
   const server = http.createServer((req, res) => {
     const accepted = { req, res };
     acceptedRequests.add(accepted);
@@ -637,11 +694,12 @@ async function handleRequest(
 /** Loopback prefix for reading the user's own MemTree pages through this proxy. */
 const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
 /**
- * `<request id>` or `<request id>.json`; nothing that could walk the upstream
+ * `<request id>`, `<request id>.json`, or `<request id>/session.json` (the
+ * page's session pane); nothing that could walk the upstream
  * path. The id is the request UUID or the server's short form of it (leading
  * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
  */
-const MEMTREE_PASSTHROUGH_TARGET_RE = /^[A-Za-z0-9-]+(\.json)?$/;
+const MEMTREE_PASSTHROUGH_TARGET_RE = /^[A-Za-z0-9-]+(\.json|\/session\.json)?$/;
 
 /**
  * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own
@@ -717,7 +775,52 @@ async function handleNoticeHook(
     return;
   }
 
+  if (parsed.hook_event_name === "SessionStart") {
+    const line = resumeLinkLine(state, parsed);
+    if (!line) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(body.length),
+      "cache-control": "no-store",
+    });
+    res.end(body);
+    return;
+  }
   if (parsed.hook_event_name === "UserPromptSubmit") {
+    // `/memtree-view`: answered here and blocked, so no model turn runs and
+    // the prompt never enters the conversation. Not a human turn either, so
+    // none of the turn state below is touched.
+    const commandReply =
+      parsed.agent_id === undefined
+        ? sessionCommandReply(state, parsed.session_id, parsed.prompt)
+        : undefined;
+    if (commandReply !== undefined) {
+      const body = Buffer.from(
+        JSON.stringify({
+          decision: "block",
+          reason: commandReply,
+          // Claude Code otherwise repeats "Original prompt: /ccc:memtree-view"
+          // under the answer. Older releases ignore the flag.
+          hookSpecificOutput: {
+            hookEventName: "UserPromptSubmit",
+            suppressOriginalPrompt: true,
+          },
+        }),
+        "utf-8"
+      );
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+      res.end(body);
+      return;
+    }
     if (parsed.agent_id === undefined) {
       state.mainPromptArmed = true;
       state.mainPromptId = parsed.prompt_id;
@@ -895,6 +998,71 @@ async function handleMessages(
   const isUserTurn = isNonToolUserMessage(lastMsg);
   const isToolResultTurn = isToolResultUserMessage(lastMsg);
   const isAwaySummary = isAwaySummaryUserMessage(lastMsg);
+
+  // Claude Code's security monitor re-sends the whole session as one
+  // `<transcript>` message after most actions. Before this check it looked
+  // like a main-thread followup: it bumped the route epoch (wiping the main
+  // tool loop's compressed route mid-turn, forcing a blocking recompress),
+  // cost a MemTree passthrough, and started a from-scratch index of a
+  // conversation that already has one. It must touch none of that state, so
+  // it is handled here, before anything below mutates it. Anthropic already
+  // caches its append-only transcript well, so it goes out verbatim.
+  let clientInfo: ClaudeCodeRequestInfo | undefined;
+  try {
+    clientInfo = describeClaudeCodeRequest(body);
+    if (clientInfo.suspectedSideRequest) {
+      clientInfo.sessionTag = sessionTag(requestSessionId(req));
+    }
+  } catch {
+    // logging only; never affects the request
+  }
+  // The header rule alone is not enough: Claude Code releases before
+  // cc_turn_origin existed send main-thread requests with no turn origin, so
+  // the monitor's <transcript> block must also be recognised. A candidate
+  // whose transcript does not match keeps the ordinary handling (the
+  // pre-existing behaviour) and records why, so a format change in Claude
+  // Code shows up in requests.jsonl instead of silently misrouting.
+  let sideRequest = false;
+  if (clientInfo && isClaudeCodeSideRequest(clientInfo)) {
+    try {
+      rec.transcript = inspectMonitorTranscript(body);
+      sideRequest = rec.transcript.ok;
+      if (!rec.transcript.ok) {
+        console.error(
+          `[ccc proxy] possible side request, transcript format not recognised ` +
+            `(${rec.transcript.reason}${rec.transcript.badLine ? ` at line ${rec.transcript.badLine}` : ""}); ` +
+            `handled as an ordinary request. Claude Code may have changed the monitor format.`
+        );
+      }
+    } catch {
+      // never let the format check affect the request
+    }
+  }
+  if (sideRequest && clientInfo) {
+    if (typeof body.model === "string") rec.model = body.model;
+    rec.stream = body.stream === true;
+    rec.client = clientInfo;
+    recordTurn(rec, "side-request", forwardBody);
+    capture(opts, "anthropic-request-side", forwardBody);
+    return logged(
+      forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec)
+    );
+  }
+
+  if (isAwaySummary && state.memtreeLinkPlacement !== "off") {
+    const sessionId = requestSessionId(req);
+    recapLinkAppenders.set(req, (streamedTextChars) => {
+      const latest = state.latestMemtreeUrl;
+      if (!latest || (sessionId !== undefined && latest.sessionId !== undefined && latest.sessionId !== sessionId)) {
+        return undefined;
+      }
+      return recapLinkText(
+        latest.url,
+        streamedTextChars,
+        latest.compressed ? undefined : NOT_COMPRESSED_NOTE
+      );
+    });
+  }
   const isLocalBashCommand = isLocalBashCommandTurn(messages);
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
   // attribution before lifecycle-hook state so an agent request cannot claim
@@ -1027,6 +1195,8 @@ async function handleMessages(
 
   if (typeof body.model === "string") rec.model = body.model;
   rec.stream = body.stream === true;
+  // Observation only: which requests carry Claude Code's turn origin.
+  if (clientInfo) rec.client = clientInfo;
 
   if (!isFollowupUserTurn) {
     // Tool turn or FIRST user turn: keep the index fed off the response path
@@ -1267,6 +1437,30 @@ async function handleMessages(
     );
   }
 
+  // The away recap is a fork of the main conversation: its history is the
+  // main thread's plus one question. Ride the main thread's last compressed
+  // prefix instead of compressing separately, so the request stays under the
+  // window, hits the prompt cache the main thread warmed, and costs no
+  // MemTree call. Any mismatch falls through to the recap's own compression.
+  if (isAwaySummary) {
+    const fork = forkRoutedBody(
+      body,
+      messages,
+      state.lastMainRoute,
+      requestSessionId(req),
+      modelContextLimit
+    );
+    if ("body" in fork) {
+      releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
+      recordTurn(rec, "fork-memory", fork.body);
+      capture(opts, "anthropic-request-memory-fork", fork.body);
+      return logged(
+        forwardRaw(req, res, fork.body, opts, upstream, state.shutdownSignal, rec)
+      );
+    }
+    rec.forkMiss = fork.miss;
+  }
+
   // Close the recovery-retry window only once this compressible main turn's
   // response has been fully delivered downstream: a failed forward (500/529)
   // keeps state.mainPromptDelivered false so the client's identical-body retry
@@ -1334,6 +1528,7 @@ async function handleMessages(
       hash,
       modelContextLimit,
       rec,
+      sessionId: requestSessionId(req),
     });
   } catch (err) {
     releaseUncommittedRouteDecision();
@@ -1720,12 +1915,17 @@ function installMemtreeLink(
     ) {
       return undefined;
     }
-    return { key: latest.index, link: latest.url };
+    return {
+      key: latest.index,
+      link: latest.url,
+      ...(latest.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
+    };
   };
   switch (placement) {
     case "success":
       state.notices.setLink(resolve);
       break;
+    case "turn":
     case "message":
     case "stop":
       state.notices.setTrailer(resolve, placement);
@@ -1733,6 +1933,96 @@ function installMemtreeLink(
     case "off":
       break;
   }
+}
+
+/**
+ * The link line for a resumed main session: its newest page, from memory when
+ * this proxy served it (an in-app `/resume` back to an earlier conversation),
+ * else from the on-disk store (a new `ccc --resume` process). Adopts it as the
+ * session's current page so trailers continue from it, at a sequence number
+ * any later call beats.
+ */
+function resumeLinkLine(
+  state: ProxyState,
+  input: SessionStartHookInput
+): string | undefined {
+  if (input.agent_id !== undefined || input.source === "compact") return undefined;
+  if (state.memtreeLinkPlacement === "off") return undefined;
+  const sessionId = input.session_id;
+  const inMemory = state.latestMemtreeUrl;
+  const page =
+    inMemory && inMemory.sessionId === sessionId
+      ? inMemory
+      : state.memtreeLinkStore?.get(sessionId);
+  if (!page) return undefined;
+  if (page !== inMemory) {
+    state.latestMemtreeUrl = {
+      sessionId,
+      url: page.url,
+      index: page.index,
+      compressed: page.compressed,
+      seq: state.memtreeCallSeq,
+    };
+  }
+  return state.notices.resumeLine({
+    key: page.index,
+    link: page.url,
+    ...(page.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
+  });
+}
+
+/** Default `/memtree-compact` target: the server's own static fallback budget. */
+export const MEMTREE_COMPACT_DEFAULT_TOKENS = 50_000;
+const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
+
+/** The reply to a ccc slash command, or undefined for an ordinary prompt. */
+function sessionCommandReply(
+  state: ProxyState,
+  sessionId: string,
+  prompt: string
+): string | undefined {
+  if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
+    return [
+      "• /memtree-view · show this session's MemTree page link",
+      `• /memtree-compact [tokens | off] · keep this session compressed (default ${MEMTREE_COMPACT_DEFAULT_TOKENS / 1000}k, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
+    ].join("\n");
+  }
+  if (isMemtreeViewCommand(prompt)) return memtreeViewLine(state, sessionId);
+  const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
+  if (args === undefined) return undefined;
+  if (/^off$/i.test(args)) {
+    state.compactTargets.delete(sessionId);
+    return `${TRAILER_LABEL} compaction off: MemTree compresses only when the conversation outgrows the model's window.`;
+  }
+  const target = args === "" ? MEMTREE_COMPACT_DEFAULT_TOKENS : parseTokenCount(args);
+  if (target === undefined || target < MEMTREE_COMPACT_MIN_TOKENS) {
+    return `${TRAILER_LABEL} usage: /memtree-compact [tokens, e.g. 50k, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k | off]`;
+  }
+  state.compactTargets.set(sessionId, target);
+  return `${TRAILER_LABEL} compacting: from your next message on, this session is sent compressed to about ${Math.round(target / 1000)}k tokens. /memtree-compact off to stop.`;
+}
+
+/** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
+function parseTokenCount(text: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(text.trim());
+  if (!match) return undefined;
+  const scale = { k: 1_000, m: 1_000_000 }[match[2]?.toLowerCase() as "k" | "m"] ?? 1;
+  const value = Math.round(Number(match[1]) * scale);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** The `/memtree-view` answer: this session's newest page, or why there is none. */
+function memtreeViewLine(state: ProxyState, sessionId: string): string {
+  const inMemory = state.latestMemtreeUrl;
+  const page =
+    inMemory && (inMemory.sessionId === undefined || inMemory.sessionId === sessionId)
+      ? inMemory
+      : state.memtreeLinkStore?.get(sessionId);
+  if (!page) {
+    return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
+  }
+  const note = page.compressed ? "" : ` ${NOT_COMPRESSED_NOTE}`;
+  return `${TRAILER_LABEL} ${page.url}${note}`;
 }
 
 function nextMemtreeCallSeq(state: ProxyState): number {
@@ -1758,7 +2048,9 @@ function noteMemtreePage(
   if (!url || !index) return;
   const latest = state.latestMemtreeUrl;
   if (latest && latest.seq >= seq) return;
-  state.latestMemtreeUrl = { sessionId, url, index, seq };
+  const compressed = didMemtreeCompress(result!);
+  state.latestMemtreeUrl = { sessionId, url, index, compressed, seq };
+  if (sessionId) state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
 }
 
 /**
@@ -1885,7 +2177,7 @@ function installMemoryRoute(
   // cloneJson/hash construction could throw, so tests can reach the
   // "activation-error" settle label. See ProxyOptions.routeInstallFault.
   state.routeInstallFault?.();
-  setMemoryRoute(state, key, {
+  const route: MemoryRoute = {
     sessionId,
     originalSystemHash: routeValueHash(
       normalizeRouteSystem(originalBody.system)
@@ -1901,8 +2193,51 @@ function installMemoryRoute(
       "system"
     ),
     routeEpoch,
-  });
+  };
+  setMemoryRoute(state, key, route);
+  if (key === JSON.stringify([sessionId, "main"])) state.lastMainRoute = route;
   return true;
+}
+
+type ForkMiss = NonNullable<MessagesRecord["forkMiss"]>;
+
+/**
+ * A fork of the main conversation (the away recap) sent on the main thread's
+ * last compressed prefix: that prefix, then the fork's own messages after it.
+ * Only session, system and every prefix message are checked; unlike a tool
+ * turn, the suffix may end in a plain user message (the fork's question).
+ */
+function forkRoutedBody(
+  body: Record<string, any>,
+  messages: Message[],
+  route: MemoryRoute | undefined,
+  sessionId: string | undefined,
+  modelContextLimit: number
+): { body: Buffer } | { miss: ForkMiss } {
+  if (!route) return { miss: "no-route" };
+  if (!sessionId || route.sessionId !== sessionId) return { miss: "session" };
+  if (routeValueHash(normalizeRouteSystem(body.system)) !== route.originalSystemHash) {
+    return { miss: "system" };
+  }
+  const prefixLength = route.originalPrefixHashes.length;
+  if (messages.length <= prefixLength) return { miss: "prefix" };
+  for (let i = 0; i < prefixLength; i++) {
+    if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
+      return { miss: "prefix" };
+    }
+  }
+  const routed: Record<string, any> = {
+    ...body,
+    messages: [...cloneJson(route.compressedMessages), ...messages.slice(prefixLength)],
+  };
+  if (route.hasCompressedSystem) {
+    routed.system = currentRouteSystem(route.compressedSystem, body.system);
+  } else {
+    delete routed.system;
+  }
+  const buffer = Buffer.from(JSON.stringify(routed), "utf-8");
+  if (routedBodyExceedsContext(body, buffer, modelContextLimit)) return { miss: "too-large" };
+  return { body: buffer };
 }
 
 function memoryRoutedToolBody(
@@ -2282,9 +2617,16 @@ async function runBlockingCompression(args: {
   hash: string;
   modelContextLimit: number;
   rec: MessagesRecord;
+  sessionId: string | undefined;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
+  const compactTarget =
+    args.sessionId !== undefined ? state.compactTargets.get(args.sessionId) : undefined;
+  const messageUsage =
+    args.sessionId !== undefined && opts.transcriptUsage
+      ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree)
+      : undefined;
   const compressStarted = Date.now();
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
@@ -2297,6 +2639,8 @@ async function runBlockingCompression(args: {
       modelContextLimit
     ),
     tools: Array.isArray(body.tools) ? body.tools : undefined,
+    ...(compactTarget !== undefined ? { compressionTargetTokens: compactTarget } : {}),
+    ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -2510,6 +2854,7 @@ async function recoverToolRouteMiss(args: {
       hash,
       modelContextLimit,
       rec,
+      sessionId: requestSessionId(req),
     });
   } catch (err) {
     // Nothing in the pipeline is expected to throw (compress() maps every
@@ -2898,6 +3243,17 @@ async function handleCountTokens(
  * completion validation; its output is discarded and can never change the
  * client response.
  */
+/**
+ * Requests whose streamed response gets a text block appended: the hidden
+ * away-summary (recap) request, so the recap Claude Code shows ends with the
+ * MemTree link. Keyed by the incoming request so every forwarding path below
+ * picks it up without threading a parameter through each one.
+ */
+const recapLinkAppenders = new WeakMap<
+  http.IncomingMessage,
+  (streamedTextChars: number) => string | undefined
+>();
+
 function forwardRaw(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -2911,6 +3267,7 @@ function forwardRaw(
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
     headers["content-length"] = String(bodyBuffer.length);
+    const appendRecapText = recapLinkAppenders.get(req);
     // The passive observer must be able to decode its copy to verify complete
     // delivery (message_stop for SSE, complete JSON otherwise). Constrain the
     // negotiated coding to what the observation decoders support, so an
@@ -2920,6 +3277,8 @@ function forwardRaw(
     headers["accept-encoding"] = observableAcceptEncoding(
       headers["accept-encoding"]
     );
+    // Appending needs plain SSE text; the recap is tiny, so skip compression.
+    if (appendRecapText) headers["accept-encoding"] = "identity";
     const forwardStarted = Date.now();
     let settled = false;
     let upstreamCompleted = false;
@@ -3048,9 +3407,20 @@ function forwardRaw(
             sawMessageStop = true;
           }
         };
+        // Rewrite only a plain, successful SSE stream; anything else passes
+        // through untouched and simply carries no link.
+        const appendText =
+          appendRecapText &&
+          isSse &&
+          !compressed &&
+          (upstreamRes.statusCode ?? 0) >= 200 &&
+          (upstreamRes.statusCode ?? 0) < 300
+            ? appendRecapText
+            : undefined;
         const sseObserver = isSse
           ? new SseNoticeRewriter({
               onEvent: observeSseEvent,
+              ...(appendText ? { endOfTurnText: appendText } : {}),
             })
           : null;
         const incrementalDecoder = sseObserver && compressed
@@ -3178,6 +3548,42 @@ function forwardRaw(
           });
           upstreamRes.on("aborted", () => {
             incrementalDecoder.destroy();
+            res.destroy();
+            settle(false);
+          });
+          return;
+        }
+
+        if (appendText && sseObserver) {
+          // Same observation as below, but the client gets the rewriter's
+          // output (original frames plus the appended block) instead of the
+          // raw bytes. Backpressure mirrors pipe().
+          upstreamRes.on("data", (chunk: Buffer) => {
+            if (rec && !sawFirstByte) {
+              sawFirstByte = true;
+              rec.ttfbMs = Date.now() - forwardStarted;
+            }
+            const out = sseObserver.push(chunk);
+            if (!out || res.destroyed || res.writableEnded) return;
+            if (!res.write(out)) {
+              upstreamRes.pause();
+              res.once("drain", () => upstreamRes.resume());
+            }
+            if (sawMessageStop && !observerFailed && !res.destroyed) {
+              notifyProtocolComplete();
+            }
+          });
+          upstreamRes.on("end", () => {
+            const rest = sseObserver.flush();
+            if (rest && !res.destroyed && !res.writableEnded) res.write(rest);
+            if (!res.destroyed && !res.writableEnded) res.end();
+            completeUpstream(!observerFailed && sawMessageStop);
+          });
+          upstreamRes.on("error", () => {
+            res.destroy();
+            settle(false);
+          });
+          upstreamRes.on("aborted", () => {
             res.destroy();
             settle(false);
           });

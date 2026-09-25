@@ -1,0 +1,70 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { ClaudeTranscriptUsage, defaultProjectsDir, findTranscript } from "../dist/transcript-usage.js";
+
+const SESSION = "0f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+
+function transcriptDir() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-transcript-"));
+  const project = path.join(root, "-Users-me-src-app");
+  fs.mkdirSync(project);
+  return { root, file: path.join(project, `${SESSION}.jsonl`) };
+}
+const entry = (id, content, usage, extra = {}) =>
+  JSON.stringify({ type: "assistant", message: { id, role: "assistant", content, usage }, ...extra }) + "\n";
+const usage = (out, think, input = 1) => ({
+  input_tokens: input, output_tokens: out, output_tokens_details: { thinking_tokens: think },
+  cache_read_input_tokens: 100, cache_creation_input_tokens: 5,
+});
+
+test("each assistant message gets its response's usage, by tool id or text", () => {
+  const { root, file } = transcriptDir();
+  // Claude Code writes one entry per content block; the last carries final usage.
+  fs.writeFileSync(file,
+    JSON.stringify({ type: "user", message: { role: "user", content: "hi" } }) + "\n" +
+    entry("msg_a", [{ type: "thinking", thinking: "" }], usage(10, 8)) +
+    entry("msg_a", [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }], usage(40, 8)) +
+    entry("msg_b", [{ type: "text", text: "Done. All tests " }], usage(5, 0)) +
+    entry("msg_b", [{ type: "text", text: "pass." }], usage(60, 12)) +
+    "not json\n");
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+    { role: "assistant", content: [{ type: "text", text: "Done. All tests pass." }] },
+    { role: "assistant", content: [{ type: "text", text: "never answered by the transcript" }] },
+  ];
+  const got = source.usageFor(SESSION, messages);
+  assert.deepEqual(Object.keys(got), ["2", "4"]);
+  assert.deepEqual(got["2"], {
+    output_tokens: 40, thinking_tokens: 8, input_tokens: 1,
+    cache_read_input_tokens: 100, cache_creation_input_tokens: 5,
+  });
+  assert.equal(got["4"].output_tokens, 60);
+  assert.equal(got["4"].thinking_tokens, 12);
+
+  // Appended lines are picked up on the next call, including a line split
+  // across two writes.
+  const next = entry("msg_c", [{ type: "tool_use", id: "toolu_2", name: "Read", input: {} }], usage(30, 20));
+  fs.appendFileSync(file, next.slice(0, 20));
+  messages.push({ role: "assistant", content: [{ type: "tool_use", id: "toolu_2", name: "Read", input: {} }] });
+  assert.equal(source.usageFor(SESSION, messages)["6"], undefined, "half a line is not parsed yet");
+  fs.appendFileSync(file, next.slice(20));
+  assert.equal(source.usageFor(SESSION, messages)["6"].thinking_tokens, 20);
+});
+
+test("no transcript, bad session ids and unreadable files give no usage", () => {
+  const { root } = transcriptDir();
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [{ role: "assistant", content: "x" }];
+  assert.deepEqual(source.usageFor(SESSION, messages), {});
+  assert.deepEqual(source.usageFor("../../etc/passwd", messages), {});
+  assert.deepEqual(new ClaudeTranscriptUsage("/nonexistent/dir").usageFor(SESSION, messages), {});
+  assert.equal(findTranscript("/nonexistent/dir", SESSION), undefined);
+  assert.equal(defaultProjectsDir({ CLAUDE_CONFIG_DIR: "/cfg" }), path.join("/cfg", "projects"));
+});

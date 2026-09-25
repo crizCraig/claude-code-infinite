@@ -18,6 +18,7 @@ import {
 import {
   NOTICE_OPEN,
   COMPRESSED_NOTICE,
+  NOT_COMPRESSED_NOTE,
   DEGRADED_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   wrapNotice,
@@ -2620,10 +2621,10 @@ test("a page without a served index (older server, index-only ack) is never link
   }
 });
 
-const trailerNew = (link) => `∞ MemTree · new index · ${link}`;
-const trailerSame = (link) => `∞ MemTree · ${link}`;
+const trailerNew = (link) => `• MemTree · ${link}`;
+const trailerSame = (link) => `• MemTree · ${link}`;
 
-test("default placement: the link trails every finished message, marked when the index is new", async () => {
+test("placement 'message': the link trails every finished message, marked when the index is new", async () => {
   const upstream = await mockUpstream();
   const stamps = [
     pageHeaders(PAGE_URL_1, "index-a"),
@@ -2632,7 +2633,7 @@ test("default placement: the link trails every finished message, marked when the
   ];
   const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
   try {
     // First index in use: the success line stays plain; the trailer under the
     // same message announces the new index — no waiting for a later turn.
@@ -2657,7 +2658,7 @@ test("default placement: the link trails every finished message, marked when the
     );
     const sameRendered = same.body.hookSpecificOutput.displayContent;
     assert.equal(stripAnsi(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
-    assert.match(sameRendered, /\x1b\[2m∞ MemTree ·\x1b\[22m /, "unchanged index is dim");
+    assert.match(sameRendered, /\x1b\[2m• MemTree ·\x1b\[22m /, "unchanged index is dim");
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
     // New index: marked again.
@@ -2675,11 +2676,11 @@ test("default placement: the link trails every finished message, marked when the
   }
 });
 
-test("default placement: a turn with no rendered message gets the trailer from Stop", async () => {
+test("placement 'message': a turn with no rendered message gets the trailer from Stop", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"));
@@ -2689,6 +2690,539 @@ test("default placement: a turn with no rendered message gets the trailer from S
       `${COMPRESSED_NOTICE}\n${trailerNew(PAGE_URL_1)}`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 200, "every Stop without a message repeats it");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a turn MemTree passed through whole names the unused index next to its link", async () => {
+  const upstream = await mockUpstream();
+  const stamps = [pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_2, "index-a")];
+  // First turn fits the budget (server passes it through), second compresses.
+  const bodies = [{ ...compressedOnce, compressed: false }, compressedOnce];
+  const memtreeSrv = await mockMemtree(200, (_b, call) => bodies[call], (_b, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(
+      stripAnsi(first.body.hookSpecificOutput.displayContent),
+      `upstream answer\n\n• MemTree · ${PAGE_URL_1} ${NOT_COMPRESSED_NOTE}`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    const second = await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }));
+    assert.equal(
+      stripAnsi(second.body.hookSpecificOutput.displayContent),
+      `${COMPRESSED_NOTICE}\nupstream answer\n\n• MemTree · ${PAGE_URL_2}`
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a resumed session shows its link at SessionStart, from memory or from disk", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const file = pathMod.join(fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-resume-")), "links.json");
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const first = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  // A later ccc process resuming the same session: nothing in memory.
+  const second = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  const resume = { hook_event_name: "SessionStart", source: "resume" };
+  try {
+    await armMainTurn(first, "turn two", "prompt-1");
+    await postMessages(first.port, followupTurn("turn two"), headers);
+
+    // Same process (in-app /resume): from memory.
+    const again = await postHook(first, resume);
+    assert.equal(stripAnsi(again.body.systemMessage), `• MemTree · ${PAGE_URL_1}`);
+
+    // New process: from disk. Compaction and subagents get nothing.
+    assert.equal((await postHook(second, { ...resume, source: "compact" })).status, 204);
+    assert.equal((await postHook(second, { ...resume, agent_id: "a1" })).status, 204);
+    assert.equal((await postHook(second, { ...resume, session_id: "other" })).status, 204);
+    const fromDisk = await postHook(second, resume);
+    assert.equal(stripAnsi(fromDisk.body.systemMessage), `• MemTree · ${PAGE_URL_1}`);
+    // Shown at resume, so the end of the next turn does not repeat it.
+    await armMainTurn(second, "turn three", "prompt-2");
+    assert.equal((await postHook(second, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
+    assert.equal((await postHook(second, stopHook("prompt-2"))).status, 204);
+  } finally {
+    first.close();
+    second.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the resume relay script forwards SessionStart stdin to the proxy and prints its answer", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const { createSessionNoticePlugin } = await import("../dist/hooks.js");
+  const { spawn } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const tmp = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-relay-"));
+  const store = new MemtreeLinkStore(pathMod.join(tmp, "links.json"));
+  store.put("session-1", { url: PAGE_URL_2, index: "index-b", compressed: false });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store });
+  const plugin = createSessionNoticePlugin(proxy.hookUrl, { tempRoot: tmp, resumeLink: true });
+  try {
+    const config = JSON.parse(fs.readFileSync(pathMod.join(plugin.dir, "hooks", "hooks.json"), "utf-8"));
+    const entry = config.hooks.SessionStart.find((e) => e.matcher.includes("resume") && e.hooks[0].command.includes("resume-link"));
+    const command = entry.hooks[0].command;
+    // Async on purpose: the proxy lives in this process, so a sync spawn
+    // would block the very event loop that has to answer the relay.
+    const run = (input) =>
+      new Promise((resolve, reject) => {
+        const child = spawn("/bin/sh", ["-c", command]);
+        let out = "";
+        child.stdout.on("data", (c) => (out += c));
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, out }));
+        child.stdin.end(JSON.stringify(input));
+      });
+    const hit = await run({ hook_event_name: "SessionStart", session_id: "session-1", source: "resume" });
+    assert.equal(hit.code, 0);
+    assert.equal(
+      stripAnsi(JSON.parse(hit.out).systemMessage),
+      `• MemTree · ${PAGE_URL_2} ${NOT_COMPRESSED_NOTE}`
+    );
+    assert.deepEqual(
+      await run({ hook_event_name: "SessionStart", session_id: "nope", source: "resume" }),
+      { code: 0, out: "" }
+    );
+    proxy.close();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(
+      await run({ hook_event_name: "SessionStart", session_id: "session-1", source: "resume" }),
+      { code: 0, out: "" },
+      "proxy gone: silent, exit 0"
+    );
+  } finally {
+    plugin.close();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+function recapSse(text) {
+  const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  return (
+    ev("message_start", { message: { id: "m", type: "message", role: "assistant", content: [], usage: { input_tokens: 5, output_tokens: 0 } } }) +
+    ev("content_block_start", { index: 0, content_block: { type: "text", text: "" } }) +
+    ev("content_block_delta", { index: 0, delta: { type: "text_delta", text } }) +
+    ev("content_block_stop", { index: 0 }) +
+    ev("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } }) +
+    ev("message_stop", {})
+  );
+}
+
+async function postRecap(port, headers) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({
+      model: "claude-x",
+      max_tokens: 64,
+      stream: true,
+      messages: [
+        ...followupTurn("turn two").slice(0, 2),
+        { role: "user", content: "The user stepped away and is coming back. Recap in under 40 words." },
+      ],
+    }),
+  });
+  const body = await res.text();
+  const text = body
+    .split("\n")
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => JSON.parse(l.slice(5)))
+    .filter((d) => d.type === "content_block_delta")
+    .map((d) => d.delta.text)
+    .join("");
+  return { body, text };
+}
+
+test("the recap ends with the session's link, when it fits Claude Code's 400-char cap", async () => {
+  let recapText = "You asked for a MemTree link after the recap. Next: try it.";
+  const seen = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf-8");
+      // Only the recap asks for a stream here (its history may be compressed,
+      // so the prompt text itself need not reach upstream).
+      if (JSON.parse(body).stream === true) {
+        seen.push(req.headers["accept-encoding"]);
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(recapSse(recapText));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    // No page yet: recap untouched.
+    assert.equal((await postRecap(proxy.port, headers)).text, recapText);
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    const withLink = await postRecap(proxy.port, headers);
+    assert.equal(withLink.text, `${recapText}\n• MemTree · ${PAGE_URL_1}`);
+    assert.ok(!withLink.text.includes("cc-infinite-notice"), "no marker in UI-only text");
+    assert.match(withLink.body, /"index":1/, "appended as its own block after the recap");
+    assert.ok(withLink.body.trimEnd().endsWith('data: {"type":"message_stop"}'), "stream still ends properly");
+    assert.equal(seen.at(-1), "identity", "recap stream fetched uncompressed so it can be edited");
+
+    // Too long to fit: skipped rather than clipped mid-URL.
+    recapText = "x".repeat(380);
+    assert.equal((await postRecap(proxy.port, headers)).text, recapText);
+
+    // Another session's recap never gets this session's link.
+    recapText = "short";
+    assert.equal((await postRecap(proxy.port, { "x-claude-code-session-id": "other" })).text, "short");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("/memtree-view is answered by the hook and blocked, without touching turn state", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const view = (prompt = "/memtree-view") =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, prompt_id: "p-view" });
+  try {
+    const none = await view();
+    assert.equal(none.body.decision, "block");
+    assert.match(none.body.reason, /no page yet/);
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const shown = await view("/ccc:memtree-view");
+    assert.deepEqual(shown.body, {
+      decision: "block",
+      reason: `• MemTree · ${PAGE_URL_1}`,
+      hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
+    });
+
+    // The command is not a human turn: the pending notice for prompt-1 survives it.
+    const display = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(display.status, 200);
+    // Another plugin's command of the same name is left alone.
+    assert.equal((await view("/otherplugin:memtree-view")).status, 204);
+    // An ordinary prompt still arms normally (204, no body).
+    assert.equal((await view("tell me about /memtree-view")).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("/memtree-compact sets a per-session target that every later compression carries", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const command = (prompt, session_id = "session-1") =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, session_id });
+  const lastTarget = () => memtreeSrv.calls.filter((c) => !c.index_only).at(-1).compression_target_tokens;
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    assert.equal(lastTarget(), undefined, "automatic by default");
+
+    const on = await command("/memtree-compact");
+    assert.equal(on.body.decision, "block");
+    assert.match(on.body.reason, /compacting: .* about 50k tokens/);
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"), headers);
+    assert.equal(lastTarget(), 50_000);
+
+    assert.match((await command("/memtree-compact 120k")).body.reason, /about 120k tokens/);
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"), headers);
+    assert.equal(lastTarget(), 120_000);
+
+    // Another session is unaffected.
+    await armMainTurn(proxy, "turn five", "prompt-4");
+    await postMessages(proxy.port, followupTurn("turn five"), { "x-claude-code-session-id": "other" });
+    assert.equal(lastTarget(), undefined);
+
+    const help = await command("/memtree");
+    assert.equal(help.body.decision, "block");
+    assert.match(help.body.reason, /^• \/memtree-view · .*\n• \/memtree-compact \[tokens \| off\] · .*default 50k, at least 20k/);
+    assert.match((await command("/memtree-compact nope")).body.reason, /usage:/);
+    assert.match((await command("/memtree-compact 19k")).body.reason, /usage:.*at least 20k/);
+    assert.match((await command("/memtree-compact 20k")).body.reason, /about 20k tokens/);
+    assert.match((await command("/memtree-compact OFF")).body.reason, /compaction off/);
+    await armMainTurn(proxy, "turn six", "prompt-5");
+    await postMessages(proxy.port, followupTurn("turn six"), headers);
+    assert.equal(lastTarget(), undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("default placement: one line at the end of a user turn, only when the index changed", async () => {
+  const upstream = await mockUpstream();
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    // Messages carry no link, however many the turn renders.
+    const shown = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    const stop = await postHook(proxy, stopHook("prompt-1"));
+    assert.equal(stripAnsi(stop.body.systemMessage), `• MemTree · ${PAGE_URL_1}`);
+
+    // Same index, new page URL: nothing at the end of this turn.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index: one line again.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"));
+    await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
+    assert.equal(stripAnsi((await postHook(proxy, stopHook("prompt-3"))).body.systemMessage), `• MemTree · ${PAGE_URL_3}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("compress calls carry each assistant message's usage from the transcript", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const seen = [];
+  const transcriptUsage = {
+    usageFor(sessionId, messages) {
+      seen.push(sessionId);
+      const i = messages.findIndex((m) => m.role === "assistant");
+      return i < 0 ? {} : { [i]: { output_tokens: 50, thinking_tokens: 20 } };
+    },
+  };
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, transcriptUsage });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const call = memtreeSrv.calls.filter((c) => !c.index_only).at(-1);
+    assert.deepEqual(seen, ["session-1"]);
+    assert.deepEqual(call.message_usage, { 1: { output_tokens: 50, thinking_tokens: 20 } });
+    assert.equal(call.messages[1].role, "assistant", "keyed by position in the messages sent");
+
+    // No session id: nothing is looked up or sent.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).message_usage, undefined);
+    assert.equal(seen.length, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("every messages log line describes the Claude Code billing header; forwarding is unchanged", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-x", max_tokens: 64,
+        system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;" },
+                 { type: "text", text: "You are a security monitor for autonomous AI coding agents." }],
+        messages: followupTurn("judge this"),
+      }),
+    });
+    assert.equal(res.status, 200);
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+    const rec = records.find((r) => r.kind === "messages");
+    assert.equal(rec.client.suspectedSideRequest, true);
+    assert.equal(rec.client.systemHead, "You are a security monitor for autonomous AI coding agents.");
+    assert.equal(rec.client.tools, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the away recap rides the main thread's last compressed prefix after Stop, with no MemTree call", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const recapQ = { role: "user", content: "The user stepped away and is coming back. Recap in under 40 words." };
+  const post = (messages, h = headers) => postMessages(proxy.port, messages, h);
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await post(followupTurn("turn two"));
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+    const mainSent = bodies.at(-1).messages;
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status >= 200, true);
+    const before = memtreeSrv.calls.length;
+
+    const recap = [...followupTurn("turn two"), { role: "assistant", content: [{ type: "text", text: "done" }] }, recapQ];
+    await post(recap);
+    await waitFor(() => records.filter((r) => r.kind === "messages").length === 2);
+    const rec = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(rec.turnType, "fork-memory");
+    assert.equal(rec.routeLane, "away");
+    assert.equal(memtreeSrv.calls.length, before, "no MemTree call for the recap");
+    const sent = bodies.at(-1).messages;
+    assert.deepEqual(sent.slice(0, mainSent.length), mainSent, "same prefix bytes the main thread sent");
+    assert.deepEqual(sent.slice(mainSent.length), recap.slice(3));
+
+    // Another session's recap cannot ride this session's prefix.
+    await post(recap, { "x-claude-code-session-id": "other" });
+    await waitFor(() => records.filter((r) => r.kind === "messages").length === 3);
+    const other = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(other.forkMiss, "session");
+    assert.notEqual(other.turnType, "fork-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a security-monitor side request skips MemTree and leaves the main tool loop's route intact", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const msgRecs = () => records.filter((r) => r.kind === "messages");
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    await waitFor(() => msgRecs().length === 1);
+    const callsBefore = memtreeSrv.calls.length;
+
+    const monitor = JSON.stringify({
+      model: "claude-x", max_tokens: 64,
+      system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;" },
+               { type: "text", text: "You are a security monitor for autonomous AI coding agents." }],
+      messages: [
+        { role: "user", content: "CLAUDE.md config" },
+        { role: "user", content: '<transcript>\n{"user":"turn two"}\n{"Bash":{"command":"ls"}}\n</transcript>\nRespond.' },
+      ],
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: monitor });
+    assert.equal(res.status, 200);
+    await waitFor(() => msgRecs().length === 2);
+    const side = msgRecs()[1];
+    assert.equal(side.turnType, "side-request");
+    assert.equal(side.transcript.ok, true);
+    assert.equal(side.transcript.toolLines, 1);
+    assert.equal(bodies.at(-1), monitor, "forwarded byte for byte");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(memtreeSrv.calls.length, callsBefore, "no compress and no background index");
+
+    // Monitor-shaped header but no recognisable transcript (e.g. an older
+    // Claude Code main request): ordinary handling, and the reason is logged.
+    const odd = JSON.stringify({ ...JSON.parse(monitor), messages: [{ role: "user", content: "first" }, { role: "assistant", content: "a" }, { role: "user", content: "no transcript here" }] });
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: odd });
+    await waitFor(() => msgRecs().length === 3);
+    assert.notEqual(msgRecs()[2].turnType, "side-request");
+    assert.equal(msgRecs()[2].transcript.reason, "no-transcript");
+    await armMainTurn(proxy, "turn two", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    await waitFor(() => msgRecs().length === 4);
+
+    // The main thread's next tool turn still rides its compressed route.
+    const toolLoop = [
+      ...followupTurn("turn two"),
+      { role: "assistant", content: [{ type: "tool_use", id: "t9", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t9", content: "ok" }] },
+    ];
+    await postMessages(proxy.port, toolLoop, headers);
+    await waitFor(() => msgRecs().length === 5);
+    assert.equal(msgRecs()[4].turnType, "tool-memory");
   } finally {
     proxy.close();
     upstream.close();
@@ -2765,6 +3299,10 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
       pageGets.at(-1).url,
       "/usage/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok"
     );
+
+    // The page's session pane fetches this from wherever the page came from.
+    await get("/memtree/ea18af90658b/session.json");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/session.json");
 
     // Bad shapes never reach the server. (fetch normalizes a literal `..`;
     // the encoded form reaches the handler.)

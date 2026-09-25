@@ -32,6 +32,7 @@ export function parseWrapperArgs(args) {
     return { claudeArgs, debug };
 }
 export const MEMTREE_LINK_PLACEMENTS = [
+    "turn",
     "message",
     "stop",
     "success",

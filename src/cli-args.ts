@@ -39,8 +39,9 @@ export function parseWrapperArgs(args: string[]): WrapperArgs {
   return { claudeArgs, debug };
 }
 
-export type MemtreeLinkPlacement = "message" | "stop" | "success" | "off";
+export type MemtreeLinkPlacement = "turn" | "message" | "stop" | "success" | "off";
 export const MEMTREE_LINK_PLACEMENTS: readonly MemtreeLinkPlacement[] = [
+  "turn",
   "message",
   "stop",
   "success",

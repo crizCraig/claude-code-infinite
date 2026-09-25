@@ -133,7 +133,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   assert.equal(queue.linkPending("session-1"), false);
 });
 
-test("trailer follows every finished message, says 'new index' once per key, falls back to Stop", () => {
+test("trailer follows every finished message, is green once per key, falls back to Stop", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   let link = { key: "index-a", link: "https://app.polychat.co/m/aaaaaaaaaaaa" };
   queue.setTrailer((sessionId) => (sessionId === "session-1" ? link : undefined));
@@ -145,7 +145,7 @@ test("trailer follows every finished message, says 'new index' once per key, fal
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
-        "done\n\n\x1b[32m∞ MemTree · new index ·\x1b[39m https://app.polychat.co/m/aaaaaaaaaaaa",
+        "done\n\n\x1b[32m• MemTree ·\x1b[39m https://app.polychat.co/m/aaaaaaaaaaaa",
     },
   });
   // Stop after a message carried it: nothing more this turn.
@@ -154,29 +154,29 @@ test("trailer follows every finished message, says 'new index' once per key, fal
   // Same key on the next message: dim label, still shown.
   assert.equal(
     queue.claim(display({ final: true, delta: "again" })).hookSpecificOutput.displayContent,
-    "again\n\n\x1b[2m∞ MemTree ·\x1b[22m https://app.polychat.co/m/aaaaaaaaaaaa"
+    "again\n\n\x1b[2m• MemTree ·\x1b[22m https://app.polychat.co/m/aaaaaaaaaaaa"
   );
   assert.equal(queue.claim(stop()), null);
 
   // A turn that renders no message: Stop carries the trailer, once.
   link = { key: "index-b", link: "https://app.polychat.co/m/bbbbbbbbbbbb" };
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[32m∞ MemTree · new index ·\x1b[39m https://app.polychat.co/m/bbbbbbbbbbbb",
+    systemMessage: "\x1b[32m• MemTree ·\x1b[39m https://app.polychat.co/m/bbbbbbbbbbbb",
   });
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[2m∞ MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb",
+    systemMessage: "\x1b[2m• MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb",
   });
 
   // With a success line on the same (single-flush) message: line, answer, trailer.
   queue.queuePrefix("✓ ok");
   assert.equal(
     queue.claim(display({ final: true, delta: "answer" })).hookSpecificOutput.displayContent,
-    "\x1b[32m✓ ok\x1b[39m\nanswer\n\n\x1b[2m∞ MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb"
+    "\x1b[32m✓ ok\x1b[39m\nanswer\n\n\x1b[2m• MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb"
   );
   // Delta ending in a newline gets no extra separator before the blank line.
   assert.equal(
     queue.claim(display({ final: true, delta: "text\n" })).hookSpecificOutput.displayContent,
-    "text\n\n\x1b[2m∞ MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb"
+    "text\n\n\x1b[2m• MemTree ·\x1b[22m https://app.polychat.co/m/bbbbbbbbbbbb"
   );
 
   // Other sessions, subagents, a throwing resolver, no resolver: nothing.
@@ -190,14 +190,34 @@ test("trailer follows every finished message, says 'new index' once per key, fal
   assert.equal(queue.claim(stop()), null);
 });
 
+test("trailer note follows the bare link, dim", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, true);
+  let link = { key: "k1", link: "https://x/m/1", note: "/memtree-compact to compact session" };
+  queue.setTrailer(() => link, "message");
+  assert.equal(
+    queue.claim(display({ final: true, delta: "a" })).hookSpecificOutput.displayContent,
+    "a\n\n\x1b[32m• MemTree ·\x1b[39m https://x/m/1 \x1b[2m/memtree-compact to compact session\x1b[22m"
+  );
+  assert.equal(
+    queue.claim(display({ final: true, delta: "b" })).hookSpecificOutput.displayContent,
+    "b\n\n\x1b[2m• MemTree ·\x1b[22m https://x/m/1 \x1b[2m/memtree-compact to compact session\x1b[22m"
+  );
+  link = { key: "k1", link: "https://x/m/2" };
+  assert.equal(
+    queue.claim(display({ final: true, delta: "c" })).hookSpecificOutput.displayContent,
+    "c\n\n\x1b[2m• MemTree ·\x1b[22m https://x/m/2",
+    "no note once the turn compressed"
+  );
+});
+
 test("trailer placement 'stop' shows it once per turn on Stop only", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, false);
   queue.setTrailer(() => ({ key: "k", link: "https://x/m/1" }), "stop");
   assert.equal(queue.claim(display({ final: true })), null);
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "∞ MemTree · new index · https://x/m/1" });
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "∞ MemTree · https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree · https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree · https://x/m/1" });
   queue.queueSuffix("⚠ warn");
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n∞ MemTree · https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree · https://x/m/1" });
 });
 
 test("subagent hooks cannot claim and expired notices are dropped", () => {
@@ -304,7 +324,7 @@ test("session plugin contains HTTP hooks and argv prepending preserves user opti
     const config = JSON.parse(
       await fsp.readFile(path.join(plugin.dir, "hooks", "hooks.json"), "utf-8")
     );
-    assert.equal(manifest.name, "ccc-session-notices");
+    assert.equal(manifest.name, "ccc");
     for (const event of [
       "MessageDisplay",
       "Stop",
@@ -344,12 +364,27 @@ test("session plugin contains HTTP hooks and argv prepending preserves user opti
   }
 });
 
+test("session plugin lists /memtree-view and /memtree-compact in the command menu", async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-cmd-"));
+  const plugin = createSessionNoticePlugin("http://127.0.0.1:1/_ccc/hooks/x", { tempRoot });
+  try {
+    const md = await fsp.readFile(path.join(plugin.dir, "commands", "memtree-view.md"), "utf-8");
+    assert.match(md, /^---\ndescription: Show the link to this session's MemTree page\n---\n/);
+    const help = await fsp.readFile(path.join(plugin.dir, "commands", "memtree.md"), "utf-8");
+    assert.match(help, /description: List the MemTree commands/);
+    const compact = await fsp.readFile(path.join(plugin.dir, "commands", "memtree-compact.md"), "utf-8");
+    assert.match(compact, /argument-hint: \[tokens \| off\]/);
+  } finally {
+    plugin.close();
+  }
+});
+
 test("startup banner rides a SessionStart command hook emitting systemMessage JSON", async () => {
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ccc-hooks-test-"));
   // Leading newline and an apostrophe: the newline must survive as a JSON
   // escape (sh/zsh `echo` would expand it and corrupt the payload), and the
   // quote exercises shell quoting.
-  const message = "\n·─╼ ∞ MemTree · Infinite Context Enabled ∞ ╾─· it's on";
+  const message = "\n·─╼ • MemTree · Infinite Context Enabled ∞ ╾─· it's on";
   const plugin = createSessionNoticePlugin(
     "http://127.0.0.1:12345/_ccc/hooks/unpredictable",
     { tempRoot, startupMessage: message }

@@ -21,11 +21,13 @@ export declare const COMPRESSED_NOTICE = "\u2713 MemTree \u00B7 conversation opt
 export declare function compressedNoticeText(memtreeUrl?: string): string;
 /**
  * The trailer under a finished assistant message naming the newest MemTree
- * page for the conversation, plain-text form. `isNew` marks the first message
- * after a newly finished index came into use; the hook renderer styles that
- * case green and the unchanged case dim, with the URL bare either way.
+ * page for the conversation, plain-text form. The hook renderer styles the
+ * label green the first time an index is shown and dim afterwards, with the
+ * URL bare either way.
  */
-export declare function memtreeTrailerText(memtreeUrl: string, isNew: boolean): string;
+export declare function memtreeTrailerText(memtreeUrl: string, note?: string): string;
+/** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
+export declare const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export declare const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn ran uncompressed";
@@ -84,6 +86,18 @@ export declare function stripNoticeSystem(system: any): {
     system: any;
     stripped: boolean;
 };
+/** content_block_start/delta/stop triple for a plain text block. */
+export declare function textBlockEvents(index: number, text: string): string;
+/**
+ * Claude Code keeps at most this many characters of a recap (the joined text
+ * of the reply), truncating the end. Checked against Claude Code 2.1.278.
+ */
+export declare const RECAP_MAX_CHARS = 400;
+/**
+ * The recap's link line, or undefined when it would not fit under Claude
+ * Code's cap and would come back clipped mid-URL.
+ */
+export declare function recapLinkText(link: string, streamedTextChars: number, note?: string): string | undefined;
 /** content_block_start/delta/stop triple for a notice text block. */
 export declare function noticeBlockEvents(index: number, noticeText: string): string;
 /**
@@ -101,6 +115,12 @@ export interface SseRewriteOptions {
     beforeResponseNotice?: string;
     /** Inject this notice before the final message_delta/message_stop. */
     endOfTurnNotice?: string;
+    /**
+     * Inject this text, verbatim (no notice marker), as a final text block
+     * before message_delta/message_stop. Called once, with the number of text
+     * characters the response streamed so far; returning undefined skips it.
+     */
+    endOfTurnText?: (streamedTextChars: number) => string | undefined;
     /**
      * Diagnostics observer: called with every parsed upstream event's data
      * object BEFORE any rewriting (so it sees message_start even when the
@@ -121,6 +141,8 @@ export declare class SseNoticeRewriter {
     private maxIndexSeen;
     private injectedResponseNotice;
     private injectedEndNotice;
+    private injectedEndText;
+    private streamedTextChars;
     constructor(opts: SseRewriteOptions);
     push(chunk: Buffer): string;
     /** Anything buffered after the stream ends (normally empty). */
