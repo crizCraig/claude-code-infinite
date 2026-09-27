@@ -169,4 +169,22 @@ function messageText(message) {
         .map((p) => (typeof p === "string" ? p : p?.type === "text" && typeof p.text === "string" ? p.text : ""))
         .join("");
 }
+const META_VALUE = /^[\x20-\x7e]{1,128}$/;
+export function memtreeClientMeta(input) {
+    const candidate = {
+        claude_code_version: input.info?.ccVersion,
+        entrypoint: input.info?.entrypoint,
+        turn_origin: input.info?.turnOrigin,
+        lane: input.lane,
+        agent_id: input.agentId,
+        parent_agent_id: input.parentAgentId,
+        requested_model: input.model,
+    };
+    const meta = {};
+    for (const [key, value] of Object.entries(candidate)) {
+        if (typeof value === "string" && META_VALUE.test(value))
+            meta[key] = value;
+    }
+    return meta;
+}
 //# sourceMappingURL=cc-request.js.map

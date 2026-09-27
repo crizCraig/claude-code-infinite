@@ -62,4 +62,25 @@ export interface TranscriptShape {
     sample?: string;
 }
 export declare function inspectMonitorTranscript(body: Record<string, any>): TranscriptShape;
+/**
+ * What the MemTree server stores about a request's client (usage_requests
+ * .client_meta), sent as one `x-client-meta` JSON header. Only short
+ * printable-ASCII values go out, so the header is always valid.
+ */
+export interface MemtreeClientMeta {
+    claude_code_version?: string;
+    entrypoint?: string;
+    turn_origin?: string;
+    lane?: string;
+    agent_id?: string;
+    parent_agent_id?: string;
+    requested_model?: string;
+}
+export declare function memtreeClientMeta(input: {
+    info?: ClaudeCodeRequestInfo;
+    lane?: string;
+    agentId?: string;
+    parentAgentId?: string;
+    model?: unknown;
+}): MemtreeClientMeta;
 //# sourceMappingURL=cc-request.d.ts.map

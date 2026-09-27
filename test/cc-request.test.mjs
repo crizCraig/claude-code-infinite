@@ -89,3 +89,14 @@ test("header-without-origin requests log the last user message opening, count an
   assert.equal(sessionTag("abc").length, 8);
   assert.equal(sessionTag(undefined), undefined);
 });
+
+test("MemTree client metadata keeps short printable values only", async () => {
+  const { memtreeClientMeta } = await import("../dist/cc-request.js");
+  const info = describeClaudeCodeRequest({ system: MAIN, tools: [{ name: "Bash" }], messages: [{ role: "user", content: "x" }] });
+  assert.deepEqual(
+    memtreeClientMeta({ info, lane: "agent", agentId: "a1", parentAgentId: "p1", model: "claude-opus-5-5" }),
+    { claude_code_version: "2.1.281.835", entrypoint: "cli", turn_origin: "human", lane: "agent",
+      agent_id: "a1", parent_agent_id: "p1", requested_model: "claude-opus-5-5" },
+  );
+  assert.deepEqual(memtreeClientMeta({ lane: "main", model: 42, agentId: "é", parentAgentId: "x".repeat(129) }), { lane: "main" });
+});

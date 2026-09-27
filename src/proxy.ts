@@ -100,6 +100,7 @@ import {
   describeClaudeCodeRequest,
   inspectMonitorTranscript,
   isClaudeCodeSideRequest,
+  memtreeClientMeta,
   sessionTag,
   type ClaudeCodeRequestInfo,
 } from "./cc-request.js";
@@ -1099,6 +1100,15 @@ async function handleMessages(
   const isSubagentRequest = requestRouteLane === "agent";
   const isMainRequest = requestRouteLane === "main";
   rec.routeLane = requestRouteLane;
+  // Stored by the server on the usage row (client_meta): which Claude Code,
+  // lane, agent and model produced this request.
+  const clientMeta = memtreeClientMeta({
+    info: clientInfo,
+    lane: requestRouteLane,
+    agentId: firstNonEmptyHeader(req, "x-claude-code-agent-id"),
+    parentAgentId: firstNonEmptyHeader(req, "x-claude-code-parent-agent-id"),
+    model: body.model,
+  }) as Record<string, string>;
   // A typed prompt that recovers an interrupted tool loop (or was queued
   // mid-turn) arrives merged into the pending tool_result wrapper, so it fails
   // isNonToolUserMessage -- while its UserPromptSubmit hook has already cleared
@@ -1427,6 +1437,7 @@ async function handleMessages(
             routeKey: requestRouteKey,
             isMainRequest,
             recoveryAttempt,
+            clientMeta,
           }).finally(() => {
             recoveryAttempt.inFlight = false;
           })
@@ -1446,7 +1457,7 @@ async function handleMessages(
     // sound: a live route proves the installer's compress() submitted this
     // history in this process, so re-indexing buys nothing.
     if (routeMiss !== "replay") {
-      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), clientMeta);
     }
     capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
     return logged(
@@ -1554,6 +1565,7 @@ async function handleMessages(
       modelContextLimit,
       rec,
       sessionId: requestSessionId(req),
+      clientMeta,
     });
   } catch (err) {
     releaseUncommittedRouteDecision();
@@ -2750,6 +2762,7 @@ async function runBlockingCompression(args: {
   modelContextLimit: number;
   rec: MessagesRecord;
   sessionId: string | undefined;
+  clientMeta?: Record<string, string>;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
@@ -2774,6 +2787,7 @@ async function runBlockingCompression(args: {
     ...(compactTarget !== undefined ? { compressionTargetTokens: compactTarget } : {}),
     ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
+    ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -2884,6 +2898,7 @@ async function recoverToolRouteMiss(args: {
   routeKey: string;
   isMainRequest: boolean;
   recoveryAttempt: ToolRecoveryAttempt;
+  clientMeta?: Record<string, string>;
 }): Promise<void> {
   const {
     opts,
@@ -2989,6 +3004,7 @@ async function recoverToolRouteMiss(args: {
       modelContextLimit,
       rec,
       sessionId: requestSessionId(req),
+      clientMeta: args.clientMeta,
     });
   } catch (err) {
     // Nothing in the pipeline is expected to throw (compress() maps every
@@ -3063,7 +3079,7 @@ async function recoverToolRouteMiss(args: {
       !state.shutdownSignal.aborted &&
       opts.memtree.paymentRequiredDetail === null
     ) {
-      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta);
     }
     return forwardOriginal();
   }

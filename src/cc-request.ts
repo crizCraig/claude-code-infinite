@@ -215,3 +215,43 @@ function messageText(message: any): string {
     .map((p: any) => (typeof p === "string" ? p : p?.type === "text" && typeof p.text === "string" ? p.text : ""))
     .join("");
 }
+
+/**
+ * What the MemTree server stores about a request's client (usage_requests
+ * .client_meta), sent as one `x-client-meta` JSON header. Only short
+ * printable-ASCII values go out, so the header is always valid.
+ */
+export interface MemtreeClientMeta {
+  claude_code_version?: string;
+  entrypoint?: string;
+  turn_origin?: string;
+  lane?: string;
+  agent_id?: string;
+  parent_agent_id?: string;
+  requested_model?: string;
+}
+
+const META_VALUE = /^[\x20-\x7e]{1,128}$/;
+
+export function memtreeClientMeta(input: {
+  info?: ClaudeCodeRequestInfo;
+  lane?: string;
+  agentId?: string;
+  parentAgentId?: string;
+  model?: unknown;
+}): MemtreeClientMeta {
+  const candidate: Record<string, unknown> = {
+    claude_code_version: input.info?.ccVersion,
+    entrypoint: input.info?.entrypoint,
+    turn_origin: input.info?.turnOrigin,
+    lane: input.lane,
+    agent_id: input.agentId,
+    parent_agent_id: input.parentAgentId,
+    requested_model: input.model,
+  };
+  const meta: Record<string, string> = {};
+  for (const [key, value] of Object.entries(candidate)) {
+    if (typeof value === "string" && META_VALUE.test(value)) meta[key] = value;
+  }
+  return meta as MemtreeClientMeta;
+}

@@ -3298,11 +3298,14 @@ test("MemTree calls carry Claude Code's session id header, compress and backgrou
     await waitFor(() => memtreeSrv.calls.some((c) => !c.index_only));
     const compressAt = memtreeSrv.calls.findIndex((c) => !c.index_only);
     assert.equal(memtreeSrv.callHeaders[compressAt]["x-claude-code-session-id"], "session-abc");
+    assert.deepEqual(JSON.parse(memtreeSrv.callHeaders[compressAt]["x-client-meta"]),
+      { lane: "main", requested_model: "claude-x" });
 
     await postMessages(proxy.port, [{ role: "user", content: "first message" }], headers);
     await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
     const indexAt = memtreeSrv.calls.findIndex((c) => c.index_only);
     assert.equal(memtreeSrv.callHeaders[indexAt]["x-claude-code-session-id"], "session-abc");
+    assert.equal(JSON.parse(memtreeSrv.callHeaders[indexAt]["x-client-meta"]).lane, "main");
   } finally {
     proxy.close();
     upstream.close();

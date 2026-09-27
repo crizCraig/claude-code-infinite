@@ -54,6 +54,8 @@ export interface CompressRequestMeta {
      * server can list a session's MemTree pages by it. Not part of the cache key.
      */
     sessionId?: string;
+    /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */
+    clientMeta?: Record<string, string>;
 }
 export interface CompressResult {
     /** Processed (compressed) messages from the server; system role may be included. */
@@ -277,7 +279,7 @@ export declare class MemtreeClient {
      * disconnected, or on shutdown/402 — only an ordinary failure with a live
      * client keeps the longer-budget background retry.
      */
-    indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string): void;
+    indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>): void;
     /**
      * Stop accepting background indexes and wait boundedly for those already in
      * flight. Calls still running after the grace period are aborted, and this

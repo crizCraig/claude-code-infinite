@@ -43,7 +43,7 @@ import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, Mem
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -671,6 +671,15 @@ async function handleMessages(req, res, opts, upstream, state) {
     const isSubagentRequest = requestRouteLane === "agent";
     const isMainRequest = requestRouteLane === "main";
     rec.routeLane = requestRouteLane;
+    // Stored by the server on the usage row (client_meta): which Claude Code,
+    // lane, agent and model produced this request.
+    const clientMeta = memtreeClientMeta({
+        info: clientInfo,
+        lane: requestRouteLane,
+        agentId: firstNonEmptyHeader(req, "x-claude-code-agent-id"),
+        parentAgentId: firstNonEmptyHeader(req, "x-claude-code-parent-agent-id"),
+        model: body.model,
+    });
     // A typed prompt that recovers an interrupted tool loop (or was queued
     // mid-turn) arrives merged into the pending tool_result wrapper, so it fails
     // isNonToolUserMessage -- while its UserPromptSubmit hook has already cleared
@@ -971,6 +980,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     routeKey: requestRouteKey,
                     isMainRequest,
                     recoveryAttempt,
+                    clientMeta,
                 }).finally(() => {
                     recoveryAttempt.inFlight = false;
                 }));
@@ -984,7 +994,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // sound: a live route proves the installer's compress() submitted this
         // history in this process, so re-indexing buys nothing.
         if (routeMiss !== "replay") {
-            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), clientMeta);
         }
         capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
         return logged(forwardRaw(req, res, routedBody, opts, upstream, state.shutdownSignal, rec));
@@ -1070,6 +1080,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             modelContextLimit,
             rec,
             sessionId: requestSessionId(req),
+            clientMeta,
         });
     }
     catch (err) {
@@ -2065,6 +2076,7 @@ async function runBlockingCompression(args) {
         ...(compactTarget !== undefined ? { compressionTargetTokens: compactTarget } : {}),
         ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
         ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
+        ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
     };
     // Sampled BEFORE the call, while it still describes this call: after the
     // await the hash is in the cache regardless of who put it there.
@@ -2229,6 +2241,7 @@ async function recoverToolRouteMiss(args) {
             modelContextLimit,
             rec,
             sessionId: requestSessionId(req),
+            clientMeta: args.clientMeta,
         });
     }
     catch (err) {
@@ -2290,7 +2303,7 @@ async function recoverToolRouteMiss(args) {
         // or a shutting-down proxy gets no retry.
         if (!state.shutdownSignal.aborted &&
             opts.memtree.paymentRequiredDetail === null) {
-            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta);
         }
         return forwardOriginal();
     }

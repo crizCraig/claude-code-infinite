@@ -747,6 +747,7 @@ export class MemtreeClient {
             compressionTargetTokens: meta?.compressionTargetTokens,
             messageUsage: meta?.messageUsage,
             sessionId: meta?.sessionId,
+            clientMeta: meta?.clientMeta,
         }).catch((err) => {
             this.log(`compression failed: ${err?.message ?? err}`);
             // `status` is absent when the call never got a response (network
@@ -783,7 +784,7 @@ export class MemtreeClient {
      * disconnected, or on shutdown/402 — only an ordinary failure with a live
      * client keeps the longer-budget background retry.
      */
-    indexInBackground(hash, messages, modelContextLimit, sessionId) {
+    indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta) {
         if (this.backgroundClosing)
             return;
         if (this.indexedHashes.has(hash))
@@ -801,6 +802,7 @@ export class MemtreeClient {
             indexOnly: true,
             signal: controller.signal,
             sessionId,
+            clientMeta,
         })
             .then(() => undefined, (err) => {
             this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
@@ -924,6 +926,9 @@ export class MemtreeClient {
                     "x-client": CLIENT_NAME,
                     "x-client-version": CLIENT_VERSION,
                     ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
+                    ...(opts.clientMeta && Object.keys(opts.clientMeta).length
+                        ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                        : {}),
                 },
                 body: payload,
                 signal: controller.signal,
