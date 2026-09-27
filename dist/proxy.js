@@ -1424,7 +1424,7 @@ function resumeLinkLine(state, input) {
 }
 /** Default `/memtree-compact` target: the server's own static fallback budget. */
 export const MEMTREE_COMPACT_DEFAULT_TOKENS = 50_000;
-const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
+export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
 function sessionCommandReply(state, sessionId, prompt) {
     if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
@@ -1439,7 +1439,7 @@ function sessionCommandReply(state, sessionId, prompt) {
     if (args === undefined)
         return undefined;
     if (/^off$/i.test(args)) {
-        state.compactTargets.delete(sessionId);
+        state.compactTargets.set(sessionId, null);
         return `${TRAILER_LABEL} compaction off: MemTree compresses only when the conversation outgrows the model's window.`;
     }
     const target = args === "" ? MEMTREE_COMPACT_DEFAULT_TOKENS : parseTokenCount(args);
@@ -1450,7 +1450,7 @@ function sessionCommandReply(state, sessionId, prompt) {
     return `${TRAILER_LABEL} compacting: from your next message on, this session is sent compressed to about ${Math.round(target / 1000)}k tokens. /memtree-compact off to stop.`;
 }
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
-function parseTokenCount(text) {
+export function parseTokenCount(text) {
     const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(text.trim());
     if (!match)
         return undefined;
@@ -2060,7 +2060,9 @@ function cloneJson(value) {
  */
 async function runBlockingCompression(args) {
     const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } = args;
-    const compactTarget = args.sessionId !== undefined ? state.compactTargets.get(args.sessionId) : undefined;
+    const compactTarget = args.sessionId !== undefined && state.compactTargets.has(args.sessionId)
+        ? state.compactTargets.get(args.sessionId) ?? undefined
+        : opts.defaultCompactTarget;
     const messageUsage = args.sessionId !== undefined && opts.transcriptUsage
         ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree)
         : undefined;

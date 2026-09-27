@@ -14,7 +14,7 @@
 import spawn from "cross-spawn";
 import { exec } from "node:child_process";
 import * as readline from "node:readline";
-import { startProxy } from "./proxy.js";
+import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
@@ -259,6 +259,7 @@ async function main() {
         // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0
         // turns the filter off.
         claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
+        defaultCompactTarget: compactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
         // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
         // link is shown while the placement is being tried out; see ProxyOptions.
         memtreeLinkPlacement,
@@ -361,4 +362,15 @@ main().catch((err) => {
     console.error(err);
     process.exit(1);
 });
+/** `CCC_COMPACT_TARGET` ("500k", "20000"): a default compaction target, or undefined. */
+function compactTargetFromEnv(raw) {
+    if (!raw)
+        return undefined;
+    const target = parseTokenCount(raw);
+    if (target === undefined || target < MEMTREE_COMPACT_MIN_TOKENS) {
+        console.error(`ccc: ignoring CCC_COMPACT_TARGET=${raw} (use a token count of at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`);
+        return undefined;
+    }
+    return target;
+}
 //# sourceMappingURL=cli.js.map

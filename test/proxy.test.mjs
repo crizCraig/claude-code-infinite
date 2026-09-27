@@ -3369,6 +3369,26 @@ test("the compressed message's cache marker copies a 1h TTL, and a reused route 
   }
 });
 
+test("defaultCompactTarget sends compression_target_tokens for sessions without /memtree-compact", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    defaultCompactTarget: 20_000,
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    await waitFor(() => memtreeSrv.calls.some((c) => !c.index_only));
+    assert.equal(memtreeSrv.calls.find((c) => !c.index_only).compression_target_tokens, 20_000);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("placements 'stop' and 'off'", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));

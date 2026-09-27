@@ -65,6 +65,13 @@ export interface ProxyOptions {
      * send bare requests keep the old behaviour by default.
      */
     claudeCodeOnly?: boolean;
+    /**
+     * Compaction target (tokens) for every session that has not run
+     * `/memtree-compact`: `CCC_COMPACT_TARGET`. For benchmarks and headless
+     * runs, where the hook-driven command is unavailable. `/memtree-compact off`
+     * still turns it off for one session.
+     */
+    defaultCompactTarget?: number;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -127,4 +134,7 @@ export interface RunningProxy {
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** Default `/memtree-compact` target: the server's own static fallback budget. */
 export declare const MEMTREE_COMPACT_DEFAULT_TOKENS = 50000;
+export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
+/** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
+export declare function parseTokenCount(text: string): number | undefined;
 //# sourceMappingURL=proxy.d.ts.map

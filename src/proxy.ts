@@ -172,6 +172,13 @@ export interface ProxyOptions {
    * send bare requests keep the old behaviour by default.
    */
   claudeCodeOnly?: boolean;
+  /**
+   * Compaction target (tokens) for every session that has not run
+   * `/memtree-compact`: `CCC_COMPACT_TARGET`. For benchmarks and headless
+   * runs, where the hook-driven command is unavailable. `/memtree-compact off`
+   * still turns it off for one session.
+   */
+  defaultCompactTarget?: number;
   debug?: boolean;
   /**
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -336,7 +343,8 @@ interface ProxyState {
    * that session asks the server for this whole-request size instead of the
    * model-based budget, so it stays compressed while it would still fit.
    */
-  compactTargets: Map<string, number>;
+  /** Per-session `/memtree-compact` target; null means explicitly off. */
+  compactTargets: Map<string, number | null>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /**
@@ -2010,7 +2018,7 @@ function resumeLinkLine(
 
 /** Default `/memtree-compact` target: the server's own static fallback budget. */
 export const MEMTREE_COMPACT_DEFAULT_TOKENS = 50_000;
-const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
+export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
 function sessionCommandReply(
@@ -2028,7 +2036,7 @@ function sessionCommandReply(
   const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
   if (args === undefined) return undefined;
   if (/^off$/i.test(args)) {
-    state.compactTargets.delete(sessionId);
+    state.compactTargets.set(sessionId, null);
     return `${TRAILER_LABEL} compaction off: MemTree compresses only when the conversation outgrows the model's window.`;
   }
   const target = args === "" ? MEMTREE_COMPACT_DEFAULT_TOKENS : parseTokenCount(args);
@@ -2040,7 +2048,7 @@ function sessionCommandReply(
 }
 
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
-function parseTokenCount(text: string): number | undefined {
+export function parseTokenCount(text: string): number | undefined {
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(text.trim());
   if (!match) return undefined;
   const scale = { k: 1_000, m: 1_000_000 }[match[2]?.toLowerCase() as "k" | "m"] ?? 1;
@@ -2767,7 +2775,9 @@ async function runBlockingCompression(args: {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
   const compactTarget =
-    args.sessionId !== undefined ? state.compactTargets.get(args.sessionId) : undefined;
+    args.sessionId !== undefined && state.compactTargets.has(args.sessionId)
+      ? state.compactTargets.get(args.sessionId) ?? undefined
+      : opts.defaultCompactTarget;
   const messageUsage =
     args.sessionId !== undefined && opts.transcriptUsage
       ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree)
