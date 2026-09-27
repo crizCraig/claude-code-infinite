@@ -7,6 +7,12 @@ import { MemtreeClient } from "../dist/memtree.js";
 const LARGE_MODEL = "claude-opus-5";
 const SMALL_MODEL = "claude-haiku-4-5";
 const WIDE_MEMORY = "retained wide-window memory ".repeat(40_000);
+/** Text of a message whose content is a string or text blocks (the compressed message carries a cache marker). */
+function flatText(message) {
+  const c = message?.content;
+  return typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => p?.text ?? "").join("") : c;
+}
+
 const SMALL_MEMORY = "retained smaller-window memory ".repeat(1_000);
 const FOLLOWUP = [
   { role: "user", content: "Inspect the repository." },
@@ -25,12 +31,12 @@ for (const installThroughRecovery of [false, true]) {
       assert.equal(fixture.calls.length, 2, "the new window needs a fresh compression");
       assert.equal(fixture.calls[1].model_context_limit, 200_000);
       assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
-      assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+      assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
 
       await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
       assert.equal(fixture.calls.length, 2, "the smaller replacement route is reusable");
       assert.equal(fixture.lastRecord().turnType, "tool-memory");
-      assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+      assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
       assert.equal(fixture.forwarded.at(-1).messages.at(-1).content[0].tool_use_id, "t2");
     } finally {
       await fixture.close();
@@ -134,7 +140,7 @@ test("a completed recovered response can switch windows before its SSE transport
     await fixture.post(continued, { model: SMALL_MODEL });
     assert.equal(fixture.calls.length, 2, "a completed wide route can fund smaller recovery");
     assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
-    assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+    assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
   } finally {
     await reader?.cancel();
     await fixture.close();
@@ -160,7 +166,7 @@ test("a smaller-window regrant waits for the outage cooldown", async (t) => {
     await fixture.post(continued, { model: SMALL_MODEL });
     assert.equal(fixture.calls.length, 3, "the deferred allowance survives the cooldown");
     assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
-    assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+    assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
   } finally {
     await fixture.close();
   }
@@ -188,7 +194,7 @@ test("the beta header preserves 1M capacity for a cross-model route", async () =
     });
     assert.equal(fixture.calls.length, 1, "the resolved header capacity must be honored");
     assert.equal(fixture.lastRecord().turnType, "tool-memory");
-    assert.equal(fixture.forwarded.at(-1).messages[0].content, WIDE_MEMORY);
+    assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), WIDE_MEMORY);
   } finally {
     await fixture.close();
   }
@@ -202,7 +208,7 @@ test("removing the explicit 1M capacity rebuilds a route without changing model"
     await fixture.post(extend(original, "t1"));
     assert.equal(fixture.calls.length, 2);
     assert.equal(fixture.calls[1].model_context_limit, 200_000);
-    assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+    assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
   } finally {
     await fixture.close();
   }
@@ -223,7 +229,7 @@ for (const overhead of ["system", "tools", "max_tokens"]) {
       await fixture.post(FOLLOWUP, extra);
       await fixture.post(extend(FOLLOWUP, "t1"), { ...extra, model: SMALL_MODEL });
       assert.equal(fixture.calls.length, 2, "message bytes alone understate request capacity");
-      assert.equal(fixture.forwarded.at(-1).messages[0].content, SMALL_MEMORY);
+      assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
     } finally {
       await fixture.close();
     }

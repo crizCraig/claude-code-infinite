@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message } from "./turns.js";
-import { TRAILER_LABEL } from "./hooks.js";
+import { LINK_LABEL, linkLines } from "./hooks.js";
 import { UPGRADE_COMMAND, type UpdateAvailable } from "./update-check.js";
 
 export const NOTICE_OPEN = "<cc-infinite-notice>";
@@ -35,7 +35,7 @@ export function compressedNoticeText(memtreeUrl?: string): string {
  * URL bare either way.
  */
 export function memtreeTrailerText(memtreeUrl: string, note?: string): string {
-  return `${TRAILER_LABEL} ${memtreeUrl}${note ? ` ${note}` : ""}`;
+  return linkLines(LINK_LABEL, memtreeUrl, note);
 }
 
 /** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
@@ -280,7 +280,7 @@ export function recapLinkText(
   streamedTextChars: number,
   note?: string
 ): string | undefined {
-  const text = `\n${TRAILER_LABEL} ${link}${note ? ` ${note}` : ""}`;
+  const text = `\n${linkLines(LINK_LABEL, link, note)}`;
   return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
 }
 

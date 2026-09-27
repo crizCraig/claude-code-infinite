@@ -15,6 +15,18 @@ import path from "node:path";
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export const TRAILER_LABEL = "• MemTree ·";
+/** Label on a line that carries a MemTree page link. */
+export const LINK_LABEL = "• MemTree";
+
+/**
+ * A MemTree link notice: the label (and note, if any) on the first line and
+ * the URL alone, indented, on the next, so a long URL wraps on its own
+ * rather than dragging the label or note onto a second line. Label and note
+ * come pre-styled; the URL stays bare for the terminal's linkifier.
+ */
+export function linkLines(label: string, url: string, note?: string): string {
+  return `${label}${note ? ` · ${note}` : ""}\n  ${url}`;
+}
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
@@ -258,7 +270,7 @@ export class NoticeDeliveryQueue {
   resumeLine(link: SuccessLink): string {
     this.lastTrailerKey = link.key;
     this.lastLinkKey = link.key;
-    return `${this.styleSuccess(TRAILER_LABEL)} ${link.link}${this.noteSuffix(link)}`;
+    return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
   }
 
   /** Whether the next success line would carry a link not shown before. */
@@ -456,16 +468,13 @@ export class NoticeDeliveryQueue {
     // "turn": one line per user turn, and only when the index changed.
     if (this.trailerPlacement === "turn" && !isNew) return undefined;
     this.lastTrailerKey = link.key;
-    const label = isNew ? this.styleSuccess(TRAILER_LABEL) : this.styleDim(TRAILER_LABEL);
-    return `${label} ${link.link}${this.noteSuffix(link)}`;
+    const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
+    return this.linkNotice(label, link);
   }
 
-  /**
-   * The note after the link, dim, separated by a space so a terminal's URL
-   * detection stops at the link.
-   */
-  private noteSuffix(link: SuccessLink): string {
-    return link.note ? ` ${this.styleDim(link.note)}` : "";
+  /** The link notice with its note dim. */
+  private linkNotice(label: string, link: SuccessLink): string {
+    return linkLines(label, link.link, link.note && this.styleDim(link.note));
   }
 
   private styleDim(text: string): string {

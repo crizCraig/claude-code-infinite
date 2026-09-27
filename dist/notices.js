@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { TRAILER_LABEL } from "./hooks.js";
+import { LINK_LABEL, linkLines } from "./hooks.js";
 import { UPGRADE_COMMAND } from "./update-check.js";
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
@@ -30,7 +30,7 @@ export function compressedNoticeText(memtreeUrl) {
  * URL bare either way.
  */
 export function memtreeTrailerText(memtreeUrl, note) {
-    return `${TRAILER_LABEL} ${memtreeUrl}${note ? ` ${note}` : ""}`;
+    return linkLines(LINK_LABEL, memtreeUrl, note);
 }
 /** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
 export const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
@@ -223,7 +223,7 @@ export const RECAP_MAX_CHARS = 400;
  * Code's cap and would come back clipped mid-URL.
  */
 export function recapLinkText(link, streamedTextChars, note) {
-    const text = `\n${TRAILER_LABEL} ${link}${note ? ` ${note}` : ""}`;
+    const text = `\n${linkLines(LINK_LABEL, link, note)}`;
     return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
 }
 /** content_block_start/delta/stop triple for a notice text block. */

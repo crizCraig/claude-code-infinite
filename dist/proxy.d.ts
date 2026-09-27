@@ -54,6 +54,17 @@ export interface ProxyOptions {
      * `CCC_TOOL_ROUTE_RECOVERY=0` to `false` as a temporary kill switch.
      */
     toolRouteRecovery?: boolean;
+    /**
+     * Handle only Claude Code's own requests. ccc launches Claude Code with
+     * ANTHROPIC_BASE_URL pointing here, and every program Claude Code runs
+     * inherits it (scripts, test suites, SDK apps, a benchmark's judge calls).
+     * Claude Code's API client always sends `X-Claude-Code-Session-Id`; a
+     * request without it is another program's and is forwarded to Anthropic
+     * byte for byte: no MemTree compress or index, no route state, logged as
+     * `turnType: "foreign"`. The CLI turns this on; embedders and tests that
+     * send bare requests keep the old behaviour by default.
+     */
+    claudeCodeOnly?: boolean;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,

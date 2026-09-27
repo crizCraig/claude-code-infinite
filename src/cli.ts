@@ -333,6 +333,10 @@ async function main() {
     // same-session-only eviction of a rejected route stay in force, because
     // those are what stop a side request from stranding the tool loop.
     toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
+    // Programs launched from inside Claude Code inherit ANTHROPIC_BASE_URL;
+    // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0
+    // turns the filter off.
+    claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
     // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
     // link is shown while the placement is being tried out; see ProxyOptions.
     memtreeLinkPlacement,

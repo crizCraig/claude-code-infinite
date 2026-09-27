@@ -13,6 +13,17 @@ import path from "node:path";
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export const TRAILER_LABEL = "• MemTree ·";
+/** Label on a line that carries a MemTree page link. */
+export const LINK_LABEL = "• MemTree";
+/**
+ * A MemTree link notice: the label (and note, if any) on the first line and
+ * the URL alone, indented, on the next, so a long URL wraps on its own
+ * rather than dragging the label or note onto a second line. Label and note
+ * come pre-styled; the URL stays bare for the terminal's linkifier.
+ */
+export function linkLines(label, url, note) {
+    return `${label}${note ? ` · ${note}` : ""}\n  ${url}`;
+}
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
@@ -137,7 +148,7 @@ export class NoticeDeliveryQueue {
     resumeLine(link) {
         this.lastTrailerKey = link.key;
         this.lastLinkKey = link.key;
-        return `${this.styleSuccess(TRAILER_LABEL)} ${link.link}${this.noteSuffix(link)}`;
+        return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
     }
     /** Whether the next success line would carry a link not shown before. */
     linkPending(sessionId) {
@@ -314,15 +325,12 @@ export class NoticeDeliveryQueue {
         if (this.trailerPlacement === "turn" && !isNew)
             return undefined;
         this.lastTrailerKey = link.key;
-        const label = isNew ? this.styleSuccess(TRAILER_LABEL) : this.styleDim(TRAILER_LABEL);
-        return `${label} ${link.link}${this.noteSuffix(link)}`;
+        const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
+        return this.linkNotice(label, link);
     }
-    /**
-     * The note after the link, dim, separated by a space so a terminal's URL
-     * detection stops at the link.
-     */
-    noteSuffix(link) {
-        return link.note ? ` ${this.styleDim(link.note)}` : "";
+    /** The link notice with its note dim. */
+    linkNotice(label, link) {
+        return linkLines(label, link.link, link.note && this.styleDim(link.note));
     }
     styleDim(text) {
         return this.color ? `${ANSI_DIM}${text}${ANSI_NORMAL_INTENSITY}` : text;

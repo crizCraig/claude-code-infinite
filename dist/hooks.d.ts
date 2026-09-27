@@ -10,6 +10,15 @@
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export declare const TRAILER_LABEL = "\u2022 MemTree \u00B7";
+/** Label on a line that carries a MemTree page link. */
+export declare const LINK_LABEL = "\u2022 MemTree";
+/**
+ * A MemTree link notice: the label (and note, if any) on the first line and
+ * the URL alone, indented, on the next, so a long URL wraps on its own
+ * rather than dragging the label or note onto a second line. Label and note
+ * come pre-styled; the URL stays bare for the terminal's linkifier.
+ */
+export declare function linkLines(label: string, url: string, note?: string): string;
 export declare const DEFAULT_NOTICE_TTL_MS: number;
 /**
  * `/memtree`: list the MemTree commands. The link label reads `/memtree` as a
@@ -183,11 +192,8 @@ export declare class NoticeDeliveryQueue {
      * marks the key as seen. Resolver failures never break a hook.
      */
     private renderTrailer;
-    /**
-     * The note after the link, dim, separated by a space so a terminal's URL
-     * detection stops at the link.
-     */
-    private noteSuffix;
+    /** The link notice with its note dim. */
+    private linkNotice;
     private styleDim;
     private style;
     private freshPending;

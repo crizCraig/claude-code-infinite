@@ -87,6 +87,8 @@ import {
   MEMTREE_COMPACT_COMMAND,
   MEMTREE_HELP_COMMAND,
   TRAILER_LABEL,
+  LINK_LABEL,
+  linkLines,
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
@@ -158,6 +160,17 @@ export interface ProxyOptions {
    * `CCC_TOOL_ROUTE_RECOVERY=0` to `false` as a temporary kill switch.
    */
   toolRouteRecovery?: boolean;
+  /**
+   * Handle only Claude Code's own requests. ccc launches Claude Code with
+   * ANTHROPIC_BASE_URL pointing here, and every program Claude Code runs
+   * inherits it (scripts, test suites, SDK apps, a benchmark's judge calls).
+   * Claude Code's API client always sends `X-Claude-Code-Session-Id`; a
+   * request without it is another program's and is forwarded to Anthropic
+   * byte for byte: no MemTree compress or index, no route state, logged as
+   * `turnType: "foreign"`. The CLI turns this on; embedders and tests that
+   * send bare requests keep the old behaviour by default.
+   */
+  claudeCodeOnly?: boolean;
   debug?: boolean;
   /**
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -694,12 +707,14 @@ async function handleRequest(
 /** Loopback prefix for reading the user's own MemTree pages through this proxy. */
 const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
 /**
- * `<request id>`, `<request id>.json`, or `<request id>/session.json` (the
- * page's session pane); nothing that could walk the upstream
+ * `<request id>`, `<request id>.json`, `<request id>/session.json` (the
+ * page's session pane), or `sessions/<Claude Code session id>.json` (every
+ * page from one session, newest first); nothing that could walk the upstream
  * path. The id is the request UUID or the server's short form of it (leading
  * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
  */
-const MEMTREE_PASSTHROUGH_TARGET_RE = /^[A-Za-z0-9-]+(\.json|\/session\.json)?$/;
+const MEMTREE_PASSTHROUGH_TARGET_RE =
+  /^(?:[A-Za-z0-9-]+(\.json|\/session\.json)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
 
 /**
  * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own
@@ -964,6 +979,16 @@ async function handleMessages(
       opts.reqlog?.log(rec);
     }
   };
+
+  if (opts.claudeCodeOnly && requestSessionId(req) === undefined) {
+    rec.turnType = "foreign";
+    rec.forwardedBytes = rawBody.length;
+    const agent = firstNonEmptyHeader(req, "user-agent");
+    if (agent) rec.userAgent = agent.slice(0, 80);
+    return logged(
+      forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
+    );
+  }
 
   let body: Record<string, any>;
   try {
@@ -1421,7 +1446,7 @@ async function handleMessages(
     // sound: a live route proves the installer's compress() submitted this
     // history in this process, so re-indexing buys nothing.
     if (routeMiss !== "replay") {
-      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
     }
     capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
     return logged(
@@ -2021,8 +2046,7 @@ function memtreeViewLine(state: ProxyState, sessionId: string): string {
   if (!page) {
     return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
   }
-  const note = page.compressed ? "" : ` ${NOT_COMPRESSED_NOTE}`;
-  return `${TRAILER_LABEL} ${page.url}${note}`;
+  return linkLines(LINK_LABEL, page.url, page.compressed ? undefined : NOT_COMPRESSED_NOTE);
 }
 
 function nextMemtreeCallSeq(state: ProxyState): number {
@@ -2235,6 +2259,7 @@ function forkRoutedBody(
   } else {
     delete routed.system;
   }
+  capCacheBreakpoints(routed, route.compressedMessages.length);
   const buffer = Buffer.from(JSON.stringify(routed), "utf-8");
   if (routedBodyExceedsContext(body, buffer, modelContextLimit)) return { miss: "too-large" };
   return { body: buffer };
@@ -2279,6 +2304,7 @@ function memoryRoutedToolBody(
   } else {
     delete routed.system;
   }
+  capCacheBreakpoints(routed, route.compressedMessages.length);
   return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 
@@ -2530,6 +2556,112 @@ function withoutRouteBillingHeaders(value: unknown): unknown {
   });
 }
 
+/** Anthropic's limit on cache_control breakpoints per request. */
+const MAX_CACHE_BREAKPOINTS = 4;
+
+/**
+ * Claude Code marks its own blocks with cache_control, but the server's
+ * flatten turns the compressed conversation into one plain-string user
+ * message, so a compressed request carried no breakpoint at all: Anthropic
+ * billed every compressed first request in full and cached nothing
+ * (requests.jsonl, 2026-09-26: followup-compressed 51.8M uncached input,
+ * 0.06M cache write; tool-recompressed 133.5M uncached, 0 either way).
+ * Marking the flattened message caches system + tools + compressed history,
+ * and every tool turn that rides the route reads it back.
+ */
+function withFlattenCacheBreakpoint(
+  body: Record<string, any>,
+  ttl: string | undefined
+): Message[] {
+  const messages: Message[] = body.messages;
+  if (messages.length !== 1) return messages;
+  if (countCacheBreakpoints(body) >= MAX_CACHE_BREAKPOINTS) return messages;
+  const only = messages[0];
+  const text = typeof only.content === "string" ? only.content : undefined;
+  if (text === undefined) return messages;
+  const cacheControl: Record<string, string> = { type: "ephemeral" };
+  if (ttl !== undefined) cacheControl.ttl = ttl;
+  return [{ ...only, content: [{ type: "text", text, cache_control: cacheControl }] }];
+}
+
+/**
+ * The longest TTL Claude Code used on this request's breakpoints. Anthropic
+ * rejects a request whose earlier breakpoint has a shorter TTL than a later
+ * one, and the flattened message comes before every suffix breakpoint, so it
+ * takes the longest seen ("1h" for subscribers on the 1-hour allowlist).
+ * Undefined means the default 5-minute TTL.
+ */
+function cacheTtlOf(body: Record<string, any>): string | undefined {
+  let longest: string | undefined;
+  forEachCacheControl(body, (cc) => {
+    if (cc.ttl === "1h") longest = "1h";
+    else if (cc.ttl === "5m" && longest === undefined) longest = "5m";
+  });
+  return longest;
+}
+
+function countCacheBreakpoints(body: Record<string, any>): number {
+  let n = 0;
+  forEachCacheControl(body, () => n++);
+  return n;
+}
+
+function forEachCacheControl(
+  body: Record<string, any>,
+  visit: (cc: Record<string, any>) => void
+): void {
+  const blocks = (value: unknown) => {
+    if (!Array.isArray(value)) return;
+    for (const item of value) {
+      if (item && typeof item === "object" && (item as any).cache_control) {
+        visit((item as any).cache_control);
+      }
+    }
+  };
+  blocks(body.system);
+  blocks(body.tools);
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) blocks(m?.content);
+  }
+}
+
+/**
+ * Keep a request within Anthropic's breakpoint limit after the compressed
+ * prefix (which carries one) is joined to Claude Code's own suffix. Drops
+ * the earliest suffix breakpoints first, never the compressed prefix's or
+ * the request's last one, so both the big prefix and the growing tail stay
+ * cached.
+ */
+function capCacheBreakpoints(body: Record<string, any>, prefixLength: number): void {
+  let excess = countCacheBreakpoints(body) - MAX_CACHE_BREAKPOINTS;
+  if (excess <= 0 || !Array.isArray(body.messages)) return;
+  const last = lastCacheBreakpoint(body.messages);
+  for (let i = prefixLength; i < body.messages.length && excess > 0; i++) {
+    const content = body.messages[i]?.content;
+    if (!Array.isArray(content)) continue;
+    body.messages[i] = {
+      ...body.messages[i],
+      content: content.map((part: any, j: number) => {
+        if (excess <= 0 || !part?.cache_control || (i === last?.[0] && j === last?.[1])) return part;
+        excess--;
+        const { cache_control: _dropped, ...rest } = part;
+        return rest;
+      }),
+    };
+  }
+}
+
+function lastCacheBreakpoint(messages: Message[]): [number, number] | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const content = messages[i]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j--) {
+      if ((content[j] as any)?.cache_control) return [i, j];
+    }
+  }
+  return undefined;
+}
+
 /** Ignore only Anthropic content-block cache metadata, never user/tool data. */
 function withoutContentBlockCacheControl(content: unknown): unknown {
   if (Array.isArray(content)) {
@@ -2641,6 +2773,7 @@ async function runBlockingCompression(args: {
     tools: Array.isArray(body.tools) ? body.tools : undefined,
     ...(compactTarget !== undefined ? { compressionTargetTokens: compactTarget } : {}),
     ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
+    ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -2715,6 +2848,7 @@ function buildCompressedBody(
   if (systemMsg?.content != null) {
     compressedBody.system = systemMsg.content;
   }
+  compressedBody.messages = withFlattenCacheBreakpoint(compressedBody, cacheTtlOf(body));
   return {
     compressedBody,
     compressedRaw: Buffer.from(JSON.stringify(compressedBody), "utf-8"),
@@ -2929,7 +3063,7 @@ async function recoverToolRouteMiss(args: {
       !state.shutdownSignal.aborted &&
       opts.memtree.paymentRequiredDetail === null
     ) {
-      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit);
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req));
     }
     return forwardOriginal();
   }

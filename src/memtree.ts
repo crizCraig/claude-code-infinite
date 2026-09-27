@@ -71,6 +71,11 @@ export interface CompressRequestMeta {
    * MemTree page; never hashed, never part of the compression cache key.
    */
   messageUsage?: MessageUsage;
+  /**
+   * Claude Code's session id, sent as `x-claude-code-session-id` so the
+   * server can list a session's MemTree pages by it. Not part of the cache key.
+   */
+  sessionId?: string;
 }
 
 export interface CompressResult {
@@ -912,6 +917,7 @@ export class MemtreeClient {
       tools: meta?.tools,
       compressionTargetTokens: meta?.compressionTargetTokens,
       messageUsage: meta?.messageUsage,
+      sessionId: meta?.sessionId,
     }).catch((err) => {
       this.log(`compression failed: ${err?.message ?? err}`);
       // `status` is absent when the call never got a response (network
@@ -955,7 +961,8 @@ export class MemtreeClient {
   indexInBackground(
     hash: string,
     messages: Message[],
-    modelContextLimit: number
+    modelContextLimit: number,
+    sessionId?: string
   ): void {
     if (this.backgroundClosing) return;
     if (this.indexedHashes.has(hash)) return;
@@ -971,6 +978,7 @@ export class MemtreeClient {
       timeoutMs: INDEX_TIMEOUT_MS,
       indexOnly: true,
       signal: controller.signal,
+      sessionId,
     })
       .then(
         () => undefined,
@@ -1058,6 +1066,7 @@ export class MemtreeClient {
       tools?: unknown[];
       compressionTargetTokens?: number;
       messageUsage?: MessageUsage;
+      sessionId?: string;
     }
   ): Promise<CompressResult | null> {
     const body: Record<string, unknown> = {
@@ -1120,6 +1129,7 @@ export class MemtreeClient {
           "content-type": "application/json",
           "x-client": CLIENT_NAME,
           "x-client-version": CLIENT_VERSION,
+          ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
         },
         body: payload,
         signal: controller.signal,

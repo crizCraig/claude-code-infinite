@@ -40,7 +40,12 @@ export type TurnType = "first-user" | "tool" | "tool-memory"
  * Claude Code's own side request (the security monitor): forwarded
  * untouched, no MemTree call, main-thread route state left alone.
  */
- | "side-request" | "followup-client-closed" | "unparseable";
+ | "side-request"
+/**
+ * Not from Claude Code (no X-Claude-Code-Session-Id): another program that
+ * inherited ccc's ANTHROPIC_BASE_URL. Forwarded untouched, no MemTree.
+ */
+ | "foreign" | "followup-client-closed" | "unparseable";
 /** Real token usage parsed from Anthropic's response, when available. */
 export interface UsageRecord {
     input_tokens?: number;
@@ -61,6 +66,8 @@ export interface MessagesRecord {
     requestBytes: number;
     model?: string;
     stream?: boolean;
+    /** For a foreign request: the opening of its User-Agent, to name the program. */
+    userAgent?: string;
     /**
      * What Claude Code's billing header says about this request (see
      * cc-request.ts). Logged to measure which request kinds lack
