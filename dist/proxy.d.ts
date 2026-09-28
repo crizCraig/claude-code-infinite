@@ -22,7 +22,10 @@
  * - First user turn (no earlier real user input): background indexing, forward
  *   as-is — nothing is indexed yet, so blocking would be a guaranteed no-op.
  * - Followup user turn: blocking compress + substitute. The compressed body
- *   remains the prefix for that turn's tool loop.
+ *   remains the prefix for that turn's tool loop. On the main thread a
+ *   compaction also becomes the session's stable prefix (planEdgeCompaction):
+ *   later human turns ride it byte for byte, with no compress call, until
+ *   prefix + newer turns reach the budget or the covered messages change.
  * - MemTree failure/timeout degrades to passthrough. A display-only success
  *   notice is queued only when the memory response is selected AND MemTree's
  *   index coverage grew since the last announcement (unchanged coverage means
@@ -68,10 +71,18 @@ export interface ProxyOptions {
     /**
      * Compaction target (tokens) for every session that has not run
      * `/memtree-compact`: `CCC_COMPACT_TARGET`. For benchmarks and headless
-     * runs, where the hook-driven command is unavailable. `/memtree-compact off`
-     * still turns it off for one session.
+     * runs, where the hook-driven command is unavailable. It sets what each
+     * compaction aims at (instead of half the budget); it does not trigger
+     * one — that is still the budget. `/memtree-compact off` still turns
+     * compaction off for one session.
      */
     defaultCompactTarget?: number;
+    /**
+     * Test-only whole-request budget (tokens) for every session:
+     * `CCC_BUDGET_TOKENS`. Replaces the server-reported model budget (and the
+     * context-window fallback) so a cheap session crosses it in a few turns.
+     */
+    budgetTokensOverride?: number;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -131,11 +142,15 @@ export interface RunningProxy {
      */
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
+/**
+ * Budget fallback until the server reports `model_budget_tokens`: this share
+ * of the model's context window (800k of Opus 5.5's 1M, matching the server's
+ * large-context threshold).
+ */
+export declare const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
-/** Default `/memtree-compact` target: the server's own static fallback budget. */
-export declare const MEMTREE_COMPACT_DEFAULT_TOKENS = 50000;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;

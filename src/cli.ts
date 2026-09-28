@@ -364,6 +364,8 @@ async function main() {
     // turns the filter off.
     claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
     defaultCompactTarget: compactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
+    // Test-only: a small budget so a cheap session crosses it in a few turns.
+    budgetTokensOverride: budgetFromEnv(process.env.CCC_BUDGET_TOKENS),
     // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
     // link is shown while the placement is being tried out; see ProxyOptions.
     memtreeLinkPlacement,
@@ -510,4 +512,17 @@ function compactTargetFromEnv(raw: string | undefined): number | undefined {
     return undefined;
   }
   return target;
+}
+
+/** `CCC_BUDGET_TOKENS` ("60k"): a test-only whole-request budget, or undefined. */
+function budgetFromEnv(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const budget = parseTokenCount(raw);
+  if (budget === undefined || budget < 2 * MEMTREE_COMPACT_MIN_TOKENS) {
+    console.error(
+      `ccc: ignoring CCC_BUDGET_TOKENS=${raw} (use a token count of at least ${(2 * MEMTREE_COMPACT_MIN_TOKENS) / 1000}k)`
+    );
+    return undefined;
+  }
+  return budget;
 }

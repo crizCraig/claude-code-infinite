@@ -22,7 +22,15 @@ export declare function approxTokensFromBytes(bytes: number): number;
 export declare function defaultLogPath(): string;
 export type TurnType = "first-user" | "tool" | "tool-memory"
 /** Tool-route miss recovered: validated compressed bytes sent to Anthropic. */
- | "tool-recompressed" | "followup-compressed" | "followup-noop"
+ | "tool-recompressed" | "followup-compressed"
+/**
+ * A main-thread human turn sent on the session's stable compressed prefix:
+ * the prefix bytes stored at the last compaction, then every message after
+ * the part it covers, verbatim. No compress call (the history still goes
+ * to MemTree as a background index_only call), and the prefix is a prompt
+ * cache read. See `compaction` for the size check that allowed it.
+ */
+ | "followup-prefix" | "followup-noop"
 /** Indexed response that carried no prior conversation; history forwarded. */
  | "followup-empty-memory"
 /**
@@ -143,6 +151,12 @@ export interface MessagesRecord {
      * rode (turnType "fork-memory") or was not a fork.
      */
     forkMiss?: "no-route" | "session" | "system" | "prefix" | "too-large";
+    /**
+     * Stable-prefix (edge) compaction on a main-thread human turn: the budget
+     * the turn was measured against, the size estimate, and, when it compacted,
+     * why. Absent on other requests.
+     */
+    compaction?: CompactionRecord;
     /** Outcome of a best-effort tool-route miss recovery attempt. */
     routeRecovery?: {
         /**
@@ -223,6 +237,49 @@ export interface MessagesRecord {
     preludeFired?: boolean;
     usage?: UsageRecord;
 }
+/** Why a main-thread human turn compressed again instead of riding its prefix. */
+export type RecompressReason = 
+/** The prefix plus the turns after it reached the budget. */
+"budget"
+/** The messages the prefix covers changed: rewind, edit, fork, /clear. */
+ | "prefix-mismatch"
+/** `/memtree-compact [N]` asked for a compaction now. */
+ | "manual"
+/** The session's target or context window changed since the prefix was built. */
+ | "target-change";
+export interface CompactionRecord {
+    /** "off" after `/memtree-compact off`; "explicit" for an N or CCC_COMPACT_TARGET. */
+    mode: "auto" | "explicit" | "off";
+    /** The whole-request budget the turn was measured against. */
+    budgetTokens: number;
+    /**
+     * Where the budget came from: CCC_BUDGET_TOKENS ("override"), the
+     * server's `model_budget_tokens` ("server"), or the model's context window
+     * times FALLBACK_BUDGET_WINDOW_RATIO until the server reports one.
+     */
+    budgetSource: "override" | "server" | "window-ratio";
+    /** What a compaction on this turn aims at (budget/2, or the explicit N). */
+    targetTokens?: number;
+    /** Sent as compression_threshold_tokens (servers that report a budget). */
+    thresholdTokens?: number;
+    /** Size estimate of what would be sent (prefix ride or full history). */
+    estimatedTokens?: number;
+    /**
+     * "reported": Anthropic's input+cache_read+cache_creation for the previous
+     * request of the same shape, plus bytes/4 for what was added since.
+     * "bytes": bytes/4 of the whole body (no earlier usage to start from).
+     */
+    sizeSource?: "reported" | "bytes";
+    /** Set when the turn compressed (or tried to) for one of these reasons. */
+    reason?: RecompressReason;
+    /** For "prefix-mismatch": which check failed. */
+    prefixMiss?: "session" | "system" | "prefix";
+    /**
+     * A compaction was attempted but did not produce a new prefix (MemTree
+     * down, no-op, unusable) and the turn rode the old prefix instead.
+     */
+    keptPrefix?: true;
+}
 /** One MemTree API call (blocking compress or background index). */
 export interface MemtreeRecord {
     kind: "memtree";
@@ -248,6 +305,8 @@ export interface MemtreeRecord {
     memtreeUrl?: string;
     /** The completed index the turn was compressed against, if the server said. */
     memtreeIndex?: string;
+    /** The server's model budget (`model_budget_tokens`), when it reported one. */
+    modelBudgetTokens?: number;
 }
 /** A display-only notice was atomically claimed by one Claude Code hook. */
 export interface NoticeRecord {

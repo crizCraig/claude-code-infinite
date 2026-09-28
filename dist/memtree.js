@@ -84,6 +84,13 @@ export function cachedPromptTokenCount(result) {
         ? cachedTokens
         : undefined;
 }
+/** The server-reported model budget, when present and sane. */
+export function modelBudgetTokens(result) {
+    const value = result.model_budget_tokens;
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? value
+        : undefined;
+}
 /**
  * MemTree's informational estimate of the original, pre-consolidation prompt.
  * Newer servers include images as visual-token estimates and deliberately keep
@@ -751,6 +758,7 @@ export class MemtreeClient {
             model: meta?.model,
             tools: meta?.tools,
             compressionTargetTokens: meta?.compressionTargetTokens,
+            compressionThresholdTokens: meta?.compressionThresholdTokens,
             messageUsage: meta?.messageUsage,
             sessionId: meta?.sessionId,
             clientMeta: meta?.clientMeta,
@@ -862,6 +870,7 @@ export class MemtreeClient {
             modelContextLimit,
             toolsHash,
             meta?.compressionTargetTokens ?? null,
+            meta?.compressionThresholdTokens ?? null,
         ]))
             .digest("hex");
     }
@@ -896,6 +905,9 @@ export class MemtreeClient {
                 body.tools = tools;
             if (opts.compressionTargetTokens !== undefined) {
                 body.compression_target_tokens = opts.compressionTargetTokens;
+            }
+            if (opts.compressionThresholdTokens !== undefined) {
+                body.compression_threshold_tokens = opts.compressionThresholdTokens;
             }
             // Compress calls only: the server adds the thinking tokens (stripped
             // from `messages` above) to its budget, since a passthrough forwards
@@ -971,6 +983,9 @@ export class MemtreeClient {
             diagnostics = {
                 ...(memtreeUrl ? { memtreeUrl } : {}),
                 ...(memtreeIndex ? { memtreeIndex } : {}),
+                ...(modelBudgetTokens(json) !== undefined
+                    ? { modelBudgetTokens: modelBudgetTokens(json) }
+                    : {}),
                 indexedTokens: cachedPromptTokenCount(json),
                 rawPromptTokens: rawPromptTokenCount(json),
                 // Explicit field when the server sends one, else the first non-system

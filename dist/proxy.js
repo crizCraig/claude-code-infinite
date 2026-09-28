@@ -22,7 +22,10 @@
  * - First user turn (no earlier real user input): background indexing, forward
  *   as-is — nothing is indexed yet, so blocking would be a guaranteed no-op.
  * - Followup user turn: blocking compress + substitute. The compressed body
- *   remains the prefix for that turn's tool loop.
+ *   remains the prefix for that turn's tool loop. On the main thread a
+ *   compaction also becomes the session's stable prefix (planEdgeCompaction):
+ *   later human turns ride it byte for byte, with no compress call, until
+ *   prefix + newer turns reach the budget or the covered messages change.
  * - MemTree failure/timeout degrades to passthrough. A display-only success
  *   notice is queued only when the memory response is selected AND MemTree's
  *   index coverage grew since the last announcement (unchanged coverage means
@@ -39,7 +42,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, normalizeMessagesForMemtree, serverFlattenedMessages, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
@@ -72,6 +75,22 @@ const SKIP_RESPONSE_HEADERS = new Set([
     "keep-alive",
     "transfer-encoding",
 ]);
+/**
+ * Budget fallback until the server reports `model_budget_tokens`: this share
+ * of the model's context window (800k of Opus 5.5's 1M, matching the server's
+ * large-context threshold).
+ */
+export const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
+/**
+ * An explicit target is capped at this share of the budget: a compaction to
+ * the budget itself would be over budget again on the next turn and
+ * recompress on every turn.
+ */
+const MAX_EXPLICIT_TARGET_BUDGET_RATIO = 0.9;
+/** The server rejects smaller compression targets and thresholds. */
+const SERVER_MIN_TARGET_TOKENS = 10_000;
+/** Sessions whose stable prefix / passthrough size is kept (LRU). */
+const STABLE_PREFIX_MAX_SESSIONS = 16;
 /**
  * Bound on concurrently held route lanes. A route entry is 0.4–4 MB of heap,
  * so 32 lanes is honestly ~128 MB worst case — accepted so a wide agent
@@ -206,6 +225,11 @@ export function startProxy(opts) {
         memtreeLinkStore: opts.memtreeLinkStore,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
+        compactNow: new Set(),
+        stablePrefixes: new Map(),
+        serverBudgets: new Map(),
+        serverReportsBudget: false,
+        passthroughSizes: new Map(),
     };
     installMemtreeLink(state, state.memtreeLinkPlacement);
     const server = http.createServer((req, res) => {
@@ -1069,7 +1093,17 @@ async function handleMessages(req, res, opts, upstream, state) {
             opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), clientMeta);
         }
         capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
-        return logged(forwardRaw(req, res, routedBody, opts, upstream, state.shutdownSignal, rec));
+        // Sizes for the next human turn's budget check: a tool turn on a route
+        // built from the stable prefix reports to that prefix, a main request
+        // sent whole to the session's passthrough size.
+        const sizePrefix = routedTool ? rideableCandidate?.stablePrefix : undefined;
+        return logged(forwardRaw(req, res, routedBody, opts, upstream, state.shutdownSignal, rec).then(() => {
+            if (sizePrefix)
+                notePrefixSize(sizePrefix, rec, routedBody.length);
+            else if (!routedTool && isMainRequest) {
+                notePassthroughSize(state, requestSessionId(req), rec, routedBody.length);
+            }
+        }));
     }
     // The away recap is a fork of the main conversation: its history is the
     // main thread's plus one question. Ride the main thread's last compressed
@@ -1124,6 +1158,190 @@ async function handleMessages(req, res, opts, upstream, state) {
             releaseUncommittedRouteDecision();
         }
     };
+    const sessionId = requestSessionId(req);
+    // Stable-prefix (edge) compaction: the main thread's human turns only. The
+    // recap rides the main route above; subagents keep per-turn compression.
+    const edge = isMainRequest && sessionId !== undefined
+        ? planEdgeCompaction({
+            opts,
+            state,
+            body,
+            messages,
+            sessionId,
+            modelContextLimit,
+            forwardBody,
+            rec,
+        })
+        : undefined;
+    // An active subagent can repeat/embed the human prompt in its own request;
+    // producer suppression must also preserve the arm for the later main call.
+    if (displayForThisTurn)
+        state.mainPromptArmed = false;
+    /**
+     * Forward a compressed body — a fresh compaction, or a ride on the stable
+     * prefix — and make it the route for the rest of this human turn's tool
+     * loop (and, for a compaction, the session's new stable prefix).
+     */
+    const forwardCompressed = (compressedBody, compressedRaw, turnType, stable, result) => {
+        if (opts.debug) {
+            console.error(`[ccc proxy] user turn ${turnType}: ${forwardBody.length} → ` +
+                `${compressedRaw.length} body bytes`);
+        }
+        // Claude can consume message_stop, execute a fast local tool, and close the
+        // SSE response before Node observes the downstream HTTP `finish` event.
+        // Activate the route once the complete Anthropic response has been accepted
+        // by the downstream response, so an immediate tool-result request cannot
+        // race the later forwardRaw() delivery promise.
+        let routeActivationAttempted = false;
+        const activateMemoryRoute = () => {
+            if (routeActivationAttempted)
+                return;
+            if (!routeDecisionCurrent()) {
+                releaseUncommittedRouteDecision();
+                routeActivationAttempted = true;
+                return;
+            }
+            // Away lane: commit the decision but store nothing. Nothing can ever
+            // read an away route — tool turns and count_tokens can never classify as
+            // away — so storing it would only mislead and burn heap. All the
+            // reservation bookkeeping above and around this stays exactly as for any
+            // lane: it is what stops a stale slow away duplicate from stepping on a
+            // newer one.
+            if (requestRouteLane === "away") {
+                commitRouteDecision();
+                routeActivationAttempted = true;
+                return;
+            }
+            const installed = installMemoryRoute(state, requestRouteKey, req, body, messages, compressedBody, routeEpoch, routeDecisionGeneration, stable);
+            commitRouteDecision();
+            // Leave this false if installMemoryRoute unexpectedly throws: the
+            // delivery-complete fallback then gets one safe retry.
+            routeActivationAttempted = true;
+            if (opts.debug) {
+                console.error(`[ccc proxy] memory route activation: ${installed ? "installed" : "unavailable"}`);
+            }
+        };
+        if (routeDecisionCurrent()) {
+            state.memoryRoutes.delete(requestRouteKey);
+            commitRouteDecision();
+        }
+        // If a newer same-lane decision is live, keep this request's reservation
+        // until its protocol-complete activation (or terminal forward failure).
+        // The newer request may still end without mutating anything and hand
+        // ownership back while this response is in flight. Releasing here would let
+        // this request install later with no committed generation protecting that
+        // route from an even older completion.
+        recordTurn(rec, turnType, compressedRaw);
+        capture(opts, turnType === "followup-prefix" ? "anthropic-request-memory-prefix" : "anthropic-request", compressedRaw);
+        // Queue the success notice before the stream starts: a long live stream may
+        // claim its display notice before message_stop. A prefix ride made no
+        // compress call, so there is nothing new to announce.
+        if (result) {
+            queueCompressionNotice({
+                state,
+                req,
+                displayForThisTurn,
+                noticePromptGeneration,
+                noticePromptId,
+                result,
+            });
+        }
+        return logged(forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
+        // Wrapped like the recovery twin's protocol-complete callback — not
+        // for behavior (forwardRaw's notify catch swallows a throw either
+        // way, and routeActivationAttempted stays false so the
+        // delivered-settle retry below still gets its one safe attempt) but
+        // for observability: a bare throw here otherwise leaves zero trace,
+        // unlike the recovery path's "activation-error" install fate.
+        () => {
+            try {
+                activateMemoryRoute();
+            }
+            catch (err) {
+                if (opts.debug) {
+                    console.error(`[ccc proxy] followup route activation threw at protocol-complete: ${err}`);
+                }
+            }
+        }).then((delivered) => {
+            // The size Anthropic reported for this request is where the next
+            // human turn's budget check starts.
+            const sizePrefix = stable
+                ? "ride" in stable
+                    ? stable.ride
+                    : stable.installed
+                : undefined;
+            if (sizePrefix)
+                notePrefixSize(sizePrefix, rec, compressedRaw.length);
+            // A route already installed at protocol-complete deliberately survives
+            // delivered=false: that settle may be the fast-tool abort (client
+            // consumed message_stop, closed the SSE response, and its immediate
+            // tool request must ride the prefix). A socket death before flush
+            // settles identically, but its identical-body retry cannot ride the
+            // route and reclassifies as the recovery turn
+            // (routeRideableByThisRequest above), bumping the epoch and
+            // rebuilding the route.
+            if (!delivered) {
+                // Protocol-complete activation may already have installed the route
+                // before a fast downstream close. Otherwise this forward made no
+                // route decision, so return an uncommitted agent reservation.
+                if (!routeActivationAttempted)
+                    releaseUncommittedRouteDecision();
+                return;
+            }
+            markMainPromptDelivered();
+            // Route the rest of this human turn's tool loop — and the count_tokens
+            // calls Claude Code sizes its context with — through the same compressed
+            // prefix. Without this the tool loop re-sends the full history, so
+            // count_tokens reports the uncompressed conversation and Claude Code
+            // auto-compacts a context that memory had already shrunk.
+            // Retain delivery completion as a defensive retry if protocol-time
+            // route bookkeeping failed unexpectedly. Guarded like the recovery
+            // twin: a repeat throw here would reject inside this settle callback
+            // and strand the uncommitted reservation, so release it instead.
+            try {
+                activateMemoryRoute();
+            }
+            catch (err) {
+                if (!routeActivationAttempted)
+                    releaseUncommittedRouteDecision();
+                if (opts.debug) {
+                    console.error(`[ccc proxy] followup route activation retry threw: ${err}`);
+                }
+            }
+        }));
+    };
+    if (edge?.kind === "ride") {
+        // The stable prefix still covers this conversation and prefix + newer
+        // turns fit the budget: the same prefix bytes as the last request, so
+        // Anthropic reads them from cache, and no compress call. MemTree still
+        // gets the history to index.
+        opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, sessionId, clientMeta);
+        return forwardCompressed(edge.routed.body, edge.routed.raw, "followup-prefix", { ride: edge.prefix }, undefined);
+    }
+    /**
+     * A compaction that produced no new prefix: send this turn on the old one
+     * instead of the whole history when it is still valid. Undefined when there
+     * is none, or when the server passed a `/memtree-compact` request through
+     * (the conversation is under the asked-for target: send it whole).
+     */
+    const rideOldPrefix = (passedThrough) => {
+        if (edge?.kind !== "compress" || !edge.fallback)
+            return undefined;
+        if (passedThrough && edge.reason === "manual")
+            return undefined;
+        rec.compaction.keptPrefix = true;
+        return forwardCompressed(edge.fallback.routed.body, edge.fallback.routed.raw, "followup-prefix", { ride: edge.fallback.prefix }, undefined);
+    };
+    /** A main request about to go out whole: size it and drop any stale prefix. */
+    const sendingWhole = () => {
+        if (edge?.kind === "compress" && sessionId !== undefined) {
+            state.stablePrefixes.delete(sessionId);
+        }
+    };
+    const noteWholeSize = () => {
+        if (isMainRequest)
+            notePassthroughSize(state, sessionId, rec, forwardBody.length);
+    };
     // The complete request upload can outlive its downstream subscriber while
     // MemTree compression is in flight. Track that subscriber locally without
     // feeding its lifetime into MemtreeClient.compress(): compression promises
@@ -1134,10 +1352,6 @@ async function handleMessages(req, res, opts, upstream, state) {
             downstreamClosedDuringCompression = true;
     };
     res.once("close", markDownstreamClosedDuringCompression);
-    // An active subagent can repeat/embed the human prompt in its own request;
-    // producer suppression must also preserve the arm for the later main call.
-    if (displayForThisTurn)
-        state.mainPromptArmed = false;
     // The hidden away-summary request compresses too, but its page is not the
     // conversation the user is looking at.
     const linkSeq = isMainRequest && !isAwaySummary ? nextMemtreeCallSeq(state) : undefined;
@@ -1151,8 +1365,13 @@ async function handleMessages(req, res, opts, upstream, state) {
             hash,
             modelContextLimit,
             rec,
-            sessionId: requestSessionId(req),
+            sessionId,
             clientMeta,
+            ...(edge?.kind === "compress"
+                ? { compaction: { target: edge.target, threshold: edge.threshold } }
+                : edge?.kind === "off"
+                    ? { compaction: {} }
+                    : {}),
         });
     }
     catch (err) {
@@ -1165,8 +1384,13 @@ async function handleMessages(req, res, opts, upstream, state) {
     const { result } = compression;
     noteMemtreeHealth(state, compression);
     if (linkSeq !== undefined) {
-        noteMemtreePage(state, linkSeq, requestSessionId(req), result);
+        noteMemtreePage(state, linkSeq, sessionId, result);
     }
+    // Any answer settles a `/memtree-compact`: a compressed one became the
+    // prefix, a passthrough means there was nothing to compact. A failure keeps
+    // it pending for the next turn.
+    if (result && sessionId !== undefined)
+        state.compactNow.delete(sessionId);
     if (downstreamClosedDuringCompression ||
         (res.destroyed && !res.writableFinished)) {
         releaseUncommittedRouteDecision();
@@ -1177,6 +1401,9 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Each forwarder installs its own close listener synchronously, so this is
     // an event-loop-atomic handoff of downstream-close ownership.
     if (!result) {
+        const kept = rideOldPrefix(false);
+        if (kept)
+            return kept;
         // MemTree down/slow/402: the user's own Anthropic call is never gated on
         // it. Degrade to passthrough and queue a display-only hook notice for a
         // visible turn. The hidden away-summary request deliberately stays quiet.
@@ -1185,6 +1412,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // once per proxy process after it has actually been delivered.
         recordTurn(rec, "followup-degraded", forwardBody);
         clearLaneOrYield();
+        sendingWhole();
         capture(opts, "anthropic-request", forwardBody);
         const paymentDetail = opts.memtree.paymentRequiredDetail;
         const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
@@ -1200,6 +1428,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
         }
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            noteWholeSize();
             if (delivered)
                 markMainPromptDelivered();
         }));
@@ -1212,6 +1441,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         usable: historyCheck.usable,
     };
     if (!actuallyCompressed || !historyCheck.usable) {
+        const kept = rideOldPrefix(!actuallyCompressed);
+        if (kept)
+            return kept;
         // Two distinct ways to get an unusable answer, one recovery.
         //
         // No cached/indexed tokens means the server is still warming an index and
@@ -1226,6 +1458,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // asked to continue a conversation it can no longer see. Forwarding the
         // real history costs context but never silently amnesias the session.
         clearLaneOrYield();
+        sendingWhole();
         if (actuallyCompressed && opts.debug) {
             console.error(`[ccc proxy] memory response dropped the conversation ` +
                 `(retained ${historyCheck.retainedChars} of ` +
@@ -1234,6 +1467,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         recordTurn(rec, actuallyCompressed ? "followup-empty-memory" : "followup-noop", forwardBody);
         capture(opts, "anthropic-request", forwardBody);
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            noteWholeSize();
             if (delivered)
                 markMainPromptDelivered();
         }));
@@ -1250,12 +1484,16 @@ async function handleMessages(req, res, opts, upstream, state) {
         throw err;
     }
     if (built === null) {
+        const kept = rideOldPrefix(false);
+        if (kept)
+            return kept;
         // The server compressed but returned no usable `flattened_messages`
         // (pre-flatten server, or a malformed field). The flatten format lives
         // server-side only — the client deliberately has no local fallback, that
         // drift is what caused the append/adherence regressions — so forward the
         // real history instead, exactly like the unusable branch above.
         clearLaneOrYield();
+        sendingWhole();
         if (opts.debug) {
             console.error("[ccc proxy] compressed result carried no server flatten; " +
                 "forwarding history");
@@ -1263,127 +1501,25 @@ async function handleMessages(req, res, opts, upstream, state) {
         recordTurn(rec, "followup-no-flatten", forwardBody);
         capture(opts, "anthropic-request", forwardBody);
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            noteWholeSize();
             if (delivered)
                 markMainPromptDelivered();
         }));
     }
-    const { compressedBody, compressedRaw } = built;
-    if (opts.debug) {
-        console.error(`[ccc proxy] user turn compressed: ${forwardBody.length} → ` +
-            `${compressedRaw.length} body bytes`);
+    // A compaction: this result becomes the session's stable prefix once the
+    // response completes. The server may also have compressed on its own
+    // (over its budget with no threshold from us): that is a budget compaction.
+    let stable;
+    if (edge?.kind === "compress") {
+        const compaction = rec.compaction;
+        compaction.reason ??= compaction.prefixMiss ? "prefix-mismatch" : "budget";
+        stable = {
+            targetTokens: edge.targetTokens,
+            explicitTarget: edge.explicitTarget,
+            modelContextLimit,
+        };
     }
-    // Claude can consume message_stop, execute a fast local tool, and close the
-    // SSE response before Node observes the downstream HTTP `finish` event.
-    // Activate the route once the complete Anthropic response has been accepted
-    // by the downstream response, so an immediate tool-result request cannot
-    // race the later forwardRaw() delivery promise.
-    let routeActivationAttempted = false;
-    const activateMemoryRoute = () => {
-        if (routeActivationAttempted)
-            return;
-        if (!routeDecisionCurrent()) {
-            releaseUncommittedRouteDecision();
-            routeActivationAttempted = true;
-            return;
-        }
-        // Away lane: commit the decision but store nothing. Nothing can ever
-        // read an away route — tool turns and count_tokens can never classify as
-        // away — so storing it would only mislead and burn heap. All the
-        // reservation bookkeeping above and around this stays exactly as for any
-        // lane: it is what stops a stale slow away duplicate from stepping on a
-        // newer one.
-        if (requestRouteLane === "away") {
-            commitRouteDecision();
-            routeActivationAttempted = true;
-            return;
-        }
-        const installed = installMemoryRoute(state, requestRouteKey, req, body, messages, compressedBody, routeEpoch, routeDecisionGeneration);
-        commitRouteDecision();
-        // Leave this false if installMemoryRoute unexpectedly throws: the
-        // delivery-complete fallback then gets one safe retry.
-        routeActivationAttempted = true;
-        if (opts.debug) {
-            console.error(`[ccc proxy] memory route activation: ${installed ? "installed" : "unavailable"}`);
-        }
-    };
-    if (routeDecisionCurrent()) {
-        state.memoryRoutes.delete(requestRouteKey);
-        commitRouteDecision();
-    }
-    // If a newer same-lane decision is live, keep this request's reservation
-    // until its protocol-complete activation (or terminal forward failure).
-    // The newer request may still end without mutating anything and hand
-    // ownership back while this response is in flight. Releasing here would let
-    // this request install later with no committed generation protecting that
-    // route from an even older completion.
-    recordTurn(rec, "followup-compressed", compressedRaw);
-    capture(opts, "anthropic-request", compressedRaw);
-    // Queue the success notice before the stream starts: a long live stream may
-    // claim its display notice before message_stop.
-    // (actuallyCompressed is guaranteed true past the early return above.)
-    queueCompressionNotice({
-        state,
-        req,
-        displayForThisTurn,
-        noticePromptGeneration,
-        noticePromptId,
-        result,
-    });
-    return logged(forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
-    // Wrapped like the recovery twin's protocol-complete callback — not
-    // for behavior (forwardRaw's notify catch swallows a throw either
-    // way, and routeActivationAttempted stays false so the
-    // delivered-settle retry below still gets its one safe attempt) but
-    // for observability: a bare throw here otherwise leaves zero trace,
-    // unlike the recovery path's "activation-error" install fate.
-    () => {
-        try {
-            activateMemoryRoute();
-        }
-        catch (err) {
-            if (opts.debug) {
-                console.error(`[ccc proxy] followup route activation threw at protocol-complete: ${err}`);
-            }
-        }
-    }).then((delivered) => {
-        // actuallyCompressed is guaranteed true past the early return above.
-        // A route already installed at protocol-complete deliberately survives
-        // delivered=false: that settle may be the fast-tool abort (client
-        // consumed message_stop, closed the SSE response, and its immediate
-        // tool request must ride the prefix). A socket death before flush
-        // settles identically, but its identical-body retry cannot ride the
-        // route and reclassifies as the recovery turn
-        // (routeRideableByThisRequest above), bumping the epoch and
-        // rebuilding the route.
-        if (!delivered) {
-            // Protocol-complete activation may already have installed the route
-            // before a fast downstream close. Otherwise this forward made no
-            // route decision, so return an uncommitted agent reservation.
-            if (!routeActivationAttempted)
-                releaseUncommittedRouteDecision();
-            return;
-        }
-        markMainPromptDelivered();
-        // Route the rest of this human turn's tool loop — and the count_tokens
-        // calls Claude Code sizes its context with — through the same compressed
-        // prefix. Without this the tool loop re-sends the full history, so
-        // count_tokens reports the uncompressed conversation and Claude Code
-        // auto-compacts a context that memory had already shrunk.
-        // Retain delivery completion as a defensive retry if protocol-time
-        // route bookkeeping failed unexpectedly. Guarded like the recovery
-        // twin: a repeat throw here would reject inside this settle callback
-        // and strand the uncommitted reservation, so release it instead.
-        try {
-            activateMemoryRoute();
-        }
-        catch (err) {
-            if (!routeActivationAttempted)
-                releaseUncommittedRouteDecision();
-            if (opts.debug) {
-                console.error(`[ccc proxy] followup route activation retry threw: ${err}`);
-            }
-        }
-    }));
+    return forwardCompressed(built.compressedBody, built.compressedRaw, "followup-compressed", stable, result);
 }
 function queueCompressionNotice(args) {
     const { state, req, displayForThisTurn, noticePromptGeneration, noticePromptId, result, } = args;
@@ -1494,15 +1630,13 @@ function resumeLinkLine(state, input) {
         ...(page.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
     });
 }
-/** Default `/memtree-compact` target: the server's own static fallback budget. */
-export const MEMTREE_COMPACT_DEFAULT_TOKENS = 50_000;
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
 function sessionCommandReply(state, sessionId, prompt) {
     if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
         return [
             "• /memtree-view · show this session's MemTree page link",
-            `• /memtree-compact [tokens | off] · keep this session compressed (default ${MEMTREE_COMPACT_DEFAULT_TOKENS / 1000}k, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
+            `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
         ].join("\n");
     }
     if (isMemtreeViewCommand(prompt))
@@ -1510,16 +1644,26 @@ function sessionCommandReply(state, sessionId, prompt) {
     const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
     if (args === undefined)
         return undefined;
+    const keep = "then that compressed history is reused unchanged until the conversation reaches the budget again. /memtree-compact off to stop.";
     if (/^off$/i.test(args)) {
         state.compactTargets.set(sessionId, null);
-        return `${TRAILER_LABEL} compaction off: MemTree compresses only when the conversation outgrows the model's window.`;
+        state.compactNow.delete(sessionId);
+        state.stablePrefixes.delete(sessionId);
+        return `${TRAILER_LABEL} compaction off: the conversation is sent whole, and MemTree compresses only when it outgrows the model's budget.`;
     }
-    const target = args === "" ? MEMTREE_COMPACT_DEFAULT_TOKENS : parseTokenCount(args);
+    if (args === "") {
+        // Back to the automatic target (half the budget, or CCC_COMPACT_TARGET).
+        state.compactTargets.delete(sessionId);
+        state.compactNow.add(sessionId);
+        return `${TRAILER_LABEL} compacting: your next message is sent compressed to about half the budget, ${keep}`;
+    }
+    const target = parseTokenCount(args);
     if (target === undefined || target < MEMTREE_COMPACT_MIN_TOKENS) {
-        return `${TRAILER_LABEL} usage: /memtree-compact [tokens, e.g. 50k, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k | off]`;
+        return `${TRAILER_LABEL} usage: /memtree-compact [tokens, e.g. 400k, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k | off]`;
     }
     state.compactTargets.set(sessionId, target);
-    return `${TRAILER_LABEL} compacting: from your next message on, this session is sent compressed to about ${Math.round(target / 1000)}k tokens. /memtree-compact off to stop.`;
+    state.compactNow.add(sessionId);
+    return `${TRAILER_LABEL} compacting: your next message is sent compressed to about ${Math.round(target / 1000)}k tokens, ${keep}`;
 }
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export function parseTokenCount(text) {
@@ -1644,7 +1788,13 @@ function releaseRouteDecision(state, key, generation) {
     if (live.size === 0)
         state.routeDecisionsLive.delete(key);
 }
-function installMemoryRoute(state, key, req, originalBody, originalMessages, compressedBody, routeEpoch, decisionGeneration) {
+function installMemoryRoute(state, key, req, originalBody, originalMessages, compressedBody, routeEpoch, decisionGeneration, 
+/**
+ * Main-thread human turns only: the stable prefix these compressed messages
+ * start with. `register` stores it as the session's prefix (a compaction);
+ * a prefix ride passes the prefix it rode, already stored.
+ */
+stable) {
     // Epoch guards the human-prompt lifecycle; the decision generation orders
     // async installs that share one epoch (two recoveries, or a recovery vs an
     // in-flight followup). A stale completion must not overwrite a newer
@@ -1676,6 +1826,29 @@ function installMemoryRoute(state, key, req, originalBody, originalMessages, com
         hasCompressedSystem: Object.prototype.hasOwnProperty.call(compressedBody, "system"),
         routeEpoch,
     };
+    if (stable && "ride" in stable) {
+        route.stablePrefix = stable.ride;
+    }
+    else if (stable) {
+        // The route's own fields are the prefix: the hashes of every message this
+        // request carried, and the compressed bytes sent for them. Later requests
+        // reuse these bytes unchanged, so the prefix stays a cache read.
+        const prefix = {
+            sessionId,
+            originalSystemHash: route.originalSystemHash,
+            originalPrefixHashes: originalMessages.map(stablePrefixMessageHash),
+            compressedMessages: route.compressedMessages,
+            compressedSystem: route.compressedSystem,
+            hasCompressedSystem: route.hasCompressedSystem,
+            targetTokens: stable.targetTokens,
+            explicitTarget: stable.explicitTarget,
+            modelContextLimit: stable.modelContextLimit,
+        };
+        route.stablePrefix = prefix;
+        stable.installed = prefix;
+        boundedSet(state.stablePrefixes, sessionId, prefix);
+        state.compactNow.delete(sessionId);
+    }
     setMemoryRoute(state, key, route);
     if (key === JSON.stringify([sessionId, "main"]))
         state.lastMainRoute = route;
@@ -1690,34 +1863,277 @@ function installMemoryRoute(state, key, req, originalBody, originalMessages, com
 function forkRoutedBody(body, messages, route, sessionId, modelContextLimit) {
     if (!route)
         return { miss: "no-route" };
-    if (!sessionId || route.sessionId !== sessionId)
-        return { miss: "session" };
-    if (routeValueHash(normalizeRouteSystem(body.system)) !== route.originalSystemHash) {
-        return { miss: "system" };
+    const miss = prefixMismatch(body, messages, route, sessionId);
+    if (miss)
+        return { miss };
+    const buffer = prefixRoutedBody(body, messages, route).raw;
+    if (routedBodyExceedsContext(body, buffer, modelContextLimit))
+        return { miss: "too-large" };
+    return { body: buffer };
+}
+/**
+ * Why `messages` cannot continue from `prefix`, or null when they can: same
+ * session, same system prompt, every message the prefix covers unchanged, and
+ * at least one message after them. The suffix may be anything, human turns
+ * included.
+ */
+function prefixMismatch(body, messages, prefix, sessionId, hashMessage = routeMessageHash) {
+    if (!sessionId || prefix.sessionId !== sessionId)
+        return "session";
+    if (routeValueHash(normalizeRouteSystem(body.system)) !== prefix.originalSystemHash) {
+        return "system";
     }
-    const prefixLength = route.originalPrefixHashes.length;
+    const prefixLength = prefix.originalPrefixHashes.length;
     if (messages.length <= prefixLength)
-        return { miss: "prefix" };
+        return "prefix";
     for (let i = 0; i < prefixLength; i++) {
-        if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
-            return { miss: "prefix" };
+        if (hashMessage(messages[i]) !== prefix.originalPrefixHashes[i]) {
+            return "prefix";
         }
     }
+    return null;
+}
+/**
+ * Message identity for a stable prefix: routeMessageHash without assistant
+ * thinking blocks. A stable prefix spans human turns, and Claude Code does not
+ * reliably replay earlier turns' thinking (model switch, resume); those blocks
+ * are never sent on the prefix anyway (the compressed bytes stand in for them),
+ * so they must not decide whether it still matches.
+ */
+function stablePrefixMessageHash(message) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+        return routeMessageHash(message);
+    }
+    return routeMessageHash({
+        ...message,
+        content: message.content.filter((part) => part?.type !== "thinking" && part?.type !== "redacted_thinking"),
+    });
+}
+/**
+ * The request sent on a compressed prefix: the prefix's compressed messages
+ * (a JSON round trip of the stored bytes, so byte-identical every time), then
+ * the messages after the part it covers, verbatim, with Claude Code's current
+ * billing header grafted into the compressed system and the cache breakpoints
+ * capped at Anthropic's limit (the prefix's own marker always kept).
+ */
+function prefixRoutedBody(body, messages, prefix) {
     const routed = {
         ...body,
-        messages: [...cloneJson(route.compressedMessages), ...messages.slice(prefixLength)],
+        messages: [
+            ...cloneJson(prefix.compressedMessages),
+            ...messages.slice(prefix.originalPrefixHashes.length),
+        ],
     };
-    if (route.hasCompressedSystem) {
-        routed.system = currentRouteSystem(route.compressedSystem, body.system);
+    if (prefix.hasCompressedSystem) {
+        routed.system = currentRouteSystem(prefix.compressedSystem, body.system);
     }
     else {
         delete routed.system;
     }
-    capCacheBreakpoints(routed, route.compressedMessages.length);
-    const buffer = Buffer.from(JSON.stringify(routed), "utf-8");
-    if (routedBodyExceedsContext(body, buffer, modelContextLimit))
-        return { miss: "too-large" };
-    return { body: buffer };
+    capCacheBreakpoints(routed, prefix.compressedMessages.length);
+    return { body: routed, raw: Buffer.from(JSON.stringify(routed), "utf-8") };
+}
+function serverBudgetKey(model, modelContextLimit) {
+    return JSON.stringify([typeof model === "string" ? model : "", modelContextLimit]);
+}
+/**
+ * The session's whole-request budget: CCC_BUDGET_TOKENS when set (tests),
+ * else the model budget the server last reported for this model and window,
+ * else the window times FALLBACK_BUDGET_WINDOW_RATIO (servers that predate
+ * `model_budget_tokens`, and the first request before any response).
+ */
+function resolveBudget(opts, state, model, modelContextLimit) {
+    if (opts.budgetTokensOverride !== undefined) {
+        return { tokens: opts.budgetTokensOverride, source: "override" };
+    }
+    const reported = state.serverBudgets.get(serverBudgetKey(model, modelContextLimit));
+    if (reported !== undefined)
+        return { tokens: reported, source: "server" };
+    return {
+        tokens: Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO),
+        source: "window-ratio",
+    };
+}
+/** Remember the model budget a compress response reported. */
+function noteServerBudget(state, model, modelContextLimit, result) {
+    const tokens = result ? modelBudgetTokens(result) : undefined;
+    if (tokens === undefined)
+        return;
+    state.serverReportsBudget = true;
+    state.serverBudgets.set(serverBudgetKey(model, modelContextLimit), tokens);
+}
+/** `/memtree-compact` for this session, else CCC_COMPACT_TARGET, else automatic. */
+function compactionMode(opts, state, sessionId) {
+    const configured = sessionId !== undefined && state.compactTargets.has(sessionId)
+        ? state.compactTargets.get(sessionId)
+        : opts.defaultCompactTarget;
+    if (configured === null)
+        return { mode: "off" };
+    if (configured === undefined)
+        return { mode: "auto" };
+    return { mode: "explicit", tokens: configured };
+}
+/** What a compaction aims at: the explicit N (capped under the budget), else budget/2. */
+function compactionTarget(mode, budgetTokens) {
+    const target = mode.mode === "explicit"
+        ? Math.min(mode.tokens, Math.floor(budgetTokens * MAX_EXPLICIT_TARGET_BUDGET_RATIO))
+        : Math.floor(budgetTokens / 2);
+    return Math.max(SERVER_MIN_TARGET_TOKENS, target);
+}
+/**
+ * Target and threshold for compress calls other than a main-thread human turn
+ * (subagent and recap followups, tool-route recovery). They never build a
+ * stable prefix, so they only need to stay under the budget: a server that
+ * understands the threshold gets both, an older one gets neither and uses its
+ * own model budget. Never a bare target, which would force a compression on
+ * every call.
+ */
+function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
+    const mode = compactionMode(opts, state, sessionId);
+    if (mode.mode === "off" || !state.serverReportsBudget)
+        return {};
+    const budget = resolveBudget(opts, state, model, modelContextLimit);
+    return {
+        target: compactionTarget(mode, budget.tokens),
+        threshold: Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens),
+    };
+}
+/** Anthropic's whole input size for a request: uncached + cache read + cache write. */
+function reportedInputTokens(rec) {
+    const usage = rec.usage;
+    if (!usage || typeof usage.input_tokens !== "number")
+        return undefined;
+    return (usage.input_tokens +
+        (usage.cache_read_input_tokens ?? 0) +
+        (usage.cache_creation_input_tokens ?? 0));
+}
+/**
+ * Size of a body about to be sent: the reported size of an earlier request of
+ * the same shape plus bytes/4 for what was added since, or bytes/4 of the
+ * whole body when there is no earlier usage (or the body shrank).
+ */
+function estimateRequestTokens(sample, bytes) {
+    if (sample && bytes >= sample.forwardedBytes) {
+        return {
+            tokens: sample.tokens + approxTokensFromBytes(bytes - sample.forwardedBytes),
+            source: "reported",
+        };
+    }
+    return { tokens: approxTokensFromBytes(bytes), source: "bytes" };
+}
+/** Keep the newest (largest-body) reported size of a request on this prefix. */
+function notePrefixSize(prefix, rec, bytes) {
+    const tokens = reportedInputTokens(rec);
+    if (tokens === undefined)
+        return;
+    if (prefix.lastSize && bytes < prefix.lastSize.forwardedBytes)
+        return;
+    prefix.lastSize = { tokens, forwardedBytes: bytes };
+}
+/** Record the reported size of a main-thread request forwarded whole. */
+function notePassthroughSize(state, sessionId, rec, bytes) {
+    const tokens = reportedInputTokens(rec);
+    if (sessionId === undefined || tokens === undefined)
+        return;
+    boundedSet(state.passthroughSizes, sessionId, { tokens, forwardedBytes: bytes });
+}
+function boundedSet(map, key, value) {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > STABLE_PREFIX_MAX_SESSIONS) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined)
+            break;
+        map.delete(oldest);
+    }
+}
+/**
+ * Stable-prefix (edge) compaction for a main-thread human turn:
+ *
+ * - With a stored prefix that still matches the conversation and a size
+ *   (prefix + newer turns) under the budget: ride it, no compress call.
+ * - Otherwise compress: forced to the target when the prefix outgrew the
+ *   budget, the window/target changed, or `/memtree-compact` asked; while the
+ *   session is still passing through, let the server decide against the
+ *   budget (threshold), or — on a server that predates the threshold — force
+ *   only once the proxy's own estimate reaches the budget.
+ *
+ * Fills rec.compaction with the budget, estimate and reason.
+ */
+function planEdgeCompaction(args) {
+    const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } = args;
+    const mode = compactionMode(opts, state, sessionId);
+    const budget = resolveBudget(opts, state, body.model, modelContextLimit);
+    const compaction = {
+        mode: mode.mode,
+        budgetTokens: budget.tokens,
+        budgetSource: budget.source,
+    };
+    rec.compaction = compaction;
+    if (mode.mode === "off") {
+        state.stablePrefixes.delete(sessionId);
+        state.compactNow.delete(sessionId);
+        return { kind: "off" };
+    }
+    const targetTokens = compactionTarget(mode, budget.tokens);
+    const explicitTarget = mode.mode === "explicit";
+    compaction.targetTokens = targetTokens;
+    const forced = (reason, fallback) => {
+        compaction.reason = reason;
+        return {
+            kind: "compress",
+            target: targetTokens,
+            targetTokens,
+            explicitTarget,
+            reason,
+            ...(fallback ? { fallback } : {}),
+        };
+    };
+    let prefix = state.stablePrefixes.get(sessionId);
+    if (prefix) {
+        const miss = prefixMismatch(body, messages, prefix, sessionId, stablePrefixMessageHash);
+        if (miss) {
+            // Rewind, edit, fork, /clear, or a changed system prompt: the prefix no
+            // longer stands for this conversation. Start over from passthrough.
+            state.stablePrefixes.delete(sessionId);
+            compaction.prefixMiss = miss;
+            prefix = undefined;
+        }
+    }
+    if (prefix) {
+        boundedSet(state.stablePrefixes, sessionId, prefix);
+        const routed = prefixRoutedBody(body, messages, prefix);
+        const size = estimateRequestTokens(prefix.lastSize, routed.raw.length);
+        compaction.estimatedTokens = size.tokens;
+        compaction.sizeSource = size.source;
+        const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit);
+        const fallback = overWindow ? undefined : { prefix, routed };
+        if (state.compactNow.has(sessionId))
+            return forced("manual", fallback);
+        if (prefix.modelContextLimit !== modelContextLimit ||
+            (explicitTarget && prefix.targetTokens !== targetTokens)) {
+            return forced("target-change", fallback);
+        }
+        if (size.tokens >= budget.tokens || overWindow)
+            return forced("budget", fallback);
+        return { kind: "ride", prefix, routed };
+    }
+    if (state.compactNow.has(sessionId))
+        return forced("manual");
+    const size = estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
+    compaction.estimatedTokens = size.tokens;
+    compaction.sizeSource = size.source;
+    if (state.serverReportsBudget) {
+        // The server measures the request and compresses only past the budget.
+        const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
+        compaction.thresholdTokens = threshold;
+        return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
+    }
+    if (size.tokens >= budget.tokens)
+        return forced("budget");
+    // Under budget by our estimate, on a server that cannot take a threshold:
+    // no target, so it passes through unless over its own model budget.
+    return { kind: "compress", targetTokens, explicitTarget };
 }
 function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     // Model is deliberately not route identity: Claude Code switches models
@@ -2132,9 +2548,8 @@ function cloneJson(value) {
  */
 async function runBlockingCompression(args) {
     const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } = args;
-    const compactTarget = args.sessionId !== undefined && state.compactTargets.has(args.sessionId)
-        ? state.compactTargets.get(args.sessionId) ?? undefined
-        : opts.defaultCompactTarget;
+    const compaction = args.compaction ??
+        laneCompaction(opts, state, args.sessionId, body.model, modelContextLimit);
     const messageUsage = args.sessionId !== undefined && opts.transcriptUsage
         ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree)
         : undefined;
@@ -2147,7 +2562,12 @@ async function runBlockingCompression(args) {
         // server's budget telemetry names the variant it actually served.
         model: modelForMemtree(typeof body.model === "string" ? body.model : undefined, modelContextLimit),
         tools: Array.isArray(body.tools) ? body.tools : undefined,
-        ...(compactTarget !== undefined ? { compressionTargetTokens: compactTarget } : {}),
+        ...(compaction.target !== undefined
+            ? { compressionTargetTokens: compaction.target }
+            : {}),
+        ...(compaction.threshold !== undefined
+            ? { compressionThresholdTokens: compaction.threshold }
+            : {}),
         ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
         ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
         ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
@@ -2158,6 +2578,7 @@ async function runBlockingCompression(args) {
     // compress() maps every failure to a resolved null (it never rejects).
     const result = await opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta);
     const compressMs = Date.now() - compressStarted;
+    noteServerBudget(state, body.model, modelContextLimit, result);
     // Sampled at this call's settle, before a concurrent same-request failure of
     // another class can overwrite the complete-key entry.
     const failureArming = result === null &&

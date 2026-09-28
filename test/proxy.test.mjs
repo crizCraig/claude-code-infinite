@@ -2961,7 +2961,7 @@ test("/memtree-view is answered by the hook and blocked, without touching turn s
   }
 });
 
-test("/memtree-compact sets a per-session target that every later compression carries", async () => {
+test("/memtree-compact compacts the session's next message to its target (default half the budget)", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
@@ -2969,7 +2969,10 @@ test("/memtree-compact sets a per-session target that every later compression ca
   const headers = { "x-claude-code-session-id": "session-1" };
   const command = (prompt, session_id = "session-1") =>
     postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, session_id });
-  const lastTarget = () => memtreeSrv.calls.filter((c) => !c.index_only).at(-1).compression_target_tokens;
+  const lastCall = () => memtreeSrv.calls.filter((c) => !c.index_only).at(-1);
+  const lastTarget = () => lastCall().compression_target_tokens;
+  // claude-x has a 200k window; this server reports no model budget, so the
+  // budget is the window-ratio fallback: 160k, half of it 80k.
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), headers);
@@ -2977,15 +2980,20 @@ test("/memtree-compact sets a per-session target that every later compression ca
 
     const on = await command("/memtree-compact");
     assert.equal(on.body.decision, "block");
-    assert.match(on.body.reason, /compacting: .* about 50k tokens/);
+    assert.match(on.body.reason, /compacting: your next message .* about half the budget/);
     await armMainTurn(proxy, "turn three", "prompt-2");
     await postMessages(proxy.port, followupTurn("turn three"), headers);
-    assert.equal(lastTarget(), 50_000);
+    assert.equal(lastTarget(), 80_000);
+    assert.equal(lastCall().compression_threshold_tokens, undefined, "manual: forced, no threshold");
 
     assert.match((await command("/memtree-compact 120k")).body.reason, /about 120k tokens/);
     await armMainTurn(proxy, "turn four", "prompt-3");
     await postMessages(proxy.port, followupTurn("turn four"), headers);
     assert.equal(lastTarget(), 120_000);
+    // Compacted once: the next turn is back to the budget check (under it).
+    await armMainTurn(proxy, "turn 4b", "prompt-3b");
+    await postMessages(proxy.port, followupTurn("turn 4b"), headers);
+    assert.equal(lastTarget(), undefined);
 
     // Another session is unaffected.
     await armMainTurn(proxy, "turn five", "prompt-4");
@@ -2994,7 +3002,7 @@ test("/memtree-compact sets a per-session target that every later compression ca
 
     const help = await command("/memtree");
     assert.equal(help.body.decision, "block");
-    assert.match(help.body.reason, /^• \/memtree-view · .*\n• \/memtree-compact \[tokens \| off\] · .*default 50k, at least 20k/);
+    assert.match(help.body.reason, /^• \/memtree-view · .*\n• \/memtree-compact \[tokens \| off\] · .*default half the budget, at least 20k/);
     assert.match((await command("/memtree-compact nope")).body.reason, /usage:/);
     assert.match((await command("/memtree-compact 19k")).body.reason, /usage:.*at least 20k/);
     assert.match((await command("/memtree-compact 20k")).body.reason, /about 20k tokens/);
@@ -3002,6 +3010,7 @@ test("/memtree-compact sets a per-session target that every later compression ca
     await armMainTurn(proxy, "turn six", "prompt-5");
     await postMessages(proxy.port, followupTurn("turn six"), headers);
     assert.equal(lastTarget(), undefined);
+    assert.equal(lastCall().compression_threshold_tokens, undefined);
   } finally {
     proxy.close();
     upstream.close();
@@ -3369,19 +3378,28 @@ test("the compressed message's cache marker copies a 1h TTL, and a reused route 
   }
 });
 
-test("defaultCompactTarget sends compression_target_tokens for sessions without /memtree-compact", async () => {
+test("defaultCompactTarget is the target of a compaction, not a trigger: the budget still decides", async () => {
   const upstream = await mockUpstream();
-  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  // A server that reports its model budget understands the threshold.
+  const memtreeSrv = await mockMemtree(200, { ...compressedOnce, model_budget_tokens: 100_000 });
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     defaultCompactTarget: 20_000,
   });
+  const compressCalls = () => memtreeSrv.calls.filter((c) => !c.index_only);
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
-    await waitFor(() => memtreeSrv.calls.some((c) => !c.index_only));
-    assert.equal(memtreeSrv.calls.find((c) => !c.index_only).compression_target_tokens, 20_000);
+    // First call: the server's abilities are unknown and the conversation is
+    // far under the (fallback) budget, so nothing forces a compression.
+    assert.equal(compressCalls()[0].compression_target_tokens, undefined);
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"), { "x-claude-code-session-id": "session-1" });
+    // Now the server decides against the budget it reported; the env target
+    // is what it compresses to once over.
+    assert.equal(compressCalls()[1].compression_target_tokens, 20_000);
+    assert.equal(compressCalls()[1].compression_threshold_tokens, 100_000);
   } finally {
     proxy.close();
     upstream.close();
@@ -8043,5 +8061,391 @@ test("a first-user-shaped side call does not consume the boundary wipe", async (
     proxy.close();
     upstream.close();
     memtreeSrv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Stable compressed prefix (edge compaction)
+// ---------------------------------------------------------------------------
+
+const EPH = { type: "ephemeral" };
+const BIG = (tag, chars = 100_000) => `${tag} ` + "x".repeat(chars);
+
+/**
+ * A MemTree server that decides like the real one: a request compresses only
+ * with a target, and only when its size (chars/4) exceeds the threshold, or
+ * the target itself when no threshold was sent. `reportsBudget: false` models
+ * a server from before `model_budget_tokens` / `compression_threshold_tokens`.
+ */
+async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000 } = {}) {
+  let compressions = 0;
+  return mockMemtree(200, (body) => {
+    if (body.index_only) {
+      return {
+        messages: [],
+        usage: { prompt_tokens: 0, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+        index_only: true,
+      };
+    }
+    const size = Math.round(JSON.stringify(body.messages).length / 4);
+    const target = body.compression_target_tokens;
+    const threshold = reportsBudget ? body.compression_threshold_tokens ?? target : target;
+    const budget = reportsBudget ? { model_budget_tokens: modelBudget } : {};
+    if (target === undefined || size <= threshold) {
+      return {
+        messages: body.messages,
+        compressed: false,
+        usage: { prompt_tokens: size, completion_tokens: size, prompt_tokens_details: { cached_tokens: 1 } },
+        ...budget,
+      };
+    }
+    compressions += 1;
+    return {
+      messages: [{ role: "user", content: `memory ${compressions} ` + "m".repeat(3_000) }],
+      compressed: true,
+      usage: { prompt_tokens: size, completion_tokens: 900, prompt_tokens_details: { cached_tokens: size } },
+      ...budget,
+    };
+  });
+}
+
+/** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
+async function sizingUpstream() {
+  const bodies = [];
+  const srv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      bodies.push(JSON.parse(raw.toString("utf-8")));
+      const tokens = Math.floor(raw.length / 4);
+      const body = JSON.stringify({
+        type: "message",
+        id: "msg_upstream",
+        role: "assistant",
+        model: "claude-x",
+        content: [{ type: "text", text: "upstream answer" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 3, cache_read_input_tokens: tokens - 3, output_tokens: 1 },
+      });
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) });
+      res.end(body);
+    });
+  });
+  return { ...srv, bodies };
+}
+
+async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {} } = {}) {
+  const upstream = await sizingUpstream();
+  const memtreeSrv = await edgeMemtree(memtree);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    // null: no CCC_BUDGET_TOKENS override.
+    ...(budget === null ? {} : { budgetTokensOverride: budget }),
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    ...proxyOpts,
+  });
+  const session = "s-edge";
+  const messageRecs = () => records.filter((r) => r.kind === "messages");
+  const post = async (messages) => {
+    const before = messageRecs().length;
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-claude-code-session-id": session },
+      body: JSON.stringify({
+        model: "claude-x",
+        max_tokens: 64,
+        system: [{ type: "text", text: "sys", cache_control: EPH }],
+        messages,
+      }),
+    });
+    await res.json();
+    await waitFor(() => messageRecs().length > before);
+    return messageRecs().at(-1);
+  };
+  const command = (prompt) =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, session_id: session });
+  return {
+    upstream,
+    memtreeSrv,
+    records,
+    proxy,
+    post,
+    command,
+    compressCalls: () => memtreeSrv.calls.filter((c) => !c.index_only),
+    indexCalls: () => memtreeSrv.calls.filter((c) => c.index_only),
+    close: () => {
+      proxy.close();
+      upstream.close();
+      memtreeSrv.close();
+    },
+  };
+}
+
+const userText = (text) => ({ role: "user", content: [{ type: "text", text }] });
+const markedUser = (text) => ({ role: "user", content: [{ type: "text", text, cache_control: EPH }] });
+const assistantText = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
+const countMarkers = (b) =>
+  [
+    ...(Array.isArray(b.system) ? b.system : []),
+    ...b.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])),
+  ].filter((p) => p?.cache_control).length;
+
+test("edge compaction: passthrough under budget, one compaction to half at the budget, then byte-identical prefix rides until the budget is reached again", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+
+    // Under budget: passes through (the server decides; nothing to compress).
+    conv.push(assistantText("a1"), markedUser("q2"));
+    const t2 = await h.post(conv);
+    assert.equal(t2.turnType, "followup-noop");
+    assert.equal(t2.compaction.budgetTokens, 20_000);
+    assert.equal(t2.compaction.budgetSource, "override");
+    assert.equal(h.compressCalls().length, 1);
+    assert.equal(h.compressCalls()[0].compression_target_tokens, undefined, "first call: server abilities unknown");
+
+    // Crossing the budget: compress to half of it, once.
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const t3 = await h.post(conv);
+    assert.equal(t3.turnType, "followup-compressed");
+    assert.equal(t3.compaction.reason, "budget");
+    assert.equal(h.compressCalls().length, 2);
+    assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[1].compression_threshold_tokens, 20_000);
+    const compacted = h.upstream.bodies.at(-1);
+    assert.equal(compacted.messages.length, 1);
+    assert.deepEqual(compacted.messages[0].content[0].cache_control, EPH, "the prefix carries the cache marker");
+    const prefixLength = conv.length;
+
+    // Next human turn: no compress call, the stored prefix byte for byte, then
+    // everything after it verbatim.
+    conv[conv.length - 1] = userText(BIG("q3"));
+    conv.push(assistantText("a3"), markedUser("q4"));
+    const indexBefore = h.indexCalls().length;
+    const t4 = await h.post(conv);
+    assert.equal(t4.turnType, "followup-prefix");
+    assert.equal(t4.compress, undefined);
+    assert.equal(h.compressCalls().length, 2, "no compress call while the prefix is reused");
+    const ride = h.upstream.bodies.at(-1);
+    assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.deepEqual(ride.messages.slice(1), conv.slice(prefixLength));
+    assert.ok(countMarkers(ride) <= 4);
+    assert.ok(ride.messages[0].content[0].cache_control, "the prefix keeps its marker");
+    await waitFor(() => h.indexCalls().length > indexBefore);
+
+    // The turn's tool loop rides the same prefix bytes.
+    conv[conv.length - 1] = userText("q4");
+    conv.push(
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: EPH }] }
+    );
+    assert.equal((await h.post(conv)).turnType, "tool-memory");
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+
+    // Another human turn, still under budget: another ride, still no compress.
+    conv[conv.length - 1] = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
+    conv.push(assistantText("a4"), markedUser("q5"));
+    const t5 = await h.post(conv);
+    assert.equal(t5.turnType, "followup-prefix");
+    assert.equal(t5.compaction.sizeSource, "reported");
+    assert.ok(t5.compaction.estimatedTokens < 20_000);
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.equal(h.compressCalls().length, 2);
+
+    // Prefix + new turns reach the budget: recompress, forced to the target.
+    conv[conv.length - 1] = userText("q5");
+    conv.push(assistantText("a5"), markedUser(BIG("q6")));
+    const t6 = await h.post(conv);
+    assert.equal(t6.turnType, "followup-compressed");
+    assert.equal(t6.compaction.reason, "budget");
+    assert.ok(t6.compaction.estimatedTokens >= 20_000);
+    assert.equal(h.compressCalls().length, 3);
+    assert.equal(h.compressCalls()[2].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[2].compression_threshold_tokens, undefined);
+    const recompacted = h.upstream.bodies.at(-1);
+    assert.notEqual(JSON.stringify(recompacted.messages[0]), JSON.stringify(compacted.messages[0]));
+
+    // And the new prefix is the one reused from then on.
+    conv[conv.length - 1] = userText(BIG("q6"));
+    conv.push(assistantText("a6"), markedUser("q7"));
+    assert.equal((await h.post(conv)).turnType, "followup-prefix");
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(recompacted.messages[0]));
+    assert.equal(h.compressCalls().length, 3);
+    for (const body of h.upstream.bodies) assert.ok(countMarkers(body) <= 4, `${countMarkers(body)} markers`);
+  } finally {
+    h.close();
+  }
+});
+
+/** Drive a harness session to its first compaction; returns the conversation. */
+async function compactOnce(h) {
+  const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+  await h.post(conv);
+  conv.push(assistantText("a2"), userText(BIG("q3")));
+  const rec = await h.post(conv);
+  assert.equal(rec.turnType, "followup-compressed");
+  return conv;
+}
+
+test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses instead of riding", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    const calls = h.compressCalls().length;
+
+    // An edited earlier message: the prefix no longer stands for this history.
+    const edited = [userText("q1 (edited)"), ...conv.slice(1), assistantText("a3"), userText("q4")];
+    const miss = await h.post(edited);
+    assert.equal(miss.compaction.prefixMiss, "prefix");
+    assert.equal(miss.compaction.reason, "prefix-mismatch");
+    assert.equal(miss.turnType, "followup-compressed", "still over budget: compacted again");
+    assert.equal(h.compressCalls().length, calls + 1);
+
+    // /clear: a new, small conversation passes through again.
+    const cleared = await h.post([userText("new"), assistantText("hi"), userText("small")]);
+    assert.equal(cleared.compaction.prefixMiss, "prefix");
+    assert.equal(cleared.turnType, "followup-noop");
+    assert.equal(cleared.compaction.reason, undefined);
+    assert.equal(h.compressCalls().length, calls + 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: /memtree-compact off drops the prefix and passes through", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    assert.match((await h.command("/memtree-compact off")).body.reason, /compaction off/);
+    conv.push(assistantText("a3"), userText("q4"));
+    const off = await h.post(conv);
+    assert.equal(off.compaction.mode, "off");
+    assert.equal(off.turnType, "followup-noop", "sent whole");
+    const last = h.compressCalls().at(-1);
+    assert.equal(last.compression_target_tokens, undefined);
+    assert.equal(last.compression_threshold_tokens, undefined);
+    conv.push(assistantText("a4"), userText("q5"));
+    assert.notEqual((await h.post(conv)).turnType, "followup-prefix", "no prefix to ride");
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: /memtree-compact N compacts now to N, then rides", async () => {
+  const h = await edgeHarness({ budget: 100_000 });
+  try {
+    // ~37k tokens: under the 100k budget, so nothing compacts on its own.
+    const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2", 150_000))];
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    conv.push(assistantText("a2"), userText("q3"));
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+
+    assert.match((await h.command("/memtree-compact 30k")).body.reason, /about 30k tokens/);
+    conv.push(assistantText("a3"), userText("q4"));
+    const manual = await h.post(conv);
+    assert.equal(manual.turnType, "followup-compressed");
+    assert.equal(manual.compaction.reason, "manual");
+    assert.equal(manual.compaction.mode, "explicit");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, 30_000);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined, "forced");
+
+    const calls = h.compressCalls().length;
+    conv.push(assistantText("a4"), userText("q5"));
+    const next = await h.post(conv);
+    assert.equal(next.turnType, "followup-prefix");
+    assert.equal(next.compaction.targetTokens, 30_000);
+    assert.equal(h.compressCalls().length, calls);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction on a server without model_budget_tokens: the proxy's own estimate triggers the compaction", async () => {
+  const h = await edgeHarness({ budget: 20_000, memtree: { reportsBudget: false } });
+  try {
+    const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    assert.equal(h.compressCalls()[0].compression_target_tokens, undefined);
+    conv.push(assistantText("a2"), userText(BIG("q3")));
+    const crossed = await h.post(conv);
+    assert.equal(crossed.turnType, "followup-compressed");
+    assert.equal(crossed.compaction.reason, "budget");
+    assert.ok(crossed.compaction.estimatedTokens >= 20_000);
+    assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[1].compression_threshold_tokens, undefined);
+    conv.push(assistantText("a3"), userText("q4"));
+    assert.equal((await h.post(conv)).turnType, "followup-prefix");
+    assert.equal(h.compressCalls().length, 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction budget: context window x ratio until the server reports its model budget", async () => {
+  const h = await edgeHarness({ budget: null, memtree: { modelBudget: 150_000 } });
+  try {
+    const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+    const first = await h.post(conv);
+    assert.equal(first.compaction.budgetSource, "window-ratio");
+    assert.equal(first.compaction.budgetTokens, 160_000, "claude-x: 200k window x 0.8");
+    conv.push(assistantText("a2"), userText("q3"));
+    const second = await h.post(conv);
+    assert.equal(second.compaction.budgetSource, "server");
+    assert.equal(second.compaction.budgetTokens, 150_000);
+    assert.equal(second.compaction.targetTokens, 75_000);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, 150_000);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: a failed recompression rides the old prefix instead of sending the whole history", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    const compacted = h.upstream.bodies.at(-1);
+    // MemTree goes away; the next turn crosses the budget again.
+    h.memtreeSrv.server.closeAllConnections();
+    h.memtreeSrv.close();
+    conv.push(assistantText("a3"), userText(BIG("q4")));
+    const failed = await h.post(conv);
+    assert.equal(failed.turnType, "followup-prefix");
+    assert.equal(failed.compaction.reason, "budget");
+    assert.equal(failed.compaction.keptPrefix, true);
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: earlier thinking that Claude Code stops replaying does not break the prefix", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const thinking = { type: "thinking", thinking: "hmm", signature: "sig" };
+    const conv = [
+      userText("q1"),
+      { role: "assistant", content: [thinking, { type: "text", text: "a1" }] },
+      userText("q2"),
+    ];
+    await h.post(conv);
+    conv.push(assistantText("a2"), userText(BIG("q3")));
+    assert.equal((await h.post(conv)).turnType, "followup-compressed");
+    const replayed = [
+      conv[0],
+      { role: "assistant", content: [{ type: "text", text: "a1" }] },
+      ...conv.slice(2),
+      assistantText("a3"),
+      userText("q4"),
+    ];
+    const next = await h.post(replayed);
+    assert.equal(next.turnType, "followup-prefix");
+    assert.equal(next.compaction.prefixMiss, undefined);
+  } finally {
+    h.close();
   }
 });

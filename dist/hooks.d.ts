@@ -29,7 +29,10 @@ export declare const MEMTREE_HELP_COMMAND = "memtree";
 export declare const SESSION_PLUGIN_NAME = "ccc";
 /** `/memtree-view`: print this session's MemTree page link. */
 export declare const MEMTREE_VIEW_COMMAND = "memtree-view";
-/** `/memtree-compact [tokens|off]`: keep this session compressed from now on. */
+/**
+ * `/memtree-compact [tokens|off]`: compact this session on its next message
+ * and keep that compressed history until the budget is reached again.
+ */
 export declare const MEMTREE_COMPACT_COMMAND = "memtree-compact";
 /**
  * The arguments of a submitted `/<name>` (bare or `/ccc:`-qualified), or

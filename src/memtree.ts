@@ -73,6 +73,14 @@ export interface CompressRequestMeta {
    */
   compressionTargetTokens?: number;
   /**
+   * Server `compression_threshold_tokens`: compress only when the whole
+   * request exceeds this many tokens, and then to `compressionTargetTokens`.
+   * Without it the target is also the threshold. Servers that predate the
+   * field ignore it (they also omit `model_budget_tokens`, which is how the
+   * proxy tells them apart).
+   */
+  compressionThresholdTokens?: number;
+  /**
    * Each assistant message's response usage (output, thinking, input), keyed
    * by its position in the messages sent. Archived by the server for the
    * MemTree page; never hashed, never part of the compression cache key.
@@ -108,6 +116,11 @@ export interface CompressResult {
    * back to the cached_tokens heuristic (see didMemtreeCompress).
    */
   compressed?: boolean;
+  /**
+   * The model's whole-request budget the server computed (tokens), whatever
+   * target the request set. Servers that predate it omit the field.
+   */
+  model_budget_tokens?: number;
   /**
    * Optional explicit unfolded index, consumed only by the memoryChars
    * reqlog diagnostic. Older servers omit it; callers fall back to the first
@@ -184,6 +197,14 @@ export function cachedPromptTokenCount(
     Number.isFinite(cachedTokens) &&
     cachedTokens >= 0
     ? cachedTokens
+    : undefined;
+}
+
+/** The server-reported model budget, when present and sane. */
+export function modelBudgetTokens(result: CompressResult): number | undefined {
+  const value = result.model_budget_tokens;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
     : undefined;
 }
 
@@ -932,6 +953,7 @@ export class MemtreeClient {
       model: meta?.model,
       tools: meta?.tools,
       compressionTargetTokens: meta?.compressionTargetTokens,
+      compressionThresholdTokens: meta?.compressionThresholdTokens,
       messageUsage: meta?.messageUsage,
       sessionId: meta?.sessionId,
       clientMeta: meta?.clientMeta,
@@ -1061,6 +1083,7 @@ export class MemtreeClient {
           modelContextLimit,
           toolsHash,
           meta?.compressionTargetTokens ?? null,
+          meta?.compressionThresholdTokens ?? null,
         ])
       )
       .digest("hex");
@@ -1084,6 +1107,7 @@ export class MemtreeClient {
       model?: string;
       tools?: unknown[];
       compressionTargetTokens?: number;
+      compressionThresholdTokens?: number;
       messageUsage?: MessageUsage;
       sessionId?: string;
       clientMeta?: Record<string, string>;
@@ -1108,6 +1132,9 @@ export class MemtreeClient {
       if (tools !== undefined) body.tools = tools;
       if (opts.compressionTargetTokens !== undefined) {
         body.compression_target_tokens = opts.compressionTargetTokens;
+      }
+      if (opts.compressionThresholdTokens !== undefined) {
+        body.compression_threshold_tokens = opts.compressionThresholdTokens;
       }
       // Compress calls only: the server adds the thinking tokens (stripped
       // from `messages` above) to its budget, since a passthrough forwards
@@ -1134,6 +1161,7 @@ export class MemtreeClient {
       memoryChars?: number;
       memtreeUrl?: string;
       memtreeIndex?: string;
+      modelBudgetTokens?: number;
     } = {};
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -1198,6 +1226,9 @@ export class MemtreeClient {
       diagnostics = {
         ...(memtreeUrl ? { memtreeUrl } : {}),
         ...(memtreeIndex ? { memtreeIndex } : {}),
+        ...(modelBudgetTokens(json) !== undefined
+          ? { modelBudgetTokens: modelBudgetTokens(json) }
+          : {}),
         indexedTokens: cachedPromptTokenCount(json),
         rawPromptTokens: rawPromptTokenCount(json),
         // Explicit field when the server sends one, else the first non-system

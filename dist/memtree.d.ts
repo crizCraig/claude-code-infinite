@@ -51,6 +51,14 @@ export interface CompressRequestMeta {
      */
     compressionTargetTokens?: number;
     /**
+     * Server `compression_threshold_tokens`: compress only when the whole
+     * request exceeds this many tokens, and then to `compressionTargetTokens`.
+     * Without it the target is also the threshold. Servers that predate the
+     * field ignore it (they also omit `model_budget_tokens`, which is how the
+     * proxy tells them apart).
+     */
+    compressionThresholdTokens?: number;
+    /**
      * Each assistant message's response usage (output, thinking, input), keyed
      * by its position in the messages sent. Archived by the server for the
      * MemTree page; never hashed, never part of the compression cache key.
@@ -85,6 +93,11 @@ export interface CompressResult {
      * back to the cached_tokens heuristic (see didMemtreeCompress).
      */
     compressed?: boolean;
+    /**
+     * The model's whole-request budget the server computed (tokens), whatever
+     * target the request set. Servers that predate it omit the field.
+     */
+    model_budget_tokens?: number;
     /**
      * Optional explicit unfolded index, consumed only by the memoryChars
      * reqlog diagnostic. Older servers omit it; callers fall back to the first
@@ -129,6 +142,8 @@ export declare function serverFlattenedMessages(result: CompressResult): Message
 export declare function didMemtreeCompress(result: CompressResult): boolean;
 /** Number of original prompt tokens covered by the index MemTree selected. */
 export declare function cachedPromptTokenCount(result: CompressResult): number | undefined;
+/** The server-reported model budget, when present and sane. */
+export declare function modelBudgetTokens(result: CompressResult): number | undefined;
 /**
  * MemTree's informational estimate of the original, pre-consolidation prompt.
  * Newer servers include images as visual-token estimates and deliberately keep

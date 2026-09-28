@@ -44,7 +44,10 @@ export const MEMTREE_HELP_COMMAND = "memtree";
 export const SESSION_PLUGIN_NAME = "ccc";
 /** `/memtree-view`: print this session's MemTree page link. */
 export const MEMTREE_VIEW_COMMAND = "memtree-view";
-/** `/memtree-compact [tokens|off]`: keep this session compressed from now on. */
+/**
+ * `/memtree-compact [tokens|off]`: compact this session on its next message
+ * and keep that compressed history until the budget is reached again.
+ */
 export const MEMTREE_COMPACT_COMMAND = "memtree-compact";
 const UNAVAILABLE_BODY =
   "Reply with exactly this one line and nothing else: \"MemTree is not reachable right now; try again in a moment.\"\n";
@@ -59,7 +62,7 @@ const SESSION_COMMANDS: Record<string, string> = {
   [MEMTREE_VIEW_COMMAND]:
     "---\ndescription: Show the link to this session's MemTree page\n---\n" + UNAVAILABLE_BODY,
   [MEMTREE_COMPACT_COMMAND]:
-    "---\ndescription: Keep this session compressed by MemTree from now on (optional token target, or off)\n" +
+    "---\ndescription: Compact this session with MemTree now and keep the compressed history (optional token target, or off)\n" +
     "argument-hint: [tokens | off]\n---\n" + UNAVAILABLE_BODY,
 };
 
