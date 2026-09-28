@@ -154,4 +154,15 @@ export declare function memtreePageId(pageUrl: string): string | undefined;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
+/**
+ * Keep a request within Anthropic's breakpoint limit after the compressed
+ * prefix (which carries one) is joined to Claude Code's own suffix. Drops
+ * the earliest suffix breakpoints first, never the compressed prefix's or
+ * the request's last one, so both the big prefix and the growing tail stay
+ * cached.
+ */
+declare function capCacheBreakpoints(body: Record<string, any>, _prefixLength?: number): void;
+/** Test seam. */
+export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
+export {};
 //# sourceMappingURL=proxy.d.ts.map

@@ -277,6 +277,8 @@ async function main() {
         // turns the filter off.
         claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
         defaultCompactTarget: compactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
+        // Debugging: write every forwarded Anthropic request body to this directory.
+        ...(process.env.CCC_CAPTURE_DIR ? { captureDir: process.env.CCC_CAPTURE_DIR } : {}),
         // Test-only: a small budget so a cheap session crosses it in a few turns.
         budgetTokensOverride: budgetFromEnv(process.env.CCC_BUDGET_TOKENS),
         // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page

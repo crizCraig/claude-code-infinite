@@ -3379,22 +3379,39 @@ function forEachCacheControl(
  * the request's last one, so both the big prefix and the growing tail stay
  * cached.
  */
-function capCacheBreakpoints(body: Record<string, any>, prefixLength: number): void {
+function capCacheBreakpoints(body: Record<string, any>, _prefixLength?: number): void {
+  // Protected: the compressed prefix's own marker (always on messages[0], the
+  // flattened memory) and the newest marker. Everything else goes, oldest
+  // first: message markers after the prefix (a reused prefix route carries
+  // earlier turns' messages, with Claude Code's markers still on them), then
+  // system and tool markers, which the prefix marker's cache entry covers
+  // anyway because it comes after them. Anthropic rejects more than 4.
   let excess = countCacheBreakpoints(body) - MAX_CACHE_BREAKPOINTS;
-  if (excess <= 0 || !Array.isArray(body.messages)) return;
-  const last = lastCacheBreakpoint(body.messages);
-  for (let i = prefixLength; i < body.messages.length && excess > 0; i++) {
-    const content = body.messages[i]?.content;
-    if (!Array.isArray(content)) continue;
-    body.messages[i] = {
-      ...body.messages[i],
-      content: content.map((part: any, j: number) => {
-        if (excess <= 0 || !part?.cache_control || (i === last?.[0] && j === last?.[1])) return part;
-        excess--;
-        const { cache_control: _dropped, ...rest } = part;
-        return rest;
-      }),
-    };
+  if (excess <= 0) return;
+  const last = Array.isArray(body.messages) ? lastCacheBreakpoint(body.messages) : undefined;
+  if (Array.isArray(body.messages)) {
+    for (let i = 1; i < body.messages.length && excess > 0; i++) {
+      const content = body.messages[i]?.content;
+      if (!Array.isArray(content)) continue;
+      body.messages[i] = {
+        ...body.messages[i],
+        content: content.map((part: any, j: number) => {
+          if (excess <= 0 || !part?.cache_control || (i === last?.[0] && j === last?.[1])) return part;
+          excess--;
+          const { cache_control: _dropped, ...rest } = part;
+          return rest;
+        }),
+      };
+    }
+  }
+  for (const key of ["system", "tools"] as const) {
+    if (excess <= 0 || !Array.isArray(body[key])) continue;
+    body[key] = body[key].map((part: any) => {
+      if (excess <= 0 || !part || typeof part !== "object" || !part.cache_control) return part;
+      excess--;
+      const { cache_control: _dropped, ...rest } = part;
+      return rest;
+    });
   }
 }
 
@@ -4865,3 +4882,6 @@ function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
     stream.on("error", reject);
   });
 }
+
+/** Test seam. */
+export const __testCapCacheBreakpoints = capCacheBreakpoints;

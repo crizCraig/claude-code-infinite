@@ -3407,6 +3407,43 @@ test("defaultCompactTarget is the target of a compaction, not a trigger: the bud
   }
 });
 
+test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28 Anthropic 400)", async () => {
+  const { __testCapCacheBreakpoints: cap } = await import("../dist/proxy.js");
+  const hour = { type: "ephemeral", ttl: "1h" };
+  // Layout of the failing request: 2 system markers, the prefix marker, a stale
+  // Claude Code marker on an earlier turn's message, and the newest marker.
+  const body = {
+    system: [{ type: "text", text: "hdr" }, { type: "text", text: "a" }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "memory", cache_control: hour }] },
+      { role: "assistant", content: [{ type: "text", text: "x" }] },
+      { role: "user", content: [{ type: "text", text: "turn" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "r", cache_control: hour }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "u", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "u", content: "r", cache_control: hour }] },
+    ],
+  };
+  cap(body, 5);
+  const markers = [...body.system, ...body.messages.flatMap((m) => m.content)].filter((p) => p.cache_control);
+  assert.equal(markers.length, 4);
+  assert.ok(body.messages[0].content[0].cache_control, "the prefix keeps its marker");
+  assert.ok(body.messages[6].content[0].cache_control, "the newest block keeps its marker");
+  assert.equal(body.messages[4].content[0].cache_control, undefined, "the stale suffix marker goes first");
+
+  // Still too many after the messages: system markers go next.
+  const heavy = {
+    system: [{ type: "text", text: "a", cache_control: hour }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "memory", cache_control: hour }] },
+      { role: "user", content: [{ type: "text", text: "q", cache_control: hour }] },
+    ],
+  };
+  cap(heavy, 1);
+  assert.equal([...heavy.system, ...heavy.messages.flatMap((m) => m.content)].filter((p) => p.cache_control).length, 4);
+  assert.ok(heavy.messages[0].content[0].cache_control && heavy.messages[1].content[0].cache_control);
+});
+
 test("placements 'stop' and 'off'", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
