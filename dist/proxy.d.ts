@@ -132,6 +132,8 @@ export interface RunningProxy {
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
+/** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
+export declare function memtreePageId(pageUrl: string): string | undefined;
 /** Default `/memtree-compact` target: the server's own static fallback budget. */
 export declare const MEMTREE_COMPACT_DEFAULT_TOKENS = 50000;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;

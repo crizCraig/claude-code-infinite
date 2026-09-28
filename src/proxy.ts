@@ -701,6 +701,12 @@ async function handleRequest(
     return handleNoticeHook(req, res, state, opts.reqlog);
   }
 
+  if (
+    req.method === "GET" &&
+    (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)
+  ) {
+    return handleMemTreeCurrent(req, res, opts, state, url);
+  }
   if (req.method === "GET" && url.pathname.startsWith(MEMTREE_PASSTHROUGH_PREFIX)) {
     return handleMemTreePassthrough(req, res, opts, url);
   }
@@ -755,6 +761,88 @@ async function handleMemTreePassthrough(
   } catch (err) {
     res.writeHead(502, { "content-type": "application/json" });
     res.end(JSON.stringify({ detail: `MemTree fetch failed: ${String(err)}` }));
+  }
+}
+
+/**
+ * `GET /memtree/current[.json][?session=<Claude Code session id>]`: the page
+ * the newest main request was served from — what the `memtree` MCP server
+ * reads (memtree-mcp.ts). Bare `current` answers the pointer
+ * `{id, url, index, session_id, compressed}` without an upstream call, so the
+ * MCP server can keep its cached tree until the page changes; `current.json`
+ * relays the page JSON itself, like `/memtree/<id>.json`.
+ *
+ * One Claude Code runs per ccc proxy, so the newest page this proxy served is
+ * the current conversation's even when `session` names another id (Claude
+ * Code hands MCP servers the id they were started under, which a fork,
+ * `/resume` or `/clear` can leave stale). `session` matters only before this
+ * proxy has served any page: then it selects the session's newest page from
+ * the on-disk link store (a resumed session's first turn). 404 when neither
+ * has one.
+ */
+async function handleMemTreeCurrent(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  opts: ProxyOptions,
+  state: ProxyState,
+  url: URL
+): Promise<void> {
+  const sessionId = url.searchParams.get("session") || undefined;
+  const page = currentMemtreePage(state, sessionId);
+  const id = page ? memtreePageId(page.url) : undefined;
+  if (!page || !id) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "No MemTree page for this session yet" }));
+    return;
+  }
+  if (!url.pathname.endsWith(".json")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id,
+        url: page.url,
+        index: page.index,
+        session_id: page.sessionId ?? null,
+        compressed: page.compressed,
+      })
+    );
+    return;
+  }
+  try {
+    const upstream = await opts.memtree.fetchMemTree(
+      `/usage/memtree/${id}.json`,
+      req.headers.accept ?? "application/json"
+    );
+    res.writeHead(upstream.status, {
+      "content-type": upstream.contentType,
+      "x-memtree-page": page.url,
+    });
+    res.end(upstream.body);
+  } catch (err) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: `MemTree fetch failed: ${String(err)}` }));
+  }
+}
+
+const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+
+function currentMemtreePage(
+  state: ProxyState,
+  sessionId: string | undefined
+): { url: string; index: string; compressed: boolean; sessionId?: string } | undefined {
+  if (state.latestMemtreeUrl) return state.latestMemtreeUrl;
+  if (!sessionId) return undefined;
+  const stored = state.memtreeLinkStore?.get(sessionId);
+  return stored ? { ...stored, sessionId } : undefined;
+}
+
+/** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
+export function memtreePageId(pageUrl: string): string | undefined {
+  try {
+    const match = /\/(?:m|usage\/memtree)\/([A-Za-z0-9-]+?)(?:\.json)?$/.exec(new URL(pageUrl).pathname);
+    return match?.[1];
+  } catch {
+    return undefined;
   }
 }
 

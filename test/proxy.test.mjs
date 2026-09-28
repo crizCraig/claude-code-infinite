@@ -3479,6 +3479,114 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
   }
 });
 
+test("GET /memtree/current[.json]: the newest served page, else the session's stored page, else 404", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const file = pathMod.join(fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-current-")), "links.json");
+  new MemtreeLinkStore(file).put("resumed-session", { url: PAGE_URL_2, index: "index-old", compressed: true });
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  // Compress POSTs stamp PAGE_URL_1; page GETs answer a tree.
+  const memtreeSrv = await listenMemtree((req, res) => {
+    if (req.method === "GET") {
+      pageGets.push(req.url);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodes: [{ id: 0, s: "root", k: [] }], blocks: [] }));
+      return;
+    }
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json", ...pageHeaders(PAGE_URL_1, "index-a") });
+      res.end(JSON.stringify(compressedOnce));
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  const get = (path) => fetch(`http://127.0.0.1:${proxy.port}${path}`);
+  try {
+    assert.equal((await get("/memtree/current")).status, 404, "nothing served, no session");
+    assert.equal((await get("/memtree/current?session=unknown")).status, 404);
+    assert.equal(pageGets.length, 0);
+    // Before this proxy served a page: the session's stored page (resume).
+    assert.deepEqual(await (await get("/memtree/current?session=resumed-session")).json(), {
+      id: "0f1c2d3e4a5b",
+      url: PAGE_URL_2,
+      index: "index-old",
+      session_id: "resumed-session",
+      compressed: true,
+    });
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const pointer = await (await get("/memtree/current?session=session-1")).json();
+    assert.deepEqual(pointer, {
+      id: "ea18af90658b",
+      url: PAGE_URL_1,
+      index: "index-a",
+      session_id: "session-1",
+      compressed: true,
+    });
+    // The served page wins over a stale or forked session id: one Claude Code per proxy.
+    assert.equal((await (await get("/memtree/current?session=resumed-session")).json()).id, "ea18af90658b");
+    assert.equal((await (await get("/memtree/current")).json()).id, "ea18af90658b");
+    assert.equal(pageGets.length, 0, "the pointer never calls upstream");
+
+    const page = await get("/memtree/current.json");
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get("x-memtree-page"), PAGE_URL_1);
+    assert.deepEqual((await page.json()).nodes, [{ id: 0, s: "root", k: [] }]);
+    assert.deepEqual(pageGets, ["/usage/memtree/ea18af90658b.json"]);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("x-memtree-tools rides compress calls only when the memtree MCP tools are configured", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const run = async (memtreeTools) => {
+    const proxy = await startProxy({
+      memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k", memtreeTools }),
+      upstreamOrigin: upstream.origin,
+    });
+    const from = memtreeSrv.calls.length;
+    const headers = { "x-claude-code-session-id": `session-${from}` };
+    try {
+      await armMainTurn(proxy, "turn two", "prompt-1");
+      await postMessages(proxy.port, followupTurn("turn two"), headers);
+      await postMessages(proxy.port, [{ role: "user", content: `first message ${from}` }], headers);
+      await waitFor(() => {
+        const mine = memtreeSrv.calls.slice(from);
+        return mine.some((c) => !c.index_only) && mine.some((c) => c.index_only);
+      });
+      return memtreeSrv.calls.slice(from).map((c, i) => ({
+        indexOnly: !!c.index_only,
+        tools: memtreeSrv.callHeaders[from + i]["x-memtree-tools"],
+      }));
+    } finally {
+      proxy.close();
+    }
+  };
+  try {
+    const on = await run("search,read_node,read_lines");
+    assert.ok(on.filter((c) => !c.indexOnly).every((c) => c.tools === "search,read_node,read_lines"));
+    assert.ok(on.filter((c) => c.indexOnly).every((c) => c.tools === undefined), "index-only calls return no memory");
+    const off = await run(undefined);
+    assert.ok(off.length >= 2);
+    assert.ok(off.every((c) => c.tools === undefined));
+  } finally {
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("Stop-only arm → compress → systemMessage fallback delivers without MessageDisplay", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, {

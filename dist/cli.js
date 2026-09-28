@@ -25,6 +25,8 @@ import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parse
 import { checkForUpdate } from "./update-check.js";
 import { isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
+import { runMemtreeMcpServer } from "./memtree-mcp.js";
+import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, } from "./config.js";
@@ -162,6 +164,13 @@ async function main() {
     if (filteredArgs[0] === "fetch") {
         process.exit(await runMemtreeFetchCommand(filteredArgs.slice(1)));
     }
+    // `ccc memtree-mcp`: the `memtree` MCP server over stdio (memtree-mcp.ts),
+    // for an --mcp-config a caller writes (e.g. the memory recall probe). It
+    // reads the tree through the ccc proxy in its inherited ANTHROPIC_BASE_URL.
+    if (filteredArgs[0] === "memtree-mcp") {
+        runMemtreeMcpServer();
+        return;
+    }
     const mode = filteredArgs[0] === "local" ? "local" :
         filteredArgs[0] === "staging" ? "staging" :
             "production";
@@ -231,6 +240,12 @@ async function main() {
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
     const reqlog = new RequestLogger();
+    // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
+    // interactive sessions unless CCC_MEMTREE_MCP=0; print/non-TTY runs have it
+    // only when their own --mcp-config names it. Either way MemTree is told
+    // (x-memtree-tools) only when the session really has the tools.
+    const autoMemtreeMcp = interactiveUi && memtreeMcpEnabledByEnv(process.env);
+    const memtreeToolsConfigured = autoMemtreeMcp || argsConfigureMemtreeMcp(claudeArgs);
     // Start the local proxy. Claude Code's OAuth token flows through it straight
     // to api.anthropic.com and never reaches polychat.co.
     const memtree = new MemtreeClient({
@@ -238,6 +253,8 @@ async function main() {
         apiKey: polychatApiKey,
         debug: isDebugMode,
         reqlog,
+        // Mutable below: a failed config write withdraws it before any call.
+        memtreeTools: memtreeToolsConfigured ? MEMTREE_TOOLS_HEADER_VALUE : undefined,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
@@ -304,6 +321,22 @@ async function main() {
             }
         }
     }
+    let memtreeMcpConfig = null;
+    if (autoMemtreeMcp) {
+        try {
+            memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`);
+            childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path);
+        }
+        catch (err) {
+            // Optional like the notice plugin; without it MemTree must not name
+            // tools the session lacks.
+            if (!argsConfigureMemtreeMcp(claudeArgs))
+                memtree.setMemtreeTools(undefined);
+            if (isDebugMode) {
+                console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
+            }
+        }
+    }
     // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
     // native login and sends its own OAuth bearer to the local base URL.
     const child = spawn("claude", childArgs, {
@@ -316,6 +349,7 @@ async function main() {
             return;
         shuttingDown = true;
         noticePlugin?.close();
+        memtreeMcpConfig?.close();
         // Stop new proxy work and give active handlers a bounded chance to
         // finalize their records. Background indexing is a separate log producer:
         // stop and drain it too before waiting for scheduled JSONL appends on

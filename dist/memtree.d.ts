@@ -28,6 +28,13 @@ export interface MemtreeOptions {
     debug?: boolean;
     /** Always-on JSONL diagnostics; every MemTree call logs one line. */
     reqlog?: RequestLogSink;
+    /**
+     * `x-memtree-tools` on compress calls: the memtree MCP tools this Claude
+     * Code session has (e.g. "search,read_node,read_lines"), so the server can
+     * tell the model how to use them in the memory it returns. Set only when
+     * the `memtree` MCP server is configured for the session (memtree-mcp-config.ts).
+     */
+    memtreeTools?: string;
 }
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
@@ -200,6 +207,7 @@ export declare class MemtreeClient {
     private compressTimeoutMs;
     private debug;
     private reqlog;
+    private memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     private compressCache;
     /** Message hashes already submitted for background indexing. */
@@ -224,6 +232,8 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** Change the `x-memtree-tools` value for later calls (undefined: none). */
+    setMemtreeTools(value: string | undefined): void;
     /**
      * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
      * polychat host with this client's key. Backs the loopback `/memtree/*`

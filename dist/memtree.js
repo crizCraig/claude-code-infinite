@@ -635,6 +635,7 @@ export class MemtreeClient {
     compressTimeoutMs;
     debug;
     reqlog;
+    memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     compressCache = new Map();
     /** Message hashes already submitted for background indexing. */
@@ -662,6 +663,10 @@ export class MemtreeClient {
      */
     get compressBudgetMs() {
         return this.compressTimeoutMs;
+    }
+    /** Change the `x-memtree-tools` value for later calls (undefined: none). */
+    setMemtreeTools(value) {
+        this.memtreeTools = value || undefined;
     }
     /**
      * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
@@ -692,6 +697,7 @@ export class MemtreeClient {
                 Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
         this.debug = opts.debug ?? false;
         this.reqlog = opts.reqlog;
+        this.memtreeTools = opts.memtreeTools || undefined;
     }
     static hashMessages(messages) {
         return createHash("sha256")
@@ -928,6 +934,10 @@ export class MemtreeClient {
                     ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
                     ...(opts.clientMeta && Object.keys(opts.clientMeta).length
                         ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                        : {}),
+                    // Compress calls only: an index-only call returns no memory.
+                    ...(this.memtreeTools && !opts.indexOnly
+                        ? { "x-memtree-tools": this.memtreeTools }
                         : {}),
                 },
                 body: payload,

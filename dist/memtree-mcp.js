@@ -1,0 +1,254 @@
+/**
+ * `memtree` MCP server: lets the agent search and read its own session's
+ * MemTree (tools `search`, `read_node`, `read_lines`, which Claude Code
+ * exposes as `mcp__memtree__*`).
+ *
+ * A minimal JSON-RPC 2.0 server over stdio (newline-delimited messages, the
+ * MCP stdio transport); no SDK dependency. Started by Claude Code from the
+ * `--mcp-config` ccc passes (interactive sessions) or one the caller passes
+ * (`ccc memtree-mcp`, e.g. the memory recall probe).
+ *
+ * Which tree: the loopback proxy of the ccc that launched this Claude Code
+ * (`CCC_MEMTREE_PROXY`, else the inherited `ANTHROPIC_BASE_URL`) answers
+ * `GET /memtree/current?session=<id>` with the newest page it served — the
+ * tree the current request was compressed against. The session id is the
+ * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers; the proxy uses it
+ * only when it has served no page yet (a resumed session's first turn). The
+ * page JSON is fetched through the proxy's key-free `/memtree/<id>.json`
+ * relay, cached, and refetched when the proxy's newest page changes.
+ */
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { formatLines, formatNode, formatSearch, MemtreeIndex, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
+import { CLIENT_VERSION } from "./memtree.js";
+export const MEMTREE_MCP_SERVER_NAME = "memtree";
+/** Sent to MemTree as `x-memtree-tools` when this server is configured. */
+export const MEMTREE_TOOL_NAMES = ["search", "read_node", "read_lines"];
+const LATEST_PROTOCOL_VERSION = "2025-06-18";
+const FETCH_TIMEOUT_MS = 60_000;
+export const MEMTREE_TOOLS = [
+    {
+        name: "search",
+        description: "Search this session's MemTree — the index of the earlier conversation that was summarized out of your context — for exact details " +
+            "(names, ids, numbers, file paths, commands, errors, decisions). Case-insensitive term matching over node summaries and the verbatim " +
+            "transcript lines under each leaf; returns the best nodes with their summaries, leaf line ranges and matching lines. " +
+            "Use it before answering \"I don't know\" about something from earlier in the session.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Words to look for; distinctive terms work best (e.g. a file name, id or error text)." },
+                limit: {
+                    type: "number",
+                    description: `Maximum results (default ${SEARCH_DEFAULT_LIMIT}, at most ${SEARCH_MAX_LIMIT}).`,
+                },
+            },
+            required: ["query"],
+        },
+    },
+    {
+        name: "read_node",
+        description: "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
+            "for a leaf, the transcript line range it covers. Node 0 is the root.",
+        inputSchema: {
+            type: "object",
+            properties: { id: { type: "number", description: "Node id (0 is the root)." } },
+            required: ["id"],
+        },
+    },
+    {
+        name: "read_lines",
+        description: "Read exact transcript lines of the summarized conversation: block and 1-based inclusive start/end lines, as given by a leaf's range. " +
+            `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped.`,
+        inputSchema: {
+            type: "object",
+            properties: {
+                block: { type: "number", description: "Block index (a leaf's first range number)." },
+                start: { type: "number", description: "First line, 1-based." },
+                end: { type: "number", description: "Last line, inclusive." },
+            },
+            required: ["block", "start", "end"],
+        },
+    },
+];
+/** Resolves, fetches and caches the current page. */
+export class CurrentTree {
+    deps;
+    cached;
+    fetchImpl;
+    constructor(deps) {
+        this.deps = deps;
+        this.fetchImpl = deps.fetch ?? globalThis.fetch;
+    }
+    async get() {
+        const base = this.deps.proxyUrl?.replace(/\/$/, "");
+        if (!base) {
+            throw new ToolInputError("MemTree tools need a running ccc session: neither CCC_MEMTREE_PROXY nor ANTHROPIC_BASE_URL is set.");
+        }
+        const query = this.deps.sessionId ? `?session=${encodeURIComponent(this.deps.sessionId)}` : "";
+        const pointer = await this.getJson(`${base}/memtree/current${query}`);
+        if (pointer.status === 404) {
+            throw new ToolInputError("This session has no MemTree yet: nothing has been indexed or compressed so far, so everything is still in your context.");
+        }
+        if (!pointer.ok)
+            throw new ToolInputError(`MemTree unavailable (current page: ${pointer.error})`);
+        const current = pointer.body;
+        if (typeof current?.id !== "string" || !current.id) {
+            throw new ToolInputError("MemTree unavailable: the proxy named no current page");
+        }
+        if (this.cached?.id === current.id)
+            return this.cached.index;
+        const page = await this.getJson(`${base}/memtree/${encodeURIComponent(current.id)}.json`);
+        if (!page.ok)
+            throw new ToolInputError(`MemTree unavailable (page ${current.id}: ${page.error})`);
+        const json = page.body;
+        if (!Array.isArray(json?.nodes) || json.nodes.length === 0) {
+            // Still building (or an empty tree): not cached, so the next call retries.
+            throw new ToolInputError(`The MemTree for this session is still being built${json?.status ? ` (${json.status})` : ""}; try again in a minute.`);
+        }
+        const index = new MemtreeIndex(json);
+        this.cached = { id: current.id, index };
+        return index;
+    }
+    async getJson(url) {
+        let response;
+        try {
+            response = await this.fetchImpl(url, {
+                headers: { accept: "application/json" },
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+            });
+        }
+        catch (err) {
+            return { ok: false, status: 0, error: String(err) };
+        }
+        const text = await response.text().catch(() => "");
+        if (!response.ok) {
+            return { ok: false, status: response.status, error: `HTTP ${response.status} ${text.slice(0, 300)}` };
+        }
+        try {
+            return { ok: true, status: response.status, body: JSON.parse(text) };
+        }
+        catch {
+            return { ok: false, status: response.status, error: "response was not JSON" };
+        }
+    }
+}
+/**
+ * One JSON-RPC message in, the response out (undefined for notifications).
+ * Exposed for tests; the stdio loop below is only framing.
+ */
+export async function handleMcpMessage(message, tree) {
+    const isRequest = message.id !== undefined && message.id !== null;
+    const reply = (result) => ({ jsonrpc: "2.0", id: message.id, result });
+    const fail = (code, text) => ({
+        jsonrpc: "2.0",
+        id: message.id ?? null,
+        error: { code, message: text },
+    });
+    switch (message.method) {
+        case "initialize": {
+            const requested = message.params?.protocolVersion;
+            return reply({
+                protocolVersion: typeof requested === "string" ? requested : LATEST_PROTOCOL_VERSION,
+                capabilities: { tools: {} },
+                serverInfo: { name: MEMTREE_MCP_SERVER_NAME, version: CLIENT_VERSION },
+                instructions: "Search and read this session's MemTree: the summarized earlier part of the conversation, with its verbatim transcript lines. " +
+                    "Use it when a detail from earlier in the session is not in your context.",
+            });
+        }
+        case "ping":
+            return isRequest ? reply({}) : undefined;
+        case "tools/list":
+            return reply({ tools: MEMTREE_TOOLS });
+        case "tools/call": {
+            const name = message.params?.name;
+            const args = (message.params?.arguments ?? {});
+            try {
+                const text = await callTool(String(name), args, tree);
+                return reply({ content: [{ type: "text", text }] });
+            }
+            catch (err) {
+                if (err instanceof UnknownToolError)
+                    return fail(-32602, err.message);
+                const text = err instanceof Error ? err.message : String(err);
+                return reply({ content: [{ type: "text", text }], isError: true });
+            }
+        }
+        default:
+            if (!isRequest)
+                return undefined; // notifications/initialized, cancelled, …
+            return fail(-32601, `Method not found: ${message.method}`);
+    }
+}
+class UnknownToolError extends Error {
+}
+async function callTool(name, args, tree) {
+    switch (name) {
+        case "search": {
+            if (typeof args.query !== "string" || !args.query.trim()) {
+                throw new ToolInputError("search: query must be a non-empty string");
+            }
+            const limit = args.limit === undefined ? undefined : Number(args.limit);
+            return formatSearch(await tree.get(), args.query, limit);
+        }
+        case "read_node":
+            return formatNode(await tree.get(), Number(args.id));
+        case "read_lines":
+            return formatLines(await tree.get(), Number(args.block), Number(args.start), Number(args.end));
+        default:
+            throw new UnknownToolError(`Unknown tool: ${name}`);
+    }
+}
+/** Serve MCP over this process's stdin/stdout until stdin closes. */
+export function runMemtreeMcpServer(env = process.env) {
+    const tree = new CurrentTree({
+        proxyUrl: env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
+        sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    });
+    let buffer = "";
+    // Replies go out in arrival order even though tool calls are async.
+    let queue = Promise.resolve();
+    const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newline).trim();
+            buffer = buffer.slice(newline + 1);
+            if (!line)
+                continue;
+            let message;
+            try {
+                message = JSON.parse(line);
+            }
+            catch {
+                send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+                continue;
+            }
+            queue = queue.then(async () => {
+                const response = await handleMcpMessage(message, tree).catch((err) => ({
+                    jsonrpc: "2.0",
+                    id: message.id ?? null,
+                    error: { code: -32603, message: String(err) },
+                }));
+                if (response)
+                    send(response);
+            });
+        }
+    });
+    process.stdin.on("end", () => {
+        void queue.then(() => process.exit(0));
+    });
+}
+function isMainModule() {
+    try {
+        const self = fs.realpathSync(fileURLToPath(import.meta.url));
+        return !!process.argv[1] && fs.realpathSync(process.argv[1]) === self;
+    }
+    catch {
+        return false;
+    }
+}
+if (isMainModule())
+    runMemtreeMcpServer();
+//# sourceMappingURL=memtree-mcp.js.map

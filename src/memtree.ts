@@ -49,6 +49,13 @@ export interface MemtreeOptions {
   debug?: boolean;
   /** Always-on JSONL diagnostics; every MemTree call logs one line. */
   reqlog?: RequestLogSink;
+  /**
+   * `x-memtree-tools` on compress calls: the memtree MCP tools this Claude
+   * Code session has (e.g. "search,read_node,read_lines"), so the server can
+   * tell the model how to use them in the memory it returns. Set only when
+   * the `memtree` MCP server is configured for the session (memtree-mcp-config.ts).
+   */
+  memtreeTools?: string;
 }
 
 /**
@@ -778,6 +785,7 @@ export class MemtreeClient {
   private compressTimeoutMs: number;
   private debug: boolean;
   private reqlog: RequestLogSink | undefined;
+  private memtreeTools: string | undefined;
   /** Complete compression request key → in-flight/settled promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
   /** Message hashes already submitted for background indexing. */
@@ -807,6 +815,11 @@ export class MemtreeClient {
    */
   get compressBudgetMs(): number {
     return this.compressTimeoutMs;
+  }
+
+  /** Change the `x-memtree-tools` value for later calls (undefined: none). */
+  setMemtreeTools(value: string | undefined): void {
+    this.memtreeTools = value || undefined;
   }
 
   /**
@@ -843,6 +856,7 @@ export class MemtreeClient {
       Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
     this.debug = opts.debug ?? false;
     this.reqlog = opts.reqlog;
+    this.memtreeTools = opts.memtreeTools || undefined;
   }
 
   static hashMessages(messages: Message[]): string {
@@ -1138,6 +1152,10 @@ export class MemtreeClient {
           ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
           ...(opts.clientMeta && Object.keys(opts.clientMeta).length
             ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+            : {}),
+          // Compress calls only: an index-only call returns no memory.
+          ...(this.memtreeTools && !opts.indexOnly
+            ? { "x-memtree-tools": this.memtreeTools }
             : {}),
         },
         body: payload,
