@@ -17,7 +17,7 @@
  * message takes its response's last entry, a user message the latest entry
  * among its tool results (by tool-call id) and typed text (by a hash of the
  * text without `<system-reminder>` blocks). Text can repeat ("yes", "Done."),
- * so a text match takes the first time at or after the previous message's.
+ * so a text match consumes the next unused entry at or after the previous message's.
  * A subagent's messages come from its own transcript,
  * `<session id>/subagents/agent-<agent id>.jsonl` next to the main one. MemTree records these per input
  * block, to tell which conversation and block is most recent.
@@ -48,8 +48,6 @@ const SAFE_ID = /^[A-Za-z0-9-]+$/;
 /** ISO 8601 time of each message the transcript knows, keyed like MessageUsage. */
 export type MessageTimes = Record<string, string>;
 
-/** Longest text prefix hashed to identify a text-only response. */
-const TEXT_KEY_CHARS = 400;
 /** Transcript bytes read per refresh; later calls pick up the rest. */
 const MAX_READ_BYTES = 64 * 1024 * 1024;
 
@@ -149,7 +147,6 @@ class TranscriptIndex {
   /** Response message id → its usage (the largest seen: entries repeat it). */
   private readonly usageById = new Map<string, ResponseUsage>();
   private readonly idByToolUse = new Map<string, string>();
-  private readonly idByText = new Map<string, string>();
   /** Response id → its text so far (one transcript entry per content block). */
   private readonly textById = new Map<string, string>();
   /** Response id → its latest entry's time (thinking starts, last block lands). */
@@ -194,14 +191,17 @@ class TranscriptIndex {
 
   matchTimes(messages: Message[]): MessageTimes {
     const out: MessageTimes = {};
+    const userCursors = new Map<string, number>();
+    const responseCursors = new Map<string, number>();
+    const usedResponses = new Set<string>();
     // Latest time assigned so far: repeated text matches forward from it.
     let floor: string | undefined;
     messages.forEach((message, index) => {
       const time =
         message?.role === "assistant"
-          ? this.timeForResponse(message, floor)
+          ? this.timeForResponse(message, floor, responseCursors, usedResponses)
           : message?.role === "user"
-            ? this.timeForUser(message, floor)
+            ? this.timeForUser(message, floor, userCursors)
             : undefined;
       if (time) {
         out[String(index)] = time;
@@ -211,24 +211,55 @@ class TranscriptIndex {
     return out;
   }
 
-  private timeForResponse(message: Message, floor: string | undefined): string | undefined {
+  private timeForResponse(
+    message: Message,
+    floor: string | undefined,
+    cursors: Map<string, number>,
+    used: Set<string>
+  ): string | undefined {
     for (const part of Array.isArray(message.content) ? message.content : []) {
       if (part?.type === "tool_use" && typeof part.id === "string") {
         const id = this.idByToolUse.get(part.id);
-        if (id) return this.timeById.get(id);
+        if (id) {
+          if (used.has(id)) return undefined;
+          used.add(id);
+          return this.timeById.get(id);
+        }
       }
     }
-    const key = textKey(messageText(message));
-    const ids = key ? this.idsByText.get(key) : undefined;
-    const times = (ids ?? []).map((id) => this.timeById.get(id)).filter(isString);
-    return firstAtOrAfter(times, floor);
+    const text = messageText(message).trim();
+    const key = textKey(text);
+    if (!key) return undefined;
+    const ids = this.idsByText.get(key) ?? [];
+    for (let i = cursors.get(key) ?? 0; i < ids.length; i++) {
+      cursors.set(key, i + 1);
+      const id = ids[i];
+      const time = this.timeById.get(id);
+      if (used.has(id) || this.textById.get(id)?.trim() !== text) continue;
+      if (!time || (floor && time < floor)) continue;
+      used.add(id);
+      return time;
+    }
+    return undefined;
   }
 
   /** Latest time among the entries this message was built from. */
-  private timeForUser(message: Message, floor: string | undefined): string | undefined {
+  private timeForUser(
+    message: Message,
+    floor: string | undefined,
+    cursors: Map<string, number>
+  ): string | undefined {
     const times: (string | undefined)[] = [];
-    const typed = (text: string) =>
-      firstAtOrAfter(this.timesByUserText.get(userTextKey(text) ?? "") ?? [], floor);
+    const typed = (text: string) => {
+      const key = userTextKey(text);
+      if (!key) return undefined;
+      const entries = this.timesByUserText.get(key) ?? [];
+      for (let i = cursors.get(key) ?? 0; i < entries.length; i++) {
+        cursors.set(key, i + 1);
+        if (!floor || entries[i] >= floor) return entries[i];
+      }
+      return undefined;
+    };
     if (typeof message.content === "string") times.push(typed(message.content));
     for (const part of Array.isArray(message.content) ? message.content : []) {
       if (part?.type === "tool_result" && typeof part.tool_use_id === "string") {
@@ -248,8 +279,10 @@ class TranscriptIndex {
         if (id) return id;
       }
     }
-    const key = textKey(messageText(message));
-    return key ? this.idByText.get(key) : undefined;
+    const text = messageText(message).trim();
+    const key = textKey(text);
+    const ids = key ? this.idsByText.get(key) : undefined;
+    return ids?.findLast((id) => this.textById.get(id)?.trim() === text);
   }
 
   private ingest(line: string): void {
@@ -283,7 +316,6 @@ class TranscriptIndex {
         this.textById.set(id, text);
         const key = textKey(text);
         if (key) {
-          this.idByText.set(key, id);
           appendOnce(this.idsByText, key, id);
         }
       }
@@ -294,7 +326,7 @@ class TranscriptIndex {
     const content = message?.content;
     if (typeof content === "string") {
       const key = userTextKey(content);
-      if (key) appendOnce(this.timesByUserText, key, time);
+      if (key) appendTime(this.timesByUserText, key, time);
       return;
     }
     for (const part of Array.isArray(content) ? content : []) {
@@ -302,7 +334,7 @@ class TranscriptIndex {
         this.timeByToolResult.set(part.tool_use_id, time);
       } else if (part?.type === "text" && typeof part.text === "string") {
         const key = userTextKey(part.text);
-        if (key) appendOnce(this.timesByUserText, key, time);
+        if (key) appendTime(this.timesByUserText, key, time);
       }
     }
   }
@@ -312,7 +344,6 @@ class TranscriptIndex {
     this.partial = "";
     this.usageById.clear();
     this.idByToolUse.clear();
-    this.idByText.clear();
     this.textById.clear();
     this.timeById.clear();
     this.timeByToolResult.clear();
@@ -345,11 +376,11 @@ function messageText(message: Message): string {
     .join("");
 }
 
-/** A short stable key for a response's text; empty text has none. */
+/** Hash the entire normalized text: shared prefixes must never identify a message. */
 function textKey(text: string): string | undefined {
   const trimmed = text.trim();
   if (!trimmed) return undefined;
-  return createHash("sha256").update(trimmed.slice(0, TEXT_KEY_CHARS)).digest("hex").slice(0, 32);
+  return createHash("sha256").update(trimmed).digest("hex").slice(0, 32);
 }
 
 /** The entry's ISO time, normalized; entries without a parseable one have none. */
@@ -367,11 +398,11 @@ function latest(times: (string | undefined)[]): string | undefined {
   return best;
 }
 
-/** The first time at or after `floor` (all sorted as written); else the last one. */
-function firstAtOrAfter(times: string[], floor: string | undefined): string | undefined {
-  if (!times.length) return undefined;
-  if (!floor) return times[0];
-  return times.find((time) => time >= floor) ?? times[times.length - 1];
+/** Keep separate entries even when they have identical millisecond timestamps. */
+function appendTime(map: Map<string, string[]>, key: string, time: string): void {
+  const times = map.get(key);
+  if (times) times.push(time);
+  else map.set(key, [time]);
 }
 
 function appendOnce(map: Map<string, string[]>, key: string, value: string): void {
@@ -379,8 +410,6 @@ function appendOnce(map: Map<string, string[]>, key: string, value: string): voi
   if (!list) map.set(key, [value]);
   else if (list[list.length - 1] !== value) list.push(value);
 }
-
-const isString = (value: unknown): value is string => typeof value === "string";
 
 const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 

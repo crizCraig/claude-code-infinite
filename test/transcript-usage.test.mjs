@@ -80,7 +80,7 @@ test("each message gets the time Claude Code wrote it: responses, tool results, 
       { timestamp: "2026-09-23T20:00:09.000Z" }) +
     user([{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }], "2026-09-23T20:01:00.000Z") +
     user("and the docs", "2026-09-23T20:02:00.000Z") +
-    entry("msg_b", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: "2026-09-23T20:03:00+02:00" }) +
+    entry("msg_b", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: "2026-09-23T22:03:00+02:00" }) +
     user("no time on this one", undefined));
   const source = new ClaudeTranscriptUsage(root);
   const messages = [
@@ -100,7 +100,7 @@ test("each message gets the time Claude Code wrote it: responses, tool results, 
     1: "2026-09-23T20:00:00.000Z",
     2: "2026-09-23T20:00:09.000Z", // the response's last entry
     3: "2026-09-23T20:02:00.000Z", // the latest of its parts
-    4: "2026-09-23T18:03:00.000Z", // normalized to UTC
+    4: "2026-09-23T20:03:00.000Z", // normalized to UTC
   });
   assert.deepEqual(new ClaudeTranscriptUsage("/nonexistent/dir").timesFor(SESSION, messages), {});
 });
@@ -148,4 +148,114 @@ test("a subagent's messages are timed from its own transcript under the session"
   assert.deepEqual(source.timesFor(SESSION, agentMessages, "../x"), {});
   assert.deepEqual(source.timesFor(SESSION, [{ role: "user", content: "main prompt" }]),
     { 0: "2026-09-23T20:00:00.000Z" });
+});
+
+const timedUser = (content, timestamp) =>
+  JSON.stringify({ type: "user", message: { role: "user", content }, timestamp }) + "\n";
+const EARLY = "2026-09-23T20:00:00.000Z";
+const LATE = "2026-09-23T21:00:00.000Z";
+
+test("consecutive repeated user messages consume occurrences and omit exhausted matches", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, timedUser("yes", EARLY) + timedUser("yes", LATE));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = Array.from({ length: 3 }, () => ({ role: "user", content: "yes" }));
+  assert.deepEqual(source.timesFor(SESSION, messages), { 0: EARLY, 1: LATE });
+  assert.deepEqual(source.timesFor(SESSION, messages), { 0: EARLY, 1: LATE },
+    "each call matches the whole history afresh");
+});
+
+test("merged repeated text consumes both occurrences and takes the latest time", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, timedUser("yes", EARLY) + timedUser("yes", LATE));
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, [
+    { role: "user", content: [{ type: "text", text: "yes" }, { type: "text", text: "yes" }] },
+    { role: "user", content: "yes" },
+  ]), { 0: LATE });
+});
+
+test("distinct repeated entries with identical timestamps remain separate occurrences", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, timedUser("yes", EARLY) + timedUser("yes", EARLY));
+  const messages = Array.from({ length: 3 }, () => ({ role: "user", content: "yes" }));
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, messages), { 0: EARLY, 1: EARLY });
+});
+
+test("text matches never fall back to entries earlier than the previous message", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, timedUser("old", EARLY) +
+    entry("old-answer", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: EARLY }) +
+    timedUser("current", LATE));
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, [
+    { role: "user", content: "current" },
+    { role: "user", content: "old" },
+    { role: "assistant", content: "Done." },
+  ]), { 0: LATE });
+});
+
+test("consecutive repeated assistant text consumes response occurrences", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file,
+    entry("first", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: EARLY }) +
+    entry("second", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: LATE }));
+  const messages = Array.from({ length: 3 }, () => ({ role: "assistant", content: "Done." }));
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, messages), { 0: EARLY, 1: LATE });
+});
+
+test("user timestamp matching checks the entire reminder-stripped text", () => {
+  const { root, file } = transcriptDir();
+  const prefix = "instructions ".repeat(50);
+  fs.writeFileSync(file, timedUser(prefix + "first", EARLY) + timedUser(prefix + "second", LATE));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(source.timesFor(SESSION, [
+    { role: "user", content: prefix + "<system-reminder>extra</system-reminder>second" },
+    { role: "user", content: prefix + "never written" },
+  ]), { 0: LATE });
+});
+
+test("assistant text matching checks the entire response, including accumulated blocks", () => {
+  const { root, file } = transcriptDir();
+  const prefix = "answer ".repeat(80);
+  fs.writeFileSync(file,
+    entry("first", [{ type: "text", text: prefix + "first" }], usage(5, 0), { timestamp: EARLY }) +
+    entry("second", [{ type: "text", text: prefix }], usage(6, 0), { timestamp: LATE }) +
+    entry("second", [{ type: "text", text: "second" }], usage(7, 0), { timestamp: LATE }));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(source.timesFor(SESSION, [
+    { role: "assistant", content: prefix + "second" },
+    { role: "assistant", content: prefix + "never written" },
+  ]), { 0: LATE });
+  assert.deepEqual(source.timesFor(SESSION, [{ role: "assistant", content: prefix }]), {},
+    "a stale intermediate text key does not identify the final response");
+});
+
+
+test("matching a response by tool id also consumes its text occurrence", () => {
+  const { root, file } = transcriptDir();
+  const tool = { type: "tool_use", id: "tool-one", name: "Bash", input: {} };
+  fs.writeFileSync(file,
+    entry("first", [{ type: "text", text: "Done." }, tool], usage(5, 0), { timestamp: EARLY }) +
+    entry("second", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: LATE }));
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, [
+    { role: "assistant", content: [tool] },
+    { role: "assistant", content: "Done." },
+    { role: "assistant", content: "Done." },
+  ]), { 0: EARLY, 1: LATE });
+});
+
+test("full-text usage matching ignores collisions and stale intermediate response keys", () => {
+  const { root, file } = transcriptDir();
+  const prefix = "answer ".repeat(80);
+  fs.writeFileSync(file,
+    entry("first", [{ type: "text", text: prefix }], usage(5, 0)) +
+    entry("second", [{ type: "text", text: prefix }], usage(6, 0)) +
+    entry("second", [{ type: "text", text: "second" }], usage(7, 0)));
+  const got = new ClaudeTranscriptUsage(root).usageFor(SESSION, [
+    { role: "assistant", content: prefix },
+    { role: "assistant", content: prefix + "second" },
+    { role: "assistant", content: prefix + "never written" },
+  ]);
+  assert.deepEqual(Object.keys(got), ["0", "1"]);
+  assert.equal(got["0"].output_tokens, 5);
+  assert.equal(got["1"].output_tokens, 7);
 });
