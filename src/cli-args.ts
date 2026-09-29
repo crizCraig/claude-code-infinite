@@ -61,3 +61,26 @@ export function memtreeLinkPlacementFromEnv(
     ? (normalized as MemtreeLinkPlacement)
     : undefined;
 }
+
+/**
+ * `CCC_COMPACT_TARGET`: "500k" / "20000" sets every session's compaction
+ * target; "off" starts every session with compaction off (the state
+ * `/memtree-compact off` sets, for headless runs that cannot type it).
+ * `value` is undefined when unset or invalid; `warning` explains an invalid one.
+ */
+export function compactTargetFromEnv(
+  raw: string | undefined,
+  parseTokens: (text: string) => number | undefined,
+  minTokens: number
+): { value: number | null | undefined; warning?: string } {
+  if (!raw || !raw.trim()) return { value: undefined };
+  if (/^off$/i.test(raw.trim())) return { value: null };
+  const target = parseTokens(raw);
+  if (target === undefined || target < minTokens) {
+    return {
+      value: undefined,
+      warning: `ccc: ignoring CCC_COMPACT_TARGET=${raw} (use off, or a token count of at least ${minTokens / 1000}k)`,
+    };
+  }
+  return { value: target };
+}

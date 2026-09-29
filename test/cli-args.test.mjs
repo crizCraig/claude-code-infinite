@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  compactTargetFromEnv,
   isPrintInvocation,
   memtreeLinkPlacementFromEnv,
   parseWrapperArgs,
@@ -42,4 +43,20 @@ test("CCC_MEMTREE_LINK picks a known placement, anything else means default", ()
   assert.equal(memtreeLinkPlacementFromEnv(undefined), undefined);
   assert.equal(memtreeLinkPlacementFromEnv(""), undefined);
   assert.equal(memtreeLinkPlacementFromEnv("recap"), undefined);
+});
+
+test("CCC_COMPACT_TARGET: a token count, off, or ignored with a warning", () => {
+  const parse = (t) => {
+    const m = /^(\d+)(k)?$/i.exec(t.trim());
+    return m ? Number(m[1]) * (m[2] ? 1000 : 1) : undefined;
+  };
+  assert.deepEqual(compactTargetFromEnv(undefined, parse, 20_000), { value: undefined });
+  assert.deepEqual(compactTargetFromEnv("", parse, 20_000), { value: undefined });
+  assert.deepEqual(compactTargetFromEnv("500k", parse, 20_000), { value: 500_000 });
+  assert.deepEqual(compactTargetFromEnv("off", parse, 20_000), { value: null });
+  assert.deepEqual(compactTargetFromEnv(" OFF ", parse, 20_000), { value: null });
+  const small = compactTargetFromEnv("5k", parse, 20_000);
+  assert.equal(small.value, undefined);
+  assert.match(small.warning, /ignoring CCC_COMPACT_TARGET=5k/);
+  assert.equal(compactTargetFromEnv("lots", parse, 20_000).value, undefined);
 });

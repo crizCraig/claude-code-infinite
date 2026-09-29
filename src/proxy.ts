@@ -186,9 +186,11 @@ export interface ProxyOptions {
    * runs, where the hook-driven command is unavailable. It sets what each
    * compaction aims at (instead of half the budget); it does not trigger
    * one — that is still the budget. `/memtree-compact off` still turns
-   * compaction off for one session.
+   * compaction off for one session. null (`CCC_COMPACT_TARGET=off`) starts
+   * every session in the `/memtree-compact off` state, for headless runs that
+   * cannot type the command; `/memtree-compact [N]` still turns it back on.
    */
-  defaultCompactTarget?: number;
+  defaultCompactTarget?: number | null;
   /**
    * Test-only whole-request budget (tokens) for every session:
    * `CCC_BUDGET_TOKENS`. Replaces the server-reported model budget (and the
@@ -359,8 +361,14 @@ interface ProxyState {
    * that session asks the server for this whole-request size instead of the
    * model-based budget, so it stays compressed while it would still fit.
    */
-  /** Per-session `/memtree-compact` target; null means explicitly off. */
-  compactTargets: Map<string, number | null>;
+  /**
+   * Per-session `/memtree-compact` target; null means explicitly off, and
+   * undefined the automatic target (half the budget) even when
+   * `CCC_COMPACT_TARGET=off` made off the default.
+   */
+  compactTargets: Map<string, number | null | undefined>;
+  /** `CCC_COMPACT_TARGET=off`: sessions start with compaction off. */
+  defaultCompactOff: boolean;
   /**
    * Sessions that ran `/memtree-compact [N]` and have not compacted since:
    * their next main human turn compresses whatever its size (reason
@@ -690,6 +698,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     memtreeLinkStore: opts.memtreeLinkStore,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
+    defaultCompactOff: opts.defaultCompactTarget === null,
     compactNow: new Set(),
     stablePrefixes: new Map(),
     serverBudgets: new Map(),
@@ -2414,7 +2423,10 @@ function sessionCommandReply(
   }
   if (args === "") {
     // Back to the automatic target (half the budget, or CCC_COMPACT_TARGET).
-    state.compactTargets.delete(sessionId);
+    // Under CCC_COMPACT_TARGET=off the default is off, so pin the automatic
+    // target for this session instead of falling back to that default.
+    if (state.defaultCompactOff) state.compactTargets.set(sessionId, undefined);
+    else state.compactTargets.delete(sessionId);
     state.compactNow.add(sessionId);
     return `${TRAILER_LABEL} compacting: your next message is sent compressed to about half the budget, ${keep}`;
   }

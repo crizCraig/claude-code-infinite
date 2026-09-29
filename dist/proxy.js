@@ -225,6 +225,7 @@ export function startProxy(opts) {
         memtreeLinkStore: opts.memtreeLinkStore,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
+        defaultCompactOff: opts.defaultCompactTarget === null,
         compactNow: new Set(),
         stablePrefixes: new Map(),
         serverBudgets: new Map(),
@@ -1674,7 +1675,12 @@ function sessionCommandReply(state, sessionId, prompt) {
     }
     if (args === "") {
         // Back to the automatic target (half the budget, or CCC_COMPACT_TARGET).
-        state.compactTargets.delete(sessionId);
+        // Under CCC_COMPACT_TARGET=off the default is off, so pin the automatic
+        // target for this session instead of falling back to that default.
+        if (state.defaultCompactOff)
+            state.compactTargets.set(sessionId, undefined);
+        else
+            state.compactTargets.delete(sessionId);
         state.compactNow.add(sessionId);
         return `${TRAILER_LABEL} compacting: your next message is sent compressed to about half the budget, ${keep}`;
     }

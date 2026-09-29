@@ -23,7 +23,7 @@ import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
-import { isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv } from "./cli-args.js";
+import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
@@ -276,7 +276,7 @@ async function main() {
         // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0
         // turns the filter off.
         claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
-        defaultCompactTarget: compactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
+        defaultCompactTarget: defaultCompactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
         // Debugging: write every forwarded Anthropic request body to this directory.
         ...(process.env.CCC_CAPTURE_DIR ? { captureDir: process.env.CCC_CAPTURE_DIR } : {}),
         // Test-only: a small budget so a cheap session crosses it in a few turns.
@@ -400,16 +400,12 @@ main().catch((err) => {
     console.error(err);
     process.exit(1);
 });
-/** `CCC_COMPACT_TARGET` ("500k", "20000"): a default compaction target, or undefined. */
-function compactTargetFromEnv(raw) {
-    if (!raw)
-        return undefined;
-    const target = parseTokenCount(raw);
-    if (target === undefined || target < MEMTREE_COMPACT_MIN_TOKENS) {
-        console.error(`ccc: ignoring CCC_COMPACT_TARGET=${raw} (use a token count of at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`);
-        return undefined;
-    }
-    return target;
+/** `CCC_COMPACT_TARGET` ("500k", "20000", "off"): see cli-args.ts. */
+function defaultCompactTargetFromEnv(raw) {
+    const { value, warning } = compactTargetFromEnv(raw, parseTokenCount, MEMTREE_COMPACT_MIN_TOKENS);
+    if (warning)
+        console.error(warning);
+    return value;
 }
 /** `CCC_BUDGET_TOKENS` ("60k"): a test-only whole-request budget, or undefined. */
 function budgetFromEnv(raw) {

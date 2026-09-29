@@ -8402,6 +8402,33 @@ test("edge compaction: /memtree-compact off drops the prefix and passes through"
   }
 });
 
+test("edge compaction: CCC_COMPACT_TARGET=off (defaultCompactTarget null) starts off; /memtree-compact turns it on", async () => {
+  const h = await edgeHarness({ budget: 20_000, proxyOpts: { defaultCompactTarget: null } });
+  try {
+    // Over the 20k budget from the first turn, yet nothing forces a compaction
+    // and no stable prefix is built: the /memtree-compact off state.
+    const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2"))];
+    const first = await h.post(conv);
+    assert.equal(first.compaction.mode, "off");
+    assert.equal(first.compaction.reason, undefined);
+    assert.equal(first.turnType, "followup-noop", "sent whole");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, undefined);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+
+    // `/memtree-compact` with no N pins the automatic target (budget/2) for
+    // this session, rather than falling back to the off default.
+    assert.match((await h.command("/memtree-compact")).body.reason, /about half the budget/);
+    conv.push(assistantText("a2"), userText("q3"));
+    const manual = await h.post(conv);
+    assert.equal(manual.compaction.mode, "auto");
+    assert.equal(manual.compaction.reason, "manual");
+    assert.equal(manual.turnType, "followup-compressed");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, 10_000);
+  } finally {
+    h.close();
+  }
+});
+
 test("edge compaction: /memtree-compact N compacts now to N, then rides", async () => {
   const h = await edgeHarness({ budget: 100_000 });
   try {

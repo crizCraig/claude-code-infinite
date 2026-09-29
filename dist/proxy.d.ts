@@ -74,9 +74,11 @@ export interface ProxyOptions {
      * runs, where the hook-driven command is unavailable. It sets what each
      * compaction aims at (instead of half the budget); it does not trigger
      * one — that is still the budget. `/memtree-compact off` still turns
-     * compaction off for one session.
+     * compaction off for one session. null (`CCC_COMPACT_TARGET=off`) starts
+     * every session in the `/memtree-compact off` state, for headless runs that
+     * cannot type the command; `/memtree-compact [N]` still turns it back on.
      */
-    defaultCompactTarget?: number;
+    defaultCompactTarget?: number | null;
     /**
      * Test-only whole-request budget (tokens) for every session:
      * `CCC_BUDGET_TOKENS`. Replaces the server-reported model budget (and the

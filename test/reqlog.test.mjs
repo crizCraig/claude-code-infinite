@@ -232,6 +232,7 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
     assert.deepEqual(Object.keys(noticeRec).sort(), [
       "event",
       "kind",
+      "pid",
       "ts",
       "via",
     ]);
@@ -410,9 +411,11 @@ test("RequestLogger.flush waits for scheduled JSONL appends", async () => {
 
   assert.equal(await reqlog.flush(1_000), true);
   assert.deepEqual(
-    readRecords(logPath).map(({ ts: _ts, ...record }) => record),
+    readRecords(logPath).map(({ ts: _ts, pid: _pid, ...record }) => record),
     [{ kind: "notice", event: "claimed", via: "Stop" }]
   );
+  // pid tells apart concurrent ccc processes appending to the one log.
+  assert.equal(readRecords(logPath)[0].pid, process.pid);
 });
 
 test("MemtreeClient shutdown aborts and logs background indexes before flush", async () => {
@@ -440,7 +443,7 @@ test("MemtreeClient shutdown aborts and logs background indexes before flush", a
     const recordsAtFlush = readRecords(logPath);
     assert.equal(recordsAtFlush.length, 1);
     assert.deepEqual(
-      recordsAtFlush.map(({ ts: _ts, ms: _ms, ...record }) => record),
+      recordsAtFlush.map(({ ts: _ts, pid: _pid, ms: _ms, ...record }) => record),
       [{
         kind: "memtree",
         indexOnly: true,

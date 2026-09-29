@@ -19,4 +19,14 @@ export declare const MEMTREE_LINK_PLACEMENTS: readonly MemtreeLinkPlacement[];
  * the proxy's default placement.
  */
 export declare function memtreeLinkPlacementFromEnv(value: string | undefined): MemtreeLinkPlacement | undefined;
+/**
+ * `CCC_COMPACT_TARGET`: "500k" / "20000" sets every session's compaction
+ * target; "off" starts every session with compaction off (the state
+ * `/memtree-compact off` sets, for headless runs that cannot type it).
+ * `value` is undefined when unset or invalid; `warning` explains an invalid one.
+ */
+export declare function compactTargetFromEnv(raw: string | undefined, parseTokens: (text: string) => number | undefined, minTokens: number): {
+    value: number | null | undefined;
+    warning?: string;
+};
 //# sourceMappingURL=cli-args.d.ts.map
