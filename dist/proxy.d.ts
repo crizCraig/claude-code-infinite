@@ -142,6 +142,12 @@ export interface RunningProxy {
      */
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
+/** A request size Anthropic reported, and the bytes of the body it was for. */
+interface SizeSample {
+    /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
+    tokens: number;
+    forwardedBytes: number;
+}
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share
  * of the model's context window (800k of Opus 5.5's 1M, matching the server's
@@ -155,6 +161,20 @@ export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
 /**
+ * Size of a body about to be sent, scaled from the reported size of an earlier
+ * request of the same shape by that request's own bytes-per-token ratio.
+ * Compressed memory is denser than bytes/4 (about 2.65 bytes per token on a
+ * 2026-09-29 Opus session), so a plain bytes/4 fallback undercounted a body
+ * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
+ * 429k reported), which would delay recompression past the budget. Growth
+ * uses the denser of the sample's ratio and bytes/4, so the estimate errs
+ * high. bytes/4 only when there is no sample.
+ */
+declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): {
+    tokens: number;
+    source: "reported" | "bytes";
+};
+/**
  * Keep a request within Anthropic's breakpoint limit after the compressed
  * prefix (which carries one) is joined to Claude Code's own suffix. Drops
  * the earliest suffix breakpoints first, never the compressed prefix's or
@@ -164,5 +184,6 @@ export declare function parseTokenCount(text: string): number | undefined;
 declare function capCacheBreakpoints(body: Record<string, any>, _prefixLength?: number): void;
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
+export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
 export {};
 //# sourceMappingURL=proxy.d.ts.map

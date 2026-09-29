@@ -2008,14 +2008,24 @@ function reportedInputTokens(rec) {
         (usage.cache_creation_input_tokens ?? 0));
 }
 /**
- * Size of a body about to be sent: the reported size of an earlier request of
- * the same shape plus bytes/4 for what was added since, or bytes/4 of the
- * whole body when there is no earlier usage (or the body shrank).
+ * Size of a body about to be sent, scaled from the reported size of an earlier
+ * request of the same shape by that request's own bytes-per-token ratio.
+ * Compressed memory is denser than bytes/4 (about 2.65 bytes per token on a
+ * 2026-09-29 Opus session), so a plain bytes/4 fallback undercounted a body
+ * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
+ * 429k reported), which would delay recompression past the budget. Growth
+ * uses the denser of the sample's ratio and bytes/4, so the estimate errs
+ * high. bytes/4 only when there is no sample.
  */
 function estimateRequestTokens(sample, bytes) {
-    if (sample && bytes >= sample.forwardedBytes) {
+    if (sample && sample.tokens > 0 && sample.forwardedBytes > 0) {
+        const bytesPerToken = sample.forwardedBytes / sample.tokens;
+        if (bytes <= sample.forwardedBytes) {
+            return { tokens: Math.round(bytes / bytesPerToken), source: "reported" };
+        }
+        const added = bytes - sample.forwardedBytes;
         return {
-            tokens: sample.tokens + approxTokensFromBytes(bytes - sample.forwardedBytes),
+            tokens: sample.tokens + Math.max(approxTokensFromBytes(added), Math.round(added / bytesPerToken)),
             source: "reported",
         };
     }
@@ -3774,4 +3784,5 @@ function readAll(stream) {
 }
 /** Test seam. */
 export const __testCapCacheBreakpoints = capCacheBreakpoints;
+export const __testEstimateRequestTokens = estimateRequestTokens;
 //# sourceMappingURL=proxy.js.map

@@ -3444,6 +3444,20 @@ test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28
   assert.ok(heavy.messages[0].content[0].cache_control && heavy.messages[1].content[0].cache_control);
 });
 
+test("size estimate scales by the sample's bytes per token, including when the body shrank (2026-09-29)", async () => {
+  const { __testEstimateRequestTokens: est } = await import("../dist/proxy.js");
+  const sample = { tokens: 429_480, forwardedBytes: 1_136_746 };
+  const shrank = est(sample, 1_135_494);
+  assert.equal(shrank.source, "reported");
+  assert.ok(Math.abs(shrank.tokens - 429_016) < 1_000, `got ${shrank.tokens}`);
+  const grew = est(sample, 1_143_717);
+  assert.ok(grew.tokens >= 431_293 - 100 && grew.tokens <= 431_293 + 1_000, `got ${grew.tokens}`);
+  // Growth never counts fewer tokens than bytes/4 would.
+  const sparse = { tokens: 100_000, forwardedBytes: 1_000_000 };
+  assert.equal(est(sparse, 1_004_000).tokens, 101_000);
+  assert.deepEqual(est(undefined, 400_000), { tokens: 100_000, source: "bytes" });
+});
+
 test("placements 'stop' and 'off'", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
