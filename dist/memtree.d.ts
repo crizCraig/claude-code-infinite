@@ -311,7 +311,7 @@ export declare class MemtreeClient {
      * client keeps the longer-budget background retry.
      */
     indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
-    /** Message times for the reminder-stripped list actually sent. */
+    /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes): void;
     /**
      * Stop accepting background indexes and wait boundedly for those already in

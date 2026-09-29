@@ -800,7 +800,7 @@ export class MemtreeClient {
      * client keeps the longer-budget background retry.
      */
     indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta, 
-    /** Message times for the reminder-stripped list actually sent. */
+    /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor) {
         if (this.backgroundClosing)
             return;
@@ -812,15 +812,23 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexedHashes.delete(first);
         }
-        const stripped = stripCcSystemReminders(messages);
+        const stripped = [];
+        const retained = [];
+        for (const message of messages) {
+            const [cleaned] = stripCcSystemReminders([message]);
+            if (cleaned) {
+                stripped.push(cleaned);
+                retained.push(message);
+            }
+        }
         const controller = new AbortController();
         const operation = this.callContextMemory(stripped, modelContextLimit, {
             timeoutMs: INDEX_TIMEOUT_MS,
             indexOnly: true,
             signal: controller.signal,
-            // Computed after stripping: a reminder-only message is dropped, which
-            // shifts every later index.
-            messageTimes: messageTimesFor?.(stripped),
+            // Match original text: trimming each block can change joined assistant
+            // text. Omit dropped messages first so the times use the sent positions.
+            messageTimes: messageTimesFor?.(retained),
             sessionId,
             clientMeta,
         })

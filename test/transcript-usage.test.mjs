@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ClaudeTranscriptUsage, defaultProjectsDir, findTranscript } from "../dist/transcript-usage.js";
+import { MemtreeClient } from "../dist/memtree.js";
 
 const SESSION = "0f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
 
@@ -258,4 +259,43 @@ test("full-text usage matching ignores collisions and stale intermediate respons
   assert.deepEqual(Object.keys(got), ["0", "1"]);
   assert.equal(got["0"].output_tokens, 5);
   assert.equal(got["1"].output_tokens, 7);
+});
+
+test("background indexing preserves multi-block response times while removing reminders", async (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(file,
+    timedUser("check the tests", EARLY) +
+    entry("answer", [{ type: "text", text: "Done. All tests " }], usage(5, 0),
+      { timestamp: EARLY }) +
+    entry("answer", [{ type: "text", text: "pass." }], usage(7, 0),
+      { timestamp: LATE }));
+  const messages = [
+    { role: "user", content: "<system-reminder>drop this message</system-reminder>" },
+    { role: "user", content: "check the <system-reminder>extra</system-reminder>tests" },
+    { role: "assistant", content: [
+      { type: "text", text: "Done. All tests " },
+      { type: "text", text: "pass." },
+    ] },
+  ];
+  const source = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(source.timesFor(SESSION, messages), { 1: EARLY, 2: LATE });
+  assert.equal(source.usageFor(SESSION, messages)["2"].output_tokens, 7);
+  let sent;
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    sent = JSON.parse(options.body);
+    return new Response(JSON.stringify({ messages: [] }));
+  });
+  const memtree = new MemtreeClient({ baseUrl: "https://memtree.invalid", apiKey: "k" });
+  memtree.indexInBackground("multi-block-times", messages, 200_000, SESSION, undefined,
+    (retained) => source.timesFor(SESSION, retained));
+  await memtree.drainBackground();
+  assert.deepEqual(sent.message_times, { 0: EARLY, 1: LATE });
+  assert.deepEqual(sent.messages, [
+    { role: "user", content: "check the tests" },
+    { role: "assistant", content: [
+      { type: "text", text: "Done. All tests" },
+      { type: "text", text: "pass." },
+    ] },
+  ]);
 });
