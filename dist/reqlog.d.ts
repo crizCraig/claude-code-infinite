@@ -21,8 +21,21 @@ import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
 /** Rough bytes→tokens estimate (bytes/4). Label the result approximate. */
 export declare function approxTokensFromBytes(bytes: number): number;
 export declare function defaultLogPath(): string;
-export type TurnType = "first-user" | "tool" | "tool-memory"
-/** Tool-route miss recovered: validated compressed bytes sent to Anthropic. */
+export type TurnType = "first-user" | "tool"
+/** A tool turn sent on its lane's memory route (compressed prefix + suffix). */
+ | "tool-memory"
+/**
+ * A main-thread tool turn sent on the session's stable prefix directly (no
+ * lane route to ride, e.g. after a tool-turn compaction made while a typed
+ * prompt was pending): the prefix bytes, then every later message verbatim.
+ */
+ | "tool-prefix"
+/**
+ * A tool turn that compressed: its estimated size reached the budget (see
+ * `compaction`, reason "budget"), or its lane's route no longer fitted the
+ * context window. Validated compressed bytes were sent to Anthropic; on the
+ * main thread the result is also the session's new stable prefix.
+ */
  | "tool-recompressed" | "followup-compressed"
 /**
  * A main-thread human turn sent on the session's stable compressed prefix:
@@ -141,11 +154,14 @@ export interface MessagesRecord {
      * stored prefix, an unexpected tool suffix shape, or an assembled route
      * estimated to exceed the destination context window. (An epoch-stale
      * route never reaches rejection: getMemoryRoute drops it on lookup, so
-     * that case logs "missing".)
+     * that case logs "missing".) "superseded": a main-thread route built on
+     * an older stable prefix than the session's current one (a later tool-turn
+     * compaction replaced the prefix without owning the route); dropped, and
+     * the turn rides the current prefix instead.
      * Absent means there was no applicable miss — hits and away-summary turns
      * never emit it. "none" is deliberately not a value.
      */
-    routeMiss?: "missing" | "rejected" | "replay";
+    routeMiss?: "missing" | "rejected" | "replay" | "superseded";
     /**
      * Why a fork of the main conversation (away recap) did not ride the main
      * thread's last prefix and fell back to its own compression; absent when it
@@ -153,39 +169,62 @@ export interface MessagesRecord {
      */
     forkMiss?: "no-route" | "session" | "system" | "prefix" | "too-large";
     /**
-     * Stable-prefix (edge) compaction on a main-thread human turn: the budget
-     * the turn was measured against, the size estimate, and, when it compacted,
-     * why. Absent on other requests.
+     * Stable-prefix (edge) compaction: the budget the turn was measured
+     * against, the size estimate, and, when it compacted, why. Recorded on
+     * main-thread human turns and on every lane's tool turns (a tool turn under
+     * the budget forwards with no compress call; at the budget it compresses
+     * once, reason "budget"). Absent on other requests, and on tool turns under
+     * the CCC_TOOL_ROUTE_RECOVERY=0 kill switch.
      */
     compaction?: CompactionRecord;
-    /** Outcome of a best-effort tool-route miss recovery attempt. */
+    /**
+     * Outcome of a tool-turn compaction attempt (a tool turn whose estimated
+     * size reached the budget), or why none was made although one was due.
+     * Absent on tool turns under the budget: they forward with no attempt.
+     */
     routeRecovery?: {
         /**
          * Serialized non-system conversation bytes, measured once per attempt.
-         * Absent when the miss was resolved without an attempt (kill switch off,
-         * cooldown, or a lane that already spent its per-epoch budget).
+         * Absent when no attempt was made (kill switch, cooldown, in-flight,
+         * backoff).
          */
         conversationBytes?: number;
-        outcome: "compressed" | "failed" | "noop" | "unusable"
+        outcome: "compressed" | "failed"
+        /** The server returned the conversation uncompressed (index warming). */
+         | "noop" | "unusable"
         /**
          * Compressed result carried no server `flattened_messages`
          * (pre-flatten server or malformed field). Forwarded the original.
          */
          | "no-flatten" | "no-gain" | "client-closed"
-        /** Kill switch off: no attempt was made or measured. */
+        /**
+         * CCC_TOOL_ROUTE_RECOVERY=0: a route miss that got no size check and
+         * no attempt.
+         */
          | "disabled"
         /** A recent attempt returned null; the blocking wait was skipped. */
          | "cooldown"
+        /** Another attempt for this lane is still in flight. */
+         | "in-flight"
         /**
-         * This lane already spent its one blocking attempt this epoch; the
-         * miss forwarded verbatim without another attempt.
+         * This lane's last attempt this human turn produced no prefix (no-op,
+         * no gain, failure); the next one waits until the conversation has
+         * grown by a twentieth of the budget, so a lane that cannot compress
+         * does not pay a blocking call on every tool turn. (Replaces the old
+         * "spent": one attempt per lane per human turn, whatever the size.)
          */
-         | "spent"
+         | "backoff"
         /**
          * The compressed result could not be serialized (e.g. V8 string-length
          * limit on a multi-megabyte body). Forwarded the original.
          */
          | "build-failed";
+        /**
+         * Main-thread compactions with a session: whether the result became the
+         * session's stable prefix ("not-installed": the forward never completed,
+         * or a newer prefix replaced the one this compaction started from).
+         */
+        prefix?: "installed" | "not-installed";
         /** Route candidate fate; only "compressed" outcomes carry it. */
         install?: "installed" | "stale" | "prompt-pending" | "no-session"
         /**
@@ -238,7 +277,7 @@ export interface MessagesRecord {
     preludeFired?: boolean;
     usage?: UsageRecord;
 }
-/** Why a main-thread human turn compressed again instead of riding its prefix. */
+/** Why a turn compressed instead of riding its prefix (or passing through). */
 export type RecompressReason = 
 /** The prefix plus the turns after it reached the budget. */
 "budget"

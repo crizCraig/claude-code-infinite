@@ -21,7 +21,7 @@ const FOLLOWUP = [
 ];
 
 for (const installThroughRecovery of [false, true]) {
-  test(`a smaller window rebuilds a wide route with ${installThroughRecovery ? "spent" : "fresh"} recovery allowance`, async () => {
+  test(`a smaller window rebuilds a wide route installed by a ${installThroughRecovery ? "tool-turn compaction" : "human turn"}`, async () => {
     const fixture = await windowFixture();
     try {
       const original = installThroughRecovery ? extend(FOLLOWUP, "t0") : FOLLOWUP;
@@ -59,7 +59,7 @@ test("an unsuccessful smaller-window recovery is not regranted on unchanged retr
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "noop");
     for (const messages of [continued, extend(continued, "t2")]) {
       await fixture.post(messages, { model: SMALL_MODEL });
-      assert.equal(fixture.lastRecord().routeRecovery.outcome, "spent");
+      assert.equal(fixture.lastRecord().routeRecovery.outcome, "backoff");
       assert.equal(fixture.calls.length, 2, "one extra allowance per reduced capacity");
     }
   } finally {
@@ -93,7 +93,7 @@ test("a smaller-window recovery in flight holds the lane's allowance", async () 
       }),
     ]);
     await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
-    assert.equal(fixture.lastRecord().routeRecovery.outcome, "spent");
+    assert.equal(fixture.lastRecord().routeRecovery.outcome, "in-flight");
     assert.equal(fixture.calls.length, 2, "a concurrent miss cannot buy another attempt");
     release();
     await rebuilding;
@@ -116,7 +116,9 @@ test("an oversized replacement route cannot repeatedly regrant the smaller windo
     assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
     await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
     assert.equal(fixture.lastRecord().routeMiss, "rejected");
-    assert.equal(fixture.lastRecord().routeRecovery.outcome, "spent");
+    // The replacement still does not fit the window: the lane backs off
+    // instead of recompressing on every tool turn.
+    assert.equal(fixture.lastRecord().routeRecovery.outcome, "backoff");
     assert.equal(fixture.calls.length, 2, "the attempt already targeted this capacity");
   } finally {
     await fixture.close();
@@ -271,6 +273,10 @@ async function windowFixture({ compress, status, nativeOneMillionContext, holdFi
   const memtree = new MemtreeClient({ baseUrl: backend.origin, apiKey: "offline-test" });
   const proxy = await startProxy({
     memtree, upstreamOrigin: upstream.origin, nativeOneMillionContext,
+    // Tool turns compress only at the budget. FOLLOWUP's ~560k tokens are
+    // under the default 800k, so a 500k budget keeps a tool turn on the wide
+    // window compacting (and installing a route) as these tests need.
+    budgetTokensOverride: 500_000,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
   });
   async function request(messages, extra = {}, headers = {}) {

@@ -12,11 +12,13 @@
  *
  * Turn classification for POST /v1/messages:
  * - Tool turn (last message isn't a real user input): background indexing,
- *   forward as-is — either riding its lane's memory route (routes live in a
- *   small map keyed by request identity: session + main/away/agent-id) or
- *   verbatim. A miss buys ONE best-effort blocking recompression per lane
- *   per epoch, any size (plans/2026-08-04_PLAN_tool_turn_route_recovery.md,
- *   plans/2026-08-08_PLAN_route_parity_simple.md); failure degrades to the
+ *   forward as-is — riding its lane's memory route (routes live in a small
+ *   map keyed by request identity: session + main/away/agent-id), on the main
+ *   thread the session's stable prefix, or verbatim — while the estimated
+ *   size is under the budget, with no compress call. At the budget it
+ *   compresses once to the target (planToolCompaction), the same rule human
+ *   turns follow; on the main thread the result becomes the stable prefix
+ *   later tool and human turns ride. Failure degrades to the old ride or the
  *   verbatim forward. Every identity installs into its own lane — isolation
  *   is structural, not defended.
  * - First user turn (no earlier real user input): background indexing, forward
@@ -162,11 +164,14 @@ export interface ProxyOptions {
    */
   nativeOneMillionContext?: boolean;
   /**
-   * Best-effort blocking recompression when a large main tool turn misses
-   * its memory route (default true). This is a soft recovery fuse, not a
-   * hard payload cap: MemTree failure still degrades to forwarding the
-   * original body after the configured compress budget. The CLI maps
-   * `CCC_TOOL_ROUTE_RECOVERY=0` to `false` as a temporary kill switch.
+   * Tool-turn compaction (default true): a tool turn on any lane whose
+   * estimated size reaches the budget compresses once to the target, like a
+   * main human turn (planToolCompaction); on the main thread the result is
+   * the session's stable prefix. A soft fuse, not a hard payload cap: MemTree
+   * failure degrades to the old prefix or the original body. `false` (the
+   * CLI's `CCC_TOOL_ROUTE_RECOVERY=0`) is a pure-passthrough switch for tool
+   * turns: no size check and no compress call; they ride their lane's route
+   * when one exists and otherwise go out whole.
    */
   toolRouteRecovery?: boolean;
   /**
@@ -402,6 +407,11 @@ interface ProxyState {
    * one while the session is still passing through.
    */
   passthroughSizes: Map<string, SizeSample>;
+  /**
+   * The same, per route lane, for lanes other than the main thread's
+   * (subagents): the anchor of their tool turns' budget check.
+   */
+  laneSizes: Map<string, SizeSample>;
   /** Monotonic guard against stale async routing decisions, hooks or no hooks. */
   mainRouteEpoch: number;
   /**
@@ -435,16 +445,16 @@ interface ProxyState {
    */
   routeDecisionsLive: Map<string, Set<number>>;
   /**
-   * Route lanes that have spent their blocking recompression attempt this
-   * epoch, including the capacity it targeted and whether it is still live.
-   * An oversized route at a strictly smaller capacity gets one new attempt;
-   * unchanged retries and concurrent requests never re-grant it.
-   * Replaces the old 400KiB byte gate with the budget main already
-   * lives by: the followup path pays exactly one blocking compress per human
-   * turn, so every lane gets the same self-limiting deal. Cleared alongside
-   * memoryRoutes on every epoch bump — except the followup-path bump of a
-   * prompt the hook already armed, which keeps the budget so one turn boundary
-   * grants each lane one attempt, not two (see bumpRouteEpoch).
+   * Each lane's latest tool-turn compaction attempt this epoch: the capacity
+   * it targeted, whether it is still in flight (a concurrent attempt in the
+   * lane waits: "in-flight"), and, when it produced no prefix, the size the
+   * lane must grow to before it tries again ("backoff"). A lane is no longer
+   * spent by one attempt: tool turns compress whenever their estimate reaches
+   * the budget (planToolCompaction). A route over a strictly smaller capacity
+   * lifts the backoff. Cleared alongside memoryRoutes on every epoch bump —
+   * except the followup-path bump of a prompt the hook already armed, which
+   * keeps it so one turn boundary lifts a backoff once, not twice (see
+   * bumpRouteEpoch).
    */
   toolRecoveryAttemptedLanes: Map<string, ToolRecoveryAttempt>;
   /**
@@ -472,6 +482,12 @@ interface MemoryRoute {
    * ride the route report their Anthropic usage to it (lastSize).
    */
   stablePrefix?: StablePrefix;
+  /**
+   * Newest reported size of a tool turn sent on this route, for a route with
+   * no stable prefix (subagent lanes; sessions with compaction off). The
+   * tool-turn budget check (planToolCompaction) starts from it.
+   */
+  lastSize?: SizeSample;
 }
 
 /** A request size Anthropic reported, and the bytes of the body it was for. */
@@ -508,7 +524,14 @@ interface StablePrefixInstall {
   targetTokens: number;
   explicitTarget: boolean;
   modelContextLimit: number;
-  /** Set by installMemoryRoute to the prefix it stored. */
+  /**
+   * Tool-turn compactions only: the session prefix this one replaces (null:
+   * none). The install is skipped if the session's prefix changed while the
+   * compress call was in flight, so an older completion never overwrites a
+   * newer prefix. Undefined (human turns): install unconditionally.
+   */
+  replaces?: StablePrefix | null;
+  /** Set by installMemoryRoute / storeStablePrefix to the prefix it stored. */
   installed?: StablePrefix;
 }
 
@@ -532,7 +555,17 @@ const STABLE_PREFIX_MAX_SESSIONS = 16;
 interface ToolRecoveryAttempt {
   modelContextLimit: number;
   inFlight: boolean;
+  /**
+   * Set when the attempt produced no prefix (failure, no-op, no gain, ...):
+   * the lane's next attempt this human turn waits until the estimate reaches
+   * this size, so a lane that cannot compress does not pay a blocking call on
+   * every tool turn (routeRecovery outcome "backoff").
+   */
+  retryAtTokens?: number;
 }
+
+/** Growth (share of the budget) a lane waits for after an attempt that failed. */
+const TOOL_COMPACTION_RETRY_BUDGET_RATIO = 0.05;
 
 /**
  * Bound on concurrently held route lanes. A route entry is 0.4–4 MB of heap,
@@ -704,6 +737,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     serverBudgets: new Map(),
     serverReportsBudget: false,
     passthroughSizes: new Map(),
+    laneSizes: new Map(),
   };
   installMemtreeLink(state, state.memtreeLinkPlacement);
   const server = http.createServer((req, res) => {
@@ -1455,9 +1489,10 @@ async function handleMessages(
 
   if (!isFollowupUserTurn) {
     // Tool turn or FIRST user turn: keep the index fed off the response path
-    // and forward as-is — except a tool turn that misses its lane's memory
-    // route, which gets one best-effort blocking recompression below (once
-    // per lane per epoch).
+    // and forward as-is (on the lane's memory route or the session's stable
+    // prefix when one applies) — except a tool turn whose estimated size
+    // reached the budget, which compresses once to the target below
+    // (planToolCompaction), exactly like a main human turn.
     // On the first user turn nothing is indexed yet, so a blocking compress
     // would be a guaranteed no-op costing first-token latency
     // (plans/2026-07-05_PLAN_first_user_turn_nonblocking.md).
@@ -1509,7 +1544,7 @@ async function handleMessages(
     }
     let routedBody = forwardBody;
     let routedTool = false;
-    let routeMiss: "missing" | "rejected" | "replay" | undefined;
+    let routeMiss: "missing" | "rejected" | "replay" | "superseded" | undefined;
     if (isToolResultTurn) {
       // Every identity — main, subagent, away — consults its own lane. A
       // request can only ever name its own key, so the old foreign-owner
@@ -1565,7 +1600,7 @@ async function handleMessages(
           // derives both from the same request — so this is by construction a
           // same-session divergence: evict, and let recovery rebuild it.
           // A matching route that outgrew the request's resolved window must
-          // also rebuild; a smaller window can re-grant a spent attempt.
+          // also rebuild; a smaller window lifts the lane's backoff.
           routeMiss = "rejected";
           state.memoryRoutes.delete(requestRouteKey);
           if (overContextWindow) {
@@ -1582,93 +1617,144 @@ async function handleMessages(
         }
       }
     }
+    const toolSessionId = requestSessionId(req);
+    // A main-thread route built on an older stable prefix than the session's
+    // current one: a tool-turn compaction replaced the prefix without owning
+    // the route (a typed prompt was pending, see recoverToolRouteMiss). The
+    // route would carry the old, over-budget prefix; ride the current one.
+    if (
+      routedTool &&
+      isMainRequest &&
+      toolSessionId !== undefined &&
+      rideableCandidate?.stablePrefix !== state.stablePrefixes.get(toolSessionId)
+    ) {
+      routedTool = false;
+      routedBody = forwardBody;
+      routeMiss = "superseded";
+      state.memoryRoutes.delete(requestRouteKey);
+    }
     if (routeMiss !== undefined) rec.routeMiss = routeMiss;
 
-    if (
-      // A "replay" is not a miss to recover from: its route is intact and
-      // the verbatim forward IS the retry's payload, so it neither attempts
-      // nor spends the lane's budget.
-      (routeMiss === "missing" || routeMiss === "rejected") &&
-      // Cheap shape check: without an earlier real user message no
-      // server-side prefix can exist, so the miss is unrecoverable by
-      // construction and not worth an attempt or a record.
-      hasEarlierNonToolUserMessage(messages)
-    ) {
-      // No byte gate. The old 400KiB threshold answered "is this miss worth
-      // a blocking round trip?" with a latency guess; the answer main
-      // already lives by is a budget: at most ONE blocking recompress per
-      // (lane, epoch), with a new allowance if its route no longer fits a
-      // smaller context window. The followup path similarly pays once per
-      // human turn. The budget bounds the wait, and the
-      // no-gain check in recovery still guarantees the payload never gets
-      // worse than verbatim.
-      if (opts.toolRouteRecovery === false) {
-        // Under the kill switch no attempt ever runs and no lane is ever
-        // marked spent, so every shape-eligible miss records "disabled" —
-        // exactly the set of misses a switched-on proxy would have fed into
-        // the budget below.
+    // Cheap shape check: without an earlier real user message there is
+    // nothing MemTree could compress, so no attempt is worth making.
+    const canCompress = hasEarlierNonToolUserMessage(messages);
+    let toolRide: ToolRide | undefined = routedTool
+      ? {
+          raw: routedBody,
+          turnType: "tool-memory",
+          sizeHolder: rideableCandidate!.stablePrefix ?? rideableCandidate!,
+        }
+      : undefined;
+    if (opts.toolRouteRecovery === false) {
+      // Kill switch: no size check and no compress call on any tool turn.
+      // A route still rides; a miss forwards whole and records "disabled".
+      if ((routeMiss === "missing" || routeMiss === "rejected") && canCompress) {
         rec.routeRecovery = { outcome: "disabled" };
-      } else if (state.toolRecoveryAttemptedLanes.has(requestRouteKey)) {
-        // This lane already spent its one blocking attempt this epoch;
-        // the rest of its tool loop forwards verbatim (or rides, if the
-        // attempt installed). Checked BEFORE the cooldown so a spent lane
-        // records "spent" even while a cooldown is active: the two gates
-        // are independent facts, and the reqlog acceptance metric (attempts
-        // per lane per turn) needs budget exhaustion visible during
-        // outages, not masked behind "cooldown".
-        rec.routeRecovery = { outcome: "spent" };
-      } else if (Date.now() < state.toolRecoveryCooldownUntil) {
-        // A recent attempt burned the full compress budget and still
-        // failed. Every tool turn appends a tool_result and rehashes, so
-        // compress() dedup can never absorb the repeat: without this
-        // cooldown a MemTree outage would add the whole blocking budget
-        // to EVERY large tool turn for the rest of the session — dozens
-        // per human turn, strictly worse than the verbatim path this
-        // fuse promises never to be worse than. A cooldown skip does not
-        // consume the lane's attempt.
-        rec.routeRecovery = { outcome: "cooldown" };
-      } else {
-        const recoveryAttempt = { modelContextLimit, inFlight: true };
-        state.toolRecoveryAttemptedLanes.set(requestRouteKey, recoveryAttempt);
-        // Serialized non-system conversation bytes, for the record only —
-        // computed here, once per lane per epoch, never on the misses that
-        // skip the attempt: keeping the multi-megabyte stringify off every
-        // other miss is what made deleting the byte gate affordable.
-        const conversationBytes = Buffer.byteLength(
-          JSON.stringify(messages.filter((m) => m.role !== "system")),
-          "utf-8"
-        );
-        return logged(
-          recoverToolRouteMiss({
-            opts,
-            state,
-            req,
-            res,
-            upstream,
-            body,
-            messages,
-            forwardBody,
-            msgsForMemtree,
-            hash,
-            modelContextLimit,
-            routeEpoch,
-            rec,
-            conversationBytes,
-            routeKey: requestRouteKey,
-            isMainRequest,
-            recoveryAttempt,
-            clientMeta,
-          }).finally(() => {
-            recoveryAttempt.inFlight = false;
-          })
-        );
+      }
+    } else if (isToolResultTurn && routeMiss !== "replay") {
+      // Every lane's tool turn lives by the budget, like a main human turn:
+      // under it, forward (on the lane's route or the session's stable
+      // prefix, else whole) with no compress call; at it, compress once to
+      // the target (planToolCompaction). A "replay" is a client retry of the
+      // request that installed the route, forwarded verbatim.
+      const plan = planToolCompaction({
+        opts,
+        state,
+        body,
+        messages,
+        sessionId: toolSessionId,
+        routeKey: requestRouteKey,
+        isMainRequest,
+        modelContextLimit,
+        forwardBody,
+        rec,
+        ride: toolRide,
+        canCompress,
+      });
+      if (plan.kind === "ride") toolRide = plan.ride;
+      if (plan.kind === "compress") {
+        const prior = state.toolRecoveryAttemptedLanes.get(requestRouteKey);
+        if (prior?.inFlight) {
+          // A concurrent request of this lane is already compressing.
+          rec.routeRecovery = { outcome: "in-flight" };
+        } else if (
+          prior?.retryAtTokens !== undefined &&
+          plan.estimateTokens < prior.retryAtTokens
+        ) {
+          // This lane's last attempt this human turn produced nothing; wait
+          // for growth instead of paying a blocking call on every tool turn.
+          rec.routeRecovery = { outcome: "backoff" };
+        } else if (Date.now() < state.toolRecoveryCooldownUntil) {
+          // A recent attempt burned the full compress budget and still
+          // failed. Every tool turn appends a tool_result and rehashes, so
+          // compress() dedup can never absorb the repeat: without this
+          // cooldown a MemTree outage would add the whole blocking budget to
+          // every tool turn over the budget. A cooldown skip does not start
+          // the lane's backoff.
+          rec.routeRecovery = { outcome: "cooldown" };
+        } else {
+          const recoveryAttempt: ToolRecoveryAttempt = { modelContextLimit, inFlight: true };
+          state.toolRecoveryAttemptedLanes.set(requestRouteKey, recoveryAttempt);
+          // Serialized non-system conversation bytes, for the record only —
+          // computed only when an attempt is made.
+          const conversationBytes = Buffer.byteLength(
+            JSON.stringify(messages.filter((m) => m.role !== "system")),
+            "utf-8"
+          );
+          return logged(
+            recoverToolRouteMiss({
+              opts,
+              state,
+              req,
+              res,
+              upstream,
+              body,
+              messages,
+              forwardBody,
+              msgsForMemtree,
+              hash,
+              modelContextLimit,
+              routeEpoch,
+              rec,
+              conversationBytes,
+              routeKey: requestRouteKey,
+              isMainRequest,
+              recoveryAttempt,
+              clientMeta,
+              compaction: { target: plan.target },
+              ...(plan.replaces !== undefined
+                ? {
+                    stable: {
+                      targetTokens: plan.targetTokens,
+                      explicitTarget: plan.explicitTarget,
+                      modelContextLimit,
+                      replaces: plan.replaces,
+                    },
+                  }
+                : {}),
+              ...(plan.fallback ? { fallback: plan.fallback } : {}),
+              retryAtTokens:
+                plan.estimateTokens +
+                Math.floor(plan.budgetTokens * TOOL_COMPACTION_RETRY_BUDGET_RATIO),
+            }).finally(() => {
+              recoveryAttempt.inFlight = false;
+            })
+          );
+        }
+        // No attempt: send the old ride when there is one, else the whole
+        // history.
+        if (plan.fallback) {
+          toolRide = plan.fallback;
+          rec.compaction!.keptPrefix = true;
+        }
       }
     }
 
+    const sendBody = toolRide?.raw ?? forwardBody;
     recordTurn(
       rec,
-      routedTool ? "tool-memory" : isUserTurn ? "first-user" : "tool",
-      routedBody
+      toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool",
+      sendBody
     );
     // A replay matched the stored route's prefix hashes, which are
     // normalization-tolerant — attribution/cache-control churn can make its
@@ -1677,26 +1763,25 @@ async function handleMessages(
     // sound: a live route proves the installer's compress() submitted this
     // history in this process, so re-indexing buys nothing.
     if (routeMiss !== "replay") {
-      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), clientMeta);
+      opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, toolSessionId, clientMeta);
     }
-    capture(opts, routedTool ? "anthropic-request-memory-tool" : "anthropic-request", routedBody);
-    // Sizes for the next human turn's budget check: a tool turn on a route
-    // built from the stable prefix reports to that prefix, a main request
-    // sent whole to the session's passthrough size.
-    const sizePrefix = routedTool ? rideableCandidate?.stablePrefix : undefined;
+    capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
+    // The size Anthropic reports is the next budget check's anchor: a ride
+    // reports to its prefix (or route), a whole request to the session's (or
+    // lane's) passthrough size.
     return logged(
       forwardRaw(
         req,
         res,
-        routedBody,
+        sendBody,
         opts,
         upstream,
         state.shutdownSignal,
         rec
       ).then(() => {
-        if (sizePrefix) notePrefixSize(sizePrefix, rec, routedBody.length);
-        else if (!routedTool && isMainRequest) {
-          notePassthroughSize(state, requestSessionId(req), rec, routedBody.length);
+        if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
+        else {
+          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestRouteKey, rec, sendBody.length);
         }
       })
     );
@@ -2597,7 +2682,7 @@ function installMemoryRoute(
    * a prefix ride passes the prefix it rode, already stored.
    */
   stable?: StablePrefixInstall | { ride: StablePrefix }
-): boolean {
+): MemoryRoute | undefined {
   // Epoch guards the human-prompt lifecycle; the decision generation orders
   // async installs that share one epoch (two recoveries, or a recovery vs an
   // in-flight followup). A stale completion must not overwrite a newer
@@ -2607,12 +2692,12 @@ function installMemoryRoute(
     state.mainRouteEpoch !== routeEpoch ||
     !routeDecisionHolds(state, key, decisionGeneration)
   ) {
-    return false;
+    return undefined;
   }
   const sessionId = requestSessionId(req);
   if (!sessionId || !Array.isArray(compressedBody.messages)) {
     state.memoryRoutes.delete(key);
-    return false;
+    return undefined;
   }
   // Test-only fault-injection seam (undefined in production): placed after
   // every guard and before the store, exactly where the route object's
@@ -2642,25 +2727,49 @@ function installMemoryRoute(
     // The route's own fields are the prefix: the hashes of every message this
     // request carried, and the compressed bytes sent for them. Later requests
     // reuse these bytes unchanged, so the prefix stays a cache read.
-    const prefix: StablePrefix = {
-      sessionId,
-      originalSystemHash: route.originalSystemHash,
-      originalPrefixHashes: originalMessages.map(stablePrefixMessageHash),
-      compressedMessages: route.compressedMessages,
-      compressedSystem: route.compressedSystem,
-      hasCompressedSystem: route.hasCompressedSystem,
-      targetTokens: stable.targetTokens,
-      explicitTarget: stable.explicitTarget,
-      modelContextLimit: stable.modelContextLimit,
-    };
-    route.stablePrefix = prefix;
-    stable.installed = prefix;
-    boundedSet(state.stablePrefixes, sessionId, prefix);
-    state.compactNow.delete(sessionId);
+    route.stablePrefix = storeStablePrefix(state, sessionId, originalMessages, route, stable);
   }
   setMemoryRoute(state, key, route);
   if (key === JSON.stringify([sessionId, "main"])) state.lastMainRoute = route;
-  return true;
+  return route;
+}
+
+/**
+ * Store a compaction's compressed bytes as the session's stable prefix. For a
+ * tool-turn compaction (`replaces` set) only while the session's prefix is
+ * still the one the compaction replaced; undefined when skipped.
+ */
+function storeStablePrefix(
+  state: ProxyState,
+  sessionId: string,
+  originalMessages: Message[],
+  compressed: Pick<
+    StablePrefix,
+    "originalSystemHash" | "compressedMessages" | "compressedSystem" | "hasCompressedSystem"
+  >,
+  stable: StablePrefixInstall
+): StablePrefix | undefined {
+  if (
+    stable.replaces !== undefined &&
+    (state.stablePrefixes.get(sessionId) ?? null) !== stable.replaces
+  ) {
+    return undefined;
+  }
+  const prefix: StablePrefix = {
+    sessionId,
+    originalSystemHash: compressed.originalSystemHash,
+    originalPrefixHashes: originalMessages.map(stablePrefixMessageHash),
+    compressedMessages: compressed.compressedMessages,
+    compressedSystem: compressed.compressedSystem,
+    hasCompressedSystem: compressed.hasCompressedSystem,
+    targetTokens: stable.targetTokens,
+    explicitTarget: stable.explicitTarget,
+    modelContextLimit: stable.modelContextLimit,
+  };
+  stable.installed = prefix;
+  boundedSet(state.stablePrefixes, sessionId, prefix);
+  state.compactNow.delete(sessionId);
+  return prefix;
 }
 
 type ForkMiss = NonNullable<MessagesRecord["forkMiss"]>;
@@ -2848,7 +2957,7 @@ function compactionTarget(mode: CompactionMode, budgetTokens: number): number {
 
 /**
  * Target and threshold for compress calls other than a main-thread human turn
- * (subagent and recap followups, tool-route recovery). They never build a
+ * or a tool turn (subagent and recap followups). They never build a
  * stable prefix, so they only need to stay under the budget: a server that
  * understands the threshold gets both, an older one gets neither and uses its
  * own model budget. Never a bare target, which would force a compression on
@@ -2912,8 +3021,11 @@ function estimateRequestTokens(
   return { tokens: approxTokensFromBytes(bytes), source: "bytes" };
 }
 
+/** Something a request's reported size is recorded on: a stable prefix or a route. */
+type SizeHolder = { lastSize?: SizeSample };
+
 /** Keep the newest (largest-body) reported size of a request on this prefix. */
-function notePrefixSize(prefix: StablePrefix, rec: MessagesRecord, bytes: number): void {
+function notePrefixSize(prefix: SizeHolder, rec: MessagesRecord, bytes: number): void {
   const tokens = reportedInputTokens(rec);
   if (tokens === undefined) return;
   if (prefix.lastSize && bytes < prefix.lastSize.forwardedBytes) return;
@@ -2932,10 +3044,39 @@ function notePassthroughSize(
   boundedSet(state.passthroughSizes, sessionId, { tokens, forwardedBytes: bytes });
 }
 
-function boundedSet<V>(map: Map<string, V>, key: string, value: V): void {
+/** Size of a tool turn sent on a ride, recorded on its prefix or route. */
+const noteRideSize = notePrefixSize;
+
+/**
+ * Record the reported size of a request forwarded whole: the session's
+ * passthrough size on the main thread, else its lane's.
+ */
+function noteWholeRequestSize(
+  state: ProxyState,
+  isMainRequest: boolean,
+  sessionId: string | undefined,
+  routeKey: string,
+  rec: MessagesRecord,
+  bytes: number
+): void {
+  if (isMainRequest && sessionId !== undefined) {
+    notePassthroughSize(state, sessionId, rec, bytes);
+    return;
+  }
+  const tokens = reportedInputTokens(rec);
+  if (tokens === undefined) return;
+  boundedSet(state.laneSizes, routeKey, { tokens, forwardedBytes: bytes }, MEMORY_ROUTE_MAX_LANES);
+}
+
+function boundedSet<V>(
+  map: Map<string, V>,
+  key: string,
+  value: V,
+  limit = STABLE_PREFIX_MAX_SESSIONS
+): void {
   map.delete(key);
   map.set(key, value);
-  while (map.size > STABLE_PREFIX_MAX_SESSIONS) {
+  while (map.size > limit) {
     const oldest = map.keys().next().value;
     if (oldest === undefined) break;
     map.delete(oldest);
@@ -3067,6 +3208,120 @@ function planEdgeCompaction(args: {
   // Under budget by our estimate, on a server that cannot take a threshold:
   // no target, so it passes through unless over its own model budget.
   return { kind: "compress", targetTokens, explicitTarget };
+}
+
+/** A tool turn sent on a compressed prefix instead of its whole history. */
+interface ToolRide {
+  raw: Buffer;
+  /** "tool-memory": the lane's route; "tool-prefix": the session's stable prefix. */
+  turnType: "tool-memory" | "tool-prefix";
+  /** Where this request's reported size is recorded. */
+  sizeHolder: SizeHolder;
+}
+
+/** What a tool turn does about compaction (planToolCompaction). */
+type ToolPlan =
+  /** Compaction off for the session: ride the route if any, else whole; no compress call. */
+  | { kind: "off" }
+  /** Under the budget on a route or the stable prefix: send it, no compress call. */
+  | { kind: "ride"; ride: ToolRide }
+  /** Under the budget with nothing to ride: forward whole, no compress call. */
+  | { kind: "pass" }
+  /**
+   * At the budget (or past the context window): compress once, forced to
+   * `target`. `fallback` is the ride sent if that fails. `replaces` (main
+   * thread with a session) makes the result the session's stable prefix,
+   * replacing that one (null: none).
+   */
+  | {
+      kind: "compress";
+      target: number;
+      targetTokens: number;
+      explicitTarget: boolean;
+      estimateTokens: number;
+      budgetTokens: number;
+      fallback?: ToolRide;
+      replaces?: StablePrefix | null;
+    };
+
+/**
+ * Stable-prefix compaction for a tool turn, on every lane: the rule human
+ * turns follow (planEdgeCompaction), minus the server-side threshold call —
+ * a tool turn under the budget makes no compress call at all.
+ *
+ * - The ride: the lane's route (`ride`, already matched), else on the main
+ *   thread the session's stable prefix when it still covers this history.
+ * - Its size: estimateRequestTokens anchored on the size Anthropic reported
+ *   for the previous request of the same shape (the ride's prefix or route,
+ *   else the session's / lane's whole-request size), bytes/4 without one.
+ * - Under the budget (and within the window): ride, or forward whole.
+ * - At the budget: compress, forced to the target (reason "budget"); on the
+ *   main thread the result becomes the stable prefix later tool AND human
+ *   turns ride.
+ *
+ * Fills rec.compaction.
+ */
+function planToolCompaction(args: {
+  opts: ProxyOptions;
+  state: ProxyState;
+  body: Record<string, any>;
+  messages: Message[];
+  sessionId: string | undefined;
+  routeKey: string;
+  isMainRequest: boolean;
+  modelContextLimit: number;
+  forwardBody: Buffer;
+  rec: MessagesRecord;
+  ride: ToolRide | undefined;
+  canCompress: boolean;
+}): ToolPlan {
+  const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } =
+    args;
+  const mode = compactionMode(opts, state, sessionId);
+  const budget = resolveBudget(opts, state, body.model, modelContextLimit);
+  const compaction: CompactionRecord = {
+    mode: mode.mode,
+    budgetTokens: budget.tokens,
+    budgetSource: budget.source,
+  };
+  rec.compaction = compaction;
+  if (mode.mode === "off") return { kind: "off" };
+  const targetTokens = compactionTarget(mode, budget.tokens);
+  compaction.targetTokens = targetTokens;
+
+  const stableLane = args.isMainRequest && sessionId !== undefined;
+  const current = stableLane ? state.stablePrefixes.get(sessionId) : undefined;
+  let ride = args.ride;
+  let overWindow = false;
+  if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
+    const routed = prefixRoutedBody(body, messages, current);
+    if (routedBodyExceedsContext(body, routed.raw, modelContextLimit)) overWindow = true;
+    else ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
+  } else if (!ride) {
+    overWindow = routedBodyExceedsContext(body, forwardBody, modelContextLimit);
+  }
+  const sample = ride
+    ? ride.sizeHolder.lastSize
+    : stableLane
+      ? state.passthroughSizes.get(sessionId!)
+      : state.laneSizes.get(args.routeKey);
+  const size = estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
+  compaction.estimatedTokens = size.tokens;
+  compaction.sizeSource = size.source;
+  if ((size.tokens < budget.tokens && !overWindow) || !args.canCompress) {
+    return ride ? { kind: "ride", ride } : { kind: "pass" };
+  }
+  compaction.reason = "budget";
+  return {
+    kind: "compress",
+    target: targetTokens,
+    targetTokens,
+    explicitTarget: mode.mode === "explicit",
+    estimateTokens: size.tokens,
+    budgetTokens: budget.tokens,
+    ...(ride ? { fallback: ride } : {}),
+    ...(stableLane ? { replaces: current ?? null } : {}),
+  };
 }
 
 function memoryRoutedToolBody(
@@ -3691,15 +3946,18 @@ function buildCompressedBody(
 }
 
 /**
- * Best-effort recovery for a large main tool turn whose memory route missed
- * (missing slot or same-session rejection): one blocking recompression
- * attempt, sharing the followup path's complete selection pipeline. This is
- * a soft fuse — any failure, no-op, unusable, or non-shrinking result
- * degrades to forwarding the original body, never worse than the verbatim
- * path it replaces. A validated smaller result forwards exactly one
- * compressed Anthropic leg, claims no human-turn state (no notice, no prompt
- * arm/delivery mutation), and installs a self-healing route at
- * protocol-complete so the rest of the tool loop rides locally again.
+ * A tool turn's compaction (planToolCompaction said its estimated size
+ * reached the budget): one blocking compression forced to the target,
+ * sharing the followup path's complete selection pipeline. This is a soft
+ * fuse — any failure, no-op, unusable, or non-shrinking result degrades to
+ * the body the turn would otherwise have sent (`fallback`: the old route or
+ * prefix ride, recorded as keptPrefix; else the whole history). A validated
+ * smaller result forwards exactly one compressed Anthropic leg, claims no
+ * human-turn state (no notice, no prompt arm/delivery mutation), and at
+ * protocol-complete installs the lane's route and, on the main thread, the
+ * session's new stable prefix (`stable`), so later tool and human turns ride
+ * it with no compress call. An attempt that produced no prefix sets the
+ * lane's backoff (`retryAtTokens`).
  */
 async function recoverToolRouteMiss(args: {
   opts: ProxyOptions;
@@ -3720,6 +3978,14 @@ async function recoverToolRouteMiss(args: {
   isMainRequest: boolean;
   recoveryAttempt: ToolRecoveryAttempt;
   clientMeta?: Record<string, string>;
+  /** compression_target_tokens / threshold for the compress call. */
+  compaction?: { target?: number; threshold?: number };
+  /** Main thread with a session: store the result as the stable prefix. */
+  stable?: StablePrefixInstall;
+  /** Sent instead of the whole history when the attempt produces nothing. */
+  fallback?: ToolRide;
+  /** The lane's backoff size, set when the attempt produces no prefix. */
+  retryAtTokens?: number;
 }): Promise<void> {
   const {
     opts,
@@ -3739,7 +4005,12 @@ async function recoverToolRouteMiss(args: {
     routeKey,
     isMainRequest,
     recoveryAttempt,
+    stable,
+    fallback,
   } = args;
+  const backOff = () => {
+    if (args.retryAtTokens !== undefined) recoveryAttempt.retryAtTokens = args.retryAtTokens;
+  };
 
   const sessionId = requestSessionId(req);
   // A pending MAIN prompt arm/retry window means a typed prompt may arrive
@@ -3826,6 +4097,7 @@ async function recoverToolRouteMiss(args: {
       rec,
       sessionId: requestSessionId(req),
       clientMeta: args.clientMeta,
+      ...(args.compaction ? { compaction: args.compaction } : {}),
     });
   } catch (err) {
     // Nothing in the pipeline is expected to throw (compress() maps every
@@ -3875,7 +4147,27 @@ async function recoverToolRouteMiss(args: {
     return;
   }
 
+  /**
+   * The attempt produced nothing: send what the turn would have sent without
+   * it — the old ride (kept prefix) or the whole history — and back off.
+   */
   const forwardOriginal = () => {
+    backOff();
+    if (fallback) {
+      if (rec.compaction) rec.compaction.keptPrefix = true;
+      recordTurn(rec, fallback.turnType, fallback.raw);
+      capture(opts, "anthropic-request-memory-tool", fallback.raw);
+      return forwardRaw(
+        req,
+        res,
+        fallback.raw,
+        opts,
+        upstream,
+        state.shutdownSignal,
+        rec
+      ).then(() => noteRideSize(fallback.sizeHolder, rec, fallback.raw.length));
+    }
+    recordTurn(rec, "tool", forwardBody);
     capture(opts, "anthropic-request", forwardBody);
     return forwardRaw(
       req,
@@ -3885,13 +4177,14 @@ async function recoverToolRouteMiss(args: {
       upstream,
       state.shutdownSignal,
       rec
-    ).then(() => undefined);
+    ).then(() =>
+      noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, forwardBody.length)
+    );
   };
 
   if (!result) {
     rec.routeRecovery = { conversationBytes, outcome: "failed" };
     releaseOwnReservation();
-    recordTurn(rec, "tool", forwardBody);
     // An ordinary server/network failure or timeout retains the background
     // submission: its longer independent budget can still warm the index for
     // a later turn. An unpaid key (402, possibly set by this very compress)
@@ -3923,7 +4216,6 @@ async function recoverToolRouteMiss(args: {
       outcome: actuallyCompressed ? "unusable" : "noop",
     };
     releaseOwnReservation();
-    recordTurn(rec, "tool", forwardBody);
     return forwardOriginal();
   }
 
@@ -3942,7 +4234,6 @@ async function recoverToolRouteMiss(args: {
   } catch (err) {
     rec.routeRecovery = { conversationBytes, outcome: "build-failed" };
     releaseOwnReservation();
-    recordTurn(rec, "tool", forwardBody);
     if (opts.debug) {
       console.error(
         `[ccc proxy] recovered body build failed: ${
@@ -3960,7 +4251,6 @@ async function recoverToolRouteMiss(args: {
     // other non-forwardable recovery outcome.
     rec.routeRecovery = { conversationBytes, outcome: "no-flatten" };
     releaseOwnReservation();
-    recordTurn(rec, "tool", forwardBody);
     if (opts.debug) {
       console.error(
         "[ccc proxy] recovered result carried no server flatten; " +
@@ -3970,21 +4260,40 @@ async function recoverToolRouteMiss(args: {
     return forwardOriginal();
   }
   const { compressedBody, compressedRaw } = built;
-  if (compressedRaw.length >= forwardBody.length) {
+  if (compressedRaw.length >= (fallback?.raw ?? forwardBody).length) {
     // The final transformed body is the proof of payload recovery; a result
-    // with no byte gain is not worth a route built on it.
+    // with no byte gain over what the turn would send anyway is not worth a
+    // route built on it.
     rec.routeRecovery = { conversationBytes, outcome: "no-gain" };
     releaseOwnReservation();
-    recordTurn(rec, "tool", forwardBody);
     return forwardOriginal();
   }
 
   rec.routeRecovery = { conversationBytes, outcome: "compressed" };
   let activationAttempted = false;
   let installFate: "installed" | "stale" | undefined;
+  let installedRoute: MemoryRoute | undefined;
   const activateRecoveredRoute = () => {
     if (activationAttempted) return;
     if (!routeOwning) {
+      // No route (a typed prompt is pending, or no session to match a later
+      // ride against), but on the main thread the result still becomes the
+      // session's stable prefix: nothing classifies against it, and later
+      // tool turns ride it directly ("tool-prefix").
+      if (stable && sessionId !== undefined) {
+        storeStablePrefix(
+          state,
+          sessionId,
+          messages,
+          {
+            originalSystemHash: routeValueHash(normalizeRouteSystem(body.system)),
+            compressedMessages: cloneJson(compressedBody.messages),
+            compressedSystem: cloneJson(compressedBody.system),
+            hasCompressedSystem: Object.prototype.hasOwnProperty.call(compressedBody, "system"),
+          },
+          stable
+        );
+      }
       activationAttempted = true;
       return;
     }
@@ -3999,11 +4308,13 @@ async function recoverToolRouteMiss(args: {
       messages,
       compressedBody,
       routeEpoch,
-      decisionGeneration
+      decisionGeneration,
+      stable
     );
     // Leave this false if installMemoryRoute unexpectedly throws: the
     // delivery-complete fallback then gets one safe retry.
     activationAttempted = true;
+    installedRoute = installed;
     installFate = installed ? "installed" : "stale";
     // A tool continuation can arrive after message_stop while this HTTP
     // stream is still draining. Its route is already complete, so a smaller
@@ -4111,6 +4422,14 @@ async function recoverToolRouteMiss(args: {
         : rec.clientAborted
           ? "client-aborted"
           : "upstream-failed");
+  if (stable) rec.routeRecovery.prefix = stable.installed ? "installed" : "not-installed";
+  // The compacted request's reported size anchors the next budget check.
+  const sizeHolder: SizeHolder | undefined = stable?.installed ?? installedRoute;
+  if (sizeHolder) notePrefixSize(sizeHolder, rec, compressedRaw.length);
+  // Nothing to ride next turn, or a result that still does not fit the
+  // window (the next turn would reject it and compress again): wait for
+  // growth before the lane tries again.
+  if (!sizeHolder || routedBodyExceedsContext(body, compressedRaw, modelContextLimit)) backOff();
   // A reservation that lost its race (stale) or never reached
   // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
   // it must stop suppressing whoever is still trying to install.
