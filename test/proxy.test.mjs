@@ -5235,6 +5235,79 @@ test("a tool turn under the budget makes no compress call and spends nothing; th
   }
 });
 
+test("a no-op that finds no tree stops the tool loop's compress calls until the tree's page is built", async () => {
+  // Live Haiku run 2026-09-29: a new conversation's loop crossed the budget
+  // before its first tree existed; each tool turn paid a blocking compress
+  // call that could only pass everything through (unindexed messages are
+  // always kept verbatim). Now the lane waits for the tree instead.
+  const upstream = await recordingUpstream();
+  let pageReady = false;
+  let pageGets = 0;
+  const calls = [];
+  const memtreeSrv = await listen((req, res) => {
+    if (req.method === "GET") {
+      pageGets++;
+      assert.match(req.url, /^\/usage\/memtree\/ea18af90658b\.json$/);
+      res.writeHead(pageReady ? 200 : 202, { "content-type": "application/json" });
+      res.end(JSON.stringify(pageReady ? { nodes: [] } : { status: "building" }));
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      calls.push(parsed);
+      const body = parsed.index_only
+        ? { messages: [], index_only: true, usage: {} }
+        : pageReady
+          ? withServerFlatten(recoveredMemory(), parsed)
+          : { messages: parsed.messages, compressed: false, usage: { prompt_tokens_details: { cached_tokens: 0 } } };
+      res.writeHead(200, { "content-type": "application/json", ...(parsed.index_only ? {} : pageHeaders(PAGE_URL_1)) });
+      res.end(JSON.stringify(body));
+    });
+  });
+  const records = [];
+  const proxy = await startRecoveryProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const blockingCalls = () => calls.filter((c) => !c.index_only).length;
+  try {
+    let loop = largeToolTurn();
+    await postMessages(proxy.port, loop, SESSION);
+    const first = messageRecords(records).at(-1);
+    assert.equal(first.routeRecovery.outcome, "noop");
+    assert.equal(first.routeRecovery.awaitingIndex, true);
+    assert.equal(blockingCalls(), 1);
+
+    for (const id of ["t2", "t3"]) {
+      loop = extendToolLoop(loop, id);
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+    }
+    assert.equal(blockingCalls(), 1, "no compress call while the tree is building");
+    await waitFor(() => pageGets >= 1);
+
+    pageReady = true;
+    loop = extendToolLoop(loop, "t4");
+    await postMessages(proxy.port, loop, SESSION);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+    await waitFor(() => pageGets >= 2);
+    await new Promise((r) => setTimeout(r, 20));
+
+    loop = extendToolLoop(loop, "t5");
+    await postMessages(proxy.port, loop, SESSION);
+    const ready = messageRecords(records).at(-1);
+    assert.equal(ready.routeRecovery.outcome, "compressed", "tree built: compresses without waiting for growth");
+    assert.equal(blockingCalls(), 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("disabled recovery records the suppressed miss and never compresses", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());

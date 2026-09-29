@@ -93,6 +93,36 @@ const MAX_EXPLICIT_TARGET_BUDGET_RATIO = 0.9;
 const SERVER_MIN_TARGET_TOKENS = 10_000;
 /** Sessions whose stable prefix / passthrough size is kept (LRU). */
 const STABLE_PREFIX_MAX_SESSIONS = 16;
+/**
+ * Background check of whether a lane's awaited tree exists: its page answers
+ * 200 once built (202 while building). Any other answer stops the wait, so a
+ * page that never resolves falls back to the growth backoff instead of
+ * blocking compaction for good.
+ */
+function checkAwaitedIndex(opts, attempt) {
+    const waiting = attempt.awaitingIndex;
+    if (!waiting || waiting.checking)
+        return;
+    waiting.checking = true;
+    opts.memtree
+        .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`)
+        .then((page) => {
+        if (page.status === 202)
+            return;
+        if (attempt.awaitingIndex === waiting)
+            attempt.awaitingIndex = undefined;
+        // A finished tree is exactly what the backoff was waiting for.
+        if (page.status === 200)
+            attempt.retryAtTokens = undefined;
+    })
+        .catch(() => {
+        if (attempt.awaitingIndex === waiting)
+            attempt.awaitingIndex = undefined;
+    })
+        .finally(() => {
+        waiting.checking = false;
+    });
+}
 /** Growth (share of the budget) a lane waits for after an attempt that failed. */
 const TOOL_COMPACTION_RETRY_BUDGET_RATIO = 0.05;
 /**
@@ -1070,6 +1100,13 @@ async function handleMessages(req, res, opts, upstream, state) {
                 if (prior?.inFlight) {
                     // A concurrent request of this lane is already compressing.
                     rec.routeRecovery = { outcome: "in-flight" };
+                }
+                else if (prior?.awaitingIndex && !plan.overWindow) {
+                    // The last attempt found no tree for this conversation, so a
+                    // compress call could only pass everything through again. Forward
+                    // now; the page check lets the next tool turn try once it exists.
+                    rec.routeRecovery = { outcome: "awaiting-index" };
+                    checkAwaitedIndex(opts, prior);
                 }
                 else if (prior?.retryAtTokens !== undefined &&
                     plan.estimateTokens < prior.retryAtTokens) {
@@ -2318,6 +2355,7 @@ function planToolCompaction(args) {
         explicitTarget: mode.mode === "explicit",
         estimateTokens: size.tokens,
         budgetTokens: budget.tokens,
+        overWindow,
         ...(ride ? { fallback: ride } : {}),
         ...(stableLane ? { replaces: current ?? null } : {}),
     };
@@ -3045,6 +3083,13 @@ async function recoverToolRouteMiss(args) {
             conversationBytes,
             outcome: actuallyCompressed ? "unusable" : "noop",
         };
+        // No tree yet (nothing indexed): wait for it to be built rather than
+        // retrying on growth, which on a fast-growing loop is every tool turn.
+        const pageId = result.memtreeUrl ? memtreePageId(result.memtreeUrl) : undefined;
+        if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0) && pageId) {
+            recoveryAttempt.awaitingIndex = { pageId, checking: false };
+            rec.routeRecovery.awaitingIndex = true;
+        }
         releaseOwnReservation();
         return forwardOriginal();
     }

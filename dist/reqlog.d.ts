@@ -215,6 +215,13 @@ export interface MessagesRecord {
          */
          | "backoff"
         /**
+         * This lane's last attempt found no finished tree for the conversation
+         * (no-op, nothing indexed), so a compress call could only pass it
+         * through again. None is made until that attempt's MemTree page
+         * reports built (checked in the background, one fetch at a time).
+         */
+         | "awaiting-index"
+        /**
          * The compressed result could not be serialized (e.g. V8 string-length
          * limit on a multi-megabyte body). Forwarded the original.
          */
@@ -225,6 +232,8 @@ export interface MessagesRecord {
          * or a newer prefix replaced the one this compaction started from).
          */
         prefix?: "installed" | "not-installed";
+        /** A no-op that found no tree: the lane now waits for one ("awaiting-index"). */
+        awaitingIndex?: boolean;
         /** Route candidate fate; only "compressed" outcomes carry it. */
         install?: "installed" | "stale" | "prompt-pending" | "no-session"
         /**
