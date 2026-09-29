@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { MessageUsage } from "./transcript-usage.js";
+import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import {
@@ -86,6 +86,12 @@ export interface CompressRequestMeta {
    * MemTree page; never hashed, never part of the compression cache key.
    */
   messageUsage?: MessageUsage;
+  /**
+   * When Claude Code wrote each message (ISO), keyed like messageUsage. The
+   * server records a time range per MemTree input block; never hashed, never
+   * part of the compression cache key.
+   */
+  messageTimes?: MessageTimes;
   /**
    * Claude Code's session id, sent as `x-claude-code-session-id` so the
    * server can list a session's MemTree pages by it. Not part of the cache key.
@@ -955,6 +961,7 @@ export class MemtreeClient {
       compressionTargetTokens: meta?.compressionTargetTokens,
       compressionThresholdTokens: meta?.compressionThresholdTokens,
       messageUsage: meta?.messageUsage,
+      messageTimes: meta?.messageTimes,
       sessionId: meta?.sessionId,
       clientMeta: meta?.clientMeta,
     }).catch((err) => {
@@ -1002,7 +1009,9 @@ export class MemtreeClient {
     messages: Message[],
     modelContextLimit: number,
     sessionId?: string,
-    clientMeta?: Record<string, string>
+    clientMeta?: Record<string, string>,
+    /** Message times for the reminder-stripped list actually sent. */
+    messageTimesFor?: (messages: Message[]) => MessageTimes
   ): void {
     if (this.backgroundClosing) return;
     if (this.indexedHashes.has(hash)) return;
@@ -1018,6 +1027,9 @@ export class MemtreeClient {
       timeoutMs: INDEX_TIMEOUT_MS,
       indexOnly: true,
       signal: controller.signal,
+      // Computed after stripping: a reminder-only message is dropped, which
+      // shifts every later index.
+      messageTimes: messageTimesFor?.(stripped),
       sessionId,
       clientMeta,
     })
@@ -1109,6 +1121,7 @@ export class MemtreeClient {
       compressionTargetTokens?: number;
       compressionThresholdTokens?: number;
       messageUsage?: MessageUsage;
+      messageTimes?: MessageTimes;
       sessionId?: string;
       clientMeta?: Record<string, string>;
     }
@@ -1120,6 +1133,11 @@ export class MemtreeClient {
     // Server may ignore this until the index-only endpoint mode ships
     // (plan Phase 2.2); harmless extra field either way.
     if (opts.indexOnly) body.index_only = true;
+    // Both call kinds: index-only calls build most of the tree, and the
+    // server stamps each input block with its messages' time range.
+    if (opts.messageTimes && Object.keys(opts.messageTimes).length) {
+      body.message_times = opts.messageTimes;
+    }
     // Model (and tools, whose serialized size feeds the same budget) let the
     // server resolve a model-based memory budget instead of its static 50k
     // fallback. Only meaningful on compression calls: the server's index_only

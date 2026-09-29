@@ -68,3 +68,84 @@ test("no transcript, bad session ids and unreadable files give no usage", () => 
   assert.equal(findTranscript("/nonexistent/dir", SESSION), undefined);
   assert.equal(defaultProjectsDir({ CLAUDE_CONFIG_DIR: "/cfg" }), path.join("/cfg", "projects"));
 });
+
+test("each message gets the time Claude Code wrote it: responses, tool results, typed text", () => {
+  const { root, file } = transcriptDir();
+  const user = (content, timestamp) =>
+    JSON.stringify({ type: "user", message: { role: "user", content }, timestamp }) + "\n";
+  fs.writeFileSync(file,
+    user("fix the <system-reminder>r1</system-reminder>bug", "2026-09-23T20:00:00.000Z") +
+    entry("msg_a", [{ type: "thinking", thinking: "" }], usage(10, 8), { timestamp: "2026-09-23T20:00:05.000Z" }) +
+    entry("msg_a", [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }], usage(40, 8),
+      { timestamp: "2026-09-23T20:00:09.000Z" }) +
+    user([{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }], "2026-09-23T20:01:00.000Z") +
+    user("and the docs", "2026-09-23T20:02:00.000Z") +
+    entry("msg_b", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: "2026-09-23T20:03:00+02:00" }) +
+    user("no time on this one", undefined));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "fix the bug" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }] },
+    // Claude Code folds a tool result and the next typed prompt into one message.
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_1", content: "ok" },
+      { type: "text", text: "<system-reminder>r2</system-reminder>and the docs" },
+    ] },
+    { role: "assistant", content: [{ type: "text", text: "Done." }] },
+    { role: "user", content: "no time on this one" },
+    { role: "user", content: "never typed" },
+  ];
+  assert.deepEqual(source.timesFor(SESSION, messages), {
+    1: "2026-09-23T20:00:00.000Z",
+    2: "2026-09-23T20:00:09.000Z", // the response's last entry
+    3: "2026-09-23T20:02:00.000Z", // the latest of its parts
+    4: "2026-09-23T18:03:00.000Z", // normalized to UTC
+  });
+  assert.deepEqual(new ClaudeTranscriptUsage("/nonexistent/dir").timesFor(SESSION, messages), {});
+});
+
+test("repeated text takes the next time in order, not the last one written", () => {
+  const { root, file } = transcriptDir();
+  const user = (content, timestamp) =>
+    JSON.stringify({ type: "user", message: { role: "user", content }, timestamp }) + "\n";
+  fs.writeFileSync(file,
+    user("yes", "2026-09-23T20:00:00.000Z") +
+    entry("msg_a", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: "2026-09-23T20:01:00.000Z" }) +
+    user("yes", "2026-09-23T21:00:00.000Z") +
+    entry("msg_b", [{ type: "text", text: "Done." }], usage(5, 0), { timestamp: "2026-09-23T21:01:00.000Z" }));
+  const messages = [
+    { role: "user", content: "yes" },
+    { role: "assistant", content: [{ type: "text", text: "Done." }] },
+    { role: "user", content: "yes" },
+    { role: "assistant", content: [{ type: "text", text: "Done." }] },
+  ];
+  assert.deepEqual(new ClaudeTranscriptUsage(root).timesFor(SESSION, messages), {
+    0: "2026-09-23T20:00:00.000Z",
+    1: "2026-09-23T20:01:00.000Z",
+    2: "2026-09-23T21:00:00.000Z",
+    3: "2026-09-23T21:01:00.000Z",
+  });
+});
+
+test("a subagent's messages are timed from its own transcript under the session", () => {
+  const { root, file } = transcriptDir();
+  const user = (content, timestamp) =>
+    JSON.stringify({ type: "user", message: { role: "user", content }, timestamp }) + "\n";
+  fs.writeFileSync(file, user("main prompt", "2026-09-23T20:00:00.000Z"));
+  const agentDir = path.join(path.dirname(file), SESSION, "subagents");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "agent-a80911251b4ee7fa1.jsonl"),
+    user("map the pipeline", "2026-09-23T20:05:00.000Z"));
+  const source = new ClaudeTranscriptUsage(root);
+  const agentMessages = [{ role: "user", content: "map the pipeline" }];
+  const want = { 0: "2026-09-23T20:05:00.000Z" };
+  assert.deepEqual(source.timesFor(SESSION, agentMessages, "a80911251b4ee7fa1"), want);
+  assert.deepEqual(source.timesFor(SESSION, agentMessages, "agent-a80911251b4ee7fa1"), want);
+  assert.deepEqual(source.timesFor(SESSION, agentMessages), {}, "not in the main transcript");
+  assert.deepEqual(source.timesFor(SESSION, [{ role: "user", content: "main prompt" }], "a80911251b4ee7fa1"), {},
+    "an agent never reads the main transcript");
+  assert.deepEqual(source.timesFor(SESSION, agentMessages, "../x"), {});
+  assert.deepEqual(source.timesFor(SESSION, [{ role: "user", content: "main prompt" }]),
+    { 0: "2026-09-23T20:00:00.000Z" });
+});

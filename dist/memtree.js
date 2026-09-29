@@ -760,6 +760,7 @@ export class MemtreeClient {
             compressionTargetTokens: meta?.compressionTargetTokens,
             compressionThresholdTokens: meta?.compressionThresholdTokens,
             messageUsage: meta?.messageUsage,
+            messageTimes: meta?.messageTimes,
             sessionId: meta?.sessionId,
             clientMeta: meta?.clientMeta,
         }).catch((err) => {
@@ -798,7 +799,9 @@ export class MemtreeClient {
      * disconnected, or on shutdown/402 — only an ordinary failure with a live
      * client keeps the longer-budget background retry.
      */
-    indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta) {
+    indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta, 
+    /** Message times for the reminder-stripped list actually sent. */
+    messageTimesFor) {
         if (this.backgroundClosing)
             return;
         if (this.indexedHashes.has(hash))
@@ -815,6 +818,9 @@ export class MemtreeClient {
             timeoutMs: INDEX_TIMEOUT_MS,
             indexOnly: true,
             signal: controller.signal,
+            // Computed after stripping: a reminder-only message is dropped, which
+            // shifts every later index.
+            messageTimes: messageTimesFor?.(stripped),
             sessionId,
             clientMeta,
         })
@@ -891,6 +897,11 @@ export class MemtreeClient {
         // (plan Phase 2.2); harmless extra field either way.
         if (opts.indexOnly)
             body.index_only = true;
+        // Both call kinds: index-only calls build most of the tree, and the
+        // server stamps each input block with its messages' time range.
+        if (opts.messageTimes && Object.keys(opts.messageTimes).length) {
+            body.message_times = opts.messageTimes;
+        }
         // Model (and tools, whose serialized size feeds the same budget) let the
         // server resolve a model-based memory budget instead of its static 50k
         // fallback. Only meaningful on compression calls: the server's index_only

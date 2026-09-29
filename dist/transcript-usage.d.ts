@@ -8,9 +8,16 @@ export interface ResponseUsage {
 }
 /** Keyed by the assistant message's position in the list sent to MemTree. */
 export type MessageUsage = Record<string, ResponseUsage>;
+/** ISO 8601 time of each message the transcript knows, keyed like MessageUsage. */
+export type MessageTimes = Record<string, string>;
 export interface TranscriptUsageSource {
     /** Usage for each assistant message in `messages` that the transcript knows. */
-    usageFor(sessionId: string, messages: Message[]): MessageUsage;
+    usageFor(sessionId: string, messages: Message[], agentId?: string): MessageUsage;
+    /**
+     * When Claude Code wrote each message in `messages` that the transcript
+     * knows; a subagent's (`agentId`) from its own transcript.
+     */
+    timesFor?(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
 }
 /**
  * Reads transcripts incrementally: each session's file is opened once and
@@ -20,11 +27,16 @@ export declare class ClaudeTranscriptUsage implements TranscriptUsageSource {
     private readonly projectsDir;
     private readonly sessions;
     constructor(projectsDir?: string);
-    usageFor(sessionId: string, messages: Message[]): MessageUsage;
+    usageFor(sessionId: string, messages: Message[], agentId?: string): MessageUsage;
+    timesFor(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
     private indexFor;
 }
 /** `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`. */
 export declare function defaultProjectsDir(env?: NodeJS.ProcessEnv): string;
-/** The session's transcript in whichever project directory holds it. */
-export declare function findTranscript(projectsDir: string, sessionId: string): string | undefined;
+/**
+ * The session's transcript in whichever project directory holds it, or with
+ * `agentId`, that subagent's. The id is accepted with or without its `agent-`
+ * file prefix.
+ */
+export declare function findTranscript(projectsDir: string, sessionId: string, agentId?: string): string | undefined;
 //# sourceMappingURL=transcript-usage.d.ts.map

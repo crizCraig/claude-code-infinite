@@ -3070,6 +3070,9 @@ test("compress calls carry each assistant message's usage from the transcript", 
       const i = messages.findIndex((m) => m.role === "assistant");
       return i < 0 ? {} : { [i]: { output_tokens: 50, thinking_tokens: 20 } };
     },
+    timesFor(_sessionId, messages) {
+      return { [messages.length - 1]: "2026-09-23T20:00:00.000Z" };
+    },
   };
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, transcriptUsage });
   try {
@@ -3079,11 +3082,13 @@ test("compress calls carry each assistant message's usage from the transcript", 
     assert.deepEqual(seen, ["session-1"]);
     assert.deepEqual(call.message_usage, { 1: { output_tokens: 50, thinking_tokens: 20 } });
     assert.equal(call.messages[1].role, "assistant", "keyed by position in the messages sent");
+    assert.deepEqual(call.message_times, { [call.messages.length - 1]: "2026-09-23T20:00:00.000Z" });
 
     // No session id: nothing is looked up or sent.
     await armMainTurn(proxy, "turn three", "prompt-2");
     await postMessages(proxy.port, followupTurn("turn three"));
     assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).message_usage, undefined);
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).message_times, undefined);
     assert.equal(seen.length, 1);
   } finally {
     proxy.close();
@@ -8540,5 +8545,70 @@ test("edge compaction: earlier thinking that Claude Code stops replaying does no
     assert.equal(next.compaction.prefixMiss, undefined);
   } finally {
     h.close();
+  }
+});
+
+test("index-only calls carry message times keyed by the reminder-stripped list sent", async () => {
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const messages = [
+    { role: "user", content: "first" },
+    { role: "user", content: "<system-reminder>only a reminder</system-reminder>" },
+    { role: "assistant", content: "answer" },
+  ];
+  let seenByTimes;
+  try {
+    memtree.indexInBackground("h-times", messages, 200_000, "session-1", undefined, (sent) => {
+      seenByTimes = sent;
+      return { [sent.findIndex((m) => m.role === "assistant")]: "2026-09-23T20:00:00.000Z" };
+    });
+    await memtree.drainBackground(5_000);
+    const call = memtreeSrv.calls.find((c) => c.index_only);
+    assert.equal(seenByTimes.length, 2, "the reminder-only message was dropped before timing");
+    assert.deepEqual(call.message_times, { 1: "2026-09-23T20:00:00.000Z" });
+    assert.equal(call.messages[1].role, "assistant");
+  } finally {
+    memtreeSrv.close();
+  }
+});
+
+test("a subagent's MemTree calls are timed from that subagent's transcript", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const asked = [];
+  const transcriptUsage = {
+    usageFor(sessionId, _messages, agentId) {
+      asked.push(["usage", sessionId, agentId]);
+      return {};
+    },
+    timesFor(sessionId, messages, agentId) {
+      asked.push(["times", sessionId, agentId]);
+      return { [messages.length - 1]: "2026-09-23T20:00:00.000Z" };
+    },
+  };
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    transcriptUsage,
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-9" };
+  const base = followupTurn("agent turn two");
+  try {
+    await postMessages(proxy.port, base, agent);
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), agent);
+    await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
+    const session = SESSION["x-claude-code-session-id"];
+    assert.ok(asked.length >= 2, JSON.stringify(asked));
+    for (const call of asked) assert.deepEqual(call.slice(1), [session, "agent-9"]);
+    for (const call of memtreeSrv.calls) {
+      assert.deepEqual(call.message_times, { [call.messages.length - 1]: "2026-09-23T20:00:00.000Z" });
+    }
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
   }
 });
