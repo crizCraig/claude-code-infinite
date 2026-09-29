@@ -186,7 +186,7 @@ export interface MessagesRecord {
         /**
          * Serialized non-system conversation bytes, measured once per attempt.
          * Absent when no attempt was made (kill switch, cooldown, in-flight,
-         * backoff).
+         * backoff, awaiting-index).
          */
         conversationBytes?: number;
         outcome: "compressed" | "failed"
@@ -207,11 +207,11 @@ export interface MessagesRecord {
         /** Another attempt for this lane is still in flight. */
          | "in-flight"
         /**
-         * This lane's last attempt this human turn produced no prefix (no-op,
-         * no gain, failure); the next one waits until the conversation has
-         * grown by a twentieth of the budget, so a lane that cannot compress
-         * does not pay a blocking call on every tool turn. (Replaces the old
-         * "spent": one attempt per lane per human turn, whatever the size.)
+         * This lane's last attempt this human turn produced no prefix to ride
+         * (no-op, no gain, failure, a forward that installed nothing, or a
+         * result still over the window); the next one waits until the
+         * conversation has grown by a twentieth of the budget, so a lane that
+         * cannot compress does not pay a blocking call on every tool turn.
          */
          | "backoff"
         /**
@@ -242,14 +242,15 @@ export interface MessagesRecord {
          * or a truncated upstream stream, but any non-2xx of the compressed
          * forward lands here — including a plain 4xx, which is deliberately
          * non-arming for the fuse — as does proxy-shutdown teardown of an
-         * in-flight recovery. Refunds the lane's blocking budget.
+         * in-flight recovery. Lifts the lane's backoff so the identical-body
+         * retry compresses again.
          */
          | "upstream-failed"
         /**
          * The upstream served the turn to protocol-complete but route
          * bookkeeping threw at an activation attempt (the protocol-complete
          * attempt, the delivered-settle retry, or both), so no route exists.
-         * Releases the lane's reservation but does NOT refund. In the common
+         * Releases the lane's reservation but keeps its backoff. In the common
          * sub-case the client got its complete answer — a fast-tool abort
          * after message_stop lands here, not in "client-aborted" — so no
          * identical-body retry is coming, and the throw is not
@@ -257,19 +258,20 @@ export interface MessagesRecord {
          * that dies before the accepted message_stop bytes flush (which
          * DOES retry the identical body) and an upstream-owned error
          * arriving after the data chunk that carried message_stop. A retry
-         * finds its lane spent until the next human-turn re-grant — a
+         * finds its lane backed off and forwards uncompressed until the
+         * history grows past the retry size or the next human turn — a
          * bounded degradation accepted because the closes are
-         * indistinguishable at settle time and refunding them would fund
-         * one blocking recompress per tool turn under a deterministic
+         * indistinguishable at settle time and lifting the backoff would
+         * fund one blocking recompress per tool turn under a deterministic
          * activation throw.
          */
          | "activation-error"
         /**
          * The downstream client aborted mid-stream before protocol-complete.
-         * Refunds exactly like upstream-failed (no route exists and the
-         * client's identical-body retry is imminent) but is split out so
-         * attempt-rate tripwires can tell client behavior from upstream
-         * health.
+         * Lifts the backoff exactly like upstream-failed (no route exists
+         * and the client's identical-body retry is imminent) but is split
+         * out so attempt-rate tripwires can tell client behavior from
+         * upstream health.
          */
          | "client-aborted";
     };

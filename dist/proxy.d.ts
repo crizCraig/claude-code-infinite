@@ -132,8 +132,8 @@ export interface ProxyOptions {
      * simulates route bookkeeping failing (the cloneJson/JSON.stringify
      * calls), which no natural input can trigger — every install input has
      * already survived JSON.parse. Exists solely so the "activation-error"
-     * install fate (label precedence over clientAborted, release without
-     * refund) is pinnable by tests. Undefined in production.
+     * install fate (label precedence over clientAborted, release keeping the
+     * lane's backoff) is pinnable by tests. Undefined in production.
      */
     routeInstallFault?: () => void;
 }

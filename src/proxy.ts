@@ -128,11 +128,11 @@ import {
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
-// timeout budget), suppress the blocking attempt for this long. The followup
-// path pays a failed compress at most once per HUMAN turn; the fuse sits on
-// the tool loop and would otherwise pay it once per TOOL turn — and history
-// grows every turn, so compress()'s complete-request dedup never absorbs the
-// repeat.
+// timeout budget), suppress the blocking attempt for this long, across every
+// lane. A lane's own growth backoff alone would let each over-budget tool turn
+// pay the failed call again once its history grew past the retry size, and
+// every other lane would pay it too — history grows every turn, so
+// compress()'s complete-request dedup never absorbs the repeat.
 // Long enough that a real outage costs one stall, short enough that a
 // transient blip does not disable recovery for a working session.
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
@@ -244,8 +244,8 @@ export interface ProxyOptions {
    * simulates route bookkeeping failing (the cloneJson/JSON.stringify
    * calls), which no natural input can trigger — every install input has
    * already survived JSON.parse. Exists solely so the "activation-error"
-   * install fate (label precedence over clientAborted, release without
-   * refund) is pinnable by tests. Undefined in production.
+   * install fate (label precedence over clientAborted, release keeping the
+   * lane's backoff) is pinnable by tests. Undefined in production.
    */
   routeInstallFault?: () => void;
 }
@@ -303,8 +303,8 @@ interface ProxyState {
    * single-wipe decision keys off THIS flag, not off mainPromptArmed: the
    * arm can outlive its boundary (a followup with active subagents never
    * consumes it, and a missed Stop never clears it), and trusting it would
-   * let a later hookless boundary inherit spent lanes from the previous
-   * human turn.
+   * let a later hookless boundary inherit the previous human turn's lane
+   * compaction marks (backoff, awaiting-index).
    */
   recoveryBudgetWipedForBoundary: boolean;
   mainPromptId?: string;
@@ -448,10 +448,11 @@ interface ProxyState {
    * Each lane's latest tool-turn compaction attempt this epoch: the capacity
    * it targeted, whether it is still in flight (a concurrent attempt in the
    * lane waits: "in-flight"), and, when it produced no prefix, the size the
-   * lane must grow to before it tries again ("backoff"). A lane is no longer
-   * spent by one attempt: tool turns compress whenever their estimate reaches
-   * the budget (planToolCompaction). A route over a strictly smaller capacity
-   * lifts the backoff. Cleared alongside memoryRoutes on every epoch bump —
+   * lane must grow to before it tries again ("backoff"), or that it waits
+   * for its tree to be built ("awaiting-index"). Tool turns compress whenever
+   * their estimate reaches the budget (planToolCompaction); these marks only
+   * pace retries after an attempt that produced nothing. A route over a
+   * strictly smaller capacity lifts them. Cleared alongside memoryRoutes on every epoch bump —
    * except the followup-path bump of a prompt the hook already armed, which
    * keeps it so one turn boundary lifts a backoff once, not twice (see
    * bumpRouteEpoch).
@@ -669,18 +670,18 @@ function firstNonEmptyHeader(
  * epoch. Everything keyed to the epoch just superseded goes with it: every
  * surviving reservation belongs to that closed epoch and can no longer hold
  * anything, and a new human turn ends the previous turn's subagents too, so
- * every lane's route and spent-recovery mark is dropped rather than
- * selectively pruned. Doing all of it here is what makes the sets' documented
+ * every lane's route and tool-compaction attempt mark (in-flight, backoff,
+ * awaiting-index) is dropped rather than selectively pruned. Doing all of it here is what makes the sets' documented
  * bound ("cleared on each epoch bump") true at every bump site rather than
  * only at the followup one.
  *
- * keepRecoveryBudget skips only the spent-recovery wipe, for the followup
+ * keepRecoveryBudget skips only the attempt-mark wipe, for the followup
  * bump of a prompt whose UserPromptSubmit bump already wiped it: one turn
- * boundary otherwise wipes twice milliseconds apart, re-granting a lane that
- * spent its blocking attempt in between. Hookless embedders (no
- * UserPromptSubmit ever fires) must never pass true — their followup bump is
- * the only per-human-turn re-grant, without which a spent lane would forward
- * full history forever.
+ * boundary otherwise wipes twice milliseconds apart, lifting a backoff a
+ * lane earned in between. Hookless embedders (no UserPromptSubmit ever
+ * fires) must never pass true — their followup bump is their only
+ * per-human-turn reset, without which a lane's backoff or awaiting-index
+ * mark would carry into the next human turn.
  */
 function bumpRouteEpoch(
   state: ProxyState,
@@ -1466,11 +1467,11 @@ async function handleMessages(
     if (isMainRequest) {
       // Clears every lane before this request reserves the main lane in the
       // new epoch. If this boundary's UserPromptSubmit bump already wiped the
-      // recovery budget milliseconds ago, keep a lane spent since then spent.
+      // lanes' attempt marks milliseconds ago, keep any backoff set since.
       // Consume-once: the flag (not the arm, which can outlive its boundary)
       // is what proves the wipe was THIS boundary's, and a hookless followup
       // (flag never set) must still clear, being its embedder's only
-      // per-human-turn re-grant.
+      // per-human-turn reset.
       routeEpoch = bumpRouteEpoch(state, state.recoveryBudgetWipedForBoundary);
       state.recoveryBudgetWipedForBoundary = false;
     }
@@ -1538,36 +1539,38 @@ async function handleMessages(
     // A first-user-shaped main request is its boundary's only main arrival —
     // no followup bump will ever come to consume the UserPromptSubmit flag.
     // Consume it here, or a later hookless followup would read THIS
-    // boundary's "already wiped" and skip its own turn's re-grant, carrying
-    // spent lanes across a human-turn boundary.
+    // boundary's "already wiped" and skip its own turn's reset, carrying
+    // lane backoffs across a human-turn boundary.
     //
     // Only the armed prompt itself consumes (same prompt-text correlation as
     // hookOwnedMainFollowup): CC-internal side calls can arrive first-user
     // shaped on the main key without being the armed prompt, and letting one
     // of those consume would leave the real followup bumping with keep=false
-    // — a second wipe in the same boundary, re-granting lanes spent moments
+    // — a second wipe in the same boundary, lifting backoffs set moments
     // earlier. That is the exact double-wipe keepRecoveryBudget closes.
     //
     // Two residual gaps are accepted (cycle-5 review), both bounded to one
     // boundary and both degrading toward verbatim forwards:
     // - A transformed prompt (slash-command expansion, hook-wrapped text)
     //   fails the correlation and never consumes; a later hookless followup
-    //   then keeps last boundary's spent lanes spent for one turn. Stop's
-    //   clear-and-regrant converges it. Clearing on ANY first-user arrival
+    //   then keeps last boundary's lane backoffs for one turn. Stop's epoch
+    //   bump converges it. Clearing on ANY first-user arrival
     //   would re-open the double-wipe above — don't.
     // - A side call that echoes the typed prompt verbatim passes the
     //   correlation and consumes, re-admitting the double-wipe for that
-    //   narrow window. Text correlation cannot distinguish it; cost is one
-    //   extra blocking compress, capped by the per-lane budget.
+    //   narrow window. Text correlation cannot distinguish it; cost is at
+    //   most one extra blocking compress per lane, which then backs off.
     // - (cycle-6 review) The rideability veto below is length-only: a
     //   straggler recovery can install an old-history route on the main lane
     //   after the prompt-boundary bump, and a merged-prompt wrapper longer
     //   than that stale prefix is vetoed out of recovery classification. If
     //   its ride then hash-mismatches, it rejects into tool recovery with
     //   the prompt window still pending and the arm never consumed on that
-    //   path, so the rest of the turn runs transform-only-then-spent. Same
-    //   envelope as the two gaps above: one boundary, verbatim-forward
-    //   degradation, converged by Stop's clear-and-regrant. In the common
+    //   path, so the rest of the turn's main tool compactions are
+    //   transform-only (no route; the stable prefix still installs and later
+    //   tool turns ride it as tool-prefix). Same envelope as the two gaps
+    //   above: one boundary, bounded degradation, converged by Stop's epoch
+    //   bump. In the common
     //   sub-case the hashes match and the wrapper simply rides with the
     //   prompt in the suffix, which is correct.
     if (
@@ -3432,9 +3435,10 @@ function regrantSmallerWindowRecovery(
 ): void {
   const previous = state.toolRecoveryAttemptedLanes.get(key);
   if (previous && !previous.inFlight && modelContextLimit < previous.modelContextLimit) {
-    // The route has already been evicted. Keeping no spent mark lets an
-    // outage cooldown defer this allowance without losing it; the next actual
-    // attempt records the smaller capacity before it awaits anything.
+    // The route has already been evicted. Dropping the attempt mark lifts its
+    // backoff/awaiting-index, and an outage cooldown can defer the new
+    // attempt without losing it; the next actual attempt records the smaller
+    // capacity before it awaits anything.
     state.toolRecoveryAttemptedLanes.delete(key);
   }
 }
@@ -4090,8 +4094,8 @@ async function recoverToolRouteMiss(args: {
   // recovery-prompt classification.
   // The armed prompt belongs only to the main lane. An attributed agent's
   // route cannot veto main's merged-prompt classification, so suppressing the
-  // agent install here would merely strand its tool loop after spending the
-  // lane's one recovery attempt.
+  // agent install here would merely leave its tool loop routeless (agents
+  // have no stable prefix), compressing again on every over-budget turn.
   const promptWindowPending = isMainRequest && state.mainPromptArmed;
   // Every identity owns its own lane now, so the only transform-only reasons
   // left are local to this request: no session id to safely match a later
@@ -4150,11 +4154,9 @@ async function recoverToolRouteMiss(args: {
     // every concurrent install for the rest of the epoch — the same hole the
     // release exists to close. Hand it back before the error propagates.
     //
-    // Deliberately NOT refunded and no health noted: an unknown throw may be
-    // deterministic, and refunding would let each identical retry pay a fresh
-    // blocking compress — the same loop the keep-spent policy exists to
-    // prevent for pre-forward outcomes. The lane staying spent degrades to
-    // verbatim forwards, the conservative direction.
+    // No health noted and no backoff set (backOff runs only on the paths
+    // below): the lane's attempt mark keeps only its capacity, so the next
+    // tool turn over the budget attempts again.
     releaseOwnReservation();
     throw err;
   } finally {
@@ -4177,14 +4179,12 @@ async function recoverToolRouteMiss(args: {
     // no Anthropic request and no route.
     rec.routeRecovery = { conversationBytes, outcome: "client-closed" };
     releaseOwnReservation();
-    // Same hazard class as the refunded post-forward fates ("upstream-failed"
-    // / "client-aborted"): no route was installed and the client's identical
-    // retry is imminent. Without a refund, the retry hits "spent" and every
-    // subsequent tool turn in the epoch forwards full history. The retry's
-    // recompress is a compress-cache hit (client closes are deliberately
-    // never fed into compress()), so the re-attempt is cheap. Epoch-guarded
-    // like the other refunds so a late settle cannot re-grant a later human
-    // turn's lane.
+    // Same hazard class as the post-forward fates "upstream-failed" /
+    // "client-aborted": no route was installed and the client's identical
+    // retry is imminent, so no backoff is set and the attempt mark is
+    // dropped; the retry compresses again, a compress-cache hit (client
+    // closes are deliberately never fed into compress()). Epoch-guarded so a
+    // late settle cannot touch a later human turn's lane.
     if (state.mainRouteEpoch === routeEpoch) {
       state.toolRecoveryAttemptedLanes.delete(routeKey);
     }
@@ -4402,10 +4402,11 @@ async function recoverToolRouteMiss(args: {
   // The close is not always client-owned — an upstream socket error after
   // the data chunk carrying message_stop lands here too — and a socket
   // that dies before the queued bytes flush DOES retry the identical body.
-  // Those rarer closes lose the refund — an accepted, bounded degradation
-  // (lane stays spent until the next human-turn re-grant), because the
-  // closes are indistinguishable at settle time and refunding them would
-  // fund one blocking recompress per tool turn under a deterministic
+  // Those rarer closes keep the lane's backoff — an accepted, bounded
+  // degradation (the retry forwards uncompressed until the history grows
+  // past the retry size or the next human turn clears it), because the
+  // closes are indistinguishable at settle time and lifting the backoff
+  // would fund one blocking recompress per tool turn under a deterministic
   // activation throw.
   let activationThrew = false;
   const delivered = await forwardRaw(
@@ -4438,15 +4439,15 @@ async function recoverToolRouteMiss(args: {
   // Swallow a repeat throw: if it escaped here, the settle logic below
   // would be skipped and the lane's reservation stranded for the rest of
   // the epoch. With no install fate the fallback below still labels
-  // ("activation-error" for this corner) and releases; no refund, since
-  // the delivered client will not retry.
+  // ("activation-error" for this corner) and releases; the backoff stays,
+  // since the delivered client will not retry.
   if (delivered) {
     try {
       activateRecoveredRoute();
     } catch {
       // Fate/release handled by the settle logic below. Remember the throw:
       // this is a fully delivered response with no route, which must not be
-      // labeled (or refunded) as an upstream failure.
+      // labeled (or have its backoff lifted) as an upstream failure.
       activationThrew = true;
     }
   }
@@ -4461,11 +4462,11 @@ async function recoverToolRouteMiss(args: {
       // upstream served to protocol-complete whose route bookkeeping threw
       // at an activation attempt (the protocol-complete attempt, the
       // delivered retry, or both): label it distinctly so it neither
-      // pollutes the upstream-failure metric nor triggers the refund. In
+      // pollutes the upstream-failure metric nor lifts the backoff. In
       // the common sub-case the client got its answer (a fast-tool abort
       // consumed message_stop first) and no identical-body retry is coming;
-      // the rarer closes — a pre-flush socket death (which does retry and
-      // eats the spent lane) or an upstream-owned error after the accepted
+      // the rarer closes — a pre-flush socket death (which does retry, into
+      // the lane's backoff) or an upstream-owned error after the accepted
       // message_stop chunk — land here too. See the activationThrew comment
       // above for why that trade-off is deliberate.
       installFate ??
@@ -4488,14 +4489,15 @@ async function recoverToolRouteMiss(args: {
   if (rec.routeRecovery.install !== "installed") releaseOwnReservation();
   // A failed forward AFTER a healthy compress — upstream 5xx/529 or a client
   // mid-stream abort — left no route and the client retries the identical
-  // body, so refund the lane's blocking budget — epoch-guarded, so a late
-  // settle cannot re-grant a later human turn's lane. The retry's recompress
-  // is a compress-cache hit, so the re-attempt is cheap. Deliberately NOT
-  // refunded on reject-deletes: siblings sharing a parent-agent fallback
-  // lane genuinely mismatch each other every turn, and refunding those would
-  // be one real blocking compress per tool step forever. The two refunded
-  // fates are split in reqlog so the attempt-rate tripwire can tell client
-  // behavior from upstream health; the refund itself treats them alike.
+  // body, so drop the lane's attempt mark, lifting the backoff just set —
+  // epoch-guarded, so a late settle cannot touch a later human turn's lane.
+  // The retry's recompress is a compress-cache hit, so the re-attempt is
+  // cheap. A later route reject-delete deliberately does NOT lift a backoff:
+  // siblings sharing a parent-agent fallback lane genuinely mismatch each
+  // other every turn, and lifting it there would be one real blocking
+  // compress per tool step. The two fates are split in reqlog so the
+  // attempt-rate tripwire can tell client behavior from upstream health;
+  // the backoff lift treats them alike.
   if (
     (rec.routeRecovery.install === "upstream-failed" ||
       rec.routeRecovery.install === "client-aborted") &&
