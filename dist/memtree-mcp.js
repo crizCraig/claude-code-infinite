@@ -26,13 +26,32 @@ export const MEMTREE_MCP_SERVER_NAME = "memtree";
 export const MEMTREE_TOOL_NAMES = ["search", "read_node", "read_lines"];
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
+/**
+ * The MCP server's instructions, which Claude Code places in the system prompt
+ * from the first request: the one place that explains the agent's situation
+ * before any memory message exists. Constant, so the prompt cache holds.
+ */
+export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infinite, which lets a conversation continue past the model's context window. " +
+    "MemTree indexes the whole conversation as it goes: a tree of summaries from a one-line overview at the root down to " +
+    "leaves, each pointing at the exact transcript lines it summarizes. Indexing runs in the background and trails the " +
+    "newest messages slightly.\n\n" +
+    "Until the conversation reaches its size budget you see every message verbatim, and these tools are only a way to " +
+    "find things in a long history. Once it reaches the budget, the earlier conversation is replaced by a single memory " +
+    "message: that tree, expanded where it looked relevant to the latest request and collapsed elsewhere. The user's own " +
+    "messages shown there, and everything after the memory message, stay word for word; the rest of the earlier " +
+    "conversation survives only as summaries, which drop exact values, instructions, reasoning and dead ends. The detail " +
+    "is not gone: these tools read it back.\n\n" +
+    "So once you see that memory message: when your work depends on something from earlier in the session (what the " +
+    "user asked for or ruled out, decisions and why they were made, findings, ids and paths, commands, what was tried " +
+    "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
+    "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.";
 export const MEMTREE_TOOLS = [
     {
         name: "search",
-        description: "Search this session's MemTree — the index of the earlier conversation that was summarized out of your context — for exact details " +
+        description: "Search this session's MemTree (the index of this conversation; once a memory message has replaced the earlier part, the only way to its detail) for exact details " +
             "(names, ids, numbers, file paths, commands, errors, decisions). Case-insensitive term matching over node summaries and the verbatim " +
             "transcript lines under each leaf; returns the best nodes with their summaries, leaf line ranges and matching lines. " +
-            "Use it before answering \"I don't know\" about something from earlier in the session.",
+            "Use it before re-deriving or guessing something from earlier in the session.",
         inputSchema: {
             type: "object",
             properties: {
@@ -151,8 +170,7 @@ export async function handleMcpMessage(message, tree) {
                 protocolVersion: typeof requested === "string" ? requested : LATEST_PROTOCOL_VERSION,
                 capabilities: { tools: {} },
                 serverInfo: { name: MEMTREE_MCP_SERVER_NAME, version: CLIENT_VERSION },
-                instructions: "Search and read this session's MemTree: the summarized earlier part of the conversation, with its verbatim transcript lines. " +
-                    "Use it when a detail from earlier in the session is not in your context.",
+                instructions: MEMTREE_MCP_INSTRUCTIONS,
             });
         }
         case "ping":

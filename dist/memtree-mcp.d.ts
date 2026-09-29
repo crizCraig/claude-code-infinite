@@ -2,6 +2,12 @@ import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines"];
+/**
+ * The MCP server's instructions, which Claude Code places in the system prompt
+ * from the first request: the one place that explains the agent's situation
+ * before any memory message exists. Constant, so the prompt cache holds.
+ */
+export declare const MEMTREE_MCP_INSTRUCTIONS: string;
 export declare const MEMTREE_TOOLS: ({
     name: string;
     description: string;
