@@ -240,9 +240,13 @@ export const RECAP_MAX_CHARS = 400;
 /**
  * The recap's link line, or undefined when it would not fit under Claude
  * Code's cap and would come back clipped mid-URL.
+ *
+ * Ends with a newline: for its first few recaps Claude Code appends
+ * " (disable recaps in /config)" to the recap text, which would otherwise land
+ * on the URL's line and read as part of the MemTree note.
  */
 export function recapLinkText(link, streamedTextChars, note) {
-    const text = `\n${linkLines(LINK_LABEL, link, note)}`;
+    const text = `\n${linkLines(LINK_LABEL, link, note)}\n`;
     return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
 }
 /** content_block_start/delta/stop triple for a notice text block. */

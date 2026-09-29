@@ -2910,7 +2910,9 @@ test("the recap ends with the session's link, when it fits Claude Code's 400-cha
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), headers);
     const withLink = await postRecap(proxy.port, headers);
-    assert.equal(withLink.text, `${recapText}\n• MemTree\n  ${PAGE_URL_1}`);
+    // Ends with a newline so Claude Code's "(disable recaps in /config)" hint
+    // starts its own line instead of trailing the URL.
+    assert.equal(withLink.text, `${recapText}\n• MemTree\n  ${PAGE_URL_1}\n`);
     assert.ok(!withLink.text.includes("cc-infinite-notice"), "no marker in UI-only text");
     assert.match(withLink.body, /"index":1/, "appended as its own block after the recap");
     assert.ok(withLink.body.trimEnd().endsWith('data: {"type":"message_stop"}'), "stream still ends properly");
