@@ -61,6 +61,7 @@ import {
   normalizeMessagesForMemtree,
   serverFlattenedMessages,
   type CompressResult,
+  rawPromptTokenCount,
 } from "./memtree.js";
 import {
   contextLimitForModel,
@@ -77,6 +78,7 @@ import {
 } from "./turns.js";
 import {
   COMPRESSED_NOTICE,
+  compressedTotalsText,
   DEGRADED_NOTICE,
   NOT_COMPRESSED_NOTE,
   recapLinkText,
@@ -1868,6 +1870,7 @@ async function handleMessages(
         noticePromptGeneration,
         noticePromptId,
         result,
+        rec,
       });
     }
     return logged(
@@ -2227,6 +2230,9 @@ function queueCompressionNotice(args: {
   noticePromptGeneration: number;
   noticePromptId: string | undefined;
   result: CompressResult;
+  /** This turn's record: its compaction estimate and, once the response
+   * arrives, Anthropic's usage for the compressed request. */
+  rec?: MessagesRecord;
 }): void {
   const {
     state,
@@ -2235,6 +2241,7 @@ function queueCompressionNotice(args: {
     noticePromptGeneration,
     noticePromptId,
     result,
+    rec,
   } = args;
   if (
     !displayForThisTurn ||
@@ -2273,7 +2280,32 @@ function queueCompressionNotice(args: {
       return;
     }
   }
-  state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
+  state.notices.queuePrefix(
+    () => compressedTotalsText(...compressionTotals(rec, result)),
+    undefined,
+    noticePromptId
+  );
+}
+
+/**
+ * Before and after sizes for the success line, read when the line is shown.
+ * Before: ccc's estimate for the uncompressed request (anchored on Anthropic's
+ * last reported size for this session), else the server's raw_prompt_tokens,
+ * which counts less of the request (495k against ~861k on a 2026-09-29 Opus
+ * session). After: Anthropic's reported input for the compressed request once
+ * its usage has arrived, else "before" scaled by the forwarded/original bytes.
+ */
+function compressionTotals(
+  rec: MessagesRecord | undefined,
+  result: CompressResult
+): [number | undefined, number | undefined] {
+  const original = rec?.compaction?.estimatedTokens ?? rawPromptTokenCount(result);
+  if (!rec) return [original, undefined];
+  const reported = reportedInputTokens(rec);
+  if (reported !== undefined) return [original, reported];
+  const fwd = rec.forwardedBytes;
+  if (original === undefined || !fwd || !rec.requestBytes) return [original, undefined];
+  return [original, Math.round((original * fwd) / rec.requestBytes)];
 }
 
 /**

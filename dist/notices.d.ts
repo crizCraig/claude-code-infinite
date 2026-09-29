@@ -18,6 +18,12 @@ export declare const COMPRESSED_NOTICE = "\u2713 MemTree \u00B7 conversation opt
  * (monochrome rendering, docs, tests). The hook renderer styles the text and
  * leaves the URL bare so Claude Code's linkifier gets a clean link.
  */
+/**
+ * The success line with the conversation's size before and after
+ * compression: `✓ MemTree · conversation optimized · ~861k → 426k tokens`.
+ * Without both counts, or when "after" is not smaller, the plain line.
+ */
+export declare function compressedTotalsText(originalTokens: number | undefined, compressedTokens: number | undefined): string;
 export declare function compressedNoticeText(memtreeUrl?: string): string;
 /**
  * The trailer under a finished assistant message naming the newest MemTree

@@ -42,9 +42,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
-import { COMPRESSED_NOTICE, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
+import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
@@ -1244,6 +1244,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 noticePromptGeneration,
                 noticePromptId,
                 result,
+                rec,
             });
         }
         return logged(forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
@@ -1522,7 +1523,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     return forwardCompressed(built.compressedBody, built.compressedRaw, "followup-compressed", stable, result);
 }
 function queueCompressionNotice(args) {
-    const { state, req, displayForThisTurn, noticePromptGeneration, noticePromptId, result, } = args;
+    const { state, req, displayForThisTurn, noticePromptGeneration, noticePromptId, result, rec, } = args;
     if (!displayForThisTurn ||
         state.mainPromptGeneration !== noticePromptGeneration) {
         return;
@@ -1556,7 +1557,27 @@ function queueCompressionNotice(args) {
             return;
         }
     }
-    state.notices.queuePrefix(COMPRESSED_NOTICE, undefined, noticePromptId);
+    state.notices.queuePrefix(() => compressedTotalsText(...compressionTotals(rec, result)), undefined, noticePromptId);
+}
+/**
+ * Before and after sizes for the success line, read when the line is shown.
+ * Before: ccc's estimate for the uncompressed request (anchored on Anthropic's
+ * last reported size for this session), else the server's raw_prompt_tokens,
+ * which counts less of the request (495k against ~861k on a 2026-09-29 Opus
+ * session). After: Anthropic's reported input for the compressed request once
+ * its usage has arrived, else "before" scaled by the forwarded/original bytes.
+ */
+function compressionTotals(rec, result) {
+    const original = rec?.compaction?.estimatedTokens ?? rawPromptTokenCount(result);
+    if (!rec)
+        return [original, undefined];
+    const reported = reportedInputTokens(rec);
+    if (reported !== undefined)
+        return [original, reported];
+    const fwd = rec.forwardedBytes;
+    if (original === undefined || !fwd || !rec.requestBytes)
+        return [original, undefined];
+    return [original, Math.round((original * fwd) / rec.requestBytes)];
 }
 /**
  * The link on the success line: the newest page for the hook's session,

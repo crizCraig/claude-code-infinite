@@ -28,13 +28,17 @@ import { AWAY_SUMMARY_PROMPT_PREFIX } from "../dist/turns.js";
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
 
+/** The success line, optionally with its "· ~Nk → Mk tokens" sizes, then the answer. */
+const SUCCESS_TOTALS_RE = / · ~\d+(?:\.\d+)?[km]? → \d+(?:\.\d+)?[km]? tokens/;
+
 function assertSuccessNotice(text, answer) {
   const colored = text.startsWith(GREEN);
+  const plain = text.replace(SUCCESS_TOTALS_RE, "");
   assert.equal(
-    text,
+    plain,
     `${colored ? GREEN : ""}${COMPRESSED_NOTICE}` +
       `${colored ? DEFAULT_FOREGROUND : ""}\n${answer}`,
-    "the notice is the bare copy: no latency, no token totals"
+    "the success line, with no latency"
   );
 }
 
@@ -3456,6 +3460,17 @@ test("size estimate scales by the sample's bytes per token, including when the b
   const sparse = { tokens: 100_000, forwardedBytes: 1_000_000 };
   assert.equal(est(sparse, 1_004_000).tokens, 101_000);
   assert.deepEqual(est(undefined, 400_000), { tokens: 100_000, source: "bytes" });
+});
+
+test("the success line reports the size before and after compression", async () => {
+  const { compressedTotalsText } = await import("../dist/notices.js");
+  assert.equal(
+    compressedTotalsText(860_941, 425_541),
+    `${COMPRESSED_NOTICE} · ~861k → 426k tokens`
+  );
+  assert.equal(compressedTotalsText(1_250_000, 425_000), `${COMPRESSED_NOTICE} · ~1.3m → 425k tokens`);
+  assert.equal(compressedTotalsText(undefined, 425_541), COMPRESSED_NOTICE, "no before size");
+  assert.equal(compressedTotalsText(400_000, 425_541), COMPRESSED_NOTICE, "not smaller");
 });
 
 test("placements 'stop' and 'off'", async () => {
@@ -7190,7 +7205,7 @@ test("an unarmed local bang-command turn owns its compression notice", async () 
     });
     assert.equal(stop.status, 200, "the unarmed bang turn queued its notice");
     assert.equal(
-      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, ""),
+      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, "").replace(SUCCESS_TOTALS_RE, ""),
       COMPRESSED_NOTICE
     );
     assert.equal(

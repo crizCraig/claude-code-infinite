@@ -20,6 +20,25 @@ export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
  * (monochrome rendering, docs, tests). The hook renderer styles the text and
  * leaves the URL bare so Claude Code's linkifier gets a clean link.
  */
+/**
+ * The success line with the conversation's size before and after
+ * compression: `✓ MemTree · conversation optimized · ~861k → 426k tokens`.
+ * Without both counts, or when "after" is not smaller, the plain line.
+ */
+export function compressedTotalsText(originalTokens, compressedTokens) {
+    const ok = (n) => typeof n === "number" && Number.isFinite(n) && n > 0;
+    if (!ok(originalTokens) || !ok(compressedTokens) || compressedTokens >= originalTokens) {
+        return COMPRESSED_NOTICE;
+    }
+    return `${COMPRESSED_NOTICE} · ~${formatTokenCount(originalTokens)} → ${formatTokenCount(compressedTokens)} tokens`;
+}
+/** "861k", "1.3m": whole thousands, millions to one decimal. */
+function formatTokenCount(tokens) {
+    return new Intl.NumberFormat("en-US", {
+        notation: "compact",
+        maximumFractionDigits: tokens >= 1_000_000 ? 1 : 0,
+    }).format(tokens).toLowerCase();
+}
 export function compressedNoticeText(memtreeUrl) {
     return memtreeUrl ? `${COMPRESSED_NOTICE} · ${memtreeUrl}` : COMPRESSED_NOTICE;
 }
