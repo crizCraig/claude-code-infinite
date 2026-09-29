@@ -4154,9 +4154,11 @@ async function recoverToolRouteMiss(args: {
     // every concurrent install for the rest of the epoch — the same hole the
     // release exists to close. Hand it back before the error propagates.
     //
-    // No health noted and no backoff set (backOff runs only on the paths
-    // below): the lane's attempt mark keeps only its capacity, so the next
-    // tool turn over the budget attempts again.
+    // Back the lane off as for any attempt that produced nothing: a throw
+    // that repeats would otherwise cost a full blocking compress on every
+    // over-budget tool turn. Growth past the retry size, or the next human
+    // turn, tries again.
+    backOff();
     releaseOwnReservation();
     throw err;
   } finally {
