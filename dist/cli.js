@@ -263,14 +263,13 @@ async function main() {
         debug: isDebugMode,
         reqlog,
         nativeOneMillionContext,
-        // Temporary kill switch for tool-route miss RECOVERY only
-        // (plans/2026-08-04_PLAN_tool_turn_route_recovery.md): set
-        // CCC_TOOL_ROUTE_RECOVERY=0 and relaunch to skip the blocking
-        // recompression attempt and forward missed tool turns verbatim with
-        // background indexing, as before. It deliberately does NOT revert the
-        // other half of that change: classification-time clear gating and
-        // same-session-only eviction of a rejected route stay in force, because
-        // those are what stop a side request from stranding the tool loop.
+        // Kill switch for tool-turn COMPACTION only: CCC_TOOL_ROUTE_RECOVERY=0
+        // makes tool turns pure passthrough — no size check, no compress call;
+        // they ride their lane's route when one exists and otherwise go out whole
+        // (with background indexing). Human turns keep compacting. It
+        // deliberately does NOT revert classification-time clear gating or
+        // same-session-only eviction of a rejected route, because those are what
+        // stop a side request from stranding the tool loop.
         toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
         // Programs launched from inside Claude Code inherit ANTHROPIC_BASE_URL;
         // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0

@@ -12,11 +12,13 @@
  *
  * Turn classification for POST /v1/messages:
  * - Tool turn (last message isn't a real user input): background indexing,
- *   forward as-is — either riding its lane's memory route (routes live in a
- *   small map keyed by request identity: session + main/away/agent-id) or
- *   verbatim. A miss buys ONE best-effort blocking recompression per lane
- *   per epoch, any size (plans/2026-08-04_PLAN_tool_turn_route_recovery.md,
- *   plans/2026-08-08_PLAN_route_parity_simple.md); failure degrades to the
+ *   forward as-is — riding its lane's memory route (routes live in a small
+ *   map keyed by request identity: session + main/away/agent-id), on the main
+ *   thread the session's stable prefix, or verbatim — while the estimated
+ *   size is under the budget, with no compress call. At the budget it
+ *   compresses once to the target (planToolCompaction), the same rule human
+ *   turns follow; on the main thread the result becomes the stable prefix
+ *   later tool and human turns ride. Failure degrades to the old ride or the
  *   verbatim forward. Every identity installs into its own lane — isolation
  *   is structural, not defended.
  * - First user turn (no earlier real user input): background indexing, forward
@@ -50,11 +52,14 @@ export interface ProxyOptions {
      */
     nativeOneMillionContext?: boolean;
     /**
-     * Best-effort blocking recompression when a large main tool turn misses
-     * its memory route (default true). This is a soft recovery fuse, not a
-     * hard payload cap: MemTree failure still degrades to forwarding the
-     * original body after the configured compress budget. The CLI maps
-     * `CCC_TOOL_ROUTE_RECOVERY=0` to `false` as a temporary kill switch.
+     * Tool-turn compaction (default true): a tool turn on any lane whose
+     * estimated size reaches the budget compresses once to the target, like a
+     * main human turn (planToolCompaction); on the main thread the result is
+     * the session's stable prefix. A soft fuse, not a hard payload cap: MemTree
+     * failure degrades to the old prefix or the original body. `false` (the
+     * CLI's `CCC_TOOL_ROUTE_RECOVERY=0`) is a pure-passthrough switch for tool
+     * turns: no size check and no compress call; they ride their lane's route
+     * when one exists and otherwise go out whole.
      */
     toolRouteRecovery?: boolean;
     /**
