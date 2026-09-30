@@ -11,12 +11,60 @@
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message } from "./turns.js";
+import { LINK_LABEL, linkLines } from "./hooks.js";
 import { UPGRADE_COMMAND, type UpdateAvailable } from "./update-check.js";
 
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
 
 export const COMPRESSED_NOTICE = "✓ MemTree · conversation optimized";
+
+/**
+ * The success line with the newest ready MemTree page for this conversation
+ * appended, when the client has one it has not shown yet — plain text form
+ * (monochrome rendering, docs, tests). The hook renderer styles the text and
+ * leaves the URL bare so Claude Code's linkifier gets a clean link.
+ */
+/**
+ * The success line with the conversation's size before and after
+ * compression: `✓ MemTree · conversation optimized · ~861k → 426k tokens`.
+ * Without both counts, or when "after" is not smaller, the plain line.
+ */
+export function compressedTotalsText(
+  originalTokens: number | undefined,
+  compressedTokens: number | undefined
+): string {
+  const ok = (n: number | undefined): n is number =>
+    typeof n === "number" && Number.isFinite(n) && n > 0;
+  if (!ok(originalTokens) || !ok(compressedTokens) || compressedTokens >= originalTokens) {
+    return COMPRESSED_NOTICE;
+  }
+  return `${COMPRESSED_NOTICE} · ~${formatTokenCount(originalTokens)} → ${formatTokenCount(compressedTokens)} tokens`;
+}
+
+/** "861k", "1.3m": whole thousands, millions to one decimal. */
+function formatTokenCount(tokens: number): string {
+  return new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: tokens >= 1_000_000 ? 1 : 0,
+  }).format(tokens).toLowerCase();
+}
+
+export function compressedNoticeText(memtreeUrl?: string): string {
+  return memtreeUrl ? `${COMPRESSED_NOTICE} · ${memtreeUrl}` : COMPRESSED_NOTICE;
+}
+/**
+ * The trailer under a finished assistant message naming the newest MemTree
+ * page for the conversation, plain-text form. The hook renderer styles the
+ * label green the first time an index is shown and dim afterwards, with the
+ * URL bare either way.
+ */
+export function memtreeTrailerText(memtreeUrl: string, note?: string): string {
+  return linkLines(LINK_LABEL, memtreeUrl, note);
+}
+
+/** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
+export const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE =
@@ -225,6 +273,46 @@ function sseEvent(type: string, data: Record<string, any>): string {
   return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+/** content_block_start/delta/stop triple for a plain text block. */
+export function textBlockEvents(index: number, text: string): string {
+  return (
+    sseEvent("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    }) +
+    sseEvent("content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text },
+    }) +
+    sseEvent("content_block_stop", { type: "content_block_stop", index })
+  );
+}
+
+/**
+ * Claude Code keeps at most this many characters of a recap (the joined text
+ * of the reply), truncating the end. Checked against Claude Code 2.1.278.
+ */
+export const RECAP_MAX_CHARS = 400;
+
+/**
+ * The recap's link line, or undefined when it would not fit under Claude
+ * Code's cap and would come back clipped mid-URL.
+ *
+ * Ends with a newline: for its first few recaps Claude Code appends
+ * " (disable recaps in /config)" to the recap text, which would otherwise land
+ * on the URL's line and read as part of the MemTree note.
+ */
+export function recapLinkText(
+  link: string,
+  streamedTextChars: number,
+  note?: string
+): string | undefined {
+  const text = `\n${linkLines(LINK_LABEL, link, note)}\n`;
+  return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
+}
+
 /** content_block_start/delta/stop triple for a notice text block. */
 export function noticeBlockEvents(index: number, noticeText: string): string {
   return (
@@ -275,6 +363,12 @@ export interface SseRewriteOptions {
   /** Inject this notice before the final message_delta/message_stop. */
   endOfTurnNotice?: string;
   /**
+   * Inject this text, verbatim (no notice marker), as a final text block
+   * before message_delta/message_stop. Called once, with the number of text
+   * characters the response streamed so far; returning undefined skips it.
+   */
+  endOfTurnText?: (streamedTextChars: number) => string | undefined;
+  /**
    * Diagnostics observer: called with every parsed upstream event's data
    * object BEFORE any rewriting (so it sees message_start even when the
    * prelude drops it, and original block indexes). Exceptions are swallowed —
@@ -294,6 +388,8 @@ export class SseNoticeRewriter {
   private maxIndexSeen = -1;
   private injectedResponseNotice = false;
   private injectedEndNotice = false;
+  private injectedEndText = false;
+  private streamedTextChars = 0;
 
   constructor(private opts: SseRewriteOptions) {}
 
@@ -342,6 +438,14 @@ export class SseNoticeRewriter {
       } catch {
         // observer must never break the stream
       }
+    }
+
+    if (
+      type === "content_block_delta" &&
+      data.delta?.type === "text_delta" &&
+      typeof data.delta.text === "string"
+    ) {
+      this.streamedTextChars += data.delta.text.length;
     }
 
     const baseShift = this.opts.renumberBy ?? 0;
@@ -400,6 +504,21 @@ export class SseNoticeRewriter {
         const noticeIndex = this.maxIndexSeen + 1;
         this.maxIndexSeen = noticeIndex;
         notices += noticeBlockEvents(noticeIndex, this.opts.endOfTurnNotice);
+      }
+
+      if (this.opts.endOfTurnText && !this.injectedEndText) {
+        this.injectedEndText = true;
+        let text: string | undefined;
+        try {
+          text = this.opts.endOfTurnText(this.streamedTextChars);
+        } catch {
+          text = undefined; // a formatter must never break the stream
+        }
+        if (text) {
+          const index = this.maxIndexSeen + 1;
+          this.maxIndexSeen = index;
+          notices += textBlockEvents(index, text);
+        }
       }
 
       if (notices) return notices + rawEvent;

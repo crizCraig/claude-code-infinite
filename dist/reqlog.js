@@ -11,8 +11,9 @@
  *   with one rotation slot: if the file exceeds ~20MB at proxy startup it is
  *   renamed to requests.jsonl.1 (overwriting any previous .1).
  *
- * One JSON object per line. `ts` (ISO 8601) is stamped here so callers only
- * supply event fields. Token counts under `approxInputTokens` are a rough
+ * One JSON object per line. `ts` (ISO 8601) and `pid` (the ccc process, which
+ * tells apart concurrent ccc sessions sharing this file) are stamped here so
+ * callers only supply event fields. Token counts under `approxInputTokens` are a rough
  * bytes/4 chars→tokens proxy, NOT real tokenizer output — exact usage, when
  * the response format lets us extract it cheaply, lands under `usage`.
  */
@@ -44,7 +45,7 @@ export class RequestLogger {
     /** Fire-and-forget append of one JSONL line. Never throws, never blocks. */
     log(record) {
         try {
-            const line = JSON.stringify({ ts: new Date().toISOString(), ...record }) + "\n";
+            const line = JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...record }) + "\n";
             let finish;
             const pending = new Promise((resolve) => {
                 finish = resolve;

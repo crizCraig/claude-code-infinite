@@ -14,14 +14,19 @@
 import spawn from "cross-spawn";
 import { exec } from "node:child_process";
 import * as readline from "node:readline";
-import { startProxy } from "./proxy.js";
+import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
+import { MemtreeLinkStore } from "./memtree-links.js";
+import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
-import { isPrintInvocation, parseWrapperArgs } from "./cli-args.js";
+import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
+import { runMemtreeFetchCommand } from "./memtree-fetch.js";
+import { runMemtreeMcpServer } from "./memtree-mcp.js";
+import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, } from "./config.js";
@@ -153,6 +158,19 @@ async function main() {
     const parsedArgs = parseWrapperArgs(process.argv.slice(2));
     const isDebugMode = parsedArgs.debug;
     const filteredArgs = parsedArgs.claudeArgs;
+    // `ccc fetch <memtree-url>`: read one of the user's MemTree pages with the
+    // stored key and print it. No proxy, no Claude — an agent's escape hatch
+    // when it is not running inside a ccc session.
+    if (filteredArgs[0] === "fetch") {
+        process.exit(await runMemtreeFetchCommand(filteredArgs.slice(1)));
+    }
+    // `ccc memtree-mcp`: the `memtree` MCP server over stdio (memtree-mcp.ts),
+    // for an --mcp-config a caller writes (e.g. the memory recall probe). It
+    // reads the tree through the ccc proxy in its inherited ANTHROPIC_BASE_URL.
+    if (filteredArgs[0] === "memtree-mcp") {
+        runMemtreeMcpServer();
+        return;
+    }
     const mode = filteredArgs[0] === "local" ? "local" :
         filteredArgs[0] === "staging" ? "staging" :
             "production";
@@ -222,6 +240,12 @@ async function main() {
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
     const reqlog = new RequestLogger();
+    // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
+    // interactive sessions unless CCC_MEMTREE_MCP=0; print/non-TTY runs have it
+    // only when their own --mcp-config names it. Either way MemTree is told
+    // (x-memtree-tools) only when the session really has the tools.
+    const autoMemtreeMcp = interactiveUi && memtreeMcpEnabledByEnv(process.env);
+    const memtreeToolsConfigured = autoMemtreeMcp || argsConfigureMemtreeMcp(claudeArgs);
     // Start the local proxy. Claude Code's OAuth token flows through it straight
     // to api.anthropic.com and never reaches polychat.co.
     const memtree = new MemtreeClient({
@@ -229,22 +253,38 @@ async function main() {
         apiKey: polychatApiKey,
         debug: isDebugMode,
         reqlog,
+        // Mutable below: a failed config write withdraws it before any call.
+        memtreeTools: memtreeToolsConfigured ? MEMTREE_TOOLS_HEADER_VALUE : undefined,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
+    const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
     const proxy = await startProxy({
         memtree,
         debug: isDebugMode,
         reqlog,
         nativeOneMillionContext,
-        // Temporary kill switch for tool-route miss RECOVERY only
-        // (plans/2026-08-04_PLAN_tool_turn_route_recovery.md): set
-        // CCC_TOOL_ROUTE_RECOVERY=0 and relaunch to skip the blocking
-        // recompression attempt and forward missed tool turns verbatim with
-        // background indexing, as before. It deliberately does NOT revert the
-        // other half of that change: classification-time clear gating and
-        // same-session-only eviction of a rejected route stay in force, because
-        // those are what stop a side request from stranding the tool loop.
+        // Kill switch for tool-turn COMPACTION only: CCC_TOOL_ROUTE_RECOVERY=0
+        // makes tool turns pure passthrough — no size check, no compress call;
+        // they ride their lane's route when one exists and otherwise go out whole
+        // (with background indexing). Human turns keep compacting. It
+        // deliberately does NOT revert classification-time clear gating or
+        // same-session-only eviction of a rejected route, because those are what
+        // stop a side request from stranding the tool loop.
         toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
+        // Programs launched from inside Claude Code inherit ANTHROPIC_BASE_URL;
+        // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0
+        // turns the filter off.
+        claudeCodeOnly: process.env.CCC_CLAUDE_CODE_ONLY !== "0",
+        defaultCompactTarget: defaultCompactTargetFromEnv(process.env.CCC_COMPACT_TARGET),
+        // Debugging: write every forwarded Anthropic request body to this directory.
+        ...(process.env.CCC_CAPTURE_DIR ? { captureDir: process.env.CCC_CAPTURE_DIR } : {}),
+        // Test-only: a small budget so a cheap session crosses it in a few turns.
+        budgetTokensOverride: budgetFromEnv(process.env.CCC_BUDGET_TOKENS),
+        // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
+        // link is shown while the placement is being tried out; see ProxyOptions.
+        memtreeLinkPlacement,
+        memtreeLinkStore: new MemtreeLinkStore(),
+        transcriptUsage: new ClaudeTranscriptUsage(),
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
@@ -270,6 +310,7 @@ async function main() {
             noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
                 messageDisplay: installedClaudeSupportsMessageDisplay(),
                 startupMessage: startupNoticeText(terminalSupportsColor(), updateAvailable),
+                resumeLink: memtreeLinkPlacement !== "off",
             });
             // Global option must precede a user-supplied `--`, positional prompt, or
             // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
@@ -280,6 +321,22 @@ async function main() {
             // prevent the underlying Claude session from launching.
             if (isDebugMode) {
                 console.error(`[DEBUG] Notice plugin disabled: ${String(err)}`);
+            }
+        }
+    }
+    let memtreeMcpConfig = null;
+    if (autoMemtreeMcp) {
+        try {
+            memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`);
+            childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path);
+        }
+        catch (err) {
+            // Optional like the notice plugin; without it MemTree must not name
+            // tools the session lacks.
+            if (!argsConfigureMemtreeMcp(claudeArgs))
+                memtree.setMemtreeTools(undefined);
+            if (isDebugMode) {
+                console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
             }
         }
     }
@@ -295,6 +352,7 @@ async function main() {
             return;
         shuttingDown = true;
         noticePlugin?.close();
+        memtreeMcpConfig?.close();
         // Stop new proxy work and give active handlers a bounded chance to
         // finalize their records. Background indexing is a separate log producer:
         // stop and drain it too before waiting for scheduled JSONL appends on
@@ -341,4 +399,22 @@ main().catch((err) => {
     console.error(err);
     process.exit(1);
 });
+/** `CCC_COMPACT_TARGET` ("500k", "20000", "off"): see cli-args.ts. */
+function defaultCompactTargetFromEnv(raw) {
+    const { value, warning } = compactTargetFromEnv(raw, parseTokenCount, MEMTREE_COMPACT_MIN_TOKENS);
+    if (warning)
+        console.error(warning);
+    return value;
+}
+/** `CCC_BUDGET_TOKENS` ("60k"): a test-only whole-request budget, or undefined. */
+function budgetFromEnv(raw) {
+    if (!raw)
+        return undefined;
+    const budget = parseTokenCount(raw);
+    if (budget === undefined || budget < 2 * MEMTREE_COMPACT_MIN_TOKENS) {
+        console.error(`ccc: ignoring CCC_BUDGET_TOKENS=${raw} (use a token count of at least ${(2 * MEMTREE_COMPACT_MIN_TOKENS) / 1000}k)`);
+        return undefined;
+    }
+    return budget;
+}
 //# sourceMappingURL=cli.js.map

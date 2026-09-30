@@ -119,6 +119,7 @@ test("current native models use 1M without a suffix or beta header", () => {
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-opus-5",
+    "claude-opus-5-5",
     "claude-sonnet-5",
     "claude-fable-5",
     "claude-mythos-5",

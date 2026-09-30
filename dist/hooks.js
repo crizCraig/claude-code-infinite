@@ -11,11 +11,85 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
+/** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
+export const TRAILER_LABEL = "• MemTree ·";
+/** Label on a line that carries a MemTree page link. */
+export const LINK_LABEL = "• MemTree";
+/**
+ * A MemTree link notice: the label (and note, if any) on the first line and
+ * the URL alone, indented, on the next, so a long URL wraps on its own
+ * rather than dragging the label or note onto a second line. Label and note
+ * come pre-styled; the URL stays bare for the terminal's linkifier.
+ */
+export function linkLines(label, url, note) {
+    return `${label}${note ? ` · ${note}` : ""}\n  ${url}`;
+}
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
+const ANSI_DIM = "\x1b[2m";
+const ANSI_NORMAL_INTENSITY = "\x1b[22m";
 const STARTUP_NOTICE_FILE = "startup-notice.json";
+const RESUME_RELAY_FILE = "resume-link.mjs";
+/**
+ * `/memtree`: list the MemTree commands. The link label reads `/memtree` as a
+ * hint, and typing it exactly must not dead-end in "Unknown command".
+ */
+export const MEMTREE_HELP_COMMAND = "memtree";
+/** The session plugin's name, which prefixes its commands in Claude Code's menu. */
+export const SESSION_PLUGIN_NAME = "ccc";
+/** `/memtree-view`: print this session's MemTree page link. */
+export const MEMTREE_VIEW_COMMAND = "memtree-view";
+/**
+ * `/memtree-compact [tokens|off]`: compact this session on its next message
+ * and keep that compressed history until the budget is reached again.
+ */
+export const MEMTREE_COMPACT_COMMAND = "memtree-compact";
+const UNAVAILABLE_BODY = "Reply with exactly this one line and nothing else: \"MemTree is not reachable right now; try again in a moment.\"\n";
+/**
+ * Listed in the slash-command menu. The proxy answers each one from the
+ * UserPromptSubmit hook and blocks it, so no model turn runs; a body only
+ * runs if that hook could not answer (proxy gone).
+ */
+const SESSION_COMMANDS = {
+    [MEMTREE_HELP_COMMAND]: "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact)\n---\n" + UNAVAILABLE_BODY,
+    [MEMTREE_VIEW_COMMAND]: "---\ndescription: Show the link to this session's MemTree page\n---\n" + UNAVAILABLE_BODY,
+    [MEMTREE_COMPACT_COMMAND]: "---\ndescription: Compact this session with MemTree now and keep the compressed history (optional token target, or off)\n" +
+        "argument-hint: [tokens | off]\n---\n" + UNAVAILABLE_BODY,
+};
+/**
+ * The arguments of a submitted `/<name>` (bare or `/ccc:`-qualified), or
+ * undefined when the prompt is not that command.
+ */
+export function sessionCommandArgs(prompt, name) {
+    // Bare `/memtree-view` or this plugin's own `/ccc:memtree-view`; another
+    // plugin's command of the same name is not ours to answer.
+    const match = new RegExp(`^/(?:${SESSION_PLUGIN_NAME}:)?${name}(?:\\s+(.*))?$`, "s").exec(prompt.trim());
+    return match ? (match[1] ?? "").trim() : undefined;
+}
+export function isMemtreeViewCommand(prompt) {
+    return sessionCommandArgs(prompt, MEMTREE_VIEW_COMMAND) !== undefined;
+}
+/**
+ * Relays the SessionStart hook input (stdin) to the proxy's hook URL (argv)
+ * and prints the proxy's JSON answer, if any. Always exits 0 with no output
+ * on failure: a missing link must never surface as a hook error.
+ */
+const RESUME_RELAY_SOURCE = `let input = "";
+process.stdin.on("data", (c) => (input += c));
+process.stdin.on("end", async () => {
+  try {
+    const res = await fetch(process.argv[2], {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: input,
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.status === 200) process.stdout.write(await res.text());
+  } catch {}
+});
+`;
 /** Respect explicit monochrome settings and Node's platform color detection. */
 export function terminalSupportsColor(env = process.env, stream = process.stdout) {
     if (Object.prototype.hasOwnProperty.call(env, "NO_COLOR"))
@@ -42,6 +116,15 @@ export class NoticeDeliveryQueue {
     now;
     color;
     pending = null;
+    link = null;
+    /** Key of the last link shown; the same key is not repeated. */
+    lastLinkKey = null;
+    trailer = null;
+    trailerPlacement = "message";
+    /** Key of the last trailer shown; a different key is announced as new. */
+    lastTrailerKey = null;
+    /** Whether a trailer was rendered under a message since the last Stop. */
+    trailerShownThisTurn = false;
     constructor(ttlMs = DEFAULT_NOTICE_TTL_MS, now = Date.now, color = terminalSupportsColor()) {
         this.ttlMs = ttlMs;
         this.now = now;
@@ -50,6 +133,39 @@ export class NoticeDeliveryQueue {
     /** Replace stale delivery state when a new main human prompt is submitted. */
     clearForUserRequest() {
         this.pending = null;
+    }
+    /**
+     * Install the per-session link that rides the success line, shown once per
+     * change: `<success text> · <link>`. Unlike prefix/suffix notices it is
+     * not per-prompt; it describes the conversation's current state whenever a
+     * success line is next shown.
+     */
+    setLink(resolve) {
+        this.link = resolve;
+    }
+    /**
+     * The link line for a resumed session, shown by the SessionStart hook
+     * before any new turn. Marks the key as shown, so the next trailer under a
+     * message renders dim (unchanged) rather than green (new).
+     */
+    resumeLine(link) {
+        this.lastTrailerKey = link.key;
+        this.lastLinkKey = link.key;
+        return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
+    }
+    /** Whether the next success line would carry a link not shown before. */
+    linkPending(sessionId) {
+        return this.resolveLink(sessionId) !== undefined;
+    }
+    /**
+     * Install the trailer: the newest link for the session, shown after every
+     * message (or on every Stop), the first time under a new `key` marked as
+     * new. Not once-per-key like the success-line link: the point is that the
+     * link is always at the bottom of the screen.
+     */
+    setTrailer(resolve, placement = "message") {
+        this.trailer = resolve;
+        this.trailerPlacement = placement;
     }
     queuePrefix(text, onDelivered, promptId) {
         this.pending = {
@@ -78,20 +194,27 @@ export class NoticeDeliveryQueue {
         if (input.hook_event_name !== "Stop")
             return null;
         const pending = this.freshPending();
-        if (!pending || !this.promptMatches(pending, input.prompt_id))
+        const matched = pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
+        const prefix = matched?.prefix;
+        const suffix = matched?.suffix;
+        // Stop is the turn's last hook: the trailer lands here when the turn
+        // rendered no message to carry it ("message"), or always ("stop").
+        const trailerDue = this.trailerPlacement !== "message" || !this.trailerShownThisTurn;
+        const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
+        this.trailerShownThisTurn = false;
+        if (!prefix && !suffix && trailer === undefined)
             return null;
-        const prefix = pending.prefix;
-        const suffix = pending.suffix;
-        if (!prefix && !suffix)
-            return null;
-        this.pending = null;
+        if (prefix || suffix)
+            this.pending = null;
         markDelivered(prefix);
         markDelivered(suffix);
         const lines = [];
         if (prefix)
-            lines.push(this.styleSuccess(resolveNoticeText(prefix)));
+            lines.push(this.renderSuccess(prefix, input.session_id));
         if (suffix)
             lines.push(this.styleWarning(resolveNoticeText(suffix)));
+        if (trailer !== undefined)
+            lines.push(trailer);
         return {
             systemMessage: lines.join("\n"),
         };
@@ -101,7 +224,12 @@ export class NoticeDeliveryQueue {
         const matched = pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
         const prefix = matched && input.index === 0 ? matched.prefix : undefined;
         const suffix = matched && input.final ? matched.suffix : undefined;
-        if (!prefix && !suffix)
+        const trailer = input.final && this.trailerPlacement === "message"
+            ? this.renderTrailer(input.session_id)
+            : undefined;
+        if (trailer !== undefined)
+            this.trailerShownThisTurn = true;
+        if (!prefix && !suffix && trailer === undefined)
             return null;
         // Remove before callbacks or response construction so a reentrant/parallel
         // Stop hook cannot deliver the same notice a second time.
@@ -109,7 +237,8 @@ export class NoticeDeliveryQueue {
             delete matched.prefix;
         if (suffix)
             delete matched.suffix;
-        this.dropIfEmpty(matched);
+        if (matched)
+            this.dropIfEmpty(matched);
         markDelivered(prefix);
         markDelivered(suffix);
         let displayContent = input.delta;
@@ -118,13 +247,18 @@ export class NoticeDeliveryQueue {
             // Standard named-color SGR is interpreted by Claude Code on every
             // supported terminal (and stripped cleanly in monochrome/NO_COLOR).
             // Reset foreground only so surrounding renderer styles are preserved.
-            const styled = this.styleSuccess(resolveNoticeText(prefix));
+            const styled = this.renderSuccess(prefix, input.session_id);
             displayContent = `${styled}\n${displayContent}`;
         }
         if (suffix) {
             const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
             const styled = this.styleWarning(resolveNoticeText(suffix));
             displayContent = `${displayContent}${separator}${styled}`;
+        }
+        if (trailer !== undefined) {
+            // A blank line keeps the trailer apart from the answer above it.
+            const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";
+            displayContent = `${displayContent}${separator}\n${trailer}`;
         }
         return {
             hookSpecificOutput: {
@@ -144,6 +278,65 @@ export class NoticeDeliveryQueue {
     /** Warnings get the same own-line treatment as success, in yellow. */
     styleWarning(text) {
         return this.style(text, ANSI_YELLOW);
+    }
+    /**
+     * The success line, with the session's not-yet-shown link (if any) after
+     * a separator — `✓ … optimized · <link>`. Claiming the link here marks it
+     * shown, so it rides exactly one success line.
+     */
+    renderSuccess(prefix, sessionId) {
+        const text = resolveNoticeText(prefix);
+        const link = this.resolveLink(sessionId);
+        if (link === undefined)
+            return this.styleSuccess(text);
+        this.lastLinkKey = link.key;
+        return `${this.styleSuccess(`${text} ·`)} ${link.link}`;
+    }
+    /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */
+    resolveLink(sessionId) {
+        if (!this.link)
+            return undefined;
+        let link;
+        try {
+            link = this.link(sessionId);
+        }
+        catch {
+            return undefined;
+        }
+        return link?.link && link.key && link.key !== this.lastLinkKey ? link : undefined;
+    }
+    /**
+     * The trailer line for this session, or undefined when there is no link.
+     * The first time a key is seen the label says so in green; afterwards the
+     * label is dim. The URL stays bare either way (linkifier-safe). Rendering
+     * marks the key as seen. Resolver failures never break a hook.
+     */
+    renderTrailer(sessionId) {
+        if (!this.trailer)
+            return undefined;
+        let link;
+        try {
+            link = this.trailer(sessionId);
+        }
+        catch {
+            return undefined;
+        }
+        if (!link?.link || !link.key)
+            return undefined;
+        const isNew = link.key !== this.lastTrailerKey;
+        // "turn": one line per user turn, and only when the index changed.
+        if (this.trailerPlacement === "turn" && !isNew)
+            return undefined;
+        this.lastTrailerKey = link.key;
+        const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
+        return this.linkNotice(label, link);
+    }
+    /** The link notice with its note dim. */
+    linkNotice(label, link) {
+        return linkLines(label, link.link, link.note && this.styleDim(link.note));
+    }
+    styleDim(text) {
+        return this.color ? `${ANSI_DIM}${text}${ANSI_NORMAL_INTENSITY}` : text;
     }
     style(text, sgr) {
         return this.color ? `${sgr}${text}${ANSI_DEFAULT_FOREGROUND}` : text;
@@ -214,6 +407,11 @@ export function parseNoticeHookInput(value) {
         }
         return input;
     }
+    if (input.hook_event_name === "SessionStart") {
+        if (input.source !== undefined && typeof input.source !== "string")
+            return null;
+        return input;
+    }
     if (input.hook_event_name === "UserPromptSubmit") {
         if (typeof input.prompt !== "string")
             return null;
@@ -248,8 +446,16 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     const dir = fs.mkdtempSync(path.join(opts.tempRoot ?? os.tmpdir(), "ccc-notice-plugin-"));
     const manifestDir = path.join(dir, ".claude-plugin");
     const hooksDir = path.join(dir, "hooks");
+    const commandsDir = path.join(dir, "commands");
     fs.mkdirSync(manifestDir, { recursive: true });
     fs.mkdirSync(hooksDir, { recursive: true });
+    // Listed in the slash-command menu; the proxy answers it from the
+    // UserPromptSubmit hook (see MEMTREE_VIEW_COMMAND) before any model turn.
+    // The body only runs if that hook could not answer (proxy gone).
+    fs.mkdirSync(commandsDir, { recursive: true });
+    for (const [name, source] of Object.entries(SESSION_COMMANDS)) {
+        fs.writeFileSync(path.join(commandsDir, `${name}.md`), source, { mode: 0o600 });
+    }
     const hook = { type: "http", url: hookUrl, timeout: 5 };
     const hooks = {
         Stop: [{ hooks: [hook] }],
@@ -267,6 +473,7 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
         // JSON's \n into a raw newline and silently corrupting the payload.
         fs.writeFileSync(path.join(hooksDir, STARTUP_NOTICE_FILE), JSON.stringify({ systemMessage: opts.startupMessage }), { mode: 0o600 });
         hooks.SessionStart = [
+            ...(hooks.SessionStart ?? []),
             {
                 // A compaction continues the same conversation; only real session
                 // starts (fresh, --resume, /clear) re-show the banner.
@@ -281,8 +488,32 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             },
         ];
     }
+    if (opts.resumeLink) {
+        const relay = path.join(hooksDir, RESUME_RELAY_FILE);
+        fs.writeFileSync(relay, RESUME_RELAY_SOURCE, { mode: 0o600 });
+        hooks.SessionStart = [
+            ...(hooks.SessionStart ?? []),
+            {
+                // Every session start that could already have a page. A fresh or
+                // cleared session has none yet, so in practice this answers resumes;
+                // compaction continues the same session and needs no line.
+                matcher: "startup|resume|clear|fork",
+                hooks: [
+                    {
+                        type: "command",
+                        command: [process.execPath, relay, hookUrl]
+                            .map(singleQuoteForShell)
+                            .join(" "),
+                        timeout: 5,
+                    },
+                ],
+            },
+        ];
+    }
     fs.writeFileSync(path.join(manifestDir, "plugin.json"), JSON.stringify({
-        name: "ccc-session-notices",
+        // Claude Code lists plugin commands as `/<name>:<command>`, so this
+        // short name is what users see: `/ccc:memtree`, `/ccc:memtree-view`, …
+        name: SESSION_PLUGIN_NAME,
         version: "1.0.0",
         description: "Session-only display hooks for Claude Code Infinite",
     }), { mode: 0o600 });

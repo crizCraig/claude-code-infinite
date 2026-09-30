@@ -16,6 +16,7 @@
  * amplify identical HTTP calls, and budget-changing inputs never reuse a
  * stale compression result.
  */
+import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
@@ -27,15 +28,55 @@ export interface MemtreeOptions {
     debug?: boolean;
     /** Always-on JSONL diagnostics; every MemTree call logs one line. */
     reqlog?: RequestLogSink;
+    /**
+     * `x-memtree-tools` on compress calls: the memtree MCP tools this Claude
+     * Code session has (e.g. "search,read_node,read_lines"), so the server can
+     * tell the model how to use them in the memory it returns. Set only when
+     * the `memtree` MCP server is configured for the session (memtree-mcp-config.ts).
+     */
+    memtreeTools?: string;
 }
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
- * memory budget (e.g. the 500k whole-request target for Fable / Opus 4.8).
+ * memory budget (e.g. the 800k whole-request target for Fable / Opus 5).
  * Without `model` the server can only apply its static 50k fallback.
  */
 export interface CompressRequestMeta {
     model?: string;
     tools?: unknown[];
+    /**
+     * Explicit whole-request target (server `compression_target_tokens`),
+     * overriding the model-based budget. Set by `/memtree-compact` so a session
+     * is compressed even while it would still fit the model's window.
+     */
+    compressionTargetTokens?: number;
+    /**
+     * Server `compression_threshold_tokens`: compress only when the whole
+     * request exceeds this many tokens, and then to `compressionTargetTokens`.
+     * Without it the target is also the threshold. Servers that predate the
+     * field ignore it (they also omit `model_budget_tokens`, which is how the
+     * proxy tells them apart).
+     */
+    compressionThresholdTokens?: number;
+    /**
+     * Each assistant message's response usage (output, thinking, input), keyed
+     * by its position in the messages sent. Archived by the server for the
+     * MemTree page; never hashed, never part of the compression cache key.
+     */
+    messageUsage?: MessageUsage;
+    /**
+     * When Claude Code wrote each message (ISO), keyed like messageUsage. The
+     * server records a time range per MemTree input block; never hashed, never
+     * part of the compression cache key.
+     */
+    messageTimes?: MessageTimes;
+    /**
+     * Claude Code's session id, sent as `x-claude-code-session-id` so the
+     * server can list a session's MemTree pages by it. Not part of the cache key.
+     */
+    sessionId?: string;
+    /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */
+    clientMeta?: Record<string, string>;
 }
 export interface CompressResult {
     /** Processed (compressed) messages from the server; system role may be included. */
@@ -59,6 +100,11 @@ export interface CompressResult {
      */
     compressed?: boolean;
     /**
+     * The model's whole-request budget the server computed (tokens), whatever
+     * target the request set. Servers that predate it omit the field.
+     */
+    model_budget_tokens?: number;
+    /**
      * Optional explicit unfolded index, consumed only by the memoryChars
      * reqlog diagnostic. Older servers omit it; callers fall back to the first
      * non-system processed message, which is the current server layout.
@@ -67,6 +113,17 @@ export interface CompressResult {
     usage?: unknown;
     /** Client-observed latency of the underlying HTTP call (survives retry dedupe). */
     clientLatencyMs?: number;
+    /**
+     * The per-request MemTree page (`X-Polychat-Memtree-Url`), when the server
+     * sent one. `.json` on the same path is the machine-readable tree.
+     */
+    memtreeUrl?: string;
+    /**
+     * The completed index this turn was compressed against
+     * (`X-Polychat-Memtree-Index`); absent on index-only acks and servers that
+     * predate it. A new value means a new index finished and is now in use.
+     */
+    memtreeIndex?: string;
 }
 /**
  * The server-flattened single user message of a compressed result, or null
@@ -91,6 +148,8 @@ export declare function serverFlattenedMessages(result: CompressResult): Message
 export declare function didMemtreeCompress(result: CompressResult): boolean;
 /** Number of original prompt tokens covered by the index MemTree selected. */
 export declare function cachedPromptTokenCount(result: CompressResult): number | undefined;
+/** The server-reported model budget, when present and sane. */
+export declare function modelBudgetTokens(result: CompressResult): number | undefined;
 /**
  * MemTree's informational estimate of the original, pre-consolidation prompt.
  * Newer servers include images as visual-token estimates and deliberately keep
@@ -169,6 +228,7 @@ export declare class MemtreeClient {
     private compressTimeoutMs;
     private debug;
     private reqlog;
+    private memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     private compressCache;
     /** Message hashes already submitted for background indexing. */
@@ -193,6 +253,19 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** Change the `x-memtree-tools` value for later calls (undefined: none). */
+    setMemtreeTools(value: string | undefined): void;
+    /**
+     * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
+     * polychat host with this client's key. Backs the loopback `/memtree/*`
+     * passthrough, so an agent inside a ccc session reads the user's own tree
+     * through ANTHROPIC_BASE_URL without ever handling the key.
+     */
+    fetchMemTree(pathAndQuery: string, accept?: string): Promise<{
+        status: number;
+        contentType: string;
+        body: Buffer;
+    }>;
     constructor(opts: MemtreeOptions);
     static hashMessages(messages: Message[]): string;
     /**
@@ -237,7 +310,9 @@ export declare class MemtreeClient {
      * disconnected, or on shutdown/402 — only an ordinary failure with a live
      * client keeps the longer-budget background retry.
      */
-    indexInBackground(hash: string, messages: Message[], modelContextLimit: number): void;
+    indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
+    /** Times for retained original messages, in the positions actually sent. */
+    messageTimesFor?: (messages: Message[]) => MessageTimes): void;
     /**
      * Stop accepting background indexes and wait boundedly for those already in
      * flight. Calls still running after the grace period are aborted, and this

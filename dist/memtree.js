@@ -84,6 +84,13 @@ export function cachedPromptTokenCount(result) {
         ? cachedTokens
         : undefined;
 }
+/** The server-reported model budget, when present and sane. */
+export function modelBudgetTokens(result) {
+    const value = result.model_budget_tokens;
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? value
+        : undefined;
+}
 /**
  * MemTree's informational estimate of the original, pre-consolidation prompt.
  * Newer servers include images as visual-token estimates and deliberately keep
@@ -635,6 +642,7 @@ export class MemtreeClient {
     compressTimeoutMs;
     debug;
     reqlog;
+    memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     compressCache = new Map();
     /** Message hashes already submitted for background indexing. */
@@ -663,6 +671,31 @@ export class MemtreeClient {
     get compressBudgetMs() {
         return this.compressTimeoutMs;
     }
+    /** Change the `x-memtree-tools` value for later calls (undefined: none). */
+    setMemtreeTools(value) {
+        this.memtreeTools = value || undefined;
+    }
+    /**
+     * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
+     * polychat host with this client's key. Backs the loopback `/memtree/*`
+     * passthrough, so an agent inside a ccc session reads the user's own tree
+     * through ANTHROPIC_BASE_URL without ever handling the key.
+     */
+    async fetchMemTree(pathAndQuery, accept = "application/json") {
+        const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
+            headers: {
+                authorization: `Bearer ${this.apiKey}`,
+                accept,
+                "x-client": CLIENT_NAME,
+                "x-client-version": CLIENT_VERSION,
+            },
+        });
+        return {
+            status: response.status,
+            contentType: response.headers.get("content-type") ?? "application/octet-stream",
+            body: Buffer.from(await response.arrayBuffer()),
+        };
+    }
     constructor(opts) {
         this.baseUrl = opts.baseUrl.replace(/\/$/, "");
         this.apiKey = opts.apiKey;
@@ -671,6 +704,7 @@ export class MemtreeClient {
                 Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
         this.debug = opts.debug ?? false;
         this.reqlog = opts.reqlog;
+        this.memtreeTools = opts.memtreeTools || undefined;
     }
     static hashMessages(messages) {
         return createHash("sha256")
@@ -723,6 +757,12 @@ export class MemtreeClient {
             signal,
             model: meta?.model,
             tools: meta?.tools,
+            compressionTargetTokens: meta?.compressionTargetTokens,
+            compressionThresholdTokens: meta?.compressionThresholdTokens,
+            messageUsage: meta?.messageUsage,
+            messageTimes: meta?.messageTimes,
+            sessionId: meta?.sessionId,
+            clientMeta: meta?.clientMeta,
         }).catch((err) => {
             this.log(`compression failed: ${err?.message ?? err}`);
             // `status` is absent when the call never got a response (network
@@ -759,7 +799,9 @@ export class MemtreeClient {
      * disconnected, or on shutdown/402 — only an ordinary failure with a live
      * client keeps the longer-budget background retry.
      */
-    indexInBackground(hash, messages, modelContextLimit) {
+    indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta, 
+    /** Times for retained original messages, in the positions actually sent. */
+    messageTimesFor) {
         if (this.backgroundClosing)
             return;
         if (this.indexedHashes.has(hash))
@@ -770,12 +812,25 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexedHashes.delete(first);
         }
-        const stripped = stripCcSystemReminders(messages);
+        const stripped = [];
+        const retained = [];
+        for (const message of messages) {
+            const [cleaned] = stripCcSystemReminders([message]);
+            if (cleaned) {
+                stripped.push(cleaned);
+                retained.push(message);
+            }
+        }
         const controller = new AbortController();
         const operation = this.callContextMemory(stripped, modelContextLimit, {
             timeoutMs: INDEX_TIMEOUT_MS,
             indexOnly: true,
             signal: controller.signal,
+            // Match original text: trimming each block can change joined assistant
+            // text. Omit dropped messages first so the times use the sent positions.
+            messageTimes: messageTimesFor?.(retained),
+            sessionId,
+            clientMeta,
         })
             .then(() => undefined, (err) => {
             this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
@@ -823,7 +878,14 @@ export class MemtreeClient {
         const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
         const toolsHash = createHash("sha256").update(toolsJson).digest("hex");
         return createHash("sha256")
-            .update(JSON.stringify([hash, model ?? null, modelContextLimit, toolsHash]))
+            .update(JSON.stringify([
+            hash,
+            model ?? null,
+            modelContextLimit,
+            toolsHash,
+            meta?.compressionTargetTokens ?? null,
+            meta?.compressionThresholdTokens ?? null,
+        ]))
             .digest("hex");
     }
     remember(cacheKey, promise) {
@@ -843,6 +905,11 @@ export class MemtreeClient {
         // (plan Phase 2.2); harmless extra field either way.
         if (opts.indexOnly)
             body.index_only = true;
+        // Both call kinds: index-only calls build most of the tree, and the
+        // server stamps each input block with its messages' time range.
+        if (opts.messageTimes && Object.keys(opts.messageTimes).length) {
+            body.message_times = opts.messageTimes;
+        }
         // Model (and tools, whose serialized size feeds the same budget) let the
         // server resolve a model-based memory budget instead of its static 50k
         // fallback. Only meaningful on compression calls: the server's index_only
@@ -855,6 +922,18 @@ export class MemtreeClient {
                 body.model = model;
             if (tools !== undefined)
                 body.tools = tools;
+            if (opts.compressionTargetTokens !== undefined) {
+                body.compression_target_tokens = opts.compressionTargetTokens;
+            }
+            if (opts.compressionThresholdTokens !== undefined) {
+                body.compression_threshold_tokens = opts.compressionThresholdTokens;
+            }
+            // Compress calls only: the server adds the thinking tokens (stripped
+            // from `messages` above) to its budget, since a passthrough forwards
+            // them, and archives the counts for the MemTree page's thinking share.
+            if (opts.messageUsage && Object.keys(opts.messageUsage).length) {
+                body.message_usage = opts.messageUsage;
+            }
             // Ask the server for its canonical single-user-message flatten of the
             // compressed result. The flatten format (closed transcript container,
             // per-human-turn headers, live-tail framing, header escaping) lives
@@ -883,6 +962,14 @@ export class MemtreeClient {
                     "content-type": "application/json",
                     "x-client": CLIENT_NAME,
                     "x-client-version": CLIENT_VERSION,
+                    ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
+                    ...(opts.clientMeta && Object.keys(opts.clientMeta).length
+                        ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                        : {}),
+                    // Compress calls only: an index-only call returns no memory.
+                    ...(this.memtreeTools && !opts.indexOnly
+                        ? { "x-memtree-tools": this.memtreeTools }
+                        : {}),
                 },
                 body: payload,
                 signal: controller.signal,
@@ -906,9 +993,18 @@ export class MemtreeClient {
                 throw new Error("context_memory returned no messages");
             }
             const clientLatencyMs = Date.now() - started;
+            // The per-request MemTree page, stamped by the server before the first
+            // body byte; absent on servers that predate the view.
+            const memtreeUrl = response.headers.get("x-polychat-memtree-url") ?? undefined;
+            const memtreeIndex = response.headers.get("x-polychat-memtree-index") ?? undefined;
             this.unpaidDetail = null; // a success proves the key is paid (again)
             ok = true;
             diagnostics = {
+                ...(memtreeUrl ? { memtreeUrl } : {}),
+                ...(memtreeIndex ? { memtreeIndex } : {}),
+                ...(modelBudgetTokens(json) !== undefined
+                    ? { modelBudgetTokens: modelBudgetTokens(json) }
+                    : {}),
                 indexedTokens: cachedPromptTokenCount(json),
                 rawPromptTokens: rawPromptTokenCount(json),
                 // Explicit field when the server sends one, else the first non-system
@@ -921,7 +1017,12 @@ export class MemtreeClient {
             this.log(`context_memory ok in ${clientLatencyMs}ms ` +
                 `(${messages.length} → ${json.messages.length} messages` +
                 `${opts.indexOnly ? ", index-only" : ""})`);
-            return { ...json, clientLatencyMs };
+            return {
+                ...json,
+                clientLatencyMs,
+                ...(memtreeUrl ? { memtreeUrl } : {}),
+                ...(memtreeIndex ? { memtreeIndex } : {}),
+            };
         }
         finally {
             clearTimeout(timeout);
