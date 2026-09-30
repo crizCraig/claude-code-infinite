@@ -24,6 +24,7 @@ import {
   wrapNotice,
 } from "../dist/notices.js";
 import { AWAY_SUMMARY_PROMPT_PREFIX } from "../dist/turns.js";
+import { SessionFinder } from "../dist/memtree-mcp.js";
 
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
@@ -3558,6 +3559,147 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
     const before = pageGets.length;
     assert.equal((await get("/memtree/ea18af90%2F..%2Fx")).status, 404);
     assert.equal(pageGets.length, before);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("GET /memtree/sessions and /memtree/search relay to the finder endpoints with the key and project", async () => {
+  const upstream = await mockUpstream();
+  const seen = [];
+  const memtreeSrv = await listen((req, res) => {
+    seen.push({
+      url: req.url,
+      authorization: req.headers.authorization,
+      meta: req.headers["x-client-meta"],
+      session: req.headers["x-claude-code-session-id"],
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ sessions: [], hits: [], next_cursor: null }));
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    projectMeta: { project_dir: "polychat", git_repo: "acme/polychat", git_branch: "main", git_commit: "c6fe251" },
+  });
+  const get = (path, headers = {}) => fetch(`http://127.0.0.1:${proxy.port}${path}`, { headers });
+  try {
+    const list = await get("/memtree/sessions?since=2026-09-01&project=polychat&cursor=abc%3D&limit=5");
+    assert.equal(list.status, 200);
+    assert.deepEqual(seen.at(-1), {
+      url: "/v1/memtree/sessions?since=2026-09-01&project=polychat&cursor=abc%3D&limit=5",
+      authorization: "Bearer secret-key",
+      meta: JSON.stringify({ project_dir: "polychat", git_repo: "acme/polychat", git_branch: "main", git_commit: "c6fe251" }),
+      session: undefined,
+    });
+    await get("/memtree/search?q=%22cache+invalidation%22&mode=text", { "x-claude-code-session-id": "sess-1" });
+    assert.equal(seen.at(-1).url, "/v1/memtree/search?q=%22cache+invalidation%22&mode=text");
+    assert.equal(seen.at(-1).session, "sess-1");
+    await get("/memtree/search?q=x", { "x-claude-code-session-id": "bad id/../x" });
+    assert.equal(seen.at(-1).session, undefined, "a malformed session id is not forwarded");
+
+    // The Step 6 per-tree search goes through the page relay.
+    await get("/memtree/ea18af90658b/search?q=deploy&limit=3");
+    assert.equal(seen.at(-1).url, "/usage/memtree/ea18af90658b/search?q=deploy&limit=3");
+
+    // Nothing else reaches the server: no subpaths, no encoded walks.
+    const before = seen.length;
+    for (const path of [
+      "/memtree/sessions/x",
+      "/memtree/search/..%2F..%2Fadmin",
+      "/memtree/sessions%2F..%2Fadmin",
+      "/memtree/search%3Fq=x",
+      "/memtree/ea18af90658b/search/x",
+    ]) {
+      assert.equal((await get(path)).status, 404, path);
+    }
+    assert.equal(seen.length, before);
+    // A literal `..` is normalized by the URL parser before routing.
+    await get("/memtree/sessions/../search?q=y");
+    assert.equal(seen.at(-1).url, "/v1/memtree/search?q=y");
+    // Only GET is relayed (anything else is not a MemTree call).
+    await fetch(`http://127.0.0.1:${proxy.port}/memtree/sessions`, { method: "POST", body: "{}" });
+    assert.equal(seen.length, before + 1, "the POST never reached the MemTree server");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("list_sessions and search_sessions through the proxy against a mock MemTree server", async () => {
+  const upstream = await mockUpstream();
+  const requests = [];
+  const rid = "3f2a9c1b-7e40-4d2a-9a51-0c8e2b6f4d17";
+  const hit = (score, model) => ({
+    id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", kind: "claude_code_session",
+    session_id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f",
+    tree: { request_id: rid, created_at: "2026-09-29T01:38:02.211000+00:00",
+            links: { url: "https://api.polychat.co/m/3f2a9c1b7e40" } },
+    leaf: "leaf_node_1:2:4.txt", range: { block: 1, start: 2, end: 4 },
+    snippet: "the <b>Deploy</b> target is cloud-run", score, ...(model ? { embedding_model: model } : {}),
+  });
+  const memtreeSrv = await listen((req, res) => {
+    const url = new URL(req.url, "http://x");
+    requests.push({ path: url.pathname, params: Object.fromEntries(url.searchParams), session: req.headers["x-claude-code-session-id"] });
+    const send = (status, body) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (url.pathname === "/v1/memtree/sessions") {
+      return send(200, {
+        sessions: [{
+          id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", kind: "claude_code_session",
+          session_id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", title: "Usage dashboard overhaul",
+          snippet: "Restyle the usage page", first_at: "2026-09-28T17:02:11+00:00", last_at: "2026-09-29T01:40:57+00:00",
+          project: { dir: "polychat", repo: "acme/polychat", branch: "main", commit: "c6fe251" },
+          models: ["claude-opus-5-5"], request_count: 212, latest_tree: { request_id: rid, links: { url: "https://api.polychat.co/m/3f2a9c1b7e40" } },
+        }],
+        next_cursor: url.searchParams.get("cursor") ? null : "CURSOR1",
+      });
+    }
+    if (url.searchParams.get("q") === "partner") return send(403, { detail: "not available to partner keys" });
+    if (url.searchParams.get("mode") === "vector") {
+      return send(200, { query: url.searchParams.get("q"), mode: "vector", charged: true, next_cursor: "V2",
+        groups: [{ embedding_model: "voyage-3.5", has_more: true, hits: [hit(0.88, "voyage-3.5")] },
+                 { embedding_model: "gemini-embedding-001", has_more: false, hits: [hit(0.61, "gemini-embedding-001")] }] });
+    }
+    return send(200, { query: url.searchParams.get("q"), mode: "text", hits: [hit(0.0913)], next_cursor: null, matches_capped: false });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const finder = new SessionFinder({ proxyUrl: `http://127.0.0.1:${proxy.port}`, sessionId: "sess-9" });
+  try {
+    const listed = await finder.listSessions({ project: "polychat", since: "2026-09-01" });
+    assert.deepEqual(requests.at(-1), { path: "/v1/memtree/sessions", params: { since: "2026-09-01", project: "polychat" }, session: "sess-9" });
+    assert.match(listed, /^1 session, most recently active first:/);
+    assert.match(listed, /\[1\] Usage dashboard overhaul/);
+    assert.match(listed, /session 6025e1f7-074b-4abb-a8e7-dbf07ef1e81f · 2026-09-28 17:02 UTC → 2026-09-29 01:40 UTC · 212 requests/);
+    assert.match(listed, /project: acme\/polychat · main @ c6fe251/);
+    assert.match(listed, new RegExp(`read_node \\{"tree": "${rid}", "id": 0\\}`));
+    assert.match(listed, /"cursor": "CURSOR1"/);
+    assert.match(await finder.listSessions({ cursor: "CURSOR1" }), /No more results\./);
+
+    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target" });
+    assert.equal(requests.at(-1).params.mode, "vector", "vector by default");
+    assert.match(semantic, /charged: one query embedding per model/);
+    assert.match(semantic, /== voyage-3\.5 ==[\s\S]*== gemini-embedding-001 ==/, "one ranking per model");
+    assert.match(semantic, /scores are not comparable across groups/);
+    assert.match(semantic, new RegExp(`open: read_lines \\{"tree": "${rid}", "block": 1, "start": 2, "end": 4\\}`));
+    assert.match(semantic, /"cursor": "V2"/);
+
+    const exact = await finder.searchSessions({ query: "deploy", mode: "text", project: "polychat" });
+    assert.deepEqual(requests.at(-1).params, { q: "deploy", mode: "text", project: "polychat" });
+    assert.match(exact, /1 text match for "deploy":/);
+    assert.match(exact, /the \*\*Deploy\*\* target/);
+    assert.match(exact, /page: https:\/\/api\.polychat\.co\/m\/3f2a9c1b7e40/);
+    assert.match(exact, /block 1 lines 2-4/);
+    assert.match(exact, /No more results\./);
+
+    await assert.rejects(finder.searchSessions({ query: "partner" }), /HTTP 403 not available to partner keys/);
   } finally {
     proxy.close();
     upstream.close();
