@@ -4,6 +4,10 @@
 
 # Claude Code Infinite
 
+MemTree learns from your agent's work the way intelligence always has: by abstracting it. As your
+agent works, MemTree consolidates each stretch of experience into summaries, then summaries of
+summaries: a hierarchy of abstractions across time. Nothing is thrown away.
+
 * Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
 * Supports unlimited-length coding sessions
 * Feels fast and fresh with every message
