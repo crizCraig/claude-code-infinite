@@ -851,10 +851,12 @@ export class MemtreeClient {
    */
   async fetchMemTree(
     pathAndQuery: string,
-    accept = "application/json"
+    accept = "application/json",
+    extraHeaders: Record<string, string> = {}
   ): Promise<{ status: number; contentType: string; body: Buffer }> {
     const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
       headers: {
+        ...extraHeaders,
         authorization: `Bearer ${this.apiKey}`,
         accept,
         "x-client": CLIENT_NAME,

@@ -681,9 +681,10 @@ export class MemtreeClient {
      * passthrough, so an agent inside a ccc session reads the user's own tree
      * through ANTHROPIC_BASE_URL without ever handling the key.
      */
-    async fetchMemTree(pathAndQuery, accept = "application/json") {
+    async fetchMemTree(pathAndQuery, accept = "application/json", extraHeaders = {}) {
         const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
             headers: {
+                ...extraHeaders,
                 authorization: `Bearer ${this.apiKey}`,
                 accept,
                 "x-client": CLIENT_NAME,

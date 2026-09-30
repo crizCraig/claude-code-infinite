@@ -375,6 +375,10 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
         return handleMemTreeCurrent(req, res, opts, state, url);
     }
+    const finderPath = req.method === "GET" ? MEMTREE_FINDER_RELAY.get(url.pathname) : undefined;
+    if (finderPath) {
+        return handleMemTreeFinder(req, res, opts, finderPath, url);
+    }
     if (req.method === "GET" && url.pathname.startsWith(MEMTREE_PASSTHROUGH_PREFIX)) {
         return handleMemTreePassthrough(req, res, opts, url);
     }
@@ -390,12 +394,13 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
 const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
 /**
  * `<request id>`, `<request id>.json`, `<request id>/session.json` (the
- * page's session pane), or `sessions/<Claude Code session id>.json` (every
+ * page's session pane), `<request id>/search` (the server's term search over
+ * that tree, `?q=&limit=`), or `sessions/<Claude Code session id>.json` (every
  * page from one session, newest first); nothing that could walk the upstream
  * path. The id is the request UUID or the server's short form of it (leading
  * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
  */
-const MEMTREE_PASSTHROUGH_TARGET_RE = /^(?:[A-Za-z0-9-]+(\.json|\/session\.json)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
+const MEMTREE_PASSTHROUGH_TARGET_RE = /^(?:[A-Za-z0-9-]+(\.json|\/session\.json|\/search)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
 /**
  * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own
  * MemTree page with their key. Claude Code's child env already carries this
@@ -413,6 +418,43 @@ async function handleMemTreePassthrough(req, res, opts, url) {
     }
     try {
         const upstream = await opts.memtree.fetchMemTree(`/usage/memtree/${target}${url.search}`, req.headers.accept ?? "application/json");
+        res.writeHead(upstream.status, { "content-type": upstream.contentType });
+        res.end(upstream.body);
+    }
+    catch (err) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: `MemTree fetch failed: ${String(err)}` }));
+    }
+}
+/**
+ * Loopback routes for finding things across the user's own sessions, relayed
+ * to the server's owner-only endpoints with the user's key (which never
+ * leaves this process): `GET /memtree/sessions?…` lists sessions, `GET
+ * /memtree/search?…` searches their trees. Exact paths only; the query string
+ * goes on unchanged (the URL parser has already split off any path or
+ * fragment). Matched before the page relay, whose id pattern would otherwise
+ * take them for page ids.
+ *
+ * The project meta goes along in `x-client-meta`, and the caller's Claude
+ * Code session id when it sends one, so a charged (vector) search's usage row
+ * says where it came from.
+ */
+const MEMTREE_FINDER_RELAY = new Map([
+    [`${MEMTREE_PASSTHROUGH_PREFIX}sessions`, "/v1/memtree/sessions"],
+    [`${MEMTREE_PASSTHROUGH_PREFIX}search`, "/v1/memtree/search"],
+]);
+const SESSION_ID_HEADER_VALUE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+async function handleMemTreeFinder(req, res, opts, upstreamPath, url) {
+    const headers = {};
+    const meta = memtreeClientMeta({ project: opts.projectMeta });
+    if (Object.keys(meta).length)
+        headers["x-client-meta"] = JSON.stringify(meta);
+    const sessionId = firstNonEmptyHeader(req, "x-claude-code-session-id");
+    if (sessionId && SESSION_ID_HEADER_VALUE.test(sessionId)) {
+        headers["x-claude-code-session-id"] = sessionId;
+    }
+    try {
+        const upstream = await opts.memtree.fetchMemTree(`${upstreamPath}${url.search}`, req.headers.accept ?? "application/json", headers);
         res.writeHead(upstream.status, { "content-type": upstream.contentType });
         res.end(upstream.body);
     }
@@ -811,6 +853,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         agentId: firstNonEmptyHeader(req, "x-claude-code-agent-id"),
         parentAgentId: firstNonEmptyHeader(req, "x-claude-code-parent-agent-id"),
         model: body.model,
+        project: opts.projectMeta,
     });
     // A typed prompt that recovers an interrupted tool loop (or was queued
     // mid-turn) arrives merged into the pending tool_result wrapper, so it fails

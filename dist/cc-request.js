@@ -172,6 +172,10 @@ function messageText(message) {
 const META_VALUE = /^[\x20-\x7e]{1,128}$/;
 export function memtreeClientMeta(input) {
     const candidate = {
+        project_dir: input.project?.project_dir,
+        git_repo: input.project?.git_repo,
+        git_branch: input.project?.git_branch,
+        git_commit: input.project?.git_commit,
         claude_code_version: input.info?.ccVersion,
         entrypoint: input.info?.entrypoint,
         turn_origin: input.info?.turnOrigin,

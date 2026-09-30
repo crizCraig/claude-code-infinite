@@ -255,7 +255,7 @@ export declare class MemtreeClient {
      * passthrough, so an agent inside a ccc session reads the user's own tree
      * through ANTHROPIC_BASE_URL without ever handling the key.
      */
-    fetchMemTree(pathAndQuery: string, accept?: string): Promise<{
+    fetchMemTree(pathAndQuery: string, accept?: string, extraHeaders?: Record<string, string>): Promise<{
         status: number;
         contentType: string;
         body: Buffer;

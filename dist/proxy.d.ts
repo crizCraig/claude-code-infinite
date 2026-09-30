@@ -42,6 +42,7 @@ import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import type { MemtreeLinkStore } from "./memtree-links.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
+import type { ProjectMeta } from "./project-meta.js";
 import { type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -122,6 +123,12 @@ export interface ProxyOptions {
      * passes the reader for ~/.claude/projects.
      */
     transcriptUsage?: TranscriptUsageSource;
+    /**
+     * The session's project (project-meta.ts: directory name, `owner/repo`,
+     * branch, commit), added to every MemTree call's `x-client-meta` so the
+     * user can find sessions by project. Omitted means none is sent.
+     */
+    projectMeta?: ProjectMeta;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
