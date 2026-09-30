@@ -1315,6 +1315,13 @@ async function handleMessages(
   const isUserTurn = isNonToolUserMessage(lastMsg);
   const isToolResultTurn = isToolResultUserMessage(lastMsg);
   const isAwaySummary = isAwaySummaryUserMessage(lastMsg);
+  // Neither a prompt nor a tool result: a background task notification
+  // arrives as a trailing role=system block after the assistant's last reply,
+  // so the last conversation message is that reply. It carries the whole
+  // history like any turn and must live by the budget like a tool turn; it
+  // once fell through every branch and forwarded the uncompacted 4.4MB
+  // history (Prompt is too long, 2026-09-30).
+  const isContinuationTurn = lastMsg !== undefined && !isUserTurn && !isToolResultTurn;
 
   // Claude Code's security monitor re-sends the whole session as one
   // `<transcript>` message after most actions. Before this check it looked
@@ -1673,6 +1680,7 @@ async function handleMessages(
       state.memoryRoutes.delete(requestRouteKey);
     }
     if (routeMiss !== undefined) rec.routeMiss = routeMiss;
+    if (isContinuationTurn) rec.continuation = true;
 
     // Cheap shape check: without an earlier real user message there is
     // nothing MemTree could compress, so no attempt is worth making.
@@ -1690,7 +1698,7 @@ async function handleMessages(
       if ((routeMiss === "missing" || routeMiss === "rejected") && canCompress) {
         rec.routeRecovery = { outcome: "disabled" };
       }
-    } else if (isToolResultTurn && routeMiss !== "replay") {
+    } else if ((isToolResultTurn || isContinuationTurn) && routeMiss !== "replay") {
       // Every lane's tool turn lives by the budget, like a main human turn:
       // under it, forward (on the lane's route or the session's stable
       // prefix, else whole) with no compress call; at it, compress once to

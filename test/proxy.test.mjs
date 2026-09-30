@@ -8771,6 +8771,55 @@ test("tool-loop compaction: a human turn after a tool-turn compaction rides the 
   }
 });
 
+const taskNotification = (text) => ({
+  role: "system",
+  content: `<task-notification>\n<status>failed</status>\n<summary>${text}</summary>\n</task-notification>`,
+});
+
+test("a task notification after a compacted turn rides the stable prefix instead of forwarding the whole history", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    const [crossed] = await toolTurnsWhile(h, conv, "tool");
+    assert.equal(crossed.turnType, "tool-recompressed");
+    const compacted = h.upstream.bodies.at(-1);
+    const calls = h.compressCalls().length;
+
+    // The turn ends; later a background agent's notification arrives as a
+    // trailing system block after the assistant's final reply.
+    toolStep(conv, "t-last", 100);
+    conv.push(assistantText("done"), taskNotification("agent stalled"));
+    const rec = await h.post(conv);
+    assert.equal(rec.continuation, true);
+    assert.equal(rec.turnType, "tool-prefix");
+    assert.equal(rec.routeMiss, undefined, "a notification never consults or evicts the lane route");
+    assert.equal(h.compressCalls().length, calls, "under the budget: no compress call");
+    const ride = h.upstream.bodies.at(-1);
+    assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.equal(ride.messages.at(-1).role, "system", "the notification itself goes out verbatim");
+  } finally {
+    h.close();
+  }
+});
+
+test("a task notification at the budget with no stable prefix compresses instead of forwarding whole", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+    conv.push(assistantText("a".repeat(100_000)), taskNotification("agent finished"));
+    const rec = await h.post(conv);
+    assert.equal(rec.continuation, true);
+    assert.equal(rec.compaction.reason, "budget");
+    assert.equal(rec.turnType, "tool-recompressed");
+    assert.equal(h.compressCalls().length, 1);
+    assert.ok(rec.forwardedBytes < rec.requestBytes / 4, "the compressed history went upstream");
+  } finally {
+    h.close();
+  }
+});
+
 test("tool-loop compaction with a typed prompt pending (headless -p): the result becomes the stable prefix and later tool turns ride it directly", async () => {
   const h = await edgeHarness({ budget: 20_000 });
   try {
