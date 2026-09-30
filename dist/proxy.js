@@ -1185,7 +1185,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // sound: a live route proves the installer's compress() submitted this
         // history in this process, so re-indexing buys nothing.
         if (routeMiss !== "replay") {
-            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, toolSessionId, clientMeta);
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, toolSessionId, clientMeta, transcriptTimesFor(opts, toolSessionId, agentAttributionId(req)));
         }
         capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
         // The size Anthropic reports is the next budget check's anchor: a ride
@@ -1410,7 +1410,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // turns fit the budget: the same prefix bytes as the last request, so
         // Anthropic reads them from cache, and no compress call. MemTree still
         // gets the history to index.
-        opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, sessionId, clientMeta);
+        opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, sessionId, clientMeta, transcriptTimesFor(opts, sessionId, agentAttributionId(req)));
         return forwardCompressed(edge.routed.body, edge.routed.raw, "followup-prefix", { ride: edge.prefix }, undefined);
     }
     /**
@@ -1461,6 +1461,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             modelContextLimit,
             rec,
             sessionId,
+            agentId: agentAttributionId(req),
             clientMeta,
             ...(edge?.kind === "compress"
                 ? { compaction: { target: edge.target, threshold: edge.threshold } }
@@ -2798,8 +2799,9 @@ async function runBlockingCompression(args) {
     const compaction = args.compaction ??
         laneCompaction(opts, state, args.sessionId, body.model, modelContextLimit);
     const messageUsage = args.sessionId !== undefined && opts.transcriptUsage
-        ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree)
+        ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree, args.agentId)
         : undefined;
+    const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
     const compressStarted = Date.now();
     const compressMeta = {
         // Model + tools drive the server's model-based memory budget
@@ -2816,6 +2818,7 @@ async function runBlockingCompression(args) {
             ? { compressionThresholdTokens: compaction.threshold }
             : {}),
         ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
+        ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
         ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
         ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
     };
@@ -2990,6 +2993,7 @@ async function recoverToolRouteMiss(args) {
             modelContextLimit,
             rec,
             sessionId: requestSessionId(req),
+            agentId: agentAttributionId(req),
             clientMeta: args.clientMeta,
             ...(args.compaction ? { compaction: args.compaction } : {}),
         });
@@ -3063,7 +3067,7 @@ async function recoverToolRouteMiss(args) {
         // or a shutting-down proxy gets no retry.
         if (!state.shutdownSignal.aborted &&
             opts.memtree.paymentRequiredDetail === null) {
-            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta);
+            opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta, transcriptTimesFor(opts, requestSessionId(req), agentAttributionId(req)));
         }
         return forwardOriginal();
     }
@@ -4052,4 +4056,11 @@ function readAll(stream) {
 /** Test seam. */
 export const __testCapCacheBreakpoints = capCacheBreakpoints;
 export const __testEstimateRequestTokens = estimateRequestTokens;
+/** Reads message times from the session's transcript, when there is one. */
+function transcriptTimesFor(opts, sessionId, agentId) {
+    const source = opts.transcriptUsage;
+    if (sessionId === undefined || !source?.timesFor)
+        return undefined;
+    return (messages) => source.timesFor(sessionId, messages, agentId);
+}
 //# sourceMappingURL=proxy.js.map
