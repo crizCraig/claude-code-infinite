@@ -8422,7 +8422,7 @@ async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upst
   });
   const session = "s-edge";
   const messageRecs = () => records.filter((r) => r.kind === "messages");
-  const post = async (messages, extraHeaders = {}) => {
+  const post = async (messages, extraHeaders = {}, extraBody = {}) => {
     const before = messageRecs().length;
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
@@ -8436,6 +8436,7 @@ async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upst
         max_tokens: 64,
         system: [{ type: "text", text: "sys", cache_control: EPH }],
         messages,
+        ...extraBody,
       }),
     });
     await res.json();
@@ -9316,6 +9317,37 @@ for (const reportUsage of [false, true]) {
       const text = stripAnsi(notice.body.hookSpecificOutput.displayContent);
       assert.ok(text.includes(compressedTotalsText(rec.compaction.estimatedTokens, expectedAfter)), text);
       assert.equal(rec.compaction.estimatedBytes, expectedBytes);
+    } finally { h.close(); }
+  });
+}
+
+
+for (const reportUsage of [true, false]) {
+  test(`human output reservation ${reportUsage ? "forces with calibrated usage" : "does not force from bytes alone"}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { reportUsage } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("")];
+      const shape = { model: "claude-x", max_tokens: 64, system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv };
+      const padding = 600_268 - Buffer.byteLength(JSON.stringify(shape));
+      conv.at(-1).content[0].text = "x".repeat(padding);
+      const warm = await h.post(conv);
+      assert.equal(warm.requestBytes, 600_268);
+      assert.equal(warm.turnType, "followup-noop");
+      if (reportUsage) assert.equal(warm.usage.input_tokens + warm.usage.cache_read_input_tokens, 150_067);
+      // The larger output reservation adds three bytes. Keep total request
+      // bytes unchanged so the calibrated next input estimate is exact.
+      conv.at(-1).content[0].text = "x".repeat(padding - 3);
+      const rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.equal(rec.requestBytes, 600_268);
+      assert.equal(rec.compaction.estimatedTokens, 150_067);
+      assert.equal(rec.compaction.sizeSource, reportUsage ? "reported" : "bytes");
+      assert.ok(150_067 < 160_000 && 150_067 + 64_000 > 200_000);
+      const call = h.compressCalls().at(-1);
+      assert.equal(h.compressCalls().length, 2);
+      assert.equal(call.compression_target_tokens, 80_000);
+      assert.equal(call.compression_threshold_tokens, reportUsage ? undefined : 160_000);
+      assert.equal(rec.turnType, reportUsage ? "followup-compressed" : "followup-noop");
+      if (reportUsage) assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000);
     } finally { h.close(); }
   });
 }

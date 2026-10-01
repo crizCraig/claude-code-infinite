@@ -3067,6 +3067,19 @@ function laneCompaction(
   };
 }
 
+/** Calibrated input must leave room for the requested output as well. */
+function calibratedSizeExceedsLimits(
+  record: CompactionRecord,
+  body: Record<string, any>,
+  modelContextLimit: number
+): boolean {
+  const outputTokens = typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)
+    ? Math.max(0, body.max_tokens) : 0;
+  const tokens = record.estimatedTokens ?? 0;
+  return record.sizeSource === "reported" &&
+    (tokens >= record.budgetTokens || tokens + outputTokens > modelContextLimit);
+}
+
 /** Only calibrated usage may force an estimate-driven compaction. */
 function budgetCompaction(
   state: ProxyState,
@@ -3075,13 +3088,7 @@ function budgetCompaction(
   body: Record<string, any>,
   modelContextLimit: number
 ): { target?: number; threshold?: number } {
-  const outputTokens = typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)
-    ? Math.max(0, body.max_tokens) : 0;
-  const tokens = record.estimatedTokens ?? 0;
-  if (record.sizeSource === "reported" &&
-      (tokens >= record.budgetTokens || tokens + outputTokens > modelContextLimit)) {
-    return { target };
-  }
+  if (calibratedSizeExceedsLimits(record, body, modelContextLimit)) return { target };
   // Older servers may ignore a threshold, so do not send a forcing target
   // until support is known. They can still compact against their own budget.
   if (!state.serverReportsBudget) return {};
@@ -3320,7 +3327,7 @@ function planEdgeCompaction(args: {
   compaction.estimatedTokens = size.tokens;
   compaction.estimatedBytes = forwardBody.length;
   compaction.sizeSource = size.source;
-  if (size.source === "reported" && size.tokens >= budget.tokens) {
+  if (calibratedSizeExceedsLimits(compaction, body, modelContextLimit)) {
     return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
   }
   if (state.serverReportsBudget) {
