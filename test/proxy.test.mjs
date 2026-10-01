@@ -8439,11 +8439,13 @@ async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop =
 /** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
 async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
   const bodies = [];
+  const rawBodies = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
+      rawBodies.push(raw.toString("utf-8"));
       bodies.push(JSON.parse(raw.toString("utf-8")));
       const tokens = Math.floor(raw.length / bytesPerToken);
       const body = JSON.stringify({
@@ -8459,7 +8461,7 @@ async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
       res.end(body);
     });
   });
-  return { ...srv, bodies };
+  return { ...srv, bodies, rawBodies };
 }
 
 async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upstreamOptions = {} } = {}) {
@@ -9441,6 +9443,60 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
           assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
           assert.equal(rec.turnType, "followup-compressed");
           assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
+        }
+      }
+    } finally { h.close(); }
+  });
+}
+
+for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
+  test(`tool prefix output reservation: ${mode}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
+      await h.post(conv);
+      await h.command("/memtree-compact");
+      conv.push(assistantText("a"), userText("compact"));
+      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      const calls = h.compressCalls().length;
+      if (mode === "failure" || mode === "backoff") {
+        h.memtreeSrv.server.closeAllConnections();
+        h.memtreeSrv.close();
+      }
+      toolStep(conv, "dense", 290_000);
+      let rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "bytes estimate fits");
+      if (mode === "uncalibrated") {
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.equal(h.compressCalls().length, calls, "uncalibrated estimate never forces");
+        assert.match(rec.turnType, /^tool-(memory|prefix)$/);
+      } else {
+        assert.equal(rec.compaction.sizeSource, "reported");
+        assert.ok(rec.compaction.estimatedTokens < 160_000);
+        assert.ok(rec.compaction.estimatedTokens + 64_000 > 200_000);
+        if (mode === "compress") {
+          assert.equal(h.compressCalls().length, calls + 1);
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+          assert.equal(rec.routeRecovery.outcome, "compressed");
+          assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
+        } else {
+          assert.equal(rec.compress.ok, false);
+          assert.deepEqual(h.upstream.bodies.at(-1).messages, conv);
+          if (mode === "backoff") {
+            toolStep(conv, "next", 10);
+            const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
+              system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv }, null, 2);
+            const count = messageRecords(h.records).length;
+            const res = await fetch(`http://127.0.0.1:${h.proxy.port}/v1/messages`, {
+              method: "POST", headers: { "content-type": "application/json", "x-claude-code-session-id": "s-edge" }, body: original,
+            });
+            await res.json();
+            await waitFor(() => messageRecords(h.records).length > count);
+            rec = messageRecords(h.records).at(-1);
+            assert.equal(rec.routeRecovery.outcome, "backoff");
+            assert.equal(rec.turnType, "tool");
+            assert.equal(h.upstream.rawBodies.at(-1), original, "backoff clears unsafe caller ride and preserves original bytes");
+          }
         }
       }
     } finally { h.close(); }

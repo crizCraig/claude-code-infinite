@@ -1072,6 +1072,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 sizeHolder: rideableCandidate.stablePrefix ?? rideableCandidate,
             }
             : undefined;
+        let toolNeedsOriginal = false;
         if (opts.toolRouteRecovery === false) {
             // Kill switch: no size check and no compress call on any tool turn.
             // A route still rides; a miss forwards whole and records "disabled".
@@ -1101,7 +1102,15 @@ async function handleMessages(req, res, opts, upstream, state) {
             });
             if (plan.kind === "ride")
                 toolRide = plan.ride;
+            if (plan.kind === "pass" && plan.original) {
+                toolRide = undefined;
+                toolNeedsOriginal = true;
+            }
             if (plan.kind === "compress") {
+                // Clear the caller's old ride before any in-flight/backoff/cooldown
+                // exit. An over-window prefix cannot remain the implicit fallback.
+                toolRide = plan.fallback;
+                toolNeedsOriginal = plan.overWindow;
                 const prior = state.toolRecoveryAttemptedLanes.get(requestRouteKey);
                 if (prior?.awaitingIndex && Date.now() >= prior.awaitingIndex.deadline) {
                     prior.awaitingIndex = undefined;
@@ -1146,7 +1155,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                         upstream,
                         body,
                         messages,
-                        forwardBody,
+                        forwardBody: plan.overWindow ? rawBody : forwardBody,
                         originalBody: rawBody,
                         msgsForMemtree,
                         hash,
@@ -1184,7 +1193,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 }
             }
         }
-        const sendBody = toolRide?.raw ?? forwardBody;
+        const sendBody = toolRide?.raw ?? (toolNeedsOriginal ? rawBody : forwardBody);
         recordTurn(rec, toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool", sendBody);
         // A replay matched the stored route's prefix hashes, which are
         // normalization-tolerant — attribution/cache-control churn can make its
@@ -2418,7 +2427,13 @@ function planToolCompaction(args) {
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
-    if ((size.tokens < budget.tokens && !overWindow) || !args.canCompress) {
+    overWindow ||= calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+    if (!args.canCompress) {
+        if (overWindow)
+            return { kind: "pass", original: true };
+        return ride ? { kind: "ride", ride } : { kind: "pass" };
+    }
+    if (size.tokens < budget.tokens && !overWindow) {
         return ride ? { kind: "ride", ride } : { kind: "pass" };
     }
     compaction.reason = "budget";
@@ -2430,7 +2445,7 @@ function planToolCompaction(args) {
         estimateTokens: size.tokens,
         budgetTokens: budget.tokens,
         overWindow,
-        ...(ride ? { fallback: ride } : {}),
+        ...(ride && !overWindow ? { fallback: ride } : {}),
         ...(stableLane ? { replaces: current ?? null } : {}),
     };
 }
