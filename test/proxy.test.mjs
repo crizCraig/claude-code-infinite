@@ -9405,3 +9405,44 @@ for (const reportUsage of [true, false]) {
     } finally { h.close(); }
   });
 }
+
+for (const mode of ["compress", "failure", "uncalibrated"]) {
+  test(`human prefix output reservation: ${mode}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
+      await h.post(conv);
+      await h.command("/memtree-compact");
+      conv.push(assistantText("a"), userText("compact"));
+      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      const calls = h.compressCalls().length;
+      if (mode === "failure") {
+        h.memtreeSrv.server.closeAllConnections();
+        h.memtreeSrv.close();
+      }
+      conv.push(assistantText("a"), userText("y".repeat(290_000)));
+      const rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "transport estimate fits");
+      if (mode === "uncalibrated") {
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.equal(rec.turnType, "followup-prefix");
+        assert.equal(h.compressCalls().length, calls, "bytes alone do not force");
+      } else {
+        assert.equal(rec.compaction.sizeSource, "reported");
+        assert.ok(rec.compaction.estimatedTokens < 160_000);
+        assert.ok(rec.compaction.estimatedTokens + 64_000 > 200_000);
+        if (mode === "failure") {
+          assert.equal(rec.compress.ok, false, "attempted compression");
+          assert.equal(rec.turnType, "followup-degraded");
+          assert.equal(rec.forwardedBytes, rec.requestBytes, "unsafe prefix is not retained as fallback");
+          assert.deepEqual(h.upstream.bodies.at(-1).messages, conv);
+        } else {
+          assert.equal(h.compressCalls().length, calls + 1);
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+          assert.equal(rec.turnType, "followup-compressed");
+          assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
+        }
+      }
+    } finally { h.close(); }
+  });
+}

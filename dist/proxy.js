@@ -2163,12 +2163,16 @@ function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
     };
 }
 /** Calibrated input must leave room for the requested output as well. */
-function calibratedSizeExceedsLimits(record, body, modelContextLimit) {
+function calibratedSizeExceedsWindow(record, body, modelContextLimit) {
     const outputTokens = typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)
         ? Math.max(0, body.max_tokens) : 0;
-    const tokens = record.estimatedTokens ?? 0;
     return record.sizeSource === "reported" &&
-        (tokens >= record.budgetTokens || tokens + outputTokens > modelContextLimit);
+        (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit;
+}
+function calibratedSizeExceedsLimits(record, body, modelContextLimit) {
+    return (record.sizeSource === "reported" &&
+        (record.estimatedTokens ?? 0) >= record.budgetTokens) ||
+        calibratedSizeExceedsWindow(record, body, modelContextLimit);
 }
 /** Only calibrated usage may force an estimate-driven compaction. */
 function budgetCompaction(state, record, target, body, modelContextLimit) {
@@ -2326,7 +2330,8 @@ function planEdgeCompaction(args) {
         compaction.estimatedTokens = size.tokens;
         compaction.estimatedBytes = routed.raw.length;
         compaction.sizeSource = size.source;
-        const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit);
+        const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit) ||
+            calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
         const fallback = overWindow ? undefined : { prefix, routed };
         if (state.compactNow.has(sessionId))
             return forced("manual", fallback);
