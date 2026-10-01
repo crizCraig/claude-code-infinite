@@ -216,8 +216,10 @@ export interface ProxyOptions {
    *   Stop as the fallback for a turn that rendered none; the first message
    *   after a newly finished index came into use is green, later ones dim.
    * - "stop": the same trailer, on Stop only, once per turn.
-   * - "success": appended to the `✓ MemTree · conversation optimized` line,
-   *   once per new index, nothing otherwise.
+   * - "success": only under the `✓ MemTree · conversation optimized` line.
+   * In "turn" (the default) and "success", the success line carries the
+   * current page link on its own line below it; in "turn" the end-of-turn
+   * trailer then skips a link that line already showed.
    * - "off": no link anywhere (the page still reaches the request log).
    * The CLI maps `CCC_MEMTREE_LINK` onto this.
    */
@@ -2490,8 +2492,14 @@ function installMemtreeLink(
       state.notices.setLink(resolve);
       break;
     case "turn":
+      // The success line carries the current page on the line below it; the
+      // end-of-turn trailer then skips a link that line already showed.
+      state.notices.setLink(resolve);
+      state.notices.setTrailer(resolve, placement);
+      break;
     case "message":
     case "stop":
+      // These trailers show on every message or every Stop; no second copy.
       state.notices.setTrailer(resolve, placement);
       break;
     case "off":

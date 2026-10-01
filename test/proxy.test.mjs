@@ -2516,7 +2516,7 @@ const stopHook = (prompt_id) => ({
   stop_hook_active: false,
   ...(prompt_id ? { prompt_id } : {}),
 });
-const successLine = (link) => `${COMPRESSED_NOTICE} · ${link}`;
+const successLine = (link) => `${COMPRESSED_NOTICE}\n  ${link}`;
 /** Page + served-index headers for one compress call. */
 const pageHeaders = (url, index) => ({
   "x-polychat-memtree-url": url,
@@ -2545,8 +2545,8 @@ test("the first success line links the page; later ones only when a new index wa
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
     const rendered = first.body.hookSpecificOutput.displayContent;
     assert.equal(stripAnsi(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
-    assert.match(rendered, /\x1b\[39m https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
-      "the link follows the SGR reset, bare, so a linkifier cannot swallow it");
+    assert.match(rendered, /\x1b\[39m\n  https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
+      "the link sits bare on its own line after the SGR reset, so a linkifier cannot swallow it");
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }))).status,
       204
@@ -3024,7 +3024,7 @@ test("/memtree-compact compacts the session's next message to its target (defaul
   }
 });
 
-test("default placement: one line at the end of a user turn, only when the index changed", async () => {
+test("default placement: the success line carries the link; the end-of-turn line only for one not yet shown", async () => {
   const upstream = await mockUpstream();
   const stamps = [
     pageHeaders(PAGE_URL_1, "index-a"),
@@ -3037,11 +3037,10 @@ test("default placement: one line at the end of a user turn, only when the index
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"));
-    // Messages carry no link, however many the turn renders.
+    // The success line shows the page below it, so Stop doesn't repeat it.
     const shown = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
-    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
-    const stop = await postHook(proxy, stopHook("prompt-1"));
-    assert.equal(stripAnsi(stop.body.systemMessage), `• MemTree\n  ${PAGE_URL_1}`);
+    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_1)}\nupstream answer`);
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 
     // Same index, new page URL: nothing at the end of this turn.
     await armMainTurn(proxy, "turn three", "prompt-2");
@@ -3049,11 +3048,12 @@ test("default placement: one line at the end of a user turn, only when the index
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
-    // New index: one line again.
+    // New index: the success line returns with the new page; Stop stays quiet.
     await armMainTurn(proxy, "turn four", "prompt-3");
     await postMessages(proxy.port, followupTurn("turn four"));
-    await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
-    assert.equal(stripAnsi((await postHook(proxy, stopHook("prompt-3"))).body.systemMessage), `• MemTree\n  ${PAGE_URL_3}`);
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
+    assert.equal(stripAnsi(next.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_3)}\nupstream answer`);
+    assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
   } finally {
     proxy.close();
     upstream.close();
