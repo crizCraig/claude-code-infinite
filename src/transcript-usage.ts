@@ -209,10 +209,49 @@ class TranscriptIndex {
 
   match(messages: Message[]): MessageUsage {
     const out: MessageUsage = {};
-    messages.forEach((message, index) => {
-      if (message?.role !== "assistant") return;
-      const id = this.responseIdFor(message);
-      const usage = id !== undefined ? this.usageById.get(id) : undefined;
+    // Reserve identities before matching any text, including identities in
+    // ambiguous messages. Input order must not let a text-only reply steal a
+    // response that another message identifies by its tool calls.
+    const claims = new Map<string, number>();
+    const textCounts = new Map<string, number>();
+    const matches = messages.map((message) => {
+      if (message?.role !== "assistant") return undefined;
+      const ids = new Set<string>();
+      let hasTools = false;
+      let unknownTool = false;
+      for (const part of Array.isArray(message.content) ? message.content : []) {
+        if (part?.type !== "tool_use") continue;
+        hasTools = true;
+        const id = typeof part.id === "string" ? this.idByToolUse.get(part.id) : undefined;
+        if (id) ids.add(id);
+        else unknownTool = true;
+      }
+      for (const id of ids) claims.set(id, (claims.get(id) ?? 0) + 1);
+      const text = messageText(message).trim();
+      if (!hasTools && text) textCounts.set(text, (textCounts.get(text) ?? 0) + 1);
+      return { ids, hasTools, unknownTool, text };
+    });
+    matches.forEach((match, index) => {
+      if (!match) return;
+      let id: string | undefined;
+      if (match.hasTools) {
+        if (match.unknownTool || match.ids.size !== 1) return;
+        const candidate = match.ids.values().next().value!;
+        if (claims.get(candidate) !== 1) return;
+        id = candidate;
+      } else {
+        if (!match.text || textCounts.get(match.text) !== 1) return;
+        const key = textKey(match.text);
+        const candidates = (key ? this.idsByText.get(key) ?? [] : []).filter(
+          (candidate) => !claims.has(candidate) && this.textById.get(candidate)?.trim() === match.text
+        );
+        // A subset of history can contain any occurrence of repeated text.
+        // Neither first nor last is safe to guess, even if usage is missing
+        // for one candidate; omit uncertain metadata instead.
+        if (candidates.length !== 1) return;
+        id = candidates[0];
+      }
+      const usage = this.usageById.get(id);
       if (usage) out[String(index)] = usage;
     });
     return out;
@@ -298,20 +337,6 @@ class TranscriptIndex {
       }
     }
     return latest(times);
-  }
-
-  private responseIdFor(message: Message): string | undefined {
-    const parts = Array.isArray(message.content) ? message.content : [];
-    for (const part of parts) {
-      if (part?.type === "tool_use" && typeof part.id === "string") {
-        const id = this.idByToolUse.get(part.id);
-        if (id) return id;
-      }
-    }
-    const text = messageText(message).trim();
-    const key = textKey(text);
-    const ids = key ? this.idsByText.get(key) : undefined;
-    return ids?.findLast((id) => this.textById.get(id)?.trim() === text);
   }
 
   private ingest(line: string): void {

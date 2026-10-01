@@ -363,3 +363,67 @@ test("UTF-8 text survives a character split across bounded transcript reads", (t
   assert.deepEqual(source.usageFor(SESSION, messages), {}, "first read ends inside the emoji");
   assert.equal(source.usageFor(SESSION, messages)["0"].output_tokens, 6);
 });
+
+
+test("usage omits repeated response text, including a subset containing only one occurrence", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const text = (value) => ({ type: "text", text: value });
+  fs.writeFileSync(file,
+    entry("msg_a", [text("Done.")], usage(10, 2)) +
+    entry("msg_b", [text("Done.")], usage(200, 30)) +
+    entry("msg_c", [text("Unique answer")], usage(70, 4)));
+  const source = new ClaudeTranscriptUsage(root);
+  const done = { role: "assistant", content: [text("Done.")] };
+  const unique = { role: "assistant", content: "Unique answer" };
+  assert.deepEqual(source.usageFor(SESSION, [done, done]), {});
+  assert.deepEqual(source.usageFor(SESSION, [done]), {}, "a partial history cannot identify which Done response remains");
+  assert.deepEqual(source.usageFor(SESSION, [unique, unique]), {}, "one response cannot supply two messages");
+  const got = source.usageFor(SESSION, [done, unique]);
+  assert.deepEqual(Object.keys(got), ["1"]);
+  assert.equal(got[1].output_tokens, 70);
+  assert.equal(got[1].thinking_tokens, 4);
+});
+
+test("usage reserves tool identities before text matching regardless of input order", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const text = { type: "text", text: "Done." };
+  const tool = (id) => ({ type: "tool_use", id, name: "Bash", input: {} });
+  fs.writeFileSync(file,
+    entry("msg_a", [text, tool("tool_a")], usage(10, 2)) +
+    entry("msg_b", [text], usage(200, 30)));
+  const source = new ClaudeTranscriptUsage(root);
+  const identified = { role: "assistant", content: [text, tool("tool_a")] };
+  const plain = { role: "assistant", content: [text] };
+  for (const messages of [[identified, plain], [plain, identified]]) {
+    const got = source.usageFor(SESSION, messages);
+    assert.equal(got[messages.indexOf(identified)].output_tokens, 10);
+    assert.equal(got[messages.indexOf(plain)].output_tokens, 200);
+  }
+  // When only the identified response exists, a separate text block cannot
+  // reuse it as though it were a second response.
+  fs.writeFileSync(file, entry("msg_a", [text, tool("tool_a")], usage(10, 2)));
+  const fresh = new ClaudeTranscriptUsage(root);
+  const got = fresh.usageFor(SESSION, [plain, identified]);
+  assert.deepEqual(Object.keys(got), ["1"]);
+  assert.equal(got[1].output_tokens, 10);
+});
+
+test("usage omits conflicting, unknown, and duplicate tool response claims", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const tool = (id) => ({ type: "tool_use", id, name: "Bash", input: {} });
+  const text = { type: "text", text: "Done." };
+  const message = (...parts) => ({ role: "assistant", content: parts });
+  fs.writeFileSync(file,
+    entry("msg_a", [text, tool("tool_a"), tool("tool_a2")], usage(10, 2)) +
+    entry("msg_b", [text, tool("tool_b")], usage(200, 30)));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(source.usageFor(SESSION, [message(tool("tool_a"), tool("tool_b")), message(text)]), {});
+  assert.deepEqual(source.usageFor(SESSION, [message(tool("tool_a")), message(tool("tool_a2"))]), {});
+  assert.deepEqual(source.usageFor(SESSION, [message(text, tool("unknown"))]), {});
+  assert.deepEqual(source.usageFor(SESSION, [message(tool("tool_a"), tool("unknown"))]), {});
+  const got = source.usageFor(SESSION, [message(tool("tool_a"), tool("tool_a2"))]);
+  assert.equal(got[0].output_tokens, 10, "multiple tools in the same response are unambiguous");
+});
