@@ -2117,7 +2117,7 @@ function noteServerBudget(state, model, modelContextLimit, result) {
     if (tokens === undefined)
         return;
     state.serverReportsBudget = true;
-    state.serverBudgets.set(serverBudgetKey(model, modelContextLimit), tokens);
+    boundedSet(state.serverBudgets, serverBudgetKey(model, modelContextLimit), tokens);
 }
 /** `/memtree-compact` for this session, else CCC_COMPACT_TARGET, else automatic. */
 function compactionMode(opts, state, sessionId) {

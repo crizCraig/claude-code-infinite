@@ -3006,7 +3006,7 @@ function noteServerBudget(
   const tokens = result ? modelBudgetTokens(result) : undefined;
   if (tokens === undefined) return;
   state.serverReportsBudget = true;
-  state.serverBudgets.set(serverBudgetKey(model, modelContextLimit), tokens);
+  boundedSet(state.serverBudgets, serverBudgetKey(model, modelContextLimit), tokens);
 }
 
 type CompactionMode =

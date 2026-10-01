@@ -9107,3 +9107,28 @@ test("capture files and new or reused directories are private and exclude auth h
     }
   } finally { process.umask(oldUmask); upstream.close(); memtreeSrv.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("model churn evicts old server budgets and safely falls back to the context ratio", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await edgeMemtree({ modelBudget: 150_000 });
+  const records = [];
+  const proxy = await startProxy({ memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }), upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+  let seq = 0;
+  const postModel = async (model) => {
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: JSON.stringify({ model, max_tokens: 64, messages: followupTurn(`question ${seq++}`) }) });
+    assert.equal(response.status, 200);
+    await response.text();
+    return messageRecords(records).at(-1);
+  };
+  try {
+    assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "window-ratio");
+    const remembered = await postModel("claude-review-0");
+    assert.equal(remembered.compaction.budgetSource, "server");
+    assert.equal(remembered.compaction.budgetTokens, 150_000);
+    for (let n = 1; n <= 20; n++) await postModel(`claude-review-${n}`);
+    const evicted = await postModel("claude-review-0");
+    assert.equal(evicted.compaction.budgetSource, "window-ratio", "old model budget is evicted after churn");
+    assert.equal(evicted.compaction.budgetTokens, 160_000);
+    assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "server", "a fresh report repopulates the evicted entry");
+  } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
+});
