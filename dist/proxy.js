@@ -2023,7 +2023,10 @@ function forkRoutedBody(body, messages, route, sessionId, modelContextLimit) {
     const miss = prefixMismatch(body, messages, route, sessionId);
     if (miss)
         return { miss };
-    const buffer = prefixRoutedBody(body, messages, route).raw;
+    const routed = prefixRoutedBody(body, messages, route);
+    if (!routed)
+        return { miss: "prefix" };
+    const buffer = routed.raw;
     if (routedBodyExceedsContext(body, buffer, modelContextLimit))
         return { miss: "too-large" };
     return { body: buffer };
@@ -2088,6 +2091,8 @@ function prefixRoutedBody(body, messages, prefix) {
         delete routed.system;
     }
     capCacheBreakpoints(routed, prefix.compressedMessages.length);
+    if (!validCacheTtlOrder(routed))
+        return null;
     return { body: routed, raw: Buffer.from(JSON.stringify(routed), "utf-8") };
 }
 function serverBudgetKey(model, modelContextLimit) {
@@ -2286,6 +2291,13 @@ function planEdgeCompaction(args) {
     if (prefix) {
         boundedSet(state.stablePrefixes, sessionId, prefix);
         const routed = prefixRoutedBody(body, messages, prefix);
+        if (!routed) {
+            // Cache TTLs are not conversation identity, but a stored 5m prefix
+            // cannot precede a new 1h suffix. Rebuild without an invalid fallback;
+            // never rewrite the prefix's bytes or the user's marker TTLs.
+            state.stablePrefixes.delete(sessionId);
+            return forced("prefix-mismatch");
+        }
         const size = estimateRequestTokens(prefix.lastSize, routed.raw.length);
         compaction.estimatedTokens = size.tokens;
         compaction.sizeSource = size.source;
@@ -2355,13 +2367,15 @@ function planToolCompaction(args) {
     let overWindow = false;
     if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
         const routed = prefixRoutedBody(body, messages, current);
-        if (routedBodyExceedsContext(body, routed.raw, modelContextLimit))
-            overWindow = true;
-        else
-            ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
+        if (routed) {
+            if (routedBodyExceedsContext(body, routed.raw, modelContextLimit))
+                overWindow = true;
+            else
+                ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
+        }
     }
-    else if (!ride) {
-        overWindow = routedBodyExceedsContext(body, forwardBody, modelContextLimit);
+    if (!ride) {
+        overWindow ||= routedBodyExceedsContext(body, forwardBody, modelContextLimit);
     }
     const sample = ride
         ? ride.sizeHolder.lastSize
@@ -2422,6 +2436,8 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
         delete routed.system;
     }
     capCacheBreakpoints(routed, route.compressedMessages.length);
+    if (!validCacheTtlOrder(routed))
+        return null;
     return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 /** Size the assembled input (including system/tools) and reserve output room. */
@@ -2653,21 +2669,29 @@ function withFlattenCacheBreakpoint(body, ttl) {
     return [{ ...only, content: [{ type: "text", text, cache_control: cacheControl }] }];
 }
 /**
- * The longest TTL Claude Code used on this request's breakpoints. Anthropic
- * rejects a request whose earlier breakpoint has a shorter TTL than a later
- * one, and the flattened message comes before every suffix breakpoint, so it
- * takes the longest seen ("1h" for subscribers on the 1-hour allowlist).
- * Undefined means the default 5-minute TTL.
+ * Match the last existing marker in Anthropic's tools/system/messages order.
+ * For a valid request it is the shortest TTL, so a new final marker cannot
+ * put 1h after a retained 5m marker. Preserve omitted TTLs (default 5m).
  */
 function cacheTtlOf(body) {
-    let longest;
+    let last;
+    forEachCacheControl(body, (cc) => { last = cc.ttl; });
+    return last;
+}
+/** A transformed request must not place a 1h breakpoint after a 5m one. */
+function validCacheTtlOrder(body) {
+    let sawShort = false;
+    let valid = true;
     forEachCacheControl(body, (cc) => {
-        if (cc.ttl === "1h")
-            longest = "1h";
-        else if (cc.ttl === "5m" && longest === undefined)
-            longest = "5m";
+        if (cc.ttl === "1h") {
+            if (sawShort)
+                valid = false;
+        }
+        else {
+            sawShort = true;
+        }
     });
-    return longest;
+    return valid;
 }
 function countCacheBreakpoints(body) {
     let n = 0;
@@ -2684,8 +2708,9 @@ function forEachCacheControl(body, visit) {
             }
         }
     };
-    blocks(body.system);
+    // Anthropic prompt order matters for mixed cache TTLs.
     blocks(body.tools);
+    blocks(body.system);
     if (Array.isArray(body.messages)) {
         for (const m of body.messages)
             blocks(m?.content);
@@ -2907,6 +2932,8 @@ function buildCompressedBody(body, result) {
         compressedBody.system = systemMsg.content;
     }
     compressedBody.messages = withFlattenCacheBreakpoint(compressedBody, cacheTtlOf(body));
+    if (!validCacheTtlOrder(compressedBody))
+        return null;
     return {
         compressedBody,
         compressedRaw: Buffer.from(JSON.stringify(compressedBody), "utf-8"),

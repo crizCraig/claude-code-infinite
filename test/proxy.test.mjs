@@ -3389,6 +3389,106 @@ test("the compressed message's cache marker copies a 1h TTL, and a reused route 
   }
 });
 
+/** Capture the actual outgoing request, including raw bytes for fail-open checks. */
+async function cacheTtlHarness() {
+  const raws = [];
+  let failCompression = false;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      raws.push(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, () => failCompression ? { messages: [] } : compressedOnce);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  return {
+    proxy,
+    raws,
+    failCompression: () => { failCompression = true; },
+    compressCalls: () => memtreeSrv.calls.filter((call) => !call.index_only),
+    post: async (body, endpoint = "messages") => {
+      const raw = JSON.stringify(body, null, 2);
+      const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/${endpoint}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "session-1" },
+        body: raw,
+      });
+      await response.text();
+      return { original: raw, forwarded: JSON.parse(raws.at(-1)) };
+    },
+    close: () => { proxy.close(); upstream.close(); memtreeSrv.close(); },
+  };
+}
+
+const cacheMarker = (ttl) => ({ type: "ephemeral", ...(ttl === undefined ? {} : { ttl }) });
+const cacheText = (text, ttl) => ({ type: "text", text, cache_control: cacheMarker(ttl) });
+
+for (const ttl of [undefined, "5m", "1h"]) {
+  test(`cache TTL: a flattened marker matches the last existing marker (${ttl ?? "default 5m"})`, async () => {
+    const h = await cacheTtlHarness();
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const body = {
+        model: "claude-x", max_tokens: 64,
+        tools: [{ name: "Bash", input_schema: { type: "object" }, cache_control: cacheMarker("1h") }],
+        system: [cacheText("sys", ttl)],
+        messages: followupTurn("turn two"),
+      };
+      const { forwarded } = await h.post(body);
+      assert.equal(forwarded.messages.length, 1, "actually compressed");
+      assert.deepEqual(forwarded.messages[0].content[0].cache_control, cacheMarker(ttl));
+      assert.deepEqual(forwarded.tools, body.tools, "user tool markers remain unchanged");
+      assert.deepEqual(forwarded.system, body.system, "user system markers remain unchanged");
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ["human", "human-failed-rebuild", "tool", "count_tokens"]) {
+  test(`cache TTL: a 5m prefix cannot precede new 1h markers (${lane})`, async () => {
+    const h = await cacheTtlHarness();
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const history = followupTurn("turn two");
+      history[history.length - 1].content = [cacheText("turn two", "5m")];
+      const body = { model: "claude-x", max_tokens: 64, system: [cacheText("sys", "5m")], messages: history };
+      const { forwarded: first } = await h.post(body);
+      assert.equal(first.messages.length, 1);
+      const toolTail = [
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: cacheMarker("5m") }] },
+      ];
+      const { forwarded: ride } = await h.post({ ...body, messages: [...history, ...toolTail] });
+      assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(first.messages[0]), "compatible rides preserve prefix bytes");
+      const callsBefore = h.compressCalls().length;
+      // Every marker on the original next request is now 1h, so it is valid.
+      const nextHistory = structuredClone(history);
+      nextHistory.at(-1).content[0].cache_control = cacheMarker("1h");
+      const nextTail = lane.startsWith("human")
+        ? [{ role: "assistant", content: "answer" }, { role: "user", content: [cacheText("turn three", "1h")] }]
+        : structuredClone(toolTail);
+      if (!lane.startsWith("human")) nextTail.at(-1).content[0].cache_control = cacheMarker("1h");
+      const next = { ...body, system: [cacheText("sys", "1h")], messages: [...nextHistory, ...nextTail] };
+      if (lane.startsWith("human")) await armMainTurn(h.proxy, "turn three", "prompt-2");
+      if (lane === "human-failed-rebuild") h.failCompression();
+      const { original, forwarded } = await h.post(next, lane === "count_tokens" ? "messages/count_tokens" : "messages");
+      if (lane === "human") {
+        assert.equal(h.compressCalls().length, callsBefore + 1, "incompatible prefix is rebuilt");
+        assert.equal(forwarded.messages.length, 1);
+        assert.deepEqual(forwarded.messages[0].content[0].cache_control, cacheMarker("1h"));
+        assert.deepEqual(forwarded.system, next.system);
+      } else {
+        assert.equal(h.raws.at(-1), original, "unusable reuse/rebuild forwards the original request bytes");
+      }
+    } finally { h.close(); }
+  });
+}
+
 test("defaultCompactTarget is the target of a compaction, not a trigger: the budget still decides", async () => {
   const upstream = await mockUpstream();
   // A server that reports its model budget understands the threshold.
