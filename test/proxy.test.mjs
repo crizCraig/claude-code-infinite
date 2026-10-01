@@ -8808,6 +8808,7 @@ test("tool-loop compaction: a single human turn's tool loop passes through under
     assert.equal(crossed.turnType, "tool-recompressed");
     assert.equal(crossed.compaction.reason, "budget");
     assert.equal(crossed.compaction.sizeSource, "reported");
+    assert.equal(crossed.compaction.estimatedBytes, crossed.requestBytes, "first tool compression sizes the whole request");
     assert.ok(crossed.compaction.estimatedTokens >= 20_000);
     assert.equal(crossed.routeRecovery.outcome, "compressed");
     assert.equal(crossed.routeRecovery.install, "installed");
@@ -9292,3 +9293,29 @@ test("a bytes-only window alarm does not force below the calibrated budget and w
     assert.equal(call.compression_threshold_tokens, 160_000);
   } finally { h.close(); }
 });
+
+for (const reportUsage of [false, true]) {
+  test(`recompaction totals use the old prefix size basis ${reportUsage ? "with" : "without"} Anthropic usage`, async () => {
+    const { compressedTotalsText } = await import("../dist/notices.js");
+    const h = await edgeHarness({ upstreamOptions: { reportUsage } });
+    try {
+      const conv = await compactOnce(h);
+      const oldBody = structuredClone(h.upstream.bodies.at(-1));
+      const suffix = [assistantText(BIG("answer")), userText("recompact")];
+      conv.push(...suffix);
+      const expectedBytes = Buffer.byteLength(JSON.stringify({ ...oldBody, messages: [...oldBody.messages, ...suffix] }));
+      await h.command("recompact");
+      const rec = await h.post(conv);
+      assert.equal(rec.turnType, "followup-compressed");
+      assert.ok(rec.requestBytes > expectedBytes * 1.5, "raw history is much larger than the old prefix ride");
+      const expectedAfter = reportUsage
+        ? rec.usage.input_tokens + rec.usage.cache_read_input_tokens
+        : Math.round(rec.compaction.estimatedTokens * rec.forwardedBytes / expectedBytes);
+      const notice = await postHook(h.proxy, displayHook({ session_id: "s-edge" }));
+      assert.equal(notice.status, 200);
+      const text = stripAnsi(notice.body.hookSpecificOutput.displayContent);
+      assert.ok(text.includes(compressedTotalsText(rec.compaction.estimatedTokens, expectedAfter)), text);
+      assert.equal(rec.compaction.estimatedBytes, expectedBytes);
+    } finally { h.close(); }
+  });
+}

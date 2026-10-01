@@ -1680,11 +1680,10 @@ function queueCompressionNotice(args) {
 }
 /**
  * Before and after sizes for the success line, read when the line is shown.
- * Before: ccc's estimate for the uncompressed request (anchored on Anthropic's
- * last reported size for this session), else the server's raw_prompt_tokens,
- * which counts less of the request (495k against ~861k on a 2026-09-29 Opus
- * session). After: Anthropic's reported input for the compressed request once
- * its usage has arrived, else "before" scaled by the forwarded/original bytes.
+ * Before: the estimated request that would otherwise have been sent (the
+ * old prefix plus suffix on recompaction), else the server's raw_prompt_tokens
+ * for the original history. After: Anthropic's reported compressed input once
+ * usage arrives, else "before" scaled using the bytes of that same estimate.
  */
 function compressionTotals(rec, result) {
     const original = rec?.compaction?.estimatedTokens ?? rawPromptTokenCount(result);
@@ -1694,9 +1693,12 @@ function compressionTotals(rec, result) {
     if (reported !== undefined)
         return [original, reported];
     const fwd = rec.forwardedBytes;
-    if (original === undefined || !fwd || !rec.requestBytes)
+    const basisBytes = rec.compaction?.estimatedTokens !== undefined
+        ? rec.compaction.estimatedBytes
+        : rec.requestBytes;
+    if (original === undefined || !fwd || !basisBytes)
         return [original, undefined];
-    return [original, Math.round((original * fwd) / rec.requestBytes)];
+    return [original, Math.round((original * fwd) / basisBytes)];
 }
 /**
  * The link on the success line: the newest page for the hook's session,
@@ -2319,6 +2321,7 @@ function planEdgeCompaction(args) {
         }
         const size = estimateRequestTokens(prefix.lastSize, routed.raw.length);
         compaction.estimatedTokens = size.tokens;
+        compaction.estimatedBytes = routed.raw.length;
         compaction.sizeSource = size.source;
         const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit);
         const fallback = overWindow ? undefined : { prefix, routed };
@@ -2336,6 +2339,7 @@ function planEdgeCompaction(args) {
         return forced("manual");
     const size = estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
     compaction.estimatedTokens = size.tokens;
+    compaction.estimatedBytes = forwardBody.length;
     compaction.sizeSource = size.source;
     if (size.source === "reported" && size.tokens >= budget.tokens) {
         return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
@@ -2404,6 +2408,7 @@ function planToolCompaction(args) {
             : state.laneSizes.get(args.routeKey);
     const size = estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
     compaction.estimatedTokens = size.tokens;
+    compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
     if ((size.tokens < budget.tokens && !overWindow) || !args.canCompress) {
         return ride ? { kind: "ride", ride } : { kind: "pass" };

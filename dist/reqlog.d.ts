@@ -315,6 +315,8 @@ export interface CompactionRecord {
     thresholdTokens?: number;
     /** Size estimate of what would be sent (prefix ride or full history). */
     estimatedTokens?: number;
+    /** Bytes of the request underlying estimatedTokens, including a reused prefix. */
+    estimatedBytes?: number;
     /**
      * "reported": Anthropic's input+cache_read+cache_creation for the previous
      * request of the same shape, plus bytes/4 for what was added since.
