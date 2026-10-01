@@ -16,7 +16,7 @@ summaries: a hierarchy of abstractions across time. Nothing is thrown away.
  
 ## Requirements
 
-* [node.js 18 or newer](https://nodejs.org/en/download/)
+* [node.js 20.3 or newer](https://nodejs.org/en/download/)
 * [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
 * **Claude Subscription** - optional but highly recommended as this offers up to 1000x cost savings vs Anthropic's API pricing
 
@@ -25,7 +25,7 @@ summaries: a hierarchy of abstractions across time. Nothing is thrown away.
 > [!TIP]
 > No Anthropic subscription? See [Using Without an Anthropic Subscription](#using-without-an-anthropic-subscription) below.
 
-1. Install (Node ≥ 18; no git needed)
+1. Install (Node ≥ 20.3; no git needed)
   ```bash
   npm install -g https://github.com/crizCraig/claude-code-infinite/tarball/main
   ```
