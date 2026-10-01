@@ -19,7 +19,7 @@ import {
   MEMTREE_TOOLS,
   SessionFinder,
 } from "../dist/memtree-mcp.js";
-import { searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
+import { formatSessions, formatSearchResults, searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
 import { readProjectMeta, repoNameFromRemote } from "../dist/project-meta.js";
 import {
   argsConfigureMemtreeMcp,
@@ -335,6 +335,31 @@ test("tree tools read another session's tree by id, cached, with follow-ups nami
   const bad = await call("read_node", { tree: "../x", id: 0 });
   assert.equal(bad.result.isError, true);
   assert.match(bad.result.content[0].text, /tree must be a request id/);
+});
+
+test("finder follow-ups preserve pinned tree references and fall back for older servers", async () => {
+  const request_id = "ea18af90-658b-485f-ad71-063e0ca5e724";
+  const state = { urls: [], pageFetches: 0, pages: {} };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fakeProxyFetch(state) });
+  for (const suffix of ["-v1-own", "-v3-served", undefined]) {
+    const ref = suffix ? `${request_id}${suffix}` : undefined;
+    const target = ref ?? request_id;
+    const identity = { request_id, ...(ref ? { ref } : {}) };
+    const sessions = formatSessions({ sessions: [{ id: "session", latest_tree: identity }] }, {});
+    assert.ok(sessions.includes(`read_node {"tree": "${target}", "id": 0}`));
+    assert.ok(sessions.includes(`search {"tree": "${target}", "query":`));
+    const hit = { id: "session", tree: identity, range: { block: 0, start: 1, end: 2 } };
+    for (const body of [{ hits: [hit] }, { groups: [{ embedding_model: "mock", hits: [hit] }] }]) {
+      const result = formatSearchResults(body, { query: "test" });
+      assert.ok(result.includes(`read_lines {"tree": "${target}", "block": 0, "start": 1, "end": 2}`));
+    }
+    state.pages[`/memtree/${target}.json`] = PAGE;
+    assert.equal((await tree.get(target)).nodes.size, PAGE.nodes.length);
+    assert.equal(state.urls.at(-1), `/memtree/${target}.json`);
+  }
+  const before = state.urls.length;
+  await assert.rejects(tree.get(`${request_id}-v1-own/../search`), /tree must be/);
+  assert.equal(state.urls.length, before);
 });
 
 test("finder query strings: filters pass through, mode defaults to vector, limits clamp", () => {

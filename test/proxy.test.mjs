@@ -3546,6 +3546,14 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
       "/usage/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok"
     );
 
+    for (const suffix of ["v1-own", "v3-served"]) {
+      const ref = `ea18af90-658b-485f-ad71-063e0ca5e724-${suffix}`;
+      assert.equal((await get(`/memtree/${ref}.json`)).status, 200);
+      assert.equal(pageGets.at(-1).url, `/usage/memtree/${ref}.json`);
+      assert.equal((await get(`/memtree/${ref}/search?q=test`)).status, 200);
+      assert.equal(pageGets.at(-1).url, `/usage/memtree/${ref}/search?q=test`);
+    }
+
     // The page's session pane fetches this from wherever the page came from.
     await get("/memtree/ea18af90658b/session.json");
     assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/session.json");
@@ -3558,6 +3566,7 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
     // the encoded form reaches the handler.)
     const before = pageGets.length;
     assert.equal((await get("/memtree/ea18af90%2F..%2Fx")).status, 404);
+    assert.equal((await get("/memtree/ea18af90-v1-own%2F..%2Fsearch")).status, 404);
     assert.equal(pageGets.length, before);
   } finally {
     proxy.close();

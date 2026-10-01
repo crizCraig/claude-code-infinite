@@ -6,8 +6,9 @@
  * which relays to the server's owner-only `GET /v1/memtree/sessions` and
  * `GET /v1/memtree/search` with the user's key; the key never reaches this
  * process. Results are formatted as plain text for the model, like the
- * single-tree tools (memtree-tools.ts). Every hit names the tree (a request
- * id) and the transcript lines, and says which `read_lines` / `read_node`
+ * single-tree tools (memtree-tools.ts). Every hit names the tree (a pinned
+ * reference, or a request id on older servers) and the transcript lines,
+ * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
 import { ToolInputError } from "./memtree-tools.js";
@@ -46,14 +47,14 @@ export interface FinderSession {
   models?: string[];
   request_count?: number;
   tokens?: { prompt?: number; completion?: number; conversation?: number | null };
-  latest_tree?: { request_id: string; links?: FinderTreeLinks } | null;
+  latest_tree?: { request_id: string; ref?: string; links?: FinderTreeLinks } | null;
 }
 
 export interface FinderHit {
   id: string;
   kind?: string;
   session_id?: string | null;
-  tree: { request_id: string; created_at?: string | null; links?: FinderTreeLinks | null };
+  tree: { request_id: string; ref?: string; created_at?: string | null; links?: FinderTreeLinks | null };
   leaf?: string;
   range?: { block: number; start: number; end: number } | null;
   snippet?: string | null;
@@ -153,9 +154,10 @@ export function formatSessions(body: FinderSessionsResponse, args: Record<string
     if (s.snippet) out.push(`    first message: ${oneLine(s.snippet, SNIPPET_CHARS)}`);
     const tree = s.latest_tree;
     if (tree?.request_id) {
+      const ref = tree.ref ?? tree.request_id;
       out.push(
         `    latest tree: ${tree.request_id}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
-          `browse it with read_node {"tree": "${tree.request_id}", "id": 0}, or search it with search {"tree": "${tree.request_id}", "query": …}`
+          `browse it with read_node {"tree": "${ref}", "id": 0}, or search it with search {"tree": "${ref}", "query": …}`
       );
     }
   });
@@ -199,6 +201,7 @@ const OPEN_NOTE =
 
 function formatHit(hit: FinderHit, n: number): string[] {
   const tree = hit.tree?.request_id;
+  const ref = hit.tree?.ref ?? tree;
   const range = hit.range;
   const head = [
     sessionLabel(hit.kind, hit.id, hit.session_id),
@@ -212,9 +215,9 @@ function formatHit(hit: FinderHit, n: number): string[] {
   const lines = ["", `[${n}] ${head}`];
   if (hit.tree?.links?.url) lines.push(`    page: ${hit.tree.links.url}`);
   if (hit.snippet) lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
-  if (tree && range) {
+  if (ref && range) {
     lines.push(
-      `    open: read_lines {"tree": "${tree}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`
+      `    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`
     );
   }
   return lines;

@@ -33,6 +33,7 @@ export interface FinderSession {
     };
     latest_tree?: {
         request_id: string;
+        ref?: string;
         links?: FinderTreeLinks;
     } | null;
 }
@@ -42,6 +43,7 @@ export interface FinderHit {
     session_id?: string | null;
     tree: {
         request_id: string;
+        ref?: string;
         created_at?: string | null;
         links?: FinderTreeLinks | null;
     };

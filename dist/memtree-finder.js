@@ -6,8 +6,9 @@
  * which relays to the server's owner-only `GET /v1/memtree/sessions` and
  * `GET /v1/memtree/search` with the user's key; the key never reaches this
  * process. Results are formatted as plain text for the model, like the
- * single-tree tools (memtree-tools.ts). Every hit names the tree (a request
- * id) and the transcript lines, and says which `read_lines` / `read_node`
+ * single-tree tools (memtree-tools.ts). Every hit names the tree (a pinned
+ * reference, or a request id on older servers) and the transcript lines,
+ * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
 import { ToolInputError } from "./memtree-tools.js";
@@ -96,8 +97,9 @@ export function formatSessions(body, args) {
             out.push(`    first message: ${oneLine(s.snippet, SNIPPET_CHARS)}`);
         const tree = s.latest_tree;
         if (tree?.request_id) {
+            const ref = tree.ref ?? tree.request_id;
             out.push(`    latest tree: ${tree.request_id}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
-                `browse it with read_node {"tree": "${tree.request_id}", "id": 0}, or search it with search {"tree": "${tree.request_id}", "query": …}`);
+                `browse it with read_node {"tree": "${ref}", "id": 0}, or search it with search {"tree": "${ref}", "query": …}`);
         }
     });
     out.push("", nextPage("list_sessions", body.next_cursor));
@@ -138,6 +140,7 @@ export function formatSearchResults(body, args) {
 const OPEN_NOTE = "Snippets are excerpts; read_lines with the hit's tree returns the exact transcript lines, read_node {\"tree\": …, \"id\": 0} browses that tree from its root.";
 function formatHit(hit, n) {
     const tree = hit.tree?.request_id;
+    const ref = hit.tree?.ref ?? tree;
     const range = hit.range;
     const head = [
         sessionLabel(hit.kind, hit.id, hit.session_id),
@@ -153,8 +156,8 @@ function formatHit(hit, n) {
         lines.push(`    page: ${hit.tree.links.url}`);
     if (hit.snippet)
         lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
-    if (tree && range) {
-        lines.push(`    open: read_lines {"tree": "${tree}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`);
+    if (ref && range) {
+        lines.push(`    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`);
     }
     return lines;
 }
