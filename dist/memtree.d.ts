@@ -72,7 +72,7 @@ export interface CompressRequestMeta {
     messageTimes?: MessageTimes;
     /**
      * Claude Code's session id, sent as `x-claude-code-session-id` so the
-     * server can list a session's MemTree pages by it. Not part of the cache key.
+     * server can list a session's MemTree pages by it. Also scopes cached pages.
      */
     sessionId?: string;
     /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */

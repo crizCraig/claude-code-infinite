@@ -94,7 +94,7 @@ export interface CompressRequestMeta {
   messageTimes?: MessageTimes;
   /**
    * Claude Code's session id, sent as `x-claude-code-session-id` so the
-   * server can list a session's MemTree pages by it. Not part of the cache key.
+   * server can list a session's MemTree pages by it. Also scopes cached pages.
    */
   sessionId?: string;
   /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */
@@ -1016,8 +1016,9 @@ export class MemtreeClient {
     messageTimesFor?: (messages: Message[]) => MessageTimes
   ): void {
     if (this.backgroundClosing) return;
-    if (this.indexedHashes.has(hash)) return;
-    this.indexedHashes.add(hash);
+    const indexKey = JSON.stringify([sessionId ?? null, hash]);
+    if (this.indexedHashes.has(indexKey)) return;
+    this.indexedHashes.add(indexKey);
     if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
       const first = this.indexedHashes.values().next().value;
       if (first !== undefined) this.indexedHashes.delete(first);
@@ -1101,6 +1102,7 @@ export class MemtreeClient {
       .update(
         JSON.stringify([
           hash,
+          meta?.sessionId ?? null,
           model ?? null,
           modelContextLimit,
           toolsHash,

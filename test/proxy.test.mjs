@@ -205,6 +205,14 @@ async function postMessages(port, messages, extraHeaders = {}) {
   return res.json();
 }
 
+function linkText(text) {
+  return stripAnsi(text).replace(SUCCESS_TOTALS_RE, "");
+}
+
+function postSessionMessages(port, messages, extraHeaders = {}) {
+  return postMessages(port, messages, { "x-claude-code-session-id": "session-1", ...extraHeaders });
+}
+
 async function postCountTokens(port, body, extraHeaders = {}, search = "") {
   const res = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens${search}`, {
     method: "POST",
@@ -2567,15 +2575,15 @@ test(`the first success line links the page; later ones only when a new index wa
   });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
     const rendered = first.body.hookSpecificOutput.displayContent;
-    assert.equal(stripAnsi(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
+    assert.equal(linkText(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
     if (color) {
       assert.match(rendered, /\x1b\[39m https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
         "the link follows the SGR reset, bare, so a linkifier cannot swallow it");
     } else {
-      assert.equal(rendered, `${successLine(PAGE_URL_1)}\nupstream answer`,
+      assert.equal(rendered.replace(SUCCESS_TOTALS_RE, ""), `${successLine(PAGE_URL_1)}\nupstream answer`,
         "NO_COLOR leaves the entire notice and URL plain");
     }
     assert.equal(
@@ -2586,16 +2594,16 @@ test(`the first success line links the page; later ones only when a new index wa
 
     // Same index, flat coverage: nothing to announce — no line at all.
     await armMainTurn(proxy, "turn three", "prompt-2");
-    await postMessages(proxy.port, followupTurn("turn three"));
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
     // New index, flat coverage: the line comes back with the new page.
     await armMainTurn(proxy, "turn four", "prompt-3");
-    await postMessages(proxy.port, followupTurn("turn four"));
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
     const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3" }));
     assert.equal(
-      stripAnsi(next.body.hookSpecificOutput.displayContent),
+      linkText(next.body.hookSpecificOutput.displayContent),
       `${successLine(PAGE_URL_3)}\nupstream answer`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
@@ -2618,9 +2626,9 @@ test("a tool-only turn's Stop fallback carries the success line with its link", 
   });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const stop = await postHook(proxy, stopHook("prompt-1"));
-    assert.equal(stripAnsi(stop.body.systemMessage), successLine(PAGE_URL_2));
+    assert.equal(linkText(stop.body.systemMessage), successLine(PAGE_URL_2));
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
   } finally {
     proxy.close();
@@ -2647,13 +2655,13 @@ test("a page without a served index (older server, index-only ack) is never link
     memtreeLinkPlacement: "success",
   });
   try {
-    await postMessages(proxy.port, toolTurn);
+    await postSessionMessages(proxy.port, toolTurn);
     await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
     assert.equal(
-      stripAnsi(first.body.hookSpecificOutput.displayContent),
+      linkText(first.body.hookSpecificOutput.displayContent),
       `${COMPRESSED_NOTICE}\nupstream answer`,
       "a page that may still be building gets no link"
     );
@@ -2684,11 +2692,11 @@ test(`placement 'message': the link trails every finished message, marked when t
     // First index in use: the success line stays plain; the trailer under the
     // same message announces the new index — no waiting for a later turn.
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
     const rendered = first.body.hookSpecificOutput.displayContent;
     assert.equal(
-      stripAnsi(rendered),
+      linkText(rendered),
       `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
     );
     assert.ok(rendered.endsWith(`${color ? "\x1b[39m" : "• MemTree"}\n  ${PAGE_URL_1}`),
@@ -2698,14 +2706,14 @@ test(`placement 'message': the link trails every finished message, marked when t
 
     // Same index next turn: no success line, trailer still there, dim label.
     await armMainTurn(proxy, "turn three", "prompt-2");
-    await postMessages(proxy.port, followupTurn("turn three"));
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
     const same = await postHook(
       proxy,
       displayHook({ prompt_id: "prompt-2", index: 1, final: true, delta: "done" })
     );
     const sameRendered = same.body.hookSpecificOutput.displayContent;
-    assert.equal(stripAnsi(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
+    assert.equal(linkText(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
     if (color) {
       assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
     } else {
@@ -2716,10 +2724,10 @@ test(`placement 'message': the link trails every finished message, marked when t
 
     // New index: marked again.
     await armMainTurn(proxy, "turn four", "prompt-3");
-    await postMessages(proxy.port, followupTurn("turn four"));
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
     const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
     assert.equal(
-      stripAnsi(next.body.hookSpecificOutput.displayContent),
+      linkText(next.body.hookSpecificOutput.displayContent),
       `upstream answer\n\n${trailerNew(PAGE_URL_3)}`
     );
   } finally {
@@ -2737,10 +2745,10 @@ test("placement 'message': a turn with no rendered message gets the trailer from
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const stop = await postHook(proxy, stopHook("prompt-1"));
     assert.equal(
-      stripAnsi(stop.body.systemMessage),
+      linkText(stop.body.systemMessage),
       `${COMPRESSED_NOTICE}\n${trailerNew(PAGE_URL_1)}`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 200, "every Stop without a message repeats it");
@@ -2761,19 +2769,19 @@ test("a turn MemTree passed through whole names the unused index next to its lin
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
     assert.equal(
-      stripAnsi(first.body.hookSpecificOutput.displayContent),
+      linkText(first.body.hookSpecificOutput.displayContent),
       `upstream answer\n\n• MemTree · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_1}`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 
     await armMainTurn(proxy, "turn three", "prompt-2");
-    await postMessages(proxy.port, followupTurn("turn three"));
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
     const second = await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }));
     assert.equal(
-      stripAnsi(second.body.hookSpecificOutput.displayContent),
+      linkText(second.body.hookSpecificOutput.displayContent),
       `${COMPRESSED_NOTICE}\nupstream answer\n\n• MemTree\n  ${PAGE_URL_2}`
     );
   } finally {
@@ -3078,24 +3086,24 @@ test("default placement: one line at the end of a user turn, only when the index
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
-    await postMessages(proxy.port, followupTurn("turn two"));
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
     // Messages carry no link, however many the turn renders.
     const shown = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
-    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
     const stop = await postHook(proxy, stopHook("prompt-1"));
-    assert.equal(stripAnsi(stop.body.systemMessage), `• MemTree\n  ${PAGE_URL_1}`);
+    assert.equal(linkText(stop.body.systemMessage), `• MemTree\n  ${PAGE_URL_1}`);
 
     // Same index, new page URL: nothing at the end of this turn.
     await armMainTurn(proxy, "turn three", "prompt-2");
-    await postMessages(proxy.port, followupTurn("turn three"));
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
     assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
     // New index: one line again.
     await armMainTurn(proxy, "turn four", "prompt-3");
-    await postMessages(proxy.port, followupTurn("turn four"));
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
     await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
-    assert.equal(stripAnsi((await postHook(proxy, stopHook("prompt-3"))).body.systemMessage), `• MemTree\n  ${PAGE_URL_3}`);
+    assert.equal(linkText((await postHook(proxy, stopHook("prompt-3"))).body.systemMessage), `• MemTree\n  ${PAGE_URL_3}`);
   } finally {
     proxy.close();
     upstream.close();
@@ -3692,15 +3700,15 @@ test("placements 'stop' and 'off'", async () => {
   });
   try {
     await armMainTurn(onStop, "turn two", "prompt-1");
-    await postMessages(onStop.port, followupTurn("turn two"));
+    await postSessionMessages(onStop.port, followupTurn("turn two"));
     const shown = await postHook(onStop, displayHook({ prompt_id: "prompt-1", final: true }));
-    assert.equal(stripAnsi(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
-    assert.equal(stripAnsi((await postHook(onStop, stopHook("prompt-1"))).body.systemMessage), trailerNew(PAGE_URL_1));
+    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal(linkText((await postHook(onStop, stopHook("prompt-1"))).body.systemMessage), trailerNew(PAGE_URL_1));
 
     await armMainTurn(off, "turn two", "prompt-1");
-    await postMessages(off.port, followupTurn("turn two"));
+    await postSessionMessages(off.port, followupTurn("turn two"));
     const plain = await postHook(off, displayHook({ prompt_id: "prompt-1", final: true }));
-    assert.equal(stripAnsi(plain.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal(linkText(plain.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
     assert.equal((await postHook(off, stopHook("prompt-1"))).status, 204);
   } finally {
     onStop.close();
@@ -3766,7 +3774,7 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
   }
 });
 
-test("GET /memtree/current[.json]: the newest served page, else the session's stored page, else 404", async () => {
+test("GET /memtree/current[.json]: pages stay scoped to their sessions", async () => {
   const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
   const fs = await import("node:fs");
   const os = await import("node:os");
@@ -3818,12 +3826,15 @@ test("GET /memtree/current[.json]: the newest served page, else the session's st
       session_id: "session-1",
       compressed: true,
     });
-    // The served page wins over a stale or forked session id: one Claude Code per proxy.
-    assert.equal((await (await get("/memtree/current?session=resumed-session")).json()).id, "ea18af90658b");
-    assert.equal((await (await get("/memtree/current")).json()).id, "ea18af90658b");
+    // Concurrent and cleared sessions cannot inherit the newest page of another.
+    assert.equal((await (await get("/memtree/current?session=resumed-session")).json()).id, "0f1c2d3e4a5b");
+    assert.equal((await get("/memtree/current")).status, 404);
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "clear", session_id: "cleared-session" });
+    assert.equal((await get("/memtree/current?session=cleared-session")).status, 404);
+    assert.equal((await (await get("/memtree/current?session=session-1")).json()).id, "ea18af90658b");
     assert.equal(pageGets.length, 0, "the pointer never calls upstream");
 
-    const page = await get("/memtree/current.json");
+    const page = await get("/memtree/current.json?session=session-1");
     assert.equal(page.status, 200);
     assert.equal(page.headers.get("x-memtree-page"), PAGE_URL_1);
     assert.deepEqual((await page.json()).nodes, [{ id: 0, s: "root", k: [] }]);
@@ -9593,3 +9604,61 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
     } finally { h.close(); }
   });
 }
+
+
+test("concurrent session pages and late completions are ordered within each session, even with links off", async () => {
+  const upstream = await mockUpstream();
+  const pending = new Map();
+  const memtreeSrv = await listenMemtree((req, res) => {
+    req.on("end", () => {
+      const session = req.headers["x-claude-code-session-id"];
+      const queue = pending.get(session) ?? [];
+      queue.push((id) => {
+        res.writeHead(200, { "content-type": "application/json", ...pageHeaders(`https://app.polychat.co/m/${id}`, id) });
+        res.end(JSON.stringify(compressedOnce));
+      });
+      pending.set(session, queue);
+    });
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "off",
+  });
+  const get = (session) => fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${session}`);
+  const waitFor = async (session, count) => {
+    for (let n = 0; n < 500 && (pending.get(session)?.length ?? 0) < count; n++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(pending.get(session)?.length, count);
+  };
+  const requests = [];
+  try {
+    const launch = async (session, prompt, count) => {
+      await postHook(proxy, { hook_event_name: "UserPromptSubmit", session_id: session, prompt, prompt_id: prompt });
+      const request = postMessages(proxy.port, followupTurn(prompt), { "x-claude-code-session-id": session });
+      requests.push(request);
+      await waitFor(session, count);
+    };
+    await launch("a", "a old", 1);
+    await launch("b", "b new", 1);
+    await launch("a", "a new", 2);
+    pending.get("b")[0]("bbbb22");
+    await requests[1];
+    pending.get("a")[1]("aaaa22");
+    await requests[2];
+    pending.get("a")[0]("aaaa11");
+    await requests[0];
+    assert.equal((await (await get("a")).json()).id, "aaaa22", "old A cannot replace newer A");
+    assert.equal((await (await get("b")).json()).id, "bbbb22", "A cannot replace concurrent B");
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "clear", session_id: "c" });
+    assert.equal((await get("c")).status, 404);
+    assert.equal((await (await get("a")).json()).id, "aaaa22");
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "resume", session_id: "b" });
+    assert.equal((await (await get("b")).json()).id, "bbbb22");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});

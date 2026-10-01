@@ -136,7 +136,7 @@ function fakeProxyFetch(state) {
     state.urls.push(u.pathname + u.search);
     if (u.pathname === "/memtree/current") {
       if (!state.current) return new Response("{}", { status: 404 });
-      return Response.json({ id: state.current, url: `https://app/m/${state.current}` });
+      return Response.json({ session_id: "session-1", id: state.current, url: `https://app/m/${state.current}` });
     }
     state.pageFetches++;
     return Response.json(state.pages[u.pathname] ?? { status: "building" });
@@ -150,11 +150,11 @@ test("CurrentTree follows the proxy's current page and caches it until the page 
     current: "aaa111",
     pages: { "/memtree/aaa111.json": PAGE, "/memtree/bbb222.json": { ...PAGE, nodes: PAGE.nodes.slice(0, 2) } },
   };
-  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "sess 1", fetch: fakeProxyFetch(state) });
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "session-1", fetch: fakeProxyFetch(state) });
   assert.equal((await tree.get()).nodes.size, 6);
   assert.equal((await tree.get()).nodes.size, 6);
   assert.equal(state.pageFetches, 1, "cached while the page is unchanged");
-  assert.equal(state.urls[0], "/memtree/current?session=sess%201");
+  assert.equal(state.urls[0], "/memtree/current?session=session-1");
   state.current = "bbb222";
   assert.equal((await tree.get()).nodes.size, 2);
   assert.equal(state.pageFetches, 2);
@@ -234,4 +234,52 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+test("CurrentTree rejects missing or mismatched session identities before exposing a tree", async () => {
+  let calls = 0;
+  let pointerSession = "session-1";
+  let pageSession = "session-1";
+  const fetch = async (url) => {
+    calls++;
+    return Response.json(url.includes("/current")
+      ? { id: "page-a", session_id: pointerSession }
+      : { ...PAGE, session_id: pageSession });
+  };
+  await assert.rejects(new CurrentTree({ proxyUrl: "http://mock", fetch }).get(), /session id is missing/);
+  assert.equal(calls, 0);
+  for (const wrong of [undefined, "session-2"]) {
+    pointerSession = wrong;
+    const tree = new CurrentTree({ proxyUrl: "http://mock", sessionId: "session-1", fetch });
+    await assert.rejects(tree.get(), /different or unknown session/);
+    pointerSession = "session-1";
+    pageSession = wrong;
+    await assert.rejects(tree.get(), /different or unknown session/);
+  }
+  pageSession = "session-1";
+  const tree = new CurrentTree({ proxyUrl: "http://mock", sessionId: "session-1", fetch });
+  assert.equal((await tree.get()).nodes.size, PAGE.nodes.length);
+  pointerSession = "session-2";
+  await assert.rejects(tree.get(), /different or unknown session/, "cached trees also require a matching pointer");
+});
+
+
+test("CurrentTree rejects a mismatched page arriving after the matching pointer", async () => {
+  let release;
+  const delayed = new Promise((resolve) => { release = resolve; });
+  let pageRequested;
+  const requested = new Promise((resolve) => { pageRequested = resolve; });
+  const tree = new CurrentTree({
+    proxyUrl: "http://mock", sessionId: "session-1",
+    fetch: async (url) => {
+      if (url.includes("/current")) return Response.json({ id: "a", session_id: "session-1" });
+      pageRequested();
+      return delayed;
+    },
+  });
+  const result = tree.get();
+  await requested;
+  release(Response.json({ ...PAGE, session_id: "session-2" }));
+  await assert.rejects(result, /different or unknown session/);
 });

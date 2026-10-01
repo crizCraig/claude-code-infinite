@@ -12,10 +12,10 @@
  * (`CCC_MEMTREE_PROXY`, else the inherited `ANTHROPIC_BASE_URL`) answers
  * `GET /memtree/current?session=<id>` with the newest page it served — the
  * tree the current request was compressed against. The session id is the
- * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers; the proxy uses it
- * only when it has served no page yet (a resumed session's first turn). The
- * page JSON is fetched through the proxy's key-free `/memtree/<id>.json`
- * relay, cached, and refetched when the proxy's newest page changes.
+ * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers. Reads require
+ * this exact session on both the pointer and the authenticated page; missing
+ * or mismatched identity fails closed. The host must restart this server with
+ * the current id when switching sessions.
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -116,6 +116,7 @@ export interface MemtreeMcpDeps {
 }
 
 interface CurrentPage {
+  session_id?: string;
   id: string;
   url: string;
 }
@@ -136,7 +137,9 @@ export class CurrentTree {
         "MemTree tools need a running ccc session: neither CCC_MEMTREE_PROXY nor ANTHROPIC_BASE_URL is set."
       );
     }
-    const query = this.deps.sessionId ? `?session=${encodeURIComponent(this.deps.sessionId)}` : "";
+    const sessionId = this.deps.sessionId;
+    if (!sessionId) throw new ToolInputError("MemTree unavailable: the calling session id is missing");
+    const query = `?session=${encodeURIComponent(sessionId)}`;
     const pointer = await this.getJson(`${base}/memtree/current${query}`);
     if (pointer.status === 404) {
       throw new ToolInputError(
@@ -148,6 +151,9 @@ export class CurrentTree {
     if (typeof current?.id !== "string" || !current.id) {
       throw new ToolInputError("MemTree unavailable: the proxy named no current page");
     }
+    if (current.session_id !== sessionId) {
+      throw new ToolInputError("MemTree unavailable: current page belongs to a different or unknown session");
+    }
     if (this.cached?.id === current.id) return this.cached.index;
 
     const page = await this.getJson(`${base}/memtree/${encodeURIComponent(current.id)}.json`);
@@ -158,6 +164,9 @@ export class CurrentTree {
       throw new ToolInputError(
         `The MemTree for this session is still being built${json?.status ? ` (${json.status})` : ""}; try again in a minute.`
       );
+    }
+    if (json.session_id !== sessionId) {
+      throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
     }
     const index = new MemtreeIndex(json);
     this.cached = { id: current.id, index };

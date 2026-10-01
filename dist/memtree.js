@@ -805,9 +805,10 @@ export class MemtreeClient {
     messageTimesFor) {
         if (this.backgroundClosing)
             return;
-        if (this.indexedHashes.has(hash))
+        const indexKey = JSON.stringify([sessionId ?? null, hash]);
+        if (this.indexedHashes.has(indexKey))
             return;
-        this.indexedHashes.add(hash);
+        this.indexedHashes.add(indexKey);
         if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
             const first = this.indexedHashes.values().next().value;
             if (first !== undefined)
@@ -881,6 +882,7 @@ export class MemtreeClient {
         return createHash("sha256")
             .update(JSON.stringify([
             hash,
+            meta?.sessionId ?? null,
             model ?? null,
             modelContextLimit,
             toolsHash,

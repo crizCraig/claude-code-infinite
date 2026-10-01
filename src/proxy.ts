@@ -103,7 +103,7 @@ import {
   type SessionStartHookInput,
 } from "./hooks.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
-import type { MemtreeLinkStore } from "./memtree-links.js";
+import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
 import {
   describeClaudeCodeRequest,
   inspectMonitorTranscript,
@@ -354,12 +354,12 @@ interface ProxyState {
    */
   lastNoticedIndexCoverage?: { sessionId?: string; indexedTokens: number };
   /**
-   * The newest MemTree page for this conversation, linked from the success
+   * The newest MemTree page per session, linked from the success
    * line once per new served index. `seq` orders calls by submission so a
    * slow older call that settles after a newer one cannot roll the link back
    * to a staler tree.
    */
-  latestMemtreeUrl?: MemtreePage;
+  memtreePages: Map<string, MemtreePage>;
   /** Submission counter behind the pages' `seq`. */
   memtreeCallSeq: number;
   memtreeLinkStore?: MemtreeLinkStore;
@@ -778,6 +778,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
     routeInstallFault: opts.routeInstallFault,
+    memtreePages: new Map(),
     memtreeCallSeq: 0,
     memtreeLinkStore: opts.memtreeLinkStore,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
@@ -975,19 +976,14 @@ async function handleMemTreePassthrough(
 
 /**
  * `GET /memtree/current[.json][?session=<Claude Code session id>]`: the page
- * the newest main request was served from — what the `memtree` MCP server
+ * the session's newest main request was served from — what the `memtree` MCP server
  * reads (memtree-mcp.ts). Bare `current` answers the pointer
  * `{id, url, index, session_id, compressed}` without an upstream call, so the
  * MCP server can keep its cached tree until the page changes; `current.json`
  * relays the page JSON itself, like `/memtree/<id>.json`.
  *
- * One Claude Code runs per ccc proxy, so the newest page this proxy served is
- * the current conversation's even when `session` names another id (Claude
- * Code hands MCP servers the id they were started under, which a fork,
- * `/resume` or `/clear` can leave stale). `session` matters only before this
- * proxy has served any page: then it selects the session's newest page from
- * the on-disk link store (a resumed session's first turn). 404 when neither
- * has one.
+ * Every pointer is scoped to the caller's exact session id. Missing session
+ * ids never fall back to another conversation served by the same proxy.
  */
 async function handleMemTreeCurrent(
   req: http.IncomingMessage,
@@ -1039,8 +1035,9 @@ function currentMemtreePage(
   state: ProxyState,
   sessionId: string | undefined
 ): { url: string; index: string; compressed: boolean; sessionId?: string } | undefined {
-  if (state.latestMemtreeUrl) return state.latestMemtreeUrl;
   if (!sessionId) return undefined;
+  const latest = state.memtreePages.get(sessionId);
+  if (latest) return latest;
   const stored = state.memtreeLinkStore?.get(sessionId);
   return stored ? { ...stored, sessionId } : undefined;
 }
@@ -1390,7 +1387,7 @@ async function handleMessages(
   if (isAwaySummary && state.memtreeLinkPlacement !== "off") {
     const sessionId = requestSessionId(req);
     recapLinkAppenders.set(req, (streamedTextChars) => {
-      const latest = state.latestMemtreeUrl;
+      const latest = currentMemtreePage(state, sessionId);
       if (!latest || (sessionId !== undefined && latest.sessionId !== undefined && latest.sessionId !== sessionId)) {
         return undefined;
       }
@@ -2516,17 +2513,8 @@ function installMemtreeLink(
   placement: MemtreeLinkPlacement
 ): void {
   const resolve = (sessionId: string | undefined) => {
-    const latest = state.latestMemtreeUrl;
+    const latest = currentMemtreePage(state, sessionId);
     if (!latest) return undefined;
-    // A page from another Claude Code session sharing this proxy is not this
-    // conversation's; only an attributed mismatch disqualifies it.
-    if (
-      latest.sessionId !== undefined &&
-      sessionId !== undefined &&
-      latest.sessionId !== sessionId
-    ) {
-      return undefined;
-    }
     return {
       key: latest.index,
       link: latest.url,
@@ -2561,20 +2549,20 @@ function resumeLinkLine(
   if (input.agent_id !== undefined || input.source === "compact") return undefined;
   if (state.memtreeLinkPlacement === "off") return undefined;
   const sessionId = input.session_id;
-  const inMemory = state.latestMemtreeUrl;
+  const inMemory = state.memtreePages.get(sessionId);
   const page =
     inMemory && inMemory.sessionId === sessionId
       ? inMemory
       : state.memtreeLinkStore?.get(sessionId);
   if (!page) return undefined;
   if (page !== inMemory) {
-    state.latestMemtreeUrl = {
+    rememberMemtreePage(state, sessionId, {
       sessionId,
       url: page.url,
       index: page.index,
       compressed: page.compressed,
       seq: state.memtreeCallSeq,
-    };
+    });
   }
   return state.notices.resumeLine({
     key: page.index,
@@ -2637,7 +2625,7 @@ export function parseTokenCount(text: string): number | undefined {
 
 /** The `/memtree-view` answer: this session's newest page, or why there is none. */
 function memtreeViewLine(state: ProxyState, sessionId: string): string {
-  const inMemory = state.latestMemtreeUrl;
+  const inMemory = state.memtreePages.get(sessionId);
   const page =
     inMemory && (inMemory.sessionId === undefined || inMemory.sessionId === sessionId)
       ? inMemory
@@ -2668,12 +2656,21 @@ function noteMemtreePage(
 ): void {
   const url = result?.memtreeUrl;
   const index = result?.memtreeIndex;
-  if (!url || !index) return;
-  const latest = state.latestMemtreeUrl;
+  if (!sessionId || !url || !index) return;
+  const latest = state.memtreePages.get(sessionId);
   if (latest && latest.seq >= seq) return;
   const compressed = didMemtreeCompress(result!);
-  state.latestMemtreeUrl = { sessionId, url, index, compressed, seq };
+  rememberMemtreePage(state, sessionId, { sessionId, url, index, compressed, seq });
   if (sessionId) state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
+}
+
+/** Bound optional page state independently of how many sessions use the proxy. */
+function rememberMemtreePage(state: ProxyState, sessionId: string, page: MemtreePage): void {
+  state.memtreePages.delete(sessionId);
+  state.memtreePages.set(sessionId, page);
+  while (state.memtreePages.size > MEMTREE_LINKS_MAX_SESSIONS) {
+    state.memtreePages.delete(state.memtreePages.keys().next().value!);
+  }
 }
 
 /**

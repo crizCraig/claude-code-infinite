@@ -40,7 +40,7 @@
  */
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
-import type { MemtreeLinkStore } from "./memtree-links.js";
+import { type MemtreeLinkStore } from "./memtree-links.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import { type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
