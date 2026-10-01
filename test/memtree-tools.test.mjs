@@ -195,6 +195,20 @@ for (const explicit of [false, true]) {
   });
 }
 
+test("CurrentTree caches immutable pinned served trees", async () => {
+  for (const version of [1, 3]) {
+    const ref = `ea18af90-658b-485f-ad71-063e0ca5e724-v${version}-served`;
+    const state = {
+      urls: [], pageFetches: 0,
+      pages: { [`/memtree/${ref}.json`]: { ...PAGE, served_prefix: true, ref } },
+    };
+    const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fakeProxyFetch(state) });
+    const first = await tree.get(ref);
+    assert.equal(await tree.get(ref), first, "a pinned served tree cannot switch to the own tree");
+    assert.equal(state.pageFetches, 1);
+  }
+});
+
 test("MCP handler: initialize, tools/list, tools/call results and errors", async () => {
   const tree = { get: async () => index() };
   const init = await handleMcpMessage(
@@ -390,7 +404,10 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
   assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
   assert.equal(search.inputSchema.properties.mode.enum.join(","), "vector,text");
   for (const name of ["search", "read_node", "read_lines"]) {
-    assert.ok(MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree, name);
+    const tree = MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree;
+    assert.ok(tree, name);
+    assert.match(tree.description, /reference.*list_sessions or search_sessions/i);
+    assert.match(tree.description, /legacy request ids/i);
   }
 });
 

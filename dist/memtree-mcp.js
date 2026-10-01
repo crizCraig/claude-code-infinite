@@ -82,7 +82,7 @@ export const MEMTREE_TOOLS = [
                 },
                 tree: {
                     type: "string",
-                    description: "Optional: another session's tree (a request id from list_sessions or search_sessions). Omit for this session.",
+                    description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
                 },
             },
             required: ["query"],
@@ -98,7 +98,7 @@ export const MEMTREE_TOOLS = [
                 id: { type: "number", description: "Node id (0 is the root)." },
                 tree: {
                     type: "string",
-                    description: "Optional: another session's tree (a request id from list_sessions or search_sessions). Omit for this session.",
+                    description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
                 },
             },
             required: ["id"],
@@ -116,7 +116,7 @@ export const MEMTREE_TOOLS = [
                 end: { type: "number", description: "Last line, inclusive." },
                 tree: {
                     type: "string",
-                    description: "Optional: another session's tree (a request id from list_sessions or search_sessions). Omit for this session.",
+                    description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
                 },
             },
             required: ["block", "start", "end"],
@@ -237,8 +237,8 @@ export class CurrentTree {
         if (this.cached?.id === id)
             return this.cached.index;
         const index = await this.loadPage(id, "this session");
-        // A prefix is temporary: the same request id will later serve its own tree.
-        if (!index.page.served_prefix)
+        // Only an unpinned prefix can later switch to the request's own tree.
+        if (!index.page.served_prefix || index.page.ref === id)
             this.cached = { id, index };
         return index;
     }
@@ -291,7 +291,7 @@ export class CurrentTree {
             return hit;
         }
         const index = await this.loadPage(id, `tree ${id}`);
-        if (!index.page.served_prefix)
+        if (!index.page.served_prefix || index.page.ref === id)
             this.others.set(id, index);
         while (this.others.size > OTHER_TREES_CACHED) {
             this.others.delete(this.others.keys().next().value);
