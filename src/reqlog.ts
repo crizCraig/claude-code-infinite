@@ -186,6 +186,14 @@ export interface MessagesRecord {
    */
   routeMiss?: "missing" | "rejected" | "replay" | "superseded";
   /**
+   * The request's last conversation message was neither a user prompt nor a
+   * tool result: e.g. a background task notification, which Claude Code
+   * sends as a trailing role=system block after the assistant's last reply.
+   * Handled like a tool turn (stable-prefix ride, budget compaction) without
+   * consulting the lane's route. Absent on every other request.
+   */
+  continuation?: true;
+  /**
    * Why a fork of the main conversation (away recap) did not ride the main
    * thread's last prefix and fell back to its own compression; absent when it
    * rode (turnType "fork-memory") or was not a fork.
