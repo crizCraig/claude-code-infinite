@@ -32,7 +32,9 @@ import path from "node:path";
 /** Session and agent ids name files: no path separators or dots. */
 const SAFE_ID = /^[A-Za-z0-9-]+$/;
 /** Transcript bytes read per refresh; later calls pick up the rest. */
-const MAX_READ_BYTES = 64 * 1024 * 1024;
+const MAX_READ_BYTES = 1024 * 1024;
+/** Oversized JSONL entries are optional metadata; discard them without accumulating. */
+const MAX_LINE_BYTES = 1024 * 1024;
 /**
  * Reads transcripts incrementally: each session's file is opened once and
  * only the bytes appended since the last call are parsed.
@@ -115,7 +117,8 @@ export function findTranscript(projectsDir, sessionId, agentId) {
 class TranscriptIndex {
     file;
     offset = 0;
-    partial = "";
+    partial = Buffer.alloc(0);
+    discardingOversizedLine = false;
     /** Response message id → its usage (the largest seen: entries repeat it). */
     usageById = new Map();
     idByToolUse = new Map();
@@ -141,17 +144,44 @@ class TranscriptIndex {
         const length = Math.min(size - this.offset, MAX_READ_BYTES);
         const buffer = Buffer.alloc(length);
         const fd = fs.openSync(this.file, "r");
+        let bytesRead;
         try {
-            fs.readSync(fd, buffer, 0, length, this.offset);
+            bytesRead = fs.readSync(fd, buffer, 0, length, this.offset);
         }
         finally {
             fs.closeSync(fd);
         }
-        this.offset += length;
-        const lines = (this.partial + buffer.toString("utf-8")).split("\n");
-        this.partial = lines.pop() ?? "";
-        for (const line of lines)
-            this.ingest(line);
+        this.offset += bytesRead;
+        // One bounded read per refresh, even while discarding: a corrupt line must
+        // never turn optional metadata lookup into a synchronous scan to EOF.
+        let bytes = buffer.subarray(0, bytesRead);
+        if (this.discardingOversizedLine) {
+            const newline = bytes.indexOf(10);
+            if (newline < 0)
+                return;
+            bytes = bytes.subarray(newline + 1);
+            this.discardingOversizedLine = false;
+        }
+        // Keep bytes intact until a whole line is available, including UTF-8
+        // characters split across reads. Both operands are independently bounded.
+        const lines = this.partial.length ? Buffer.concat([this.partial, bytes]) : bytes;
+        this.partial = Buffer.alloc(0);
+        let start = 0;
+        let newline;
+        while ((newline = lines.indexOf(10, start)) >= 0) {
+            if (newline - start <= MAX_LINE_BYTES) {
+                this.ingest(lines.toString("utf-8", start, newline));
+            }
+            start = newline + 1;
+        }
+        const remaining = lines.length - start;
+        if (remaining > MAX_LINE_BYTES) {
+            this.discardingOversizedLine = true;
+        }
+        else if (remaining) {
+            // Copy only the tail, rather than retaining the whole read buffer.
+            this.partial = Buffer.from(lines.subarray(start));
+        }
     }
     match(messages) {
         const out = {};
@@ -321,7 +351,8 @@ class TranscriptIndex {
     }
     reset() {
         this.offset = 0;
-        this.partial = "";
+        this.partial = Buffer.alloc(0);
+        this.discardingOversizedLine = false;
         this.usageById.clear();
         this.idByToolUse.clear();
         this.textById.clear();

@@ -299,3 +299,67 @@ test("background indexing preserves multi-block response times while removing re
     ] },
   ]);
 });
+
+const TRANSCRIPT_READ_BUDGET = 1024 * 1024;
+
+test("oversized lines are discarded with bounded work and recover only after their newline", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // The valid-looking suffix is still part of the corrupt line, not an entry.
+  fs.writeFileSync(file, "x".repeat(4 * TRANSCRIPT_READ_BUDGET) +
+    entry("suffix", [{ type: "text", text: "must not match" }], usage(90, 10)) +
+    entry("recovered", [{ type: "text", text: "recovered" }], usage(7, 2), { timestamp: LATE }));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [
+    { role: "assistant", content: "must not match" },
+    { role: "assistant", content: "recovered" },
+  ];
+  const originalRead = fs.readSync;
+  const reads = [];
+  t.mock.method(fs, "readSync", (...args) => {
+    reads.push({ length: args[3], position: args[4] });
+    return originalRead(...args);
+  });
+  for (let call = 0; call < 4; call++) {
+    const before = reads.length;
+    const got = call % 2 ? source.timesFor(SESSION, messages) : source.usageFor(SESSION, messages);
+    assert.deepEqual(got, {});
+    assert.equal(reads.length - before, 1, "each metadata lookup performs only one read, even while skipping");
+    assert.equal(reads.at(-1).length, TRANSCRIPT_READ_BUDGET);
+    assert.equal(reads.at(-1).position, call * TRANSCRIPT_READ_BUDGET);
+    // Inspect retained bytes: an unfinished corrupt line cannot grow with the file.
+    const index = source.sessions.get(SESSION);
+    assert.ok(index.partial.length <= TRANSCRIPT_READ_BUDGET);
+    if (call > 0) assert.equal(index.partial.length, 0, "discarded bytes are not retained");
+  }
+  const got = source.usageFor(SESSION, messages);
+  assert.deepEqual(Object.keys(got), ["1"], "the oversized line's suffix was never parsed");
+  assert.equal(got["1"].output_tokens, 7);
+  assert.deepEqual(source.timesFor(SESSION, messages), { 1: LATE });
+  assert.equal(reads.length, 5, "EOF lookups need no further reads");
+});
+
+test("truncating a transcript clears oversized-line discard state", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(file, "x".repeat(2 * TRANSCRIPT_READ_BUDGET));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [{ role: "assistant", content: "new transcript" }];
+  assert.deepEqual(source.usageFor(SESSION, messages), {});
+  assert.deepEqual(source.usageFor(SESSION, messages), {});
+  fs.writeFileSync(file, entry("new", [{ type: "text", text: "new transcript" }], usage(8, 3)));
+  assert.equal(source.usageFor(SESSION, messages)["0"].output_tokens, 8);
+});
+
+test("UTF-8 text survives a character split across bounded transcript reads", (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const line = Buffer.from(entry("unicode", [{ type: "text", text: "😀done" }], usage(6, 1)));
+  const characterOffset = line.indexOf(Buffer.from("😀"));
+  const paddingLength = TRANSCRIPT_READ_BUDGET - characterOffset - 1;
+  fs.writeFileSync(file, Buffer.concat([Buffer.from(" ".repeat(paddingLength - 1) + "\n"), line]));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [{ role: "assistant", content: "😀done" }];
+  assert.deepEqual(source.usageFor(SESSION, messages), {}, "first read ends inside the emoji");
+  assert.equal(source.usageFor(SESSION, messages)["0"].output_tokens, 6);
+});
