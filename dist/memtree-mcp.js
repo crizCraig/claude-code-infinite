@@ -26,6 +26,7 @@ export const MEMTREE_MCP_SERVER_NAME = "memtree";
 export const MEMTREE_TOOL_NAMES = ["search", "read_node", "read_lines"];
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
+const PREFIX_RETRY_INTERVAL_MS = 45_000;
 /**
  * The MCP server's instructions, which Claude Code places in the system prompt
  * from the first request: the one place that explains the agent's situation
@@ -93,12 +94,26 @@ export const MEMTREE_TOOLS = [
 export class CurrentTree {
     deps;
     cached;
+    prefixRetryAt = new Map();
+    inFlight;
     fetchImpl;
+    now;
     constructor(deps) {
         this.deps = deps;
         this.fetchImpl = deps.fetch ?? globalThis.fetch;
+        this.now = deps.now ?? Date.now;
     }
-    async get() {
+    get() {
+        if (this.inFlight)
+            return this.inFlight;
+        const pending = this.load();
+        this.inFlight = pending;
+        return pending.finally(() => {
+            if (this.inFlight === pending)
+                this.inFlight = undefined;
+        });
+    }
+    async load() {
         const base = this.deps.proxyUrl?.replace(/\/$/, "");
         if (!base) {
             throw new ToolInputError("MemTree tools need a running ccc session: neither CCC_MEMTREE_PROXY nor ANTHROPIC_BASE_URL is set.");
@@ -122,6 +137,15 @@ export class CurrentTree {
         }
         if (this.cached?.id === current.id)
             return this.cached.index;
+        const now = this.now();
+        const retryAt = this.prefixRetryAt.get(current.id);
+        if (retryAt !== undefined && retryAt > now) {
+            throw this.prefixRetryError(retryAt - now);
+        }
+        // If a previous prefix refresh failed, keep the same cooldown after that
+        // failure so successive tools cannot hammer the page endpoint.
+        if (retryAt !== undefined)
+            this.prefixRetryAt.set(current.id, now + PREFIX_RETRY_INTERVAL_MS);
         const page = await this.getJson(`${base}/memtree/${encodeURIComponent(current.id)}.json`);
         if (!page.ok)
             throw new ToolInputError(`MemTree unavailable (page ${current.id}: ${page.error})`);
@@ -134,8 +158,23 @@ export class CurrentTree {
             throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
         }
         const index = new MemtreeIndex(json);
+        if (json.served_prefix === true) {
+            this.prefixRetryAt.set(current.id, this.now() + PREFIX_RETRY_INTERVAL_MS);
+            // Keep the map small if a long-lived MCP process sees many page ids.
+            if (this.prefixRetryAt.size > 64) {
+                const oldest = this.prefixRetryAt.keys().next().value;
+                if (oldest !== undefined)
+                    this.prefixRetryAt.delete(oldest);
+            }
+            return index;
+        }
+        this.prefixRetryAt.delete(current.id);
         this.cached = { id: current.id, index };
         return index;
+    }
+    prefixRetryError(remainingMs) {
+        const seconds = Math.ceil(remainingMs / 1000);
+        return new ToolInputError(`This MemTree page is a temporary prefix while newer messages are indexing; try again in ${seconds} second${seconds === 1 ? "" : "s"}.`);
     }
     async getJson(url) {
         let response;

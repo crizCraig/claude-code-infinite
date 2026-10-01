@@ -77,14 +77,20 @@ export interface MemtreeMcpDeps {
     proxyUrl?: string;
     sessionId?: string;
     fetch?: typeof fetch;
+    now?: () => number;
 }
 /** Resolves, fetches and caches the current page. */
 export declare class CurrentTree {
     private readonly deps;
     private cached?;
+    private readonly prefixRetryAt;
+    private inFlight?;
     private readonly fetchImpl;
+    private readonly now;
     constructor(deps: MemtreeMcpDeps);
     get(): Promise<MemtreeIndex>;
+    private load;
+    private prefixRetryError;
     private getJson;
 }
 type JsonRpcId = string | number | null;
