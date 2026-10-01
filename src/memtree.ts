@@ -857,9 +857,11 @@ export class MemtreeClient {
    */
   async fetchMemTree(
     pathAndQuery: string,
-    accept = "application/json"
+    accept = "application/json",
+    signal?: AbortSignal
   ): Promise<{ status: number; contentType: string; body: Buffer }> {
     const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
+      signal,
       headers: {
         authorization: `Bearer ${this.apiKey}`,
         accept,

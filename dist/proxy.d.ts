@@ -90,6 +90,9 @@ export interface ProxyOptions {
      * context-window fallback) so a cheap session crosses it in a few turns.
      */
     budgetTokensOverride?: number;
+    /** Test-only overrides for the first-tree probe (5s) and total wait (60s). */
+    awaitedIndexProbeTimeoutMs?: number;
+    awaitedIndexWaitTimeoutMs?: number;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,

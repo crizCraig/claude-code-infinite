@@ -99,15 +99,19 @@ const STABLE_PREFIX_MAX_SESSIONS = 16;
  * page that never resolves falls back to the growth backoff instead of
  * blocking compaction for good.
  */
-function checkAwaitedIndex(opts, attempt) {
+function checkAwaitedIndex(opts, attempt, shutdownSignal) {
     const waiting = attempt.awaitingIndex;
-    if (!waiting || waiting.checking)
+    if (!waiting || waiting.checking || shutdownSignal.aborted)
         return;
     waiting.checking = true;
+    // Bound both the individual body read and repeated 202 responses. A page
+    // that never completes must eventually return the lane to growth backoff.
+    const timeoutMs = Math.max(1, Math.min(opts.awaitedIndexProbeTimeoutMs ?? 5_000, waiting.deadline - Date.now()));
+    const signal = AbortSignal.any([shutdownSignal, AbortSignal.timeout(timeoutMs)]);
     opts.memtree
-        .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`)
+        .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`, "application/json", signal)
         .then((page) => {
-        if (page.status === 202)
+        if (page.status === 202 && Date.now() < waiting.deadline)
             return;
         if (attempt.awaitingIndex === waiting)
             attempt.awaitingIndex = undefined;
@@ -1099,6 +1103,9 @@ async function handleMessages(req, res, opts, upstream, state) {
                 toolRide = plan.ride;
             if (plan.kind === "compress") {
                 const prior = state.toolRecoveryAttemptedLanes.get(requestRouteKey);
+                if (prior?.awaitingIndex && Date.now() >= prior.awaitingIndex.deadline) {
+                    prior.awaitingIndex = undefined;
+                }
                 if (prior?.inFlight) {
                     // A concurrent request of this lane is already compressing.
                     rec.routeRecovery = { outcome: "in-flight" };
@@ -1108,7 +1115,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     // compress call could only pass everything through again. Forward
                     // now; the page check lets the next tool turn try once it exists.
                     rec.routeRecovery = { outcome: "awaiting-index" };
-                    checkAwaitedIndex(opts, prior);
+                    checkAwaitedIndex(opts, prior, state.shutdownSignal);
                 }
                 else if (prior?.retryAtTokens !== undefined &&
                     plan.estimateTokens < prior.retryAtTokens) {
@@ -3099,7 +3106,11 @@ async function recoverToolRouteMiss(args) {
         // retrying on growth, which on a fast-growing loop is every tool turn.
         const pageId = result.memtreeUrl ? memtreePageId(result.memtreeUrl) : undefined;
         if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0) && pageId) {
-            recoveryAttempt.awaitingIndex = { pageId, checking: false };
+            recoveryAttempt.awaitingIndex = {
+                pageId,
+                checking: false,
+                deadline: Date.now() + (opts.awaitedIndexWaitTimeoutMs ?? 60_000),
+            };
             rec.routeRecovery.awaitingIndex = true;
         }
         releaseOwnReservation();

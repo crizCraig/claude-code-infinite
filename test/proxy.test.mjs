@@ -8992,3 +8992,60 @@ test("compression exceptions forward human and tool requests byte for byte and b
     } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
   }
 });
+
+test("first-tree waiting expires hung probes and endless 202s, and aborts probes on shutdown", async () => {
+  for (const mode of ["hung", "building", "shutdown"]) {
+    const upstream = await recordingUpstream();
+    const records = [];
+    let gets = 0, closed = 0, calls = 0, ready = false;
+    const memtreeSrv = await listen((req, res) => {
+      if (req.method === "GET") {
+        gets++;
+        res.on("close", () => closed++);
+        res.writeHead(mode === "building" ? 202 : 200, { "content-type": "application/json" });
+        if (mode === "building") res.end(JSON.stringify({ status: "building" }));
+        else res.write("{"); // Headers arrive, but reading the body never finishes.
+        return;
+      }
+      const chunks = [];
+      req.on("data", c => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks));
+        if (!body.index_only) calls++;
+        res.writeHead(200, { "content-type": "application/json", ...pageHeaders(PAGE_URL_1) });
+        res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true, usage: {} } : ready ? withServerFlatten(recoveredMemory(), body) : { messages: body.messages, compressed: false, usage: { prompt_tokens_details: { cached_tokens: 0 } } }));
+      });
+    });
+    const proxy = await startRecoveryProxy({
+      memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+      upstreamOrigin: upstream.origin,
+      awaitedIndexProbeTimeoutMs: mode === "shutdown" ? 10_000 : 25,
+      awaitedIndexWaitTimeoutMs: 150,
+      reqlog: { log: r => records.push(structuredClone(r)) },
+    });
+    try {
+      let loop = largeToolTurn();
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(calls, 1);
+      const waitStarted = Date.now();
+      loop = extendToolLoop(loop);
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+      await waitFor(() => gets === 1);
+      if (mode === "shutdown") {
+        await proxy.close();
+        await waitFor(() => closed === 1, 500);
+      } else {
+        if (mode === "hung") await waitFor(() => closed === 1, 500);
+        else await waitFor(() => Date.now() >= waitStarted + 150, 500);
+        ready = true;
+        loop = extendToolLoop(loop, "t3");
+        loop.at(-1).content[0].content = "growth".repeat(10_000);
+        await postMessages(proxy.port, loop, SESSION);
+        assert.equal(calls, 2, `${mode}: finite wait allows a fresh compress`);
+        assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "compressed");
+        assert.equal(upstream.seen.length, 3, "all tool turns reach upstream in order");
+      }
+    } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
+  }
+});

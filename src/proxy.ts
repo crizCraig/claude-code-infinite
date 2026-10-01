@@ -202,6 +202,9 @@ export interface ProxyOptions {
    * context-window fallback) so a cheap session crosses it in a few turns.
    */
   budgetTokensOverride?: number;
+  /** Test-only overrides for the first-tree probe (5s) and total wait (60s). */
+  awaitedIndexProbeTimeoutMs?: number;
+  awaitedIndexWaitTimeoutMs?: number;
   debug?: boolean;
   /**
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -572,7 +575,7 @@ interface ToolRecoveryAttempt {
    * reply's MemTree page has finished building. A window overflow still
    * attempts.
    */
-  awaitingIndex?: { pageId: string; checking: boolean };
+  awaitingIndex?: { pageId: string; checking: boolean; deadline: number };
 }
 
 /**
@@ -581,14 +584,25 @@ interface ToolRecoveryAttempt {
  * page that never resolves falls back to the growth backoff instead of
  * blocking compaction for good.
  */
-function checkAwaitedIndex(opts: ProxyOptions, attempt: ToolRecoveryAttempt): void {
+function checkAwaitedIndex(
+  opts: ProxyOptions,
+  attempt: ToolRecoveryAttempt,
+  shutdownSignal: AbortSignal
+): void {
   const waiting = attempt.awaitingIndex;
-  if (!waiting || waiting.checking) return;
+  if (!waiting || waiting.checking || shutdownSignal.aborted) return;
   waiting.checking = true;
+  // Bound both the individual body read and repeated 202 responses. A page
+  // that never completes must eventually return the lane to growth backoff.
+  const timeoutMs = Math.max(1, Math.min(
+    opts.awaitedIndexProbeTimeoutMs ?? 5_000,
+    waiting.deadline - Date.now()
+  ));
+  const signal = AbortSignal.any([shutdownSignal, AbortSignal.timeout(timeoutMs)]);
   opts.memtree
-    .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`)
+    .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`, "application/json", signal)
     .then((page) => {
-      if (page.status === 202) return;
+      if (page.status === 202 && Date.now() < waiting.deadline) return;
       if (attempt.awaitingIndex === waiting) attempt.awaitingIndex = undefined;
       // A finished tree is exactly what the backoff was waiting for.
       if (page.status === 200) attempt.retryAtTokens = undefined;
@@ -1713,6 +1727,9 @@ async function handleMessages(
       if (plan.kind === "ride") toolRide = plan.ride;
       if (plan.kind === "compress") {
         const prior = state.toolRecoveryAttemptedLanes.get(requestRouteKey);
+        if (prior?.awaitingIndex && Date.now() >= prior.awaitingIndex.deadline) {
+          prior.awaitingIndex = undefined;
+        }
         if (prior?.inFlight) {
           // A concurrent request of this lane is already compressing.
           rec.routeRecovery = { outcome: "in-flight" };
@@ -1721,7 +1738,7 @@ async function handleMessages(
           // compress call could only pass everything through again. Forward
           // now; the page check lets the next tool turn try once it exists.
           rec.routeRecovery = { outcome: "awaiting-index" };
-          checkAwaitedIndex(opts, prior);
+          checkAwaitedIndex(opts, prior, state.shutdownSignal);
         } else if (
           prior?.retryAtTokens !== undefined &&
           plan.estimateTokens < prior.retryAtTokens
@@ -4281,7 +4298,11 @@ async function recoverToolRouteMiss(args: {
     // retrying on growth, which on a fast-growing loop is every tool turn.
     const pageId = result.memtreeUrl ? memtreePageId(result.memtreeUrl) : undefined;
     if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0) && pageId) {
-      recoveryAttempt.awaitingIndex = { pageId, checking: false };
+      recoveryAttempt.awaitingIndex = {
+        pageId,
+        checking: false,
+        deadline: Date.now() + (opts.awaitedIndexWaitTimeoutMs ?? 60_000),
+      };
       rec.routeRecovery.awaitingIndex = true;
     }
     releaseOwnReservation();
