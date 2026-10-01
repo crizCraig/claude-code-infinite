@@ -1140,6 +1140,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                         body,
                         messages,
                         forwardBody,
+                        originalBody: rawBody,
                         msgsForMemtree,
                         hash,
                         modelContextLimit,
@@ -1470,9 +1471,17 @@ async function handleMessages(req, res, opts, upstream, state) {
                     : {}),
         });
     }
-    catch (err) {
+    catch {
         releaseUncommittedRouteDecision();
-        throw err;
+        recordTurn(rec, "followup-degraded", rawBody);
+        capture(opts, "anthropic-request", rawBody);
+        return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
+            .then((delivered) => {
+            if (isMainRequest)
+                notePassthroughSize(state, sessionId, rec, rawBody.length);
+            if (delivered)
+                markMainPromptDelivered();
+        }));
     }
     finally {
         res.off("close", markDownstreamClosedDuringCompression);
@@ -2998,19 +3007,17 @@ async function recoverToolRouteMiss(args) {
             ...(args.compaction ? { compaction: args.compaction } : {}),
         });
     }
-    catch (err) {
-        // Nothing in the pipeline is expected to throw (compress() maps every
-        // failure to null), but a reservation held by a dead attempt suppresses
-        // every concurrent install for the rest of the epoch — the same hole the
-        // release exists to close. Hand it back before the error propagates.
-        //
-        // Back the lane off as for any attempt that produced nothing: a throw
-        // that repeats would otherwise cost a full blocking compress on every
-        // over-budget tool turn. Growth past the retry size, or the next human
-        // turn, tries again.
+    catch {
+        // An unexpected pipeline exception must never fail the user's API call.
+        // Preserve the lane's growth backoff and release its reservation, then
+        // send the original upload even when it exceeds the model window.
         backOff();
         releaseOwnReservation();
-        throw err;
+        rec.routeRecovery = { conversationBytes, outcome: "failed" };
+        recordTurn(rec, "tool", args.originalBody);
+        capture(opts, "anthropic-request", args.originalBody);
+        return forwardRaw(req, res, args.originalBody, opts, upstream, state.shutdownSignal, rec)
+            .then(() => noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length));
     }
     finally {
         res.off("close", markDownstreamClosed);

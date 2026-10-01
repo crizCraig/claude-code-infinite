@@ -4942,6 +4942,7 @@ function recordingUpstream() {
       const isCount = req.url.startsWith("/v1/messages/count_tokens");
       const raw = Buffer.concat(chunks);
       seen.push({
+        raw: raw.toString("utf-8"),
         isCount,
         body: JSON.parse(raw.toString("utf-8")),
       });
@@ -8953,5 +8954,41 @@ test("a subagent's MemTree calls are timed from that subagent's transcript", asy
     proxy.close();
     upstream.close();
     memtreeSrv.close();
+  }
+});
+
+
+test("compression exceptions forward human and tool requests byte for byte and back off", async () => {
+  for (const lane of ["human", "tool"]) {
+    const upstream = await recordingUpstream();
+    const memtreeSrv = await mockMemtree(200, recoveredMemory());
+    const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+    const records = [];
+    const proxy = await startRecoveryProxy({ memtree, upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+    try {
+      let conv = lane === "tool" ? largeToolTurn() : followupTurn("second");
+      await postMessages(proxy.port, conv, SESSION);
+      assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /recovered memory/);
+      let throws = 0;
+      memtree.compress = async () => { throws++; throw new Error("injected compress failure"); };
+      if (lane === "tool") {
+        conv = extendToolLoop(conv);
+        conv.at(-1).content[0].content = "r".repeat(1_000_000);
+      } else {
+        conv = [...conv, { role: "assistant", content: "answer" }, { role: "user", content: "q".repeat(1_000_000) }];
+      }
+      const raw = JSON.stringify({ model: "claude-x", max_tokens: 64, system: "<cc-infinite-notice>MemTree working - conversation consolidated</cc-infinite-notice>", messages: conv }, null, 2) + "\n";
+      const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: raw });
+      assert.equal(response.status, 200, `${lane}: exception must not return 502`);
+      await response.text();
+      assert.equal(upstream.seen.at(-1).raw, raw, `${lane}: original bytes, not the old prefix`);
+      assert.equal(throws, 1);
+      if (lane === "tool") {
+        const next = extendToolLoop(conv, "t3");
+        await postMessages(proxy.port, next, SESSION);
+        assert.equal(throws, 1, "small tool growth preserves exception backoff");
+        assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "backoff");
+      }
+    } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
   }
 });
