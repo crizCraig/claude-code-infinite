@@ -1275,6 +1275,11 @@ async function handleMessages(req, res, opts, upstream, state) {
             rec,
         })
         : undefined;
+    // Capture the prefix whose fate this request owns before any async work.
+    // A tool compaction can replace it without advancing the human epoch.
+    const prefixAtDecision = sessionId === undefined
+        ? undefined
+        : state.stablePrefixes.get(sessionId);
     // An active subagent can repeat/embed the human prompt in its own request;
     // producer suppression must also preserve the arm for the later main call.
     if (displayForThisTurn)
@@ -1437,7 +1442,10 @@ async function handleMessages(req, res, opts, upstream, state) {
     };
     /** A main request about to go out whole: size it and drop any stale prefix. */
     const sendingWhole = () => {
-        if (edge?.kind === "compress" && sessionId !== undefined) {
+        if (edge?.kind === "compress" &&
+            sessionId !== undefined &&
+            routeDecisionCurrent() &&
+            state.stablePrefixes.get(sessionId) === prefixAtDecision) {
             state.stablePrefixes.delete(sessionId);
         }
     };

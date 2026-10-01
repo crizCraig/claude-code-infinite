@@ -9049,3 +9049,33 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
     } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
   }
 });
+
+test("an older failed human compression cannot erase a newer stable prefix", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const held = deferred();
+  const records = [];
+  let calls = 0;
+  const good = { ...recoveredMemory(), flattened_messages: recoveredMemory().messages };
+  memtree.compress = async () => { calls++; return calls === 1 ? held.promise : good; };
+  const proxy = await startRecoveryProxy({ memtree, upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+  let older;
+  try {
+    const base = followupTurn("second");
+    older = postMessages(proxy.port, base, SESSION);
+    await waitFor(() => calls === 1);
+    const newer = [...base, { role: "assistant", content: "second answer" }, { role: "user", content: "third" }];
+    await postMessages(proxy.port, newer, SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    const prefixBytes = JSON.stringify(upstream.seen.at(-1).body.messages[0]);
+    held.resolve(null);
+    await older;
+    assert.deepEqual(upstream.seen.at(-1).body.messages, base, "failed older request still forwards its own history");
+    const latest = [...newer, { role: "assistant", content: "third answer" }, { role: "user", content: "fourth" }];
+    await postMessages(proxy.port, latest, SESSION);
+    assert.equal(calls, 2, "newest turn must reuse the winning prefix without recompressing");
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-prefix");
+    assert.equal(JSON.stringify(upstream.seen.at(-1).body.messages[0]), prefixBytes);
+  } finally { held.resolve(null); await older; await proxy.close(); upstream.close(); memtreeSrv.close(); }
+});
