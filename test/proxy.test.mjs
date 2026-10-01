@@ -8383,7 +8383,7 @@ async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop =
 }
 
 /** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
-async function sizingUpstream() {
+async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
   const bodies = [];
   const srv = await listen((req, res) => {
     const chunks = [];
@@ -8391,7 +8391,7 @@ async function sizingUpstream() {
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
       bodies.push(JSON.parse(raw.toString("utf-8")));
-      const tokens = Math.floor(raw.length / 4);
+      const tokens = Math.floor(raw.length / bytesPerToken);
       const body = JSON.stringify({
         type: "message",
         id: "msg_upstream",
@@ -8399,7 +8399,7 @@ async function sizingUpstream() {
         model: "claude-x",
         content: [{ type: "text", text: "upstream answer" }],
         stop_reason: "end_turn",
-        usage: { input_tokens: 3, cache_read_input_tokens: tokens - 3, output_tokens: 1 },
+        ...(reportUsage ? { usage: { input_tokens: 3, cache_read_input_tokens: tokens - 3, output_tokens: 1 } } : {}),
       });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) });
       res.end(body);
@@ -8408,8 +8408,8 @@ async function sizingUpstream() {
   return { ...srv, bodies };
 }
 
-async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {} } = {}) {
-  const upstream = await sizingUpstream();
+async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upstreamOptions = {} } = {}) {
+  const upstream = await sizingUpstream(upstreamOptions);
   const memtreeSrv = await edgeMemtree(memtree);
   const records = [];
   const proxy = await startProxy({
@@ -8493,7 +8493,7 @@ test("edge compaction: passthrough under budget, one compaction to half at the b
     assert.equal(t3.compaction.reason, "budget");
     assert.equal(h.compressCalls().length, 2);
     assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
-    assert.equal(h.compressCalls()[1].compression_threshold_tokens, 20_000);
+    assert.equal(h.compressCalls()[1].compression_threshold_tokens, undefined, "calibrated budget crossing forces compression");
     const compacted = h.upstream.bodies.at(-1);
     assert.equal(compacted.messages.length, 1);
     assert.deepEqual(compacted.messages[0].content[0].cache_control, EPH, "the prefix carries the cache marker");
@@ -9231,4 +9231,64 @@ test("model churn evicts old server budgets and safely falls back to the context
     assert.equal(evicted.compaction.budgetTokens, 160_000);
     assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "server", "a fresh report repopulates the evicted entry");
   } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
+});
+
+
+test("calibrated dense input forces compaction before the server threshold", async () => {
+  const h = await edgeHarness({ upstreamOptions: { bytesPerToken: 2 } });
+  try {
+    const conv = [userText("q"), assistantText("a"), userText("warm")];
+    await h.post(conv);
+    conv.push(assistantText("a"), userText("dense ".repeat(8_000)));
+    const rec = await h.post(conv);
+    assert.equal(rec.compaction.sizeSource, "reported");
+    assert.ok(rec.compaction.estimatedTokens >= 20_000);
+    const call = h.compressCalls().at(-1);
+    assert.ok(JSON.stringify(call.messages).length / 4 < 20_000);
+    assert.equal(call.compression_threshold_tokens, undefined);
+    assert.equal(call.compression_target_tokens, 10_000);
+    assert.equal(rec.turnType, "followup-compressed");
+  } finally { h.close(); }
+});
+
+for (const reportsBudget of [true, false]) {
+  for (const lane of ["human", "tool", "prefix"]) {
+    test(`uncalibrated ${lane} budget check lets ${reportsBudget ? "threshold" : "older"} server decide`, async () => {
+      const h = await edgeHarness({ memtree: { reportsBudget }, upstreamOptions: { reportUsage: false } });
+      try {
+        const conv = [userText("q"), assistantText("a"), userText("warm")];
+        await h.post(conv);
+        if (lane === "prefix") {
+          await h.command("/memtree-compact");
+          conv.push(assistantText("a"), userText(BIG("manual")));
+          assert.equal((await h.post(conv)).turnType, "followup-compressed");
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined, "manual remains explicit");
+        }
+        if (lane === "tool") toolStep(conv, "large", 100_000);
+        else conv.push(assistantText("a"), userText(BIG("cross")));
+        const rec = await h.post(conv);
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.ok(rec.compaction.estimatedTokens >= 20_000);
+        const call = h.compressCalls().at(-1);
+        assert.equal(call.compression_threshold_tokens, reportsBudget ? 20_000 : undefined);
+        assert.equal(call.compression_target_tokens, reportsBudget ? 10_000 : undefined);
+      } finally { h.close(); }
+    });
+  }
+}
+
+test("a bytes-only window alarm does not force below the calibrated budget and window", async () => {
+  const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 10 } });
+  try {
+    const conv = [userText("q"), assistantText("a"), userText("x".repeat(900_000))];
+    await h.post(conv);
+    toolStep(conv, "small", 10);
+    const rec = await h.post(conv);
+    assert.equal(rec.compaction.sizeSource, "reported");
+    assert.ok(rec.compaction.estimatedTokens < 160_000);
+    assert.ok(rec.requestBytes / 4 > 200_000);
+    const call = h.compressCalls().at(-1);
+    assert.equal(call.compression_target_tokens, 80_000);
+    assert.equal(call.compression_threshold_tokens, 160_000);
+  } finally { h.close(); }
 });

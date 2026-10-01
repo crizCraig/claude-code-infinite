@@ -1158,7 +1158,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                         isMainRequest,
                         recoveryAttempt,
                         clientMeta,
-                        compaction: { target: plan.target },
+                        compaction: { target: plan.target, threshold: plan.threshold },
                         ...(plan.replaces !== undefined
                             ? {
                                 stable: {
@@ -2160,6 +2160,23 @@ function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
         threshold: Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens),
     };
 }
+/** Only calibrated usage may force an estimate-driven compaction. */
+function budgetCompaction(state, record, target, body, modelContextLimit) {
+    const outputTokens = typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)
+        ? Math.max(0, body.max_tokens) : 0;
+    const tokens = record.estimatedTokens ?? 0;
+    if (record.sizeSource === "reported" &&
+        (tokens >= record.budgetTokens || tokens + outputTokens > modelContextLimit)) {
+        return { target };
+    }
+    // Older servers may ignore a threshold, so do not send a forcing target
+    // until support is known. They can still compact against their own budget.
+    if (!state.serverReportsBudget)
+        return {};
+    const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, record.budgetTokens);
+    record.thresholdTokens = threshold;
+    return { target, threshold };
+}
 /** Anthropic's whole input size for a request: uncached + cache read + cache write. */
 function reportedInputTokens(rec) {
     const usage = rec.usage;
@@ -2270,7 +2287,9 @@ function planEdgeCompaction(args) {
         compaction.reason = reason;
         return {
             kind: "compress",
-            target: targetTokens,
+            ...(reason === "budget"
+                ? budgetCompaction(state, compaction, targetTokens, body, modelContextLimit)
+                : { target: targetTokens }),
             targetTokens,
             explicitTarget,
             reason,
@@ -2318,16 +2337,17 @@ function planEdgeCompaction(args) {
     const size = estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
     compaction.estimatedTokens = size.tokens;
     compaction.sizeSource = size.source;
+    if (size.source === "reported" && size.tokens >= budget.tokens) {
+        return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
+    }
     if (state.serverReportsBudget) {
         // The server measures the request and compresses only past the budget.
         const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
         compaction.thresholdTokens = threshold;
         return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
     }
-    if (size.tokens >= budget.tokens)
-        return forced("budget");
-    // Under budget by our estimate, on a server that cannot take a threshold:
-    // no target, so it passes through unless over its own model budget.
+    // Without calibrated usage or threshold support, let the server decide
+    // against its own model budget rather than forcing from transport bytes.
     return { kind: "compress", targetTokens, explicitTarget };
 }
 /**
@@ -2341,7 +2361,7 @@ function planEdgeCompaction(args) {
  *   for the previous request of the same shape (the ride's prefix or route,
  *   else the session's / lane's whole-request size), bytes/4 without one.
  * - Under the budget (and within the window): ride, or forward whole.
- * - At the budget: compress, forced to the target (reason "budget"); on the
+ * - At the budget: compress, forcing the target only with calibrated usage; on the
  *   main thread the result becomes the stable prefix later tool AND human
  *   turns ride.
  *
@@ -2391,7 +2411,7 @@ function planToolCompaction(args) {
     compaction.reason = "budget";
     return {
         kind: "compress",
-        target: targetTokens,
+        ...budgetCompaction(state, compaction, targetTokens, body, modelContextLimit),
         targetTokens,
         explicitTarget: mode.mode === "explicit",
         estimateTokens: size.tokens,
