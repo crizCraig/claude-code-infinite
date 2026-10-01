@@ -61,7 +61,10 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
     "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
     "The user's other sessions are searchable too: list_sessions lists them by time and project, and search_sessions " +
-    "finds passages across all of them; use these when the user refers to earlier work that is not in this session.";
+    "finds passages across all of them; use these when the user refers to earlier work that is not in this session. " +
+    "For search_sessions, vector mode (default) finds meaning: the first page is charged even when the query embedding " +
+    "is cached; cursor continuation is free, including when the embedding must be regenerated. Text mode is free. " +
+    "Cursors page over live results, not a frozen snapshot; new indexing can change later pages.";
 export const MEMTREE_TOOLS = [
     {
         name: "search",
@@ -138,15 +141,17 @@ export const MEMTREE_TOOLS = [
     },
     {
         name: "search_sessions",
-        description: "Search the transcripts of all of the user's own sessions at once; each hit names the session, the tree (a request id), " +
+        description: "Search the transcripts of all of the user's own sessions at once; each hit names the session, the tree reference, " +
             "the transcript lines and a snippet, and says which read_lines call opens it. mode \"vector\" (default) matches meaning " +
-            "and is charged a small per-query embedding cost; mode \"text\" matches exact words, ids and paths and is free. " +
+            "and its first page is charged even when the query embedding is cached; cursor continuation is free, including " +
+            "when the embedding must be regenerated. Mode \"text\" matches exact words, ids and paths and is free. " +
+            "Cursors page over live results, not a frozen snapshot; new indexing can change later pages. " +
             "A passage repeated across a session's successive trees is reported once, from the newest.",
         inputSchema: {
             type: "object",
             properties: {
                 query: { type: "string", description: "What to look for: a question or description (vector), or exact words (text; \"quoted phrase\", or, -word)." },
-                mode: { type: "string", enum: ["vector", "text"], description: "vector (default, semantic, charged per query) or text (exact words, free)." },
+                mode: { type: "string", enum: ["vector", "text"], description: "vector (default, semantic, first page charged, cursor continuation free) or text (exact words, free)." },
                 project: { type: "string", description: "Only sessions in this working directory or git repository (owner/repo, or just repo)." },
                 since: { type: "string", description: "Only requests at or after this ISO 8601 time or date." },
                 until: { type: "string", description: "Only requests before this ISO 8601 time or date." },

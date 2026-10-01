@@ -379,8 +379,15 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /list_sessions/);
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /search_sessions/);
   const search = MEMTREE_TOOLS.find((t) => t.name === "search_sessions");
-  assert.match(search.description, /charged a small per-query embedding cost/);
-  assert.match(search.description, /free/);
+  for (const description of [MEMTREE_MCP_INSTRUCTIONS, search.description]) {
+    assert.match(description, /vector.*default/i);
+    assert.match(description, /first page.*charged/i);
+    assert.match(description, /cached/i);
+    assert.match(description, /cursor continuation.*free/i);
+    assert.match(description, /text.*free/i);
+    assert.match(description, /live.*snapshot/i);
+  }
+  assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
   assert.equal(search.inputSchema.properties.mode.enum.join(","), "vector,text");
   for (const name of ["search", "read_node", "read_lines"]) {
     assert.ok(MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree, name);
