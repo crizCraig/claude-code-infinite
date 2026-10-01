@@ -3775,7 +3775,6 @@ function withFlattenCacheBreakpoint(
 ): Message[] {
   const messages: Message[] = body.messages;
   if (messages.length !== 1) return messages;
-  if (countCacheBreakpoints(body) >= MAX_CACHE_BREAKPOINTS) return messages;
   const only = messages[0];
   const text = typeof only.content === "string" ? only.content : undefined;
   if (text === undefined) return messages;
@@ -4094,6 +4093,9 @@ function buildCompressedBody(
     compressedBody.system = systemMsg.content;
   }
   compressedBody.messages = withFlattenCacheBreakpoint(compressedBody, cacheTtlOf(body));
+  // Reserve a slot for the prefix even when all four original markers were
+  // on retained tools/system blocks. Only this transformed body is capped.
+  capCacheBreakpoints(compressedBody, compressedBody.messages.length);
   if (!validCacheTtlOrder(compressedBody)) return null;
   return {
     compressedBody,

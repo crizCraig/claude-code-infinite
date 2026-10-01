@@ -3449,6 +3449,60 @@ for (const ttl of [undefined, "5m", "1h"]) {
   });
 }
 
+for (const layout of ["four tools", "mixed tools and system"]) {
+  test(`cache prefix slot: reserve a marker with ${layout}, then reuse identical prefix bytes`, async () => {
+    const h = await cacheTtlHarness();
+    const mixed = layout === "mixed tools and system";
+    const ttl = mixed ? "5m" : "1h";
+    const markerBlocks = (body) => [
+      ...(body.tools ?? []), ...(body.system ?? []),
+      ...body.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []),
+    ].filter((block) => block.cache_control);
+    try {
+      const body = {
+        model: "claude-x", max_tokens: 64,
+        tools: Array.from({ length: mixed ? 2 : 4 }, (_, n) => ({
+          name: `tool_${n}`, input_schema: { type: "object" }, cache_control: cacheMarker("1h"),
+        })),
+        ...(mixed ? { system: [cacheText("sys one", ttl), cacheText("sys two", ttl)] } : {}),
+        messages: followupTurn("turn two"),
+      };
+      assert.equal(markerBlocks(body).length, 4, "the incoming request uses exactly four valid markers");
+      const snapshot = structuredClone(body);
+      const first = await h.post({ ...body, messages: [{ role: "user", content: "first question" }] });
+      assert.equal(h.raws.at(-1), first.original, "passthrough keeps all original marker bytes");
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const { forwarded: compressed } = await h.post(body);
+      assert.equal(compressed.messages.length, 1);
+      assert.deepEqual(compressed.messages[0].content[0]?.cache_control, cacheMarker(ttl), "the flattened prefix always gets a marker");
+      assert.equal(markerBlocks(compressed).length, 4, "prefix plus three retained markers");
+      assert.deepEqual(body, snapshot, "input tools and system remain unchanged");
+
+      // Move one incoming marker to the newest result, keeping the original
+      // request valid at four markers before the proxy adds its prefix.
+      const next = structuredClone(body);
+      const field = mixed ? "system" : "tools";
+      const { cache_control: _old, ...unmarked } = next[field][0];
+      next[field][0] = unmarked;
+      next.messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id: "slot-tool", name: "tool_0", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "slot-tool", content: "ok", cache_control: cacheMarker(ttl) }] },
+      );
+      assert.equal(markerBlocks(next).length, 4);
+      const nextSnapshot = structuredClone(next);
+      const { forwarded: ride } = await h.post(next);
+      assert.equal(h.compressCalls().length, 1, "compatible tool turn rides without recompressing");
+      assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compressed.messages[0]), "prefix bytes remain identical");
+      assert.equal(markerBlocks(ride).length, 4);
+      assert.deepEqual(ride.messages.at(-1).content[0].cache_control, cacheMarker(ttl), "newest suffix marker is retained");
+      assert.deepEqual(next, nextSnapshot, "reusing the prefix leaves input objects unchanged");
+      const ttls = markerBlocks(ride).map((block) => block.cache_control.ttl ?? "5m");
+      const firstShort = ttls.indexOf("5m");
+      assert.ok(firstShort < 0 || ttls.slice(firstShort).every((value) => value === "5m"), "all surviving 1h markers precede 5m markers");
+    } finally { h.close(); }
+  });
+}
+
 for (const lane of ["human", "human-failed-rebuild", "tool", "count_tokens"]) {
   test(`cache TTL: a 5m prefix cannot precede new 1h markers (${lane})`, async () => {
     const h = await cacheTtlHarness();
