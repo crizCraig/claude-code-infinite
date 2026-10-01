@@ -2523,7 +2523,33 @@ const pageHeaders = (url, index) => ({
   ...(index ? { "x-polychat-memtree-index": index } : {}),
 });
 
-test("the first success line links the page; later ones only when a new index was served", async () => {
+// These tests exercise both rendering modes independently of the runner's terminal.
+// Top-level tests run sequentially; restore the environment after each case.
+function setNoticeColorMode(t, color) {
+  const oldNoColor = process.env.NO_COLOR;
+  const oldTerm = process.env.TERM;
+  const oldHasColors = Object.getOwnPropertyDescriptor(process.stdout, "hasColors");
+  t.after(() => {
+    if (oldNoColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = oldNoColor;
+    if (oldTerm === undefined) delete process.env.TERM;
+    else process.env.TERM = oldTerm;
+    if (oldHasColors) Object.defineProperty(process.stdout, "hasColors", oldHasColors);
+    else delete process.stdout.hasColors;
+  });
+  if (color) delete process.env.NO_COLOR;
+  else process.env.NO_COLOR = "1";
+  process.env.TERM = "xterm-256color";
+  // A color-capable terminal must still respect NO_COLOR.
+  Object.defineProperty(process.stdout, "hasColors", {
+    configurable: true,
+    value: () => true,
+  });
+}
+
+for (const color of [false, true]) {
+test(`the first success line links the page; later ones only when a new index was served (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
   const upstream = await mockUpstream();
   // Turn two and three compress against the same index; turn four against a
   // newer one (the tool loop's index finished in between).
@@ -2545,8 +2571,13 @@ test("the first success line links the page; later ones only when a new index wa
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
     const rendered = first.body.hookSpecificOutput.displayContent;
     assert.equal(stripAnsi(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
-    assert.match(rendered, /\x1b\[39m https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
-      "the link follows the SGR reset, bare, so a linkifier cannot swallow it");
+    if (color) {
+      assert.match(rendered, /\x1b\[39m https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
+        "the link follows the SGR reset, bare, so a linkifier cannot swallow it");
+    } else {
+      assert.equal(rendered, `${successLine(PAGE_URL_1)}\nupstream answer`,
+        "NO_COLOR leaves the entire notice and URL plain");
+    }
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }))).status,
       204
@@ -2574,6 +2605,7 @@ test("the first success line links the page; later ones only when a new index wa
     memtreeSrv.close();
   }
 });
+}
 
 test("a tool-only turn's Stop fallback carries the success line with its link", async () => {
   const upstream = await mockUpstream();
@@ -2636,7 +2668,9 @@ test("a page without a served index (older server, index-only ack) is never link
 const trailerNew = (link) => `• MemTree\n  ${link}`;
 const trailerSame = (link) => `• MemTree\n  ${link}`;
 
-test("placement 'message': the link trails every finished message, marked when the index is new", async () => {
+for (const color of [false, true]) {
+test(`placement 'message': the link trails every finished message, marked when the index is new (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
   const upstream = await mockUpstream();
   const stamps = [
     pageHeaders(PAGE_URL_1, "index-a"),
@@ -2657,7 +2691,9 @@ test("placement 'message': the link trails every finished message, marked when t
       stripAnsi(rendered),
       `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
     );
-    assert.ok(rendered.endsWith(`\x1b[39m\n  ${PAGE_URL_1}`), "URL bare after the reset");
+    assert.ok(rendered.endsWith(`${color ? "\x1b[39m" : "• MemTree"}\n  ${PAGE_URL_1}`),
+      "URL is bare on its own line, after the reset when colored");
+    if (!color) assert.equal(rendered, stripAnsi(rendered), "NO_COLOR suppresses all ANSI styling");
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 
     // Same index next turn: no success line, trailer still there, dim label.
@@ -2670,7 +2706,12 @@ test("placement 'message': the link trails every finished message, marked when t
     );
     const sameRendered = same.body.hookSpecificOutput.displayContent;
     assert.equal(stripAnsi(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
-    assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
+    if (color) {
+      assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
+    } else {
+      assert.equal(sameRendered, `done\n\n${trailerSame(PAGE_URL_2)}`,
+        "NO_COLOR leaves the unchanged label and URL plain");
+    }
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
     // New index: marked again.
@@ -2687,6 +2728,7 @@ test("placement 'message': the link trails every finished message, marked when t
     memtreeSrv.close();
   }
 });
+}
 
 test("placement 'message': a turn with no rendered message gets the trailer from Stop", async () => {
   const upstream = await mockUpstream();
