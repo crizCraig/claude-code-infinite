@@ -51,7 +51,7 @@ import {
   gunzipSync,
   inflateSync,
 } from "node:zlib";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import {
@@ -5294,9 +5294,12 @@ function capture(opts: ProxyOptions, kind: string, body: Buffer): void {
   const dir = opts.captureDir;
   if (!dir) return;
   try {
-    mkdirSync(dir, { recursive: true });
-    const name = `${String(++captureCounter).padStart(4, "0")}-${kind}.json`;
-    writeFileSync(join(dir, name), body);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // mkdir does not tighten a directory reused from an earlier run.
+    chmodSync(dir, 0o700);
+    const name = `${String(++captureCounter).padStart(4, "0")}-${kind}-${randomBytes(8).toString("hex")}.json`;
+    // Never reuse an existing file (which may have permissive old modes).
+    writeFileSync(join(dir, name), body, { mode: 0o600, flag: "wx" });
   } catch {
     // diagnostics only — never break the proxy path
   }

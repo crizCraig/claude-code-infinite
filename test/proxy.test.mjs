@@ -9079,3 +9079,31 @@ test("an older failed human compression cannot erase a newer stable prefix", asy
     assert.equal(JSON.stringify(upstream.seen.at(-1).body.messages[0]), prefixBytes);
   } finally { held.resolve(null); await older; await proxy.close(); upstream.close(); memtreeSrv.close(); }
 });
+
+test("capture files and new or reused directories are private and exclude auth headers", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-capture-permissions-"));
+  const oldUmask = process.umask(0o022);
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  try {
+    for (const mode of ["new", "existing"]) {
+      const dir = path.join(root, mode);
+      if (mode === "existing") fs.mkdirSync(dir, { mode: 0o755 });
+      const records = [];
+      const proxy = await startProxy({ memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "memtree-secret" }), upstreamOrigin: upstream.origin, captureDir: dir, reqlog: { log: r => records.push(structuredClone(r)) } });
+      try {
+        await postMessages(proxy.port, [{ role: "user", content: "hello" }], { ...SESSION, authorization: "Bearer anthropic-secret", "x-api-key": "api-secret" });
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700, `${mode} capture directory is private`);
+        const files = fs.readdirSync(dir);
+        assert.equal(files.length, 1);
+        assert.equal(fs.statSync(path.join(dir, files[0])).mode & 0o777, 0o600);
+        const contents = fs.readFileSync(path.join(dir, files[0]), "utf8");
+        assert.deepEqual(JSON.parse(contents).messages, [{ role: "user", content: "hello" }]);
+        assert.doesNotMatch(contents + JSON.stringify(records), /anthropic-secret|api-secret|memtree-secret/);
+      } finally { await proxy.close(); }
+    }
+  } finally { process.umask(oldUmask); upstream.close(); memtreeSrv.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
