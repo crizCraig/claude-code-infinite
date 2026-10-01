@@ -232,7 +232,9 @@ export class CurrentTree {
         if (this.cached?.id === id)
             return this.cached.index;
         const index = await this.loadPage(id, "this session");
-        this.cached = { id, index };
+        // A prefix is temporary: the same request id will later serve its own tree.
+        if (!index.page.served_prefix)
+            this.cached = { id, index };
         return index;
     }
     /**
@@ -284,7 +286,8 @@ export class CurrentTree {
             return hit;
         }
         const index = await this.loadPage(id, `tree ${id}`);
-        this.others.set(id, index);
+        if (!index.page.served_prefix)
+            this.others.set(id, index);
         while (this.others.size > OTHER_TREES_CACHED) {
             this.others.delete(this.others.keys().next().value);
         }

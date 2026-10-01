@@ -176,6 +176,25 @@ test("CurrentTree follows the proxy's current page and caches it until the page 
   await assert.rejects(new CurrentTree({}).get(), /need a running ccc session/);
 });
 
+for (const explicit of [false, true]) {
+  test(`CurrentTree refreshes a temporary prefix for ${explicit ? "an explicit" : "the current"} tree`, async () => {
+    const id = "aaa111";
+    const path = `/memtree/${id}.json`;
+    const state = {
+      urls: [], pageFetches: 0, current: id,
+      pages: { [path]: { ...PAGE, served_prefix: true, nodes: PAGE.nodes.slice(0, 2) } },
+    };
+    const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fakeProxyFetch(state) });
+    const requested = explicit ? id : undefined;
+    assert.equal((await tree.get(requested)).nodes.size, 2, "prefix remains readable while building");
+    state.pages[path] = PAGE;
+    const completed = await tree.get(requested);
+    assert.equal(completed.nodes.size, 6, "same request id resolves to the completed tree");
+    assert.equal(await tree.get(requested), completed, "completed tree stays cached");
+    assert.equal(state.pageFetches, 2);
+  });
+}
+
 test("MCP handler: initialize, tools/list, tools/call results and errors", async () => {
   const tree = { get: async () => index() };
   const init = await handleMcpMessage(
