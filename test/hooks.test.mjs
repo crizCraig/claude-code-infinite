@@ -94,16 +94,18 @@ test("a pending link rides the success line once per key, in display or Stop, ne
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
-        "\x1b[32m✓ MemTree · conversation optimized ·\x1b[39m " +
-        "https://app.polychat.co/m/aaaaaaaaaaaa\nanswer",
+        "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
+        "  https://app.polychat.co/m/aaaaaaaaaaaa\nanswer",
     },
   });
   assert.equal(queue.linkPending("session-1"), false);
-  // A new page for the same index is not news: the next success line is plain.
+  // Every success line carries the current page below it, same index or not.
   link = { key: "index-a", link: "https://app.polychat.co/m/aaaaaaaaaaab" };
   queue.queuePrefix("✓ MemTree · conversation optimized");
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[32m✓ MemTree · conversation optimized\x1b[39m",
+    systemMessage:
+      "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
+      "  https://app.polychat.co/m/aaaaaaaaaaab",
   });
 
   // A new index: Stop fallback carries its page on the success line, once.
@@ -111,8 +113,8 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   queue.queuePrefix("✓ MemTree · conversation optimized");
   assert.deepEqual(queue.claim(stop()), {
     systemMessage:
-      "\x1b[32m✓ MemTree · conversation optimized ·\x1b[39m " +
-      "https://app.polychat.co/m/bbbbbbbbbbbb",
+      "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
+      "  https://app.polychat.co/m/bbbbbbbbbbbb",
   });
   assert.equal(queue.claim(stop()), null);
 

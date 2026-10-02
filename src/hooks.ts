@@ -425,19 +425,33 @@ export class NoticeDeliveryQueue {
   }
 
   /**
-   * The success line, with the session's not-yet-shown link (if any) after
-   * a separator — `✓ … optimized · <link>`. Claiming the link here marks it
-   * shown, so it rides exactly one success line.
+   * The success line with the session's current MemTree page on its own
+   * indented line below it (`✓ … optimized · ~813k → 408k tokens` then
+   * `  <link>`), every time the line is shown. The URL stays bare for the
+   * terminal's linkifier. Marks the key shown, so the end-of-turn trailer
+   * does not repeat the same link.
    */
   private renderSuccess(
     prefix: PendingNoticePart,
     sessionId: string | undefined
   ): string {
     const text = resolveNoticeText(prefix);
-    const link = this.resolveLink(sessionId);
+    const link = this.currentLink(sessionId);
     if (link === undefined) return this.styleSuccess(text);
     this.lastLinkKey = link.key;
-    return `${this.styleSuccess(`${text} ·`)} ${link.link}`;
+    this.lastTrailerKey = link.key;
+    return `${this.styleSuccess(text)}\n  ${link.link}`;
+  }
+
+  /** The session's current link, shown or not. Resolver failures never break a hook. */
+  private currentLink(sessionId: string | undefined): SuccessLink | undefined {
+    if (!this.link) return undefined;
+    try {
+      const link = this.link(sessionId);
+      return link?.link && link.key ? link : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */

@@ -51,7 +51,7 @@ function formatTokenCount(tokens: number): string {
 }
 
 export function compressedNoticeText(memtreeUrl?: string): string {
-  return memtreeUrl ? `${COMPRESSED_NOTICE} · ${memtreeUrl}` : COMPRESSED_NOTICE;
+  return memtreeUrl ? `${COMPRESSED_NOTICE}\n  ${memtreeUrl}` : COMPRESSED_NOTICE;
 }
 /**
  * The trailer under a finished assistant message naming the newest MemTree

@@ -181,11 +181,15 @@ export declare class NoticeDeliveryQueue {
     /** Warnings get the same own-line treatment as success, in yellow. */
     private styleWarning;
     /**
-     * The success line, with the session's not-yet-shown link (if any) after
-     * a separator — `✓ … optimized · <link>`. Claiming the link here marks it
-     * shown, so it rides exactly one success line.
+     * The success line with the session's current MemTree page on its own
+     * indented line below it (`✓ … optimized · ~813k → 408k tokens` then
+     * `  <link>`), every time the line is shown. The URL stays bare for the
+     * terminal's linkifier. Marks the key shown, so the end-of-turn trailer
+     * does not repeat the same link.
      */
     private renderSuccess;
+    /** The session's current link, shown or not. Resolver failures never break a hook. */
+    private currentLink;
     /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */
     private resolveLink;
     /**

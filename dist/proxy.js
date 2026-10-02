@@ -1811,8 +1811,14 @@ function installMemtreeLink(state, placement) {
             state.notices.setLink(resolve);
             break;
         case "turn":
+            // The success line carries the current page on the line below it; the
+            // end-of-turn trailer then skips a link that line already showed.
+            state.notices.setLink(resolve);
+            state.notices.setTrailer(resolve, placement);
+            break;
         case "message":
         case "stop":
+            // These trailers show on every message or every Stop; no second copy.
             state.notices.setTrailer(resolve, placement);
             break;
         case "off":
