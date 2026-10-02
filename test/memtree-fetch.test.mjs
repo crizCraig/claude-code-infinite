@@ -52,6 +52,8 @@ test("the host picks the saved key, mirroring ccc's modes", () => {
   );
   assert.equal(modeForUrl(new URL("http://localhost:8080/x")), "local");
   assert.equal(modeForUrl(new URL("http://127.0.0.1:8080/x")), "local");
+  assert.equal(modeForUrl(new URL("https://app.polychat.co/m/x")), "production");
+  assert.equal(modeForUrl(new URL("http://local.polychat.co:8000/x")), "local");
   const keys = { production: "sk-prod", staging: "sk-stg", local: "" };
   assert.equal(keyForMode("staging", keys), "sk-stg");
   assert.equal(keyForMode("local", keys), undefined);
@@ -113,4 +115,29 @@ test("the success line carries the MemTree link only when there is one to show",
     compressedNoticeText("https://app.polychat.co/m/0f1c2d3e4a5b"),
     `${COMPRESSED_NOTICE}\n  https://app.polychat.co/m/0f1c2d3e4a5b`
   );
+});
+
+test("a host that is not Polychat's gets no key", async () => {
+  for (const host of [
+    "https://evil.example",
+    "https://polychat-staging.evil.example",
+    "https://api.polychat.co.evil.example",
+    "http://api.polychat.co",
+  ]) {
+    assert.equal(modeForUrl(new URL(`${host}/x`)), null, host);
+  }
+  let fetched = false;
+  let err = "";
+  const code = await runMemtreeFetchCommand([`https://evil.example/m/0f1c2d3e4a5b`], {
+    keys: { production: "sk-prod", staging: "sk-stg", local: "sk-local" },
+    stdout: () => {},
+    stderr: (t) => (err += t),
+    fetch: async () => {
+      fetched = true;
+      return new Response("{}");
+    },
+  });
+  assert.equal(code, 2);
+  assert.equal(fetched, false);
+  assert.match(err, /not a Polychat host/);
 });

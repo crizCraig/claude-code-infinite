@@ -969,6 +969,11 @@ async function handleRequest(
     return handleNoticeHook(req, res, state, opts.reqlog);
   }
 
+  if (url.pathname.startsWith(MEMTREE_PASSTHROUGH_PREFIX) && !isLocalCaller(req)) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "MemTree relay is for local agents only" }));
+    return;
+  }
   if (
     req.method === "GET" &&
     (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)
@@ -989,6 +994,42 @@ async function handleRequest(
     return handleCountTokens(req, res, opts, upstream, state);
   }
   return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const BROWSER_SAME_SITE = new Set(["same-origin", "none"]);
+
+/**
+ * The `/memtree/*` relay answers with the user's key, so only callers on this
+ * machine may use it: agents (curl, the MCP server) and the MemTree page itself
+ * when opened from the loopback. A web page on another site can reach the
+ * loopback too, either directly (it sends an `origin` or `sec-fetch-site` saying
+ * so) or by rebinding its own hostname to 127.0.0.1 (its `host` then names it).
+ */
+function isLocalCaller(req: http.IncomingMessage): boolean {
+  if (!isLoopbackHost(req.headers.host)) return false;
+  const origin = req.headers.origin;
+  if (origin !== undefined && !isLoopbackOrigin(origin)) return false;
+  const site = req.headers["sec-fetch-site"];
+  return site === undefined || BROWSER_SAME_SITE.has(String(site));
+}
+
+function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    return LOOPBACK_HOSTNAMES.has(new URL(`http://${host}`).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    return url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
 /** Loopback prefix for reading the user's own MemTree pages through this proxy. */
