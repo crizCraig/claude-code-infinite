@@ -21,7 +21,7 @@ import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColo
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
-import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, } from "./payment-gate.js";
+import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, hyperlink, } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
@@ -57,8 +57,11 @@ async function promptForApiKey(mode) {
     const url = mode === "local"
         ? "http://local.polychat.co:5173/memtree-api"
         : POLYCHAT_AUTH_URL;
+    // The label is a clickable link (OSC 8) where the terminal supports it, and
+    // the URL is printed too, for other terminals and for opening it elsewhere.
+    console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
     await new Promise((resolve) => {
-        rl.question(`\nPress Enter to open your browser to obtain your Memtree API key...`, () => resolve());
+        rl.question(`\nPress Enter to open it in your browser...`, () => resolve());
     });
     openUrl(url);
     return new Promise((resolve) => {

@@ -36,6 +36,7 @@ import {
   parsePaymentChoice,
   parsePaymentStatus,
   type PaymentStatus,
+  hyperlink,
 } from "./payment-gate.js";
 import { checkForUpdate } from "./update-check.js";
 import {
@@ -107,11 +108,11 @@ async function promptForApiKey(mode: Mode): Promise<string> {
       ? "http://local.polychat.co:5173/memtree-api"
       : POLYCHAT_AUTH_URL;
 
+  // The label is a clickable link (OSC 8) where the terminal supports it, and
+  // the URL is printed too, for other terminals and for opening it elsewhere.
+  console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
   await new Promise<void>((resolve) => {
-    rl.question(
-      `\nPress Enter to open your browser to obtain your Memtree API key...`,
-      () => resolve()
-    );
+    rl.question(`\nPress Enter to open it in your browser...`, () => resolve());
   });
 
   openUrl(url);
