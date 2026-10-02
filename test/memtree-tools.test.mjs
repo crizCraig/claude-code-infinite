@@ -39,6 +39,43 @@ const PAGE = JSON.parse(
 );
 const index = () => new MemtreeIndex(PAGE);
 
+test("scoped finder responses must confirm the requested tree; unscoped legacy hits work", async () => {
+  let body = { hits: [{ id: "s", tree: { request_id: "other" }, range: { block: 0, start: 1, end: 2 } }] };
+  const finder = new SessionFinder({ proxyUrl: "http://localhost:9", fetch: async () => Response.json(body) });
+  await assert.rejects(finder.searchSessions({ query: "x", mode: "vector" }, "wanted"), /confirm.*tree/);
+  assert.match(await finder.searchSessions({ query: "x" }), /read_lines/);
+  body = { ...body, tree: "wrong" };
+  await assert.rejects(finder.searchSessions({ query: "x" }, "wanted"), /confirm.*tree/);
+  body = { ...body, tree: "wanted" };
+  assert.match(await finder.searchSessions({ query: "x" }, "wanted"), /read_lines/);
+});
+
+test("current search and prefix cache enforce the page session", async () => {
+  const fetch = async (url) => Response.json(String(url).includes("/current")
+    ? { id: "page", session_id: "A" }
+    : String(url).includes("/search")
+      ? { terms: ["billing"], hits: [], session_id: "B" }
+      : { ...PAGE, session_id: "B", served_prefix: true });
+  const tree = new CurrentTree({ proxyUrl: "http://localhost:9", sessionId: "A", fetch });
+  await assert.rejects(tree.search("billing", 10), /different.*session/);
+  await tree.get("page");
+  await assert.rejects(tree.get(), /different.*session/);
+  await assert.rejects(tree.currentId(true), /different.*session/);
+});
+
+test("old per-tree search without session identity falls back to a validated page", async () => {
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(String(url));
+    return Response.json(String(url).includes("/current") ? { id: "page", session_id: "A" }
+      : String(url).includes("/search") ? { terms: ["billing"], hits: [] }
+      : { ...PAGE, session_id: "A" });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://localhost:9", sessionId: "A", fetch });
+  assert.match(await tree.search("billing", 10), /best match/);
+  assert.ok(urls.some((url) => url.endsWith("page.json")));
+});
+
 test("invalid JSON-RPC values do not kill the stdio queue", () => {
   const messages = [null, [], 42, { method: "ping", id: {} },
     { jsonrpc: "2.0", id: 7, method: "ping" }];
@@ -516,6 +553,7 @@ test("CurrentTree search: the server's tree search first, the page JSON when the
       if (!serverHasSearch) return Response.json({ detail: "Not Found" }, { status: 404 });
       return Response.json({
         query: u.searchParams.get("q"),
+        session_id: "session-1",
         terms: ["8443"],
         hits: [{ id: 5, leaf: true, depth: 2, summary: "Billing port", range: { block: 0, start: 5, end: 5 },
                  matched_terms: ["8443"], line_hits: 1, score: 120, snippets: [{ line: 5, text: "port 8443" }] }],

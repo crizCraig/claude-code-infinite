@@ -181,7 +181,7 @@ export interface MemtreeMcpDeps {
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
     /** This session's current tree id (for searches scoped to it on the server). */
-    currentId?(): Promise<string>;
+    currentId?(validatePage?: boolean): Promise<string>;
     /** Term search, formatted; optional so a plain index can stand in (tests). */
     search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
 }
@@ -213,7 +213,8 @@ export declare class CurrentTree implements TreeSource {
     private loadCurrent;
     private requireSessionId;
     /** The proxy's current page for the calling session; fails closed on any other session. */
-    currentId(): Promise<string>;
+    currentId(validatePage?: boolean): Promise<string>;
+    private checkSession;
     private getOther;
     /**
      * Fetch one page. ``sessionId`` (the current tree only) must match the page's

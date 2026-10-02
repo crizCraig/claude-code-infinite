@@ -255,8 +255,14 @@ export class CurrentTree {
             const base = proxyBase(this.deps);
             const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/search?${params}`);
             const parsed = answer.ok ? serverSearchHits(answer.body) : undefined;
-            if (parsed)
-                return formatSearchHits(parsed.hits, query, parsed.terms, other);
+            if (parsed) {
+                const session = answer.body.session_id;
+                if (!other && session !== undefined)
+                    this.checkSession(session, this.requireSessionId());
+                if (other || session !== undefined)
+                    return formatSearchHits(parsed.hits, query, parsed.terms, other);
+                // Older servers omit identity: search only the session-validated page.
+            }
             if (answer.status === 202) {
                 throw new ToolInputError("That MemTree is still being built; try again in a minute.");
             }
@@ -284,7 +290,7 @@ export class CurrentTree {
         return sessionId;
     }
     /** The proxy's current page for the calling session; fails closed on any other session. */
-    async currentId() {
+    async currentId(validatePage = false) {
         const base = proxyBase(this.deps);
         const sessionId = this.requireSessionId();
         const query = `?session=${encodeURIComponent(sessionId)}`;
@@ -301,7 +307,19 @@ export class CurrentTree {
         if (current.session_id !== sessionId) {
             throw new ToolInputError("MemTree unavailable: current page belongs to a different or unknown session");
         }
+        if (validatePage) {
+            const index = this.cached?.id === current.id ? this.cached.index
+                : await this.loadPage(current.id, "this session", sessionId);
+            this.checkSession(index.page.session_id, sessionId);
+            if (!isTemporaryPrefix(index, current.id))
+                this.cached = { id: current.id, index };
+        }
         return current.id;
+    }
+    checkSession(actual, expected) {
+        if (actual !== expected) {
+            throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
+        }
     }
     async getOther(id) {
         const hit = this.others.get(id);
@@ -331,8 +349,11 @@ export class CurrentTree {
         const retryAt = this.prefixRetryAt.get(id);
         if (retryAt !== undefined && retryAt > now) {
             const stored = this.prefixes.get(id);
-            if (stored)
+            if (stored) {
+                if (sessionId !== undefined)
+                    this.checkSession(stored.page.session_id, sessionId);
                 return stored;
+            }
             throw this.prefixRetryError(retryAt - now);
         }
         // If a previous prefix refresh failed, keep the same cooldown after that
@@ -394,6 +415,9 @@ export class SessionFinder {
     }
     async searchSessions(args, tree) {
         const body = await this.get(`/memtree/search${searchQuery(args, tree)}`, "search");
+        if (tree && (!body || typeof body !== "object" || body.tree !== tree)) {
+            throw new ToolInputError("search: server did not confirm the requested tree; update the MemTree server before scoped search");
+        }
         return formatSearchResults(body, { ...args, tree });
     }
     async get(pathAndQuery, tool) {
@@ -511,7 +535,7 @@ async function searchTool(args, tree, finder) {
         throw new ToolInputError("search across sessions is not available here");
     if (current && !tree.currentId)
         throw new ToolInputError("this session's tree is not available here");
-    const scope = current ? await tree.currentId() : named;
+    const scope = current ? await tree.currentId(true) : named;
     return finder.searchSessions(args, scope);
 }
 /** `{tree, id}` from a node address, or from tree (optional) and the numeric field. */
