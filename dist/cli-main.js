@@ -31,7 +31,7 @@ import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledB
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, } from "./config.js";
-import { repairStrandedResume } from "./resume-repair.js";
+import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -263,6 +263,7 @@ async function main() {
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
+    const transcriptUsage = new ClaudeTranscriptUsage();
     const proxy = await startProxy({
         memtree,
         debug: isDebugMode,
@@ -289,12 +290,16 @@ async function main() {
         // link is shown while the placement is being tried out; see ProxyOptions.
         memtreeLinkPlacement,
         memtreeLinkStore: new MemtreeLinkStore(),
-        transcriptUsage: new ClaudeTranscriptUsage(),
+        transcriptUsage,
         projectMeta,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
     reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext);
+    // The first request after a resume must count the whole session's thinking.
+    const resumedSession = resumeSessionId(claudeArgs);
+    if (resumedSession !== undefined)
+        transcriptUsage.catchUp(resumedSession);
     if (isDebugMode) {
         console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
         console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);

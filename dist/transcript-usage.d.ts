@@ -28,6 +28,13 @@ export declare class ClaudeTranscriptUsage implements TranscriptUsageSource {
     private readonly sessions;
     constructor(projectsDir?: string);
     usageFor(sessionId: string, messages: Message[], agentId?: string): MessageUsage;
+    /**
+     * Reads a session's transcript to its end now, off the request path. A
+     * lookup reads one bounded chunk, so without this the first requests after
+     * resuming a long session see only its oldest responses and undercount the
+     * thinking MemTree's budget check relies on. Best effort: never throws.
+     */
+    catchUp(sessionId: string): void;
     timesFor(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
     private indexFor;
 }

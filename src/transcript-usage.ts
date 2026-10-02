@@ -50,6 +50,11 @@ export type MessageTimes = Record<string, string>;
 
 /** Transcript bytes read per refresh; later calls pick up the rest. */
 const MAX_READ_BYTES = 1024 * 1024;
+/**
+ * The most catchUp reads in one go. Far above any session seen (10 MB); the
+ * cap only bounds a pathological file, which then finishes on later lookups.
+ */
+const MAX_CATCH_UP_BYTES = 256 * 1024 * 1024;
 /** Oversized JSONL entries are optional metadata; discard them without accumulating. */
 const MAX_LINE_BYTES = 1024 * 1024;
 
@@ -82,6 +87,26 @@ export class ClaudeTranscriptUsage implements TranscriptUsageSource {
       return index.match(messages);
     } catch {
       return {};
+    }
+  }
+
+  /**
+   * Reads a session's transcript to its end now, off the request path. A
+   * lookup reads one bounded chunk, so without this the first requests after
+   * resuming a long session see only its oldest responses and undercount the
+   * thinking MemTree's budget check relies on. Best effort: never throws.
+   */
+  catchUp(sessionId: string): void {
+    try {
+      const index = this.indexFor(sessionId);
+      let read = 0;
+      while (index && read < MAX_CATCH_UP_BYTES) {
+        const bytes = index.refresh();
+        if (bytes === 0) break;
+        read += bytes;
+      }
+    } catch {
+      // Lookups still read incrementally.
     }
   }
 
@@ -163,10 +188,11 @@ class TranscriptIndex {
 
   constructor(private readonly file: string) {}
 
-  refresh(): void {
+  /** Reads the next bounded chunk; returns the bytes read (0 at the end). */
+  refresh(): number {
     const size = fs.statSync(this.file).size;
     if (size < this.offset) this.reset(); // rewritten transcript
-    if (size === this.offset) return;
+    if (size === this.offset) return 0;
     const length = Math.min(size - this.offset, MAX_READ_BYTES);
     const buffer = Buffer.alloc(length);
     const fd = fs.openSync(this.file, "r");
@@ -182,7 +208,7 @@ class TranscriptIndex {
     let bytes = buffer.subarray(0, bytesRead);
     if (this.discardingOversizedLine) {
       const newline = bytes.indexOf(10);
-      if (newline < 0) return;
+      if (newline < 0) return bytesRead;
       bytes = bytes.subarray(newline + 1);
       this.discardingOversizedLine = false;
     }
@@ -205,6 +231,7 @@ class TranscriptIndex {
       // Copy only the tail, rather than retaining the whole read buffer.
       this.partial = Buffer.from(lines.subarray(start));
     }
+    return bytesRead;
   }
 
   match(messages: Message[]): MessageUsage {

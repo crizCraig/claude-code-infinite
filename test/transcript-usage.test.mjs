@@ -427,3 +427,22 @@ test("usage omits conflicting, unknown, and duplicate tool response claims", (t)
   const got = source.usageFor(SESSION, [message(tool("tool_a"), tool("tool_a2"))]);
   assert.equal(got[0].output_tokens, 10, "multiple tools in the same response are unambiguous");
 });
+
+test("catchUp reads a resumed transcript to its end before the first lookup", (t) => {
+  // 2026-10-02: the first request after resuming a 10 MB transcript saw only
+  // its first megabyte, so nearly all recent thinking went uncounted, MemTree
+  // judged the history under budget and it went out whole at 990k of 1M.
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filler = entry("old", [{ type: "text", text: "f".repeat(1000) }], usage(1, 0));
+  fs.writeFileSync(file, filler.repeat(Math.ceil((3 * TRANSCRIPT_READ_BUDGET) / filler.length)) +
+    entry("recent", [{ type: "text", text: "the latest answer" }], usage(50, 40)));
+  const messages = [{ role: "assistant", content: "the latest answer" }];
+
+  const bounded = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(bounded.usageFor(SESSION, messages), {}, "one lookup still reads one bounded chunk");
+
+  const resumed = new ClaudeTranscriptUsage(root);
+  resumed.catchUp(SESSION);
+  assert.equal(resumed.usageFor(SESSION, messages)["0"].thinking_tokens, 40);
+});
