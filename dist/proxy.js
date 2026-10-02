@@ -959,6 +959,10 @@ async function handleMessages(req, res, opts, upstream, state) {
     // epoch, system, and every prefix hash before any rewrite, so a retained
     // route can never graft onto an unrelated request; it can only match its
     // own conversation's extension or fail closed.
+    if (isFollowupUserTurn && isMainRequest && state.mainRouteOwnershipUncertain) {
+        sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
+        return;
+    }
     if (isFollowupUserTurn) {
         if (isMainRequest) {
             // Clears every lane before this request reserves the main lane in the
@@ -1143,7 +1147,8 @@ async function handleMessages(req, res, opts, upstream, state) {
             routedTool = false;
             routedBody = forwardBody;
             routeMiss = "superseded";
-            state.memoryRoutes.delete(requestRouteKey);
+            if (!state.mainRouteOwnershipUncertain)
+                state.memoryRoutes.delete(requestRouteKey);
         }
         if (routeMiss !== undefined)
             rec.routeMiss = routeMiss;

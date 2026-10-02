@@ -1494,7 +1494,7 @@ async function startMidTurnHarness(extraOpts = {}) {
     upstream.close();
     memtreeSrv.close();
   };
-  return { proxy, compressCalls, lastUpstream, close };
+  return { proxy, compressCalls, lastUpstream, upstreamCount: () => upstreamBodies.length, close };
 }
 
 test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-02 overflow)", async () => {
@@ -1604,6 +1604,10 @@ test("ambiguous route mismatch refuses instead of forwarding the full history", 
     const before = h.lastUpstream();
     await armMainTurn(h.proxy, "queued", "queued");
     await postHook(h.proxy, { hook_event_name: "Stop" });
+    const upstreamCount = h.upstreamCount();
+    await postMessages(h.proxy.port, followupTurn("unidentified queued owner"), headers);
+    assert.equal(h.upstreamCount(), upstreamCount, "unproven owner must not reach upstream");
+    assert.equal(h.lastUpstream(), before, "unproven plain-user ownership must not replace the route");
     const mismatch = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "tool");
     await postMessages(h.proxy.port, mismatch, headers);
     assert.equal(h.lastUpstream(), before, "no whole-history request may reach upstream");
