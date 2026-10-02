@@ -31,6 +31,7 @@ import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledB
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, } from "./config.js";
+import { repairStrandedResume } from "./resume-repair.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -293,6 +294,7 @@ async function main() {
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
+    reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext);
     if (isDebugMode) {
         console.log(`[DEBUG] Local proxy listening on http://127.0.0.1:${proxy.port}`);
         console.log(`[DEBUG] MemTree API: ${memtreeBaseUrl}`);
@@ -405,6 +407,25 @@ main().catch((err) => {
     process.exit(1);
 });
 /** `CCC_COMPACT_TARGET` ("500k", "20000", "off"): see cli-args.ts. */
+/**
+ * A resumed session whose last response was recorded past Claude Code's limit
+ * would refuse every prompt; lower that record first (resume-repair.ts).
+ * Never blocks the launch.
+ */
+function reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext) {
+    try {
+        const repair = repairStrandedResume(claudeArgs, { nativeOneMillionContext });
+        if (!repair)
+            return;
+        const k = (tokens) => `${Math.round(tokens / 1000)}k`;
+        console.log(`\x1b[2mThis session last recorded ${k(repair.recordedTokens)} tokens, past Claude ` +
+            `Code's limit; lowered to ${k(repair.loweredTokens)} so MemTree can compress the ` +
+            `next message. Backup: ${repair.backupPath}\x1b[0m\n`);
+    }
+    catch (err) {
+        console.error(`\x1b[2mCould not check the resumed session's size: ${String(err)}\x1b[0m`);
+    }
+}
 function defaultCompactTargetFromEnv(raw) {
     const { value, warning } = compactTargetFromEnv(raw, parseTokenCount, MEMTREE_COMPACT_MIN_TOKENS);
     if (warning)

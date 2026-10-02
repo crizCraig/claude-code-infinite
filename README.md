@@ -58,6 +58,14 @@ above a fixed 100k-token threshold, even when the active model has a 1M window
 and auto-compaction is disabled. `ccc` suppresses that resume-time
 recommendation as well; it does not disable the manual `/compact` command.
 
+A session whose last response was recorded within 10% of the model's window
+(for example one sent whole while MemTree was unavailable) would otherwise be
+refused locally with "Context limit reached" on every prompt after a resume.
+On `ccc --resume <id>`, `ccc` backs the transcript up to
+`~/.claude-code-infinite/transcript-backups/` and lowers that last response's
+recorded usage to half the window, so the next message is sent and MemTree
+compresses it.
+
 To restore Claude Code's native auto-compaction setting for one invocation, use:
 
 ```bash
