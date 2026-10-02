@@ -176,7 +176,7 @@ test("CurrentTree follows the proxy's current page and caches it until the page 
   await assert.rejects(new CurrentTree({}).get(), /need a running ccc session/);
 });
 
-test("CurrentTree returns prefixes transiently, throttles refreshes, then caches completion", async () => {
+test("CurrentTree serves a prefix through its cooldown, refreshes after it, then caches completion", async () => {
   let now = 0;
   let pageFetches = 0;
   let complete = false;
@@ -197,9 +197,9 @@ test("CurrentTree returns prefixes transiently, throttles refreshes, then caches
   assert.equal(first.nodes.size, PAGE.nodes.length);
   assert.equal(concurrent, first, "concurrent callers share one fetch sequence");
   assert.equal(pageFetches, 1);
-  await assert.rejects(tree.get(), /temporary prefix.*45 seconds/);
+  assert.equal(await tree.get(), first, "the last prefix is served during its cooldown");
   now = 44_999;
-  await assert.rejects(tree.get(), /temporary prefix.*1 second/);
+  assert.equal(await tree.get(), first);
   assert.equal(pageFetches, 1, "the prefix is not fetched again during its cooldown");
 
   now = 45_000;
@@ -208,6 +208,24 @@ test("CurrentTree returns prefixes transiently, throttles refreshes, then caches
   assert.equal(pageFetches, 2);
   await tree.get();
   assert.equal(pageFetches, 2, "only the completed page is cached");
+});
+
+test("CurrentTree keeps at most four stored prefixes; an evicted one waits out its cooldown", async () => {
+  let pageFetches = 0;
+  const tree = new CurrentTree({
+    proxyUrl: "http://mock",
+    now: () => 0,
+    fetch: async () => {
+      pageFetches++;
+      return Response.json({ ...PAGE, served_prefix: true });
+    },
+  });
+  for (const id of ["p1", "p2", "p3", "p4", "p5"]) await tree.get(id);
+  assert.equal(pageFetches, 5);
+  await tree.get("p5");
+  assert.equal(pageFetches, 5, "a stored prefix is served without a fetch");
+  await assert.rejects(tree.get("p1"), /temporary prefix.*45 seconds/, "evicted: no copy to serve");
+  assert.equal(pageFetches, 5, "and no fetch before its cooldown ends");
 });
 
 test("CurrentTree keeps prefix cooldown after a failed refresh and fetches a changed id immediately", async () => {
@@ -232,16 +250,19 @@ test("CurrentTree keeps prefix cooldown after a failed refresh and fetches a cha
   await tree.get();
   now = 45_000;
   failRefresh = true;
-  await assert.rejects(tree.get(), /HTTP 503/);
-  failRefresh = false;
-  await assert.rejects(tree.get(), /temporary prefix.*45 seconds/);
+  const prefix = await (async () => {
+    await assert.rejects(tree.get(), /HTTP 503/);
+    failRefresh = false;
+    return tree.get();
+  })();
+  assert.equal(prefix.nodes.size, PAGE.nodes.length, "the stored prefix is served after a failed refresh");
   assert.equal(pageFetches, 2, "a failed refresh still starts a new cooldown");
 
   current = "page-b";
   assert.equal((await tree.get()).nodes.size, PAGE.nodes.length);
   assert.equal(pageFetches, 3, "a new current id can be fetched immediately");
   current = "page-a";
-  await assert.rejects(tree.get(), /temporary prefix.*45 seconds/, "cooldown is tracked per page id");
+  assert.equal(await tree.get(), prefix, "cooldown and stored prefix are tracked per page id");
   assert.equal(pageFetches, 3);
 });
 

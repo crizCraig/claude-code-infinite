@@ -293,6 +293,8 @@ export class CurrentTree implements TreeSource {
   private cached?: { id: string; index: MemtreeIndex };
   /** Temporary prefix pages: when each may be fetched again. */
   private readonly prefixRetryAt = new Map<string, number>();
+  /** The last fetched temporary prefix per page, served during its cooldown. */
+  private readonly prefixes = new Map<string, MemtreeIndex>();
   private inFlight?: Promise<MemtreeIndex>;
   /** Other trees, least recently used first. */
   private readonly others = new Map<string, MemtreeIndex>();
@@ -400,14 +402,18 @@ export class CurrentTree implements TreeSource {
 
   /**
    * Fetch one page. ``sessionId`` (the current tree only) must match the page's
-   * session. A temporary prefix is returned but not cached by the callers, and
-   * is refetched at most every PREFIX_RETRY_INTERVAL_MS, so successive tools
-   * cannot hammer the page endpoint.
+   * session. A temporary prefix (the newest completed tree for an earlier part
+   * of the conversation, shown until the request's own tree is built) is not
+   * cached for good: it is refetched at most every PREFIX_RETRY_INTERVAL_MS, and
+   * the last copy is served in between, so successive tools neither hammer the
+   * page endpoint nor get an error for a tree they could read.
    */
   private async loadPage(id: string, label: string, sessionId?: string): Promise<MemtreeIndex> {
     const now = this.now();
     const retryAt = this.prefixRetryAt.get(id);
     if (retryAt !== undefined && retryAt > now) {
+      const stored = this.prefixes.get(id);
+      if (stored) return stored;
       throw this.prefixRetryError(retryAt - now);
     }
     // If a previous prefix refresh failed, keep the same cooldown after that
@@ -430,6 +436,12 @@ export class CurrentTree implements TreeSource {
     const index = new MemtreeIndex(json);
     if (isTemporaryPrefix(index, id)) {
       this.prefixRetryAt.set(id, this.now() + PREFIX_RETRY_INTERVAL_MS);
+      this.prefixes.delete(id);
+      this.prefixes.set(id, index);
+      // Each page can be several MB: keep only the most recent few.
+      while (this.prefixes.size > OTHER_TREES_CACHED) {
+        this.prefixes.delete(this.prefixes.keys().next().value!);
+      }
       // Keep the map small if a long-lived MCP process sees many page ids.
       if (this.prefixRetryAt.size > 64) {
         const oldest = this.prefixRetryAt.keys().next().value;
@@ -438,6 +450,7 @@ export class CurrentTree implements TreeSource {
       return index;
     }
     this.prefixRetryAt.delete(id);
+    this.prefixes.delete(id);
     return index;
   }
 
