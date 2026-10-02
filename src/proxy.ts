@@ -328,6 +328,21 @@ interface ProxyState {
    */
   mainPromptDelivered: boolean;
   mainPromptGeneration: number;
+  /**
+   * True from an armed main UserPromptSubmit until its matching Stop. A main
+   * UserPromptSubmit while this is set is a prompt typed mid-turn: Claude Code
+   * fires the hook at once but delivers the text inside a <system-reminder>
+   * beside the next tool_result, so no request ever owns it as a turn.
+   */
+  mainTurnActive: boolean;
+  /**
+   * A prompt whose UserPromptSubmit arrived mid-turn, held instead of armed.
+   * It is armed only if a main request later carries it as a plain user turn
+   * (Claude Code skips Stop on an interrupt, so a real next prompt can look
+   * mid-turn here). Arming at the hook cleared the route the running tool
+   * loop rides, and nothing rebuilt it (2026-10-02 overflow).
+   */
+  deferredMainPrompt?: { id?: string; text?: string };
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
   /**
@@ -704,6 +719,38 @@ function firstNonEmptyHeader(
  * per-human-turn reset, without which a lane's backoff or awaiting-index
  * mark would carry into the next human turn.
  */
+/**
+ * A main human turn begins: arm the prompt for this boundary's request and
+ * clear the previous turn's routes.
+ */
+function armMainPrompt(
+  state: ProxyState,
+  promptId: string | undefined,
+  prompt: string | undefined
+): void {
+  state.mainPromptArmed = true;
+  state.mainPromptId = promptId;
+  state.mainPromptText = prompt;
+  state.mainPromptDelivered = false;
+  state.mainPromptGeneration++;
+  state.mainTurnActive = true;
+  state.deferredMainPrompt = undefined;
+  bumpRouteEpoch(state);
+  state.recoveryBudgetWipedForBoundary = true;
+  state.notices.clearForUserRequest();
+}
+
+/** Arms a mid-turn-deferred prompt once a plain user turn proves it a new turn. */
+function armDeferredPromptIfCarried(
+  state: ProxyState,
+  lastMsg: Message | undefined
+): void {
+  const deferred = state.deferredMainPrompt;
+  if (deferred?.text === undefined) return;
+  if (!messageCarriesPromptText(lastMsg, deferred.text)) return;
+  armMainPrompt(state, deferred.id, deferred.text);
+}
+
 function bumpRouteEpoch(
   state: ProxyState,
   keepRecoveryBudget = false
@@ -776,6 +823,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     recoveryBudgetWipedForBoundary: false,
     mainPromptDelivered: true,
     mainPromptGeneration: 0,
+    mainTurnActive: false,
     activeSubagents: new Set(),
     memoryRoutes: new Map(),
     mainRouteEpoch: 0,
@@ -1200,14 +1248,11 @@ async function handleNoticeHook(
       return;
     }
     if (parsed.agent_id === undefined) {
-      state.mainPromptArmed = true;
-      state.mainPromptId = parsed.prompt_id;
-      state.mainPromptText = parsed.prompt;
-      state.mainPromptDelivered = false;
-      state.mainPromptGeneration++;
-      bumpRouteEpoch(state);
-      state.recoveryBudgetWipedForBoundary = true;
-      state.notices.clearForUserRequest();
+      if (state.mainTurnActive) {
+        state.deferredMainPrompt = { id: parsed.prompt_id, text: parsed.prompt };
+      } else {
+        armMainPrompt(state, parsed.prompt_id, parsed.prompt);
+      }
     }
     res.writeHead(204);
     res.end();
@@ -1231,12 +1276,14 @@ async function handleNoticeHook(
     parsed.agent_id === undefined &&
     (state.mainPromptId === undefined ||
       parsed.prompt_id === undefined ||
-      state.mainPromptId === parsed.prompt_id);
+      state.mainPromptId === parsed.prompt_id ||
+      state.deferredMainPrompt?.id === parsed.prompt_id);
   const output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
       ? null
       : state.notices.claim(parsed);
   if (stopMatchesMainPrompt) {
+    state.mainTurnActive = false;
     state.mainPromptArmed = false;
     state.mainPromptId = undefined;
     state.mainPromptText = undefined;
@@ -1469,6 +1516,9 @@ async function handleMessages(
   const isSubagentRequest = requestRouteLane === "agent";
   const isMainRequest = requestRouteLane === "main";
   rec.routeLane = requestRouteLane;
+  if (isMainRequest && !isAwaySummary && isUserTurn) {
+    armDeferredPromptIfCarried(state, lastMsg);
+  }
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
   const clientMeta = memtreeClientMeta({

@@ -193,6 +193,31 @@ function firstNonEmptyHeader(req, name) {
  * per-human-turn reset, without which a lane's backoff or awaiting-index
  * mark would carry into the next human turn.
  */
+/**
+ * A main human turn begins: arm the prompt for this boundary's request and
+ * clear the previous turn's routes.
+ */
+function armMainPrompt(state, promptId, prompt) {
+    state.mainPromptArmed = true;
+    state.mainPromptId = promptId;
+    state.mainPromptText = prompt;
+    state.mainPromptDelivered = false;
+    state.mainPromptGeneration++;
+    state.mainTurnActive = true;
+    state.deferredMainPrompt = undefined;
+    bumpRouteEpoch(state);
+    state.recoveryBudgetWipedForBoundary = true;
+    state.notices.clearForUserRequest();
+}
+/** Arms a mid-turn-deferred prompt once a plain user turn proves it a new turn. */
+function armDeferredPromptIfCarried(state, lastMsg) {
+    const deferred = state.deferredMainPrompt;
+    if (deferred?.text === undefined)
+        return;
+    if (!messageCarriesPromptText(lastMsg, deferred.text))
+        return;
+    armMainPrompt(state, deferred.id, deferred.text);
+}
 function bumpRouteEpoch(state, keepRecoveryBudget = false) {
     const epoch = ++state.mainRouteEpoch;
     state.routeDecisionsLive.clear();
@@ -251,6 +276,7 @@ export function startProxy(opts) {
         recoveryBudgetWipedForBoundary: false,
         mainPromptDelivered: true,
         mainPromptGeneration: 0,
+        mainTurnActive: false,
         activeSubagents: new Set(),
         memoryRoutes: new Map(),
         mainRouteEpoch: 0,
@@ -611,14 +637,12 @@ async function handleNoticeHook(req, res, state, reqlog) {
             return;
         }
         if (parsed.agent_id === undefined) {
-            state.mainPromptArmed = true;
-            state.mainPromptId = parsed.prompt_id;
-            state.mainPromptText = parsed.prompt;
-            state.mainPromptDelivered = false;
-            state.mainPromptGeneration++;
-            bumpRouteEpoch(state);
-            state.recoveryBudgetWipedForBoundary = true;
-            state.notices.clearForUserRequest();
+            if (state.mainTurnActive) {
+                state.deferredMainPrompt = { id: parsed.prompt_id, text: parsed.prompt };
+            }
+            else {
+                armMainPrompt(state, parsed.prompt_id, parsed.prompt);
+            }
         }
         res.writeHead(204);
         res.end();
@@ -640,11 +664,13 @@ async function handleNoticeHook(req, res, state, reqlog) {
         parsed.agent_id === undefined &&
         (state.mainPromptId === undefined ||
             parsed.prompt_id === undefined ||
-            state.mainPromptId === parsed.prompt_id);
+            state.mainPromptId === parsed.prompt_id ||
+            state.deferredMainPrompt?.id === parsed.prompt_id);
     const output = parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
         ? null
         : state.notices.claim(parsed);
     if (stopMatchesMainPrompt) {
+        state.mainTurnActive = false;
         state.mainPromptArmed = false;
         state.mainPromptId = undefined;
         state.mainPromptText = undefined;
@@ -854,6 +880,9 @@ async function handleMessages(req, res, opts, upstream, state) {
     const isSubagentRequest = requestRouteLane === "agent";
     const isMainRequest = requestRouteLane === "main";
     rec.routeLane = requestRouteLane;
+    if (isMainRequest && !isAwaySummary && isUserTurn) {
+        armDeferredPromptIfCarried(state, lastMsg);
+    }
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
     const clientMeta = memtreeClientMeta({

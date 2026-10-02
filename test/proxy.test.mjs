@@ -1446,6 +1446,130 @@ test("prompt substring inside a tool wrapper's system-reminder must not consume 
   }
 });
 
+/** Claude Code 2.1.284's shape for a prompt typed while the turn is running. */
+const midTurnReminder = (prompt) =>
+  "<system-reminder>\nThe user sent a new message while you were working:\n" +
+  `${prompt}\n\nThis is how Claude Code surfaces messages the user sends mid-turn ` +
+  "— within the running turn, often alongside the next tool result, rather " +
+  "than as a separate conversation turn. Address the message above as you " +
+  "continue this turn.\n</system-reminder>";
+
+/** Appends one tool_use/tool_result round; extra parts ride the result wrapper. */
+const withToolRound = (messages, id, extraParts = []) => [
+  ...messages,
+  { role: "assistant", content: [{ type: "tool_use", id, name: "x", input: {} }] },
+  {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: id, content: "ok" }, ...extraParts],
+  },
+];
+
+async function startMidTurnHarness(extraOpts = {}) {
+  const upstreamBodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context" }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    ...extraOpts,
+  });
+  const compressCalls = () => memtreeSrv.calls.filter((c) => c.index_only !== true).length;
+  const lastUpstream = () => JSON.stringify(upstreamBodies.at(-1).messages);
+  const close = () => {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  };
+  return { proxy, compressCalls, lastUpstream, close };
+}
+
+test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-02 overflow)", async () => {
+  // Incident: the user typed while the main turn was running. UserPromptSubmit
+  // fired at once and cleared the route; Claude Code then delivered the text
+  // inside a <system-reminder> next to the next tool_result, which the
+  // merged-prompt matcher ignores. Recovery stayed transform-only under the
+  // armed window, its retry was spent, and every later tool turn forwarded
+  // the full history until the conversation hit the 1M window. Compaction
+  // off: the session's stable prefix would otherwise carry the tool loop.
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    assert.equal(h.compressCalls(), 1, "the followup compresses and installs a route");
+
+    const round1 = withToolRound(base, "t1");
+    await postMessages(h.proxy.port, round1, headers);
+    assert.match(h.lastUpstream(), /compressed context/, "tool turn rides the route");
+
+    await postHook(h.proxy, {
+      hook_event_name: "UserPromptSubmit",
+      prompt: "do both?",
+      prompt_id: "prompt-midturn",
+    });
+    const round2 = withToolRound(round1, "t2", [
+      { type: "text", text: midTurnReminder("do both?") },
+    ]);
+    await postMessages(h.proxy.port, round2, headers);
+    assert.match(h.lastUpstream(), /compressed context/, "mid-turn prompt rides the route");
+    assert.doesNotMatch(h.lastUpstream(), /first question/, "no full-history passthrough");
+    assert.match(h.lastUpstream(), /do both\?/, "the typed prompt still reaches the model");
+
+    await postMessages(h.proxy.port, withToolRound(round2, "t3"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "later tool turns keep riding");
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.equal(h.compressCalls(), 1, "a mid-turn prompt needs no blocking compress");
+  } finally {
+    h.close();
+  }
+});
+
+test("a prompt deferred as mid-turn still owns its own turn when Stop never came", async () => {
+  // Claude Code skips Stop on an interrupt, so a real next prompt can look
+  // mid-turn to the hook. It is deferred, then armed by the request that
+  // carries it as a plain user turn: it compresses and its tool loop rides.
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    const round1 = withToolRound(base, "t1");
+    await postMessages(h.proxy.port, round1, headers);
+
+    await armMainTurn(h.proxy, "turn three", "prompt-three");
+    const next = [
+      ...round1,
+      { role: "assistant", content: [{ type: "text", text: "interrupted" }] },
+      { role: "user", content: "turn three" },
+    ];
+    await postMessages(h.proxy.port, next, headers);
+    assert.equal(h.compressCalls(), 2, "the real next prompt compresses");
+    assert.match(h.lastUpstream(), /compressed context/);
+
+    await postMessages(h.proxy.port, withToolRound(next, "t4"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "its tool loop rides the new route");
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+  } finally {
+    h.close();
+  }
+});
+
 test("retried recovery turn after an upstream 529 still compresses instead of sticky passthrough", async () => {
   // The failure this pins down: the recovery wrapper is classified and
   // compressed, but the display arm is consumed before forwarding. When the
@@ -2397,7 +2521,7 @@ test("hidden away-summary queues nothing and cannot disarm an overlapping human 
   }
 });
 
-test("new UserPromptSubmit during async compression discards the old turn's notice", async () => {
+test("a replacement prompt's own turn discards the old turn's late notice", async () => {
   const upstream = await mockUpstream();
   let releaseFirst;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
@@ -2420,7 +2544,9 @@ test("new UserPromptSubmit during async compression discards the old turn's noti
         usage: {
           prompt_tokens: 200_000,
           completion_tokens: 100_000,
-          prompt_tokens_details: { cached_tokens: 1 },
+          // Growing coverage: the repeat-notice dedup must not mask the
+          // replacement turn's own notice.
+          prompt_tokens_details: { cached_tokens: compressCalls },
         },
       }));
     });
@@ -2432,17 +2558,18 @@ test("new UserPromptSubmit during async compression discards the old turn's noti
     const oldRequest = postMessages(proxy.port, followupTurn("old prompt"));
     await waitFor(() => compressCalls === 1);
 
-    // This clears/replaces delivery state while the old MemTree call is still
-    // in flight. Its eventual completion must not reinsert a stale notice.
+    // No Stop yet, so the hook defers this prompt as possibly mid-turn; its
+    // own request below arms it (an interrupt skips Stop). That arm replaces
+    // delivery state, so the old turn's late completion cannot surface.
     await armMainTurn(proxy, "new prompt", "prompt-new");
     releaseFirst();
     await oldRequest;
+
+    await postMessages(proxy.port, followupTurn("new prompt"));
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-old" }))).status,
       204
     );
-
-    await postMessages(proxy.port, followupTurn("new prompt"));
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-new" }))).status,
       200,
