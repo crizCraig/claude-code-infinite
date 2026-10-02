@@ -655,6 +655,8 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
   for (const description of [MEMTREE_MCP_INSTRUCTIONS, search.description]) {
     assert.match(description, /text.*default/i);
     assert.match(description, /address/i);
+    assert.match(description, /address.*unavailable|unavailable.*address/i);
+    assert.match(description, /range/i);
     assert.match(description, /first page.*charged/i);
     assert.match(description, /cached/i);
     assert.match(description, /cursor continuation.*free/i);

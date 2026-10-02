@@ -73,7 +73,7 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "sessions (use that when the user refers to earlier work that is not in this session), and list shows those " +
     "sessions by time and project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
     "meaning: its first page is charged even when the query embedding is cached; cursor continuation is free, " +
-    "including when the embedding must be regenerated. Every hit has an address (<tree>#<node>) and its path from the root: " +
+    "including when the embedding must be regenerated. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
     "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
     "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
     "frozen snapshot.";
@@ -86,7 +86,7 @@ export const MEMTREE_TOOLS = [
             "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
             "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
-            "Each hit gives its node address (<tree>#<node>), its path from the root and a snippet.",
+            "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range.",
         inputSchema: {
             type: "object",
             properties: {
