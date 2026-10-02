@@ -1570,6 +1570,48 @@ test("a prompt deferred as mid-turn still owns its own turn when Stop never came
   }
 });
 
+test("queued prompts before Stop keep the compressed route for tool wrappers", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    for (const prompt of ["first queued", "second queued"]) {
+      await armMainTurn(h.proxy, prompt, prompt);
+    }
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    const next = withToolRound(base, "late-tool", [
+      { type: "text", text: "first queued" },
+      { type: "text", text: midTurnReminder("second queued") },
+    ]);
+    await postMessages(h.proxy.port, next, headers);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.match(h.lastUpstream(), /first queued/);
+    assert.match(h.lastUpstream(), /second queued/);
+    assert.equal(h.compressCalls(), 1);
+  } finally { h.close(); }
+});
+
+test("ambiguous route mismatch refuses instead of forwarding the full history", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    const before = h.lastUpstream();
+    await armMainTurn(h.proxy, "queued", "queued");
+    await postHook(h.proxy, { hook_event_name: "Stop" });
+    const mismatch = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "tool");
+    await postMessages(h.proxy.port, mismatch, headers);
+    assert.equal(h.lastUpstream(), before, "no whole-history request may reach upstream");
+    await postMessages(h.proxy.port, withToolRound(base, "valid-tool"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "uncertain mismatch must keep the route");
+  } finally { h.close(); }
+});
+
 test("retried recovery turn after an upstream 529 still compresses instead of sticky passthrough", async () => {
   // The failure this pins down: the recovery wrapper is classified and
   // compressed, but the display arm is consumed before forwarding. When the

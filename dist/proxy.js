@@ -205,6 +205,7 @@ function armMainPrompt(state, promptId, prompt) {
     state.mainPromptGeneration++;
     state.mainTurnActive = true;
     state.deferredMainPrompt = undefined;
+    state.mainRouteOwnershipUncertain = false;
     bumpRouteEpoch(state);
     state.recoveryBudgetWipedForBoundary = true;
     state.notices.clearForUserRequest();
@@ -277,6 +278,7 @@ export function startProxy(opts) {
         mainPromptDelivered: true,
         mainPromptGeneration: 0,
         mainTurnActive: false,
+        mainRouteOwnershipUncertain: false,
         activeSubagents: new Set(),
         memoryRoutes: new Map(),
         mainRouteEpoch: 0,
@@ -639,6 +641,7 @@ async function handleNoticeHook(req, res, state, reqlog) {
         if (parsed.agent_id === undefined) {
             if (state.mainTurnActive) {
                 state.deferredMainPrompt = { id: parsed.prompt_id, text: parsed.prompt };
+                state.mainRouteOwnershipUncertain = true;
             }
             else {
                 armMainPrompt(state, parsed.prompt_id, parsed.prompt);
@@ -670,6 +673,8 @@ async function handleNoticeHook(req, res, state, reqlog) {
         ? null
         : state.notices.claim(parsed);
     if (stopMatchesMainPrompt) {
+        const ownsTurn = parsed.prompt_id !== undefined && parsed.prompt_id === state.mainPromptId;
+        state.mainRouteOwnershipUncertain ||= !ownsTurn || state.deferredMainPrompt !== undefined;
         state.mainTurnActive = false;
         state.mainPromptArmed = false;
         state.mainPromptId = undefined;
@@ -678,7 +683,8 @@ async function handleNoticeHook(req, res, state, reqlog) {
         // Invalidate a response still in flight at Stop. Otherwise its late
         // delivery callback could enqueue a notice after Stop returned.
         state.mainPromptGeneration++;
-        bumpRouteEpoch(state);
+        if (!state.mainRouteOwnershipUncertain)
+            bumpRouteEpoch(state);
         // The boundary this flag described is over; a followup arriving before
         // the next UserPromptSubmit is a new hookless boundary and must wipe.
         state.recoveryBudgetWipedForBoundary = false;
@@ -1107,7 +1113,9 @@ async function handleMessages(req, res, opts, upstream, state) {
                     // A matching route that outgrew the request's resolved window must
                     // also rebuild; a smaller window lifts the lane's backoff.
                     routeMiss = "rejected";
-                    state.memoryRoutes.delete(requestRouteKey);
+                    if (!isMainRequest || !state.mainRouteOwnershipUncertain) {
+                        state.memoryRoutes.delete(requestRouteKey);
+                    }
                     if (overContextWindow) {
                         regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
                     }
@@ -1271,6 +1279,11 @@ async function handleMessages(req, res, opts, upstream, state) {
                     rec.compaction.keptPrefix = true;
                 }
             }
+        }
+        if (isMainRequest && state.mainRouteOwnershipUncertain && !toolRide &&
+            (isToolResultTurn || isContinuationTurn)) {
+            sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
+            return;
         }
         const sendBody = toolRide?.raw ?? (toolNeedsOriginal ? rawBody : forwardBody);
         recordTurn(rec, toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool", sendBody);
