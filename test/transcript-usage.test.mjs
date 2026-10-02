@@ -21,6 +21,24 @@ const usage = (out, think, input = 1) => ({
   cache_read_input_tokens: 100, cache_creation_input_tokens: 5,
 });
 
+test("catch-up consumes a complete EOF record once, but waits for incomplete JSON", () => {
+  const { root, file } = transcriptDir();
+  const content = [{ type: "text", text: "complete EOF answer" }];
+  const line = entry("eof", content, usage(20, 10)).trimEnd();
+  fs.writeFileSync(file, line.slice(0, -1));
+  const source = new ClaudeTranscriptUsage(root);
+  const messages = [{ role: "assistant", content }];
+  source.catchUp(SESSION);
+  assert.deepEqual(source.usageFor(SESSION, messages), {});
+  fs.appendFileSync(file, "}");
+  source.catchUp(SESSION);
+  assert.equal(source.usageFor(SESSION, messages)[0].thinking_tokens, 10);
+  fs.appendFileSync(file, "\n" + entry("next", [{ type: "text", text: "next" }], usage(30, 15)));
+  source.catchUp(SESSION);
+  assert.equal(source.usageFor(SESSION, messages)[0].thinking_tokens, 10,
+    "the newline must not append the EOF response's text a second time");
+});
+
 test("each assistant message gets its response's usage, by tool id or text", () => {
   const { root, file } = transcriptDir();
   // Claude Code writes one entry per content block; the last carries final usage.

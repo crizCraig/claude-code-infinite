@@ -171,6 +171,7 @@ export function findTranscript(
 class TranscriptIndex {
   private offset = 0;
   private partial: Buffer = Buffer.alloc(0);
+  /** Skip to newline after an oversized line or a complete EOF record already ingested. */
   private discardingOversizedLine = false;
   /** Response message id → its usage (the largest seen: entries repeat it). */
   private readonly usageById = new Map<string, ResponseUsage>();
@@ -230,8 +231,22 @@ class TranscriptIndex {
     } else if (remaining) {
       // Copy only the tail, rather than retaining the whole read buffer.
       this.partial = Buffer.from(lines.subarray(start));
+      if (this.offset === size) this.ingestCompleteEof();
     }
     return bytesRead;
+  }
+
+  private ingestCompleteEof(): void {
+    const line = this.partial.toString("utf-8");
+    try {
+      JSON.parse(line);
+    } catch {
+      return; // A writer may still be appending this JSON record.
+    }
+    this.ingest(line);
+    this.partial = Buffer.alloc(0);
+    // A later newline terminates this same record; don't ingest it twice.
+    this.discardingOversizedLine = true;
   }
 
   match(messages: Message[]): MessageUsage {
