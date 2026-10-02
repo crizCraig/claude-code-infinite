@@ -14,13 +14,26 @@ function response(id, model, usage, text = "ok") {
   };
 }
 
-const usage = (cacheRead, cacheCreation = 0, output = 100) => ({
+const buckets = (cacheRead, cacheCreation, output) => ({
   input_tokens: 2,
   cache_read_input_tokens: cacheRead,
   cache_creation_input_tokens: cacheCreation,
   cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: cacheCreation },
   output_tokens: output,
 });
+
+/** Claude Code 2.1.287's shape: the top-level totals plus per-iteration usage. */
+const usage = (cacheRead, cacheCreation = 0, output = 100) => ({
+  ...buckets(cacheRead, cacheCreation, output),
+  iterations: [{ ...buckets(cacheRead, cacheCreation, output), type: "message" }],
+});
+
+/** Context as Claude Code counts it: the last message iteration when present. */
+function countedTokens(u) {
+  const last = u.iterations?.findLast((i) => i.type === "message") ?? u;
+  return last.input_tokens + last.cache_read_input_tokens +
+    last.cache_creation_input_tokens + last.output_tokens;
+}
 
 /** A projects dir holding one session transcript; returns paths and a cleanup. */
 function fixture(entries) {
@@ -76,8 +89,10 @@ test("a session stranded past the window is lowered to half of it, with a backup
     const after = readEntries(file);
     for (const index of [2, 3]) {
       const u = after[index].message.usage;
+      assert.equal(countedTokens(u), 500_000 + 1_399, "Claude Code counts the lowered size");
       assert.equal(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens, 500_000);
       assert.equal(u.cache_creation.ephemeral_1h_input_tokens, 0);
+      assert.equal(u.iterations[0].cache_creation.ephemeral_1h_input_tokens, 0);
       assert.equal(u.output_tokens, 1_399);
       assert.equal(after[index].message.content[0].text, entries[index].message.content[0].text);
     }
@@ -90,7 +105,10 @@ test("a session stranded past the window is lowered to half of it, with a backup
 test("a session that still fits, an unknown shape, or a missing transcript is left alone", () => {
   const cases = [
     [response("m", "claude-opus-5-5", usage(600_000))],
-    [response("m", "claude-opus-5-5", { ...usage(990_000), output_tokens: "many" })],
+    [response("m", "claude-opus-5-5", {
+      ...usage(990_000),
+      iterations: [{ ...buckets(990_000, 0, 100), output_tokens: "many", type: "message" }],
+    })],
   ];
   for (const entries of cases) {
     const { file, options, cleanup } = fixture(entries);
@@ -119,6 +137,21 @@ test("the stranded size follows the model's window, not a fixed number", () => {
     const result = repairStrandedResume(["-r", SESSION], options);
     assert.equal(result.loweredTokens, 100_000, "a 200k model lowers to half its window");
     assert.equal(readEntries(file)[0].message.usage.input_tokens, 100_000);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a usage whose last iteration still records the stranded size is lowered too", () => {
+  // The state an earlier repair left: top-level totals lowered, the iteration
+  // Claude Code actually counts still at 977k.
+  const u = usage(971_850, 5_933, 1_399);
+  Object.assign(u, { input_tokens: 500_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+  const { file, options, cleanup } = fixture([response("m", "claude-opus-5-5", u)]);
+  try {
+    const result = repairStrandedResume(["--resume", SESSION], options);
+    assert.equal(result.recordedTokens, 2 + 971_850 + 5_933 + 1_399);
+    assert.equal(countedTokens(readEntries(file)[0].message.usage), 500_000 + 1_399);
   } finally {
     cleanup();
   }

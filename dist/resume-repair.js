@@ -117,27 +117,50 @@ function assistantMessage(line) {
         return undefined;
     return message;
 }
-/** What Claude Code counts as the context: every input bucket plus the output. */
+/**
+ * What Claude Code counts as the context: every input bucket plus the output,
+ * taken from the last message iteration when the usage has one (Claude Code
+ * 2.1.287's Nue), else from the top-level totals.
+ */
 function recordedSize(usage) {
-    const keys = [
-        "input_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-        "output_tokens",
-    ];
+    const counted = countedIteration(usage) ?? usage;
     let total = 0;
-    for (const key of keys) {
-        const value = usage[key] ?? 0;
+    for (const key of BUCKETS) {
+        const value = counted[key] ?? 0;
         if (typeof value !== "number" || !Number.isFinite(value))
             return undefined;
         total += value;
     }
     return total;
 }
-/** Moves the whole recorded input into input_tokens at the lowered size. */
+const BUCKETS = [
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+];
+/** Iteration kinds that carry a request's own context, as Claude Code reads them. */
+const MESSAGE_ITERATIONS = new Set(["message", "fallback_message"]);
+function countedIteration(usage) {
+    if (!Array.isArray(usage.iterations))
+        return undefined;
+    const last = usage.iterations.findLast((it) => it?.type !== "advisor_message" && it?.type !== "compaction");
+    return MESSAGE_ITERATIONS.has(last?.type) ? last : undefined;
+}
+/** Moves the whole recorded input into input_tokens at the lowered size, iterations too. */
 function lowerUsage(line, loweredTokens) {
     const entry = JSON.parse(line);
     const usage = entry.message.usage;
+    lowerBuckets(usage, loweredTokens);
+    if (Array.isArray(usage.iterations)) {
+        for (const iteration of usage.iterations) {
+            if (MESSAGE_ITERATIONS.has(iteration?.type))
+                lowerBuckets(iteration, loweredTokens);
+        }
+    }
+    return JSON.stringify(entry);
+}
+function lowerBuckets(usage, loweredTokens) {
     usage.input_tokens = loweredTokens;
     usage.cache_read_input_tokens = 0;
     usage.cache_creation_input_tokens = 0;
@@ -147,7 +170,6 @@ function lowerUsage(line, loweredTokens) {
                 usage.cache_creation[key] = 0;
         }
     }
-    return JSON.stringify(entry);
 }
 function backupTranscript(file, sessionId, options) {
     const dir = options.backupDir ?? path.join(getConfigDir(), "transcript-backups");
