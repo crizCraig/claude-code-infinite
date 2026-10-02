@@ -1,3 +1,4 @@
+import type { ProjectMeta } from "./project-meta.js";
 import { createHash } from "node:crypto";
 /**
  * What Claude Code says about a request in its billing header, for telling
@@ -229,6 +230,11 @@ export interface MemtreeClientMeta {
   agent_id?: string;
   parent_agent_id?: string;
   requested_model?: string;
+  /** The session's project (project-meta.ts), for the sessions list's project filter. */
+  project_dir?: string;
+  git_repo?: string;
+  git_branch?: string;
+  git_commit?: string;
 }
 
 const META_VALUE = /^[\x20-\x7e]{1,128}$/;
@@ -239,8 +245,14 @@ export function memtreeClientMeta(input: {
   agentId?: string;
   parentAgentId?: string;
   model?: unknown;
+  /** Read once at startup (project-meta.ts); the same for every request. */
+  project?: ProjectMeta;
 }): MemtreeClientMeta {
   const candidate: Record<string, unknown> = {
+    project_dir: input.project?.project_dir,
+    git_repo: input.project?.git_repo,
+    git_branch: input.project?.git_branch,
+    git_commit: input.project?.git_commit,
     claude_code_version: input.info?.ccVersion,
     entrypoint: input.info?.entrypoint,
     turn_origin: input.info?.turnOrigin,

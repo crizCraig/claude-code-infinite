@@ -72,7 +72,17 @@ export interface SearchHit {
 export declare function queryTerms(query: string): string[];
 export declare class ToolInputError extends Error {
 }
-export declare function formatSearch(index: MemtreeIndex, query: string, limit?: number): string;
-export declare function formatNode(index: MemtreeIndex, id: number): string;
-export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number): string;
+export declare function formatSearch(index: MemtreeIndex, query: string, limit?: number, tree?: string): string;
+/**
+ * The hits of the server's term search over one tree
+ * (`GET /usage/memtree/<id>/search`, a port of MemtreeIndex.search), in the
+ * local shape; undefined when the body is not that endpoint's answer.
+ */
+export declare function serverSearchHits(body: unknown): {
+    hits: SearchHit[];
+    terms: string[];
+} | undefined;
+export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string): string;
+export declare function formatNode(index: MemtreeIndex, id: number, tree?: string): string;
+export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number, tree?: string): string;
 //# sourceMappingURL=memtree-tools.d.ts.map

@@ -261,12 +261,53 @@ function splitLines(block: unknown): string[] {
 
 export class ToolInputError extends Error {}
 
-export function formatSearch(index: MemtreeIndex, query: string, limit?: number): string {
-  const hits = index.search(query, limit ?? SEARCH_DEFAULT_LIMIT);
+/** `"tree": "<id>", ` for follow-up calls on another session's tree; "" for this session's. */
+function treeArg(tree?: string): string {
+  return tree ? `"tree": ${JSON.stringify(tree)}, ` : "";
+}
+
+export function formatSearch(index: MemtreeIndex, query: string, limit?: number, tree?: string): string {
   const terms = queryTerms(query);
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
+  return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree);
+}
+
+/**
+ * The hits of the server's term search over one tree
+ * (`GET /usage/memtree/<id>/search`, a port of MemtreeIndex.search), in the
+ * local shape; undefined when the body is not that endpoint's answer.
+ */
+export function serverSearchHits(body: unknown): { hits: SearchHit[]; terms: string[] } | undefined {
+  const json = body as { terms?: unknown; hits?: unknown } | undefined;
+  if (!json || !Array.isArray(json.hits) || !Array.isArray(json.terms)) return undefined;
+  const hits: SearchHit[] = [];
+  for (const raw of json.hits as Record<string, unknown>[]) {
+    if (!raw || !Number.isInteger(raw.id)) return undefined;
+    const range = raw.range as LeafRange | null | undefined;
+    hits.push({
+      id: raw.id as number,
+      depth: typeof raw.depth === "number" ? raw.depth : undefined,
+      leaf: raw.leaf === true,
+      summary: typeof raw.summary === "string" ? raw.summary : "",
+      matchedTerms: Array.isArray(raw.matched_terms) ? raw.matched_terms.map(String) : [],
+      lineHits: typeof raw.line_hits === "number" ? raw.line_hits : 0,
+      score: typeof raw.score === "number" ? raw.score : 0,
+      ...(range && Number.isInteger(range.block) ? { range } : {}),
+      snippets: Array.isArray(raw.snippets) ? (raw.snippets as SearchHit["snippets"]) : [],
+    });
+  }
+  return { hits, terms: (json.terms as unknown[]).map(String) };
+}
+
+export function formatSearchHits(
+  hits: SearchHit[],
+  query: string,
+  terms: string[],
+  tree?: string
+): string {
+  if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
   if (!hits.length) {
-    return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {"id": 0} to browse from the root.`;
+    return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
   }
   const out = [`${hits.length} best match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)} (terms: ${terms.join(", ")}):`];
   for (const hit of hits) {
@@ -285,12 +326,14 @@ export function formatSearch(index: MemtreeIndex, query: string, limit?: number)
   }
   out.push(
     "",
-    "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root."
+    tree
+      ? `Summaries are lossy; read_lines {"tree": ${JSON.stringify(tree)}, block, start, end} returns the exact transcript lines, read_node {"tree": ${JSON.stringify(tree)}, id} a node's children and path from the root.`
+      : "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root."
   );
   return out.join("\n");
 }
 
-export function formatNode(index: MemtreeIndex, id: number): string {
+export function formatNode(index: MemtreeIndex, id: number, tree?: string): string {
   if (!Number.isInteger(id)) throw new ToolInputError("read_node: id must be an integer node id");
   const node = index.nodes.get(id);
   if (!node) {
@@ -306,7 +349,7 @@ export function formatNode(index: MemtreeIndex, id: number): string {
   if (index.isLeaf(node)) {
     const [block, start, end] = node.l!;
     out.push(
-      `transcript: block ${block} lines ${start}-${end} (${end - start + 1} lines; read_lines {"block": ${block}, "start": ${start}, "end": ${end}})`
+      `transcript: block ${block} lines ${start}-${end} (${end - start + 1} lines; read_lines {${treeArg(tree)}"block": ${block}, "start": ${start}, "end": ${end}})`
     );
   }
   const path = index.ancestors(id);
@@ -332,7 +375,8 @@ export function formatLines(
   index: MemtreeIndex,
   block: number,
   start: number,
-  end: number
+  end: number,
+  tree?: string
 ): string {
   if (![block, start, end].every(Number.isInteger)) {
     throw new ToolInputError("read_lines: block, start and end must be integers");
@@ -380,7 +424,7 @@ export function formatLines(
   if (shown < wanted) {
     notes.unshift(
       `capped at ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} chars per call: showed ${start}-${shown}; ` +
-        `continue with read_lines {"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`
+        `continue with read_lines {${treeArg(tree)}"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`
     );
   }
   const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;

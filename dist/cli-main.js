@@ -26,6 +26,7 @@ import { checkForUpdate } from "./update-check.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
+import { readProjectMeta } from "./project-meta.js";
 import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
@@ -221,9 +222,12 @@ async function main() {
     // bound; its result goes into the SessionStart banner below, since the TUI
     // covers this terminal within a second. Both resolve rather than reject, so
     // Promise.all cannot throw.
-    const [paymentStatus, updateAvailable] = await Promise.all([
+    // The project (directory, git repo, branch, commit) goes with every MemTree
+    // call so sessions can be found by project; read once, never fails.
+    const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
         fetchPaymentStatus(memtreeBaseUrl, polychatApiKey),
         checkForUpdate({ currentVersion: CLIENT_VERSION }),
+        readProjectMeta(process.cwd()),
     ]);
     if (paymentStatus?.paid === false) {
         if (interactiveUi) {
@@ -285,6 +289,7 @@ async function main() {
         memtreeLinkPlacement,
         memtreeLinkStore: new MemtreeLinkStore(),
         transcriptUsage: new ClaudeTranscriptUsage(),
+        projectMeta,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);

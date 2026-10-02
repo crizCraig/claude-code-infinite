@@ -1,7 +1,10 @@
 /**
  * `memtree` MCP server: lets the agent search and read its own session's
  * MemTree (tools `search`, `read_node`, `read_lines`, which Claude Code
- * exposes as `mcp__memtree__*`).
+ * exposes as `mcp__memtree__*`), and find things in the user's other sessions
+ * (`list_sessions`, `search_sessions`, memtree-finder.ts). The three tree
+ * tools take an optional `tree` (a request id from those results) to read
+ * another session's tree instead of this one's.
  *
  * A minimal JSON-RPC 2.0 server over stdio (newline-delimited messages, the
  * MCP stdio transport); no SDK dependency. Started by Claude Code from the
@@ -12,18 +15,41 @@
  * (`CCC_MEMTREE_PROXY`, else the inherited `ANTHROPIC_BASE_URL`) answers
  * `GET /memtree/current?session=<id>` with the newest page it served — the
  * tree the current request was compressed against. The session id is the
- * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers. Reads require
- * this exact session on both the pointer and the authenticated page; missing
- * or mismatched identity fails closed. The host must restart this server with
- * the current id when switching sessions.
+ * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers. Reads of this
+ * session's current tree require that exact session on both the proxy's pointer
+ * and the page; missing or mismatched identity fails closed, and the host must
+ * restart this server with the current id when switching sessions. The page JSON
+ * is fetched through the proxy's key-free `/memtree/<id>.json` relay and cached
+ * once complete.
+ *
+ * Other trees (the owner's other sessions, by request id from list_sessions or
+ * search_sessions) are read the same way without the session check: they are
+ * named explicitly, and the server authorizes them by the user's key.
+ *
+ * `search` asks the server first (`/memtree/<id>/search`, the Step 6 term
+ * search, so a long session's page JSON is not downloaded just to search it)
+ * and falls back to searching the page JSON locally on a server without that
+ * endpoint.
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  FINDER_SEARCH_DEFAULT_LIMIT,
+  FINDER_SEARCH_MAX_LIMIT,
+  formatSearchResults,
+  formatSessions,
+  searchQuery,
+  SESSIONS_DEFAULT_LIMIT,
+  SESSIONS_MAX_LIMIT,
+  sessionsQuery,
+} from "./memtree-finder.js";
+import {
   formatLines,
   formatNode,
   formatSearch,
+  formatSearchHits,
   MemtreeIndex,
+  serverSearchHits,
   READ_LINES_MAX_CHARS,
   READ_LINES_MAX_LINES,
   SEARCH_DEFAULT_LIMIT,
@@ -35,7 +61,13 @@ import { CLIENT_VERSION } from "./memtree.js";
 
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
-export const MEMTREE_TOOL_NAMES = ["search", "read_node", "read_lines"] as const;
+export const MEMTREE_TOOL_NAMES = [
+  "search",
+  "read_node",
+  "read_lines",
+  "list_sessions",
+  "search_sessions",
+] as const;
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
 const PREFIX_RETRY_INTERVAL_MS = 45_000;
@@ -59,7 +91,12 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "So once you see that memory message: when your work depends on something from earlier in the session (what the " +
   "user asked for or ruled out, decisions and why they were made, findings, ids and paths, commands, what was tried " +
   "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
-  "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.";
+  "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
+  "The user's other sessions are searchable too: list_sessions lists them by time and project, and search_sessions " +
+  "finds passages across all of them; use these when the user refers to earlier work that is not in this session. " +
+  "For search_sessions, vector mode (default) finds meaning: the first page is charged even when the query embedding " +
+  "is cached; cursor continuation is free, including when the embedding must be regenerated. Text mode is free. " +
+  "Cursors page over live results, not a frozen snapshot; new indexing can change later pages.";
 
 export const MEMTREE_TOOLS = [
   {
@@ -77,6 +114,10 @@ export const MEMTREE_TOOLS = [
           type: "number",
           description: `Maximum results (default ${SEARCH_DEFAULT_LIMIT}, at most ${SEARCH_MAX_LIMIT}).`,
         },
+        tree: {
+          type: "string",
+          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
+        },
       },
       required: ["query"],
     },
@@ -88,7 +129,13 @@ export const MEMTREE_TOOLS = [
       "for a leaf, the transcript line range it covers. Node 0 is the root.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "number", description: "Node id (0 is the root)." } },
+      properties: {
+        id: { type: "number", description: "Node id (0 is the root)." },
+        tree: {
+          type: "string",
+          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
+        },
+      },
       required: ["id"],
     },
   },
@@ -103,8 +150,53 @@ export const MEMTREE_TOOLS = [
         block: { type: "number", description: "Block index (a leaf's first range number)." },
         start: { type: "number", description: "First line, 1-based." },
         end: { type: "number", description: "Last line, inclusive." },
+        tree: {
+          type: "string",
+          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
+        },
       },
       required: ["block", "start", "end"],
+    },
+  },
+  {
+    name: "list_sessions",
+    description:
+      "List the user's own MemTree sessions (this one and others), most recently active first: title (the tree's root summary), " +
+      "first message, times, project (directory, git repo, branch, commit), models, request count and the latest tree's id. " +
+      "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <id>, \"id\": 0} or search {\"tree\": <id>, ...}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since: { type: "string", description: "Only activity at or after this ISO 8601 time or date (UTC unless an offset is given), e.g. 2026-09-01." },
+        until: { type: "string", description: "Only activity before this ISO 8601 time or date." },
+        project: { type: "string", description: "Working directory name or git repository (owner/repo, or just repo), case-insensitive." },
+        q: { type: "string", description: "Keep sessions whose title, first message or project contains this text." },
+        cursor: { type: "string", description: "next cursor from a previous call, to get the next page (same other arguments)." },
+        limit: { type: "number", description: `Sessions per page (default ${SESSIONS_DEFAULT_LIMIT}, at most ${SESSIONS_MAX_LIMIT}).` },
+      },
+    },
+  },
+  {
+    name: "search_sessions",
+    description:
+      "Search the transcripts of all of the user's own sessions at once; each hit names the session, the tree reference, " +
+      "the transcript lines and a snippet, and says which read_lines call opens it. mode \"vector\" (default) matches meaning " +
+      "and its first page is charged even when the query embedding is cached; cursor continuation is free, including " +
+      "when the embedding must be regenerated. Mode \"text\" matches exact words, ids and paths and is free. " +
+      "Cursors page over live results, not a frozen snapshot; new indexing can change later pages. " +
+      "A passage repeated across a session's successive trees is reported once, from the newest.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to look for: a question or description (vector), or exact words (text; \"quoted phrase\", or, -word)." },
+        mode: { type: "string", enum: ["vector", "text"], description: "vector (default, semantic, first page charged, cursor continuation free) or text (exact words, free)." },
+        project: { type: "string", description: "Only sessions in this working directory or git repository (owner/repo, or just repo)." },
+        since: { type: "string", description: "Only requests at or after this ISO 8601 time or date." },
+        until: { type: "string", description: "Only requests before this ISO 8601 time or date." },
+        cursor: { type: "string", description: "next cursor from a previous call, to get the next page (same other arguments)." },
+        limit: { type: "number", description: `Hits per page (default ${FINDER_SEARCH_DEFAULT_LIMIT}, at most ${FINDER_SEARCH_MAX_LIMIT}; per model for vector).` },
+      },
+      required: ["query"],
     },
   },
 ];
@@ -123,11 +215,89 @@ interface CurrentPage {
   url: string;
 }
 
-/** Resolves, fetches and caches the current page. */
-export class CurrentTree {
+/** A request id in either spelling (UUID or the short leading-hex form). */
+const TREE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** Other sessions' pages kept in memory at once (each can be several MB). */
+const OTHER_TREES_CACHED = 4;
+
+interface ProxyJson {
+  ok: boolean;
+  status: number;
+  body?: unknown;
+  error?: string;
+}
+
+/** GET JSON from the loopback proxy; never throws. */
+async function proxyGetJson(
+  fetchImpl: typeof fetch,
+  url: string,
+  headers: Record<string, string> = {}
+): Promise<ProxyJson> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      headers: { accept: "application/json", ...headers },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  }
+  const text = await response.text().catch(() => "");
+  if (!response.ok) {
+    let detail = text.slice(0, 300);
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed?.detail === "string") detail = parsed.detail;
+    } catch {
+      // not JSON: keep the raw text
+    }
+    return { ok: false, status: response.status, error: `HTTP ${response.status} ${detail}` };
+  }
+  try {
+    return { ok: true, status: response.status, body: JSON.parse(text) };
+  } catch {
+    return { ok: false, status: response.status, error: "response was not JSON" };
+  }
+}
+
+function proxyBase(deps: MemtreeMcpDeps): string {
+  const base = deps.proxyUrl?.replace(/\/$/, "");
+  if (!base) {
+    throw new ToolInputError(
+      "MemTree tools need a running ccc session: neither CCC_MEMTREE_PROXY nor ANTHROPIC_BASE_URL is set."
+    );
+  }
+  return base;
+}
+
+function checkTreeId(tree: unknown): string | undefined {
+  if (tree === undefined || tree === null || tree === "") return undefined;
+  if (typeof tree !== "string" || !TREE_ID_RE.test(tree.trim())) {
+    throw new ToolInputError("tree must be a request id from list_sessions or search_sessions");
+  }
+  return tree.trim();
+}
+
+/** What the tree tools read: this session's current tree, or another one by id. */
+export interface TreeSource {
+  get(tree?: string): Promise<MemtreeIndex>;
+  /** Term search, formatted; optional so a plain index can stand in (tests). */
+  search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
+}
+
+/**
+ * Resolves, fetches and caches the current page, and other sessions' pages
+ * by request id.
+ */
+export class CurrentTree implements TreeSource {
   private cached?: { id: string; index: MemtreeIndex };
+  /** Temporary prefix pages: when each may be fetched again. */
   private readonly prefixRetryAt = new Map<string, number>();
   private inFlight?: Promise<MemtreeIndex>;
+  /** Other trees, least recently used first. */
+  private readonly others = new Map<string, MemtreeIndex>();
+  /** Set once the server answered 404 to a tree search the page JSON could answer. */
+  private serverSearchMissing = false;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
 
@@ -136,26 +306,67 @@ export class CurrentTree {
     this.now = deps.now ?? Date.now;
   }
 
-  get(): Promise<MemtreeIndex> {
+  get(tree?: string): Promise<MemtreeIndex> {
+    let other: string | undefined;
+    try {
+      other = checkTreeId(tree);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (other) return this.getOther(other);
     if (this.inFlight) return this.inFlight;
-    const pending = this.load();
+    const pending = this.loadCurrent();
     this.inFlight = pending;
     return pending.finally(() => {
       if (this.inFlight === pending) this.inFlight = undefined;
     });
   }
 
-  private async load(): Promise<MemtreeIndex> {
-    const base = this.deps.proxyUrl?.replace(/\/$/, "");
-    if (!base) {
-      throw new ToolInputError(
-        "MemTree tools need a running ccc session: neither CCC_MEMTREE_PROXY nor ANTHROPIC_BASE_URL is set."
-      );
+  /**
+   * The server's term search over the tree when it has the endpoint (no page
+   * download), else the same search over the page JSON here.
+   */
+  async search(query: string, limit: number | undefined, tree?: string): Promise<string> {
+    const other = checkTreeId(tree);
+    if (!this.serverSearchMissing) {
+      const id = other ?? (await this.currentId());
+      const params = new URLSearchParams({ q: query });
+      if (limit !== undefined && Number.isFinite(limit)) params.set("limit", String(limit));
+      const base = proxyBase(this.deps);
+      const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/search?${params}`);
+      const parsed = answer.ok ? serverSearchHits(answer.body) : undefined;
+      if (parsed) return formatSearchHits(parsed.hits, query, parsed.terms, other);
+      if (answer.status === 202) {
+        throw new ToolInputError("That MemTree is still being built; try again in a minute.");
+      }
+      const result = formatSearch(await this.get(other), query, limit, other);
+      if (answer.status === 404 || answer.status === 405) this.serverSearchMissing = true;
+      return result;
     }
+    return formatSearch(await this.get(other), query, limit, other);
+  }
+
+  private async loadCurrent(): Promise<MemtreeIndex> {
+    const id = await this.currentId();
+    const sessionId = this.requireSessionId();
+    if (this.cached?.id === id) return this.cached.index;
+    const index = await this.loadPage(id, "this session", sessionId);
+    if (!isTemporaryPrefix(index, id)) this.cached = { id, index };
+    return index;
+  }
+
+  private requireSessionId(): string {
     const sessionId = this.deps.sessionId;
     if (!sessionId) throw new ToolInputError("MemTree unavailable: the calling session id is missing");
+    return sessionId;
+  }
+
+  /** The proxy's current page for the calling session; fails closed on any other session. */
+  private async currentId(): Promise<string> {
+    const base = proxyBase(this.deps);
+    const sessionId = this.requireSessionId();
     const query = `?session=${encodeURIComponent(sessionId)}`;
-    const pointer = await this.getJson(`${base}/memtree/current${query}`);
+    const pointer = await proxyGetJson(this.fetchImpl, `${base}/memtree/current${query}`);
     if (pointer.status === 404) {
       throw new ToolInputError(
         "This session has no MemTree yet: nothing has been indexed or compressed so far, so everything is still in your context."
@@ -169,32 +380,56 @@ export class CurrentTree {
     if (current.session_id !== sessionId) {
       throw new ToolInputError("MemTree unavailable: current page belongs to a different or unknown session");
     }
-    if (this.cached?.id === current.id) return this.cached.index;
+    return current.id;
+  }
 
+  private async getOther(id: string): Promise<MemtreeIndex> {
+    const hit = this.others.get(id);
+    if (hit) {
+      this.others.delete(id);
+      this.others.set(id, hit);
+      return hit;
+    }
+    const index = await this.loadPage(id, `tree ${id}`);
+    if (!isTemporaryPrefix(index, id)) this.others.set(id, index);
+    while (this.others.size > OTHER_TREES_CACHED) {
+      this.others.delete(this.others.keys().next().value!);
+    }
+    return index;
+  }
+
+  /**
+   * Fetch one page. ``sessionId`` (the current tree only) must match the page's
+   * session. A temporary prefix is returned but not cached by the callers, and
+   * is refetched at most every PREFIX_RETRY_INTERVAL_MS, so successive tools
+   * cannot hammer the page endpoint.
+   */
+  private async loadPage(id: string, label: string, sessionId?: string): Promise<MemtreeIndex> {
     const now = this.now();
-    const retryAt = this.prefixRetryAt.get(current.id);
+    const retryAt = this.prefixRetryAt.get(id);
     if (retryAt !== undefined && retryAt > now) {
       throw this.prefixRetryError(retryAt - now);
     }
     // If a previous prefix refresh failed, keep the same cooldown after that
     // failure so successive tools cannot hammer the page endpoint.
-    if (retryAt !== undefined) this.prefixRetryAt.set(current.id, now + PREFIX_RETRY_INTERVAL_MS);
+    if (retryAt !== undefined) this.prefixRetryAt.set(id, now + PREFIX_RETRY_INTERVAL_MS);
 
-    const page = await this.getJson(`${base}/memtree/${encodeURIComponent(current.id)}.json`);
-    if (!page.ok) throw new ToolInputError(`MemTree unavailable (page ${current.id}: ${page.error})`);
+    const base = proxyBase(this.deps);
+    const page = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}.json`);
+    if (!page.ok) throw new ToolInputError(`MemTree unavailable (page ${id}: ${page.error})`);
     const json = page.body as MemtreePageJson;
     if (!Array.isArray(json?.nodes) || json.nodes.length === 0) {
       // Still building (or an empty tree): not cached, so the next call retries.
       throw new ToolInputError(
-        `The MemTree for this session is still being built${json?.status ? ` (${json.status})` : ""}; try again in a minute.`
+        `The MemTree for ${label} is still being built${json?.status ? ` (${json.status})` : ""}; try again in a minute.`
       );
     }
-    if (json.session_id !== sessionId) {
+    if (sessionId !== undefined && json.session_id !== sessionId) {
       throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
     }
     const index = new MemtreeIndex(json);
-    if (json.served_prefix === true) {
-      this.prefixRetryAt.set(current.id, this.now() + PREFIX_RETRY_INTERVAL_MS);
+    if (isTemporaryPrefix(index, id)) {
+      this.prefixRetryAt.set(id, this.now() + PREFIX_RETRY_INTERVAL_MS);
       // Keep the map small if a long-lived MCP process sees many page ids.
       if (this.prefixRetryAt.size > 64) {
         const oldest = this.prefixRetryAt.keys().next().value;
@@ -202,8 +437,7 @@ export class CurrentTree {
       }
       return index;
     }
-    this.prefixRetryAt.delete(current.id);
-    this.cached = { id: current.id, index };
+    this.prefixRetryAt.delete(id);
     return index;
   }
 
@@ -213,28 +447,45 @@ export class CurrentTree {
       `This MemTree page is a temporary prefix while newer messages are indexing; try again in ${seconds} second${seconds === 1 ? "" : "s"}.`
     );
   }
+}
 
-  private async getJson(
-    url: string
-  ): Promise<{ ok: boolean; status: number; body?: unknown; error?: string }> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        headers: { accept: "application/json" },
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-    } catch (err) {
-      return { ok: false, status: 0, error: String(err) };
+/** A served prefix that may later switch to the request's own tree (a pinned ref never does). */
+function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
+  return index.page.served_prefix === true && index.page.ref !== id;
+}
+
+/** The cross-session tools: formatted text from the proxy's finder relay. */
+export interface SessionFinderSource {
+  listSessions(args: Record<string, unknown>): Promise<string>;
+  searchSessions(args: Record<string, unknown>): Promise<string>;
+}
+
+export class SessionFinder implements SessionFinderSource {
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(private readonly deps: MemtreeMcpDeps) {
+    this.fetchImpl = deps.fetch ?? globalThis.fetch;
+  }
+
+  async listSessions(args: Record<string, unknown>): Promise<string> {
+    const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list_sessions");
+    return formatSessions(body as Parameters<typeof formatSessions>[0], args);
+  }
+
+  async searchSessions(args: Record<string, unknown>): Promise<string> {
+    const body = await this.get(`/memtree/search${searchQuery(args)}`, "search_sessions");
+    return formatSearchResults(body as Parameters<typeof formatSearchResults>[0], args);
+  }
+
+  private async get(pathAndQuery: string, tool: string): Promise<unknown> {
+    const headers: Record<string, string> = {};
+    if (this.deps.sessionId) headers["x-claude-code-session-id"] = this.deps.sessionId;
+    const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, headers);
+    if (answer.ok) return answer.body;
+    if (answer.status === 404) {
+      throw new ToolInputError(`${tool}: this MemTree server does not support finding sessions yet (${answer.error}).`);
     }
-    const text = await response.text().catch(() => "");
-    if (!response.ok) {
-      return { ok: false, status: response.status, error: `HTTP ${response.status} ${text.slice(0, 300)}` };
-    }
-    try {
-      return { ok: true, status: response.status, body: JSON.parse(text) };
-    } catch {
-      return { ok: false, status: response.status, error: "response was not JSON" };
-    }
+    throw new ToolInputError(`${tool} failed: ${answer.error}`);
   }
 }
 
@@ -252,7 +503,8 @@ interface JsonRpcRequest {
  */
 export async function handleMcpMessage(
   message: JsonRpcRequest,
-  tree: { get(): Promise<MemtreeIndex> }
+  tree: TreeSource,
+  finder?: SessionFinderSource
 ): Promise<object | undefined> {
   const isRequest = message.id !== undefined && message.id !== null;
   const reply = (result: object) => ({ jsonrpc: "2.0", id: message.id, result });
@@ -279,7 +531,7 @@ export async function handleMcpMessage(
       const name = message.params?.name;
       const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
       try {
-        const text = await callTool(String(name), args, tree);
+        const text = await callTool(String(name), args, tree, finder);
         return reply({ content: [{ type: "text", text }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
@@ -298,20 +550,28 @@ class UnknownToolError extends Error {}
 async function callTool(
   name: string,
   args: Record<string, unknown>,
-  tree: { get(): Promise<MemtreeIndex> }
+  tree: TreeSource,
+  finder?: SessionFinderSource
 ): Promise<string> {
+  const other = name === "list_sessions" || name === "search_sessions" ? undefined : checkTreeId(args.tree);
   switch (name) {
     case "search": {
       if (typeof args.query !== "string" || !args.query.trim()) {
         throw new ToolInputError("search: query must be a non-empty string");
       }
       const limit = args.limit === undefined ? undefined : Number(args.limit);
-      return formatSearch(await tree.get(), args.query, limit);
+      if (tree.search) return tree.search(args.query, limit, other);
+      return formatSearch(await tree.get(other), args.query, limit, other);
     }
     case "read_node":
-      return formatNode(await tree.get(), Number(args.id));
+      return formatNode(await tree.get(other), Number(args.id), other);
     case "read_lines":
-      return formatLines(await tree.get(), Number(args.block), Number(args.start), Number(args.end));
+      return formatLines(await tree.get(other), Number(args.block), Number(args.start), Number(args.end), other);
+    case "list_sessions":
+    case "search_sessions": {
+      if (!finder) throw new ToolInputError(`${name} is not available here`);
+      return name === "list_sessions" ? finder.listSessions(args) : finder.searchSessions(args);
+    }
     default:
       throw new UnknownToolError(`Unknown tool: ${name}`);
   }
@@ -319,10 +579,12 @@ async function callTool(
 
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void {
-  const tree = new CurrentTree({
+  const deps: MemtreeMcpDeps = {
     proxyUrl: env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
-  });
+  };
+  const tree = new CurrentTree(deps);
+  const finder = new SessionFinder(deps);
   let buffer = "";
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
@@ -343,7 +605,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
         continue;
       }
       queue = queue.then(async () => {
-        const response = await handleMcpMessage(message, tree).catch((err) => ({
+        const response = await handleMcpMessage(message, tree, finder).catch((err) => ({
           jsonrpc: "2.0",
           id: message.id ?? null,
           error: { code: -32603, message: String(err) },

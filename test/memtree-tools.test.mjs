@@ -12,7 +12,15 @@ import {
   READ_LINES_MAX_LINES,
   ToolInputError,
 } from "../dist/memtree-tools.js";
-import { CurrentTree, handleMcpMessage, MEMTREE_TOOLS } from "../dist/memtree-mcp.js";
+import {
+  CurrentTree,
+  handleMcpMessage,
+  MEMTREE_MCP_INSTRUCTIONS,
+  MEMTREE_TOOLS,
+  SessionFinder,
+} from "../dist/memtree-mcp.js";
+import { formatSessions, formatSearchResults, searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
+import { readProjectMeta, repoNameFromRemote } from "../dist/project-meta.js";
 import {
   argsConfigureMemtreeMcp,
   mcpConfigArgs,
@@ -237,6 +245,43 @@ test("CurrentTree keeps prefix cooldown after a failed refresh and fetches a cha
   assert.equal(pageFetches, 3);
 });
 
+for (const explicit of [false, true]) {
+  test(`CurrentTree refreshes a temporary prefix for ${explicit ? "an explicit" : "the current"} tree`, async () => {
+    const id = "aaa111";
+    const path = `/memtree/${id}.json`;
+    const state = {
+      urls: [], pageFetches: 0, current: id,
+      pages: { [path]: { ...PAGE, session_id: "session-1", served_prefix: true, nodes: PAGE.nodes.slice(0, 2) } },
+    };
+    let clock = 0;
+    const tree = new CurrentTree({
+      proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", now: () => clock, fetch: fakeProxyFetch(state),
+    });
+    const requested = explicit ? id : undefined;
+    assert.equal((await tree.get(requested)).nodes.size, 2, "prefix remains readable while building");
+    state.pages[path] = { ...PAGE, session_id: "session-1" };
+    clock += 45_001; // past the temporary-prefix recheck cooldown
+    const completed = await tree.get(requested);
+    assert.equal(completed.nodes.size, 6, "same request id resolves to the completed tree");
+    assert.equal(await tree.get(requested), completed, "completed tree stays cached");
+    assert.equal(state.pageFetches, 2);
+  });
+}
+
+test("CurrentTree caches immutable pinned served trees", async () => {
+  for (const version of [1, 3]) {
+    const ref = `ea18af90-658b-485f-ad71-063e0ca5e724-v${version}-served`;
+    const state = {
+      urls: [], pageFetches: 0,
+      pages: { [`/memtree/${ref}.json`]: { ...PAGE, served_prefix: true, ref } },
+    };
+    const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fakeProxyFetch(state) });
+    const first = await tree.get(ref);
+    assert.equal(await tree.get(ref), first, "a pinned served tree cannot switch to the own tree");
+    assert.equal(state.pageFetches, 1);
+  }
+});
+
 test("MCP handler: initialize, tools/list, tools/call results and errors", async () => {
   const tree = { get: async () => index() };
   const init = await handleMcpMessage(
@@ -249,7 +294,13 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
   assert.equal(await handleMcpMessage({ jsonrpc: "2.0", method: "notifications/initialized" }, tree), undefined);
 
   const list = await handleMcpMessage({ jsonrpc: "2.0", id: 2, method: "tools/list" }, tree);
-  assert.deepEqual(list.result.tools.map((t) => t.name), ["search", "read_node", "read_lines"]);
+  assert.deepEqual(list.result.tools.map((t) => t.name), [
+    "search",
+    "read_node",
+    "read_lines",
+    "list_sessions",
+    "search_sessions",
+  ]);
   assert.equal(list.result.tools, MEMTREE_TOOLS);
 
   const call = (name, args) =>
@@ -274,7 +325,7 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
 });
 
 test("mcp config: bound to the proxy, argv prepended with = forms, detection in --mcp-config", () => {
-  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines");
+  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines,list_sessions,search_sessions");
   const config = memtreeMcpConfig("http://127.0.0.1:1234");
   const server = config.mcpServers.memtree;
   assert.equal(server.env.CCC_MEMTREE_PROXY, "http://127.0.0.1:1234");
@@ -285,7 +336,13 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
     `--allowedTools=${MEMTREE_ALLOWED_TOOLS.join(",")}`,
     "hello",
   ]);
-  assert.deepEqual(MEMTREE_ALLOWED_TOOLS, ["mcp__memtree__search", "mcp__memtree__read_node", "mcp__memtree__read_lines"]);
+  assert.deepEqual(MEMTREE_ALLOWED_TOOLS, [
+    "mcp__memtree__search",
+    "mcp__memtree__read_node",
+    "mcp__memtree__read_lines",
+    "mcp__memtree__list_sessions",
+    "mcp__memtree__search_sessions",
+  ]);
 
   assert.deepEqual(mcpConfigArgs(["-p", "q", "--mcp-config", "a.json", "b.json", "--strict-mcp-config", "--mcp-config=c", "--", "--mcp-config", "d"]),
     ["a.json", "b.json", "c"]);
@@ -351,4 +408,154 @@ test("CurrentTree rejects a mismatched page arriving after the matching pointer"
   await requested;
   release(Response.json({ ...PAGE, session_id: "session-2" }));
   await assert.rejects(result, /different or unknown session/);
+});
+
+test("CurrentTree search: the server's tree search first, the page JSON when the server lacks it", async () => {
+  const urls = [];
+  let serverHasSearch = true;
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    urls.push(u.pathname + u.search);
+    if (u.pathname === "/memtree/current") return Response.json({ id: "aaa111", session_id: "session-1" });
+    if (u.pathname.endsWith("/search")) {
+      if (!serverHasSearch) return Response.json({ detail: "Not Found" }, { status: 404 });
+      return Response.json({
+        query: u.searchParams.get("q"),
+        terms: ["8443"],
+        hits: [{ id: 5, leaf: true, depth: 2, summary: "Billing port", range: { block: 0, start: 5, end: 5 },
+                 matched_terms: ["8443"], line_hits: 1, score: 120, snippets: [{ line: 5, text: "port 8443" }] }],
+      });
+    }
+    return Response.json({ ...PAGE, session_id: "session-1" });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", fetch: fetchImpl });
+  const viaServer = await tree.search("8443", 3);
+  assert.match(viaServer, /\[node 5 · leaf · depth 2 · block 0 lines 5-5 · matched 8443 · 1 matching line\]/);
+  assert.match(viaServer, /L5: port 8443/);
+  assert.deepEqual(urls, ["/memtree/current?session=session-1", "/memtree/aaa111/search?q=8443&limit=3"], "no page download");
+
+  const other = await tree.search("8443", undefined, "bbb222");
+  assert.equal(urls.at(-1), "/memtree/bbb222/search?q=8443");
+  assert.match(other, /read_lines \{"tree": "bbb222", block, start, end\}/);
+
+  serverHasSearch = false;
+  urls.length = 0;
+  const local = await tree.search("8443");
+  assert.match(local, /The billing service port is 8443/);
+  assert.deepEqual(urls, [
+    "/memtree/current?session=session-1", "/memtree/aaa111/search?q=8443",
+    "/memtree/current?session=session-1", "/memtree/aaa111.json",
+  ]);
+  urls.length = 0;
+  await tree.search("8443");
+  assert.deepEqual(urls, ["/memtree/current?session=session-1"], "an old server is asked once; the page stays cached");
+});
+
+test("tree tools read another session's tree by id, cached, with follow-ups naming it", async () => {
+  const pageFetches = [];
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/memtree/current") return Response.json({ id: "cur" });
+    pageFetches.push(u.pathname);
+    return Response.json(PAGE);
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fetchImpl });
+  const call = (name, args) =>
+    handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree);
+  const lines = await call("read_lines", { tree: "ea18af90-658b-485f-ad71-063e0ca5e724", block: 0, start: 5, end: 5 });
+  assert.match(lines.result.content[0].text, /5\tThe billing/);
+  const node = await call("read_node", { tree: "ea18af90-658b-485f-ad71-063e0ca5e724", id: 5 });
+  assert.match(node.result.content[0].text, /read_lines \{"tree": "ea18af90-658b-485f-ad71-063e0ca5e724", "block": 1/);
+  assert.deepEqual(pageFetches, ["/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json"], "fetched once");
+  for (const id of ["t1", "t2", "t3", "t4"]) await call("read_node", { tree: id, id: 0 });
+  await call("read_node", { tree: "ea18af90-658b-485f-ad71-063e0ca5e724", id: 0 });
+  assert.equal(pageFetches.length, 6, "least recently used tree evicted after four others");
+  const bad = await call("read_node", { tree: "../x", id: 0 });
+  assert.equal(bad.result.isError, true);
+  assert.match(bad.result.content[0].text, /tree must be a request id/);
+});
+
+test("finder follow-ups preserve pinned tree references and fall back for older servers", async () => {
+  const request_id = "ea18af90-658b-485f-ad71-063e0ca5e724";
+  const state = { urls: [], pageFetches: 0, pages: {} };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", fetch: fakeProxyFetch(state) });
+  for (const suffix of ["-v1-own", "-v3-served", undefined]) {
+    const ref = suffix ? `${request_id}${suffix}` : undefined;
+    const target = ref ?? request_id;
+    const identity = { request_id, ...(ref ? { ref } : {}) };
+    const sessions = formatSessions({ sessions: [{ id: "session", latest_tree: identity }] }, {});
+    assert.ok(sessions.includes(`read_node {"tree": "${target}", "id": 0}`));
+    assert.ok(sessions.includes(`search {"tree": "${target}", "query":`));
+    const hit = { id: "session", tree: identity, range: { block: 0, start: 1, end: 2 } };
+    for (const body of [{ hits: [hit] }, { groups: [{ embedding_model: "mock", hits: [hit] }] }]) {
+      const result = formatSearchResults(body, { query: "test" });
+      assert.ok(result.includes(`read_lines {"tree": "${target}", "block": 0, "start": 1, "end": 2}`));
+    }
+    state.pages[`/memtree/${target}.json`] = PAGE;
+    assert.equal((await tree.get(target)).nodes.size, PAGE.nodes.length);
+    assert.equal(state.urls.at(-1), `/memtree/${target}.json`);
+  }
+  const before = state.urls.length;
+  await assert.rejects(tree.get(`${request_id}-v1-own/../search`), /tree must be/);
+  assert.equal(state.urls.length, before);
+});
+
+test("finder query strings: filters pass through, mode defaults to vector, limits clamp", () => {
+  assert.equal(sessionsQuery({}), "");
+  assert.equal(
+    sessionsQuery({ since: "2026-09-01", project: " polychat ", q: "deploy", cursor: "abc", limit: 500 }),
+    "?since=2026-09-01&project=polychat&q=deploy&cursor=abc&limit=100"
+  );
+  assert.equal(searchQuery({ query: "how did we deploy" }), "?q=how+did+we+deploy&mode=vector");
+  assert.equal(searchQuery({ query: "x", mode: "TEXT", limit: 0, until: "2026-09-30" }), "?q=x&mode=text&until=2026-09-30&limit=1");
+  assert.throws(() => searchQuery({ query: " " }), ToolInputError);
+  assert.throws(() => searchQuery({ query: "x", mode: "fuzzy" }), /mode must be/);
+  assert.throws(() => sessionsQuery({ since: 5 }), /since must be a string/);
+});
+
+test("MCP instructions mention the cross-session tools and stay constant", () => {
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /list_sessions/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /search_sessions/);
+  const search = MEMTREE_TOOLS.find((t) => t.name === "search_sessions");
+  for (const description of [MEMTREE_MCP_INSTRUCTIONS, search.description]) {
+    assert.match(description, /vector.*default/i);
+    assert.match(description, /first page.*charged/i);
+    assert.match(description, /cached/i);
+    assert.match(description, /cursor continuation.*free/i);
+    assert.match(description, /text.*free/i);
+    assert.match(description, /live.*snapshot/i);
+  }
+  assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
+  assert.equal(search.inputSchema.properties.mode.enum.join(","), "vector,text");
+  for (const name of ["search", "read_node", "read_lines"]) {
+    const tree = MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree;
+    assert.ok(tree, name);
+    assert.match(tree.description, /reference.*list_sessions or search_sessions/i);
+    assert.match(tree.description, /legacy request ids/i);
+  }
+});
+
+test("project meta: owner/repo only from any remote form, failures leave parts out", async () => {
+  for (const [remote, expected] of [
+    ["https://github.com/acme/polychat.git", "acme/polychat"],
+    ["https://user:ghp_secret@github.com/acme/polychat", "acme/polychat"],
+    ["git@github.com:acme/polychat.git", "acme/polychat"],
+    ["ssh://git@gitlab.example.com:2222/group/sub/repo.git", "sub/repo"],
+    ["/Users/me/src/polychat", "src/polychat"],
+    ["https://github.com/acme/polychat.git?token=x#frag", "acme/polychat"],
+    ["", undefined],
+  ]) {
+    assert.equal(repoNameFromRemote(remote), expected, remote);
+  }
+  const git = async (args) =>
+    ({ "remote get-url origin": "git@github.com:acme/polychat.git", "rev-parse --abbrev-ref HEAD": "main",
+       "rev-parse --short HEAD": "c6fe251" })[args.join(" ")];
+  assert.deepEqual(await readProjectMeta("/Users/me/src/polychat", git), {
+    project_dir: "polychat", git_repo: "acme/polychat", git_branch: "main", git_commit: "c6fe251",
+  });
+  const detached = async (args) => (args.includes("--abbrev-ref") ? "HEAD" : undefined);
+  assert.deepEqual(await readProjectMeta("/tmp/not a repo", detached), { project_dir: "not a repo" });
+  // The real runner outside a repository: resolves, never throws.
+  const outside = await readProjectMeta(os.tmpdir());
+  assert.equal(outside.project_dir, path.basename(os.tmpdir()));
 });

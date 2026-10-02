@@ -1,3 +1,4 @@
+import type { ProjectMeta } from "./project-meta.js";
 /** Characters of system prompt kept for auditing a suspected side request. */
 export declare const SYSTEM_HEAD_CHARS = 120;
 export interface ClaudeCodeRequestInfo {
@@ -75,6 +76,11 @@ export interface MemtreeClientMeta {
     agent_id?: string;
     parent_agent_id?: string;
     requested_model?: string;
+    /** The session's project (project-meta.ts), for the sessions list's project filter. */
+    project_dir?: string;
+    git_repo?: string;
+    git_branch?: string;
+    git_commit?: string;
 }
 export declare function memtreeClientMeta(input: {
     info?: ClaudeCodeRequestInfo;
@@ -82,5 +88,7 @@ export declare function memtreeClientMeta(input: {
     agentId?: string;
     parentAgentId?: string;
     model?: unknown;
+    /** Read once at startup (project-meta.ts); the same for every request. */
+    project?: ProjectMeta;
 }): MemtreeClientMeta;
 //# sourceMappingURL=cc-request.d.ts.map

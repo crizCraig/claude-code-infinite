@@ -205,13 +205,49 @@ function splitLines(block) {
 // ---- Tool output (plain text for the model) -------------------------------
 export class ToolInputError extends Error {
 }
-export function formatSearch(index, query, limit) {
-    const hits = index.search(query, limit ?? SEARCH_DEFAULT_LIMIT);
+/** `"tree": "<id>", ` for follow-up calls on another session's tree; "" for this session's. */
+function treeArg(tree) {
+    return tree ? `"tree": ${JSON.stringify(tree)}, ` : "";
+}
+export function formatSearch(index, query, limit, tree) {
     const terms = queryTerms(query);
     if (!terms.length)
         throw new ToolInputError("search: the query has no searchable terms");
+    return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree);
+}
+/**
+ * The hits of the server's term search over one tree
+ * (`GET /usage/memtree/<id>/search`, a port of MemtreeIndex.search), in the
+ * local shape; undefined when the body is not that endpoint's answer.
+ */
+export function serverSearchHits(body) {
+    const json = body;
+    if (!json || !Array.isArray(json.hits) || !Array.isArray(json.terms))
+        return undefined;
+    const hits = [];
+    for (const raw of json.hits) {
+        if (!raw || !Number.isInteger(raw.id))
+            return undefined;
+        const range = raw.range;
+        hits.push({
+            id: raw.id,
+            depth: typeof raw.depth === "number" ? raw.depth : undefined,
+            leaf: raw.leaf === true,
+            summary: typeof raw.summary === "string" ? raw.summary : "",
+            matchedTerms: Array.isArray(raw.matched_terms) ? raw.matched_terms.map(String) : [],
+            lineHits: typeof raw.line_hits === "number" ? raw.line_hits : 0,
+            score: typeof raw.score === "number" ? raw.score : 0,
+            ...(range && Number.isInteger(range.block) ? { range } : {}),
+            snippets: Array.isArray(raw.snippets) ? raw.snippets : [],
+        });
+    }
+    return { hits, terms: json.terms.map(String) };
+}
+export function formatSearchHits(hits, query, terms, tree) {
+    if (!terms.length)
+        throw new ToolInputError("search: the query has no searchable terms");
     if (!hits.length) {
-        return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {"id": 0} to browse from the root.`;
+        return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
     }
     const out = [`${hits.length} best match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)} (terms: ${terms.join(", ")}):`];
     for (const hit of hits) {
@@ -229,10 +265,12 @@ export function formatSearch(index, query, limit) {
         for (const s of hit.snippets)
             out.push(`  L${s.line}: ${s.text}`);
     }
-    out.push("", "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root.");
+    out.push("", tree
+        ? `Summaries are lossy; read_lines {"tree": ${JSON.stringify(tree)}, block, start, end} returns the exact transcript lines, read_node {"tree": ${JSON.stringify(tree)}, id} a node's children and path from the root.`
+        : "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root.");
     return out.join("\n");
 }
-export function formatNode(index, id) {
+export function formatNode(index, id, tree) {
     if (!Number.isInteger(id))
         throw new ToolInputError("read_node: id must be an integer node id");
     const node = index.nodes.get(id);
@@ -246,7 +284,7 @@ export function formatNode(index, id) {
     ];
     if (index.isLeaf(node)) {
         const [block, start, end] = node.l;
-        out.push(`transcript: block ${block} lines ${start}-${end} (${end - start + 1} lines; read_lines {"block": ${block}, "start": ${start}, "end": ${end}})`);
+        out.push(`transcript: block ${block} lines ${start}-${end} (${end - start + 1} lines; read_lines {${treeArg(tree)}"block": ${block}, "start": ${start}, "end": ${end}})`);
     }
     const path = index.ancestors(id);
     if (path.length) {
@@ -266,7 +304,7 @@ export function formatNode(index, id) {
     }
     return out.join("\n");
 }
-export function formatLines(index, block, start, end) {
+export function formatLines(index, block, start, end, tree) {
     if (![block, start, end].every(Number.isInteger)) {
         throw new ToolInputError("read_lines: block, start and end must be integers");
     }
@@ -313,7 +351,7 @@ export function formatLines(index, block, start, end) {
     const wanted = Math.min(end, lines.length);
     if (shown < wanted) {
         notes.unshift(`capped at ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} chars per call: showed ${start}-${shown}; ` +
-            `continue with read_lines {"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`);
+            `continue with read_lines {${treeArg(tree)}"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`);
     }
     const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;
     return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
