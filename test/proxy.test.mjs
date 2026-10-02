@@ -2496,7 +2496,7 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
   }
 });
 
-const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "");
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "").replace(/\x1B\]8;;[^\x07]*\x07/g, "");
 
 // The server stamps its short spelling of the page (/m/<leading hex of the
 // id>) and the completed index the turn was compressed against.
@@ -2670,7 +2670,7 @@ test("placement 'message': the link trails every finished message, marked when t
     );
     const sameRendered = same.body.hookSpecificOutput.displayContent;
     assert.equal(stripAnsi(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
-    assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
+    assert.match(sameRendered, /\x1b\[2m• \x1b\]8;;https:[^\x07]*\x07MemTree\x1b\]8;;\x07\x1b\[22m\n  /, "unchanged index is dim");
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
     // New index: marked again.
