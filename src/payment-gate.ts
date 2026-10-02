@@ -91,9 +91,9 @@ export function formatPaymentNotice(
   const plan = extractRecommendedPlan(status.message);
   const url = status.url ?? FALLBACK_SUBSCRIBE_URL;
   if (!options.hyperlinks) return `${PAYMENT_GATE_HEADLINE}\n  ${plan ? `${plan}: ` : ""}${url}`;
-  // Interactive terminals: hide the long checkout URL behind an OSC 8 link on
-  // the plan name (the banner links MemTree.dev the same way); Enter opens it.
-  return `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink(plan ?? "Subscribe", url)}`;
+  // Interactive terminals: the plan name is an OSC 8 link to checkout, and the
+  // URL is printed below it for terminals without hyperlinks (and to copy).
+  return `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink(plan ?? "Subscribe", url)}\n  ${url}`;
 }
 
 /** OSC 8 terminal hyperlink: `text` shown, `url` opened on click. */

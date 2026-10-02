@@ -73,11 +73,11 @@ test("interactive notice hides the url behind an OSC 8 link on the plan name", (
   const text = formatPaymentNotice(status, { hyperlinks: true });
   assert.equal(
     text,
-    `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Starter plan, $5/month", `${URL}&source=ccc`)}`
+    `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Starter plan, $5/month", `${URL}&source=ccc`)}\n  ${URL}&source=ccc`
   );
   assert.ok(text.includes(URL), "the url is still inside the escape sequence");
   const noPlan = formatPaymentNotice({ paid: false, message: null, url: URL }, { hyperlinks: true });
-  assert.equal(noPlan, `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Subscribe", URL)}`);
+  assert.equal(noPlan, `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink("Subscribe", URL)}\n  ${URL}`);
 });
 
 test("plan line is dropped when the server prose names none", () => {

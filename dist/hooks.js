@@ -26,6 +26,8 @@ export function linkLines(label, url, note) {
 }
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
+const OSC8_OPEN = "\x1b]8;;";
+const BEL = "\x07";
 const ANSI_YELLOW = "\x1b[33m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
 const ANSI_DIM = "\x1b[2m";
@@ -151,7 +153,7 @@ export class NoticeDeliveryQueue {
     resumeLine(link) {
         this.lastTrailerKey = link.key;
         this.lastLinkKey = link.key;
-        return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
+        return this.linkNotice(this.styleSuccess(this.anchor(LINK_LABEL, link.link)), link);
     }
     /** Whether the next success line would carry a link not shown before. */
     linkPending(sessionId) {
@@ -293,7 +295,7 @@ export class NoticeDeliveryQueue {
             return this.styleSuccess(text);
         this.lastLinkKey = link.key;
         this.lastTrailerKey = link.key;
-        return `${this.styleSuccess(text)}\n  ${link.link}`;
+        return `${this.styleSuccess(this.anchor(text, link.link))}\n  ${link.link}`;
     }
     /** The session's current link, shown or not. Resolver failures never break a hook. */
     currentLink(sessionId) {
@@ -343,12 +345,25 @@ export class NoticeDeliveryQueue {
         if (this.trailerPlacement === "turn" && !isNew)
             return undefined;
         this.lastTrailerKey = link.key;
-        const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
+        const anchored = this.anchor(LINK_LABEL, link.link);
+        const label = isNew ? this.styleSuccess(anchored) : this.styleDim(anchored);
         return this.linkNotice(label, link);
     }
     /** The link notice with its note dim. */
     linkNotice(label, link) {
         return linkLines(label, link.link, link.note && this.styleDim(link.note));
+    }
+    /**
+     * The word "MemTree" in `text` as a terminal hyperlink (OSC 8) to `url`, so
+     * it is clickable in terminals that support links; the bare URL is still
+     * printed on the next line. Only when styling is on: monochrome and plain
+     * output stay free of escape sequences. BEL-terminated, as Claude Code's
+     * own renderer writes them.
+     */
+    anchor(text, url) {
+        if (!this.color || !/^https?:\/\/[^\s\x00-\x1f\x7f]+$/.test(url))
+            return text;
+        return text.replace("MemTree", `${OSC8_OPEN}${url}${BEL}MemTree${OSC8_OPEN}${BEL}`);
     }
     styleDim(text) {
         return this.color ? `${ANSI_DIM}${text}${ANSI_NORMAL_INTENSITY}` : text;

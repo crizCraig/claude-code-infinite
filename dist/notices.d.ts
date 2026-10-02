@@ -107,7 +107,9 @@ export declare const RECAP_MAX_CHARS = 400;
  * " (disable recaps in /config)" to the recap text, which would otherwise land
  * on the URL's line and read as part of the MemTree note.
  */
-export declare function recapLinkText(link: string, streamedTextChars: number, note?: string): string | undefined;
+export declare function recapLinkText(link: string, streamedTextChars: number, note?: string, options?: {
+    hyperlinks?: boolean;
+}): string | undefined;
 /** content_block_start/delta/stop triple for a notice text block. */
 export declare function noticeBlockEvents(index: number, noticeText: string): string;
 /**
