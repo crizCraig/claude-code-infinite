@@ -2687,7 +2687,7 @@ function resumeLinkLine(
     key: page.index,
     link: page.url,
     ...(page.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
-  });
+  }, sessionId);
 }
 
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;

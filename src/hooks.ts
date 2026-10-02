@@ -236,13 +236,12 @@ export class NoticeDeliveryQueue {
   private pending: PendingNotice | null = null;
   private link: LinkResolver | null = null;
   /** Key of the last link shown; the same key is not repeated. */
-  private lastLinkKey: string | null = null;
+  private readonly delivered = new Map<string | undefined, {
+    link?: string; trailer?: string; shown: boolean;
+  }>();
   private trailer: LinkResolver | null = null;
   private trailerPlacement: TrailerPlacement = "message";
   /** Key of the last trailer shown; a different key is announced as new. */
-  private lastTrailerKey: string | null = null;
-  /** Whether a trailer was rendered under a message since the last Stop. */
-  private trailerShownThisTurn = false;
 
   constructor(
     private readonly ttlMs = DEFAULT_NOTICE_TTL_MS,
@@ -270,9 +269,9 @@ export class NoticeDeliveryQueue {
    * before any new turn. Marks the key as shown, so the next trailer under a
    * message renders dim (unchanged) rather than green (new).
    */
-  resumeLine(link: SuccessLink): string {
-    this.lastTrailerKey = link.key;
-    this.lastLinkKey = link.key;
+  resumeLine(link: SuccessLink, sessionId?: string): string {
+    this.deliveryFor(sessionId).trailer = link.key;
+    this.deliveryFor(sessionId).link = link.key;
     return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
   }
 
@@ -335,18 +334,20 @@ export class NoticeDeliveryQueue {
       pending && this.promptMatches(pending, input.prompt_id) ? pending : null;
     const prefix = matched?.prefix;
     const suffix = matched?.suffix;
+    // Mark the success link before considering a same-key turn trailer.
+    const success = prefix ? this.renderSuccess(prefix, input.session_id) : undefined;
     // Stop is the turn's last hook: the trailer lands here when the turn
     // rendered no message to carry it ("message"), or always ("stop").
     const trailerDue =
-      this.trailerPlacement !== "message" || !this.trailerShownThisTurn;
+      this.trailerPlacement !== "message" || !this.deliveryFor(input.session_id).shown;
     const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
-    this.trailerShownThisTurn = false;
+    this.deliveryFor(input.session_id).shown = false;
     if (!prefix && !suffix && trailer === undefined) return null;
     if (prefix || suffix) this.pending = null;
     markDelivered(prefix);
     markDelivered(suffix);
     const lines: string[] = [];
-    if (prefix) lines.push(this.renderSuccess(prefix, input.session_id));
+    if (success !== undefined) lines.push(success);
     if (suffix) lines.push(this.styleWarning(resolveNoticeText(suffix)));
     if (trailer !== undefined) lines.push(trailer);
     return {
@@ -366,7 +367,7 @@ export class NoticeDeliveryQueue {
       input.final && this.trailerPlacement === "message"
         ? this.renderTrailer(input.session_id)
         : undefined;
-    if (trailer !== undefined) this.trailerShownThisTurn = true;
+    if (trailer !== undefined) this.deliveryFor(input.session_id).shown = true;
     if (!prefix && !suffix && trailer === undefined) return null;
 
     // Remove before callbacks or response construction so a reentrant/parallel
@@ -438,8 +439,8 @@ export class NoticeDeliveryQueue {
     const text = resolveNoticeText(prefix);
     const link = this.currentLink(sessionId);
     if (link === undefined) return this.styleSuccess(text);
-    this.lastLinkKey = link.key;
-    this.lastTrailerKey = link.key;
+    this.deliveryFor(sessionId).link = link.key;
+    this.deliveryFor(sessionId).trailer = link.key;
     return `${this.styleSuccess(text)}\n  ${link.link}`;
   }
 
@@ -463,7 +464,7 @@ export class NoticeDeliveryQueue {
     } catch {
       return undefined;
     }
-    return link?.link && link.key && link.key !== this.lastLinkKey ? link : undefined;
+    return link?.link && link.key && link.key !== this.deliveryFor(sessionId).link ? link : undefined;
   }
 
   /**
@@ -481,10 +482,10 @@ export class NoticeDeliveryQueue {
       return undefined;
     }
     if (!link?.link || !link.key) return undefined;
-    const isNew = link.key !== this.lastTrailerKey;
+    const isNew = link.key !== this.deliveryFor(sessionId).trailer;
     // "turn": one line per user turn, and only when the index changed.
     if (this.trailerPlacement === "turn" && !isNew) return undefined;
-    this.lastTrailerKey = link.key;
+    this.deliveryFor(sessionId).trailer = link.key;
     const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
     return this.linkNotice(label, link);
   }
@@ -496,6 +497,14 @@ export class NoticeDeliveryQueue {
 
   private styleDim(text: string): string {
     return this.color ? `${ANSI_DIM}${text}${ANSI_NORMAL_INTENSITY}` : text;
+  }
+
+  private deliveryFor(sessionId: string | undefined) {
+    const state = this.delivered.get(sessionId) ?? { shown: false };
+    this.delivered.delete(sessionId);
+    this.delivered.set(sessionId, state);
+    if (this.delivered.size > 64) this.delivered.delete(this.delivered.keys().next().value);
+    return state;
   }
 
   private style(text: string, sgr: string): string {

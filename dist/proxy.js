@@ -1857,7 +1857,7 @@ function resumeLinkLine(state, input) {
         key: page.index,
         link: page.url,
         ...(page.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
-    });
+    }, sessionId);
 }
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
