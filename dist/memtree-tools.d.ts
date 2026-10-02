@@ -67,7 +67,19 @@ export interface SearchHit {
         line: number;
         text: string;
     }[];
+    /** `<tree>#<node>` from servers that address hits. */
+    address?: string;
+    /** Ancestors, root first (servers that address hits). */
+    path?: {
+        id: number;
+        summary: string;
+    }[];
 }
+/** A node address, `<tree>#<node id>` (search hits carry them). */
+export declare function parseNodeAddress(value: unknown): {
+    tree: string;
+    id: number;
+};
 /** Lowercased, de-duplicated terms; surrounding punctuation trimmed. */
 export declare function queryTerms(query: string): string[];
 export declare class ToolInputError extends Error {

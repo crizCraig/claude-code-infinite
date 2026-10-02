@@ -7,8 +7,11 @@ import {
   formatLines,
   formatNode,
   formatSearch,
+  formatSearchHits,
   MemtreeIndex,
+  parseNodeAddress,
   queryTerms,
+  serverSearchHits,
   READ_LINES_MAX_LINES,
   ToolInputError,
 } from "../dist/memtree-tools.js";
@@ -319,14 +322,13 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
     "search",
     "read_node",
     "read_lines",
-    "list_sessions",
-    "search_sessions",
+    "list",
   ]);
   assert.equal(list.result.tools, MEMTREE_TOOLS);
 
   const call = (name, args) =>
     handleMcpMessage({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }, tree);
-  const found = await call("search", { query: "8443" });
+  const found = await call("search", { query: "8443", tree: "current" });
   assert.equal(found.result.isError, undefined);
   assert.match(found.result.content[0].text, /The billing service port is 8443/);
   assert.match((await call("read_node", { id: 5 })).result.content[0].text, /^node 5 · leaf/);
@@ -345,8 +347,67 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
   assert.equal(down.result.isError, true);
 });
 
+test("search routes by tree and mode; read_node and read_lines take node addresses", async () => {
+  const seen = [];
+  const tree = {
+    get: async (t) => (seen.push(["get", t]), index()),
+    search: async (q, limit, t) => (seen.push(["tree-search", q, t]), "tree hits"),
+    currentId: async () => "cur-id",
+  };
+  const finder = {
+    listSessions: async () => "sessions",
+    searchSessions: async (args, t) => (seen.push(["server-search", args.mode ?? "text", t]), "server hits"),
+  };
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree, finder))
+      .result.content[0].text;
+
+  assert.equal(await call("search", { query: "x", tree: "current" }), "tree hits");
+  assert.equal(await call("search", { query: "x", tree: "abc-v1-own" }), "tree hits");
+  assert.equal(await call("search", { query: "x" }), "server hits");
+  assert.equal(await call("search", { query: "x", mode: "vector", tree: "current" }), "server hits");
+  assert.equal(await call("search", { query: "x", mode: "vector", tree: "abc-v1-own" }), "server hits");
+  assert.deepEqual(seen, [
+    ["tree-search", "x", undefined],
+    ["tree-search", "x", "abc-v1-own"],
+    ["server-search", "text", undefined],
+    ["server-search", "vector", "cur-id"],
+    ["server-search", "vector", "abc-v1-own"],
+  ]);
+  assert.equal(await call("list", {}), "sessions");
+
+  seen.length = 0;
+  assert.match(await call("read_node", { node: "abc-v1-own#5" }), /^node 5 · leaf/);
+  assert.match(await call("read_lines", { node: "abc-v1-own#5" }), /^block 1 lines 1-5 .*\n1\tMessage 4 from user/);
+  assert.deepEqual(seen, [["get", "abc-v1-own"], ["get", "abc-v1-own"]]);
+  assert.match(await call("read_lines", { node: "abc-v1-own#0" }), /is a branch; read_node/);
+  assert.match(await call("read_node", { node: "abc#x" }), /node must be an address/);
+  assert.match(await call("read_node", { node: "../x#1" }), /node must be an address/);
+  assert.match(await call("read_node", { id: 0, tree: "current" }), /^node 0/);
+  assert.deepEqual(parseNodeAddress(" t-v3-served#12 "), { tree: "t-v3-served", id: 12 });
+});
+
+test("hits show their node address and path from the root", () => {
+  const hit = {
+    id: "s1", kind: "claude_code_session", session_id: "s1",
+    tree: { request_id: "r1", ref: "r1-v1-own" }, range: { block: 0, start: 3, end: 4 },
+    address: "r1-v1-own#7", node: 7,
+    path: [{ id: 0, summary: "Deploys" }, { id: 2, summary: "Staging rollout" }],
+    snippet: "port **8443**", score: 0.5,
+  };
+  const text = formatSearchResults({ query: "8443", hits: [hit] }, { query: "8443" });
+  assert.match(text, /path: Deploys \(r1-v1-own#0\) › Staging rollout \(r1-v1-own#2\)/);
+  assert.match(text, /address: r1-v1-own#7/);
+  assert.match(text, /read_node \{"node": <address>\}/);
+  const local = serverSearchHits({ terms: ["8443"], hits: [{ id: 5, leaf: true, summary: "s", address: "r#5",
+    path: [{ id: 0, summary: "root" }] }] });
+  const shown = formatSearchHits(local.hits, "8443", local.terms);
+  assert.match(shown, /address: r#5/);
+  assert.match(shown, /path: root \(node 0\)/);
+});
+
 test("mcp config: bound to the proxy, argv prepended with = forms, detection in --mcp-config", () => {
-  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines,list_sessions,search_sessions");
+  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines,list");
   const config = memtreeMcpConfig("http://127.0.0.1:1234");
   const server = config.mcpServers.memtree;
   assert.equal(server.env.CCC_MEMTREE_PROXY, "http://127.0.0.1:1234");
@@ -361,8 +422,7 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
     "mcp__memtree__search",
     "mcp__memtree__read_node",
     "mcp__memtree__read_lines",
-    "mcp__memtree__list_sessions",
-    "mcp__memtree__search_sessions",
+    "mcp__memtree__list",
   ]);
 
   assert.deepEqual(mcpConfigArgs(["-p", "q", "--mcp-config", "a.json", "b.json", "--strict-mcp-config", "--mcp-config=c", "--", "--mcp-config", "d"]),
@@ -493,7 +553,7 @@ test("tree tools read another session's tree by id, cached, with follow-ups nami
   assert.equal(pageFetches.length, 6, "least recently used tree evicted after four others");
   const bad = await call("read_node", { tree: "../x", id: 0 });
   assert.equal(bad.result.isError, true);
-  assert.match(bad.result.content[0].text, /tree must be a request id/);
+  assert.match(bad.result.content[0].text, /tree must be a tree reference/);
 });
 
 test("finder follow-ups preserve pinned tree references and fall back for older servers", async () => {
@@ -521,13 +581,14 @@ test("finder follow-ups preserve pinned tree references and fall back for older 
   assert.equal(state.urls.length, before);
 });
 
-test("finder query strings: filters pass through, mode defaults to vector, limits clamp", () => {
+test("finder query strings: filters pass through, mode defaults to text, tree scopes, limits clamp", () => {
   assert.equal(sessionsQuery({}), "");
   assert.equal(
     sessionsQuery({ since: "2026-09-01", project: " polychat ", q: "deploy", cursor: "abc", limit: 500 }),
     "?since=2026-09-01&project=polychat&q=deploy&cursor=abc&limit=100"
   );
-  assert.equal(searchQuery({ query: "how did we deploy" }), "?q=how+did+we+deploy&mode=vector");
+  assert.equal(searchQuery({ query: "how did we deploy" }), "?q=how+did+we+deploy&mode=text");
+  assert.equal(searchQuery({ query: "x", mode: "vector" }, "t-v1-own"), "?q=x&mode=vector&tree=t-v1-own");
   assert.equal(searchQuery({ query: "x", mode: "TEXT", limit: 0, until: "2026-09-30" }), "?q=x&mode=text&until=2026-09-30&limit=1");
   assert.throws(() => searchQuery({ query: " " }), ToolInputError);
   assert.throws(() => searchQuery({ query: "x", mode: "fuzzy" }), /mode must be/);
@@ -535,11 +596,13 @@ test("finder query strings: filters pass through, mode defaults to vector, limit
 });
 
 test("MCP instructions mention the cross-session tools and stay constant", () => {
-  assert.match(MEMTREE_MCP_INSTRUCTIONS, /list_sessions/);
-  assert.match(MEMTREE_MCP_INSTRUCTIONS, /search_sessions/);
-  const search = MEMTREE_TOOLS.find((t) => t.name === "search_sessions");
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /\blist\b/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /"tree": "current"/);
+  assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /_sessions/);
+  const search = MEMTREE_TOOLS.find((t) => t.name === "search");
   for (const description of [MEMTREE_MCP_INSTRUCTIONS, search.description]) {
-    assert.match(description, /vector.*default/i);
+    assert.match(description, /text.*default/i);
+    assert.match(description, /address/i);
     assert.match(description, /first page.*charged/i);
     assert.match(description, /cached/i);
     assert.match(description, /cursor continuation.*free/i);
@@ -547,11 +610,11 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
     assert.match(description, /live.*snapshot/i);
   }
   assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
-  assert.equal(search.inputSchema.properties.mode.enum.join(","), "vector,text");
+  assert.equal(search.inputSchema.properties.mode.enum.join(","), "text,vector");
   for (const name of ["search", "read_node", "read_lines"]) {
     const tree = MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree;
     assert.ok(tree, name);
-    assert.match(tree.description, /reference.*list_sessions or search_sessions/i);
+    assert.match(tree.description, /reference from list or search.*"current"/i);
     assert.match(tree.description, /legacy request ids/i);
   }
 });

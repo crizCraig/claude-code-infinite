@@ -1,10 +1,11 @@
 /**
  * `memtree` MCP server: lets the agent search and read its own session's
- * MemTree (tools `search`, `read_node`, `read_lines`, which Claude Code
- * exposes as `mcp__memtree__*`), and find things in the user's other sessions
- * (`list_sessions`, `search_sessions`, memtree-finder.ts). The three tree
- * tools take an optional `tree` (a request id from those results) to read
- * another session's tree instead of this one's.
+ * MemTree and the user's other sessions (tools `search`, `read_node`,
+ * `read_lines`, `list`, which Claude Code exposes as `mcp__memtree__*`).
+ * `search` covers all of the user's sessions, or one tree with `tree` ("current"
+ * for this session's), in text (default) or vector mode; every hit names its
+ * node as an address `<tree>#<node>` with its path from the root, which
+ * `read_node` / `read_lines` take as `node`.
  *
  * A minimal JSON-RPC 2.0 server over stdio (newline-delimited messages, the
  * MCP stdio transport); no SDK dependency. Started by Claude Code from the
@@ -22,8 +23,8 @@
  * is fetched through the proxy's key-free `/memtree/<id>.json` relay and cached
  * once complete.
  *
- * Other trees (the owner's other sessions, by request id from list_sessions or
- * search_sessions) are read the same way without the session check: they are
+ * Other trees (the owner's other sessions, by reference from list or search)
+ * are read the same way without the session check: they are
  * named explicitly, and the server authorizes them by the user's key.
  *
  * `search` asks the server first (`/memtree/<id>/search`, the Step 6 term
@@ -37,6 +38,7 @@ import {
   FINDER_SEARCH_DEFAULT_LIMIT,
   FINDER_SEARCH_MAX_LIMIT,
   formatSearchResults,
+  searchMode,
   formatSessions,
   searchQuery,
   SESSIONS_DEFAULT_LIMIT,
@@ -49,6 +51,7 @@ import {
   formatSearch,
   formatSearchHits,
   MemtreeIndex,
+  parseNodeAddress,
   serverSearchHits,
   READ_LINES_MAX_CHARS,
   READ_LINES_MAX_LINES,
@@ -65,9 +68,10 @@ export const MEMTREE_TOOL_NAMES = [
   "search",
   "read_node",
   "read_lines",
-  "list_sessions",
-  "search_sessions",
+  "list",
 ] as const;
+/** `tree` value naming this session's own current tree. */
+export const CURRENT_TREE = "current";
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
 const PREFIX_RETRY_INTERVAL_MS = 45_000;
@@ -92,32 +96,38 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "user asked for or ruled out, decisions and why they were made, findings, ids and paths, commands, what was tried " +
   "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
   "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
-  "The user's other sessions are searchable too: list_sessions lists them by time and project, and search_sessions " +
-  "finds passages across all of them; use these when the user refers to earlier work that is not in this session. " +
-  "For search_sessions, vector mode (default) finds meaning: the first page is charged even when the query embedding " +
-  "is cached; cursor continuation is free, including when the embedding must be regenerated. Text mode is free. " +
-  "Cursors page over live results, not a frozen snapshot; new indexing can change later pages.";
+  "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
+  "sessions (use that when the user refers to earlier work that is not in this session), and list shows those " +
+  "sessions by time and project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
+  "meaning: its first page is charged even when the query embedding is cached; cursor continuation is free, " +
+  "including when the embedding must be regenerated. Every hit has an address (<tree>#<node>) and its path from the root: " +
+  "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
+  "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
+  "frozen snapshot.";
+
+const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
 
 export const MEMTREE_TOOLS = [
   {
     name: "search",
     description:
-      "Search this session's MemTree (the index of this conversation; once a memory message has replaced the earlier part, the only way to its detail) for exact details " +
-      "(names, ids, numbers, file paths, commands, errors, decisions). Case-insensitive term matching over node summaries and the verbatim " +
-      "transcript lines under each leaf; returns the best nodes with their summaries, leaf line ranges and matching lines. " +
-      "Use it before re-deriving or guessing something from earlier in the session.",
+      "Search MemTree for exact details or for meaning: one tree (tree, \"current\" for this session) or, without tree, " +
+      "all of the user's sessions. Use it before re-deriving or guessing something from earlier work. " +
+      "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
+      "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
+      "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
+      "Each hit gives its node address (<tree>#<node>), its path from the root and a snippet.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Words to look for; distinctive terms work best (e.g. a file name, id or error text)." },
-        limit: {
-          type: "number",
-          description: `Maximum results (default ${SEARCH_DEFAULT_LIMIT}, at most ${SEARCH_MAX_LIMIT}).`,
-        },
-        tree: {
-          type: "string",
-          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
-        },
+        query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions) or a question (vector)." },
+        tree: { type: "string", description: `Optional. ${TREE_DESC} Omit to search all sessions.` },
+        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words, free) or vector (meaning, first page charged)." },
+        project: { type: "string", description: "Without tree: only sessions in this working directory or git repository (owner/repo, or just repo)." },
+        since: { type: "string", description: "Without tree: only requests at or after this ISO 8601 time or date." },
+        until: { type: "string", description: "Without tree: only requests before this ISO 8601 time or date." },
+        cursor: { type: "string", description: "next cursor from a previous call, to get the next page (same other arguments)." },
+        limit: { type: "number", description: `Hits per page (default ${FINDER_SEARCH_DEFAULT_LIMIT}, at most ${FINDER_SEARCH_MAX_LIMIT}; per model for vector).` },
       },
       required: ["query"],
     },
@@ -126,44 +136,38 @@ export const MEMTREE_TOOLS = [
     name: "read_node",
     description:
       "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
-      "for a leaf, the transcript line range it covers. Node 0 is the root.",
+      "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "number", description: "Node id (0 is the root)." },
-        tree: {
-          type: "string",
-          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
-        },
+        node: { type: "string", description: "A node address <tree>#<id> from search." },
+        id: { type: "number", description: "Node id (0 is the root), in tree or this session's tree." },
+        tree: { type: "string", description: `With id: ${TREE_DESC} Omit for this session.` },
       },
-      required: ["id"],
     },
   },
   {
     name: "read_lines",
     description:
-      "Read exact transcript lines of the summarized conversation: block and 1-based inclusive start/end lines, as given by a leaf's range. " +
+      "Read exact transcript lines: a leaf's node address (its whole range), or block and 1-based inclusive start/end lines. " +
       `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped.`,
     inputSchema: {
       type: "object",
       properties: {
+        node: { type: "string", description: "A leaf's address <tree>#<id> from search; block/start/end then default to its range." },
         block: { type: "number", description: "Block index (a leaf's first range number)." },
         start: { type: "number", description: "First line, 1-based." },
         end: { type: "number", description: "Last line, inclusive." },
-        tree: {
-          type: "string",
-          description: "Optional: the exact tree reference from list_sessions or search_sessions, preserving its style and own/served suffix. Legacy request ids also work. Omit for this session.",
-        },
+        tree: { type: "string", description: `With block/start/end: ${TREE_DESC} Omit for this session.` },
       },
-      required: ["block", "start", "end"],
     },
   },
   {
-    name: "list_sessions",
+    name: "list",
     description:
       "List the user's own MemTree sessions (this one and others), most recently active first: title (the tree's root summary), " +
-      "first message, times, project (directory, git repo, branch, commit), models, request count and the latest tree's id. " +
-      "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <id>, \"id\": 0} or search {\"tree\": <id>, ...}.",
+      "first message, times, project (directory, git repo, branch, commit), models, request count and the latest tree's reference. " +
+      "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <ref>, \"id\": 0} or search {\"tree\": <ref>, ...}.",
     inputSchema: {
       type: "object",
       properties: {
@@ -174,29 +178,6 @@ export const MEMTREE_TOOLS = [
         cursor: { type: "string", description: "next cursor from a previous call, to get the next page (same other arguments)." },
         limit: { type: "number", description: `Sessions per page (default ${SESSIONS_DEFAULT_LIMIT}, at most ${SESSIONS_MAX_LIMIT}).` },
       },
-    },
-  },
-  {
-    name: "search_sessions",
-    description:
-      "Search the transcripts of all of the user's own sessions at once; each hit names the session, the tree reference, " +
-      "the transcript lines and a snippet, and says which read_lines call opens it. mode \"vector\" (default) matches meaning " +
-      "and its first page is charged even when the query embedding is cached; cursor continuation is free, including " +
-      "when the embedding must be regenerated. Mode \"text\" matches exact words, ids and paths and is free. " +
-      "Cursors page over live results, not a frozen snapshot; new indexing can change later pages. " +
-      "A passage repeated across a session's successive trees is reported once, from the newest.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "What to look for: a question or description (vector), or exact words (text; \"quoted phrase\", or, -word)." },
-        mode: { type: "string", enum: ["vector", "text"], description: "vector (default, semantic, first page charged, cursor continuation free) or text (exact words, free)." },
-        project: { type: "string", description: "Only sessions in this working directory or git repository (owner/repo, or just repo)." },
-        since: { type: "string", description: "Only requests at or after this ISO 8601 time or date." },
-        until: { type: "string", description: "Only requests before this ISO 8601 time or date." },
-        cursor: { type: "string", description: "next cursor from a previous call, to get the next page (same other arguments)." },
-        limit: { type: "number", description: `Hits per page (default ${FINDER_SEARCH_DEFAULT_LIMIT}, at most ${FINDER_SEARCH_MAX_LIMIT}; per model for vector).` },
-      },
-      required: ["query"],
     },
   },
 ];
@@ -273,7 +254,7 @@ function proxyBase(deps: MemtreeMcpDeps): string {
 function checkTreeId(tree: unknown): string | undefined {
   if (tree === undefined || tree === null || tree === "") return undefined;
   if (typeof tree !== "string" || !TREE_ID_RE.test(tree.trim())) {
-    throw new ToolInputError("tree must be a request id from list_sessions or search_sessions");
+    throw new ToolInputError("tree must be a tree reference from list or search, or \"current\"");
   }
   return tree.trim();
 }
@@ -281,6 +262,8 @@ function checkTreeId(tree: unknown): string | undefined {
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
   get(tree?: string): Promise<MemtreeIndex>;
+  /** This session's current tree id (for searches scoped to it on the server). */
+  currentId?(): Promise<string>;
   /** Term search, formatted; optional so a plain index can stand in (tests). */
   search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
 }
@@ -364,7 +347,7 @@ export class CurrentTree implements TreeSource {
   }
 
   /** The proxy's current page for the calling session; fails closed on any other session. */
-  private async currentId(): Promise<string> {
+  async currentId(): Promise<string> {
     const base = proxyBase(this.deps);
     const sessionId = this.requireSessionId();
     const query = `?session=${encodeURIComponent(sessionId)}`;
@@ -470,7 +453,8 @@ function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
 /** The cross-session tools: formatted text from the proxy's finder relay. */
 export interface SessionFinderSource {
   listSessions(args: Record<string, unknown>): Promise<string>;
-  searchSessions(args: Record<string, unknown>): Promise<string>;
+  /** Server search across sessions, or within ``tree`` (any mode). */
+  searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
 }
 
 export class SessionFinder implements SessionFinderSource {
@@ -481,13 +465,13 @@ export class SessionFinder implements SessionFinderSource {
   }
 
   async listSessions(args: Record<string, unknown>): Promise<string> {
-    const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list_sessions");
+    const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list");
     return formatSessions(body as Parameters<typeof formatSessions>[0], args);
   }
 
-  async searchSessions(args: Record<string, unknown>): Promise<string> {
-    const body = await this.get(`/memtree/search${searchQuery(args)}`, "search_sessions");
-    return formatSearchResults(body as Parameters<typeof formatSearchResults>[0], args);
+  async searchSessions(args: Record<string, unknown>, tree?: string): Promise<string> {
+    const body = await this.get(`/memtree/search${searchQuery(args, tree)}`, "search");
+    return formatSearchResults(body as Parameters<typeof formatSearchResults>[0], { ...args, tree });
   }
 
   private async get(pathAndQuery: string, tool: string): Promise<unknown> {
@@ -566,28 +550,81 @@ async function callTool(
   tree: TreeSource,
   finder?: SessionFinderSource
 ): Promise<string> {
-  const other = name === "list_sessions" || name === "search_sessions" ? undefined : checkTreeId(args.tree);
   switch (name) {
-    case "search": {
-      if (typeof args.query !== "string" || !args.query.trim()) {
-        throw new ToolInputError("search: query must be a non-empty string");
-      }
-      const limit = args.limit === undefined ? undefined : Number(args.limit);
-      if (tree.search) return tree.search(args.query, limit, other);
-      return formatSearch(await tree.get(other), args.query, limit, other);
+    case "search":
+      return searchTool(args, tree, finder);
+    case "read_node": {
+      const target = nodeTarget(args, "id");
+      return formatNode(await tree.get(target.tree), target.id, target.tree);
     }
-    case "read_node":
-      return formatNode(await tree.get(other), Number(args.id), other);
     case "read_lines":
-      return formatLines(await tree.get(other), Number(args.block), Number(args.start), Number(args.end), other);
-    case "list_sessions":
-    case "search_sessions": {
-      if (!finder) throw new ToolInputError(`${name} is not available here`);
-      return name === "list_sessions" ? finder.listSessions(args) : finder.searchSessions(args);
-    }
+      return readLinesTool(args, tree);
+    case "list":
+      if (!finder) throw new ToolInputError("list is not available here");
+      return finder.listSessions(args);
     default:
       throw new UnknownToolError(`Unknown tool: ${name}`);
   }
+}
+
+/**
+ * `search`: a text search of one tree uses the per-tree term search (summaries
+ * and lines); every other combination is the server's search, across sessions
+ * or scoped to the tree.
+ */
+async function searchTool(
+  args: Record<string, unknown>,
+  tree: TreeSource,
+  finder?: SessionFinderSource
+): Promise<string> {
+  if (typeof args.query !== "string" || !args.query.trim()) {
+    throw new ToolInputError("search: query must be a non-empty string");
+  }
+  const mode = searchMode(args.mode);
+  const current = args.tree === CURRENT_TREE;
+  const named = current ? undefined : checkTreeId(args.tree);
+  if (mode === "text" && (current || named)) {
+    const limit = args.limit === undefined ? undefined : Number(args.limit);
+    if (tree.search) return tree.search(args.query, limit, named);
+    return formatSearch(await tree.get(named), args.query, limit, named);
+  }
+  if (!finder) throw new ToolInputError("search across sessions is not available here");
+  if (current && !tree.currentId) throw new ToolInputError("this session's tree is not available here");
+  const scope = current ? await tree.currentId!() : named;
+  return finder.searchSessions(args, scope);
+}
+
+/** `{tree, id}` from a node address, or from tree (optional) and the numeric field. */
+function nodeTarget(args: Record<string, unknown>, field: string): { tree?: string; id: number } {
+  if (args.node !== undefined && args.node !== null && args.node !== "") {
+    const { tree, id } = parseNodeAddress(args.node);
+    return { tree: checkTreeId(tree), id };
+  }
+  return { tree: treeArgument(args.tree), id: Number(args[field]) };
+}
+
+function treeArgument(tree: unknown): string | undefined {
+  return tree === CURRENT_TREE ? undefined : checkTreeId(tree);
+}
+
+/** read_lines by leaf address (its range unless block/start/end are given) or by range. */
+async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): Promise<string> {
+  if (args.node === undefined || args.node === null || args.node === "") {
+    const target = treeArgument(args.tree);
+    return formatLines(await tree.get(target), Number(args.block), Number(args.start), Number(args.end), target);
+  }
+  const { tree: ref, id } = nodeTarget(args, "id");
+  const index = await tree.get(ref);
+  const node = index.nodes.get(id);
+  if (!node) throw new ToolInputError(`read_lines: no node ${id} in tree ${ref}`);
+  if (!index.isLeaf(node)) {
+    throw new ToolInputError(
+      `read_lines: node ${ref}#${id} is a branch; read_node {"node": "${ref}#${id}"} lists the leaves under it`
+    );
+  }
+  const [block, start, end] = node.l!;
+  const pick = (v: unknown, fallback: number) => (v === undefined || v === null ? fallback : Number(v));
+  return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
 
 /** Serve MCP over this process's stdin/stdout until stdin closes. */

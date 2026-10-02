@@ -56,6 +56,14 @@ export interface FinderHit {
     snippet?: string | null;
     score?: number;
     embedding_model?: string;
+    /** `<tree>#<node>`: the matched node, for read_node / read_lines `node`. */
+    address?: string;
+    node?: number;
+    /** Ancestors of the node, root first. */
+    path?: {
+        id: number;
+        summary: string;
+    }[];
 }
 export interface FinderSessionsResponse {
     sessions?: FinderSession[];
@@ -76,9 +84,14 @@ export interface FinderSearchResponse {
 }
 /** Query string for `/memtree/sessions` from the tool's arguments. */
 export declare function sessionsQuery(args: Record<string, unknown>): string;
-/** Query string for `/memtree/search`; `mode` defaults to vector. */
-export declare function searchQuery(args: Record<string, unknown>): string;
+/** Query string for `/memtree/search`; `mode` defaults to text; `tree` scopes it to one tree. */
+export declare function searchQuery(args: Record<string, unknown>, tree?: string): string;
 export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>): string;
 export declare function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string;
+/** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
+export declare function formatPath(path: {
+    id: number;
+    summary: string;
+}[], ref?: string): string;
 //# sourceMappingURL=memtree-finder.d.ts.map

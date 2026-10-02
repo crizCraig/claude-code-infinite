@@ -3975,7 +3975,7 @@ test("GET /memtree/sessions and /memtree/search relay to the finder endpoints wi
   }
 });
 
-test("list_sessions and search_sessions through the proxy against a mock MemTree server", async () => {
+test("list and search through the proxy against a mock MemTree server", async () => {
   const upstream = await mockUpstream();
   const requests = [];
   const rid = "3f2a9c1b-7e40-4d2a-9a51-0c8e2b6f4d17";
@@ -4028,8 +4028,8 @@ test("list_sessions and search_sessions through the proxy against a mock MemTree
     assert.match(listed, /"cursor": "CURSOR1"/);
     assert.match(await finder.listSessions({ cursor: "CURSOR1" }), /No more results\./);
 
-    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target" });
-    assert.equal(requests.at(-1).params.mode, "vector", "vector by default");
+    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target", mode: "vector" });
+    assert.equal(requests.at(-1).params.mode, "vector");
     assert.match(semantic, /charged: one query embedding per model/);
     assert.match(semantic, /== voyage-3\.5 ==[\s\S]*== gemini-embedding-001 ==/, "one ranking per model");
     assert.match(semantic, /scores are not comparable across groups/);

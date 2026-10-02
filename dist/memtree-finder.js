@@ -1,6 +1,8 @@
 /**
- * The `memtree` MCP server's cross-session tools: `list_sessions` and
- * `search_sessions` (memtree-mcp.ts wires them up).
+ * The `memtree` MCP server's server-side finding: `list` (the user's sessions)
+ * and `search` across sessions or within one tree by `tree`, in text or vector
+ * mode (memtree-mcp.ts wires them up; a text search of one tree uses the
+ * per-tree term search instead).
  *
  * Both call the ccc loopback proxy (`/memtree/sessions`, `/memtree/search`),
  * which relays to the server's owner-only `GET /v1/memtree/sessions` and
@@ -19,6 +21,7 @@ export const FINDER_SEARCH_MAX_LIMIT = 50;
 export const FINDER_SEARCH_MODES = ["vector", "text"];
 const SNIPPET_CHARS = 400;
 const TITLE_CHARS = 300;
+const PATH_SUMMARY_CHARS = 80;
 /** Query string for `/memtree/sessions` from the tool's arguments. */
 export function sessionsQuery(args) {
     const params = new URLSearchParams();
@@ -31,13 +34,15 @@ export function sessionsQuery(args) {
     const query = params.toString();
     return query ? `?${query}` : "";
 }
-/** Query string for `/memtree/search`; `mode` defaults to vector. */
-export function searchQuery(args) {
+/** Query string for `/memtree/search`; `mode` defaults to text; `tree` scopes it to one tree. */
+export function searchQuery(args, tree) {
     if (typeof args.query !== "string" || !args.query.trim()) {
-        throw new ToolInputError("search_sessions: query must be a non-empty string");
+        throw new ToolInputError("search: query must be a non-empty string");
     }
     const mode = searchMode(args.mode);
     const params = new URLSearchParams({ q: args.query.trim(), mode });
+    if (tree)
+        params.set("tree", tree);
     addText(params, "project", args.project);
     addText(params, "since", args.since);
     addText(params, "until", args.until);
@@ -47,11 +52,11 @@ export function searchQuery(args) {
 }
 export function searchMode(value) {
     if (value === undefined || value === null || value === "")
-        return "vector";
+        return "text";
     const mode = String(value).trim().toLowerCase();
     if (mode === "vector" || mode === "text")
         return mode;
-    throw new ToolInputError(`search_sessions: mode must be "vector" or "text", got ${JSON.stringify(value)}`);
+    throw new ToolInputError(`search: mode must be "vector" or "text", got ${JSON.stringify(value)}`);
 }
 function addText(params, name, value) {
     if (value === undefined || value === null)
@@ -102,7 +107,7 @@ export function formatSessions(body, args) {
                 `browse it with read_node {"tree": "${ref}", "id": 0}, or search it with search {"tree": "${ref}", "query": …}`);
         }
     });
-    out.push("", nextPage("list_sessions", body.next_cursor));
+    out.push("", nextPage("list", body.next_cursor));
     return out.join("\n");
 }
 export function formatSearchResults(body, args) {
@@ -123,7 +128,7 @@ export function formatSearchResults(body, args) {
             out.push("", `== ${group.embedding_model} ==`);
             group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
         }
-        out.push("", nextPage("search_sessions", body.next_cursor), OPEN_NOTE);
+        out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
         return out.join("\n");
     }
     const hits = body.hits ?? [];
@@ -134,10 +139,11 @@ export function formatSearchResults(body, args) {
     if (body.matches_capped) {
         out.push("", "(Only the newest 2,000 matching passages were ranked: add words, or narrow with since, until or project.)");
     }
-    out.push("", nextPage("search_sessions", body.next_cursor), OPEN_NOTE);
+    out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
 }
-const OPEN_NOTE = "Snippets are excerpts; read_lines with the hit's tree returns the exact transcript lines, read_node {\"tree\": …, \"id\": 0} browses that tree from its root.";
+const OPEN_NOTE = "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
+    "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 function formatHit(hit, n) {
     const tree = hit.tree?.request_id;
     const ref = hit.tree?.ref ?? tree;
@@ -154,12 +160,23 @@ function formatHit(hit, n) {
     const lines = ["", `[${n}] ${head}`];
     if (hit.tree?.links?.url)
         lines.push(`    page: ${hit.tree.links.url}`);
+    if (hit.path?.length)
+        lines.push(`    path: ${formatPath(hit.path, ref)}`);
     if (hit.snippet)
         lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
-    if (ref && range) {
+    if (hit.address) {
+        lines.push(`    address: ${hit.address}`);
+    }
+    else if (ref && range) {
         lines.push(`    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`);
     }
     return lines;
+}
+/** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
+export function formatPath(path, ref) {
+    return path
+        .map((p) => `${oneLine(p.summary, PATH_SUMMARY_CHARS)}${ref ? ` (${ref}#${p.id})` : ` (node ${p.id})`}`)
+        .join(" › ");
 }
 function noHits(query, mode, args) {
     if (args.cursor)
@@ -167,6 +184,9 @@ function noHits(query, mode, args) {
     const other = mode === "vector"
         ? 'For an exact word, id or path, try mode "text".'
         : 'For meaning rather than exact words, try mode "vector".';
+    if (typeof args.tree === "string" && args.tree) {
+        return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${mode} search). ${other}`;
+    }
     return `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search). ${other} Or widen since/until, or drop the project filter.`;
 }
 function nextPage(tool, cursor) {

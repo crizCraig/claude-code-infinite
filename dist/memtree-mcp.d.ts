@@ -1,7 +1,9 @@
 import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
-export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list_sessions", "search_sessions"];
+export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list"];
+/** `tree` value naming this session's own current tree. */
+export declare const CURRENT_TREE = "current";
 /**
  * The MCP server's instructions, which Claude Code places in the system prompt
  * from the first request: the one place that explains the agent's situation
@@ -18,24 +20,41 @@ export declare const MEMTREE_TOOLS: ({
                 type: string;
                 description: string;
             };
-            limit: {
-                type: string;
-                description: string;
-            };
             tree: {
                 type: string;
                 description: string;
             };
+            mode: {
+                type: string;
+                enum: string[];
+                description: string;
+            };
+            project: {
+                type: string;
+                description: string;
+            };
+            since: {
+                type: string;
+                description: string;
+            };
+            until: {
+                type: string;
+                description: string;
+            };
+            cursor: {
+                type: string;
+                description: string;
+            };
+            limit: {
+                type: string;
+                description: string;
+            };
+            node?: undefined;
             id?: undefined;
             block?: undefined;
             start?: undefined;
             end?: undefined;
-            since?: undefined;
-            until?: undefined;
-            project?: undefined;
             q?: undefined;
-            cursor?: undefined;
-            mode?: undefined;
         };
         required: string[];
     };
@@ -45,6 +64,10 @@ export declare const MEMTREE_TOOLS: ({
     inputSchema: {
         type: string;
         properties: {
+            node: {
+                type: string;
+                description: string;
+            };
             id: {
                 type: string;
                 description: string;
@@ -54,18 +77,18 @@ export declare const MEMTREE_TOOLS: ({
                 description: string;
             };
             query?: undefined;
+            mode?: undefined;
+            project?: undefined;
+            since?: undefined;
+            until?: undefined;
+            cursor?: undefined;
             limit?: undefined;
             block?: undefined;
             start?: undefined;
             end?: undefined;
-            since?: undefined;
-            until?: undefined;
-            project?: undefined;
             q?: undefined;
-            cursor?: undefined;
-            mode?: undefined;
         };
-        required: string[];
+        required?: undefined;
     };
 } | {
     name: string;
@@ -73,6 +96,10 @@ export declare const MEMTREE_TOOLS: ({
     inputSchema: {
         type: string;
         properties: {
+            node: {
+                type: string;
+                description: string;
+            };
             block: {
                 type: string;
                 description: string;
@@ -90,16 +117,16 @@ export declare const MEMTREE_TOOLS: ({
                 description: string;
             };
             query?: undefined;
-            limit?: undefined;
-            id?: undefined;
+            mode?: undefined;
+            project?: undefined;
             since?: undefined;
             until?: undefined;
-            project?: undefined;
-            q?: undefined;
             cursor?: undefined;
-            mode?: undefined;
+            limit?: undefined;
+            id?: undefined;
+            q?: undefined;
         };
-        required: string[];
+        required?: undefined;
     };
 } | {
     name: string;
@@ -133,57 +160,14 @@ export declare const MEMTREE_TOOLS: ({
             };
             query?: undefined;
             tree?: undefined;
+            mode?: undefined;
+            node?: undefined;
             id?: undefined;
             block?: undefined;
             start?: undefined;
             end?: undefined;
-            mode?: undefined;
         };
         required?: undefined;
-    };
-} | {
-    name: string;
-    description: string;
-    inputSchema: {
-        type: string;
-        properties: {
-            query: {
-                type: string;
-                description: string;
-            };
-            mode: {
-                type: string;
-                enum: string[];
-                description: string;
-            };
-            project: {
-                type: string;
-                description: string;
-            };
-            since: {
-                type: string;
-                description: string;
-            };
-            until: {
-                type: string;
-                description: string;
-            };
-            cursor: {
-                type: string;
-                description: string;
-            };
-            limit: {
-                type: string;
-                description: string;
-            };
-            tree?: undefined;
-            id?: undefined;
-            block?: undefined;
-            start?: undefined;
-            end?: undefined;
-            q?: undefined;
-        };
-        required: string[];
     };
 })[];
 export interface MemtreeMcpDeps {
@@ -196,6 +180,8 @@ export interface MemtreeMcpDeps {
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
+    /** This session's current tree id (for searches scoped to it on the server). */
+    currentId?(): Promise<string>;
     /** Term search, formatted; optional so a plain index can stand in (tests). */
     search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
 }
@@ -227,7 +213,7 @@ export declare class CurrentTree implements TreeSource {
     private loadCurrent;
     private requireSessionId;
     /** The proxy's current page for the calling session; fails closed on any other session. */
-    private currentId;
+    currentId(): Promise<string>;
     private getOther;
     /**
      * Fetch one page. ``sessionId`` (the current tree only) must match the page's
@@ -243,14 +229,15 @@ export declare class CurrentTree implements TreeSource {
 /** The cross-session tools: formatted text from the proxy's finder relay. */
 export interface SessionFinderSource {
     listSessions(args: Record<string, unknown>): Promise<string>;
-    searchSessions(args: Record<string, unknown>): Promise<string>;
+    /** Server search across sessions, or within ``tree`` (any mode). */
+    searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
 }
 export declare class SessionFinder implements SessionFinderSource {
     private readonly deps;
     private readonly fetchImpl;
     constructor(deps: MemtreeMcpDeps);
     listSessions(args: Record<string, unknown>): Promise<string>;
-    searchSessions(args: Record<string, unknown>): Promise<string>;
+    searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
     private get;
 }
 type JsonRpcId = string | number | null;
