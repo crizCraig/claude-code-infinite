@@ -1,58 +1,52 @@
 /**
- * Lets a session that ended past Claude Code's context limit be resumed.
- *
- * Claude Code sizes a resumed conversation from the usage recorded on the
- * transcript's last response. When that response was sent whole, near the
- * window (a tool loop that lost its compressed route), every later prompt is
- * refused locally ("Context limit reached") before ccc sees it, so ccc can
- * never compress the conversation: the session is stranded (2026-10-02).
- *
- * On `--resume <id>`, before Claude starts, ccc lowers that last response's
- * recorded usage to half the window, after backing up the transcript. Claude
- * Code then sends the next prompt, ccc compresses it as usual, and the next
- * response records the real size. Only the usage numbers of the last
- * response's entries change, and only for a shape ccc recognises; anything
- * else leaves the transcript untouched.
+ * Repair only a demonstrably stranded resume, before Claude starts. Unknown
+ * shapes, concurrent writers and filesystem errors leave the resume unchanged.
+ * Only the final response's totals and Claude's counted iteration are lowered.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { getConfigDir } from "./config.js";
 import { defaultProjectsDir, findTranscript } from "./transcript-usage.js";
 import { contextLimitForModel } from "./turns.js";
-/**
- * A recorded size within this fraction of the window is treated as stranded.
- * Claude Code refused at 979k of 1M; the margin is wide on purpose, since
- * lowering a session that still fit only lets Claude Code send a prompt ccc
- * compresses anyway.
- */
-export const STRANDED_WINDOW_FRACTION = 0.9;
-/** The lowered size, as a fraction of the window: room for the next prompt. */
+import { replaceQuiescentTranscript, transcriptIsQuiescent } from "./resume-repair-file.js";
+/** Unknown versions use the full window: never the former speculative 90%. */
+export const STRANDED_WINDOW_FRACTION = 1;
 export const LOWERED_WINDOW_FRACTION = 0.5;
-/** Lowers a stranded resumed session's recorded usage; undefined when nothing changed. */
 export function repairStrandedResume(claudeArgs, options) {
-    const sessionId = resumeSessionId(claudeArgs);
-    if (sessionId === undefined)
+    try {
+        const sessionId = resumeSessionId(claudeArgs);
+        if (!sessionId)
+            return undefined;
+        const file = findTranscript(options.projectsDir ?? defaultProjectsDir(), sessionId);
+        if (!file)
+            return undefined;
+        const quiescent = options.isQuiescent ?? transcriptIsQuiescent;
+        if (!quiescent(file) || !fs.lstatSync(file).isFile())
+            return undefined;
+        const snapshot = fs.statSync(file, { bigint: true });
+        const original = fs.readFileSync(file);
+        const lines = original.toString("utf8").split("\n");
+        if (!Buffer.from(lines.join("\n"), "utf8").equals(original))
+            return undefined;
+        const plan = planUsageRepair(lines, options.nativeOneMillionContext, options.claudeVersion ?? installedVersion());
+        if (!plan)
+            return undefined;
+        for (const index of plan.lineIndexes)
+            lines[index] = lowerUsage(lines[index], plan.loweredTokens);
+        const backupPath = replaceQuiescentTranscript({
+            file, original, snapshot, replacement: lines.join("\n"), quiescent,
+            backupDir: options.backupDir ?? path.join(getConfigDir(), "transcript-backups"),
+            sessionId, now: options.now,
+        });
+        return backupPath ? { sessionId, recordedTokens: plan.recordedTokens,
+            loweredTokens: plan.loweredTokens, backupPath } : undefined;
+    }
+    catch {
+        // Repair is optional: no error may prevent launching the original resume.
         return undefined;
-    const file = findTranscript(options.projectsDir ?? defaultProjectsDir(), sessionId);
-    if (file === undefined)
-        return undefined;
-    const text = fs.readFileSync(file, "utf-8");
-    const lines = text.split("\n");
-    const plan = planUsageRepair(lines, options.nativeOneMillionContext);
-    if (plan === undefined)
-        return undefined;
-    const backupPath = backupTranscript(file, sessionId, options);
-    for (const index of plan.lineIndexes)
-        lines[index] = lowerUsage(lines[index], plan.loweredTokens);
-    writeAtomically(file, lines.join("\n"));
-    return {
-        sessionId,
-        recordedTokens: plan.recordedTokens,
-        loweredTokens: plan.loweredTokens,
-        backupPath,
-    };
+    }
 }
-/** The session id of `--resume <id>`, `--resume=<id>` or `-r <id>`; not the picker form. */
 export function resumeSessionId(args) {
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
@@ -65,126 +59,106 @@ export function resumeSessionId(args) {
     }
     return undefined;
 }
-/** The last response's entries and sizes, when its recorded usage strands the session. */
-export function planUsageRepair(lines, nativeOneMillionContext) {
-    const last = lastResponse(lines);
-    if (last === undefined)
-        return undefined;
-    const window = contextLimitForModel(last.model, undefined, nativeOneMillionContext);
-    if (last.recordedTokens < window * STRANDED_WINDOW_FRACTION)
-        return undefined;
-    return {
-        lineIndexes: entriesOfResponse(lines, last.messageId),
-        recordedTokens: last.recordedTokens,
-        loweredTokens: Math.floor(window * LOWERED_WINDOW_FRACTION),
-    };
-}
-/** The newest real (non-synthetic) assistant response with usage ccc recognises. */
-function lastResponse(lines) {
-    for (let i = lines.length - 1; i >= 0; i--) {
-        const message = assistantMessage(lines[i]);
-        if (message === undefined || message.model === "<synthetic>")
-            continue;
-        const recordedTokens = recordedSize(message.usage);
-        if (recordedTokens === undefined)
-            return undefined;
-        return { messageId: message.id, model: message.model, recordedTokens };
-    }
-    return undefined;
-}
-function entriesOfResponse(lines, messageId) {
-    const indexes = [];
-    lines.forEach((line, index) => {
-        if (assistantMessage(line)?.id === messageId)
-            indexes.push(index);
-    });
-    return indexes;
-}
-function assistantMessage(line) {
-    if (!line.includes('"assistant"'))
-        return undefined;
-    let entry;
+export function planUsageRepair(lines, nativeOneMillionContext, claudeVersion = "unknown") {
     try {
-        entry = JSON.parse(line);
+        const entries = lines.map(line => line.trim() ? JSON.parse(line) : undefined);
+        if (entries.some(e => e !== undefined && !record(e)))
+            return undefined;
+        const last = entries.findLast(e => e?.type === "assistant" && e?.message?.model !== "<synthetic>");
+        const message = last?.message;
+        if (!knownMessage(message))
+            return undefined;
+        const window = contextLimitForModel(message.model, undefined, nativeOneMillionContext);
+        // 2.1.288's ode/RPe -> kvt: contextWindow - min(maxOutputTokens, 20000) - 3000.
+        // These supported model families all have >=20k output capacity. Overrides
+        // make the threshold uncertain, so automatic repair is skipped entirely.
+        if (process.env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE !== undefined ||
+            process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS !== undefined)
+            return undefined;
+        const threshold = claudeVersion === "2.1.288" ? window - 23_000 : window;
+        const recordedTokens = recordedSize(message.usage);
+        const loweredTokens = Math.floor(window * LOWERED_WINDOW_FRACTION);
+        if (recordedTokens === undefined || recordedTokens < threshold)
+            return undefined;
+        const lineIndexes = [];
+        for (let i = 0; i < entries.length; i++) {
+            const m = entries[i]?.type === "assistant" ? entries[i].message : undefined;
+            if (m?.id !== message.id)
+                continue;
+            if (!knownMessage(m) || m.model !== message.model ||
+                recordedSize(m.usage) !== recordedTokens ||
+                loweredTokens + countedUsage(m.usage).output_tokens >= threshold)
+                return undefined;
+            lineIndexes.push(i);
+        }
+        return { lineIndexes, recordedTokens, loweredTokens };
     }
     catch {
         return undefined;
     }
-    const message = entry?.type === "assistant" ? entry.message : undefined;
-    if (typeof message?.id !== "string" || typeof message.model !== "string")
-        return undefined;
-    if (!message.usage || typeof message.usage !== "object")
-        return undefined;
-    return message;
 }
-/**
- * What Claude Code counts as the context: every input bucket plus the output,
- * taken from the last message iteration when the usage has one (Claude Code
- * 2.1.287's Nue), else from the top-level totals.
- */
+const BUCKETS = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"];
+const KINDS = new Set(["message", "fallback_message", "advisor_message", "compaction"]);
+function record(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function knownMessage(message) {
+    return record(message) && typeof message.id === "string" && message.id.length > 0 &&
+        typeof message.model === "string" &&
+        /^claude-(?:opus-(?:4-[56]|5-5)|sonnet-4-[56])(?:-\d{8})?(?:\[1m\])?$/.test(message.model) &&
+        validUsage(message.usage);
+}
+function validBuckets(value) {
+    return record(value) && BUCKETS.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0) &&
+        (value.cache_creation === undefined || (record(value.cache_creation) &&
+            Object.values(value.cache_creation).every(n => Number.isSafeInteger(n) && n >= 0)));
+}
+function validUsage(usage) {
+    if (!validBuckets(usage))
+        return false;
+    if (usage.iterations === undefined)
+        return true;
+    return Array.isArray(usage.iterations) && usage.iterations.length > 0 &&
+        usage.iterations.every((it) => validBuckets(it) && KINDS.has(it.type)) &&
+        usage.iterations.some((it) => it.type === "message" || it.type === "fallback_message");
+}
+function countedUsage(usage) {
+    return usage.iterations?.findLast((it) => it.type !== "advisor_message" && it.type !== "compaction") ?? usage;
+}
 function recordedSize(usage) {
-    const counted = countedIteration(usage) ?? usage;
-    let total = 0;
-    for (const key of BUCKETS) {
-        const value = counted[key] ?? 0;
-        if (typeof value !== "number" || !Number.isFinite(value))
-            return undefined;
-        total += value;
-    }
-    return total;
-}
-const BUCKETS = [
-    "input_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "output_tokens",
-];
-/** Iteration kinds that carry a request's own context, as Claude Code reads them. */
-const MESSAGE_ITERATIONS = new Set(["message", "fallback_message"]);
-function countedIteration(usage) {
-    if (!Array.isArray(usage.iterations))
+    if (!validUsage(usage))
         return undefined;
-    const last = usage.iterations.findLast((it) => it?.type !== "advisor_message" && it?.type !== "compaction");
-    return MESSAGE_ITERATIONS.has(last?.type) ? last : undefined;
+    const counted = countedUsage(usage);
+    const total = BUCKETS.reduce((n, key) => n + counted[key], 0);
+    return Number.isSafeInteger(total) ? total : undefined;
 }
-/** Moves the whole recorded input into input_tokens at the lowered size, iterations too. */
 function lowerUsage(line, loweredTokens) {
     const entry = JSON.parse(line);
     const usage = entry.message.usage;
+    const counted = countedUsage(usage);
     lowerBuckets(usage, loweredTokens);
-    if (Array.isArray(usage.iterations)) {
-        for (const iteration of usage.iterations) {
-            if (MESSAGE_ITERATIONS.has(iteration?.type))
-                lowerBuckets(iteration, loweredTokens);
-        }
-    }
+    if (counted !== usage)
+        lowerBuckets(counted, loweredTokens);
     return JSON.stringify(entry);
 }
 function lowerBuckets(usage, loweredTokens) {
     usage.input_tokens = loweredTokens;
     usage.cache_read_input_tokens = 0;
     usage.cache_creation_input_tokens = 0;
-    if (usage.cache_creation && typeof usage.cache_creation === "object") {
-        for (const key of Object.keys(usage.cache_creation)) {
-            if (typeof usage.cache_creation[key] === "number")
-                usage.cache_creation[key] = 0;
-        }
+    if (usage.cache_creation) {
+        for (const key of Object.keys(usage.cache_creation))
+            usage.cache_creation[key] = 0;
     }
 }
-function backupTranscript(file, sessionId, options) {
-    const dir = options.backupDir ?? path.join(getConfigDir(), "transcript-backups");
-    fs.mkdirSync(dir, { recursive: true });
-    const stamp = (options.now ?? new Date()).toISOString().replace(/[:.]/g, "-");
-    const backupPath = path.join(dir, `${sessionId}.${stamp}.jsonl`);
-    fs.copyFileSync(file, backupPath);
-    return backupPath;
+function installedVersion() {
+    try {
+        return execFileSync("claude", ["--version"], { encoding: "utf8", timeout: 1500,
+            stdio: ["ignore", "pipe", "ignore"] }).match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
+    }
+    catch {
+        return "unknown";
+    }
 }
-function writeAtomically(file, text) {
-    const temp = `${file}.ccc-${process.pid}.tmp`;
-    fs.writeFileSync(temp, text);
-    fs.renameSync(temp, file);
-}
-/** Session ids name files (transcript-usage's SAFE_ID); a leading dash is the next flag. */
 function validId(value) {
     return value !== undefined && /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(value) ? value : undefined;
 }

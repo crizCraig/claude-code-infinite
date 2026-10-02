@@ -45,6 +45,8 @@ function fixture(entries) {
   fs.writeFileSync(file, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
   const options = {
     nativeOneMillionContext: true,
+    claudeVersion: "2.1.288",
+    isQuiescent: () => true,
     projectsDir,
     backupDir: path.join(root, "backups"),
     now: new Date("2026-10-02T18:30:00Z"),
@@ -69,7 +71,7 @@ test("resumeSessionId reads --resume <id>, --resume=<id> and -r <id> only", () =
 test("a session stranded past the window is lowered to half of it, with a backup", () => {
   // The 2026-10-02 shape: one response split over entries sharing its id,
   // then Claude Code's synthetic "context limit" message.
-  const big = usage(25_037, 950_000, 1_399);
+  const big = usage(26_037, 950_000, 1_399);
   const entries = [
     { type: "user", message: { role: "user", content: "hi" } },
     response("msg_old", "claude-opus-5-5", usage(400_000)),
@@ -82,7 +84,7 @@ test("a session stranded past the window is lowered to half of it, with a backup
   const original = fs.readFileSync(file, "utf-8");
   try {
     const result = repairStrandedResume(["--resume", SESSION], options);
-    assert.equal(result.recordedTokens, 2 + 25_037 + 950_000 + 1_399);
+    assert.equal(result.recordedTokens, 2 + 26_037 + 950_000 + 1_399);
     assert.equal(result.loweredTokens, 500_000);
     assert.equal(fs.readFileSync(result.backupPath, "utf-8"), original, "backup is the original");
 
@@ -131,9 +133,10 @@ test("a session that still fits, an unknown shape, or a missing transcript is le
 });
 
 test("the stranded size follows the model's window, not a fixed number", () => {
-  const entries = [response("m", "claude-x", usage(185_000))];
+  const entries = [response("m", "claude-sonnet-4-5", usage(185_000))];
   const { file, options, cleanup } = fixture(entries);
   try {
+    options.nativeOneMillionContext = false;
     const result = repairStrandedResume(["-r", SESSION], options);
     assert.equal(result.loweredTokens, 100_000, "a 200k model lowers to half its window");
     assert.equal(readEntries(file)[0].message.usage.input_tokens, 100_000);
@@ -155,4 +158,106 @@ test("a usage whose last iteration still records the stranded size is lowered to
   } finally {
     cleanup();
   }
+});
+
+test("fitting sessions and uncertain transcript shapes are never repaired", () => {
+  const variants = [
+    usage(950_000),
+    { ...usage(990_000), iterations: [{ ...buckets(990_000, 0, 100), type: "future_message" }] },
+    { ...usage(990_000), iterations: [] },
+    { ...usage(990_000), input_tokens: -1 },
+  ];
+  for (const u of variants) {
+    const f = fixture([response("m", "claude-opus-5-5", u)]);
+    try {
+      const before = fs.readFileSync(f.file);
+      assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined);
+      assert.deepEqual(fs.readFileSync(f.file), before);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("repair lowers only totals and the counted iteration and is idempotent", () => {
+  const u = usage(990_000);
+  const earlier = { ...buckets(700_000, 0, 10), type: "message" };
+  const advisor = { ...buckets(400_000, 0, 10), type: "advisor_message" };
+  u.iterations.unshift(earlier);
+  u.iterations.push(advisor);
+  const f = fixture([response("m", "claude-opus-5-5", u)]);
+  try {
+    const result = repairStrandedResume(["-r", SESSION], f.options);
+    assert.ok(result);
+    const after = readEntries(f.file)[0].message.usage;
+    assert.deepEqual(after.iterations[0], earlier);
+    assert.deepEqual(after.iterations[2], advisor);
+    const repaired = fs.readFileSync(f.file);
+    assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined);
+    assert.deepEqual(fs.readFileSync(f.file), repaired);
+  } finally { f.cleanup(); }
+});
+
+test("concurrent writers, changed snapshots and backup collisions skip without throwing", () => {
+  for (const mode of ["writer", "snapshot", "backup", "lock", "partial", "version", "unknown-last"]) {
+    const f = fixture([response("m", "claude-opus-5-5", usage(1_010_000))]);
+    const realOpen = fs.openSync;
+    let calls = 0;
+    let collision;
+    try {
+      if (mode === "writer") f.options.isQuiescent = () => false;
+      if (mode === "snapshot") f.options.isQuiescent = () => {
+        if (++calls === 2) fs.appendFileSync(f.file, '{"type":"user"}\n');
+        return true;
+      };
+      if (mode === "lock") fs.writeFileSync(`${f.file}.ccc-repair.lock`, "occupied");
+      if (mode === "partial") fs.appendFileSync(f.file, '{"type":');
+      if (mode === "version") fs.appendFileSync(f.file, JSON.stringify(response("new", "claude-future", usage(2_000_000))) + "\n");
+      if (mode === "unknown-last") fs.appendFileSync(f.file, '{"type":"assistant","message":{"id":"new"}}\n');
+      if (mode === "backup") fs.openSync = (name, flags, ...rest) => {
+        if (String(name).startsWith(f.options.backupDir)) {
+          collision = name;
+          fs.writeFileSync(name, "existing backup");
+          assert.equal(flags, "wx", "backup creation must be exclusive");
+        }
+        return realOpen(name, flags, ...rest);
+      };
+      const before = fs.readFileSync(f.file, "utf8");
+      assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined, mode);
+      assert.equal(fs.readFileSync(f.file, "utf8"), mode === "snapshot" ? before + '{"type":"user"}\n' : before, mode);
+      if (collision) assert.equal(fs.readFileSync(collision, "utf8"), "existing backup");
+    } finally { fs.openSync = realOpen; f.cleanup(); }
+  }
+});
+
+test("exact installed refusal limit and conservative unknown-version threshold", () => {
+  for (const [version, count, shouldRepair] of [
+    ["2.1.288", 976_999, false], ["2.1.288", 977_000, true],
+    ["future", 990_000, false], ["future", 1_000_000, true],
+  ]) {
+    const f = fixture([response("m", "claude-opus-5-5", usage(count - 102))]);
+    f.options.claudeVersion = version;
+    try {
+      assert.equal(Boolean(repairStrandedResume(["-r", SESSION], f.options)), shouldRepair);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("a writer after the exclusive backup was made prevents replacement", () => {
+  const f = fixture([response("m", "claude-opus-5-5", usage(990_000))]);
+  const original = fs.readFileSync(f.file, "utf8");
+  let checks = 0;
+  f.options.isQuiescent = () => {
+    if (++checks === 3) {
+      const backups = fs.readdirSync(f.options.backupDir);
+      assert.equal(backups.length, 1);
+      assert.equal(fs.readFileSync(path.join(f.options.backupDir, backups[0]), "utf8"), original);
+      fs.appendFileSync(f.file, '{"type":"user"}\n');
+    }
+    return true;
+  };
+  try {
+    assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined);
+    assert.equal(fs.readFileSync(f.file, "utf8"), original + '{"type":"user"}\n');
+    assert.equal(fs.existsSync(`${f.file}.ccc-repair.lock`), false);
+    assert.equal(fs.readdirSync(path.dirname(f.file)).some(n => n.endsWith(".tmp")), false);
+  } finally { f.cleanup(); }
 });
