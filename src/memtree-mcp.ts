@@ -499,10 +499,14 @@ interface JsonRpcRequest {
  * Exposed for tests; the stdio loop below is only framing.
  */
 export async function handleMcpMessage(
-  message: JsonRpcRequest,
+  input: unknown,
   tree: TreeSource,
   finder?: SessionFinderSource
 ): Promise<object | undefined> {
+  if (!isRpcRequest(input)) {
+    return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
+  }
+  const message = input;
   const isRequest = message.id !== undefined && message.id !== null;
   const reply = (result: object) => ({ jsonrpc: "2.0", id: message.id, result });
   const fail = (code: number, text: string) => ({
@@ -540,6 +544,16 @@ export async function handleMcpMessage(
       if (!isRequest) return undefined; // notifications/initialized, cancelled, …
       return fail(-32601, `Method not found: ${message.method}`);
   }
+}
+
+function isRpcRequest(value: unknown): value is JsonRpcRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const m = value as JsonRpcRequest;
+  return typeof m.method === "string" &&
+    (m.jsonrpc === undefined || m.jsonrpc === "2.0") &&
+    (m.id === undefined || m.id === null || typeof m.id === "string" ||
+      (typeof m.id === "number" && Number.isFinite(m.id))) &&
+    (m.params === undefined || (!!m.params && typeof m.params === "object" && !Array.isArray(m.params)));
 }
 
 class UnknownToolError extends Error {}
@@ -647,7 +661,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
       const line = buffer.slice(0, newline).trim();
       buffer = buffer.slice(newline + 1);
       if (!line) continue;
-      let message: JsonRpcRequest;
+      let message: unknown;
       try {
         message = JSON.parse(line);
       } catch {
@@ -657,7 +671,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
       queue = queue.then(async () => {
         const response = await handleMcpMessage(message, tree, finder).catch((err) => ({
           jsonrpc: "2.0",
-          id: message.id ?? null,
+          id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },
         }));
         if (response) send(response);

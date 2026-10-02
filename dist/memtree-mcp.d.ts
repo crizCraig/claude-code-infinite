@@ -240,19 +240,11 @@ export declare class SessionFinder implements SessionFinderSource {
     searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
     private get;
 }
-type JsonRpcId = string | number | null;
-interface JsonRpcRequest {
-    jsonrpc?: string;
-    id?: JsonRpcId;
-    method?: string;
-    params?: Record<string, unknown>;
-}
 /**
  * One JSON-RPC message in, the response out (undefined for notifications).
  * Exposed for tests; the stdio loop below is only framing.
  */
-export declare function handleMcpMessage(message: JsonRpcRequest, tree: TreeSource, finder?: SessionFinderSource): Promise<object | undefined>;
+export declare function handleMcpMessage(input: unknown, tree: TreeSource, finder?: SessionFinderSource): Promise<object | undefined>;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
-export {};
 //# sourceMappingURL=memtree-mcp.d.ts.map

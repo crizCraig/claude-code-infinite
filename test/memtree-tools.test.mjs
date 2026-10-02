@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   formatLines,
   formatNode,
@@ -37,6 +38,19 @@ const PAGE = JSON.parse(
   fs.readFileSync(new URL("./fixtures/memtree-page.json", import.meta.url), "utf-8")
 );
 const index = () => new MemtreeIndex(PAGE);
+
+test("invalid JSON-RPC values do not kill the stdio queue", () => {
+  const messages = [null, [], 42, { method: "ping", id: {} },
+    { jsonrpc: "2.0", id: 7, method: "ping" }];
+  const child = spawnSync(process.execPath, ["dist/memtree-mcp.js"], {
+    input: messages.map(JSON.stringify).join("\n") + "\n", encoding: "utf8", timeout: 5000,
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const answers = child.stdout.trim().split("\n").map(JSON.parse);
+  assert.equal(answers.length, messages.length);
+  assert.ok(answers.slice(0, -1).every((a) => a.error.code === -32600));
+  assert.deepEqual(answers.at(-1), { jsonrpc: "2.0", id: 7, result: {} });
+});
 
 test("queryTerms lowercases, trims punctuation, drops stopwords and repeats", () => {
   assert.deepEqual(queryTerms("What is the Bucket name? bucket, deploy.yaml!"), [

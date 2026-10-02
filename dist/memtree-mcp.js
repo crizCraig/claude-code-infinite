@@ -413,7 +413,11 @@ export class SessionFinder {
  * One JSON-RPC message in, the response out (undefined for notifications).
  * Exposed for tests; the stdio loop below is only framing.
  */
-export async function handleMcpMessage(message, tree, finder) {
+export async function handleMcpMessage(input, tree, finder) {
+    if (!isRpcRequest(input)) {
+        return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
+    }
+    const message = input;
     const isRequest = message.id !== undefined && message.id !== null;
     const reply = (result) => ({ jsonrpc: "2.0", id: message.id, result });
     const fail = (code, text) => ({
@@ -454,6 +458,16 @@ export async function handleMcpMessage(message, tree, finder) {
                 return undefined; // notifications/initialized, cancelled, …
             return fail(-32601, `Method not found: ${message.method}`);
     }
+}
+function isRpcRequest(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return false;
+    const m = value;
+    return typeof m.method === "string" &&
+        (m.jsonrpc === undefined || m.jsonrpc === "2.0") &&
+        (m.id === undefined || m.id === null || typeof m.id === "string" ||
+            (typeof m.id === "number" && Number.isFinite(m.id))) &&
+        (m.params === undefined || (!!m.params && typeof m.params === "object" && !Array.isArray(m.params)));
 }
 class UnknownToolError extends Error {
 }
@@ -561,7 +575,7 @@ export function runMemtreeMcpServer(env = process.env) {
             queue = queue.then(async () => {
                 const response = await handleMcpMessage(message, tree, finder).catch((err) => ({
                     jsonrpc: "2.0",
-                    id: message.id ?? null,
+                    id: isRpcRequest(message) ? message.id ?? null : null,
                     error: { code: -32603, message: String(err) },
                 }));
                 if (response)
