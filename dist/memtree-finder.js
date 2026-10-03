@@ -136,6 +136,9 @@ export function formatSearchResults(body, args) {
         return noHits(query, "text", args);
     const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
+    if (body.relaxed === "any_word") {
+        out.splice(1, 0, "(No passage has every word, so these have some of them, best first. Try other words, or mode \"vector\" for meaning.)");
+    }
     if (body.matches_capped) {
         out.push("", "(Only the newest matching passages were ranked: add words, or narrow with since, until or project.)");
     }

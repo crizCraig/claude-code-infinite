@@ -438,6 +438,13 @@ test("search routes by tree and mode; read_node and read_lines take node address
   assert.deepEqual(parseNodeAddress(" t-v3-served#12 "), { tree: "t-v3-served", id: 12 });
 });
 
+test("a relaxed any-word answer says that no passage had every word", () => {
+  const hit = { id: "s1", tree: { request_id: "r1", ref: "r1-v1-own" }, range: { block: 0, start: 1, end: 2 }, snippet: "x" };
+  const text = formatSearchResults({ query: "control arm cut", hits: [hit], relaxed: "any_word" }, { query: "control arm cut" });
+  assert.match(text.split("\n")[1], /No passage has every word/);
+  assert.doesNotMatch(formatSearchResults({ query: "q", hits: [hit] }, { query: "q" }), /every word/);
+});
+
 test("hits show their node address and path from the root", () => {
   const hit = {
     id: "s1", kind: "claude_code_session", session_id: "s1",

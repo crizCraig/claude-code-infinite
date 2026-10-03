@@ -81,6 +81,8 @@ export interface FinderSearchResponse {
     next_cursor?: string | null;
     matches_capped?: boolean;
     charged?: boolean;
+    /** "any_word": no passage held every word, so these hold some of them. */
+    relaxed?: string;
 }
 /** Query string for `/memtree/sessions` from the tool's arguments. */
 export declare function sessionsQuery(args: Record<string, unknown>): string;
