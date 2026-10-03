@@ -3911,7 +3911,7 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
   }
 });
 
-test("the /memtree relay refuses browsers on other sites and rebound hostnames", async () => {
+test("the proxy refuses browsers on other sites and rebound hostnames", async () => {
   const upstream = await mockUpstream();
   const pageGets = [];
   const memtreeSrv = await listen((req, res) => {
@@ -3929,6 +3929,22 @@ test("the /memtree relay refuses browsers on other sites and rebound hostnames",
       });
       req.on("error", reject);
     });
+  const post = (path, headers) =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", host: "127.0.0.1", port: proxy.port, path, headers: {
+          ...headers,
+          "content-type": "application/json",
+          "x-claude-code-session-id": "rebound-session",
+        } },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", reject);
+      req.end(JSON.stringify({ model: "m", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }));
+    });
   const local = `127.0.0.1:${proxy.port}`;
   try {
     // DNS rebinding: an attacker's hostname resolved to the loopback.
@@ -3938,6 +3954,13 @@ test("the /memtree relay refuses browsers on other sites and rebound hostnames",
     // A page on another site reaching the loopback directly.
     assert.equal(await get("/memtree/search?q=x", { host: local, origin: "https://evil.example" }), 403);
     assert.equal(await get("/memtree/search?q=x", { host: local, "sec-fetch-site": "cross-site" }), 403);
+    // Another loopback port is another site (some other local web server).
+    assert.equal(
+      await get("/memtree/search?q=x", { host: local, origin: "http://127.0.0.1:1" }),
+      403
+    );
+    assert.equal(await get("/memtree/search?q=x", { host: `${local}@evil.example` }), 403);
+    assert.equal(await post("/v1/messages", { host: `evil.example:${proxy.port}` }), 403);
     assert.equal(pageGets.length, 0, "refused requests never reach the server with the key");
 
     // Agents (no browser headers), and the page's own same-origin fetches, still work.

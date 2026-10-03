@@ -400,13 +400,13 @@ function cancelAcceptedRequest(accepted) {
 }
 async function handleRequest(req, res, opts, upstream, state, hookPath) {
     const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+    if (!isLocalCaller(req)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));
+        return;
+    }
     if (url.pathname === hookPath) {
         return handleNoticeHook(req, res, state, opts.reqlog);
-    }
-    if (url.pathname.startsWith(MEMTREE_PASSTHROUGH_PREFIX) && !isLocalCaller(req)) {
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end(JSON.stringify({ detail: "MemTree relay is for local agents only" }));
-        return;
     }
     if (req.method === "GET" &&
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
@@ -430,35 +430,37 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const BROWSER_SAME_SITE = new Set(["same-origin", "none"]);
 /**
- * The `/memtree/*` relay answers with the user's key, so only callers on this
- * machine may use it: agents (curl, the MCP server) and the MemTree page itself
- * when opened from the loopback. A web page on another site can reach the
- * loopback too, either directly (it sends an `origin` or `sec-fetch-site` saying
- * so) or by rebinding its own hostname to 127.0.0.1 (its `host` then names it).
+ * Every route acts with the user's MemTree key (the `/memtree/*` relay reads
+ * their trees; `/v1/messages` indexes and compresses on their account), so only
+ * callers on this machine may use the proxy: Claude Code, agents (curl, the MCP
+ * server) and the MemTree page itself when opened from the loopback. A web page
+ * on another site can reach the loopback too, either directly (its `origin` or
+ * `sec-fetch-site` says so) or by rebinding its own hostname to 127.0.0.1 (its
+ * `host` then names it). Same-origin means this exact host and port.
  */
 function isLocalCaller(req) {
-    if (!isLoopbackHost(req.headers.host))
+    const host = req.headers.host;
+    if (!host || !isLoopbackHost(host))
         return false;
     const origin = req.headers.origin;
-    if (origin !== undefined && !isLoopbackOrigin(origin))
+    if (origin !== undefined && !isSameLoopbackOrigin(origin, host))
         return false;
     const site = req.headers["sec-fetch-site"];
     return site === undefined || BROWSER_SAME_SITE.has(String(site));
 }
 function isLoopbackHost(host) {
-    if (!host)
-        return false;
     try {
-        return LOOPBACK_HOSTNAMES.has(new URL(`http://${host}`).hostname);
+        const url = new URL(`http://${host}`);
+        return url.host === host.toLowerCase() && LOOPBACK_HOSTNAMES.has(url.hostname);
     }
     catch {
         return false;
     }
 }
-function isLoopbackOrigin(origin) {
+function isSameLoopbackOrigin(origin, host) {
     try {
         const url = new URL(origin);
-        return url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname);
+        return url.protocol === "http:" && url.host === new URL(`http://${host}`).host;
     }
     catch {
         return false;

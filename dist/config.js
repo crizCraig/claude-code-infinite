@@ -27,17 +27,19 @@ export function saveConfig(config) {
     if (!existsSync(CONFIG_DIR)) {
         mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
     }
+    restrictConfigPermissions(); // before writing, so a loose old file never gets new keys
     writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: CONFIG_FILE_MODE });
     restrictConfigPermissions();
 }
 /** Tighten a config written before keys were owner-only (the mode above applies on create). */
 function restrictConfigPermissions() {
-    try {
-        chmodSync(CONFIG_DIR, CONFIG_DIR_MODE);
-        chmodSync(CONFIG_FILE, CONFIG_FILE_MODE);
-    }
-    catch {
-        // Best effort: a missing file or a filesystem without modes is not fatal.
+    for (const [path, mode] of [[CONFIG_DIR, CONFIG_DIR_MODE], [CONFIG_FILE, CONFIG_FILE_MODE]]) {
+        try {
+            chmodSync(path, mode);
+        }
+        catch {
+            // Best effort: a missing file or a filesystem without modes is not fatal.
+        }
     }
 }
 export function getPolychatApiKey() {
