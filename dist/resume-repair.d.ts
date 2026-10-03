@@ -23,5 +23,5 @@ export interface UsageRepairPlan {
     recordedTokens: number;
     loweredTokens: number;
 }
-export declare function planUsageRepair(lines: string[], nativeOneMillionContext: boolean, claudeVersion?: string): UsageRepairPlan | undefined;
+export declare function planUsageRepair(lines: string[], nativeOneMillionContext: boolean, claudeVersion?: string, modelOverride?: string): UsageRepairPlan | undefined;
 //# sourceMappingURL=resume-repair.d.ts.map

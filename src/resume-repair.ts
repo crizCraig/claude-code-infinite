@@ -47,7 +47,7 @@ export function repairStrandedResume(
     const lines = original.toString("utf8").split("\n");
     if (!Buffer.from(lines.join("\n"), "utf8").equals(original)) return undefined;
     const plan = planUsageRepair(lines, options.nativeOneMillionContext,
-      options.claudeVersion ?? installedVersion());
+      options.claudeVersion ?? installedVersion(), resumeModelOverride(claudeArgs));
     if (!plan) return undefined;
     for (const index of plan.lineIndexes) lines[index] = lowerUsage(lines[index], plan.loweredTokens);
     const backupPath = replaceQuiescentTranscript({
@@ -80,7 +80,8 @@ export interface UsageRepairPlan {
 }
 
 export function planUsageRepair(
-  lines: string[], nativeOneMillionContext: boolean, claudeVersion = "unknown"
+  lines: string[], nativeOneMillionContext: boolean, claudeVersion = "unknown",
+  modelOverride?: string
 ): UsageRepairPlan | undefined {
   try {
     const entries = lines.map(line => line.trim() ? JSON.parse(line) : undefined);
@@ -88,7 +89,14 @@ export function planUsageRepair(
     const last = entries.findLast(e => e?.type === "assistant" && e?.message?.model !== "<synthetic>");
     const message = last?.message;
     if (!knownMessage(message)) return undefined;
-    const window = contextLimitForModel(message.model, undefined, nativeOneMillionContext);
+    const window = resumedWindow(entries, message.model, nativeOneMillionContext, modelOverride);
+    if (window === undefined) return undefined;
+    const counted = countedUsage(message.usage);
+    const recordedInput = counted.input_tokens + counted.cache_read_input_tokens +
+      counted.cache_creation_input_tokens;
+    // A successful response already accepted this input. A smaller inferred
+    // window is disproven by the transcript, not evidence that it needs repair.
+    if (!Number.isSafeInteger(recordedInput) || recordedInput > window) return undefined;
     // 2.1.288's ode/RPe -> kvt: contextWindow - min(maxOutputTokens, 20000) - 3000.
     // These supported model families all have >=20k output capacity. Overrides
     // make the threshold uncertain, so automatic repair is skipped entirely.
@@ -113,6 +121,33 @@ export function planUsageRepair(
 
 const BUCKETS = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"];
 const KINDS = new Set(["message", "fallback_message", "advisor_message", "compaction"]);
+const KNOWN_MODEL = /^claude-(?:opus-(?:4-[56]|5-5)|sonnet-4-[56])(?:-\d{8})?(?:\[1m\])?$/;
+
+function resumeModelOverride(args: string[]): string | undefined {
+  let model = process.env.ANTHROPIC_MODEL;
+  for (let i = 0; i < args.length && args[i] !== "--"; i++) {
+    if (args[i].startsWith("--model=")) model = args[i].slice("--model=".length);
+    else if (args[i] === "--model") model = args[++i] ?? "";
+  }
+  return model;
+}
+
+function resumedWindow(
+  entries: any[], model: string, nativeOneMillionContext: boolean, override?: string
+): number | undefined {
+  // Aliases and future/custom model names cannot establish an exact window.
+  if (override !== undefined && !KNOWN_MODEL.test(override)) return undefined;
+  const window = contextLimitForModel(model, undefined, nativeOneMillionContext);
+  const overrideWindow = override === undefined ? window :
+    contextLimitForModel(override, undefined, nativeOneMillionContext);
+  // Historical explicit 1M selection remains evidence even when Claude strips
+  // the suffix from subsequent wire responses. Taking the larger window is
+  // conservative: it can skip a repair, never cause an otherwise fitting repair.
+  const recordedOneMillion = entries.some(e =>
+    [e?.model, e?.message?.model].some(m => typeof m === "string" && m.endsWith("[1m]")));
+  return Math.max(window, overrideWindow, recordedOneMillion ? 1_000_000 : 0);
+}
+
 function record(value: any): value is Record<string, any> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -120,7 +155,7 @@ function record(value: any): value is Record<string, any> {
 function knownMessage(message: any): boolean {
   return record(message) && typeof message.id === "string" && message.id.length > 0 &&
     typeof message.model === "string" &&
-    /^claude-(?:opus-(?:4-[56]|5-5)|sonnet-4-[56])(?:-\d{8})?(?:\[1m\])?$/.test(message.model) &&
+    KNOWN_MODEL.test(message.model) &&
     validUsage(message.usage);
 }
 

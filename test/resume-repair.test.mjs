@@ -198,7 +198,7 @@ test("repair lowers only totals and the counted iteration and is idempotent", ()
 
 test("concurrent writers, changed snapshots and backup collisions skip without throwing", () => {
   for (const mode of ["writer", "snapshot", "backup", "lock", "partial", "version", "unknown-last"]) {
-    const f = fixture([response("m", "claude-opus-5-5", usage(1_010_000))]);
+    const f = fixture([response("m", "claude-opus-5-5", usage(990_000))]);
     const realOpen = fs.openSync;
     let calls = 0;
     let collision;
@@ -260,4 +260,72 @@ test("a writer after the exclusive backup was made prevents replacement", () => 
     assert.equal(fs.existsSync(`${f.file}.ccc-repair.lock`), false);
     assert.equal(fs.readdirSync(path.dirname(f.file)).some(n => n.endsWith(".tmp")), false);
   } finally { f.cleanup(); }
+});
+
+test("successful input beyond an inferred window is never rewritten", () => {
+  for (const [model, count, native] of [
+    ["claude-sonnet-4-5", 300_000, false],
+    ["claude-opus-5-5", 1_010_000, true],
+  ]) {
+    const f = fixture([response("m", model, usage(count))]);
+    f.options.nativeOneMillionContext = native;
+    try {
+      const original = fs.readFileSync(f.file);
+      assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined);
+      assert.deepEqual(fs.readFileSync(f.file), original);
+      assert.equal(fs.existsSync(f.options.backupDir), false);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("transcript 1M signals and model overrides prevent a false 200k repair", () => {
+  for (const [earlierModel, args] of [
+    ["claude-sonnet-4-5[1m]", []],
+    ["claude-sonnet-4-5", ["--model", "claude-sonnet-4-5[1m]"]],
+    ["claude-sonnet-4-5", ["--model=claude-opus-5-5"]],
+    ["claude-sonnet-4-5", ["--model", "opus"]],
+    ["claude-sonnet-4-5", ["--model", "unknown-model"]],
+  ]) {
+    const f = fixture([
+      response("earlier", earlierModel, usage(100_000)),
+      response("m", "claude-sonnet-4-5", usage(185_000)),
+    ]);
+    try {
+      const original = fs.readFileSync(f.file);
+      assert.equal(repairStrandedResume(["-r", SESSION, ...args], f.options), undefined);
+      assert.deepEqual(fs.readFileSync(f.file), original);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("known extended windows repair only at their actual threshold", () => {
+  for (const [model, earlierModel, args, count, expected] of [
+    ["claude-opus-5-5", "claude-opus-5-5", [], 300_000, undefined],
+    ["claude-sonnet-4-5", "claude-sonnet-4-5[1m]", [], 990_000, 500_000],
+    ["claude-sonnet-4-5", "claude-sonnet-4-5", ["--model=claude-sonnet-4-5[1m]"], 990_000, 500_000],
+  ]) {
+    const f = fixture([
+      response("earlier", earlierModel, usage(100_000)), response("m", model, usage(count)),
+    ]);
+    try {
+      assert.equal(repairStrandedResume(["-r", SESSION, ...args], f.options)?.loweredTokens, expected);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("the environment's model override is respected and unknown values skip", () => {
+  const previous = process.env.ANTHROPIC_MODEL;
+  for (const model of ["claude-sonnet-4-5[1m]", "opus", "unknown-model"]) {
+    const f = fixture([response("m", "claude-sonnet-4-5", usage(185_000))]);
+    try {
+      process.env.ANTHROPIC_MODEL = model;
+      const original = fs.readFileSync(f.file);
+      assert.equal(repairStrandedResume(["-r", SESSION], f.options), undefined);
+      assert.deepEqual(fs.readFileSync(f.file), original);
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_MODEL;
+      else process.env.ANTHROPIC_MODEL = previous;
+      f.cleanup();
+    }
+  }
 });
