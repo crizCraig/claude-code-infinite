@@ -774,11 +774,13 @@ function toolForwardingGuard(
   isMainRequest: boolean,
   lastMsg: Message | undefined
 ): { allow: (compressed: boolean) => boolean; settle: (delivered: boolean) => void } {
-  const carried = isMainRequest && lastMsg?.role === "user"
-    ? state.deferredMainPrompts.filter((prompt, _, pending) =>
-        !!prompt.text && wrapperCarriesPrompt(lastMsg, prompt.text) &&
-        pending.filter((other) => other.text?.trim() === prompt.text!.trim()).length === 1)
-    : [];
+  const deliveredTexts = isMainRequest ? deliveredUserTexts(lastMsg) : new Set<string>();
+  const carried = state.deferredMainPrompts.filter((prompt) => {
+    const text = normalizeDeliveryText(prompt.text ?? "");
+    // One successful delivery consumes at most one queued identity for each
+    // exact normalized text, even when the request repeats that text block.
+    return !!text && deliveredTexts.delete(text);
+  });
   return {
     allow: (compressed) => {
       if (!isMainRequest || compressed || !routeOwnershipIsUncertain(state)) return true;
@@ -793,15 +795,20 @@ function toolForwardingGuard(
   };
 }
 
-/** Only top-level user text, never tool output, can prove queued delivery. */
-function wrapperCarriesPrompt(message: Message | undefined, prompt: string): boolean {
-  if (messageCarriesPromptText(message, prompt)) return true;
-  if (!message || !Array.isArray(message.content)) return false;
-  const reminder = "<system-reminder>\nThe user sent a new message while you were working:\n" +
-    prompt.trim() + "\n\nThis is how Claude Code surfaces messages the user sends mid-turn ";
-  return message.content.some((part: any) =>
-    part?.type === "text" && typeof part.text === "string" && part.text.includes(reminder)
-  );
+/** Only exact top-level user blocks, never tool output or reminders, prove delivery. */
+function deliveredUserTexts(message: Message | undefined): Set<string> {
+  if (message?.role !== "user") return new Set();
+  const content = message.content;
+  const blocks = typeof content === "string" ? [content]
+    : Array.isArray(content) ? content.flatMap((part: any) =>
+      typeof part === "string" ? [part]
+        : part?.type === "text" && typeof part.text === "string" ? [part.text] : [])
+    : [];
+  return new Set(blocks.map(normalizeDeliveryText).filter(Boolean));
+}
+
+function normalizeDeliveryText(text: string): string {
+  return stripSystemReminderText(text).replace(/\s+/g, " ").trim();
 }
 
 function bumpRouteEpoch(

@@ -1581,7 +1581,7 @@ test("delivered mid-turn wrappers retire only their proven pending prompts", asy
     for (let i = 0; i < 35; i++) {
       const prompt = i % 2 ? "repeat this prompt" : `prompt ${i}`;
       await armMainTurn(h.proxy, prompt, `mid-${i}`);
-      messages = withToolRound(messages, `tool-${i}`, [{ type: "text", text: midTurnReminder(prompt) }]);
+      messages = withToolRound(messages, `tool-${i}`, [{ type: "text", text: prompt }]);
       await postMessages(h.proxy.port, messages, headers);
       assert.match(h.lastUpstream(), /compressed context/);
     }
@@ -1603,7 +1603,7 @@ test("failed wrapper forwarding retains the queued prompt for its later own turn
     await armMainTurn(h.proxy, "not delivered", "pending");
     status = 529;
     await postMessages(h.proxy.port, withToolRound(base, "failed", [
-      { type: "text", text: midTurnReminder("not delivered") },
+      { type: "text", text: "not delivered" },
     ]), headers);
     status = 200;
     await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
@@ -10182,3 +10182,70 @@ for (const outcome of ["noop", "compressed"]) {
     } finally { release(); h.close(); }
   });
 }
+
+for (const recover of [false, true]) {
+  for (const longer of ["pending owner extended", "extended pending owner"]) {
+    test(`exact queued delivery preserves overlapping text (${recover ? "recovery" : "ordinary"}, ${longer})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, "pending owner", "short");
+        await armMainTurn(h.proxy, longer, "long");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text", text: longer }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "pending owner" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error",
+          "delivering the longer block must leave the shorter queued owner available");
+        assert.equal(h.compressCalls(), recover ? 3 : 2);
+      } finally { h.close(); }
+    });
+  }
+
+  for (const firstText of [" same prompt ", " same\n prompt <system-reminder>hook context</system-reminder>"]) {
+    test(`exact queued delivery consumes one normalized duplicate (${recover ? "recovery" : "ordinary"}, ${JSON.stringify(firstText)})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, firstText, "first");
+        await armMainTurn(h.proxy, "same prompt", "second");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text",
+          text: "<system-reminder>ambient context</system-reminder> same\t prompt  " },
+          { type: "text", text: "same prompt" }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "same prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+        await armMainTurn(h.proxy, "same\n prompt", "third");
+        const again = [...next, { role: "assistant", content: "done" },
+          { role: "user", content: "same\n prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, again)).type, "error",
+          "the first normalized queued identity was retired, not left stale");
+        assert.equal(h.compressCalls(), recover ? 4 : 3);
+      } finally { h.close(); }
+    });
+  }
+}
+
+test("reminder-only delivery is not exact queued-prompt proof", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    const wrapper = withToolRound(base, "delivery", [{ type: "text", text: midTurnReminder("pending owner") }]);
+    await postSessionMessages(h.proxy.port, wrapper);
+    const next = [...wrapper, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+    assert.equal(h.compressCalls(), 2, "unproven reminder delivery leaves its queued identity intact");
+  } finally { h.close(); }
+});
