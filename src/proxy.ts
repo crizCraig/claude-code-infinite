@@ -1169,8 +1169,6 @@ async function handleNoticeHook(
     // Invalidate a response still in flight at Stop. Otherwise its late
     // delivery callback could enqueue a notice after Stop returned.
     state.mainPromptGeneration++;
-    // The boundary this flag described is over; a followup arriving before
-    // the next UserPromptSubmit is a new hookless boundary and must wipe.
     // Subagent lifetimes are independent; only their own stop events retire them.
   }
   if (!output) {
@@ -1546,10 +1544,8 @@ async function handleMessages(
       }
     }
     const toolSessionId = requestSessionId(req);
-    // A main-thread route built on an older stable prefix than the session's
-    // current one: a tool-turn compaction replaced the prefix without owning
-    // the route (a typed prompt was pending, see recoverToolRouteMiss). The
-    // route would carry the old, over-budget prefix; ride the current one.
+    // A concurrently replaced stable prefix takes precedence over an older
+    // route. The current prefix still undergoes its own history validation.
     if (
       routedTool &&
       isMainRequest &&
@@ -1775,9 +1771,9 @@ async function handleMessages(
     releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
     routeDecisionSettled = true;
   };
-  // Terminal non-riding outcome: if this request still owns the decision,
-  // clearing the lane IS its decision; otherwise yield to the newer owner.
-  const clearLaneOrYield = () => {
+  // An uncompressed fallback releases this replacement reservation. The old
+  // validated route remains available to requests whose histories still match.
+  const releaseForOriginalFallback = () => {
     requestSendPolicies.get(req)!.failedRebuild = true;
     releaseUncommittedRouteDecision();
   };
@@ -2060,6 +2056,8 @@ async function handleMessages(
           : {}),
     });
   } catch {
+    const kept = rideOldPrefix(false);
+    if (kept) return kept;
     releaseUncommittedRouteDecision();
     recordTurn(rec, "followup-degraded", rawBody);
     capture(opts, "anthropic-request", rawBody);
@@ -2105,7 +2103,7 @@ async function handleMessages(
     // a payment-specific notice instead of the generic degraded one, at most
     // once per proxy process after it has actually been delivered.
     recordTurn(rec, "followup-degraded", forwardBody);
-    clearLaneOrYield();
+    releaseForOriginalFallback();
     sendingWhole();
     capture(opts, "anthropic-request", forwardBody);
     const paymentDetail = opts.memtree.paymentRequiredDetail;
@@ -2166,7 +2164,7 @@ async function handleMessages(
     // measure, so nothing downstream would notice that the model is about to be
     // asked to continue a conversation it can no longer see. Forwarding the
     // real history costs context but never silently amnesias the session.
-    clearLaneOrYield();
+    releaseForOriginalFallback();
     sendingWhole();
     if (actuallyCompressed && opts.debug) {
       console.error(
@@ -2218,7 +2216,7 @@ async function handleMessages(
     // server-side only — the client deliberately has no local fallback, that
     // drift is what caused the append/adherence regressions — so forward the
     // real history instead, exactly like the unusable branch above.
-    clearLaneOrYield();
+    releaseForOriginalFallback();
     sendingWhole();
     if (opts.debug) {
       console.error(
@@ -3976,6 +3974,48 @@ async function recoverToolRouteMiss(args: {
     if (routeOwning) releaseRouteDecision(state, routeKey, decisionGeneration);
   };
 
+  /**
+   * The attempt produced nothing: send what the turn would have sent without
+   * it — the old ride (kept prefix) or the whole history — and back off.
+   */
+  const forwardOriginal = () => {
+    requestSendPolicies.get(req)!.failedRebuild = true;
+    backOff();
+    if (fallback) {
+      requestSendPolicies.get(req)?.allowed.add(fallback.raw);
+      if (rec.compaction) rec.compaction.keptPrefix = true;
+      recordTurn(rec, fallback.turnType, fallback.raw);
+      capture(opts, "anthropic-request-memory-tool", fallback.raw);
+      return forwardRaw(
+        req,
+        res,
+        fallback.raw,
+        opts,
+        upstream,
+        state.shutdownSignal,
+        rec
+      ).then((delivered) => {
+        toolForwarding.settle(delivered);
+        noteRideSize(fallback.sizeHolder, rec, fallback.raw.length);
+      });
+    }
+    recordTurn(rec, "tool", args.originalBody);
+    capture(opts, "anthropic-request", args.originalBody);
+    return forwardRaw(
+      req,
+      res,
+      args.originalBody,
+      opts,
+      upstream,
+      state.shutdownSignal,
+      rec
+    ).then((delivered) => {
+      toolForwarding.settle(delivered);
+      noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length);
+    });
+  };
+
+
   // Same downstream-close tracking as the followup path: compression
   // promises are hash-deduped and may serve another live retry, so the
   // subscriber's lifetime is tracked locally, never fed into compress().
@@ -4002,17 +4042,9 @@ async function recoverToolRouteMiss(args: {
       ...(args.compaction ? { compaction: args.compaction } : {}),
     });
   } catch {
-    // Preserve the reservation and ownership safeguards even on pipeline exceptions.
-    backOff();
     releaseOwnReservation();
     rec.routeRecovery = { conversationBytes, outcome: "failed" };
-    recordTurn(rec, "tool", args.originalBody);
-    capture(opts, "anthropic-request", args.originalBody);
-    return forwardRaw(req, res, args.originalBody, opts, upstream, state.shutdownSignal, rec)
-      .then((delivered) => {
-        toolForwarding.settle(delivered);
-        noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length);
-      });
+    return forwardOriginal();
   } finally {
     res.off("close", markDownstreamClosed);
   }
@@ -4037,55 +4069,15 @@ async function recoverToolRouteMiss(args: {
     // "client-aborted": no route was installed and the client's identical
     // retry is imminent, so no backoff is set and the attempt mark is
     // dropped; the retry compresses again, a compress-cache hit (client
-    // closes are deliberately never fed into compress()). Epoch-guarded so a
-    // late settle cannot touch a later human turn's lane.
-    if (state.mainRouteEpoch === routeEpoch) {
+    // closes are deliberately never fed into compress()). Retire only this
+    // attempt so a late settle cannot remove a newer attempt.
+    if (state.toolRecoveryAttemptedLanes.get(routeKey) === recoveryAttempt) {
       state.toolRecoveryAttemptedLanes.delete(routeKey);
     }
     recordTurn(rec, "tool", Buffer.alloc(0));
     return;
   }
 
-  /**
-   * The attempt produced nothing: send what the turn would have sent without
-   * it — the old ride (kept prefix) or the whole history — and back off.
-   */
-  const forwardOriginal = () => {
-    requestSendPolicies.get(req)!.failedRebuild = true;
-    backOff();
-    if (fallback) {
-      requestSendPolicies.get(req)?.allowed.add(fallback.raw);
-      if (rec.compaction) rec.compaction.keptPrefix = true;
-      recordTurn(rec, fallback.turnType, fallback.raw);
-      capture(opts, "anthropic-request-memory-tool", fallback.raw);
-      return forwardRaw(
-        req,
-        res,
-        fallback.raw,
-        opts,
-        upstream,
-        state.shutdownSignal,
-        rec
-      ).then((delivered) => {
-        toolForwarding.settle(delivered);
-        noteRideSize(fallback.sizeHolder, rec, fallback.raw.length);
-      });
-    }
-    recordTurn(rec, "tool", forwardBody);
-    capture(opts, "anthropic-request", forwardBody);
-    return forwardRaw(
-      req,
-      res,
-      forwardBody,
-      opts,
-      upstream,
-      state.shutdownSignal,
-      rec
-    ).then((delivered) => {
-      toolForwarding.settle(delivered);
-      noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, forwardBody.length);
-    });
-  };
 
   if (!result) {
     rec.routeRecovery = { conversationBytes, outcome: "failed" };
@@ -4202,30 +4194,11 @@ async function recoverToolRouteMiss(args: {
       return;
     }
     if (!routeOwning) {
-      // No route (a typed prompt is pending, or no session to match a later
-      // ride against), but on the main thread the result still becomes the
-      // session's stable prefix: nothing classifies against it, and later
-      // tool turns ride it directly ("tool-prefix").
-      if (stable && sessionId !== undefined) {
-        storeStablePrefix(
-          state,
-          sessionId,
-          messages,
-          {
-            originalSystemHash: routeValueHash(normalizeRouteSystem(body.system)),
-            compressedMessages: cloneJson(compressedBody.messages),
-            compressedSystem: cloneJson(compressedBody.system),
-            hasCompressedSystem: Object.prototype.hasOwnProperty.call(compressedBody, "system"),
-          },
-          stable
-        );
-      }
+      // A sessionless request can use this response but cannot store a reusable route.
       activationAttempted = true;
       return;
     }
-    // No staleness pre-check: installMemoryRoute applies the identical epoch
-    // and decision-generation guard as its first act, before its sessionless
-    // clear, and a false return classifies as "stale" below.
+    // Installation checks the same lane-generation guard before any mutation.
     const installed = installMemoryRoute(
       state,
       routeKey,
@@ -4364,9 +4337,9 @@ async function recoverToolRouteMiss(args: {
   // A failed forward AFTER a healthy compress — upstream 5xx/529 or a client
   // mid-stream abort — left no route and the client retries the identical
   // body, so drop the lane's attempt mark, lifting the backoff just set —
-  // epoch-guarded, so a late settle cannot touch a later human turn's lane.
+  // identity-guarded so a late settle cannot remove a newer lane attempt.
   // The retry's recompress is a compress-cache hit, so the re-attempt is
-  // cheap. A later route reject-delete deliberately does NOT lift a backoff:
+  // cheap. A later route mismatch deliberately does NOT lift a backoff:
   // siblings sharing a parent-agent fallback lane genuinely mismatch each
   // other every turn, and lifting it there would be one real blocking
   // compress per tool step. The two fates are split in reqlog so the
@@ -4375,7 +4348,7 @@ async function recoverToolRouteMiss(args: {
   if (
     (rec.routeRecovery.install === "upstream-failed" ||
       rec.routeRecovery.install === "client-aborted") &&
-    state.mainRouteEpoch === routeEpoch
+    state.toolRecoveryAttemptedLanes.get(routeKey) === recoveryAttempt
   ) {
     state.toolRecoveryAttemptedLanes.delete(routeKey);
   }

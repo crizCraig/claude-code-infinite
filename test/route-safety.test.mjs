@@ -4,7 +4,7 @@ import http from "node:http";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 
-async function harness(budget = 1000) {
+async function harness(budget = 1000, extraOptions = {}) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -19,7 +19,7 @@ async function harness(budget = 1000) {
   const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "offline" });
   memtree.compress = async () => null;
   memtree.indexInBackground = () => {};
-  const proxy = await startProxy({ memtree, upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, budgetTokensOverride: budget, defaultCompactTarget: null });
+  const proxy = await startProxy({ memtree, upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, budgetTokensOverride: budget, defaultCompactTarget: null, ...extraOptions });
   return { proxy, memtree, seen, close() { proxy.close(); upstream.close(); } };
 }
 
@@ -78,3 +78,37 @@ test("a transport that ignores cancellation cannot hold rebuilding open indefini
     assert.ok(performance.now() - started < 1000);
   } finally { h.close(); }
 });
+
+for (const lane of ["human", "tool"]) {
+  test(`compression exceptions keep a validated prefix on the ${lane} path`, async () => {
+    let broken = false;
+    const h = await harness(20_000, { defaultCompactTarget: undefined,
+      transcriptUsage: { usageFor() { if (broken) throw Error("usage unavailable"); return {}; } } });
+    const summary = "saved memory ".repeat(250);
+    h.memtree.compress = async () => ({
+      messages: [{ role: "user", content: summary }],
+      flattened_messages: [{ role: "user", content: summary }],
+      usage: { prompt_tokens_details: { cached_tokens: 1 } },
+    });
+    const send = messages => request(h.proxy, JSON.stringify({ model: "claude-x", max_tokens: 100, messages }));
+    try {
+      const messages = [{ role: "user", content: "q" }, { role: "assistant", content: "a" },
+        { role: "user", content: "x".repeat(160_000) }];
+      assert.equal((await send(messages)).status, 200);
+      const storedPrefix = JSON.parse(h.seen[0]).messages[0];
+      broken = true;
+      if (lane === "human") {
+        await fetch(h.proxy.hookUrl, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "safe-session", prompt: "/memtree-compact" }) });
+        messages.push({ role: "assistant", content: "a" }, { role: "user", content: "next" });
+      } else {
+        messages.push({ role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "z".repeat(80_000) }] });
+      }
+      assert.equal((await send(messages)).status, 200, "the validated fallback survives a pipeline exception");
+      assert.equal(h.seen.length, 2);
+      assert.deepEqual(JSON.parse(h.seen[1]).messages[0], storedPrefix, "cached prefix bytes remain unchanged");
+      assert.ok(!h.seen[1].includes("x".repeat(1000)), "raw history never replaces the prefix");
+    } finally { h.close(); }
+  });
+}
