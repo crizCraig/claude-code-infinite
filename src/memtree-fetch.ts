@@ -26,8 +26,14 @@ export type FetchMode = "production" | "staging" | "local";
  * `.json` suffix. The server serves both spellings of either id.
  */
 const MEMTREE_PATH_RE = /^(\/m|\/usage\/memtree)\/([A-Za-z0-9-]+)(\.json)?$/;
-const STAGING_HOST_PREFIX = "polychat-staging";
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+/**
+ * The only hosts a saved key may be sent to. Anything else (including look-alikes
+ * such as `polychat-staging.evil.example`) gets no key: a pasted URL decides
+ * where the request goes, so it must never decide that a stranger gets a key.
+ */
+const PRODUCTION_HOSTS = new Set(["api.polychat.co", "app.polychat.co"]);
+const STAGING_HOSTS = new Set(["polychat-staging-421312241218.us-west2.run.app"]);
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "local.polychat.co"]);
 const ERROR_BODY_PREVIEW_CHARS = 1000;
 
 export const USAGE =
@@ -65,6 +71,10 @@ export async function runMemtreeFetchCommand(
     return 2;
   }
   const mode = modeForUrl(url);
+  if (!mode) {
+    deps.stderr(`ccc fetch: not a Polychat host, so no key is sent: ${url.host}\n`);
+    return 2;
+  }
   const key = keyForMode(mode, deps.keys);
   if (!key) {
     deps.stderr(
@@ -109,11 +119,16 @@ export function memtreeJsonUrl(raw: string): URL | null {
   return url;
 }
 
-/** Which saved key a host needs; mirrors the `ccc [staging|local]` modes. */
-export function modeForUrl(url: URL): FetchMode {
+/**
+ * Which saved key a host needs, mirroring the `ccc [staging|local]` modes; null
+ * for any other host. Production and staging keys travel only over https.
+ */
+export function modeForUrl(url: URL): FetchMode | null {
   if (LOCAL_HOSTS.has(url.hostname)) return "local";
-  if (url.hostname.startsWith(STAGING_HOST_PREFIX)) return "staging";
-  return "production";
+  if (url.protocol !== "https:") return null;
+  if (STAGING_HOSTS.has(url.hostname)) return "staging";
+  if (PRODUCTION_HOSTS.has(url.hostname)) return "production";
+  return null;
 }
 
 export function keyForMode(mode: FetchMode, keys: FetchKeys): string | undefined {

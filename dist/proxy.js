@@ -400,6 +400,11 @@ function cancelAcceptedRequest(accepted) {
 }
 async function handleRequest(req, res, opts, upstream, state, hookPath) {
     const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+    if (!isLocalCaller(req)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));
+        return;
+    }
     if (url.pathname === hookPath) {
         return handleNoticeHook(req, res, state, opts.reqlog);
     }
@@ -421,6 +426,45 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return handleCountTokens(req, res, opts, upstream, state);
     }
     return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const BROWSER_SAME_SITE = new Set(["same-origin", "none"]);
+/**
+ * Every route acts with the user's MemTree key (the `/memtree/*` relay reads
+ * their trees; `/v1/messages` indexes and compresses on their account), so only
+ * callers on this machine may use the proxy: Claude Code, agents (curl, the MCP
+ * server) and the MemTree page itself when opened from the loopback. A web page
+ * on another site can reach the loopback too, either directly (its `origin` or
+ * `sec-fetch-site` says so) or by rebinding its own hostname to 127.0.0.1 (its
+ * `host` then names it). Same-origin means this exact host and port.
+ */
+function isLocalCaller(req) {
+    const host = req.headers.host;
+    if (!host || !isLoopbackHost(host))
+        return false;
+    const origin = req.headers.origin;
+    if (origin !== undefined && !isSameLoopbackOrigin(origin, host))
+        return false;
+    const site = req.headers["sec-fetch-site"];
+    return site === undefined || BROWSER_SAME_SITE.has(String(site));
+}
+function isLoopbackHost(host) {
+    try {
+        const url = new URL(`http://${host}`);
+        return url.host === host.toLowerCase() && LOOPBACK_HOSTNAMES.has(url.hostname);
+    }
+    catch {
+        return false;
+    }
+}
+function isSameLoopbackOrigin(origin, host) {
+    try {
+        const url = new URL(origin);
+        return url.protocol === "http:" && url.host === new URL(`http://${host}`).host;
+    }
+    catch {
+        return false;
+    }
 }
 /** Loopback prefix for reading the user's own MemTree pages through this proxy. */
 const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";

@@ -19,8 +19,14 @@ import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
  * `.json` suffix. The server serves both spellings of either id.
  */
 const MEMTREE_PATH_RE = /^(\/m|\/usage\/memtree)\/([A-Za-z0-9-]+)(\.json)?$/;
-const STAGING_HOST_PREFIX = "polychat-staging";
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+/**
+ * The only hosts a saved key may be sent to. Anything else (including look-alikes
+ * such as `polychat-staging.evil.example`) gets no key: a pasted URL decides
+ * where the request goes, so it must never decide that a stranger gets a key.
+ */
+const PRODUCTION_HOSTS = new Set(["api.polychat.co", "app.polychat.co"]);
+const STAGING_HOSTS = new Set(["polychat-staging-421312241218.us-west2.run.app"]);
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "local.polychat.co"]);
 const ERROR_BODY_PREVIEW_CHARS = 1000;
 export const USAGE = "usage: ccc fetch <memtree-url>\n" +
     "  Prints the MemTree at <memtree-url> as JSON (nodes, blocks, instructions),\n" +
@@ -39,6 +45,10 @@ export async function runMemtreeFetchCommand(argv, overrides = {}) {
         return 2;
     }
     const mode = modeForUrl(url);
+    if (!mode) {
+        deps.stderr(`ccc fetch: not a Polychat host, so no key is sent: ${url.host}\n`);
+        return 2;
+    }
     const key = keyForMode(mode, deps.keys);
     if (!key) {
         deps.stderr(`ccc fetch: no MemTree key saved for ${mode} (${url.host}). ` +
@@ -78,13 +88,20 @@ export function memtreeJsonUrl(raw) {
     url.pathname = `${match[1]}/${match[2]}.json`;
     return url;
 }
-/** Which saved key a host needs; mirrors the `ccc [staging|local]` modes. */
+/**
+ * Which saved key a host needs, mirroring the `ccc [staging|local]` modes; null
+ * for any other host. Production and staging keys travel only over https.
+ */
 export function modeForUrl(url) {
     if (LOCAL_HOSTS.has(url.hostname))
         return "local";
-    if (url.hostname.startsWith(STAGING_HOST_PREFIX))
+    if (url.protocol !== "https:")
+        return null;
+    if (STAGING_HOSTS.has(url.hostname))
         return "staging";
-    return "production";
+    if (PRODUCTION_HOSTS.has(url.hostname))
+        return "production";
+    return null;
 }
 export function keyForMode(mode, keys) {
     return keys[mode] || undefined;

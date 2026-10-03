@@ -3911,6 +3911,77 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
   }
 });
 
+test("the proxy refuses browsers on other sites and rebound hostnames", async () => {
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  const memtreeSrv = await listen((req, res) => {
+    pageGets.push(req.url);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const get = (path, headers) =>
+    new Promise((resolve, reject) => {
+      const req = http.get({ host: "127.0.0.1", port: proxy.port, path, headers }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      });
+      req.on("error", reject);
+    });
+  const post = (path, headers) =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", host: "127.0.0.1", port: proxy.port, path, headers: {
+          ...headers,
+          "content-type": "application/json",
+          "x-claude-code-session-id": "rebound-session",
+        } },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", reject);
+      req.end(JSON.stringify({ model: "m", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }));
+    });
+  const local = `127.0.0.1:${proxy.port}`;
+  try {
+    // DNS rebinding: an attacker's hostname resolved to the loopback.
+    for (const path of ["/memtree/ea18af90658b.json", "/memtree/search?q=x", "/memtree/current"]) {
+      assert.equal(await get(path, { host: `evil.example:${proxy.port}` }), 403, path);
+    }
+    // A page on another site reaching the loopback directly.
+    assert.equal(await get("/memtree/search?q=x", { host: local, origin: "https://evil.example" }), 403);
+    assert.equal(await get("/memtree/search?q=x", { host: local, "sec-fetch-site": "cross-site" }), 403);
+    // Another loopback port is another site (some other local web server).
+    assert.equal(
+      await get("/memtree/search?q=x", { host: local, origin: "http://127.0.0.1:1" }),
+      403
+    );
+    assert.equal(await get("/memtree/search?q=x", { host: `${local}@evil.example` }), 403);
+    assert.equal(await post("/v1/messages", { host: `evil.example:${proxy.port}` }), 403);
+    assert.equal(pageGets.length, 0, "refused requests never reach the server with the key");
+
+    // Agents (no browser headers), and the page's own same-origin fetches, still work.
+    assert.equal(await get("/memtree/ea18af90658b.json", { host: local }), 200);
+    assert.equal(await get("/memtree/ea18af90658b.json", { host: `localhost:${proxy.port}` }), 200);
+    assert.equal(
+      await get("/memtree/ea18af90658b/session.json", {
+        host: local,
+        origin: `http://${local}`,
+        "sec-fetch-site": "same-origin",
+      }),
+      200
+    );
+    assert.equal(pageGets.length, 3);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("GET /memtree/sessions and /memtree/search relay to the finder endpoints with the key and project", async () => {
   const upstream = await mockUpstream();
   const seen = [];
