@@ -1482,8 +1482,9 @@ async function startMidTurnHarness(extraOpts = {}, upstreamStatus = () => 200) {
     messages: [{ role: "user", content: "compressed context" }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
     ...extraOpts,
   });
@@ -1494,7 +1495,7 @@ async function startMidTurnHarness(extraOpts = {}, upstreamStatus = () => 200) {
     upstream.close();
     memtreeSrv.close();
   };
-  return { proxy, compressCalls, lastUpstream, upstreamCount: () => upstreamBodies.length, close };
+  return { proxy, memtree, compressCalls, lastUpstream, upstreamCount: () => upstreamBodies.length, close };
 }
 
 test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-02 overflow)", async () => {
@@ -10083,3 +10084,101 @@ test("concurrent session pages and late completions are ordered within each sess
     memtreeSrv.close();
   }
 });
+
+for (const outcome of ["noop", "exception", "compressed"]) {
+  test(`recovery refuses ambiguous full history after ${outcome} and retains its route`, async () => {
+    const seen = [];
+    const upstream = await listen((req, res) => {
+      const chunks = []; req.on("data", c => chunks.push(c));
+      req.on("end", () => { seen.push(Buffer.concat(chunks).toString());
+        res.writeHead(200, { "content-type": "application/json" }); res.end(UPSTREAM_BODY); });
+    });
+    let calls = 0;
+    const server = await mockMemtree(200, request => {
+      if (request.index_only) return {};
+      calls++;
+      return calls === 1 || outcome === "compressed"
+        ? { messages: [{ role: "user", content: "compressed context" }], usage: { prompt_tokens_details: { cached_tokens: 123 } }, model_budget_tokens: 20000 }
+        : { messages: request.messages, model_budget_tokens: 20000 };
+    });
+    const memtree = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+    try {
+      await armMainTurn(proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(proxy.port, base);
+      await armMainTurn(proxy, "pending owner", "pending");
+      if (outcome === "exception") memtree.compress = async () => { throw new Error("pipeline failure"); };
+      const divergent = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "large");
+      divergent.at(-1).content[0].content = "X".repeat(800000);
+      const result = await postSessionMessages(proxy.port, divergent);
+      if (outcome !== "compressed") {
+        assert.equal(result.type, "error");
+        assert.equal(seen.length, 1, "ambiguous recovery cannot forward the original history");
+      }
+      await postSessionMessages(proxy.port, withToolRound(base, "original-route"));
+      assert.match(seen.at(-1), /compressed context/);
+      assert.doesNotMatch(seen.at(-1), /first question|different history/);
+    } finally { proxy.close(); server.close(); upstream.close(); }
+  });
+}
+
+test("recovery retires separately delivered queued prompts but preserves the remaining queue", async () => {
+  const h = await startMidTurnHarness();
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    await armMainTurn(h.proxy, "still queued", "later");
+    const large = withToolRound(base, "large", [{ type: "text", text: "pending owner" }]);
+    large.at(-1).content[0].content = "X".repeat(800000);
+    await postSessionMessages(h.proxy.port, large);
+    assert.equal(h.compressCalls(), 2, "the wrapper reaches recovery");
+    await armMainTurn(h.proxy, "pending owner", "new-owner");
+    let messages = [...large, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    messages = [...messages, { role: "assistant", content: "done" }, { role: "user", content: "still queued" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    assert.equal(h.compressCalls(), 4, "both separately owned prompts are available");
+  } finally { h.close(); }
+});
+
+for (const outcome of ["noop", "compressed"]) {
+  test(`recovery rechecks ownership when hooks arrive during ${outcome} compression`, async () => {
+    const h = await startMidTurnHarness();
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    try {
+      await armMainTurn(h.proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(h.proxy.port, base);
+      const original = h.memtree.compress.bind(h.memtree);
+      h.memtree.compress = async (...args) => {
+        started(); await blocked;
+        return outcome === "noop" ? null : original(...args);
+      };
+      const large = withToolRound(base, "large", [{ type: "text", text: "arrived later" }]);
+      large.at(-1).content[0].content = "X".repeat(800000);
+      const pending = postSessionMessages(h.proxy.port, large);
+      await entered;
+      await armMainTurn(h.proxy, "arrived later", "new-hook");
+      release();
+      const response = await pending;
+      if (outcome === "noop") {
+        assert.equal(response.type, "error");
+        assert.equal(h.upstreamCount(), 1, "new ambiguous ownership blocks full history");
+      }
+      await postSessionMessages(h.proxy.port, withToolRound(base, "original-route"));
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+      h.memtree.compress = original;
+      const separatelyDelivered = [...large, { role: "assistant", content: "done" },
+        { role: "user", content: "arrived later" }];
+      assert.notEqual((await postSessionMessages(h.proxy.port, separatelyDelivered)).type, "error",
+        "a hook arriving after the request snapshot cannot be retired by that response");
+    } finally { release(); h.close(); }
+  });
+}

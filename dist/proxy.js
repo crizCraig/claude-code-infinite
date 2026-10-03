@@ -223,6 +223,28 @@ function armDeferredPromptIfCarried(state, lastMsg) {
     state.deferredMainPrompts.splice(state.deferredMainPrompts.indexOf(deferred), 1);
     armMainPrompt(state, deferred.id, deferred.text);
 }
+function routeOwnershipIsUncertain(state) {
+    return state.mainRouteOwnershipUncertain || state.deferredMainPrompts.length > 0;
+}
+/** Capture prompt identities before asynchronous work; consult ownership at send time. */
+function toolForwardingGuard(state, res, isMainRequest, lastMsg) {
+    const carried = isMainRequest && lastMsg?.role === "user"
+        ? state.deferredMainPrompts.filter((prompt, _, pending) => !!prompt.text && wrapperCarriesPrompt(lastMsg, prompt.text) &&
+            pending.filter((other) => other.text?.trim() === prompt.text.trim()).length === 1)
+        : [];
+    return {
+        allow: (compressed) => {
+            if (!isMainRequest || compressed || !routeOwnershipIsUncertain(state))
+                return true;
+            sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
+            return false;
+        },
+        settle: (delivered) => {
+            if (delivered)
+                state.deferredMainPrompts = state.deferredMainPrompts.filter((prompt) => !carried.includes(prompt));
+        },
+    };
+}
 /** Only top-level user text, never tool output, can prove queued delivery. */
 function wrapperCarriesPrompt(message, prompt) {
     if (messageCarriesPromptText(message, prompt))
@@ -983,8 +1005,8 @@ async function handleMessages(req, res, opts, upstream, state) {
     // epoch, system, and every prefix hash before any rewrite, so a retained
     // route can never graft onto an unrelated request; it can only match its
     // own conversation's extension or fail closed.
-    const routeOwnershipUncertain = state.mainRouteOwnershipUncertain ||
-        state.deferredMainPrompts.length > 0;
+    const routeOwnershipUncertain = routeOwnershipIsUncertain(state);
+    const toolForwarding = toolForwardingGuard(state, res, isMainRequest && (isToolResultTurn || isContinuationTurn), lastMsg);
     const pendingPromptOwnershipUnknown = state.deferredMainPrompts.length > 0 &&
         (!state.mainPromptText || !messageCarriesPromptText(lastMsg, state.mainPromptText));
     if (isFollowupUserTurn && isMainRequest &&
@@ -1287,6 +1309,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                         routeKey: requestRouteKey,
                         isMainRequest,
                         recoveryAttempt,
+                        toolForwarding,
                         clientMeta,
                         compaction: { target: plan.target, threshold: plan.threshold },
                         ...(plan.replaces !== undefined
@@ -1314,11 +1337,8 @@ async function handleMessages(req, res, opts, upstream, state) {
                 }
             }
         }
-        if (isMainRequest && routeOwnershipUncertain && !toolRide &&
-            (isToolResultTurn || isContinuationTurn)) {
-            sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
+        if (!toolForwarding.allow(!!toolRide))
             return;
-        }
         const sendBody = toolRide?.raw ?? (toolNeedsOriginal ? rawBody : forwardBody);
         recordTurn(rec, toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool", sendBody);
         // A replay matched the stored route's prefix hashes, which are
@@ -1334,16 +1354,8 @@ async function handleMessages(req, res, opts, upstream, state) {
         // The size Anthropic reports is the next budget check's anchor: a ride
         // reports to its prefix (or route), a whole request to the session's (or
         // lane's) passthrough size.
-        const carriedPrompts = isMainRequest && isToolResultTurn
-            ? state.deferredMainPrompts.filter((prompt, _, pending) => !!prompt.text && wrapperCarriesPrompt(lastMsg, prompt.text) &&
-                pending.filter((other) => other.text?.trim() === prompt.text.trim()).length === 1)
-            : [];
         return logged(forwardRaw(req, res, sendBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
-            if (delivered) {
-                // Capture identities before forwarding: a later identical hook is a
-                // different queued prompt and cannot be consumed by this response.
-                state.deferredMainPrompts = state.deferredMainPrompts.filter((prompt) => !carriedPrompts.includes(prompt));
-            }
+            toolForwarding.settle(delivered);
             if (toolRide)
                 noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
             else {
@@ -3145,7 +3157,7 @@ function buildCompressedBody(body, result) {
  * lane's backoff (`retryAtTokens`).
  */
 async function recoverToolRouteMiss(args) {
-    const { opts, state, req, res, upstream, body, messages, forwardBody, msgsForMemtree, hash, modelContextLimit, routeEpoch, rec, conversationBytes, routeKey, isMainRequest, recoveryAttempt, stable, fallback, } = args;
+    const { opts, state, req, res, upstream, body, messages, forwardBody, msgsForMemtree, hash, modelContextLimit, routeEpoch, rec, conversationBytes, routeKey, isMainRequest, recoveryAttempt, toolForwarding, stable, fallback, } = args;
     const backOff = () => {
         if (args.retryAtTokens !== undefined)
             recoveryAttempt.retryAtTokens = args.retryAtTokens;
@@ -3186,12 +3198,12 @@ async function recoverToolRouteMiss(args) {
     // agent install here would merely leave its tool loop routeless (agents
     // have no stable prefix), compressing again on every over-budget turn.
     const promptWindowPending = isMainRequest && state.mainPromptArmed;
-    // Every identity owns its own lane now, so the only transform-only reasons
-    // left are local to this request: no session id to safely match a later
-    // ride against, or the merged-prompt window above. The foreign-owner and
+    // Every identity owns its own lane. Missing session identity, a pending
+    // prompt window, or uncertain main-prompt ownership makes this transform-only. The foreign-owner and
     // subagent carve-outs are gone because the hazard they defended against is
     // structurally unreachable — a request's key can only name its own lane.
-    const routeOwning = sessionId !== undefined && !promptWindowPending;
+    const routeOwning = sessionId !== undefined && !promptWindowPending &&
+        !(isMainRequest && routeOwnershipIsUncertain(state));
     // Only a route-owning recovery reserves the decision generation. A
     // transform-only attempt must not advance it — and, reciprocally, its late
     // completion can never install over (or clear) a route someone else
@@ -3241,16 +3253,19 @@ async function recoverToolRouteMiss(args) {
         });
     }
     catch {
-        // An unexpected pipeline exception must never fail the user's API call.
-        // Preserve the lane's growth backoff and release its reservation, then
-        // send the original upload even when it exceeds the model window.
+        // Preserve the reservation and ownership safeguards even on pipeline exceptions.
         backOff();
         releaseOwnReservation();
         rec.routeRecovery = { conversationBytes, outcome: "failed" };
+        if (!toolForwarding.allow(false))
+            return;
         recordTurn(rec, "tool", args.originalBody);
         capture(opts, "anthropic-request", args.originalBody);
         return forwardRaw(req, res, args.originalBody, opts, upstream, state.shutdownSignal, rec)
-            .then(() => noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length));
+            .then((delivered) => {
+            toolForwarding.settle(delivered);
+            noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length);
+        });
     }
     finally {
         res.off("close", markDownstreamClosed);
@@ -3287,16 +3302,24 @@ async function recoverToolRouteMiss(args) {
      */
     const forwardOriginal = () => {
         backOff();
+        if (!toolForwarding.allow(!!fallback))
+            return Promise.resolve();
         if (fallback) {
             if (rec.compaction)
                 rec.compaction.keptPrefix = true;
             recordTurn(rec, fallback.turnType, fallback.raw);
             capture(opts, "anthropic-request-memory-tool", fallback.raw);
-            return forwardRaw(req, res, fallback.raw, opts, upstream, state.shutdownSignal, rec).then(() => noteRideSize(fallback.sizeHolder, rec, fallback.raw.length));
+            return forwardRaw(req, res, fallback.raw, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+                toolForwarding.settle(delivered);
+                noteRideSize(fallback.sizeHolder, rec, fallback.raw.length);
+            });
         }
         recordTurn(rec, "tool", forwardBody);
         capture(opts, "anthropic-request", forwardBody);
-        return forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then(() => noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, forwardBody.length));
+        return forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
+            toolForwarding.settle(delivered);
+            noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, forwardBody.length);
+        });
     };
     if (!result) {
         rec.routeRecovery = { conversationBytes, outcome: "failed" };
@@ -3385,11 +3408,18 @@ async function recoverToolRouteMiss(args) {
     }
     rec.routeRecovery = { conversationBytes, outcome: "compressed" };
     let activationAttempted = false;
+    let ownershipDeferred = false;
     let installFate;
     let installedRoute;
     const activateRecoveredRoute = () => {
         if (activationAttempted)
             return;
+        if (isMainRequest && routeOwnershipIsUncertain(state)) {
+            ownershipDeferred = true;
+            releaseOwnReservation();
+            activationAttempted = true;
+            return;
+        }
         if (!routeOwning) {
             // No route (a typed prompt is pending, or no session to match a later
             // ride against), but on the main thread the result still becomes the
@@ -3450,6 +3480,10 @@ async function recoverToolRouteMiss(args) {
     // would fund one blocking recompress per tool turn under a deterministic
     // activation throw.
     let activationThrew = false;
+    if (!toolForwarding.allow(true)) {
+        releaseOwnReservation();
+        return;
+    }
     const delivered = await forwardRaw(req, res, compressedRaw, opts, upstream, state.shutdownSignal, rec, 
     // Protocol-complete (accepted SSE message_stop or a complete 2xx JSON
     // response) is the real activation point, exactly as on the followup
@@ -3466,6 +3500,7 @@ async function recoverToolRouteMiss(args) {
             activationThrew = true;
         }
     });
+    toolForwarding.settle(delivered);
     // Defensive delivery-complete fallback, mirroring the followup path. A
     // candidate already activated at message_stop deliberately survives a
     // delivered=false settle (fast-tool abort); an upstream 500/529 or an
@@ -3486,7 +3521,7 @@ async function recoverToolRouteMiss(args) {
             activationThrew = true;
         }
     }
-    rec.routeRecovery.install = !routeOwning
+    rec.routeRecovery.install = ownershipDeferred ? "prompt-pending" : !routeOwning
         ? sessionId === undefined
             ? "no-session"
             : "prompt-pending"
