@@ -60,11 +60,17 @@ test("failed oversized rebuilding retries twice then terminates, never forwardin
   } finally { h.close(); }
 });
 
-test("fallback budget reserves requested output tokens", async () => {
+test("fallback compares input with the budget and reserves output against the window", async () => {
   const h = await harness();
   try {
-    assert.equal((await request(h.proxy, body("small history", 1000))).status, 503);
-    assert.equal(h.seen.length, 0);
+    // Under the budget by input (as the server judges it, so it will not compress),
+    // and it fits the window with its output: it goes out unchanged. 2026-10-03:
+    // refusing this for the output reservation failed every session past ~672k.
+    assert.equal((await request(h.proxy, body("small history", 1000))).status, 200);
+    assert.equal(h.seen.length, 1);
+    // An over-budget input that could not be compressed is still refused.
+    assert.equal((await request(h.proxy, body("x".repeat(8000), 100))).status, 503);
+    assert.equal(h.seen.length, 1);
   } finally { h.close(); }
 });
 
