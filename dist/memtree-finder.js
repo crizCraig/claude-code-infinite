@@ -137,7 +137,7 @@ export function formatSearchResults(body, args) {
     const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
     if (body.matches_capped) {
-        out.push("", "(Only the newest 2,000 matching passages were ranked: add words, or narrow with since, until or project.)");
+        out.push("", "(Only the newest matching passages were ranked: add words, or narrow with since, until or project.)");
     }
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
