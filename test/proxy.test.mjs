@@ -1464,14 +1464,14 @@ const withToolRound = (messages, id, extraParts = []) => [
   },
 ];
 
-async function startMidTurnHarness(extraOpts = {}) {
+async function startMidTurnHarness(extraOpts = {}, upstreamStatus = () => 200) {
   const upstreamBodies = [];
   const upstream = await listen((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
+      res.writeHead(upstreamStatus(), {
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
       });
@@ -1569,6 +1569,103 @@ test("a prompt deferred as mid-turn still owns its own turn when Stop never came
     h.close();
   }
 });
+
+test("delivered mid-turn wrappers retire only their proven pending prompts", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    let messages = followupTurn("turn two");
+    await postMessages(h.proxy.port, messages, headers);
+    for (let i = 0; i < 35; i++) {
+      const prompt = i % 2 ? "repeat this prompt" : `prompt ${i}`;
+      await armMainTurn(h.proxy, prompt, `mid-${i}`);
+      messages = withToolRound(messages, `tool-${i}`, [{ type: "text", text: midTurnReminder(prompt) }]);
+      await postMessages(h.proxy.port, messages, headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+    }
+    await armMainTurn(h.proxy, "repeat this prompt", "final");
+    await postMessages(h.proxy.port, [...messages, { role: "assistant", content: "done" },
+      { role: "user", content: "repeat this prompt" }], headers);
+    assert.equal(h.compressCalls(), 2, "delivered prompts do not fill the queue or duplicate later owners");
+  } finally { h.close(); }
+});
+
+test("failed wrapper forwarding retains the queued prompt for its later own turn", async () => {
+  let status = 200;
+  const h = await startMidTurnHarness({ defaultCompactTarget: null }, () => status);
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    await armMainTurn(h.proxy, "not delivered", "pending");
+    status = 529;
+    await postMessages(h.proxy.port, withToolRound(base, "failed", [
+      { type: "text", text: midTurnReminder("not delivered") },
+    ]), headers);
+    status = 200;
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    await postMessages(h.proxy.port, [...base, { role: "assistant", content: "interrupted" },
+      { role: "user", content: "not delivered" }], headers);
+    assert.equal(h.compressCalls(), 2, "failed forwarding cannot consume the pending owner");
+  } finally { h.close(); }
+});
+
+for (const stopped of [true, false]) {
+  test(`separately delivered queued prompts retain their owners after ${stopped ? "Stop" : "interrupt"}`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      let messages = followupTurn("turn two");
+      await postMessages(h.proxy.port, messages, headers);
+      await armMainTurn(h.proxy, "queued alpha", "alpha");
+      await armMainTurn(h.proxy, "queued beta", "beta");
+      if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      for (const [index, prompt] of ["queued alpha", "queued beta"].entries()) {
+        messages = [...messages, { role: "assistant", content: "finished" },
+          { role: "user", content: prompt }];
+        await postMessages(h.proxy.port, messages, headers);
+        assert.equal(h.compressCalls(), index + 2, "each proven prompt starts its own compressed turn");
+        assert.match(h.lastUpstream(), /compressed context/);
+        if (index === 0) {
+          const before = h.upstreamCount();
+          const divergent = [{ role: "user", content: "different history" }, ...messages.slice(1)];
+          await postMessages(h.proxy.port, withToolRound(divergent, "unproven-tool"), headers);
+          assert.equal(h.upstreamCount(), before, "pending beta keeps alpha's route on an ambiguous mismatch");
+        }
+        await postMessages(h.proxy.port, withToolRound(messages, `queued-tool-${index}`), headers);
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: index === 0 ? "alpha" : "beta" });
+      }
+    } finally { h.close(); }
+  });
+}
+
+for (const overflow of [false, true]) {
+  test(`ambiguous queued ownership ${overflow ? "after bounded queue overflow" : "with duplicate text"} retains the route`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      const base = followupTurn("turn two");
+      await postMessages(h.proxy.port, base, headers);
+      for (let i = 0; i < (overflow ? 33 : 2); i++) {
+        await armMainTurn(h.proxy, overflow ? `queued ${i}` : "same prompt", `queued-${i}`);
+      }
+      await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      const count = h.upstreamCount();
+      await postMessages(h.proxy.port, [...base, { role: "assistant", content: "done" },
+        { role: "user", content: overflow ? "queued 32" : "same prompt" }], headers);
+      assert.equal(h.upstreamCount(), count, "unproven ownership refuses without forwarding");
+      await postMessages(h.proxy.port, withToolRound(base, "still-owned"), headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+    } finally { h.close(); }
+  });
+}
 
 test("queued prompts before Stop keep the compressed route for tool wrappers", async () => {
   const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });

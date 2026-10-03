@@ -338,13 +338,14 @@ interface ProxyState {
    */
   mainTurnActive: boolean;
   /**
-   * A prompt whose UserPromptSubmit arrived mid-turn, held instead of armed.
-   * It is armed only if a main request later carries it as a plain user turn
+   * Prompts whose UserPromptSubmit arrived mid-turn, held instead of armed.
+   * Each is armed only if a main request uniquely carries it as a plain user turn
    * (Claude Code skips Stop on an interrupt, so a real next prompt can look
    * mid-turn here). Arming at the hook cleared the route the running tool
    * loop rides, and nothing rebuilt it (2026-10-02 overflow).
    */
-  deferredMainPrompt?: { id?: string; text?: string };
+  deferredMainPrompts: { id?: string; text?: string }[];
+  deferredMainPromptsOverflowed: boolean;
   /** Hooks cannot prove a new owner yet: retain the route and refuse unsafe passthrough. */
   mainRouteOwnershipUncertain: boolean;
   /** Suppress producer-side state changes while agent API traffic is active. */
@@ -651,6 +652,7 @@ const TOOL_COMPACTION_RETRY_BUDGET_RATIO = 0.05;
  * route mid-turn; the cap is enforced by LRU eviction, not assumed.
  */
 const MEMORY_ROUTE_MAX_LANES = 32;
+const DEFERRED_MAIN_PROMPT_LIMIT = 32;
 
 type RouteLane = "main" | "away" | "agent";
 
@@ -738,7 +740,6 @@ function armMainPrompt(
   state.mainPromptDelivered = false;
   state.mainPromptGeneration++;
   state.mainTurnActive = true;
-  state.deferredMainPrompt = undefined;
   state.mainRouteOwnershipUncertain = false;
   bumpRouteEpoch(state);
   state.recoveryBudgetWipedForBoundary = true;
@@ -750,10 +751,27 @@ function armDeferredPromptIfCarried(
   state: ProxyState,
   lastMsg: Message | undefined
 ): void {
-  const deferred = state.deferredMainPrompt;
-  if (deferred?.text === undefined) return;
-  if (!messageCarriesPromptText(lastMsg, deferred.text)) return;
+  if (state.deferredMainPromptsOverflowed) return;
+  const matches = state.deferredMainPrompts.filter(
+    (prompt) => prompt.text !== undefined && messageCarriesPromptText(lastMsg, prompt.text)
+  );
+  // Identical or overlapping queued text cannot establish which hook owns the
+  // request. Keep both prompts and the existing route until ownership is proven.
+  if (matches.length !== 1) return;
+  const deferred = matches[0];
+  state.deferredMainPrompts.splice(state.deferredMainPrompts.indexOf(deferred), 1);
   armMainPrompt(state, deferred.id, deferred.text);
+}
+
+/** Only top-level user text, never tool output, can prove queued delivery. */
+function wrapperCarriesPrompt(message: Message | undefined, prompt: string): boolean {
+  if (messageCarriesPromptText(message, prompt)) return true;
+  if (!message || !Array.isArray(message.content)) return false;
+  const reminder = "<system-reminder>\nThe user sent a new message while you were working:\n" +
+    prompt.trim() + "\n\nThis is how Claude Code surfaces messages the user sends mid-turn ";
+  return message.content.some((part: any) =>
+    part?.type === "text" && typeof part.text === "string" && part.text.includes(reminder)
+  );
 }
 
 function bumpRouteEpoch(
@@ -829,6 +847,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainPromptDelivered: true,
     mainPromptGeneration: 0,
     mainTurnActive: false,
+    deferredMainPrompts: [],
+    deferredMainPromptsOverflowed: false,
     mainRouteOwnershipUncertain: false,
     activeSubagents: new Set(),
     memoryRoutes: new Map(),
@@ -1254,8 +1274,15 @@ async function handleNoticeHook(
       return;
     }
     if (parsed.agent_id === undefined) {
-      if (state.mainTurnActive) {
-        state.deferredMainPrompt = { id: parsed.prompt_id, text: parsed.prompt };
+      if (state.mainTurnActive || state.deferredMainPrompts.length > 0 ||
+          state.mainRouteOwnershipUncertain) {
+        // Preserve the oldest unconsumed owners. Overflow loses the ability to
+        // prove newer owners, never permission to forward their whole history.
+        if (state.deferredMainPrompts.length < DEFERRED_MAIN_PROMPT_LIMIT) {
+          state.deferredMainPrompts.push({ id: parsed.prompt_id, text: parsed.prompt });
+        } else {
+          state.deferredMainPromptsOverflowed = true;
+        }
         state.mainRouteOwnershipUncertain = true;
       } else {
         armMainPrompt(state, parsed.prompt_id, parsed.prompt);
@@ -1284,14 +1311,14 @@ async function handleNoticeHook(
     (state.mainPromptId === undefined ||
       parsed.prompt_id === undefined ||
       state.mainPromptId === parsed.prompt_id ||
-      state.deferredMainPrompt?.id === parsed.prompt_id);
+      state.deferredMainPrompts.some((prompt) => prompt.id === parsed.prompt_id));
   const output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
       ? null
       : state.notices.claim(parsed);
   if (stopMatchesMainPrompt) {
     const ownsTurn = parsed.prompt_id !== undefined && parsed.prompt_id === state.mainPromptId;
-    state.mainRouteOwnershipUncertain ||= !ownsTurn || state.deferredMainPrompt !== undefined;
+    state.mainRouteOwnershipUncertain ||= !ownsTurn || state.deferredMainPrompts.length > 0;
     state.mainTurnActive = false;
     state.mainPromptArmed = false;
     state.mainPromptId = undefined;
@@ -1601,7 +1628,12 @@ async function handleMessages(
   // epoch, system, and every prefix hash before any rewrite, so a retained
   // route can never graft onto an unrelated request; it can only match its
   // own conversation's extension or fail closed.
-  if (isFollowupUserTurn && isMainRequest && state.mainRouteOwnershipUncertain) {
+  const routeOwnershipUncertain = state.mainRouteOwnershipUncertain ||
+    state.deferredMainPrompts.length > 0;
+  const pendingPromptOwnershipUnknown = state.deferredMainPrompts.length > 0 &&
+    (!state.mainPromptText || !messageCarriesPromptText(lastMsg, state.mainPromptText));
+  if (isFollowupUserTurn && isMainRequest &&
+      (state.mainRouteOwnershipUncertain || pendingPromptOwnershipUnknown)) {
     sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
     return;
   }
@@ -1783,7 +1815,7 @@ async function handleMessages(
           // A matching route that outgrew the request's resolved window must
           // also rebuild; a smaller window lifts the lane's backoff.
           routeMiss = "rejected";
-          if (!isMainRequest || !state.mainRouteOwnershipUncertain) {
+          if (!isMainRequest || !routeOwnershipUncertain) {
             state.memoryRoutes.delete(requestRouteKey);
           }
           if (overContextWindow) {
@@ -1814,7 +1846,7 @@ async function handleMessages(
       routedTool = false;
       routedBody = forwardBody;
       routeMiss = "superseded";
-      if (!state.mainRouteOwnershipUncertain) state.memoryRoutes.delete(requestRouteKey);
+      if (!routeOwnershipUncertain) state.memoryRoutes.delete(requestRouteKey);
     }
     if (routeMiss !== undefined) rec.routeMiss = routeMiss;
     if (isContinuationTurn) rec.continuation = true;
@@ -1953,7 +1985,7 @@ async function handleMessages(
       }
     }
 
-    if (isMainRequest && state.mainRouteOwnershipUncertain && !toolRide &&
+    if (isMainRequest && routeOwnershipUncertain && !toolRide &&
         (isToolResultTurn || isContinuationTurn)) {
       sendAnthropicError(res, "MemTree route ownership is uncertain; retry after the current turn settles");
       return;
@@ -1977,6 +2009,11 @@ async function handleMessages(
     // The size Anthropic reports is the next budget check's anchor: a ride
     // reports to its prefix (or route), a whole request to the session's (or
     // lane's) passthrough size.
+    const carriedPrompts = isMainRequest && isToolResultTurn
+      ? state.deferredMainPrompts.filter((prompt, _, pending) =>
+          !!prompt.text && wrapperCarriesPrompt(lastMsg, prompt.text) &&
+          pending.filter((other) => other.text?.trim() === prompt.text!.trim()).length === 1)
+      : [];
     return logged(
       forwardRaw(
         req,
@@ -1986,7 +2023,14 @@ async function handleMessages(
         upstream,
         state.shutdownSignal,
         rec
-      ).then(() => {
+      ).then((delivered) => {
+        if (delivered) {
+          // Capture identities before forwarding: a later identical hook is a
+          // different queued prompt and cannot be consumed by this response.
+          state.deferredMainPrompts = state.deferredMainPrompts.filter(
+            (prompt) => !carriedPrompts.includes(prompt)
+          );
+        }
         if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
         else {
           noteWholeRequestSize(state, isMainRequest, toolSessionId, requestRouteKey, rec, sendBody.length);
