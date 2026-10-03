@@ -7316,13 +7316,24 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
     });
   });
   const records = [];
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const cacheChecks = [];
+  const hasCachedCompress = memtree.hasCachedCompress.bind(memtree);
+  memtree.hasCachedCompress = (...args) => {
+    const cached = hasCachedCompress(...args);
+    cacheChecks.push(cached);
+    return cached;
+  };
   const proxy = await startRecoveryProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   const replayed = followupTurn("turn two");
   try {
+    const compact = () => postHook(proxy, { hook_event_name: "UserPromptSubmit",
+      prompt: "/memtree-compact", session_id: "session-1" });
+    await compact();
     // Warm the compress cache for this exact body while MemTree is healthy.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
@@ -7333,8 +7344,12 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
 
     // The identical retry: answered entirely from cache, zero server contact.
     const before = liveCompressCalls;
+    cacheChecks.length = 0;
+    await compact(); // Force a compress call with the identical cached target.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    assert.equal(cacheChecks[0], true, "the rebuild observes a cached compression before calling compress");
+    assert.equal(messageRecords(records).at(-1).compress.ok, true);
     assert.equal(
       liveCompressCalls,
       before,
@@ -9657,7 +9672,7 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
         if (mode === "failure") {
           assert.equal(rec.compress.ok, false, "attempted compression");
           assert.equal(rec.turnType, "followup-degraded");
-          assert.equal(rec.forwardedBytes, rec.requestBytes, "unsafe prefix is not retained as fallback");
+          assert.equal(rec.forwardedBytes, 0, "unsafe prefix is not retained as fallback");
           assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
         } else {
           assert.equal(h.compressCalls().length, calls + 1);
