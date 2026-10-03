@@ -1,6 +1,8 @@
 /**
- * The `memtree` MCP server's cross-session tools: `list_sessions` and
- * `search_sessions` (memtree-mcp.ts wires them up).
+ * The `memtree` MCP server's server-side finding: `list` (the user's sessions)
+ * and `search` across sessions or within one tree by `tree`, in text or vector
+ * mode (memtree-mcp.ts wires them up; a text search of one tree uses the
+ * per-tree term search instead).
  *
  * Both call the ccc loopback proxy (`/memtree/sessions`, `/memtree/search`),
  * which relays to the server's owner-only `GET /v1/memtree/sessions` and
@@ -20,6 +22,7 @@ export const FINDER_SEARCH_MAX_LIMIT = 50;
 export const FINDER_SEARCH_MODES = ["vector", "text"] as const;
 const SNIPPET_CHARS = 400;
 const TITLE_CHARS = 300;
+const PATH_SUMMARY_CHARS = 80;
 
 export interface FinderProject {
   dir?: string | null;
@@ -60,6 +63,11 @@ export interface FinderHit {
   snippet?: string | null;
   score?: number;
   embedding_model?: string;
+  /** `<tree>#<node>`: the matched node, for read_node / read_lines `node`. */
+  address?: string;
+  node?: number;
+  /** Ancestors of the node, root first. */
+  path?: { id: number; summary: string }[];
 }
 
 export interface FinderSessionsResponse {
@@ -90,13 +98,14 @@ export function sessionsQuery(args: Record<string, unknown>): string {
   return query ? `?${query}` : "";
 }
 
-/** Query string for `/memtree/search`; `mode` defaults to vector. */
-export function searchQuery(args: Record<string, unknown>): string {
+/** Query string for `/memtree/search`; `mode` defaults to text; `tree` scopes it to one tree. */
+export function searchQuery(args: Record<string, unknown>, tree?: string): string {
   if (typeof args.query !== "string" || !args.query.trim()) {
-    throw new ToolInputError("search_sessions: query must be a non-empty string");
+    throw new ToolInputError("search: query must be a non-empty string");
   }
   const mode = searchMode(args.mode);
   const params = new URLSearchParams({ q: args.query.trim(), mode });
+  if (tree) params.set("tree", tree);
   addText(params, "project", args.project);
   addText(params, "since", args.since);
   addText(params, "until", args.until);
@@ -106,10 +115,10 @@ export function searchQuery(args: Record<string, unknown>): string {
 }
 
 export function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number] {
-  if (value === undefined || value === null || value === "") return "vector";
+  if (value === undefined || value === null || value === "") return "text";
   const mode = String(value).trim().toLowerCase();
   if (mode === "vector" || mode === "text") return mode;
-  throw new ToolInputError(`search_sessions: mode must be "vector" or "text", got ${JSON.stringify(value)}`);
+  throw new ToolInputError(`search: mode must be "vector" or "text", got ${JSON.stringify(value)}`);
 }
 
 function addText(params: URLSearchParams, name: string, value: unknown): void {
@@ -161,7 +170,7 @@ export function formatSessions(body: FinderSessionsResponse, args: Record<string
       );
     }
   });
-  out.push("", nextPage("list_sessions", body.next_cursor));
+  out.push("", nextPage("list", body.next_cursor));
   return out.join("\n");
 }
 
@@ -182,7 +191,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
       out.push("", `== ${group.embedding_model} ==`);
       group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
     }
-    out.push("", nextPage("search_sessions", body.next_cursor), OPEN_NOTE);
+    out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
   }
   const hits = body.hits ?? [];
@@ -190,14 +199,15 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
   const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
   hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
   if (body.matches_capped) {
-    out.push("", "(Only the newest 2,000 matching passages were ranked: add words, or narrow with since, until or project.)");
+    out.push("", "(Only the newest matching passages were ranked: add words, or narrow with since, until or project.)");
   }
-  out.push("", nextPage("search_sessions", body.next_cursor), OPEN_NOTE);
+  out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
   return out.join("\n");
 }
 
 const OPEN_NOTE =
-  "Snippets are excerpts; read_lines with the hit's tree returns the exact transcript lines, read_node {\"tree\": …, \"id\": 0} browses that tree from its root.";
+  "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
+  "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 
 function formatHit(hit: FinderHit, n: number): string[] {
   const tree = hit.tree?.request_id;
@@ -214,13 +224,23 @@ function formatHit(hit: FinderHit, n: number): string[] {
     .join(" · ");
   const lines = ["", `[${n}] ${head}`];
   if (hit.tree?.links?.url) lines.push(`    page: ${hit.tree.links.url}`);
+  if (hit.path?.length) lines.push(`    path: ${formatPath(hit.path, ref)}`);
   if (hit.snippet) lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
-  if (ref && range) {
+  if (hit.address) {
+    lines.push(`    address: ${hit.address}`);
+  } else if (ref && range) {
     lines.push(
       `    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`
     );
   }
   return lines;
+}
+
+/** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
+export function formatPath(path: { id: number; summary: string }[], ref?: string): string {
+  return path
+    .map((p) => `${oneLine(p.summary, PATH_SUMMARY_CHARS)}${ref ? ` (${ref}#${p.id})` : ` (node ${p.id})`}`)
+    .join(" › ");
 }
 
 function noHits(query: string, mode: string, args: Record<string, unknown>): string {
@@ -229,6 +249,9 @@ function noHits(query: string, mode: string, args: Record<string, unknown>): str
     mode === "vector"
       ? 'For an exact word, id or path, try mode "text".'
       : 'For meaning rather than exact words, try mode "vector".';
+  if (typeof args.tree === "string" && args.tree) {
+    return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${mode} search). ${other}`;
+  }
   return `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search). ${other} Or widen since/until, or drop the project filter.`;
 }
 

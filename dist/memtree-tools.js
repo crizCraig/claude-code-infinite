@@ -150,6 +150,13 @@ export class MemtreeIndex {
         };
     }
 }
+/** A node address, `<tree>#<node id>` (search hits carry them). */
+export function parseNodeAddress(value) {
+    const match = typeof value === "string" ? /^([A-Za-z0-9-]{1,80})#(\d{1,9})$/.exec(value.trim()) : null;
+    if (!match)
+        throw new ToolInputError(`node must be an address like "<tree>#<id>" from search, got ${JSON.stringify(value)}`);
+    return { tree: match[1], id: Number(match[2]) };
+}
 const STOPWORDS = new Set("a an and are as at be by did do does for from how i in is it of on or that the this to was were what when where which who why with you your".split(" "));
 /** Lowercased, de-duplicated terms; surrounding punctuation trimmed. */
 export function queryTerms(query) {
@@ -239,6 +246,8 @@ export function serverSearchHits(body) {
             score: typeof raw.score === "number" ? raw.score : 0,
             ...(range && Number.isInteger(range.block) ? { range } : {}),
             snippets: Array.isArray(raw.snippets) ? raw.snippets : [],
+            ...(typeof raw.address === "string" ? { address: raw.address } : {}),
+            ...(Array.isArray(raw.path) ? { path: raw.path } : {}),
         });
     }
     return { hits, terms: json.terms.map(String) };
@@ -262,6 +271,11 @@ export function formatSearchHits(hits, query, terms, tree) {
             .filter(Boolean)
             .join(" · ");
         out.push("", `[${head}]`, `  ${hit.summary}`);
+        if (hit.address)
+            out.push(`  address: ${hit.address}`);
+        if (hit.path?.length) {
+            out.push(`  path: ${hit.path.map((p) => `${truncate(p.summary, 80)} (node ${p.id})`).join(" › ")}`);
+        }
         for (const s of hit.snippets)
             out.push(`  L${s.line}: ${s.text}`);
     }

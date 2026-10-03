@@ -39,6 +39,29 @@ const unlink = (v) =>
   : v;
 const claimed = (q, input) => unlink(q.claim(input));
 
+test("trailer delivery is isolated by session, including identical link keys", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+  queue.setTrailer((id) => ({ key: "same-key", link: `https://x/${id}` }), "message");
+  queue.claim(display({ final: true, session_id: "A" }));
+  assert.match(queue.claim(stop({ session_id: "B" })).systemMessage, /https:\/\/x\/B/);
+  assert.equal(queue.claim(stop({ session_id: "A" })), null);
+  queue.setTrailer((id) => ({ key: "same-key", link: `https://x/${id}` }), "turn");
+  assert.match(queue.claim(stop({ session_id: "C" })).systemMessage, /https:\/\/x\/C/);
+});
+
+test("turn Stop fallback includes the success link exactly once in both color modes", () => {
+  for (const color of [true, false]) {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    const resolve = () => ({ key: "k", link: "https://x/page" });
+    queue.setLink(resolve);
+    queue.setTrailer(resolve, "turn");
+    queue.queuePrefix("optimized");
+    const output = claimed(queue, stop()).systemMessage;
+    assert.equal(output.split("https://x/page").length - 1, 1);
+    assert.match(output, /optimized[^\n]*\n  https:\/\/x\/page/);
+  }
+});
+
 test("MessageDisplay prefixes success once without changing stored content", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   queue.queuePrefix("✓ MemTree · conversation optimized");

@@ -136,13 +136,10 @@ export declare class NoticeDeliveryQueue {
     private pending;
     private link;
     /** Key of the last link shown; the same key is not repeated. */
-    private lastLinkKey;
+    private readonly delivered;
     private trailer;
     private trailerPlacement;
     /** Key of the last trailer shown; a different key is announced as new. */
-    private lastTrailerKey;
-    /** Whether a trailer was rendered under a message since the last Stop. */
-    private trailerShownThisTurn;
     constructor(ttlMs?: number, now?: () => number, color?: boolean);
     /** Replace stale delivery state when a new main human prompt is submitted. */
     clearForUserRequest(): void;
@@ -158,7 +155,7 @@ export declare class NoticeDeliveryQueue {
      * before any new turn. Marks the key as shown, so the next trailer under a
      * message renders dim (unchanged) rather than green (new).
      */
-    resumeLine(link: SuccessLink): string;
+    resumeLine(link: SuccessLink, sessionId?: string): string;
     /** Whether the next success line would carry a link not shown before. */
     linkPending(sessionId: string | undefined): boolean;
     /**
@@ -210,6 +207,7 @@ export declare class NoticeDeliveryQueue {
      */
     private anchor;
     private styleDim;
+    private deliveryFor;
     private style;
     private freshPending;
     private dropIfEmpty;

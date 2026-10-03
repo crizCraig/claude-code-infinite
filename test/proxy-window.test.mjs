@@ -54,14 +54,15 @@ test("an unsuccessful smaller-window recovery is not regranted on unchanged retr
     const original = extend(FOLLOWUP, "t0");
     await fixture.post(original);
     const continued = extend(original, "t1");
-    await fixture.post(continued, { model: SMALL_MODEL });
+    await fixture.post(continued, { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.calls.length, 2);
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "noop");
-    for (const messages of [continued, extend(continued, "t2")]) {
-      await fixture.post(messages, { model: SMALL_MODEL });
+    for (const [messages, status] of [[continued, 503], [extend(continued, "t2"), 400]]) {
+      await fixture.post(messages, { model: SMALL_MODEL }, {}, status);
       assert.equal(fixture.lastRecord().routeRecovery.outcome, "backoff");
       assert.equal(fixture.calls.length, 2, "one extra allowance per reduced capacity");
     }
+    assert.equal(fixture.forwarded.length, 1, "oversized originals never reach upstream");
   } finally {
     await fixture.close();
   }
@@ -92,9 +93,10 @@ test("a smaller-window recovery in flight holds the lane's allowance", async () 
         assert.fail("the smaller-window turn must enter blocking compression");
       }),
     ]);
-    await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
+    await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "in-flight");
     assert.equal(fixture.calls.length, 2, "a concurrent miss cannot buy another attempt");
+    assert.equal(fixture.forwarded.length, 1, "concurrent oversized original is refused");
     release();
     await rebuilding;
     assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
@@ -111,15 +113,17 @@ test("an oversized replacement route cannot repeatedly regrant the smaller windo
     const original = extend(FOLLOWUP, "t0");
     await fixture.post(original);
     const continued = extend(original, "t1");
-    await fixture.post(continued, { model: SMALL_MODEL });
+    await fixture.post(continued, { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.calls.length, 2);
-    assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
-    await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
+    assert.equal(fixture.lastRecord().routeRecovery.outcome, "unusable");
+    assert.equal(fixture.lastRecord().routeRecovery.install, undefined, "oversized replacement is never installed");
+    await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.lastRecord().routeMiss, "rejected");
     // The replacement still does not fit the window: the lane backs off
     // instead of recompressing on every tool turn.
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "backoff");
     assert.equal(fixture.calls.length, 2, "the attempt already targeted this capacity");
+    assert.equal(fixture.forwarded.length, 1, "neither unsafe replacement nor original is forwarded");
   } finally {
     await fixture.close();
   }
@@ -156,13 +160,14 @@ test("a smaller-window regrant waits for the outage cooldown", async (t) => {
     await fixture.post(original);
     await fixture.post(extend(original, "other"), {}, {
       "x-claude-code-agent-id": "failing-agent",
-    });
+    }, 503);
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "failed");
     const continued = extend(original, "t1");
-    await fixture.post(continued, { model: SMALL_MODEL });
+    await fixture.post(continued, { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.lastRecord().routeMiss, "rejected");
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "cooldown");
     assert.equal(fixture.calls.length, 2, "the extra allowance cannot bypass cooldown");
+    assert.equal(fixture.forwarded.length, 1, "outage never forwards oversized originals");
     const now = Date.now;
     t.mock.method(Date, "now", () => now() + 61_000);
     await fixture.post(continued, { model: SMALL_MODEL });
@@ -279,7 +284,7 @@ async function windowFixture({ compress, status, nativeOneMillionContext, holdFi
     budgetTokensOverride: 500_000,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
   });
-  async function request(messages, extra = {}, headers = {}) {
+  async function request(messages, extra = {}, headers = {}, expectedStatus = 200) {
     const result = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
       headers: {
@@ -288,14 +293,14 @@ async function windowFixture({ compress, status, nativeOneMillionContext, holdFi
       },
       body: JSON.stringify({ model: LARGE_MODEL, max_tokens: 64, messages, ...extra }),
     });
-    assert.equal(result.status, 200);
+    assert.equal(result.status, expectedStatus);
     return result;
   }
   return {
     calls, forwarded, request,
     lastRecord: () => records.filter((record) => record.kind === "messages").at(-1),
-    async post(messages, extra = {}, headers = {}) {
-      const result = await request(messages, extra, headers);
+    async post(messages, extra = {}, headers = {}, expectedStatus = 200) {
+      const result = await request(messages, extra, headers, expectedStatus);
       await result.json();
     },
     async close() {

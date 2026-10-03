@@ -1193,257 +1193,43 @@ test("memory route drops stale billing headers when the one-header invariant bre
   }
 });
 
-test("typed prompt merged into a tool_result wrapper recompresses instead of sticky passthrough", async () => {
-  // The failure this pins down: a prompt typed to recover an interrupted tool
-  // loop (or queued mid-turn) is delivered merged into the pending tool_result
-  // wrapper. UserPromptSubmit has already cleared the memory route expecting
-  // this request to rebuild it, but the merged shape fails isNonToolUserMessage
-  // -- so nothing rebuilds, and every later tool turn forwards the full
-  // history until the next pure user turn.
-  const upstreamBodies = [];
-  const upstream = await listen((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
-      });
-      res.end(UPSTREAM_BODY);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
-    upstreamOrigin: upstream.origin,
-    // Out of scope: tool-route recovery would add blocking compresses to the
-    // plain tool turns below, polluting the compress-count signal this test
-    // uses to detect (non-)promotion of wrappers to user turns.
-    toolRouteRecovery: false,
-  });
-  const headers = { "x-claude-code-session-id": "session-recovery" };
-  // Interrupted tool loop: tool_use answered, response lost, user typed
-  // "continue". Claude Code merges the typed text into the wrapper.
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
+test("typed prompt merged into a tool wrapper reuses the API-validated route", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
   try {
-    await armMainTurn(proxy, "continue");
-    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify({
-        model: "claude-x",
-        max_tokens: 64,
-        messages: recoveryMessages,
-      }),
-    });
-    await response.text();
-
-    assert.ok(
-      memtreeSrv.calls.some((c) => c.index_only !== true),
-      "recovery turn must reach MemTree as a blocking compress, not index-only"
-    );
-    assert.match(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "recovery turn forwards the compressed context"
-    );
-
-    // The rebuilt route must carry the next pure tool turn.
-    const toolMessages = [
-      ...recoveryMessages,
-      {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "t2", name: "x", input: {} }],
-      },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "t2", content: "ok" }],
-      },
-    ];
-    const toolResponse = await fetch(
-      `http://127.0.0.1:${proxy.port}/v1/messages`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({
-          model: "claude-x",
-          max_tokens: 64,
-          messages: toolMessages,
-        }),
-      }
-    );
-    await toolResponse.text();
-    const lastMessages = JSON.stringify(upstreamBodies.at(-1).messages);
-    assert.match(
-      lastMessages,
-      /compressed context/,
-      "tool turn after recovery rides the rebuilt memory route"
-    );
-    assert.doesNotMatch(
-      lastMessages,
-      /first question/,
-      "tool turn after recovery must not fall back to full history"
-    );
-
-    // A plain tool wrapper without an armed typed prompt must stay a tool
-    // turn: arm a prompt whose text the wrapper does not contain and verify
-    // no new compress fires for it.
-    const compressCallsBefore = memtreeSrv.calls.filter(
-      (c) => c.index_only !== true
-    ).length;
-    await armMainTurn(proxy, "unrelated typed prompt");
-    const plainToolMessages = [
-      ...toolMessages,
-      {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "t3", name: "x", input: {} }],
-      },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "t3", content: "ok" }],
-      },
-    ];
-    const plainToolResponse = await fetch(
-      `http://127.0.0.1:${proxy.port}/v1/messages`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({
-          model: "claude-x",
-          max_tokens: 64,
-          messages: plainToolMessages,
-        }),
-      }
-    );
-    await plainToolResponse.text();
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      compressCallsBefore,
-      "a wrapper without the typed text must not be promoted to a user turn"
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    const prefix = JSON.stringify(JSON.parse(h.lastUpstream())[0]);
+    await armMainTurn(h.proxy, "continue");
+    const merged = withToolRound(base, "merged", [{ type: "text", text: "continue" }]);
+    await postSessionMessages(h.proxy.port, merged);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.match(h.lastUpstream(), /continue/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.equal(JSON.stringify(JSON.parse(h.lastUpstream())[0]), prefix, "reuse keeps compressed bytes stable");
+    await postSessionMessages(h.proxy.port, withToolRound(merged, "later"));
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.equal(h.compressCalls(), 1, "hook text cannot trigger rebuilding");
+  } finally { h.close(); }
 });
 
-test("prompt substring inside a tool wrapper's system-reminder must not consume the arm", async () => {
-  // Misfire this pins down: a short prompt queued mid-turn ("continue") arms
-  // the hook and clears the route; an intermediate tool_result wrapper whose
-  // appended <system-reminder> (or unrelated mid-sentence text) happens to
-  // contain that substring must stay a plain tool turn. If it were promoted,
-  // it would consume the arm and pay a blocking compress, and the real merged
-  // wrapper arriving next would degrade to sticky full-history passthrough.
-  const upstreamBodies = [];
-  const upstream = await listen((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
-      });
-      res.end(UPSTREAM_BODY);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
-    upstreamOrigin: upstream.origin,
-    // Out of scope: recovery on the decoy tool turn would blocking-compress
-    // (transform-only under the armed window, but a compress all the same),
-    // breaking the compress-count signal for arm consumption.
-    toolRouteRecovery: false,
-  });
-  const headers = { "x-claude-code-session-id": "session-reminder-misfire" };
-  const baseMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-  ];
+test("prompt substrings in reminders cannot change route eligibility", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
   try {
-    await armMainTurn(proxy, "continue", "prompt-misfire");
-
-    // Intermediate wrapper: the armed text appears only inside an appended
-    // <system-reminder> block and mid-sentence in ordinary trailing text.
-    const decoyWrapper = [
-      ...baseMessages,
-      {
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "t1", content: "ok" },
-          {
-            type: "text",
-            text: "<system-reminder>Tests may continue running in the background.</system-reminder>",
-          },
-          { type: "text", text: "The build will continue after this step." },
-        ],
-      },
-    ];
-    await postMessages(proxy.port, decoyWrapper, headers);
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      0,
-      "reminder/mid-sentence substring must not trigger a blocking compress"
-    );
-    assert.doesNotMatch(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "decoy wrapper forwards as a plain tool turn"
-    );
-
-    // The real merged-prompt wrapper arrives next; the preserved arm must
-    // still promote it to a compressible recovery turn.
-    const recoveryWrapper = [
-      ...baseMessages,
-      {
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "t1", content: "ok" },
-          { type: "text", text: "continue" },
-        ],
-      },
-    ];
-    await postMessages(proxy.port, recoveryWrapper, headers);
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      1,
-      "real merged-prompt wrapper still owns the arm and compresses"
-    );
-    assert.match(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "recovery turn forwards the compressed context"
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "continue");
+    const decoy = withToolRound(base, "decoy", [
+      { type: "text", text: "<system-reminder>Tests continue in the background.</system-reminder>" },
+      { type: "text", text: "The build will continue after this step." },
+    ]);
+    await postSessionMessages(h.proxy.port, decoy);
+    const real = withToolRound(decoy, "real", [{ type: "text", text: "continue" }]);
+    await postSessionMessages(h.proxy.port, real);
+    assert.equal(h.compressCalls(), 1);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.match(h.lastUpstream(), /continue/);
+  } finally { h.close(); }
 });
 
 /** Claude Code 2.1.284's shape for a prompt typed while the turn is running. */
@@ -1464,14 +1250,14 @@ const withToolRound = (messages, id, extraParts = []) => [
   },
 ];
 
-async function startMidTurnHarness(extraOpts = {}) {
+async function startMidTurnHarness(extraOpts = {}, upstreamStatus = () => 200) {
   const upstreamBodies = [];
   const upstream = await listen((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
+      res.writeHead(upstreamStatus(), {
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
       });
@@ -1482,8 +1268,9 @@ async function startMidTurnHarness(extraOpts = {}) {
     messages: [{ role: "user", content: "compressed context" }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
     ...extraOpts,
   });
@@ -1494,7 +1281,7 @@ async function startMidTurnHarness(extraOpts = {}) {
     upstream.close();
     memtreeSrv.close();
   };
-  return { proxy, compressCalls, lastUpstream, close };
+  return { proxy, memtree, compressCalls, lastUpstream, upstreamCount: () => upstreamBodies.length, close };
 }
 
 test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-02 overflow)", async () => {
@@ -1539,10 +1326,10 @@ test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-0
   }
 });
 
-test("a prompt deferred as mid-turn still owns its own turn when Stop never came", async () => {
+test("an interrupted turn reuses its validated prefix when Stop never came", async () => {
   // Claude Code skips Stop on an interrupt, so a real next prompt can look
-  // mid-turn to the hook. It is deferred, then armed by the request that
-  // carries it as a plain user turn: it compresses and its tool loop rides.
+  // mid-turn to the hook. The next API request
+  // extends the same history and reuses its prefix without consulting the hook.
   const h = await startMidTurnHarness({ defaultCompactTarget: null });
   const headers = { "x-claude-code-session-id": "session-1" };
   try {
@@ -1559,7 +1346,7 @@ test("a prompt deferred as mid-turn still owns its own turn when Stop never came
       { role: "user", content: "turn three" },
     ];
     await postMessages(h.proxy.port, next, headers);
-    assert.equal(h.compressCalls(), 2, "the real next prompt compresses");
+    assert.equal(h.compressCalls(), 1, "the matching history reuses its compressed prefix");
     assert.match(h.lastUpstream(), /compressed context/);
 
     await postMessages(h.proxy.port, withToolRound(next, "t4"), headers);
@@ -1568,6 +1355,154 @@ test("a prompt deferred as mid-turn still owns its own turn when Stop never came
   } finally {
     h.close();
   }
+});
+
+test("delivered mid-turn wrappers and a later plain prompt keep reusing the prefix", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    let messages = followupTurn("turn two");
+    await postMessages(h.proxy.port, messages, headers);
+    for (let i = 0; i < 35; i++) {
+      const prompt = i % 2 ? "repeat this prompt" : `prompt ${i}`;
+      await armMainTurn(h.proxy, prompt, `mid-${i}`);
+      messages = withToolRound(messages, `tool-${i}`, [{ type: "text", text: prompt }]);
+      await postMessages(h.proxy.port, messages, headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+    }
+    await armMainTurn(h.proxy, "repeat this prompt", "final");
+    await postMessages(h.proxy.port, [...messages, { role: "assistant", content: "done" },
+      { role: "user", content: "repeat this prompt" }], headers);
+    assert.equal(h.compressCalls(), 1, "prompt bookkeeping never forces a replacement");
+  } finally { h.close(); }
+});
+
+test("failed wrapper forwarding does not block a later matching plain turn", async () => {
+  let status = 200;
+  const h = await startMidTurnHarness({ defaultCompactTarget: null }, () => status);
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    await armMainTurn(h.proxy, "not delivered", "pending");
+    status = 529;
+    await postMessages(h.proxy.port, withToolRound(base, "failed", [
+      { type: "text", text: "not delivered" },
+    ]), headers);
+    status = 200;
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    await postMessages(h.proxy.port, [...base, { role: "assistant", content: "interrupted" },
+      { role: "user", content: "not delivered" }], headers);
+    assert.equal(h.compressCalls(), 1, "failed delivery accounting cannot veto prefix reuse");
+  } finally { h.close(); }
+});
+
+for (const stopped of [true, false]) {
+  test(`separately delivered queued prompts reuse history after ${stopped ? "Stop" : "interrupt"}`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      let messages = followupTurn("turn two");
+      await postMessages(h.proxy.port, messages, headers);
+      await armMainTurn(h.proxy, "queued alpha", "alpha");
+      await armMainTurn(h.proxy, "queued beta", "beta");
+      if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      for (const [index, prompt] of ["queued alpha", "queued beta"].entries()) {
+        const beforeMatching = h.compressCalls();
+        messages = [...messages, { role: "assistant", content: "finished" },
+          { role: "user", content: prompt }];
+        await postMessages(h.proxy.port, messages, headers);
+        assert.equal(h.compressCalls(), beforeMatching, "matching prompt history reuses its validated prefix");
+        assert.match(h.lastUpstream(), /compressed context/);
+        if (index === 0) {
+          const before = h.upstreamCount();
+          const divergent = [{ role: "user", content: "different history" }, ...messages.slice(1)];
+          await postMessages(h.proxy.port, withToolRound(divergent, "unproven-tool"), headers);
+          assert.equal(h.upstreamCount(), before + 1, "the fitting divergent request proceeds despite pending beta");
+          assert.deepEqual(JSON.parse(h.lastUpstream()), withToolRound(divergent, "unproven-tool"), "a short divergent tool request may pass through unchanged");
+        }
+        await postMessages(h.proxy.port, withToolRound(messages, `queued-tool-${index}`), headers);
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: index === 0 ? "alpha" : "beta" });
+      }
+    } finally { h.close(); }
+  });
+}
+
+for (const overflow of [false, true]) {
+  test(`queued accounting ${overflow ? "past its bound" : "with duplicate text"} cannot block route reuse`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      const base = followupTurn("turn two");
+      await postMessages(h.proxy.port, base, headers);
+      for (let i = 0; i < (overflow ? 33 : 2); i++) {
+        await armMainTurn(h.proxy, overflow ? `queued ${i}` : "same prompt", `queued-${i}`);
+      }
+      await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      const count = h.upstreamCount();
+      const next = [...base, { role: "assistant", content: "done" },
+        { role: "user", content: overflow ? "queued 32" : "same prompt" }];
+      await postMessages(h.proxy.port, next, headers);
+      assert.equal(h.upstreamCount(), count + 1, "duplicate or evicted accounting cannot veto a valid route");
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.equal(h.compressCalls(), 1, "the original prefix remains reusable");
+      await postMessages(h.proxy.port, withToolRound(next, "still-owned"), headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+    } finally { h.close(); }
+  });
+}
+
+test("queued prompts before Stop keep the compressed route for tool wrappers", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    for (const prompt of ["first queued", "second queued"]) {
+      await armMainTurn(h.proxy, prompt, prompt);
+    }
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    const next = withToolRound(base, "late-tool", [
+      { type: "text", text: "first queued" },
+      { type: "text", text: midTurnReminder("second queued") },
+    ]);
+    await postMessages(h.proxy.port, next, headers);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.match(h.lastUpstream(), /first queued/);
+    assert.match(h.lastUpstream(), /second queued/);
+    assert.equal(h.compressCalls(), 1);
+  } finally { h.close(); }
+});
+
+test("queued accounting cannot veto independent request validation", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    await armMainTurn(h.proxy, "queued", "queued");
+    await postHook(h.proxy, { hook_event_name: "Stop" });
+    const upstreamCount = h.upstreamCount();
+    await postMessages(h.proxy.port, followupTurn("unidentified queued owner"), headers);
+    assert.equal(h.upstreamCount(), upstreamCount + 1, "matching plain history reuses the route");
+    assert.match(h.lastUpstream(), /compressed context/);
+    const mismatch = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "tool");
+    await postMessages(h.proxy.port, mismatch, headers);
+    assert.equal(h.upstreamCount(), upstreamCount + 2, "a short divergent tool request may pass through when recovery is disabled");
+    assert.deepEqual(JSON.parse(h.lastUpstream()), mismatch);
+    await postMessages(h.proxy.port, withToolRound(followupTurn("unidentified queued owner"), "valid-tool"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "uncertain mismatch must keep the route");
+  } finally { h.close(); }
 });
 
 test("retried recovery turn after an upstream 529 still compresses instead of sticky passthrough", async () => {
@@ -1607,28 +1542,16 @@ test("retried recovery turn after an upstream 529 still compresses instead of st
     });
   });
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
+    messages: [{ role: "user", content: "compressed context " + "m".repeat(2500) }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
   });
   const headers = { "x-claude-code-session-id": "session-recovery-retry" };
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
+  const recoveryMessages = largeToolTurn();
+  recoveryMessages.at(-1).content.push({ type: "text", text: "continue" });
   const postRecovery = () =>
     fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
@@ -1911,11 +1834,11 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
     });
   });
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
+    messages: [{ role: "user", content: "compressed context " + "m".repeat(2500) }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
@@ -1923,20 +1846,8 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
   const headers = { "x-claude-code-session-id": "session-dead-flush-retry" };
   // Interrupted tool loop: the typed "continue" is merged into the pending
   // tool_result wrapper (recovery-prompt shape).
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
+  const recoveryMessages = largeToolTurn();
+  recoveryMessages.at(-1).content.push({ type: "text", text: "continue" });
   const requestBody = JSON.stringify({
     model: "claude-x",
     max_tokens: 64,
@@ -1984,7 +1895,7 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
       records.some(
         (record) =>
           record.kind === "messages" &&
-          record.turnType === "followup-compressed"
+          record.turnType === "tool-recompressed"
       )
     );
 
@@ -2011,10 +1922,10 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
       records.filter(
         (record) =>
           record.kind === "messages" &&
-          record.turnType === "followup-compressed"
+          record.turnType === "tool-recompressed"
       ).length,
-      2,
-      "the retry reclassifies as a compressed followup, not a tool turn"
+      1,
+      "the retry reuses the already installed compressed route"
     );
 
     // The retry's successful delivery rebuilds the route for the tool loop.
@@ -3753,8 +3664,8 @@ test("defaultCompactTarget is the target of a compaction, not a trigger: the bud
 test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28 Anthropic 400)", async () => {
   const { __testCapCacheBreakpoints: cap } = await import("../dist/proxy.js");
   const hour = { type: "ephemeral", ttl: "1h" };
-  // Layout of the failing request: 2 system markers, the prefix marker, a stale
-  // Claude Code marker on an earlier turn's message, and the newest marker.
+  // Layout of the failing request: 2 system markers, the flattened marker, a
+  // prior-turn marker now inside the installed prefix, and the newest marker.
   const body = {
     system: [{ type: "text", text: "hdr" }, { type: "text", text: "a" }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
     messages: [
@@ -3767,14 +3678,19 @@ test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28
       { role: "user", content: [{ type: "tool_result", tool_use_id: "u", content: "r", cache_control: hour }] },
     ],
   };
-  cap(body, 5);
+  const installedPrefix = JSON.stringify(body.messages.slice(0, 5));
+  const installedSystem = JSON.stringify(body.system);
+  assert.equal(cap(body, 5, { preserveSystem: true }), true);
   const markers = [...body.system, ...body.messages.flatMap((m) => m.content)].filter((p) => p.cache_control);
   assert.equal(markers.length, 4);
-  assert.ok(body.messages[0].content[0].cache_control, "the prefix keeps its marker");
-  assert.ok(body.messages[6].content[0].cache_control, "the newest block keeps its marker");
-  assert.equal(body.messages[4].content[0].cache_control, undefined, "the stale suffix marker goes first");
+  assert.equal(JSON.stringify(body.messages.slice(0, 5)), installedPrefix,
+    "every installed prefix byte is retained, including earlier-turn markers");
+  assert.equal(JSON.stringify(body.system), installedSystem,
+    "the installed system is also retained byte-for-byte");
+  assert.equal(body.messages[6].content[0].cache_control, undefined,
+    "four protected markers leave no slot for the newest suffix marker");
 
-  // Still too many after the messages: system markers go next.
+  // A fresh compression has no installed system to protect: trim its markers.
   const heavy = {
     system: [{ type: "text", text: "a", cache_control: hour }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
     messages: [
@@ -3782,7 +3698,7 @@ test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28
       { role: "user", content: [{ type: "text", text: "q", cache_control: hour }] },
     ],
   };
-  cap(heavy, 1);
+  assert.equal(cap(heavy, 1), true);
   assert.equal([...heavy.system, ...heavy.messages.flatMap((m) => m.content)].filter((p) => p.cache_control).length, 4);
   assert.ok(heavy.messages[0].content[0].cache_control && heavy.messages[1].content[0].cache_control);
 });
@@ -4046,7 +3962,7 @@ test("GET /memtree/sessions and /memtree/search relay to the finder endpoints wi
   }
 });
 
-test("list_sessions and search_sessions through the proxy against a mock MemTree server", async () => {
+test("list and search through the proxy against a mock MemTree server", async () => {
   const upstream = await mockUpstream();
   const requests = [];
   const rid = "3f2a9c1b-7e40-4d2a-9a51-0c8e2b6f4d17";
@@ -4099,8 +4015,8 @@ test("list_sessions and search_sessions through the proxy against a mock MemTree
     assert.match(listed, /"cursor": "CURSOR1"/);
     assert.match(await finder.listSessions({ cursor: "CURSOR1" }), /No more results\./);
 
-    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target" });
-    assert.equal(requests.at(-1).params.mode, "vector", "vector by default");
+    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target", mode: "vector" });
+    assert.equal(requests.at(-1).params.mode, "vector");
     assert.match(semantic, /charged: one query embedding per model/);
     assert.match(semantic, /== voyage-3\.5 ==[\s\S]*== gemini-embedding-001 ==/, "one ranking per model");
     assert.match(semantic, /scores are not comparable across groups/);
@@ -5672,7 +5588,7 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
   }
 });
 
-test("recovery failure degrades to the original body and retains the background index", async () => {
+test("over-budget recovery failure returns an error and retains background indexing", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(500, { error: "boom" });
   const records = [];
@@ -5683,12 +5599,8 @@ test("recovery failure degrades to the original body and retains the background 
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 1);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "failure forwards the original body"
-    );
+    assert.equal(upstream.seen.length, 0);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5719,11 +5631,7 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
   const conversation = largeToolTurn();
   try {
     await postMessages(proxy.port, conversation, SESSION);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "a no-op preserves true passthrough semantics"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeRecovery.outcome, "noop");
@@ -5882,7 +5790,7 @@ test("disabled recovery records the suppressed miss and never compresses", async
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.match(JSON.stringify(upstream.seen[0].body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5904,10 +5812,10 @@ test("disabled recovery records the suppressed miss and never compresses", async
   }
 });
 
-test("a compaction with no byte gain forwards the original and backs the lane off until it grows", async () => {
-  // A tiny conversation's recovered body is BIGGER than the original: the
-  // no-gain check forwards the original (never worse than verbatim) and
-  // installs nothing. The lane then backs off: a same-size retry makes no
+test("an over-budget no-gain compaction refuses forwarding and backs off until growth", async () => {
+  // A tiny conversation's recovered body is BIGGER than the original.
+  // Neither result fits the configured budget, so no route or upstream
+  // request is created. The lane backs off: a same-size retry makes no
   // second call, and only growth past a twentieth of the budget retries.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
@@ -5927,11 +5835,7 @@ test("a compaction with no byte gain forwards the original and backs the lane of
     assert.equal(rec.routeMiss, "missing");
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.routeRecovery.install, undefined);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "the no-gain result never replaces the original body"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     assert.equal(blockingCalls(), 1);
 
     const sameSize = structuredClone(toolTurn);
@@ -5941,7 +5845,7 @@ test("a compaction with no byte gain forwards the original and backs the lane of
     assert.equal(rec2.routeMiss, "missing");
     assert.equal(rec2.routeRecovery.outcome, "backoff");
     assert.equal(blockingCalls(), 1, "a backoff skip pays nothing");
-    assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
 
     await postMessages(proxy.port, extendToolLoop(toolTurn, "t2"), SESSION);
     assert.equal(messageRecords(records)[2].routeRecovery.outcome, "no-gain", "grown: tried again");
@@ -6612,7 +6516,7 @@ test("a sessionless recovery is one-shot: compressed forward, no route", async (
   }
 });
 
-test("a pending human prompt window keeps recovery transform-only", async () => {
+test("a pending human prompt cannot prevent recovery route installation", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
@@ -6623,18 +6527,16 @@ test("a pending human prompt window keeps recovery transform-only", async () => 
   });
   const conversation = largeToolTurn();
   try {
-    // Armed prompt = a typed prompt may arrive merged into a tool wrapper.
-    // The intermediate wrapper must not install a route that would veto the
-    // real merged-prompt request's recovery classification.
+    // Hooks supply accounting only; this request validates its own route.
     await armMainTurn(proxy, "typed while tools ran");
     await postMessages(proxy.port, conversation, SESSION);
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
     assert.equal(rec.routeRecovery.outcome, "compressed");
-    assert.equal(rec.routeRecovery.install, "prompt-pending");
+    assert.equal(rec.routeRecovery.install, "installed");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     const rec2 = messageRecords(records)[1];
-    assert.equal(rec2.routeMiss, "missing", "no route was installed");
+    assert.equal(rec2.turnType, "tool-memory", "the validated route is reused despite pending accounting");
   } finally {
     proxy.close();
     upstream.close();
@@ -6726,7 +6628,7 @@ test("a different-session rejection preserves the owner's route; same-session re
   }
 });
 
-test("an in-flight recovery holds the lane; a concurrent miss forwards verbatim", async () => {
+test("an in-flight recovery holds the lane; an oversized concurrent miss is refused", async () => {
   // Two concurrent compactions in one lane are impossible: the first marks
   // the lane in flight BEFORE its compress settles, so a miss racing it
   // forwards verbatim ("in-flight") instead of stacking a second blocking
@@ -6770,11 +6672,7 @@ test("an in-flight recovery holds the lane; a concurrent miss forwards verbatim"
     const recB = messageRecords(records).at(-1);
     assert.equal(recB.routeRecovery.outcome, "in-flight");
     assert.equal(recB.turnType, "tool");
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /BBB first question/,
-      "the racing miss forwarded its own full history"
-    );
+    assert.equal(upstream.seen.length, 0, "the racing oversized request waits for a usable route instead of forwarding whole history");
 
     held.resolve();
     await aInFlight;
@@ -6797,7 +6695,7 @@ test("an in-flight recovery holds the lane; a concurrent miss forwards verbatim"
   }
 });
 
-test("a human prompt arming during recovery compression prevents stale installation", async () => {
+test("a hook arriving during recovery cannot invalidate the API request decision", async () => {
   const upstream = await recordingUpstream();
   const held = deferred();
   let compressArrived = false;
@@ -6824,15 +6722,14 @@ test("a human prompt arming during recovery compression prevents stale installat
   });
   try {
     const inFlight = postMessages(proxy.port, largeToolTurn(), SESSION);
-    // The recovery must have captured its epoch (compress in flight) before
-    // the human prompt bumps it.
+    // The request captured its lane generation before the hook arrives.
     await waitFor(() => compressArrived);
-    await armMainTurn(proxy, "new human turn"); // bumps the route epoch
+    await armMainTurn(proxy, "new human turn"); // accounting only
     held.resolve();
     await inFlight;
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
-    assert.equal(rec.routeRecovery.install, "stale");
+    assert.equal(rec.routeRecovery.install, "installed");
   } finally {
     proxy.close();
     upstream.close();
@@ -6865,11 +6762,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
     assert.equal(rec.routeRecovery.outcome, "unusable");
     assert.equal(rec.history.usable, false);
     assert.equal(rec.turnType, "tool", "not forwarded as tool-recompressed");
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "the real history was forwarded, not the amnesiac answer"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     // No route: the next tool turn misses rather than riding amnesia.
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(messageRecords(records)[1].routeMiss, "missing");
@@ -6880,11 +6773,11 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
   }
 });
 
-test("a compression with no byte gain forwards the original body", async () => {
+test("an oversized compression with no byte gain never forwards the original", async () => {
   const upstream = await recordingUpstream();
   // Usable and genuinely indexed, but bigger than what it replaces.
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "bloated memory " + "m".repeat(900_000) }],
+    messages: [{ role: "user", content: "bloated memory " + "m".repeat(700_000) }],
     usage: { prompt_tokens_details: { cached_tokens: 999 } },
   });
   const records = [];
@@ -6899,7 +6792,7 @@ test("a compression with no byte gain forwards the original body", async () => {
     const rec = messageRecords(records)[0];
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.turnType, "tool");
-    assert.match(JSON.stringify(upstream.seen[0].body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(
       messageRecords(records)[1].routeMiss,
@@ -6980,7 +6873,7 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
       assert.equal(rec.turnType, "tool");
     }
     assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
-    assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
 
     // Main's backoff stays visible even while the cooldown is armed: it has
     // grown by far less than a twentieth of the budget since its attempt.
@@ -7034,11 +6927,9 @@ test("a large foreign-session turn recovers into its own lane and spares the own
   }
 });
 
-test("a degraded main followup still clears the route it cannot rebuild", async () => {
-  // The inverse of the clear-gating fix: gating the clear on followup turns
-  // must not stop a genuine followup from clearing. A followup whose compress
-  // fails has no compressed prefix, so leaving the previous route installed
-  // would splice a prefix that no longer matches what the model was sent.
+test("a failed divergent followup keeps the previous route for its original history", async () => {
+  // A failed replacement cannot erase the old validated route. The failed
+  // request itself is small enough to pass through unchanged.
   const upstream = await recordingUpstream();
   let failCompress = false;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -7070,23 +6961,18 @@ test("a degraded main followup still clears the route it cannot rebuild", async 
     assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
 
     failCompress = true;
-    // Deliberately NO armMainTurn here. The UserPromptSubmit hook clears the
-    // route itself, before the request under test is even sent — arming would
-    // leave nothing for the clear-on-followup path to clear, and the test
-    // would pass with both clears deleted. `followupTurn` classifies as a main
-    // followup by shape alone, which is the hookless case that matters.
+    // Changing the last covered user message is a real history divergence.
     await postMessages(proxy.port, followupTurn("turn three"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-degraded");
 
-    // The stale route must be gone: this tool turn was sent full history.
+    // Returning to the previous matching history must still reuse its route.
     await postMessages(
       proxy.port,
-      extendToolLoop(followupTurn("turn three"), "t9"),
+      extendToolLoop(base, "t9"),
       SESSION
     );
     const after = messageRecords(records).at(-1);
-    assert.equal(after.routeMiss, "missing", "the degraded followup cleared it");
-    assert.notEqual(after.turnType, "tool-memory");
+    assert.equal(after.turnType, "tool-memory", "the outage cannot invalidate a matching prefix");
   } finally {
     proxy.close();
     upstream.close();
@@ -7501,13 +7387,24 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
     });
   });
   const records = [];
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const cacheChecks = [];
+  const hasCachedCompress = memtree.hasCachedCompress.bind(memtree);
+  memtree.hasCachedCompress = (...args) => {
+    const cached = hasCachedCompress(...args);
+    cacheChecks.push(cached);
+    return cached;
+  };
   const proxy = await startRecoveryProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   const replayed = followupTurn("turn two");
   try {
+    const compact = () => postHook(proxy, { hook_event_name: "UserPromptSubmit",
+      prompt: "/memtree-compact", session_id: "session-1" });
+    await compact();
     // Warm the compress cache for this exact body while MemTree is healthy.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
@@ -7518,8 +7415,12 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
 
     // The identical retry: answered entirely from cache, zero server contact.
     const before = liveCompressCalls;
+    cacheChecks.length = 0;
+    await compact(); // Force a compress call with the identical cached target.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    assert.equal(cacheChecks[0], true, "the rebuild observes a cached compression before calling compress");
+    assert.equal(messageRecords(records).at(-1).compress.ok, true);
     assert.equal(
       liveCompressCalls,
       before,
@@ -8054,10 +7955,8 @@ test("a hook-armed prompt's followup bump keeps a lane's backoff", async () => {
   }
 });
 
-test("a hookless followup bump still lifts a lane's backoff", async () => {
-  // Hookless embedders never fire UserPromptSubmit, so the followup bump is
-  // their only per-human-turn wipe. It must keep clearing, or a lane that
-  // spent its attempt would forward full history for the rest of the session.
+test("a hookless main followup leaves an unrelated agent lane backoff intact", async () => {
+  // A main request cannot reset recovery attempts belonging to a sub-agent.
   const upstream = await recordingUpstream();
   // BBB (the agent lane) is an index-warming no-op: its attempt produces no
   // prefix, which starts the lane's backoff until the next budget wipe.
@@ -8085,15 +7984,15 @@ test("a hookless followup bump still lifts a lane's backoff", async () => {
       messageRecords(records).at(-1).routeRecovery.outcome,
       "noop"
     );
-    // A hookless main followup: the arm was never set, so this bump clears.
+    // A hookless main followup succeeds in its own lane.
     await postMessages(proxy.port, followupTurn("turn two"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss attempts again instead of backing off.
+    // The agent lane still has its own backoff.
     await postMessages(proxy.port, extendToolLoop(largeToolTurn("BBB"), "s1"), agent);
     const regranted = messageRecords(records).at(-1);
     assert.equal(regranted.routeMiss, "missing");
-    assert.equal(regranted.routeRecovery.outcome, "noop", "a fresh attempt");
+    assert.equal(regranted.routeRecovery.outcome, "backoff", "main activity cannot reset another lane");
   } finally {
     proxy.close();
     upstream.close();
@@ -8101,12 +8000,9 @@ test("a hookless followup bump still lifts a lane's backoff", async () => {
   }
 });
 
-test("an identical tool-body retry is a replay: verbatim forward, route retained", async () => {
-  // A recovery-installed route's prefix IS the tool body that installed it.
-  // Claude Code retries a request whose socket died before the flush with the
-  // identical body; the empty suffix cannot ride, but this is a client retry,
-  // not a divergence — the route must survive so the next real tool turn
-  // rides instead of paying a rebuild.
+test("an identical tool-body retry reuses the compressed prefix with an empty suffix", async () => {
+  // The identical request has an empty suffix. It still reuses the validated
+  // compressed bytes rather than replaying raw history or rebuilding.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
@@ -8125,17 +8021,17 @@ test("an identical tool-body retry is a replay: verbatim forward, route retained
 
     await postMessages(proxy.port, conversation, SESSION);
     const replay = messageRecords(records).at(-1);
-    assert.equal(replay.routeMiss, "replay");
-    assert.equal(replay.turnType, "tool");
+    assert.equal(replay.routeMiss, undefined);
+    assert.equal(replay.turnType, "tool-memory");
     assert.equal(
       replay.routeRecovery,
       undefined,
       "a replay neither attempts recovery nor spends budget"
     );
-    assert.match(
+    assert.doesNotMatch(
       JSON.stringify(upstream.seen.at(-1).body.messages),
       /first question/,
-      "the retry forwards verbatim"
+      "the retry must not replay the whole history"
     );
 
     // The route survived the replay: the next real tool turn rides it.
@@ -8608,7 +8504,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     // the lane backing off (nothing was installed). The empty lane (not a
     // "replay") logs a plain missing miss, classifies "backoff" — the
     // released reservation is what lets it reach that label at all — and
-    // forwards the original history without paying a second blocking
+    // refuses the over-budget original without paying a second blocking
     // compress.
     await postMessages(proxy.port, conversation, SESSION);
     await waitFor(() => messageRecords(records).length >= 2);
@@ -8622,11 +8518,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     assert.equal(retry.routeRecovery.conversationBytes, undefined);
     assert.equal(retry.turnType, "tool");
     assert.equal(blockingCalls(), liveCompresses, "a backoff skip pays nothing");
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /first question/,
-      "the backed-off miss forwards the original history verbatim"
-    );
+    assert.equal(upstream.seen.length, 1, "the backed-off over-budget retry cannot forward its whole history");
   } finally {
     proxy.close();
     upstream.close();
@@ -8634,15 +8526,8 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
   }
 });
 
-test("a first-user main consumes the boundary wipe so a later hookless followup re-grants", async () => {
-  // Cycle-3 fix: a first-user-shaped main request is its boundary's only
-  // main arrival — no followup bump will ever come to consume the
-  // UserPromptSubmit flag. Left set, a LATER hookless main followup would
-  // read a stale "already wiped", keep its spent lanes spent, and the agent
-  // lane would forward full history across a human-turn boundary.
+test("first-user main traffic and a later followup cannot reset an agent lane", async () => {
   const upstream = await recordingUpstream();
-  // BBB (the agent lane) is an index-warming no-op: its attempt produces no
-  // prefix, which starts the lane's backoff until the next budget wipe.
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
       ? { messages: reqBody.messages }
@@ -8661,42 +8546,32 @@ test("a first-user main consumes the boundary wipe so a later hookless followup 
   });
   const agent = { ...SESSION, "x-claude-code-agent-id": "agent-first-user" };
   try {
-    // An agent lane spends its budget in the pre-boundary epoch...
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
       "noop"
     );
-    // ...the hook bump wipes the budget and flags the boundary as wiped...
     await armMainTurn(proxy, "typed prompt");
-    // ...and the prompt arrives FIRST-USER-shaped: single non-tool user
-    // message, no earlier real user turn, so no followup bump ever comes for
-    // this boundary. The flag must be consumed here.
     await postMessages(proxy.port, [{ role: "user", content: "typed prompt" }], SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "first-user");
 
-    // The agent spends its re-granted budget inside the new boundary.
     const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
     await postMessages(proxy.port, spentAgain, agent);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
-      "noop"
+      "backoff"
     );
 
-    // A hookless-shaped main followup (no UserPromptSubmit fired): its bump
-    // must wipe. The stale flag would have skipped the wipe here.
     await postMessages(proxy.port, followupTurn("hookless turn two"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss attempts recovery instead of logging
-    // "spent" — the exact regression the consume-once closes.
     await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
     const regranted = messageRecords(records).at(-1);
     assert.equal(regranted.routeMiss, "missing");
     assert.equal(
       regranted.routeRecovery.outcome,
-      "noop",
-      "a stale boundary flag would have kept this lane backing off"
+      "backoff",
+      "main requests cannot grant another lane fresh recovery attempts"
     );
   } finally {
     proxy.close();
@@ -8714,17 +8589,8 @@ test("a first-user main consumes the boundary wipe so a later hookless followup 
 // turn, which an external test cannot enter deterministically.
 // ---------------------------------------------------------------------------
 
-test("a first-user-shaped side call does not consume the boundary wipe", async () => {
-  // Cycle-4 fix: only the armed prompt itself may consume the
-  // UserPromptSubmit flag (the same prompt-text correlation
-  // hookOwnedMainFollowup uses). A CC-internal side call can arrive
-  // first-user shaped on the main key without being the armed prompt;
-  // letting it consume left the real followup bumping with keep=false — a
-  // second wipe in the same boundary, re-granting lanes spent moments
-  // earlier, the exact double-wipe keepRecoveryBudget closes.
+test("first-user side calls and prompt hooks cannot reset an agent lane", async () => {
   const upstream = await recordingUpstream();
-  // BBB (the agent lane) is an index-warming no-op: its attempt produces no
-  // prefix, which starts the lane's backoff until the next budget wipe.
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
       ? { messages: reqBody.messages }
@@ -8744,37 +8610,25 @@ test("a first-user-shaped side call does not consume the boundary wipe", async (
   const agent = { ...SESSION, "x-claude-code-agent-id": "agent-side-call" };
   const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
   try {
-    // An agent lane spends its budget in the pre-boundary epoch...
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
       "noop"
     );
-    // ...the hook bump wipes the budget and flags the boundary as wiped...
     await armMainTurn(proxy, "typed prompt");
-    // ...and a CC-internal side call arrives first-user shaped on the main
-    // key WITHOUT carrying the armed prompt. It forwards normally, but the
-    // armed prompt's own arrival is still due — the flag must survive it.
     await postMessages(proxy.port, [{ role: "user", content: "quota check" }], SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "first-user");
 
-    // The agent spends its re-granted budget inside the new boundary.
     const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
     await postMessages(proxy.port, spentAgain, agent);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
-      "noop"
+      "backoff"
     );
 
-    // The REAL armed prompt arrives as its hook-owned followup. Its bump must
-    // read the still-set flag and keep spent lanes spent — under the old
-    // uncorrelated consume, the side call already cleared it and this bump
-    // wiped a second time inside the same boundary.
     await postMessages(proxy.port, followupTurn("typed prompt"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss forwards verbatim, no second compress — a
-    // consumed flag would have re-granted it a fresh attempt here.
     const beforeMiss = blockingCalls();
     await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
     const spent = messageRecords(records).at(-1);
@@ -8782,7 +8636,7 @@ test("a first-user-shaped side call does not consume the boundary wipe", async (
     assert.equal(
       spent.routeRecovery.outcome,
       "backoff",
-      "a consumed flag would have let the followup re-grant this lane"
+      "main prompt accounting cannot grant another lane fresh recovery attempts"
     );
     assert.equal(spent.turnType, "tool");
     assert.equal(blockingCalls(), beforeMiss, "the backed-off lane paid nothing");
@@ -8873,7 +8727,6 @@ async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upst
   const proxy = await startProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
-    // null: no CCC_BUDGET_TOKENS override.
     ...(budget === null ? {} : { budgetTokensOverride: budget }),
     reqlog: { log: (r) => records.push(structuredClone(r)) },
     ...proxyOpts,
@@ -9353,7 +9206,7 @@ test("a task notification after a compacted turn rides the stable prefix instead
     conv.push(assistantText("done"), taskNotification("agent stalled"));
     const rec = await h.post(conv);
     assert.equal(rec.continuation, true);
-    assert.equal(rec.turnType, "tool-prefix");
+    assert.equal(rec.turnType, "tool-memory");
     assert.equal(rec.routeMiss, undefined, "a notification never consults or evicts the lane route");
     assert.equal(h.compressCalls().length, calls, "under the budget: no compress call");
     const ride = h.upstream.bodies.at(-1);
@@ -9391,11 +9244,11 @@ test("tool-loop compaction with a typed prompt pending (headless -p): the result
     assert.equal((await h.post(conv)).turnType, "first-user");
     const [crossed] = await toolTurnsWhile(h, conv, "tool");
     assert.equal(crossed.turnType, "tool-recompressed");
-    assert.equal(crossed.routeRecovery.install, "prompt-pending", "no lane route while a prompt is pending");
+    assert.equal(crossed.routeRecovery.install, "installed", "pending accounting cannot veto a valid lane route");
     assert.equal(crossed.routeRecovery.prefix, "installed");
     const compacted = h.upstream.bodies.at(-1);
 
-    const [recrossed, rides] = await toolTurnsWhile(h, conv, "tool-prefix", () => {
+    const [recrossed, rides] = await toolTurnsWhile(h, conv, "tool-memory", () => {
       assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
       assert.ok(countMarkers(h.upstream.bodies.at(-1)) <= 4);
       assert.equal(h.compressCalls().length, 1);
@@ -9408,7 +9261,7 @@ test("tool-loop compaction with a typed prompt pending (headless -p): the result
   }
 });
 
-test("tool-loop compaction: CCC_COMPACT_TARGET=off, /memtree-compact off and the kill switch pass tool turns through with no compress call", async () => {
+test("tool-loop compaction: disabled compaction makes no compress call and refuses over-budget tool turns", async () => {
   for (const setup of ["env-off", "command-off", "kill-switch"]) {
     const h = await edgeHarness({
       budget: 20_000,
@@ -9431,7 +9284,8 @@ test("tool-loop compaction: CCC_COMPACT_TARGET=off, /memtree-compact off and the
         if (setup === "kill-switch") assert.equal(rec.compaction, undefined);
         else assert.equal(rec.compaction.mode, "off");
       }
-      assert.ok(h.upstream.bodies.at(-1).messages.length > 10, "sent whole, past the budget");
+      assert.ok(h.upstream.bodies.length < 7, "over-budget tool turns do not reach upstream");
+      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 20_000), "every forwarded original fits its budget with output reservation");
       assert.equal(h.compressCalls().length, 0, `${setup}: no compress call`);
     } finally {
       h.close();
@@ -9567,7 +9421,7 @@ test("a subagent's MemTree calls are timed from that subagent's transcript", asy
 });
 
 
-test("compression exceptions forward human and tool requests byte for byte and back off", async () => {
+test("over-budget compression exceptions return retryable errors and back off", async () => {
   for (const lane of ["human", "tool"]) {
     const upstream = await recordingUpstream();
     const memtreeSrv = await mockMemtree(200, recoveredMemory());
@@ -9588,9 +9442,9 @@ test("compression exceptions forward human and tool requests byte for byte and b
       }
       const raw = JSON.stringify({ model: "claude-x", max_tokens: 64, system: "<cc-infinite-notice>MemTree working - conversation consolidated</cc-infinite-notice>", messages: conv }, null, 2) + "\n";
       const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: raw });
-      assert.equal(response.status, 200, `${lane}: exception must not return 502`);
+      assert.equal(response.status, 503, `${lane}: failed oversized recovery must be retryable`);
       await response.text();
-      assert.equal(upstream.seen.at(-1).raw, raw, `${lane}: original bytes, not the old prefix`);
+      assert.equal(upstream.seen.length, 1, `${lane}: neither oversized original nor unsafe prefix reaches upstream`);
       assert.equal(throws, 1);
       if (lane === "tool") {
         const next = extendToolLoop(conv, "t3");
@@ -9653,7 +9507,7 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
         await postMessages(proxy.port, loop, SESSION);
         assert.equal(calls, 2, `${mode}: finite wait allows a fresh compress`);
         assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "compressed");
-        assert.equal(upstream.seen.length, 3, "all tool turns reach upstream in order");
+        assert.equal(upstream.seen.length, 1, "only the final validated compressed request reaches upstream");
       }
     } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
   }
@@ -9789,6 +9643,7 @@ for (const reportsBudget of [true, false]) {
 test("a bytes-only window alarm does not force below the calibrated budget and window", async () => {
   const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 10 } });
   try {
+    await h.post([userText("q"), assistantText("a"), userText("calibration ".repeat(50_000))]);
     const conv = [userText("q"), assistantText("a"), userText("x".repeat(900_000))];
     await h.post(conv);
     toolStep(conv, "small", 10);
@@ -9869,6 +9724,7 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
       conv.push(assistantText("a"), userText("compact"));
       assert.equal((await h.post(conv)).turnType, "followup-compressed");
       const calls = h.compressCalls().length;
+      const upstreamCount = h.upstream.bodies.length;
       if (mode === "failure") {
         h.memtreeSrv.server.closeAllConnections();
         h.memtreeSrv.close();
@@ -9887,8 +9743,8 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
         if (mode === "failure") {
           assert.equal(rec.compress.ok, false, "attempted compression");
           assert.equal(rec.turnType, "followup-degraded");
-          assert.equal(rec.forwardedBytes, rec.requestBytes, "unsafe prefix is not retained as fallback");
-          assert.deepEqual(h.upstream.bodies.at(-1).messages, conv);
+          assert.equal(rec.forwardedBytes, 0, "unsafe prefix is not retained as fallback");
+          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
         } else {
           assert.equal(h.compressCalls().length, calls + 1);
           assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
@@ -9910,6 +9766,7 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
       conv.push(assistantText("a"), userText("compact"));
       assert.equal((await h.post(conv)).turnType, "followup-compressed");
       const calls = h.compressCalls().length;
+      const upstreamCount = h.upstream.bodies.length;
       if (mode === "failure" || mode === "backoff") {
         h.memtreeSrv.server.closeAllConnections();
         h.memtreeSrv.close();
@@ -9932,7 +9789,7 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
           assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
         } else {
           assert.equal(rec.compress.ok, false);
-          assert.deepEqual(h.upstream.bodies.at(-1).messages, conv);
+          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
           if (mode === "backoff") {
             toolStep(conv, "next", 10);
             const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
@@ -9946,7 +9803,8 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
             rec = messageRecords(h.records).at(-1);
             assert.equal(rec.routeRecovery.outcome, "backoff");
             assert.equal(rec.turnType, "tool");
-            assert.equal(h.upstream.rawBodies.at(-1), original, "backoff clears unsafe caller ride and preserves original bytes");
+            assert.equal(res.status, 503, "backoff retains retryability within its bounded allowance");
+            assert.equal(h.upstream.bodies.length, upstreamCount, "backoff cannot forward an oversized original");
           }
         }
       }
@@ -10010,4 +9868,193 @@ test("concurrent session pages and late completions are ordered within each sess
     upstream.close();
     memtreeSrv.close();
   }
+});
+
+for (const outcome of ["noop", "exception", "compressed"]) {
+  test(`recovery uses API validation despite pending prompts after ${outcome}`, async () => {
+    const seen = [];
+    const upstream = await listen((req, res) => {
+      const chunks = []; req.on("data", c => chunks.push(c));
+      req.on("end", () => { seen.push(Buffer.concat(chunks).toString());
+        res.writeHead(200, { "content-type": "application/json" }); res.end(UPSTREAM_BODY); });
+    });
+    let calls = 0;
+    const server = await mockMemtree(200, request => {
+      if (request.index_only) return {};
+      calls++;
+      return calls === 1 || outcome === "compressed"
+        ? { messages: [{ role: "user", content: "compressed context" }], usage: { prompt_tokens_details: { cached_tokens: 123 } }, model_budget_tokens: 20000 }
+        : { messages: request.messages, model_budget_tokens: 20000 };
+    });
+    const memtree = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+    try {
+      await armMainTurn(proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(proxy.port, base);
+      await armMainTurn(proxy, "pending owner", "pending");
+      if (outcome === "exception") memtree.compress = async () => { throw new Error("pipeline failure"); };
+      const divergent = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "large");
+      divergent.at(-1).content[0].content = "X".repeat(800000);
+      const result = await postSessionMessages(proxy.port, divergent);
+      if (outcome !== "compressed") {
+        assert.equal(result.type, "error");
+        assert.equal(seen.length, 1, "an over-budget original cannot be forwarded when rebuilding fails");
+      }
+      await postSessionMessages(proxy.port, withToolRound(outcome === "compressed" ? divergent : base, "original-route"));
+      assert.match(seen.at(-1), /compressed context/);
+      assert.doesNotMatch(seen.at(-1), /first question|different history/);
+    } finally { proxy.close(); server.close(); upstream.close(); }
+  });
+}
+
+test("recovered routes accept separately delivered prompts independently of accounting", async () => {
+  const h = await startMidTurnHarness();
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    await armMainTurn(h.proxy, "still queued", "later");
+    const large = withToolRound(base, "large", [{ type: "text", text: "pending owner" }]);
+    large.at(-1).content[0].content = "X".repeat(800000);
+    await postSessionMessages(h.proxy.port, large);
+    assert.equal(h.compressCalls(), 2, "the wrapper reaches recovery");
+    await armMainTurn(h.proxy, "pending owner", "new-owner");
+    let messages = [...large, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    messages = [...messages, { role: "assistant", content: "done" }, { role: "user", content: "still queued" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    assert.equal(h.compressCalls(), 2, "both plain prompts reuse the recovered prefix");
+  } finally { h.close(); }
+});
+
+for (const outcome of ["noop", "compressed"]) {
+  test(`hooks arriving during ${outcome} compression cannot change route eligibility`, async () => {
+    const h = await startMidTurnHarness();
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    try {
+      await armMainTurn(h.proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(h.proxy.port, base);
+      const original = h.memtree.compress.bind(h.memtree);
+      h.memtree.compress = async (...args) => {
+        started(); await blocked;
+        return outcome === "noop" ? null : original(...args);
+      };
+      const large = withToolRound(base, "large", [{ type: "text", text: "arrived later" }]);
+      large.at(-1).content[0].content = "X".repeat(800000);
+      const pending = postSessionMessages(h.proxy.port, large);
+      await entered;
+      await armMainTurn(h.proxy, "arrived later", "new-hook");
+      release();
+      const response = await pending;
+      if (outcome === "noop") {
+        assert.equal(response.type, "error");
+        assert.equal(h.upstreamCount(), 1, "an over-budget original cannot pass through regardless of the hook");
+      }
+      await postSessionMessages(h.proxy.port, withToolRound(outcome === "compressed" ? large : base, "original-route"));
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+      h.memtree.compress = original;
+      const separatelyDelivered = [...(outcome === "compressed" ? large : base), { role: "assistant", content: "done" },
+        { role: "user", content: "arrived later" }];
+      assert.notEqual((await postSessionMessages(h.proxy.port, separatelyDelivered)).type, "error",
+        "a separately delivered fitting prompt never depends on hook ownership");
+    } finally { release(); h.close(); }
+  });
+}
+
+for (const recover of [false, true]) {
+  for (const longer of ["pending owner extended", "extended pending owner"]) {
+    test(`overlapping prompt text cannot block routing (${recover ? "recovery" : "ordinary"}, ${longer})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, "pending owner", "short");
+        await armMainTurn(h.proxy, longer, "long");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text", text: longer }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "pending owner" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error",
+          "a shorter later prompt still reuses validated history");
+        assert.equal(h.compressCalls(), recover ? 2 : 1, "overlapping accounting does not force recompression");
+      } finally { h.close(); }
+    });
+  }
+
+  for (const firstText of [" same prompt ", " same\n prompt <system-reminder>hook context</system-reminder>"]) {
+    test(`normalized duplicate prompts cannot block routing (${recover ? "recovery" : "ordinary"}, ${JSON.stringify(firstText)})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, firstText, "first");
+        await armMainTurn(h.proxy, "same prompt", "second");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text",
+          text: "<system-reminder>ambient context</system-reminder> same\t prompt  " },
+          { type: "text", text: "same prompt" }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "same prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+        await armMainTurn(h.proxy, "same\n prompt", "third");
+        const again = [...next, { role: "assistant", content: "done" },
+          { role: "user", content: "same\n prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, again)).type, "error",
+          "duplicate normalized accounting never blocks a new API request");
+        assert.equal(h.compressCalls(), recover ? 2 : 1, "duplicate accounting does not force recompression");
+      } finally { h.close(); }
+    });
+  }
+}
+
+test("reminder-only delivery cannot block a later plain request", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    const wrapper = withToolRound(base, "delivery", [{ type: "text", text: midTurnReminder("pending owner") }]);
+    await postSessionMessages(h.proxy.port, wrapper);
+    const next = [...wrapper, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+    assert.equal(h.compressCalls(), 1, "unresolved reminder accounting cannot block prefix reuse");
+  } finally { h.close(); }
+});
+
+test("route eligibility survives 40 reminder-only deliveries and overlapping plain prompts", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    let messages = base;
+    for (let i = 0; i < 40; i++) {
+      await armMainTurn(h.proxy, `queued ${i}`, `queued-${i}`);
+      messages = withToolRound(messages, `round-${i}`, [{ type: "text", text: midTurnReminder(`queued ${i}`) }]);
+      await postMessages(h.proxy.port, messages, headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+    }
+    await armMainTurn(h.proxy, "pending owner", "short");
+    await armMainTurn(h.proxy, "pending owner extended", "long");
+    const before = h.upstreamCount();
+    await postMessages(h.proxy.port, [...messages, { role: "assistant", content: "done" }, { role: "user", content: "pending owner extended" }], headers);
+    assert.equal(h.upstreamCount(), before + 1, "unresolved accounting never vetoes an API request");
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+  } finally { h.close(); }
 });

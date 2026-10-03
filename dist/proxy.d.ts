@@ -38,6 +38,7 @@
  * strip pass before hashing/forwarding. Live notices use Claude Code hooks and
  * upstream response bytes pass through to the client unchanged.
  */
+import { capCacheBreakpoints } from "./route-cache.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
@@ -193,14 +194,6 @@ declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: nu
     tokens: number;
     source: "reported" | "bytes";
 };
-/**
- * Keep a request within Anthropic's breakpoint limit after the compressed
- * prefix (which carries one) is joined to Claude Code's own suffix. Drops
- * the earliest suffix breakpoints first, never the compressed prefix's or
- * the request's last one, so both the big prefix and the growing tail stay
- * cached.
- */
-declare function capCacheBreakpoints(body: Record<string, any>, _prefixLength?: number): void;
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;

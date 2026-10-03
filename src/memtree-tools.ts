@@ -198,6 +198,17 @@ export interface SearchHit {
   score: number;
   range?: LeafRange;
   snippets: { line: number; text: string }[];
+  /** `<tree>#<node>` from servers that address hits. */
+  address?: string;
+  /** Ancestors, root first (servers that address hits). */
+  path?: { id: number; summary: string }[];
+}
+
+/** A node address, `<tree>#<node id>` (search hits carry them). */
+export function parseNodeAddress(value: unknown): { tree: string; id: number } {
+  const match = typeof value === "string" ? /^([A-Za-z0-9-]{1,80})#(\d{1,9})$/.exec(value.trim()) : null;
+  if (!match) throw new ToolInputError(`node must be an address like "<tree>#<id>" from search, got ${JSON.stringify(value)}`);
+  return { tree: match[1], id: Number(match[2]) };
 }
 
 const STOPWORDS = new Set(
@@ -294,6 +305,8 @@ export function serverSearchHits(body: unknown): { hits: SearchHit[]; terms: str
       score: typeof raw.score === "number" ? raw.score : 0,
       ...(range && Number.isInteger(range.block) ? { range } : {}),
       snippets: Array.isArray(raw.snippets) ? (raw.snippets as SearchHit["snippets"]) : [],
+      ...(typeof raw.address === "string" ? { address: raw.address } : {}),
+      ...(Array.isArray(raw.path) ? { path: raw.path as SearchHit["path"] } : {}),
     });
   }
   return { hits, terms: (json.terms as unknown[]).map(String) };
@@ -322,6 +335,10 @@ export function formatSearchHits(
       .filter(Boolean)
       .join(" · ");
     out.push("", `[${head}]`, `  ${hit.summary}`);
+    if (hit.address) out.push(`  address: ${hit.address}`);
+    if (hit.path?.length) {
+      out.push(`  path: ${hit.path.map((p) => `${truncate(p.summary, 80)} (node ${p.id})`).join(" › ")}`);
+    }
     for (const s of hit.snippets) out.push(`  L${s.line}: ${s.text}`);
   }
   out.push(

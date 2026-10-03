@@ -58,7 +58,7 @@ above a fixed 100k-token threshold, even when the active model has a 1M window
 and auto-compaction is disabled. `ccc` suppresses that resume-time
 recommendation as well; it does not disable the manual `/compact` command.
 
-A session whose last response was recorded within 10% of the model's window
+A session whose last response reached the verified local refusal threshold
 (for example one sent whole while MemTree was unavailable) would otherwise be
 refused locally with "Context limit reached" on every prompt after a resume.
 On `ccc --resume <id>`, `ccc` backs the transcript up to
@@ -173,6 +173,8 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 * You want your fresh session context to be **10k** tokens or less. If your starting context is more than that, consider reducing the size of your custom MCP's and slash commands to ensure Claude performs at its very best
 
 * You can resume previous threads with `/resume`
+
+For `ccc --resume <id>`, an optional repair can unblock a transcript whose last response already exceeds Claude Code’s local refusal limit. It changes only that response’s usage totals and the iteration Claude Code counts, after writing an exclusive, uniquely named backup under `~/.claude-code-infinite/transcript-backups`. Earlier iterations and conversation content stay intact. The installed Claude Code 2.1.288 computes its blocking limit as the context window minus the output allowance (capped at 20,000) minus 3,000 tokens: 977,000 for the supported 1M models. Other versions use the conservative full-window threshold. The window comes from ccc’s model table, explicit `[1m]` transcript model signals, and any `--model` or `ANTHROPIC_MODEL` override, conservatively keeping the largest supported window. A successful response with input already beyond that inferred window disproves the inference and is never repaired. Unknown model overrides (including unresolved aliases), models or usage shapes, threshold overrides, possible running writers, changed snapshots, backup collisions, and filesystem errors all skip repair and continue the original resume. Process and file checks are bounded; other running JavaScript runtimes may conservatively prevent repair.
 
 
 ## Troubleshooting
