@@ -198,14 +198,6 @@ export declare class NoticeDeliveryQueue {
     private renderTrailer;
     /** The link notice with its note dim. */
     private linkNotice;
-    /**
-     * The word "MemTree" in `text` as a terminal hyperlink (OSC 8) to `url`, so
-     * it is clickable in terminals that support links; the bare URL is still
-     * printed on the next line. Only when styling is on: monochrome and plain
-     * output stay free of escape sequences. BEL-terminated, as Claude Code's
-     * own renderer writes them.
-     */
-    private anchor;
     private styleDim;
     private deliveryFor;
     private style;

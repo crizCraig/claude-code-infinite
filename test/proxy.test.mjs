@@ -2543,7 +2543,7 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
   }
 });
 
-const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "").replace(/\x1B\]8;;[^\x07]*\x07/g, "");
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "");
 
 // The server stamps its short spelling of the page (/m/<leading hex of the
 // id>) and the completed index the turn was compressed against.
@@ -2754,7 +2754,7 @@ test(`placement 'message': the link trails every finished message, marked when t
     const sameRendered = same.body.hookSpecificOutput.displayContent;
     assert.equal(linkText(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
     if (color) {
-      assert.match(sameRendered, /\x1b\[2m• \x1b\]8;;https:[^\x07]*\x07MemTree\x1b\]8;;\x07\x1b\[22m\n  /, "unchanged index is dim, label linked");
+      assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
     } else {
       assert.equal(sameRendered, `done\n\n${trailerSame(PAGE_URL_2)}`,
         "NO_COLOR leaves the unchanged label and URL plain");

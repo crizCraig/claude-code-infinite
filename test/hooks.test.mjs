@@ -65,15 +65,15 @@ test("turn Stop fallback includes the success link exactly once in both color mo
 test("MessageDisplay prefixes success once without changing stored content", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   queue.queuePrefix("✓ MemTree · conversation optimized");
-  assert.deepEqual(claimed(queue, display()), {
+  assert.deepEqual(queue.claim(display()), {
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
         "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\nanswer",
     },
   });
-  assert.equal(claimed(queue, display()), null);
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(display()), null);
+  assert.equal(queue.claim(stop()), null);
 });
 
 test("MessageDisplay resolves late success metrics when the notice is claimed", () => {
@@ -82,7 +82,7 @@ test("MessageDisplay resolves late success metrics when the notice is claimed", 
   queue.queuePrefix(() => `✓ MemTree · conversation optimized in ${latencyMs}ms`);
   latencyMs = 34;
   assert.equal(
-    claimed(queue, display()).hookSpecificOutput.displayContent,
+    queue.claim(display()).hookSpecificOutput.displayContent,
     "\x1b[32m✓ MemTree · conversation optimized in 34ms\x1b[39m\nanswer"
   );
 });
@@ -90,21 +90,21 @@ test("MessageDisplay resolves late success metrics when the notice is claimed", 
 test("MessageDisplay appends warnings only on final; Stop is no-duplicate fallback", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   queue.queueSuffix("⚠ MemTree degraded — this turn ran uncompressed");
-  assert.equal(claimed(queue, display({ final: false })), null);
-  assert.deepEqual(claimed(queue, display({ index: 1, final: true, delta: "done" })), {
+  assert.equal(queue.claim(display({ final: false })), null);
+  assert.deepEqual(queue.claim(display({ index: 1, final: true, delta: "done" })), {
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
         "done\n\x1b[33m⚠ MemTree degraded — this turn ran uncompressed\x1b[39m",
     },
   });
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 
   queue.queueSuffix("⚠ fallback");
-  assert.deepEqual(claimed(queue, stop()), {
+  assert.deepEqual(queue.claim(stop()), {
     systemMessage: "\x1b[33m⚠ fallback\x1b[39m",
   });
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 });
 
 test("a pending link rides the success line once per key, in display or Stop, never alone", () => {
@@ -115,13 +115,13 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   assert.equal(queue.linkPending("session-2"), false);
 
   // No success line queued: the link never appears by itself.
-  assert.equal(claimed(queue, display({ final: true })), null);
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(display({ final: true })), null);
+  assert.equal(queue.claim(stop()), null);
   assert.equal(queue.linkPending("session-1"), true, "peeking does not mark it shown");
 
   // Green text incl. separator, then the bare link (no SGR glued to the URL).
   queue.queuePrefix("✓ MemTree · conversation optimized");
-  assert.deepEqual(claimed(queue, display()), {
+  assert.deepEqual(queue.claim(display()), {
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
@@ -133,7 +133,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   // Every success line carries the current page below it, same index or not.
   link = { key: "index-a", link: "https://app.polychat.co/m/aaaaaaaaaaab" };
   queue.queuePrefix("✓ MemTree · conversation optimized");
-  assert.deepEqual(claimed(queue, stop()), {
+  assert.deepEqual(queue.claim(stop()), {
     systemMessage:
       "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
       "  https://app.polychat.co/m/aaaaaaaaaaab",
@@ -142,18 +142,18 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   // A new index: Stop fallback carries its page on the success line, once.
   link = { key: "index-b", link: "https://app.polychat.co/m/bbbbbbbbbbbb" };
   queue.queuePrefix("✓ MemTree · conversation optimized");
-  assert.deepEqual(claimed(queue, stop()), {
+  assert.deepEqual(queue.claim(stop()), {
     systemMessage:
       "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
       "  https://app.polychat.co/m/bbbbbbbbbbbb",
   });
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 
   // Another session's display, subagents, and a throwing resolver: plain line.
   link = { key: "index-c", link: "https://app.polychat.co/m/cccccccccccc" };
   queue.queuePrefix("✓ ok");
   assert.equal(
-    claimed(queue, display({ session_id: "session-2" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ session_id: "session-2" })).hookSpecificOutput.displayContent,
     "\x1b[32m✓ ok\x1b[39m\nanswer"
   );
   assert.equal(queue.linkPending("session-1"), true, "unshown for its own session");
@@ -161,7 +161,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
     throw new Error("boom");
   });
   queue.queuePrefix("✓ ok");
-  assert.deepEqual(claimed(queue, stop()), { systemMessage: "\x1b[32m✓ ok\x1b[39m" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "\x1b[32m✓ ok\x1b[39m" });
   queue.setLink(null);
   assert.equal(queue.linkPending("session-1"), false);
 });
@@ -173,8 +173,8 @@ test("trailer follows every finished message, is green once per key, falls back 
 
   // Mid-message flushes carry nothing; the finished message gets the trailer,
   // green "new index" the first time a key is seen, blank line above.
-  assert.equal(claimed(queue, display({ final: false })), null);
-  assert.deepEqual(claimed(queue, display({ final: true, delta: "done" })), {
+  assert.equal(queue.claim(display({ final: false })), null);
+  assert.deepEqual(queue.claim(display({ final: true, delta: "done" })), {
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
@@ -182,45 +182,45 @@ test("trailer follows every finished message, is green once per key, falls back 
     },
   });
   // Stop after a message carried it: nothing more this turn.
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 
   // Same key on the next message: dim label, still shown.
   assert.equal(
-    claimed(queue, display({ final: true, delta: "again" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "again" })).hookSpecificOutput.displayContent,
     "again\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/aaaaaaaaaaaa"
   );
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 
   // A turn that renders no message: Stop carries the trailer, once.
   link = { key: "index-b", link: "https://app.polychat.co/m/bbbbbbbbbbbb" };
-  assert.deepEqual(claimed(queue, stop()), {
+  assert.deepEqual(queue.claim(stop()), {
     systemMessage: "\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/bbbbbbbbbbbb",
   });
-  assert.deepEqual(claimed(queue, stop()), {
+  assert.deepEqual(queue.claim(stop()), {
     systemMessage: "\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb",
   });
 
   // With a success line on the same (single-flush) message: line, answer, trailer.
   queue.queuePrefix("✓ ok");
   assert.equal(
-    claimed(queue, display({ final: true, delta: "answer" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "answer" })).hookSpecificOutput.displayContent,
     "\x1b[32m✓ ok\x1b[39m\nanswer\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb"
   );
   // Delta ending in a newline gets no extra separator before the blank line.
   assert.equal(
-    claimed(queue, display({ final: true, delta: "text\n" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "text\n" })).hookSpecificOutput.displayContent,
     "text\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb"
   );
 
   // Other sessions, subagents, a throwing resolver, no resolver: nothing.
-  assert.equal(claimed(queue, display({ final: true, session_id: "session-2" })), null);
-  assert.equal(claimed(queue, display({ final: true, agent_id: "agent-1" })), null);
+  assert.equal(queue.claim(display({ final: true, session_id: "session-2" })), null);
+  assert.equal(queue.claim(display({ final: true, agent_id: "agent-1" })), null);
   queue.setTrailer(() => {
     throw new Error("boom");
   });
-  assert.equal(claimed(queue, display({ final: true })), null);
+  assert.equal(queue.claim(display({ final: true })), null);
   queue.setTrailer(null);
-  assert.equal(claimed(queue, stop()), null);
+  assert.equal(queue.claim(stop()), null);
 });
 
 test("trailer note follows the bare link, dim", () => {
@@ -228,16 +228,16 @@ test("trailer note follows the bare link, dim", () => {
   let link = { key: "k1", link: "https://x/m/1", note: "/memtree-compact to compact session" };
   queue.setTrailer(() => link, "message");
   assert.equal(
-    claimed(queue, display({ final: true, delta: "a" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "a" })).hookSpecificOutput.displayContent,
     "a\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1"
   );
   assert.equal(
-    claimed(queue, display({ final: true, delta: "b" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "b" })).hookSpecificOutput.displayContent,
     "b\n\n\x1b[2m• MemTree\x1b[22m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1"
   );
   link = { key: "k1", link: "https://x/m/2" };
   assert.equal(
-    claimed(queue, display({ final: true, delta: "c" })).hookSpecificOutput.displayContent,
+    queue.claim(display({ final: true, delta: "c" })).hookSpecificOutput.displayContent,
     "c\n\n\x1b[2m• MemTree\x1b[22m\n  https://x/m/2",
     "no note once the turn compressed"
   );
@@ -246,35 +246,35 @@ test("trailer note follows the bare link, dim", () => {
 test("trailer placement 'stop' shows it once per turn on Stop only", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, false);
   queue.setTrailer(() => ({ key: "k", link: "https://x/m/1" }), "stop");
-  assert.equal(claimed(queue, display({ final: true })), null);
-  assert.deepEqual(claimed(queue, stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
-  assert.deepEqual(claimed(queue, stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
+  assert.equal(queue.claim(display({ final: true })), null);
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
   queue.queueSuffix("⚠ warn");
-  assert.deepEqual(claimed(queue, stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1" });
 });
 
 test("subagent hooks cannot claim and expired notices are dropped", () => {
   let now = 100;
   const queue = new NoticeDeliveryQueue(10, () => now, true);
   queue.queuePrefix("main");
-  assert.equal(claimed(queue, display({ agent_id: "agent-1" })), null);
-  assert.ok(claimed(queue, display()), "main hook still claims after ignored agent hook");
+  assert.equal(queue.claim(display({ agent_id: "agent-1" })), null);
+  assert.ok(queue.claim(display()), "main hook still claims after ignored agent hook");
 
   queue.queuePrefix("old");
   now = 111;
-  assert.equal(claimed(queue, display()), null);
+  assert.equal(queue.claim(display()), null);
 });
 
 test("prompt_id prevents an unrelated display or Stop from claiming", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, true);
   queue.queuePrefix("main", undefined, "prompt-main");
-  assert.equal(claimed(queue, display({ prompt_id: "prompt-other" })), null);
-  assert.equal(claimed(queue, stop({ prompt_id: "prompt-other" })), null);
-  assert.ok(claimed(queue, display({ prompt_id: "prompt-main" })));
+  assert.equal(queue.claim(display({ prompt_id: "prompt-other" })), null);
+  assert.equal(queue.claim(stop({ prompt_id: "prompt-other" })), null);
+  assert.ok(queue.claim(display({ prompt_id: "prompt-main" })));
 
   // Older Claude versions omit prompt_id; keep the safe compatibility path.
   queue.queuePrefix("legacy", undefined, "prompt-main");
-  assert.ok(claimed(queue, display()));
+  assert.ok(queue.claim(display()));
 });
 
 test("payment callback runs only when a hook claims the notice", () => {
@@ -284,7 +284,7 @@ test("payment callback runs only when a hook claims the notice", () => {
   queue.clearForUserRequest();
   assert.equal(delivered, 0);
   queue.queueSuffix("payment", () => delivered++);
-  assert.deepEqual(claimed(queue, stop()), { systemMessage: "payment" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "payment" });
   assert.equal(delivered, 1);
 });
 
@@ -477,20 +477,4 @@ test("Stop-only compatibility plugin keeps arming/lifecycle hooks", async () => 
     plugin.close();
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
-});
-
-test("the MemTree label is a terminal hyperlink to the page, and the bare URL still follows", () => {
-  const queue = new NoticeDeliveryQueue(undefined, undefined, true);
-  queue.setLink(() => ({ key: "index-a", link: "https://app.polychat.co/m/aaaaaaaaaaaa" }));
-  queue.queuePrefix("✓ MemTree · conversation optimized");
-  const shown = queue.claim({ hook_event_name: "Stop", session_id: "session-1" }).systemMessage;
-  assert.equal(
-    shown,
-    "\x1b[32m✓ \x1b]8;;https://app.polychat.co/m/aaaaaaaaaaaa\x07MemTree\x1b]8;;\x07 · conversation optimized\x1b[39m\n" +
-      "  https://app.polychat.co/m/aaaaaaaaaaaa"
-  );
-  const plain = new NoticeDeliveryQueue(undefined, undefined, false);
-  plain.setLink(() => ({ key: "index-a", link: "https://app.polychat.co/m/aaaaaaaaaaaa" }));
-  plain.queuePrefix("✓ MemTree · conversation optimized");
-  assert.ok(!plain.claim({ hook_event_name: "Stop", session_id: "session-1" }).systemMessage.includes("\x1b"), "no escapes without color");
 });
