@@ -104,7 +104,6 @@ import {
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
-  terminalSupportsColor,
   type SessionStartHookInput,
 } from "./hooks.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -1418,8 +1417,7 @@ async function handleMessages(
       return recapLinkText(
         latest.url,
         streamedTextChars,
-        latest.compressed ? undefined : NOT_COMPRESSED_NOTE,
-        { hyperlinks: terminalSupportsColor() }
+        latest.compressed ? undefined : NOT_COMPRESSED_NOTE
       );
     });
   }

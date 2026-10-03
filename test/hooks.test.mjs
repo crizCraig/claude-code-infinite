@@ -494,22 +494,3 @@ test("the MemTree label is a terminal hyperlink to the page, and the bare URL st
   plain.queuePrefix("✓ MemTree · conversation optimized");
   assert.ok(!plain.claim({ hook_event_name: "Stop", session_id: "session-1" }).systemMessage.includes("\x1b"), "no escapes without color");
 });
-
-test("the recap link is an OSC 8 hyperlink when it fits the recap cap, else plain", async () => {
-  const { recapLinkText, RECAP_MAX_CHARS } = await import("../dist/notices.js");
-  const url = "https://app.polychat.co/m/0f1c2d3e4a5b";
-  const plain = recapLinkText(url, 0);
-  assert.equal(plain, `\n• MemTree\n  ${url}\n`);
-  const linked = recapLinkText(url, 0, undefined, { hyperlinks: true });
-  assert.equal(
-    linked,
-    `\n• \x1b]8;;${url}\x07MemTree\x1b]8;;\x07\n  \x1b]8;;${url}\x07${url}\x1b]8;;\x07\n`
-  );
-  // Little room left: the URL alone is linked, then plain, then nothing.
-  const urlOnly = `\n• MemTree\n  \x1b]8;;${url}\x07${url}\x1b]8;;\x07\n`;
-  assert.equal(recapLinkText(url, RECAP_MAX_CHARS - urlOnly.length, undefined, { hyperlinks: true }), urlOnly);
-  assert.equal(recapLinkText(url, RECAP_MAX_CHARS - plain.length, undefined, { hyperlinks: true }), plain);
-  assert.equal(recapLinkText(url, RECAP_MAX_CHARS - plain.length + 1, undefined, { hyperlinks: true }), undefined);
-  // A URL with control characters is never put inside an escape sequence.
-  assert.equal(recapLinkText("https://x/\x07y", 0, undefined, { hyperlinks: true }), `\n• MemTree\n  https://x/\x07y\n`);
-});

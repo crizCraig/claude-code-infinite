@@ -307,29 +307,10 @@ export const RECAP_MAX_CHARS = 400;
 export function recapLinkText(
   link: string,
   streamedTextChars: number,
-  note?: string,
-  options: { hyperlinks?: boolean } = {}
+  note?: string
 ): string | undefined {
-  const fits = (text: string) => streamedTextChars + text.length <= RECAP_MAX_CHARS;
-  const plain = `\n${linkLines(LINK_LABEL, link, note)}\n`;
-  if (!options.hyperlinks || !/^https?:\/\/[^\s\x00-\x1f\x7f]+$/.test(link)) {
-    return fits(plain) ? plain : undefined;
-  }
-  // Claude Code prints the recap as plain text (no Markdown), so a terminal's
-  // own URL detection decides what Cmd+click opens, and it can run into the
-  // next line. An OSC 8 link makes the target exact. The escapes count
-  // against the recap cap, so use the richest form that fits: label and URL
-  // linked, then the URL alone, then plain.
-  const url = oscLink(link, link);
-  const both = `\n${linkLines(LINK_LABEL.replace("MemTree", oscLink("MemTree", link)), url, note)}\n`;
-  const urlOnly = `\n${linkLines(LINK_LABEL, url, note)}\n`;
-  for (const text of [both, urlOnly, plain]) if (fits(text)) return text;
-  return undefined;
-}
-
-/** OSC 8 hyperlink, BEL-terminated as Claude Code's renderer writes them. */
-function oscLink(text: string, url: string): string {
-  return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+  const text = `\n${linkLines(LINK_LABEL, link, note)}\n`;
+  return streamedTextChars + text.length <= RECAP_MAX_CHARS ? text : undefined;
 }
 
 /** content_block_start/delta/stop triple for a notice text block. */
