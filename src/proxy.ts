@@ -3830,6 +3830,11 @@ async function runBlockingCompression(args: {
     ...(compaction.threshold !== undefined
       ? { compressionThresholdTokens: compaction.threshold }
       : {}),
+    // The size this request was judged by. Sent so the server compresses
+    // whatever the fallback gate would refuse to send uncompressed.
+    ...(rec.compaction?.estimatedTokens !== undefined
+      ? { clientInputTokens: rec.compaction.estimatedTokens }
+      : {}),
     ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),

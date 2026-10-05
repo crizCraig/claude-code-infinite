@@ -81,6 +81,15 @@ export interface CompressRequestMeta {
    */
   compressionThresholdTokens?: number;
   /**
+   * Server `client_input_tokens`: the proxy's own estimate of the request's
+   * input tokens, the one its fallback gate refuses over-budget input by.
+   * Over the budget, the server compresses even when its char estimate says
+   * the request fits, so the two cannot disagree into a stuck session
+   * (2026-10-05). Part of the cache key: a different estimate can flip the
+   * server's verdict for the same messages.
+   */
+  clientInputTokens?: number;
+  /**
    * Each assistant message's response usage (output, thinking, input), keyed
    * by its position in the messages sent. Archived by the server for the
    * MemTree page; never hashed, never part of the compression cache key.
@@ -816,6 +825,18 @@ function transmittedTools(tools: unknown[] | undefined): unknown[] | undefined {
   return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 
+/**
+ * The part of `clientInputTokens` that can change the server's verdict: whether
+ * it exceeds the budget the server compares it with. Under it, or absent, the
+ * server goes by its own measure either way, so both share one key. Keying on
+ * the raw estimate would split identical retries whose size sample moved.
+ */
+function clientOverThreshold(meta: CompressRequestMeta | undefined): true | null {
+  const budget = meta?.compressionThresholdTokens ?? meta?.compressionTargetTokens;
+  if (meta?.clientInputTokens === undefined || budget === undefined) return null;
+  return meta.clientInputTokens > budget ? true : null;
+}
+
 export class MemtreeClient {
   private baseUrl: string;
   private apiKey: string;
@@ -974,6 +995,7 @@ export class MemtreeClient {
       tools: meta?.tools,
       compressionTargetTokens: meta?.compressionTargetTokens,
       compressionThresholdTokens: meta?.compressionThresholdTokens,
+      clientInputTokens: meta?.clientInputTokens,
       messageUsage: meta?.messageUsage,
       messageTimes: meta?.messageTimes,
       sessionId: meta?.sessionId,
@@ -1120,6 +1142,7 @@ export class MemtreeClient {
           toolsHash,
           meta?.compressionTargetTokens ?? null,
           meta?.compressionThresholdTokens ?? null,
+          clientOverThreshold(meta),
         ])
       )
       .digest("hex");
@@ -1144,6 +1167,7 @@ export class MemtreeClient {
       tools?: unknown[];
       compressionTargetTokens?: number;
       compressionThresholdTokens?: number;
+      clientInputTokens?: number;
       messageUsage?: MessageUsage;
       messageTimes?: MessageTimes;
       sessionId?: string;
@@ -1177,6 +1201,9 @@ export class MemtreeClient {
       }
       if (opts.compressionThresholdTokens !== undefined) {
         body.compression_threshold_tokens = opts.compressionThresholdTokens;
+      }
+      if (opts.clientInputTokens !== undefined) {
+        body.client_input_tokens = opts.clientInputTokens;
       }
       // Compress calls only: the server adds the thinking tokens (stripped
       // from `messages` above) to its budget, since a passthrough forwards

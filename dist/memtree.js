@@ -646,6 +646,18 @@ function transmittedModel(model) {
 function transmittedTools(tools) {
     return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
+/**
+ * The part of `clientInputTokens` that can change the server's verdict: whether
+ * it exceeds the budget the server compares it with. Under it, or absent, the
+ * server goes by its own measure either way, so both share one key. Keying on
+ * the raw estimate would split identical retries whose size sample moved.
+ */
+function clientOverThreshold(meta) {
+    const budget = meta?.compressionThresholdTokens ?? meta?.compressionTargetTokens;
+    if (meta?.clientInputTokens === undefined || budget === undefined)
+        return null;
+    return meta.clientInputTokens > budget ? true : null;
+}
 export class MemtreeClient {
     baseUrl;
     apiKey;
@@ -771,6 +783,7 @@ export class MemtreeClient {
             tools: meta?.tools,
             compressionTargetTokens: meta?.compressionTargetTokens,
             compressionThresholdTokens: meta?.compressionThresholdTokens,
+            clientInputTokens: meta?.clientInputTokens,
             messageUsage: meta?.messageUsage,
             messageTimes: meta?.messageTimes,
             sessionId: meta?.sessionId,
@@ -899,6 +912,7 @@ export class MemtreeClient {
             toolsHash,
             meta?.compressionTargetTokens ?? null,
             meta?.compressionThresholdTokens ?? null,
+            clientOverThreshold(meta),
         ]))
             .digest("hex");
     }
@@ -941,6 +955,9 @@ export class MemtreeClient {
             }
             if (opts.compressionThresholdTokens !== undefined) {
                 body.compression_threshold_tokens = opts.compressionThresholdTokens;
+            }
+            if (opts.clientInputTokens !== undefined) {
+                body.client_input_tokens = opts.clientInputTokens;
             }
             // Compress calls only: the server adds the thinking tokens (stripped
             // from `messages` above) to its budget, since a passthrough forwards

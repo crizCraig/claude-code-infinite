@@ -59,6 +59,15 @@ export interface CompressRequestMeta {
      */
     compressionThresholdTokens?: number;
     /**
+     * Server `client_input_tokens`: the proxy's own estimate of the request's
+     * input tokens, the one its fallback gate refuses over-budget input by.
+     * Over the budget, the server compresses even when its char estimate says
+     * the request fits, so the two cannot disagree into a stuck session
+     * (2026-10-05). Part of the cache key: a different estimate can flip the
+     * server's verdict for the same messages.
+     */
+    clientInputTokens?: number;
+    /**
      * Each assistant message's response usage (output, thinking, input), keyed
      * by its position in the messages sent. Archived by the server for the
      * MemTree page; never hashed, never part of the compression cache key.

@@ -8657,10 +8657,14 @@ const BIG = (tag, chars = 100_000) => `${tag} ` + "x".repeat(chars);
 /**
  * A MemTree server that decides like the real one: a request compresses only
  * with a target, and only when its size (chars/4) exceeds the threshold, or
- * the target itself when no threshold was sent. `reportsBudget: false` models
- * a server from before `model_budget_tokens` / `compression_threshold_tokens`.
+ * the target itself when no threshold was sent, or when the client's
+ * `client_input_tokens` exceeds it. `reportsBudget: false` models a server
+ * from before `model_budget_tokens` / `compression_threshold_tokens`;
+ * `charsPerToken` above 4 models a server that undercounts dense content.
  */
-async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop = false } = {}) {
+async function edgeMemtree({
+  reportsBudget = true, modelBudget = 800_000, noop = false, charsPerToken = 4,
+} = {}) {
   let compressions = 0;
   return mockMemtree(200, (body) => {
     if (body.index_only) {
@@ -8670,11 +8674,12 @@ async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop =
         index_only: true,
       };
     }
-    const size = Math.round(JSON.stringify(body.messages).length / 4);
+    const size = Math.round(JSON.stringify(body.messages).length / charsPerToken);
     const target = body.compression_target_tokens;
     const threshold = reportsBudget ? body.compression_threshold_tokens ?? target : target;
     const budget = reportsBudget ? { model_budget_tokens: modelBudget } : {};
-    if (noop || target === undefined || size <= threshold) {
+    const clientOver = reportsBudget && body.client_input_tokens > threshold;
+    if (noop || target === undefined || (size <= threshold && !clientOver)) {
       return {
         messages: body.messages,
         compressed: false,
@@ -8781,6 +8786,35 @@ const countMarkers = (b) =>
     ...(Array.isArray(b.system) ? b.system : []),
     ...b.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])),
   ].filter((p) => p?.cache_control).length;
+
+test("client_input_tokens: a server that undercounts still compresses what ccc measures over budget (2026-10-05 stuck session)", async () => {
+  // Uncalibrated proxy (no upstream usage), so ccc sends a threshold and lets
+  // the server measure; the server sees half the size ccc does.
+  const h = await edgeHarness({
+    budget: 20_000,
+    memtree: { charsPerToken: 8 },
+    upstreamOptions: { reportUsage: false },
+  });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    conv.push(assistantText("a1"), markedUser("q2"));
+    assert.equal((await h.post(conv)).turnType, "followup-noop", "learns the server budget");
+
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const forwarded = h.upstream.bodies.length;
+    const t3 = await h.post(conv);
+    const call = h.compressCalls().at(-1);
+    assert.equal(call.compression_threshold_tokens, 20_000);
+    assert.equal(call.client_input_tokens, t3.compaction.estimatedTokens);
+    assert.ok(call.client_input_tokens > 20_000, "ccc measures the request over budget");
+    assert.equal(t3.turnType, "followup-compressed");
+    assert.equal(h.upstream.bodies.length, forwarded + 1, "forwarded, not refused");
+  } finally {
+    h.close();
+  }
+});
 
 test("edge compaction: passthrough under budget, one compaction to half at the budget, then byte-identical prefix rides until the budget is reached again", async () => {
   const h = await edgeHarness({ budget: 20_000 });
