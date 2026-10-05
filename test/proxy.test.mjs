@@ -10058,3 +10058,155 @@ test("route eligibility survives 40 reminder-only deliveries and overlapping pla
     assert.doesNotMatch(h.lastUpstream(), /first question/);
   } finally { h.close(); }
 });
+
+// ---------------------------------------------------------------------------
+// The link shown to the user follows the session's newest tree on the server,
+// while /memtree/current (the MCP tools) stays on the tree the memory came from.
+
+const NEWEST_REQUEST_ID = "229f05e7-d2e5-4494-a631-25dd42d5759e";
+const NEWEST_URL = "https://app.polychat.co/m/229f05e7d2e5";
+const OTHER_REQUEST_ID = "0badc0de-1111-4222-8333-444455556666";
+const OTHER_URL = "https://app.polychat.co/m/0badc0de1111";
+
+/** A `/v1/memtree/sessions` item: `requestId` is that session's newest tree. */
+const sessionsItem = (sessionId, requestId) => ({
+  id: sessionId,
+  kind: "claude_code_session",
+  session_id: sessionId,
+  title: "a session whose notes quote session-1",
+  latest_tree: {
+    request_id: requestId,
+    ref: `${requestId}-v3-own`,
+    links: { url: `https://app.polychat.co/usage/memtree/${requestId}-v3-own` },
+  },
+});
+
+/** A NewestTreeLookup over a scripted server: `answer(q)` is a body or a status. */
+async function newestLookup(answer) {
+  const { NewestTreeLookup } = await import("../dist/memtree-newest.js");
+  const asked = [];
+  const lookup = new NewestTreeLookup(async (path) => {
+    const q = new URL(path, "http://x").searchParams.get("q");
+    asked.push(q);
+    const a = answer(q);
+    if (typeof a === "number") return { status: a, body: Buffer.from('{"detail":"Not Found"}') };
+    return { status: 200, body: Buffer.from(JSON.stringify(a)) };
+  });
+  return { lookup, asked };
+}
+
+async function getCurrentId(proxy, sessionId) {
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${sessionId}`);
+  return res.status === 200 ? (await res.json()).id : res.status;
+}
+
+for (const color of [false, true]) {
+test(`stale link: memory compressed long ago, newer index-only trees since (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
+  const upstream = await mockUpstream();
+  // The only compress response names the old page; later trees came from index-only calls.
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const { lookup } = await newestLookup(() => ({ sessions: [sessionsItem("session-1", NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message", newestTrees: lookup,
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    const display = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    const shown = linkText(display.body.hookSpecificOutput.displayContent);
+    assert.ok(shown.endsWith(`\n${trailerNew(NEWEST_URL)}`), shown);
+    assert.ok(!shown.includes(PAGE_URL_1), "not the memory's source tree");
+
+    // The MCP tools keep reading the tree the memory was built from.
+    assert.equal(await getCurrentId(proxy, "session-1"), "ea18af90658b");
+
+    const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL}\n  memory from ${PAGE_URL_1}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
+
+test("a server without the sessions endpoint keeps today's link, and is asked once", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const { lookup, asked } = await newestLookup(() => 404);
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message", newestTrees: lookup,
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    const display = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.ok(linkText(display.body.hookSpecificOutput.displayContent).endsWith(`\n${trailerNew(PAGE_URL_1)}`));
+    const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${PAGE_URL_1}`);
+    assert.equal(asked.length, 1, "404 turns the lookup off for a while");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the newest-tree link never shows another session's tree", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  // `q=session-1` also matches session-2, whose notes quote that id; session-1
+  // itself has no completed tree on the server yet.
+  const { lookup } = await newestLookup((q) => ({
+    sessions: [sessionsItem("session-2", OTHER_REQUEST_ID), ...(q === "session-3" ? [sessionsItem("session-3", NEWEST_REQUEST_ID)] : [])],
+  }));
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message", newestTrees: lookup,
+  });
+  const view = (session_id) =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", session_id, prompt: "/memtree-view", prompt_id: "p-view" });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    assert.equal(stripAnsi((await view("session-1")).body.reason), `• MemTree\n  ${PAGE_URL_1}`);
+    // A session this proxy never served still gets its own tree, and only its own.
+    assert.equal(stripAnsi((await view("session-3")).body.reason), `• MemTree\n  ${NEWEST_URL}`);
+    assert.match((await view("session-4")).body.reason, /no page yet/);
+    for (const s of ["session-1", "session-3", "session-4"]) {
+      assert.ok(!(await view(s)).body.reason.includes(OTHER_URL), s);
+    }
+    assert.equal(await getCurrentId(proxy, "session-3"), 404, "the MCP pointer is not the newest tree");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a resumed session links its newest tree, while MCP resumes from the stored memory page", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const store = new MemtreeLinkStore(pathMod.join(fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-newest-")), "links.json"));
+  store.put("session-1", { url: PAGE_URL_1, index: "index-a", compressed: true });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store, newestTrees: lookup });
+  try {
+    const resumed = await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" });
+    assert.equal(stripAnsi(resumed.body.systemMessage), `• MemTree\n  ${NEWEST_URL}`);
+    assert.equal(await getCurrentId(proxy, "session-1"), "ea18af90658b");
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

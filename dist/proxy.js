@@ -251,6 +251,7 @@ export function startProxy(opts) {
         memtreePages: new Map(),
         memtreeCallSeq: 0,
         memtreeLinkStore: opts.memtreeLinkStore,
+        newestTrees: opts.newestTrees,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
         defaultCompactOff: opts.defaultCompactTarget === null,
@@ -601,6 +602,10 @@ async function handleNoticeHook(req, res, state, reqlog) {
         return;
     }
     if (parsed.hook_event_name === "SessionStart") {
+        // A resume waits briefly for the newest tree; a fresh session has none to wait for.
+        if (parsed.agent_id === undefined && parsed.source === "resume") {
+            await state.newestTrees?.settle(parsed.session_id);
+        }
         const line = resumeLinkLine(state, parsed);
         if (!line) {
             res.writeHead(204);
@@ -620,6 +625,13 @@ async function handleNoticeHook(req, res, state, reqlog) {
         // `/memtree-view`: answered here and blocked, so no model turn runs and
         // the prompt never enters the conversation. Not a human turn either, so
         // none of the turn state below is touched.
+        if (parsed.agent_id === undefined) {
+            // `/memtree-view` waits briefly for the newest tree; a prompt only warms it.
+            if (isMemtreeViewCommand(parsed.prompt))
+                await state.newestTrees?.settle(parsed.session_id);
+            else
+                state.newestTrees?.peek(parsed.session_id);
+        }
         const commandReply = parsed.agent_id === undefined
             ? sessionCommandReply(state, parsed.session_id, parsed.prompt)
             : undefined;
@@ -1669,16 +1681,7 @@ function compressionTotals(rec, result) {
  * permanent — it outlives this proxy — and fits a terminal line.
  */
 function installMemtreeLink(state, placement) {
-    const resolve = (sessionId) => {
-        const latest = currentMemtreePage(state, sessionId);
-        if (!latest)
-            return undefined;
-        return {
-            key: latest.index,
-            link: latest.url,
-            ...(latest.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
-        };
-    };
+    const resolve = (sessionId) => sessionLink(state, sessionId, currentMemtreePage(state, sessionId));
     switch (placement) {
         case "success":
             state.notices.setLink(resolve);
@@ -1715,9 +1718,10 @@ function resumeLinkLine(state, input) {
     const page = inMemory && inMemory.sessionId === sessionId
         ? inMemory
         : state.memtreeLinkStore?.get(sessionId);
-    if (!page)
+    const link = sessionLink(state, sessionId, page);
+    if (!link)
         return undefined;
-    if (page !== inMemory) {
+    if (page && page !== inMemory) {
         rememberMemtreePage(state, sessionId, {
             sessionId,
             url: page.url,
@@ -1726,11 +1730,7 @@ function resumeLinkLine(state, input) {
             seq: state.memtreeCallSeq,
         });
     }
-    return state.notices.resumeLine({
-        key: page.index,
-        link: page.url,
-        ...(page.compressed ? {} : { note: NOT_COMPRESSED_NOTE }),
-    }, sessionId);
+    return state.notices.resumeLine(link, sessionId);
 }
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
@@ -1788,10 +1788,27 @@ function memtreeViewLine(state, sessionId) {
     const page = inMemory && (inMemory.sessionId === undefined || inMemory.sessionId === sessionId)
         ? inMemory
         : state.memtreeLinkStore?.get(sessionId);
-    if (!page) {
+    const link = sessionLink(state, sessionId, page);
+    if (!link) {
         return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
     }
-    return linkLines(LINK_LABEL, page.url, page.compressed ? undefined : NOT_COMPRESSED_NOTE);
+    const lines = linkLines(LINK_LABEL, link.link, link.note);
+    // The memory the agent works from can be an older tree than the newest one.
+    return page?.compressed && page.url !== link.link
+        ? `${lines}\n  memory from ${page.url}`
+        : lines;
+}
+/**
+ * The link shown for a session: its newest completed tree when the server
+ * named one (newestTrees), else `source`, the page its memory came from. The
+ * key is the tree, so each newly finished tree is announced once.
+ */
+function sessionLink(state, sessionId, source) {
+    const newest = state.newestTrees?.peek(sessionId);
+    const note = source && !source.compressed ? { note: NOT_COMPRESSED_NOTE } : {};
+    if (newest)
+        return { key: newest.key, link: newest.url, ...note };
+    return source ? { key: source.index, link: source.url, ...note } : undefined;
 }
 function nextMemtreeCallSeq(state) {
     return ++state.memtreeCallSeq;
@@ -1814,8 +1831,9 @@ function noteMemtreePage(state, seq, sessionId, result) {
         return;
     const compressed = didMemtreeCompress(result);
     rememberMemtreePage(state, sessionId, { sessionId, url, index, compressed, seq });
-    if (sessionId)
-        state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
+    state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
+    // A cached newest tree may predate this page; ask again.
+    state.newestTrees?.invalidate(sessionId);
 }
 /** Bound optional page state independently of how many sessions use the proxy. */
 function rememberMemtreePage(state, sessionId, page) {

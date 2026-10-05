@@ -42,6 +42,7 @@ import { capCacheBreakpoints } from "./route-cache.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
+import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import { type RequestLogSink } from "./reqlog.js";
@@ -123,6 +124,13 @@ export interface ProxyOptions {
      * the CLI passes the default store under ~/.claude-code-infinite.
      */
     memtreeLinkStore?: MemtreeLinkStore;
+    /**
+     * The session's newest completed tree, asked of the server, which the link
+     * shown to the user points at (the compress page is only the tree the memory
+     * came from, and can be days old). Omitted means the link is the compress
+     * page (tests); the CLI passes a lookup over the user's key.
+     */
+    newestTrees?: NewestTreeLookup;
     /**
      * Per-response token usage (thinking share on the MemTree page), read from
      * Claude Code's transcript. Omitted means none is sent (tests); the CLI
