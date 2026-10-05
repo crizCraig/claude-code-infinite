@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { checkCompressedHistory } from "../dist/memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory } from "../dist/memtree.js";
 
 const usage = { prompt_tokens_details: { cached_tokens: 10_000 } };
 
@@ -156,3 +156,19 @@ for (const { name, content, flattened } of canonicalEchoCases) {
     assert.equal(check.usable, false);
   });
 }
+
+test("index coverage prefers usage.indexed_tokens over the billed cached_tokens", () => {
+  // Servers from 2026-10-04 bill a passthrough's covered input at nothing, so
+  // cached_tokens is 0 there even with a tree; indexed_tokens keeps coverage.
+  const passthrough = {
+    messages: [],
+    compressed: false,
+    usage: { prompt_tokens_details: { cached_tokens: 0 }, indexed_tokens: 800 },
+  };
+  assert.equal(cachedPromptTokenCount(passthrough), 800);
+  const older = { messages: [], usage: { prompt_tokens_details: { cached_tokens: 300 } } };
+  assert.equal(cachedPromptTokenCount(older), 300, "older servers: cached_tokens");
+  const bad = { messages: [], usage: { indexed_tokens: -1, prompt_tokens_details: { cached_tokens: 5 } } };
+  assert.equal(cachedPromptTokenCount(bad), 5, "an invalid indexed_tokens falls back");
+  assert.equal(cachedPromptTokenCount({ messages: [] }), undefined);
+});

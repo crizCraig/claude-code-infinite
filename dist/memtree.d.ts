@@ -146,7 +146,13 @@ export declare function serverFlattenedMessages(result: CompressResult): Message
  * flattened and Anthropic's prefix cache misses every human turn.
  */
 export declare function didMemtreeCompress(result: CompressResult): boolean;
-/** Number of original prompt tokens covered by the index MemTree selected. */
+/**
+ * Number of original prompt tokens covered by the index MemTree selected.
+ *
+ * Prefers `usage.indexed_tokens`: since 2026-10-04 the server bills a
+ * passthrough's covered input at nothing, so `cached_tokens` is 0 there even
+ * when a tree covers the prompt. Older servers only send `cached_tokens`.
+ */
 export declare function cachedPromptTokenCount(result: CompressResult): number | undefined;
 /** The server-reported model budget, when present and sane. */
 export declare function modelBudgetTokens(result: CompressResult): number | undefined;

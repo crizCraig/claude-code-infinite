@@ -72,16 +72,26 @@ export function didMemtreeCompress(result) {
         return result.compressed;
     return (cachedPromptTokenCount(result) ?? 0) > 0;
 }
-/** Number of original prompt tokens covered by the index MemTree selected. */
+/**
+ * Number of original prompt tokens covered by the index MemTree selected.
+ *
+ * Prefers `usage.indexed_tokens`: since 2026-10-04 the server bills a
+ * passthrough's covered input at nothing, so `cached_tokens` is 0 there even
+ * when a tree covers the prompt. Older servers only send `cached_tokens`.
+ */
 export function cachedPromptTokenCount(result) {
-    const details = usageRecord(result)?.prompt_tokens_details;
+    const usage = usageRecord(result);
+    const indexed = nonNegativeCount(usage?.indexed_tokens);
+    if (indexed !== undefined)
+        return indexed;
+    const details = usage?.prompt_tokens_details;
     if (!details || typeof details !== "object")
         return undefined;
-    const cachedTokens = details.cached_tokens;
-    return typeof cachedTokens === "number" &&
-        Number.isFinite(cachedTokens) &&
-        cachedTokens >= 0
-        ? cachedTokens
+    return nonNegativeCount(details.cached_tokens);
+}
+function nonNegativeCount(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? value
         : undefined;
 }
 /** The server-reported model budget, when present and sane. */
