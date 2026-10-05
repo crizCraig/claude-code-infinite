@@ -8697,18 +8697,33 @@ async function edgeMemtree({
   });
 }
 
-/** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
-async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
+/**
+ * Anthropic stand-in that reports a request's size as bytes/4, like its usage.
+ * `usageTokens(body, bytes)` overrides one response's reported input tokens.
+ * Count Tokens calls (kept out of `bodies`) answer bytes/4 of the counted body,
+ * after failing the first `countFailures` with a 500.
+ */
+async function sizingUpstream({
+  bytesPerToken = 4, reportUsage = true, usageTokens = () => undefined, countFailures = 0,
+} = {}) {
   const bodies = [];
   const rawBodies = [];
+  const countCalls = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
+      if (req.url.includes("/count_tokens")) {
+        countCalls.push({ url: req.url, headers: req.headers, body: JSON.parse(raw.toString("utf-8")) });
+        const failed = countCalls.length <= countFailures;
+        const reply = JSON.stringify(failed ? { error: "down" } : { input_tokens: Math.floor(raw.length / bytesPerToken) });
+        res.writeHead(failed ? 500 : 200, { "content-type": "application/json" });
+        return res.end(reply);
+      }
       rawBodies.push(raw.toString("utf-8"));
       bodies.push(JSON.parse(raw.toString("utf-8")));
-      const tokens = Math.floor(raw.length / bytesPerToken);
+      const tokens = usageTokens(bodies.at(-1), raw.length) ?? Math.floor(raw.length / bytesPerToken);
       const body = JSON.stringify({
         type: "message",
         id: "msg_upstream",
@@ -8722,7 +8737,7 @@ async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
       res.end(body);
     });
   });
-  return { ...srv, bodies, rawBodies };
+  return { ...srv, bodies, rawBodies, countCalls };
 }
 
 async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upstreamOptions = {} } = {}) {
@@ -8789,7 +8804,43 @@ const countMarkers = (b) =>
 
 test("client_input_tokens: a server that undercounts still compresses what ccc measures over budget (2026-10-05 stuck session)", async () => {
   // Uncalibrated proxy (no upstream usage), so ccc sends a threshold and lets
-  // the server measure; the server sees half the size ccc does.
+  // the server measure; the server sees half the size ccc does. Count Tokens
+  // turns ccc's unknown estimate into an exact one before the decision.
+  const h = await edgeHarness({
+    budget: 20_000,
+    memtree: { charsPerToken: 8 },
+    upstreamOptions: { reportUsage: false },
+    proxyOpts: { countTokens: true },
+  });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    conv.push(assistantText("a1"), markedUser("q2"));
+    assert.equal((await h.post(conv)).turnType, "followup-noop", "learns the server budget");
+    assert.equal(h.upstream.countCalls.length, 0, "small requests are not counted");
+
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const forwarded = h.upstream.bodies.length;
+    const t3 = await h.post(conv);
+    assert.equal(t3.countTokens.phase, "estimate");
+    assert.equal(t3.compaction.estimatedTokens, t3.countTokens.tokens);
+    const call = h.compressCalls().at(-1);
+    assert.equal(call.compression_threshold_tokens, undefined, "an exact size forces compression");
+    assert.equal(call.client_input_tokens, t3.countTokens.tokens);
+    assert.ok(call.client_input_tokens > 20_000, "ccc measures the request over budget");
+    assert.equal(t3.turnType, "followup-compressed");
+    assert.equal(h.upstream.bodies.length, forwarded + 1, "forwarded, not refused");
+    const counted = h.upstream.countCalls[0];
+    assert.match(counted.url, /^\/v1\/messages\/count_tokens/);
+    assert.equal(counted.body.max_tokens, undefined, "only countable fields are sent");
+    assert.ok(Array.isArray(counted.body.messages));
+  } finally {
+    h.close();
+  }
+});
+
+test("client_input_tokens: a bytes/4 guess is never sent", async () => {
   const h = await edgeHarness({
     budget: 20_000,
     memtree: { charsPerToken: 8 },
@@ -8799,18 +8850,90 @@ test("client_input_tokens: a server that undercounts still compresses what ccc m
     const conv = [userText("q1")];
     await h.post(conv);
     conv.push(assistantText("a1"), markedUser("q2"));
-    assert.equal((await h.post(conv)).turnType, "followup-noop", "learns the server budget");
-
+    await h.post(conv);
     conv[conv.length - 1] = userText("q2");
     conv.push(assistantText("a2"), markedUser(BIG("q3")));
-    const forwarded = h.upstream.bodies.length;
     const t3 = await h.post(conv);
-    const call = h.compressCalls().at(-1);
-    assert.equal(call.compression_threshold_tokens, 20_000);
-    assert.equal(call.client_input_tokens, t3.compaction.estimatedTokens);
-    assert.ok(call.client_input_tokens > 20_000, "ccc measures the request over budget");
-    assert.equal(t3.turnType, "followup-compressed");
-    assert.equal(h.upstream.bodies.length, forwarded + 1, "forwarded, not refused");
+    assert.equal(t3.compaction.sizeSource, "bytes");
+    assert.equal(h.compressCalls().at(-1).client_input_tokens, undefined);
+  } finally {
+    h.close();
+  }
+});
+
+/** A subagent tool turn whose request body is exactly `bytes` long in edgeHarness.post. */
+function sizedAgentTurn(bytes, extraBody = {}) {
+  const turn = (text) => [
+    userText("task"),
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: text }] },
+  ];
+  const envelope = JSON.stringify({
+    model: "claude-x",
+    max_tokens: 64,
+    system: [{ type: "text", text: "sys", cache_control: EPH }],
+    messages: turn(""),
+    ...extraBody,
+  }).length;
+  return turn("x".repeat(bytes - envelope));
+}
+
+test("a skewed size sample cannot refuse a 469,801-byte subagent request (2026-10-05)", async () => {
+  // A web-search helper's usage counts its server tool results as input:
+  // 12,040 tokens for a tiny body. Neither a helper on the subagent's lane
+  // (parent id only, another model) nor the subagent itself may teach the
+  // subagent that ratio. MemTree is no help here (noop), so before the fix
+  // the inflated estimate hit the fallback refusal.
+  const h = await edgeHarness({
+    budget: 800_000,
+    memtree: { noop: true },
+    upstreamOptions: { usageTokens: (_body, bytes) => (bytes < 2_000 ? 12_040 : undefined) },
+  });
+  try {
+    const search = [userText("Perform a web search for the query: Muse Spark pricing")];
+    await h.post(search, { "x-claude-code-parent-agent-id": "a1" }, { model: "claude-haiku-4-5" });
+    await h.post(search, { "x-claude-code-agent-id": "a2" });
+
+    for (const agent of ["a1", "a2"]) {
+      const forwarded = h.upstream.bodies.length;
+      const rec = await h.post(sizedAgentTurn(469_801), { "x-claude-code-agent-id": agent });
+      assert.equal(rec.routeLane, "agent");
+      assert.equal(rec.requestBytes, 469_801);
+      assert.ok(rec.compaction.estimatedTokens < 200_000, `${agent}: ${rec.compaction.estimatedTokens}`);
+      assert.equal(rec.forwardedBytes, 469_801, `${agent} forwarded whole`);
+      assert.equal(h.upstream.bodies.length, forwarded + 1);
+    }
+  } finally {
+    h.close();
+  }
+});
+
+test("an estimate alone never refuses: the request is counted exactly first", async () => {
+  // A plausible but stale sample (0.9 tokens/byte) sizes a 469,801-byte
+  // request at ~422k against a 200k budget. The pre-decision count fails, so
+  // the estimate stands through compaction (MemTree noop); the refusal check
+  // counts again, finds ~117k, and sends it.
+  const h = await edgeHarness({
+    budget: 200_000,
+    memtree: { noop: true },
+    proxyOpts: { countTokens: true },
+    upstreamOptions: {
+      usageTokens: (_body, bytes) => (bytes < 20_000 ? Math.floor(bytes * 0.9) : undefined),
+      countFailures: 1,
+    },
+  });
+  try {
+    const agent = { "x-claude-code-agent-id": "a3" };
+    await h.post(sizedAgentTurn(10_000), agent);
+    const forwarded = h.upstream.bodies.length;
+    const rec = await h.post(sizedAgentTurn(469_801), agent);
+    assert.ok(rec.compaction.estimatedTokens > 400_000, "the stale estimate is over budget");
+    assert.equal(h.upstream.countCalls.length, 2, "pre-decision count (failed), then the refusal's");
+    assert.equal(rec.countTokens.phase, "refusal");
+    assert.equal(rec.countTokens.ok, true);
+    assert.ok(rec.countTokens.tokens < 200_000);
+    assert.equal(rec.forwardedBytes, 469_801, "sent whole on the exact count");
+    assert.equal(h.upstream.bodies.length, forwarded + 1);
   } finally {
     h.close();
   }

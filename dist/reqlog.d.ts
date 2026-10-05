@@ -81,6 +81,18 @@ export interface UsageRecord {
  * written once when the response finishes. Fields that a given path can't
  * derive cheaply are simply omitted.
  */
+/** One Count Tokens call made to size a request (MessagesRecord.countTokens). */
+export interface CountTokensRecord {
+    phase: "estimate" | "refusal";
+    ok: boolean;
+    ms: number;
+    /** The estimate the call checked. */
+    estimatedTokens: number;
+    /** Exact input tokens, when the call succeeded. */
+    tokens?: number;
+    /** Upstream HTTP status, when a response arrived. */
+    status?: number;
+}
 export interface MessagesRecord {
     kind: "messages";
     turnType: TurnType;
@@ -185,6 +197,12 @@ export interface MessagesRecord {
      * the CCC_TOOL_ROUTE_RECOVERY=0 kill switch.
      */
     compaction?: CompactionRecord;
+    /**
+     * The last Count Tokens call made for this request (count-tokens.ts): to
+     * size it before the compaction decision ("estimate"), or before refusing
+     * it on an estimate ("refusal").
+     */
+    countTokens?: CountTokensRecord;
     /**
      * Outcome of a tool-turn compaction attempt (a tool turn whose estimated
      * size reached the budget), or why none was made although one was due.

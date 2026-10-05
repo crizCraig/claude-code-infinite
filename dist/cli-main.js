@@ -280,6 +280,10 @@ async function main() {
         // same-session-only eviction of a rejected route, because those are what
         // stop a side request from stranding the tool loop.
         toolRouteRecovery: process.env.CCC_TOOL_ROUTE_RECOVERY !== "0",
+        // Exact sizes from Count Tokens where an estimate would decide alone
+        // (unknown, a big jump near the budget, or a refusal). CCC_COUNT_TOKENS=0
+        // keeps estimates only.
+        countTokens: process.env.CCC_COUNT_TOKENS !== "0",
         // Programs launched from inside Claude Code inherit ANTHROPIC_BASE_URL;
         // only Claude Code's own requests get MemTree. CCC_CLAUDE_CODE_ONLY=0
         // turns the filter off.

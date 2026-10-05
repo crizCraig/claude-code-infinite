@@ -39,6 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
+import { type SizeSample } from "./count-tokens.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
@@ -64,6 +65,14 @@ export interface ProxyOptions {
      * when one exists and otherwise go out whole.
      */
     toolRouteRecovery?: boolean;
+    /**
+     * Size requests exactly with Anthropic's Count Tokens endpoint, using the
+     * request's own credentials (count-tokens.ts): before a compaction decision
+     * when the estimate is unknown or a jump nears the budget, and always before
+     * refusing a request on an estimate. The CLI turns this on
+     * (`CCC_COUNT_TOKENS=0` turns it off); embedders and tests keep estimates.
+     */
+    countTokens?: boolean;
     /**
      * Handle only Claude Code's own requests. ccc launches Claude Code with
      * ANTHROPIC_BASE_URL pointing here, and every program Claude Code runs
@@ -162,12 +171,6 @@ export interface RunningProxy {
      */
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
-/** A request size Anthropic reported, and the bytes of the body it was for. */
-interface SizeSample {
-    /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
-    tokens: number;
-    forwardedBytes: number;
-}
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share
  * of the model's context window (800k of Opus 5.5's 1M, matching the server's
@@ -188,7 +191,9 @@ export declare function parseTokenCount(text: string): number | undefined;
  * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
  * 429k reported), which would delay recompression past the budget. Growth
  * uses the denser of the sample's ratio and bytes/4, so the estimate errs
- * high. bytes/4 only when there is no sample.
+ * high. bytes/4 when there is no sample, or only an implausible one
+ * (plausibleSample): a 12 tokens/byte sample once sized a 469,801-byte
+ * subagent request at 5.78M tokens and refused it (2026-10-05).
  */
 declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): {
     tokens: number;
