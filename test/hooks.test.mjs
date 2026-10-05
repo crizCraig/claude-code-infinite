@@ -126,7 +126,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
       hookEventName: "MessageDisplay",
       displayContent:
         "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
-        "  https://app.polychat.co/m/aaaaaaaaaaaa\nanswer",
+        "  https://app.polychat.co/m/aaaaaaaaaaaa\n\nanswer",
     },
   });
   assert.equal(queue.linkPending("session-1"), false);

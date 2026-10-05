@@ -51,7 +51,8 @@ import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
-import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
+import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsColor, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
+import { hyperlink } from "./payment-gate.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
@@ -1792,7 +1793,9 @@ function memtreeViewLine(state, sessionId) {
     if (!link) {
         return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
     }
-    const lines = linkLines(LINK_LABEL, link.link, link.note);
+    // Blocked-prompt reasons need an explicit hyperlink in styled terminals.
+    const url = terminalSupportsColor() ? hyperlink(link.link, link.link) : link.link;
+    const lines = linkLines(LINK_LABEL, url, link.note);
     // The memory the agent works from can be an older tree than the newest one.
     return page?.compressed && page.url !== link.link
         ? `${lines}\n  memory from ${page.url}`

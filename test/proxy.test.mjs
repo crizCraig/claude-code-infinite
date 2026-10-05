@@ -2617,12 +2617,12 @@ test(`the first success line links the page; later ones only when a new index wa
     await postSessionMessages(proxy.port, followupTurn("turn two"));
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
     const rendered = first.body.hookSpecificOutput.displayContent;
-    assert.equal(linkText(rendered), `${successLine(PAGE_URL_1)}\nupstream answer`);
+    assert.equal(linkText(rendered), `${successLine(PAGE_URL_1)}\n\nupstream answer`);
     if (color) {
-      assert.match(rendered, /\x1b\[39m\n  https:\/\/app\.polychat\.co\/m\/ea18af90658b\nupstream/,
+      assert.match(rendered, /\x1b\[39m\n  https:\/\/app\.polychat\.co\/m\/ea18af90658b\n\nupstream/,
         "the link sits bare on its own line after the SGR reset, so a linkifier cannot swallow it");
     } else {
-      assert.equal(rendered.replace(SUCCESS_TOTALS_RE, ""), `${successLine(PAGE_URL_1)}\nupstream answer`,
+      assert.equal(rendered.replace(SUCCESS_TOTALS_RE, ""), `${successLine(PAGE_URL_1)}\n\nupstream answer`,
         "NO_COLOR leaves the entire notice and URL plain");
     }
     assert.equal(
@@ -2643,7 +2643,7 @@ test(`the first success line links the page; later ones only when a new index wa
     const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3" }));
     assert.equal(
       linkText(next.body.hookSpecificOutput.displayContent),
-      `${successLine(PAGE_URL_3)}\nupstream answer`
+      `${successLine(PAGE_URL_3)}\n\nupstream answer`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
   } finally {
@@ -3036,7 +3036,12 @@ test("/memtree-view is answered by the hook and blocked, without touching turn s
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
     const shown = await view("/ccc:memtree-view");
-    assert.deepEqual(shown.body, {
+    // In a color terminal the URL is also an OSC 8 hyperlink to itself.
+    const osc8 = /\x1b\]8;;([^\x1b]*)\x1b\\/g;
+    for (const [, target] of shown.body.reason.matchAll(osc8)) {
+      assert.ok(target === "" || target === PAGE_URL_1);
+    }
+    assert.deepEqual({ ...shown.body, reason: shown.body.reason.replace(osc8, "") }, {
       decision: "block",
       reason: `• MemTree\n  ${PAGE_URL_1}`,
       hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
@@ -3128,7 +3133,7 @@ test("default placement: the success line carries the link; the end-of-turn line
     await postSessionMessages(proxy.port, followupTurn("turn two"));
     // The success line shows the page below it, so Stop doesn't repeat it.
     const shown = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
-    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_1)}\nupstream answer`);
+    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_1)}\n\nupstream answer`);
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 
     // Same index, new page URL: nothing at the end of this turn.
@@ -3141,7 +3146,7 @@ test("default placement: the success line carries the link; the end-of-turn line
     await armMainTurn(proxy, "turn four", "prompt-3");
     await postSessionMessages(proxy.port, followupTurn("turn four"));
     const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
-    assert.equal(linkText(next.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_3)}\nupstream answer`);
+    assert.equal(linkText(next.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_3)}\n\nupstream answer`);
     assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
   } finally {
     proxy.close();

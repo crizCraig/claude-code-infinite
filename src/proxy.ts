@@ -101,12 +101,14 @@ import {
   TRAILER_LABEL,
   LINK_LABEL,
   linkLines,
+  terminalSupportsColor,
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
   type SessionStartHookInput,
   type SuccessLink,
 } from "./hooks.js";
+import { hyperlink } from "./payment-gate.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
@@ -2544,7 +2546,9 @@ function memtreeViewLine(state: ProxyState, sessionId: string): string {
   if (!link) {
     return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
   }
-  const lines = linkLines(LINK_LABEL, link.link, link.note);
+  // Blocked-prompt reasons need an explicit hyperlink in styled terminals.
+  const url = terminalSupportsColor() ? hyperlink(link.link, link.link) : link.link;
+  const lines = linkLines(LINK_LABEL, url, link.note);
   // The memory the agent works from can be an older tree than the newest one.
   return page?.compressed && page.url !== link.link
     ? `${lines}\n  memory from ${page.url}`
