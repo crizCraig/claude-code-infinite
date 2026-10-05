@@ -247,7 +247,9 @@ export class NoticeDeliveryQueue {
             // supported terminal (and stripped cleanly in monochrome/NO_COLOR).
             // Reset foreground only so surrounding renderer styles are preserved.
             const styled = this.renderSuccess(prefix, input.session_id);
-            displayContent = `${styled}\n${displayContent}`;
+            // A blank line under the link keeps the answer from crowding it.
+            const gap = styled.includes("\n") && displayContent ? "\n" : "";
+            displayContent = `${styled}\n${gap}${displayContent}`;
         }
         if (suffix) {
             const separator = displayContent && !displayContent.endsWith("\n") ? "\n" : "";

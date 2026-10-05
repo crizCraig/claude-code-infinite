@@ -101,11 +101,13 @@ import {
   TRAILER_LABEL,
   LINK_LABEL,
   linkLines,
+  terminalSupportsColor,
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
   type SessionStartHookInput,
 } from "./hooks.js";
+import { hyperlink } from "./payment-gate.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
 import {
@@ -2533,7 +2535,11 @@ function memtreeViewLine(state: ProxyState, sessionId: string): string {
   if (!page) {
     return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
   }
-  return linkLines(LINK_LABEL, page.url, page.compressed ? undefined : NOT_COMPRESSED_NOTE);
+  // Claude Code shows a blocked prompt's reason as plain text, without the
+  // linkifying it gives message content, so the URL carries its own OSC 8
+  // hyperlink (the URL as the visible text) where the terminal styles output.
+  const url = terminalSupportsColor() ? hyperlink(page.url, page.url) : page.url;
+  return linkLines(LINK_LABEL, url, page.compressed ? undefined : NOT_COMPRESSED_NOTE);
 }
 
 function nextMemtreeCallSeq(state: ProxyState): number {
