@@ -41,7 +41,7 @@
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { fitsFallbackBudget, RouteFallbackFailures } from "./route-fallback.js";
-import { countUpstreamTokens, plausibleSample, shouldCountTokens, } from "./count-tokens.js";
+import { createCountTokensSession, CountTokensCooldowns, plausibleSample, shouldCountTokens, } from "./count-tokens.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
 import https from "node:https";
@@ -259,6 +259,7 @@ export function startProxy(opts) {
         stablePrefixes: new Map(),
         serverBudgets: new Map(),
         serverReportsBudget: false,
+        countTokensCooldowns: new CountTokensCooldowns(),
         passthroughSizes: new Map(),
         laneSizes: new Map(),
     };
@@ -882,8 +883,15 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Before anything reads the size sample: replace an unknown or stale
     // estimate with an exact count where it would decide the outcome.
     const requestSessionKey = requestSessionId(req);
-    await calibrateWholeRequestSize({
-        opts, state, upstream, req, rec, body, forwardBody, modelContextLimit,
+    const countSession = createCountTokensSession({
+        upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
+        signal: state.shutdownSignal,
+        onAttempt: (result) => {
+            (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms });
+        },
+    }, state.countTokensCooldowns);
+    const exactInputTokens = await calibrateWholeRequestSize({
+        opts, state, body, forwardBody, modelContextLimit, countSession,
         sizeSlot: wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey),
         rides: state.memoryRoutes.has(requestRouteKey) ||
             (isMainRequest && requestSessionKey !== undefined &&
@@ -935,17 +943,12 @@ async function handleMessages(req, res, opts, upstream, state) {
         allowed: new WeakSet(),
         accept: (buffer) => {
             const policy = requestSendPolicies.get(req);
-            if (policy.allowed.has(buffer)) {
-                if (!routedBodyExceedsContext(body, buffer, modelContextLimit))
-                    return true;
-                policy.allowed.delete(buffer);
-            }
             return acceptWholeRequest({
-                opts, state, upstream, req, res, rec, body, modelContextLimit,
+                opts, state, res, rec, body, modelContextLimit, countSession,
+                transformed: policy.allowed.has(buffer),
                 routeKey: requestRouteKey,
                 sizeSlot: wholeRequestSizeSlot(state, isMainRequest, requestSessionId(req), requestSizeKey),
-                rawBytes: rawBody.length,
-                sendBody: policy.failedRebuild ? policy.original : buffer,
+                sendBody: policy.failedRebuild && !policy.allowed.has(buffer) ? policy.original : buffer,
             });
         },
         delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
@@ -1062,6 +1065,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 sessionId: toolSessionId,
                 routeKey: requestRouteKey,
                 sizeKey: requestSizeKey,
+                exactInputTokens,
                 isMainRequest,
                 modelContextLimit,
                 forwardBody,
@@ -1230,6 +1234,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     // recap rides the main route above; subagents keep per-turn compression.
     const edge = isMainRequest && sessionId !== undefined
         ? planEdgeCompaction({
+            exactInputTokens,
             opts,
             state,
             body,
@@ -2357,7 +2362,9 @@ function planEdgeCompaction(args) {
     }
     if (state.compactNow.has(sessionId))
         return forced("manual");
-    const size = estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
+    const size = args.exactInputTokens !== undefined
+        ? { tokens: args.exactInputTokens, source: "reported" }
+        : estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = forwardBody.length;
     compaction.sizeSource = size.source;
@@ -2419,14 +2426,18 @@ function planToolCompaction(args) {
         }
     }
     if (!ride) {
-        overWindow ||= routedBodyExceedsContext(body, forwardBody, modelContextLimit);
+        overWindow ||= args.exactInputTokens !== undefined
+            ? args.exactInputTokens + Math.max(0, body.max_tokens ?? 0) > modelContextLimit
+            : routedBodyExceedsContext(body, forwardBody, modelContextLimit);
     }
     const sample = ride
         ? ride.sizeHolder.lastSize
         : stableLane
             ? state.passthroughSizes.get(sessionId)
             : state.laneSizes.get(args.sizeKey);
-    const size = estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
+    const size = !ride && args.exactInputTokens !== undefined
+        ? { tokens: args.exactInputTokens, source: "reported" }
+        : estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
@@ -2497,7 +2508,7 @@ function routedBodyExceedsContext(body, routedBody, modelContextLimit) {
     const outputTokens = typeof body.max_tokens === "number" &&
         Number.isFinite(body.max_tokens) ? Math.max(0, body.max_tokens) : 0;
     // This is the existing local byte estimate, not a tokenizer or a hard cap.
-    // Recovery remains best-effort and never calls the provider to count tokens.
+    // Final forwarding checks can replace this estimate with Count Tokens.
     return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
 }
 function regrantSmallerWindowRecovery(state, key, modelContextLimit) {
@@ -3342,44 +3353,45 @@ async function handleCountTokens(req, res, opts, upstream, state) {
  * picks it up without threading a parameter through each one.
  */
 const recapLinkAppenders = new WeakMap();
-/**
- * Whether a request with no usable compressed form may go out whole
- * (fitsFallbackBudget), refusing it with a bounded 503/400 when not. The
- * estimate alone never refuses: before refusing, the body is counted exactly
- * with Count Tokens (when enabled) and sent if the count fits, and the count
- * becomes the slot's sample. An estimate is only as good as its sample, and a
- * bad one stranded subagents on 2026-10-05 (469,801 bytes sized at 5.78M).
- */
-function acceptWholeRequest(args) {
-    const { opts, state, body, modelContextLimit } = args;
+/** Final forwarding uses the native window; the soft budget already requested compression. */
+async function acceptWholeRequest(args) {
+    const { opts, state, body, modelContextLimit, sendBody } = args;
     const budget = resolveBudget(opts, state, body.model, modelContextLimit).tokens;
-    const outputTokens = typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0;
-    const fits = (input) => fitsFallbackBudget(input, outputTokens, budget, modelContextLimit);
-    const estimated = estimateRequestTokens(args.sizeSlot.get(), args.rawBytes).tokens;
-    if (fits(estimated))
-        return true;
-    if (!opts.countTokens)
-        return refuseWholeRequest(args, estimated, budget);
-    return countUpstreamTokens({
-        upstream: args.upstream,
-        headers: forwardableRequestHeaders(args.req),
-        requestUrl: args.req.url,
-        body: args.sendBody,
-        signal: state.shutdownSignal,
-    }).then((counted) => {
-        args.rec.countTokens = countTokensRecord("refusal", counted, estimated);
-        if (counted.tokens === undefined)
-            return refuseWholeRequest(args, estimated, budget);
-        args.sizeSlot.set({ tokens: counted.tokens, forwardedBytes: args.sendBody.length });
-        return fits(counted.tokens) || refuseWholeRequest(args, counted.tokens, budget);
-    });
+    const output = typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0;
+    const fits = (input) => fitsFallbackBudget(input, output, budget, modelContextLimit);
+    // Whole-history samples must never scale a compressed body's size. A ride's
+    // compaction record already measured this assembled body from its own sample.
+    const compaction = args.rec.compaction;
+    const rideSample = args.transformed && compaction?.sizeSource === "reported" &&
+        compaction.estimatedBytes === sendBody.length && compaction.estimatedTokens !== undefined
+        ? { tokens: compaction.estimatedTokens, forwardedBytes: sendBody.length } : undefined;
+    const sample = args.transformed ? rideSample : args.sizeSlot.get();
+    const estimate = estimateRequestTokens(sample, sendBody.length).tokens;
+    let counted = args.countSession.peek(sendBody);
+    const unknownTransformedSize = args.transformed &&
+        shouldCountTokens(sample, sendBody.length, estimate, budget);
+    if (counted?.tokens === undefined && opts.countTokens && (!fits(estimate) || unknownTransformedSize)) {
+        counted = await args.countSession.count(sendBody);
+    }
+    const exact = counted?.tokens;
+    const bytesFallback = !opts.countTokens || (counted !== undefined && exact === undefined);
+    const input = exact ?? (bytesFallback ? approxTokensFromBytes(sendBody.length) : estimate);
+    if (!fits(input))
+        return refuseWholeRequest(args, input, budget);
+    if (input > budget || (exact === undefined && !args.transformed && estimate > budget)) {
+        args.rec.overBudgetForward = {
+            reason: exact !== undefined ? "exact-count-fits-window"
+                : bytesFallback ? "bytes-fallback-fits-window" : "estimate-fits-window",
+        };
+    }
+    return true;
 }
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const failure = args.state.fallbackFailures.fail(args.routeKey);
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
-    console.error("[ccc proxy] request exceeds compaction budget; recovery failed", {
+    console.error("[ccc proxy] request exceeds native context window; recovery failed", {
         lane: args.routeKey, attempt: failure.attempt, status: failure.status,
         inputTokens, outputTokens: args.body.max_tokens ?? 0,
         budgetTokens, modelContextLimit: args.modelContextLimit,
@@ -3400,34 +3412,19 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
 async function calibrateWholeRequestSize(args) {
     const { opts, state, body, forwardBody } = args;
     if (!opts.countTokens || args.rides)
-        return;
+        return undefined;
     const budget = resolveBudget(opts, state, body.model, args.modelContextLimit).tokens;
     const sample = args.sizeSlot.get();
     const estimated = estimateRequestTokens(sample, forwardBody.length).tokens;
     if (!shouldCountTokens(sample, forwardBody.length, estimated, budget))
-        return;
-    const counted = await countUpstreamTokens({
-        upstream: args.upstream,
-        headers: forwardableRequestHeaders(args.req),
-        requestUrl: args.req.url,
-        body: forwardBody,
-        signal: state.shutdownSignal,
-    });
-    args.rec.countTokens = countTokensRecord("estimate", counted, estimated);
+        return undefined;
+    const counted = await args.countSession.count(forwardBody);
     if (counted.tokens === undefined)
-        return;
+        return undefined;
     args.sizeSlot.set({ tokens: counted.tokens, forwardedBytes: forwardBody.length });
-}
-/** The reqlog's view of one Count Tokens call. */
-function countTokensRecord(phase, counted, estimatedTokens) {
-    return {
-        phase,
-        ok: counted.tokens !== undefined,
-        ms: counted.ms,
-        estimatedTokens,
-        ...(counted.tokens !== undefined ? { tokens: counted.tokens } : {}),
-        ...(counted.status !== undefined ? { status: counted.status } : {}),
-    };
+    // Exact results remain authoritative for this body even if they are unsuitable
+    // for future learned estimates, or another request replaces the shared sample.
+    return counted.tokens;
 }
 const requestSendPolicies = new WeakMap();
 function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {

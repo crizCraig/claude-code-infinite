@@ -47,7 +47,7 @@ test("failed rebuilding forwards an under-budget original byte-for-byte", async 
 test("failed oversized rebuilding retries twice then terminates, never forwarding history", async () => {
   const h = await harness();
   try {
-    const raw = body("x".repeat(8000));
+    const raw = body("x".repeat(900_000));
     for (const expected of [503, 503, 400, 400]) {
       const response = await request(h.proxy, raw);
       assert.equal(response.status, expected);
@@ -60,7 +60,7 @@ test("failed oversized rebuilding retries twice then terminates, never forwardin
   } finally { h.close(); }
 });
 
-test("fallback compares input with the budget and reserves output against the window", async () => {
+test("fallback ignores the soft budget but reserves output against the native window", async () => {
   const h = await harness();
   try {
     // Under the budget by input (as the server judges it, so it will not compress),
@@ -68,9 +68,12 @@ test("fallback compares input with the budget and reserves output against the wi
     // refusing this for the output reservation failed every session past ~672k.
     assert.equal((await request(h.proxy, body("small history", 1000))).status, 200);
     assert.equal(h.seen.length, 1);
-    // An over-budget input that could not be compressed is still refused.
-    assert.equal((await request(h.proxy, body("x".repeat(8000), 100))).status, 503);
-    assert.equal(h.seen.length, 1);
+    // Input above the soft budget still fits the native window.
+    assert.equal((await request(h.proxy, body("x".repeat(8000), 100))).status, 200);
+    assert.equal(h.seen.length, 2);
+    // Input plus output must fit the actual context window.
+    assert.equal((await request(h.proxy, body("x".repeat(8000), 199_000))).status, 503);
+    assert.equal(h.seen.length, 2);
   } finally { h.close(); }
 });
 
@@ -80,7 +83,7 @@ test("a transport that ignores cancellation cannot hold rebuilding open indefini
     Object.defineProperty(h.memtree, "compressBudgetMs", { get: () => 20 });
     h.memtree.compress = () => new Promise(() => {});
     const started = performance.now();
-    assert.equal((await request(h.proxy, body("x".repeat(8000)))).status, 503);
+    assert.equal((await request(h.proxy, body("x".repeat(8000)))).status, 200);
     assert.ok(performance.now() - started < 1000);
   } finally { h.close(); }
 });

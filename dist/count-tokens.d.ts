@@ -1,20 +1,5 @@
-/**
- * Exact input-token counts from Anthropic's Count Tokens endpoint, made with
- * the user's own credentials, for the size estimates that decide compaction
- * and the fallback refusal (route-fallback.ts).
- *
- * The proxy normally sizes a request from an earlier response's reported
- * usage (a tokens-per-byte sample). That sample can be missing (a fresh proxy
- * after a resume), stale (a big jump of new content of unknown density), or
- * wrong for the request at hand: on 2026-10-05 a 979-byte web-search helper
- * reported 12,040 input tokens (server-side search results count as input),
- * and the 12 tokens/byte it taught its lane sized the next 169,507-byte
- * subagent request at 2.08M tokens and refused it. Counting is free but costs
- * a round trip that re-uploads the body, so it runs only where the estimate
- * is unknown or decides the outcome, never on every request.
- */
 import type http from "node:http";
-import type https from "node:https";
+import https from "node:https";
 /** Bound on a count call: past it the caller keeps its estimate. */
 export declare const COUNT_TOKENS_TIMEOUT_MS = 3000;
 /**
@@ -39,7 +24,11 @@ export interface CountTokensUpstream {
     host: string;
     port: number;
 }
+export type CountTokensOutcome = "success" | "timeout" | "network-error" | "invalid-response" | "http-error" | "server-error" | "auth" | "rate-limit" | "cooldown" | "aborted" | "deadline" | "invalid-request";
 export interface CountTokensResult {
+    outcome: CountTokensOutcome;
+    /** Internal cooldown metadata; never log it. */
+    retryAfter?: string;
     /** Exact input tokens; absent when the call failed or timed out. */
     tokens?: number;
     ms: number;
@@ -54,18 +43,33 @@ export declare function plausibleSample(sample: SizeSample | undefined): sample 
  * calibrated sample is estimated well and is not counted.
  */
 export declare function shouldCountTokens(sample: SizeSample | undefined, bytes: number, estimateTokens: number, budgetTokens: number): boolean;
-/**
- * Count `body`'s input tokens upstream with the caller's headers (credentials,
- * anthropic-version, betas). Never rejects: any failure or a timeout resolves
- * without `tokens`, and the caller keeps its estimate.
- */
-export declare function countUpstreamTokens(args: {
+/** Shared per proxy; only hashes of account/upstream identity are stored. */
+export declare class CountTokensCooldowns {
+    private readonly capacity;
+    private readonly now;
+    private readonly entries;
+    constructor(capacity?: number, now?: () => number);
+    active(key: string): boolean;
+    record(key: string, result: CountTokensResult): void;
+}
+export interface CountTokensSessionOptions {
     upstream: CountTokensUpstream;
     headers: Record<string, string>;
     requestUrl: string | undefined;
-    body: Buffer;
     signal?: AbortSignal;
     timeoutMs?: number;
+    /** Called once per attempt; log only outcome and ms, never tokens or headers. */
+    onAttempt?: (result: CountTokensResult) => void;
+}
+export interface CountTokensSession {
+    count(body: Buffer): Promise<CountTokensResult>;
+    peek(body: Buffer): CountTokensResult | undefined;
+}
+/** Exact results belong to this request and body, never a shared sample slot. */
+export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
+/** All failures resolve without tokens, including synchronous request errors. */
+export declare function countUpstreamTokens(args: CountTokensSessionOptions & {
+    body: Buffer;
 }): Promise<CountTokensResult>;
 /** The countable subset of a Messages request body, or null if it is not one. */
 export declare function countTokensBody(body: Buffer): Buffer | null;

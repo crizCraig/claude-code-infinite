@@ -160,14 +160,14 @@ test("a smaller-window regrant waits for the outage cooldown", async (t) => {
     await fixture.post(original);
     await fixture.post(extend(original, "other"), {}, {
       "x-claude-code-agent-id": "failing-agent",
-    }, 503);
+    }, 200);
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "failed");
     const continued = extend(original, "t1");
     await fixture.post(continued, { model: SMALL_MODEL }, {}, 503);
     assert.equal(fixture.lastRecord().routeMiss, "rejected");
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "cooldown");
     assert.equal(fixture.calls.length, 2, "the extra allowance cannot bypass cooldown");
-    assert.equal(fixture.forwarded.length, 1, "outage never forwards oversized originals");
+    assert.equal(fixture.forwarded.length, 2, "wide-window fallback forwards, small-window overflow does not");
     const now = Date.now;
     t.mock.method(Date, "now", () => now() + 61_000);
     await fixture.post(continued, { model: SMALL_MODEL });

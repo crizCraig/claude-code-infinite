@@ -1,19 +1,7 @@
-/**
- * Whether the original request may go out unchanged when no compressed form is
- * available: its input is within the compaction budget (an over-budget input
- * that could not be compressed is refused, so a session never grows whole
- * toward the window and strands), and input plus the output reservation fits
- * the context window.
- *
- * The budget is compared with the input alone, as the server compares it: the
- * server does not compress a request whose input is under its budget, so
- * counting the output reservation here too left every request between
- * budget - max_tokens and the budget with no way out (2026-10-03 benchmark:
- * 777k input + 128k output against 800k, on a 1M window, failed outright, with
- * compaction off as well). The local token estimate is advisory.
- */
+/** After attempting compression at the soft budget, forward input that fits
+ * the model's native context together with its output reservation. */
 export function fitsFallbackBudget(inputTokens, outputTokens, budgetTokens, contextTokens) {
-    return [inputTokens, outputTokens, budgetTokens, contextTokens].every((value) => Number.isFinite(value) && value >= 0) && inputTokens <= budgetTokens && inputTokens + outputTokens <= contextTokens;
+    return [inputTokens, outputTokens, budgetTokens, contextTokens].every((value) => Number.isFinite(value) && value >= 0) && inputTokens + outputTokens <= contextTokens;
 }
 /**
  * Claude Code 2.1.288 retries 503 itself, even with SDK maxRetries=0.

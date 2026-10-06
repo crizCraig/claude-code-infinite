@@ -93,7 +93,7 @@ test("cache and failure health lookups use the complete request key", async () =
   }
 });
 
-async function memtreeFixture({ hold = false, status = 200 } = {}) {
+async function memtreeFixture({ hold = false, status = 200, result = () => RESULT } = {}) {
   const calls = [];
   let release;
   const gate = new Promise((resolve) => {
@@ -103,10 +103,11 @@ async function memtreeFixture({ hold = false, status = 200 } = {}) {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", async () => {
-      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      calls.push(body);
       if (hold) await gate;
       res.writeHead(status, { "content-type": "application/json" });
-      res.end(status === 200 ? JSON.stringify(RESULT) : "bad request");
+      res.end(status === 200 ? JSON.stringify(result(body)) : "bad request");
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -117,6 +118,35 @@ async function memtreeFixture({ hold = false, status = 200 } = {}) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
+
+test("client token threshold crossings replace passthroughs while same-side retries deduplicate", async () => {
+  const fixture = await memtreeFixture({ hold: true, result: body => ({
+    ...RESULT, compressed: body.client_input_tokens > 800_000,
+  }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const meta = { compressionTargetTokens: 400_000, compressionThresholdTokens: 800_000 };
+    const compress = tokens => client.compress(HASH, MESSAGES, 1_000_000, undefined, {
+      ...meta, ...(tokens === undefined ? {} : { clientInputTokens: tokens }),
+    });
+    const below = compress(undefined);
+    assert.strictEqual(compress(799_999), below);
+    assert.strictEqual(compress(800_000), below, "equality is still under threshold");
+    const above = compress(800_001);
+    assert.notStrictEqual(above, below, "cannot reuse an under-budget passthrough");
+    assert.strictEqual(compress(904_036), above, "changing only the over-budget count dedups");
+    fixture.release();
+    assert.equal((await below).compressed, false);
+    assert.equal((await above).compressed, true);
+    assert.strictEqual(compress(950_000), above, "settled over-budget retry dedups too");
+    assert.equal(fixture.calls.length, 2);
+    assert.equal(fixture.calls.find(call => call.client_input_tokens !== undefined)
+      .client_input_tokens, 800_001);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
 
 
 test("identical conversations in different sessions do not share compression responses", async () => {

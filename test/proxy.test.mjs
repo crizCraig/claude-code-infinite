@@ -5588,7 +5588,7 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
   }
 });
 
-test("over-budget recovery failure returns an error and retains background indexing", async () => {
+test("soft-budget recovery failure forwards the original and retains background indexing", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(500, { error: "boom" });
   const records = [];
@@ -5599,8 +5599,8 @@ test("over-budget recovery failure returns an error and retains background index
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 0);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5631,7 +5631,7 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
   const conversation = largeToolTurn();
   try {
     await postMessages(proxy.port, conversation, SESSION);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeRecovery.outcome, "noop");
@@ -5790,7 +5790,7 @@ test("disabled recovery records the suppressed miss and never compresses", async
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5812,10 +5812,10 @@ test("disabled recovery records the suppressed miss and never compresses", async
   }
 });
 
-test("an over-budget no-gain compaction refuses forwarding and backs off until growth", async () => {
+test("an over-budget no-gain compaction forwards within the native window and backs off until growth", async () => {
   // A tiny conversation's recovered body is BIGGER than the original.
-  // Neither result fits the configured budget, so no route or upstream
-  // request is created. The lane backs off: a same-size retry makes no
+  // Neither result fits the soft budget, but the original fits its native
+  // window and is forwarded. The lane backs off: a same-size retry makes no
   // second call, and only growth past a twentieth of the budget retries.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
@@ -5835,7 +5835,7 @@ test("an over-budget no-gain compaction refuses forwarding and backs off until g
     assert.equal(rec.routeMiss, "missing");
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.routeRecovery.install, undefined);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "original fits the native window");
     assert.equal(blockingCalls(), 1);
 
     const sameSize = structuredClone(toolTurn);
@@ -5845,7 +5845,7 @@ test("an over-budget no-gain compaction refuses forwarding and backs off until g
     assert.equal(rec2.routeMiss, "missing");
     assert.equal(rec2.routeRecovery.outcome, "backoff");
     assert.equal(blockingCalls(), 1, "a backoff skip pays nothing");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 2, "original fits the native window");
 
     await postMessages(proxy.port, extendToolLoop(toolTurn, "t2"), SESSION);
     assert.equal(messageRecords(records)[2].routeRecovery.outcome, "no-gain", "grown: tried again");
@@ -6628,7 +6628,7 @@ test("a different-session rejection preserves the owner's route; same-session re
   }
 });
 
-test("an in-flight recovery holds the lane; an oversized concurrent miss is refused", async () => {
+test("an in-flight recovery holds the lane; a fitting concurrent miss forwards whole", async () => {
   // Two concurrent compactions in one lane are impossible: the first marks
   // the lane in flight BEFORE its compress settles, so a miss racing it
   // forwards verbatim ("in-flight") instead of stacking a second blocking
@@ -6672,7 +6672,7 @@ test("an in-flight recovery holds the lane; an oversized concurrent miss is refu
     const recB = messageRecords(records).at(-1);
     assert.equal(recB.routeRecovery.outcome, "in-flight");
     assert.equal(recB.turnType, "tool");
-    assert.equal(upstream.seen.length, 0, "the racing oversized request waits for a usable route instead of forwarding whole history");
+    assert.equal(upstream.seen.length, 1, "the racing request fits the native window");
 
     held.resolve();
     await aInFlight;
@@ -6762,7 +6762,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
     assert.equal(rec.routeRecovery.outcome, "unusable");
     assert.equal(rec.history.usable, false);
     assert.equal(rec.turnType, "tool", "not forwarded as tool-recompressed");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     // No route: the next tool turn misses rather than riding amnesia.
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(messageRecords(records)[1].routeMiss, "missing");
@@ -6773,7 +6773,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
   }
 });
 
-test("an oversized compression with no byte gain never forwards the original", async () => {
+test("an oversized compression with no byte gain forwards the original within its native window", async () => {
   const upstream = await recordingUpstream();
   // Usable and genuinely indexed, but bigger than what it replaces.
   const memtreeSrv = await mockMemtree(200, {
@@ -6792,7 +6792,7 @@ test("an oversized compression with no byte gain never forwards the original", a
     const rec = messageRecords(records)[0];
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.turnType, "tool");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(
       messageRecords(records)[1].routeMiss,
@@ -6873,7 +6873,7 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
       assert.equal(rec.turnType, "tool");
     }
     assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 3, "fitting originals keep forwarding during cooldown");
 
     // Main's backoff stays visible even while the cooldown is armed: it has
     // grown by far less than a twentieth of the budget since its attempt.
@@ -8504,7 +8504,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     // the lane backing off (nothing was installed). The empty lane (not a
     // "replay") logs a plain missing miss, classifies "backoff" — the
     // released reservation is what lets it reach that label at all — and
-    // refuses the over-budget original without paying a second blocking
+    // forwards the native-window-fitting original without paying a second blocking
     // compress.
     await postMessages(proxy.port, conversation, SESSION);
     await waitFor(() => messageRecords(records).length >= 2);
@@ -8518,7 +8518,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     assert.equal(retry.routeRecovery.conversationBytes, undefined);
     assert.equal(retry.turnType, "tool");
     assert.equal(blockingCalls(), liveCompresses, "a backoff skip pays nothing");
-    assert.equal(upstream.seen.length, 1, "the backed-off over-budget retry cannot forward its whole history");
+    assert.equal(upstream.seen.length, 2, "the backed-off retry fits the native window");
   } finally {
     proxy.close();
     upstream.close();
@@ -8823,11 +8823,10 @@ test("client_input_tokens: a server that undercounts still compresses what ccc m
     conv.push(assistantText("a2"), markedUser(BIG("q3")));
     const forwarded = h.upstream.bodies.length;
     const t3 = await h.post(conv);
-    assert.equal(t3.countTokens.phase, "estimate");
-    assert.equal(t3.compaction.estimatedTokens, t3.countTokens.tokens);
+    assert.equal(t3.countTokens[0].statusClass, "success");
     const call = h.compressCalls().at(-1);
     assert.equal(call.compression_threshold_tokens, undefined, "an exact size forces compression");
-    assert.equal(call.client_input_tokens, t3.countTokens.tokens);
+    assert.equal(call.client_input_tokens, t3.compaction.estimatedTokens);
     assert.ok(call.client_input_tokens > 20_000, "ccc measures the request over budget");
     assert.equal(t3.turnType, "followup-compressed");
     assert.equal(h.upstream.bodies.length, forwarded + 1, "forwarded, not refused");
@@ -8908,11 +8907,10 @@ test("a skewed size sample cannot refuse a 469,801-byte subagent request (2026-1
   }
 });
 
-test("an estimate alone never refuses: the request is counted exactly first", async () => {
-  // A plausible but stale sample (0.9 tokens/byte) sizes a 469,801-byte
-  // request at ~422k against a 200k budget. The pre-decision count fails, so
-  // the estimate stands through compaction (MemTree noop); the refusal check
-  // counts again, finds ~117k, and sends it.
+test("a failed count is reused and native-window fallback ignores a stale learned estimate", async () => {
+  // A plausible stale sample sizes this request at ~422k; Count fails and
+  // MemTree returns unchanged. The plain bytes estimate fits the native
+  // window, so the request goes out without retrying the failed Count call.
   const h = await edgeHarness({
     budget: 200_000,
     memtree: { noop: true },
@@ -8928,10 +8926,9 @@ test("an estimate alone never refuses: the request is counted exactly first", as
     const forwarded = h.upstream.bodies.length;
     const rec = await h.post(sizedAgentTurn(469_801), agent);
     assert.ok(rec.compaction.estimatedTokens > 400_000, "the stale estimate is over budget");
-    assert.equal(h.upstream.countCalls.length, 2, "pre-decision count (failed), then the refusal's");
-    assert.equal(rec.countTokens.phase, "refusal");
-    assert.equal(rec.countTokens.ok, true);
-    assert.ok(rec.countTokens.tokens < 200_000);
+    assert.equal(h.upstream.countCalls.length, 1, "failed count is reused");
+    assert.equal(rec.countTokens[0].statusClass, "server-error");
+    assert.equal(rec.overBudgetForward.reason, "bytes-fallback-fits-window");
     assert.equal(rec.forwardedBytes, 469_801, "sent whole on the exact count");
     assert.equal(h.upstream.bodies.length, forwarded + 1);
   } finally {
@@ -9418,7 +9415,7 @@ test("tool-loop compaction with a typed prompt pending (headless -p): the result
   }
 });
 
-test("tool-loop compaction: disabled compaction makes no compress call and refuses over-budget tool turns", async () => {
+test("tool-loop compaction: disabled compaction makes no compress call and forwards tool turns within the native window", async () => {
   for (const setup of ["env-off", "command-off", "kill-switch"]) {
     const h = await edgeHarness({
       budget: 20_000,
@@ -9441,8 +9438,8 @@ test("tool-loop compaction: disabled compaction makes no compress call and refus
         if (setup === "kill-switch") assert.equal(rec.compaction, undefined);
         else assert.equal(rec.compaction.mode, "off");
       }
-      assert.ok(h.upstream.bodies.length < 7, "over-budget tool turns do not reach upstream");
-      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 20_000), "every forwarded original fits its budget with output reservation");
+      assert.equal(h.upstream.bodies.length, 7, "all tool turns fit the native window");
+      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 200_000), "every forwarded original fits the native window with output reservation");
       assert.equal(h.compressCalls().length, 0, `${setup}: no compress call`);
     } finally {
       h.close();
@@ -9664,7 +9661,7 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
         await postMessages(proxy.port, loop, SESSION);
         assert.equal(calls, 2, `${mode}: finite wait allows a fresh compress`);
         assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "compressed");
-        assert.equal(upstream.seen.length, 1, "only the final validated compressed request reaches upstream");
+        assert.equal(upstream.seen.length, 3, "fitting originals forward while the tree is building");
       }
     } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
   }
