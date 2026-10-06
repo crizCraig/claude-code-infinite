@@ -1,5 +1,23 @@
 # Client input tokens review
 
+## Final result
+
+**ccc is ready to merge.** Final whole-diff review cycle 6 was clean: zero major
+and zero minor findings. Across six cycles and the source audit, all 14 findings
+(11 major, 3 minor) are fixed; no code findings remain deferred. The request-local
+sizing refactor is implemented. The three changes to older refusal-policy tests
+were explicitly approved; subsequent existing regression assertions were kept.
+
+Final verification: **543/543 tests passed in each colour mode**, and committed
+`dist/` matches a fresh build. Two independent final reviewers each passed the
+84-test focused contract suite. The final code fix is `b8a00af`.
+
+The server remains clean, unchanged at `d8bbdf7`, and **ready to merge
+independently**. New/old request-field compatibility is verified as described
+below. Main's newer unrelated changes are left for merge-time integration.
+Live subscription OAuth Count Tokens acceptance is the remaining **pre-publish**
+check, not a merge blocker; instructions are below. Nothing was pushed or merged.
+
 ## Scope and status
 
 The ccc review covers `main..feat/count-tokens-calibration`, including original
@@ -178,3 +196,34 @@ The request-local refactor is implemented. ccc remains **not ready to merge**
 because of the remaining known refusal path. The server remains **ready to merge
 independently**, clean and unchanged at `d8bbdf7`. OAuth acceptance remains the
 separate pre-publish live check described above.
+
+## Approved final sizing correction
+
+The user approved the audit's remaining finding. Commit `b8a00af` removes the
+late-recovery byte-growth guard while preserving structural validation. Every
+valid late replacement reaches central counting and selection.
+
+Two new regressions, for main and tool turns, first failed with 503 and then
+passed: a 200 KB ride counted at 210k is replaced by a larger 250 KB body counted
+at 120k. Tests verify that the replacement itself was counted and forwarded,
+the compression hint describes the 210k ride, recovery is bounded to one attempt,
+and the over-budget forward is logged. All existing assertions remain unchanged.
+
+Final full-suite runs passed **543/543** with `NO_COLOR` unset and **543/543** with
+`NO_COLOR=1`. Committed `dist/` matched a further fresh build. The source audit
+now records the corrected late-recovery path.
+
+## Final whole-diff review cycle 6
+
+Two independent fresh reviews of `main..b8a00af` found **zero major and zero minor
+issues**. They covered the original counting/calibration changes, all fixes and
+the refactor: candidate eligibility/selection, selected-body attribution and route
+ownership, failure deadlines/cooldowns, credentials/headers, privacy, sample
+isolation, compression hints and dedup. Both confirmed the source audit is
+consistent with the remaining checks; both independently passed 84 focused
+tests. The five main-only link commits were treated as branch divergence rather
+than regressions introduced here.
+
+**Final disposition: ccc ready to merge.** All 14 findings are fixed. Server ready
+independently and unchanged. No further code changes are deferred; live OAuth
+acceptance remains the pre-publish verification item.
