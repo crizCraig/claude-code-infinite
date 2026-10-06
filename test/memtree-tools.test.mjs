@@ -276,7 +276,8 @@ test("read_lines {tail: true} reads the un-indexed messages fresh from the serve
       .result.content[0].text;
 
   const text = await call({ tail: true });
-  assert.match(text, /^Not yet indexed: messages 2051-2052 of the conversation's newest record/);
+  assert.match(text, /^After this tree: messages 2051-2052 of the conversation's newest record/);
+  assert.match(text, /no tree covers it yet/, "older servers send no not_indexed_from");
   assert.match(text, /\[2052\] assistant\nPR #42 opened/);
   assert.match(text, /\[2051\] user · 2026-10-06T01:00:00Z\nopen the PR/);
   assert.match(text, /earlier: read_lines \{"tail": true, "end": 2050\}/);
@@ -293,10 +294,30 @@ test("read_lines {tail: true} reads the un-indexed messages fresh from the serve
   assert.match(await call({ tail: true }), /^No un-indexed messages after this tree/);
   tailStatus = 410;
   assert.match(await call({ tail: true }), /MemTree tail unavailable .*HTTP 410/);
+  tailStatus = 416;
+  assert.match(await call({ tail: true, start: 9000 }), /^read_lines: No un-indexed messages after this tree/,
+    "an out-of-range read is a plain read_lines error carrying the server's detail");
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /read_lines \{"tail": true\}/);
   const readLines = MEMTREE_TOOLS.find((t) => t.name === "read_lines");
   assert.match(readLines.description, /tail: true/);
   assert.equal(readLines.inputSchema.properties.tail.type, "boolean");
+});
+
+test("formatTail shows which tail messages a newer tree already covers", async () => {
+  const { formatTail } = await import("../dist/memtree-tools.js");
+  const text = formatTail({
+    tail_start: 10, tail_end: 12, not_indexed_from: 12,
+    messages: [
+      { i: 11, k: "assistant", x: "covered", state: "in_newer_tree" },
+      { i: 12, k: "assistant", x: "PR opened", state: "not_indexed" },
+    ],
+  });
+  assert.match(text, /a newer tree covers it up to 11; from 12 on, no tree yet/);
+  assert.match(text, /\[11\] assistant · in a newer tree\ncovered/);
+  assert.match(text, /\[12\] assistant\nPR opened/);
+  const whole = formatTail({ tail_start: 10, tail_end: 10, not_indexed_from: null,
+    messages: [{ i: 10, k: "user", x: "x", state: "in_newer_tree" }] });
+  assert.match(whole, /a newer tree of this conversation covers all of it/);
 });
 
 test("CurrentTree serves a prefix through its cooldown, refreshes after it, then caches completion", async () => {

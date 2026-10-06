@@ -360,6 +360,9 @@ export class CurrentTree implements TreeSource {
     if (answer.status === 404) {
       return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails).";
     }
+    if (answer.status === 416) {
+      throw new ToolInputError(`read_lines: ${(answer.error ?? "").replace(/^HTTP 416 /, "")}`);
+    }
     if (!answer.ok) throw new ToolInputError(`MemTree tail unavailable (page ${id}: ${answer.error})`);
     if (!other) this.checkSession((answer.body as { session_id?: unknown }).session_id, this.requireSessionId());
     return formatTail(answer.body, other);

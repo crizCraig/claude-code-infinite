@@ -382,12 +382,17 @@ export function formatTail(body, tree) {
     }
     const first = messages[0].i;
     const last = messages[messages.length - 1].i;
+    const from = page.not_indexed_from;
+    const coverage = from === undefined || from === page.tail_start ? "no tree covers it yet"
+        : from === null ? "a newer tree of this conversation covers all of it (see later_trees)"
+            : `a newer tree covers it up to ${from - 1}; from ${from} on, no tree yet`;
     const out = [
-        `Not yet indexed: messages ${first}-${last} of the conversation's newest record ` +
-            `(the whole tail is ${page.tail_start}-${page.tail_end}; no tree covers it yet).`,
+        `After this tree: messages ${first}-${last} of the conversation's newest record ` +
+            `(the whole tail is ${page.tail_start}-${page.tail_end}; ${coverage}).`,
     ];
     for (const m of messages) {
-        out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}`, m.x ?? "");
+        const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
+        out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}`, m.x ?? "");
     }
     const notes = [];
     if (typeof page.tail_start === "number" && first > page.tail_start) {
