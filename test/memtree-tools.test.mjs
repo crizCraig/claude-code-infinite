@@ -230,6 +230,27 @@ test("CurrentTree follows the proxy's current page and caches it until the page 
   await assert.rejects(new CurrentTree({}).get(), /need a running ccc session/);
 });
 
+test("A tree the server will never build (410) is a final answer, not 'still being built'", async () => {
+  const gone = {
+    status: "unavailable", reason: "failed", request_id: "ddd444",
+    detail: "Indexing this request's conversation failed and will not be retried. The tree will not appear here; open a newer page of the session instead.",
+  };
+  const fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/memtree/current") {
+      return Response.json({ session_id: "session-1", id: "ddd444", url: "https://app/m/ddd444" });
+    }
+    return Response.json(gone, { status: 410 });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "session-1", fetch });
+  await assert.rejects(tree.get(), (err) => {
+    assert.match(err.message, /HTTP 410 .*will not be retried.*newer page/);
+    assert.doesNotMatch(err.message, /still being built|try again/);
+    return true;
+  });
+  await assert.rejects(tree.search("deploy", undefined, "ddd444"), /HTTP 410 .*newer page/);
+});
+
 test("CurrentTree serves a prefix through its cooldown, refreshes after it, then caches completion", async () => {
   let now = 0;
   let pageFetches = 0;
