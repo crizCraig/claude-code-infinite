@@ -499,6 +499,16 @@ test("hyperlinks require a known supporting terminal and a TTY, independently of
   const iterm = { TERM: "xterm-256color", TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.5.0" };
   assert.equal(terminalSupportsHyperlinks(iterm, tty), true);
   assert.equal(terminalSupportsHyperlinks({ TERM: "xterm-256color", TERMINAL_EMULATOR: "JetBrains-JediTerm" }, tty), true);
+  for (const env of [
+    { TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty" },
+    { TERM: "xterm-256color", TERM_PROGRAM: "WezTerm" },
+    { TERM: "xterm-kitty" },
+    { TERM: "xterm-256color", TERM_PROGRAM: "vscode" },
+    { TERM: "xterm-256color", WT_SESSION: "abc" },
+  ]) {
+    assert.equal(terminalSupportsHyperlinks(env, tty), true, JSON.stringify(env));
+  }
+  assert.equal(terminalSupportsHyperlinks({ TERM: "screen-256color", TERM_PROGRAM: "ghostty" }, tty), false);
   for (const env of [{}, { TERM: "xterm-256color" }, { TERM_PROGRAM: "Apple_Terminal" },
     { ...iterm, NO_COLOR: "" }, { ...iterm, TERM: "dumb" }, { ...iterm, TERM: "screen-256color" },
     { ...iterm, TERM_PROGRAM_VERSION: "2.9" }]) {

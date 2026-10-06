@@ -114,6 +114,13 @@ export function terminalSupportsHyperlinks(env = process.env, stream = process.s
         return false;
     if (env.TERMINAL_EMULATOR === "JetBrains-JediTerm")
         return true;
+    // Terminals with OSC 8 support that identify themselves in the environment.
+    if (["ghostty", "WezTerm", "vscode"].includes(env.TERM_PROGRAM ?? ""))
+        return true;
+    if (env.TERM === "xterm-kitty" || env.TERM === "xterm-ghostty")
+        return true;
+    if (env.WT_SESSION)
+        return true; // Windows Terminal
     if (env.TERM_PROGRAM === "iTerm.app") {
         const match = /^(\d+)\.(\d+)/.exec(env.TERM_PROGRAM_VERSION ?? "");
         return !!match && (Number(match[1]) > 3 || (Number(match[1]) === 3 && Number(match[2]) >= 1));
