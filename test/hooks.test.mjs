@@ -126,7 +126,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
       hookEventName: "MessageDisplay",
       displayContent:
         "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
-        "  https://app.polychat.co/m/aaaaaaaaaaaa\nanswer",
+        "  https://app.polychat.co/m/aaaaaaaaaaaa\n\nanswer",
     },
   });
   assert.equal(queue.linkPending("session-1"), false);
@@ -477,4 +477,46 @@ test("Stop-only compatibility plugin keeps arming/lifecycle hooks", async () => 
     plugin.close();
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("a finder key replacing a source hash must not repeat the same success URL at Stop", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+  let link = { key: "source-hash", link: "https://x/page" };
+  queue.setLink(() => link);
+  queue.setTrailer(() => link, "turn");
+  queue.queuePrefix("optimized");
+  assert.match(queue.claim(display()).hookSpecificOutput.displayContent, /https:\/\/x\/page\n\nanswer/);
+  link = { ...link, key: "request-v3-own" };
+  assert.equal(queue.claim(stop()), null);
+  link = { key: "different-tree", link: "https://x/new-page" };
+  assert.match(queue.claim(stop()).systemMessage, /new-page/);
+});
+
+test("hyperlinks require a known supporting terminal and a TTY, independently of hook relay pipes", async () => {
+  const { terminalSupportsHyperlinks } = await import("../dist/hooks.js");
+  assert.equal(typeof terminalSupportsHyperlinks, "function");
+  const tty = { isTTY: true };
+  const iterm = { TERM: "xterm-256color", TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.5.0" };
+  assert.equal(terminalSupportsHyperlinks(iterm, tty), true);
+  assert.equal(terminalSupportsHyperlinks({ TERM: "xterm-256color", TERMINAL_EMULATOR: "JetBrains-JediTerm" }, tty), true);
+  for (const env of [{}, { TERM: "xterm-256color" }, { TERM_PROGRAM: "Apple_Terminal" },
+    { ...iterm, NO_COLOR: "" }, { ...iterm, TERM: "dumb" }, { ...iterm, TERM: "screen-256color" },
+    { ...iterm, TERM_PROGRAM_VERSION: "2.9" }]) {
+    assert.equal(terminalSupportsHyperlinks(env, tty), false, JSON.stringify(env));
+  }
+  assert.equal(terminalSupportsHyperlinks(iterm, { isTTY: false }), false);
+  assert.equal(terminalSupportsHyperlinks(iterm, {}), false);
+});
+
+test("a pinned spelling of the same MemTree page does not repeat at Stop", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+  let link = {key:'source-hash', link:'https://app.polychat.co/m/229f05e7d2e5'};
+  queue.setLink(() => link);
+  queue.setTrailer(() => link, 'turn');
+  queue.queuePrefix('optimized');
+  queue.claim(display());
+  link = {key:'request-v3-own',link:'https://app.polychat.co/usage/memtree/229f05e7-d2e5-4494-a631-25dd42d5759e-v3-own'};
+  assert.equal(queue.claim(stop()), null);
+  // It may still be announced on a later turn; only this turn's duplicate is suppressed.
+  assert.match(queue.claim(stop()).systemMessage, /v3-own/);
 });
