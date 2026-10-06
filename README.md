@@ -4,12 +4,27 @@
 
 # Claude Code Infinite
 
-* Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
+A better `/compact` for Claude Code. On our long-session coding benchmark, Claude Code Infinite
+matched full-context Claude Code with a third of the tokens and beat `/compact` by 20 points.
+
+* Replaces Claude Code's lossy compaction with [MemTree](https://memtree.dev): older messages become
+  summaries, recent ones stay verbatim, and every detail stays searchable
 * Supports unlimited-length coding sessions
-* Feels fast and fresh with every message
+* Same score as full context in less than half the time
 * Automatically recalls relevant past information
-* Never compact again
- 
+
+## Results
+
+<table>
+<tr><th>Setup</th><th>Score</th><th>Input tokens / run</th><th>Time</th><th>How it handles the long history</th></tr>
+<tr><td><b>Claude Code Infinite (MemTree)</b></td><td><b>69%</b></td><td><b>39M</b></td><td><b>16 min</b></td><td>Full history up to 800k tokens, then compacted to ~420k. Older messages become their MemTree summaries, recent ones stay verbatim, and every detail stays searchable.</td></tr>
+<tr><td>Full context</td><td>69%</td><td>113M</td><td>38 min</td><td>Keeps every message, growing to ~950k tokens, until Claude Code's auto-compaction fires mid-task.</td></tr>
+<tr><td><code>/compact</code></td><td>49%</td><td>17M</td><td>—</td><td>Summarizes the whole history into a ~13k-token note before starting, and the detail is gone.</td></tr>
+</table>
+
+Claude Opus 5.5, graded blind. Each run resumes a ~775k-token Claude Code session, gives it a task,
+and grades the result against a fixed answer key. More at [memtree.dev](https://memtree.dev#performance).
+
 ## Requirements
 
 * [node.js 18 or newer](https://nodejs.org/en/download/)
@@ -34,16 +49,6 @@
   ```
 
 This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
-
-## Environments
-
-The tool supports multiple environments (this selects the MemTree compression API only — Anthropic traffic always goes directly from your machine to api.anthropic.com):
-
-- **Production** (default): `ccc` - Uses https://api.polychat.co
-- **Local**: `ccc local` - Uses http://localhost:8080 for local development
-- **Staging**: `ccc staging` - Uses https://polychat-staging-421312241218.us-west2.run.app
-
-Each environment maintains its own separate API key.
 
 ## Claude Code auto-compaction
 
@@ -116,31 +121,6 @@ Memory quality is evaluated offline: the weekly `memtree-bench` harness replays 
 ## What this is NOT
 
 This is not a MPC or tool for simply retrieving memories. While we are compatible with all MPC's, tools, and other Anthropic features, these do not prevent your context window from becoming detrimentally large. MCP's and tools are some of the biggest token bloaters and it's exactly these types of messages that we heavily reduce during our compression phase.
-
-## Why it works
-
-LLMs get exponentially less intelligent as their input grows. 
-
-References:
-- [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172) (2023)
-- [RULER: What's the Real Context Size of Your Long-Context Language Models?](https://arxiv.org/abs/2404.06654) (2024)
-- <a href="https://research.trychroma.com/context-rot" target="_blank" rel="noopener noreferrer">Context Rot from Chroma</a> (2025)
- 
-<a href="https://www.youtube.com/watch?v=TUjQuC4ugak" target="_blank" rel="noopener noreferrer">
-  <img src="https://img.youtube.com/vi/TUjQuC4ugak/0.jpg" alt="Context Rot Video">
-</a>
-
-
-Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding.
-
-This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, filled precisely with the information relevant to your **last** message. Read more about how MemTree works [here](https://api.polychat.co/context-memory).
-
-### Operating System Analogy
-
-It may seem strange that we are advocating for small context windows in a product called Claude Code Infinite. But Infinite is referring to the size of a new memory layer, the MemTree, which is a layer above the context window. This layer is larger and updated more slowly than the LLMs main input, just as disk is larger + slower than RAM.
-
-So you can think of MemTree as an operating system's virtual memory manager. Just as an OS manages RAM by swapping less-used data to disk, MemTree manages the model's context window by intelligently recalling only the most relevant information from past interactions. This ensures that the model always has access to the most pertinent data without being overwhelmed by the entire history of the conversation.
-
 
 ## Usage Tips
 
