@@ -341,3 +341,50 @@ for (const enabled of [true, false]) {
     } finally { h.close(); }
   });
 }
+
+test('byte-heavy validated agent route survives the next tool turn through request-local sizing', async () => {
+  let compressions = 0;
+  const h = await harness({ budget: 100_000, usage: () => undefined,
+    count: body => ({ input_tokens: JSON.stringify(body.messages).includes('memory m') ? 120_000 : 300_000 }),
+    compress: () => ++compressions === 1 ? compressedReply(900_000) : undefined });
+  const original = [{ role: 'user', content: 'task' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'x'.repeat(1_500_000) }] }];
+  try {
+    assert.equal(await h.post(0, { agent: 'wide-route-agent', messages: original }), 200);
+    const continued = [...original,
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'next result' }] }];
+    assert.equal(await h.post(0, { agent: 'wide-route-agent', messages: continued }), 200);
+    assert.equal(h.forwards.length, 2);
+    assert.ok(JSON.stringify(h.forwards[1]).length > 800_000, 'bytes alone exceed the 200k window');
+    assert.match(JSON.stringify(h.forwards[1].messages), /memory m/);
+    assert.ok(!JSON.stringify(h.forwards[1].messages).includes('x'.repeat(1000)), 'whole oversized original is not sent');
+    assert.ok(h.counts.some(body => JSON.stringify(body.messages).includes('next result') &&
+      JSON.stringify(body.messages).includes('memory m')), 'assembled retained route gets its own exact count');
+  } finally { h.close(); }
+});
+
+for (const lane of ['agent-followup', 'away-fork']) {
+  test(`byte-heavy validated ${lane} candidate survives early routing`, async () => {
+    let compressions = 0;
+    const h = await harness({ budget: 100_000, usage: () => undefined,
+      count: body => ({ input_tokens: JSON.stringify(body.messages).includes('memory m') ? 120_000 : 300_000 }),
+      compress: () => ++compressions === 1 ? compressedReply(900_000) : undefined });
+    const original = [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+      { role: 'user', content: 'x'.repeat(1_500_000) }];
+    const agent = lane === 'agent-followup' ? 'wide-agent' : '';
+    try {
+      assert.equal(await h.post(0, { agent, messages: original }), 200);
+      const continued = [...original, { role: 'assistant', content: 'next answer' },
+        { role: 'user', content: lane === 'away-fork' ? AWAY_SUMMARY_PROMPT_PREFIX : 'next question' }];
+      assert.equal(await h.post(0, { agent, messages: continued }), 200);
+      assert.equal(h.forwards.length, 2);
+      assert.ok(JSON.stringify(h.forwards[1]).length > 800_000);
+      assert.match(JSON.stringify(h.forwards[1].messages), /memory m/);
+      assert.ok(!JSON.stringify(h.forwards[1].messages).includes('x'.repeat(1000)));
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.equal(rec.turnType, lane === 'away-fork' ? 'fork-memory' : 'followup-prefix');
+    } finally { h.close(); }
+  });
+}

@@ -647,15 +647,18 @@ function transmittedTools(tools) {
     return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 /**
- * The part of `clientInputTokens` that can change the server's verdict: whether
- * it exceeds the budget the server compares it with. Under it, or absent, the
- * server goes by its own measure either way, so both share one key. Keying on
- * the raw estimate would split identical retries whose size sample moved.
+ * With a known comparison budget, only crossing it changes the server's
+ * verdict, so same-side retries share a key. Before the server reports its
+ * budget, callers can omit both target and threshold: preserve the full hint
+ * then, since any differing value may cross the unknown model-policy budget.
+ * In particular, a newly counted retry must not reuse an unhinted passthrough.
  */
 function clientOverThreshold(meta) {
     const budget = meta?.compressionThresholdTokens ?? meta?.compressionTargetTokens;
-    if (meta?.clientInputTokens === undefined || budget === undefined)
+    if (meta?.clientInputTokens === undefined)
         return null;
+    if (budget === undefined)
+        return meta.clientInputTokens;
     return meta.clientInputTokens > budget ? true : null;
 }
 export class MemtreeClient {

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { MemtreeClient } from "../dist/memtree.js";
+import { startProxy } from "../dist/proxy.js";
 
 const MESSAGES = [{ role: "user", content: "same conversation" }];
 const HASH = MemtreeClient.hashMessages(MESSAGES);
@@ -9,6 +10,111 @@ const RESULT = {
   messages: [{ role: "user", content: "compressed conversation" }],
   compressed: true,
 };
+
+test("unknown server budget keeps absent and differing client hints separate", async () => {
+  const fixture = await memtreeFixture({ hold: true });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const compress = (tokens) => client.compress(HASH, MESSAGES, 200_000, undefined,
+      tokens === undefined ? {} : { clientInputTokens: tokens });
+    const absent = compress(undefined);
+    const low = compress(90_000);
+    const high = compress(210_000);
+    fixture.release();
+    await Promise.all([absent, low, high]);
+    assert.notStrictEqual(absent, low);
+    assert.notStrictEqual(low, high);
+    assert.strictEqual(compress(210_000), high);
+    assert.equal(fixture.calls.length, 3);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+test("concurrent fresh-proxy followup sends a newly counted hint before budget discovery", async () => {
+  let release;
+  let entered;
+  const held = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const counts = [];
+  const forwards = [];
+  const compressions = [];
+  const serve = async (handler) => {
+    const server = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", chunk => { raw += chunk; });
+      req.on("end", () => handler(req, res, JSON.parse(raw)));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    return { server, origin: `http://127.0.0.1:${server.address().port}` };
+  };
+  const upstream = await serve((req, res, body) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.includes("count_tokens")) {
+      counts.push(body);
+      const original = JSON.stringify(body).includes("x".repeat(1000));
+      res.end(counts.length === 1 ? "{broken" : JSON.stringify({
+        input_tokens: original ? 210_000 : 2_000,
+      }));
+    } else {
+      forwards.push(body);
+      res.end(JSON.stringify({ type: "message", role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+        usage: { input_tokens: 2_000, output_tokens: 1 } }));
+    }
+  });
+  const memory = await serve(async (_req, res, body) => {
+    if (!body.index_only) {
+      compressions.push(body);
+      entered();
+      await held;
+    }
+    const compressed = body.client_input_tokens > 100_000;
+    const messages = compressed ? [{ role: "user", content: "memory ".repeat(1000) }]
+      : body.messages;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ messages, compressed, model_budget_tokens: 100_000,
+      ...(compressed ? { flattened_messages: messages } : {}),
+      usage: { prompt_tokens: 210_000, completion_tokens: 2_000 } }));
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memory.origin, apiKey: "mock-key" }),
+    upstreamOrigin: upstream.origin, budgetTokensOverride: 100_000, countTokens: true,
+  });
+  const post = async () => {
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-claude-code-session-id": "s", "x-claude-code-agent-id": "a" },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages: [
+        { role: "user", content: "first" }, { role: "assistant", content: "answer" },
+        { role: "user", content: "x".repeat(240_000) },
+      ] }),
+    });
+    await response.text();
+    return response.status;
+  };
+  try {
+    const first = post();
+    await ready;
+    const second = post();
+    const deadline = Date.now() + 2_000;
+    while (compressions.length < 2 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    release();
+    assert.deepEqual(await Promise.all([first, second]), [200, 200]);
+    assert.deepEqual(compressions.map(body => body.client_input_tokens), [undefined, 210_000]);
+    assert.equal(forwards.length, 2);
+  } finally {
+    release();
+    proxy.close();
+    for (const { server } of [upstream, memory]) {
+      server.closeAllConnections();
+      server.close();
+    }
+  }
+});
 
 test("compression cache varies by model, tools, and context limit", async () => {
   const fixture = await memtreeFixture();

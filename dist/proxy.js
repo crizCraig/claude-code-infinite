@@ -999,15 +999,23 @@ async function handleMessages(req, res, opts, upstream, state) {
         }
         let routedBody = forwardBody;
         let routedTool = false;
+        let routedCandidate;
         let routeMiss;
         if (isToolResultTurn || isContinuationTurn || isUserTurn) {
             // Reuse only this API session/lane's independently validated prefix.
             const activeRoute = rideableCandidate;
             if (activeRoute) {
                 const rewritten = memoryRoutedToolBody(body, messages, activeRoute, state.mainRouteEpoch, requestSessionId(req));
-                const overContextWindow = rewritten !== null &&
-                    routedBodyExceedsContext(body, rewritten, modelContextLimit);
-                if (rewritten && !overContextWindow) {
+                if (rewritten) {
+                    const owner = activeRoute.stablePrefix ?? activeRoute;
+                    routedCandidate = requestSizing.register(rewritten, "ride", owner.lastSize);
+                    candidateSizeOwners.set(routedCandidate, owner);
+                    // Advisory window pressure can request recovery, but never removes a
+                    // structurally valid candidate before request-local counting/selection.
+                    if (!fitsNative(requestSizing.plan(routedCandidate).tokens, sizingLimits())) {
+                        routeMiss = "rejected";
+                        regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
+                    }
                     routedBody = rewritten;
                     routedTool = true;
                     if (opts.debug) {
@@ -1022,12 +1030,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     // always carries this requester's session id — installMemoryRoute
                     // derives both from the same request — so this is by construction a
                     // same-session divergence: rebuild while retaining the previous route.
-                    // A matching route that outgrew the request's resolved window must
-                    // also rebuild; a smaller window lifts the lane's backoff.
                     routeMiss = "rejected";
-                    if (overContextWindow) {
-                        regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
-                    }
                     if (opts.debug) {
                         console.error("[ccc proxy] tool turn rejected active memory route");
                     }
@@ -1047,6 +1050,8 @@ async function handleMessages(req, res, opts, upstream, state) {
             isMainRequest &&
             toolSessionId !== undefined &&
             rideableCandidate?.stablePrefix !== state.stablePrefixes.get(toolSessionId)) {
+            if (routedCandidate)
+                requestSizing.excludeFallback(routedCandidate);
             routedTool = false;
             routedBody = forwardBody;
             routeMiss = "superseded";
@@ -1224,8 +1229,9 @@ async function handleMessages(req, res, opts, upstream, state) {
     // window, hits the prompt cache the main thread warmed, and costs no
     // MemTree call. Any mismatch falls through to the recap's own compression.
     if (isAwaySummary) {
-        const fork = forkRoutedBody(body, messages, state.lastMainRoute, requestSessionId(req), modelContextLimit);
+        const fork = forkRoutedBody(body, messages, state.lastMainRoute, requestSessionId(req));
         if ("body" in fork) {
+            requestSizing.register(fork.body, "ride");
             requestSendPolicies.get(req)?.allowed.add(fork.body);
             releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
             recordTurn(rec, "fork-memory", fork.body);
@@ -1412,8 +1418,10 @@ async function handleMessages(req, res, opts, upstream, state) {
             }
         }));
     };
-    if (existingRide && (!edge || edge.kind === "off") &&
-        !routedBodyExceedsContext(body, existingRide, modelContextLimit)) {
+    if (existingRide && (!edge || edge.kind === "off")) {
+        const owner = rideableCandidate.stablePrefix ?? rideableCandidate;
+        const candidate = requestSizing.register(existingRide, "ride", owner.lastSize);
+        candidateSizeOwners.set(candidate, owner);
         return forwardCompressed(JSON.parse(existingRide.toString("utf-8")), existingRide, "followup-prefix", undefined, undefined);
     }
     if (edge?.kind === "ride") {
@@ -2031,7 +2039,7 @@ function storeStablePrefix(state, sessionId, originalMessages, compressed, stabl
  * Only session, system and every prefix message are checked; unlike a tool
  * turn, the suffix may end in a plain user message (the fork's question).
  */
-function forkRoutedBody(body, messages, route, sessionId, modelContextLimit) {
+function forkRoutedBody(body, messages, route, sessionId) {
     if (!route)
         return { miss: "no-route" };
     const miss = prefixMismatch(body, messages, route, sessionId);
@@ -2040,10 +2048,7 @@ function forkRoutedBody(body, messages, route, sessionId, modelContextLimit) {
     const routed = prefixRoutedBody(body, messages, route);
     if (!routed)
         return { miss: "prefix" };
-    const buffer = routed.raw;
-    if (routedBodyExceedsContext(body, buffer, modelContextLimit))
-        return { miss: "too-large" };
-    return { body: buffer };
+    return { body: routed.raw };
 }
 /**
  * Why `messages` cannot continue from `prefix`, or null when they can: same
@@ -2445,7 +2450,8 @@ function planToolCompaction(args) {
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
-    overWindow ||= calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+    overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
+        output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0 });
     if (!args.canCompress) {
         if (overWindow)
             return { kind: "pass", original: true };
