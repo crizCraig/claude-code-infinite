@@ -3814,6 +3814,9 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
     // The page's session pane fetches this from wherever the page came from.
     await get("/memtree/ea18af90658b/session.json");
     assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/session.json");
+    // read_lines {"tail": true}: the un-indexed messages after the tree.
+    await get("/memtree/ea18af90658b/messages?start=5&end=9");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/messages?start=5&end=9");
     await get("/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
     assert.equal(pageGets.at(-1).url, "/usage/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
     assert.equal((await get("/memtree/sessions/..%2Fx.json")).status, 404);

@@ -447,3 +447,43 @@ export function formatLines(
   const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;
   return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
 }
+
+/** One un-indexed message from the server's `/messages` read (polychat memtree_tail.py). */
+interface TailMessage {
+  i: number;
+  k?: string;
+  x?: string;
+  at?: string;
+}
+
+/**
+ * read_lines {"tail": true}: the messages after the tree that no tree covers
+ * yet, verbatim, by position in the conversation's newest record.
+ */
+export function formatTail(body: unknown, tree?: string): string {
+  const page = body as {
+    messages?: TailMessage[]; tail_start?: number; tail_end?: number; start?: number; end?: number | null;
+  };
+  const messages = Array.isArray(page?.messages) ? page.messages : [];
+  if (!messages.length) {
+    return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}).`;
+  }
+  const first = messages[0].i;
+  const last = messages[messages.length - 1].i;
+  const out = [
+    `Not yet indexed: messages ${first}-${last} of the conversation's newest record ` +
+      `(the whole tail is ${page.tail_start}-${page.tail_end}; no tree covers it yet).`,
+  ];
+  for (const m of messages) {
+    out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}`, m.x ?? "");
+  }
+  const notes: string[] = [];
+  if (typeof page.tail_start === "number" && first > page.tail_start) {
+    notes.push(`earlier: read_lines {${treeArg(tree)}"tail": true, "end": ${first - 1}}`);
+  }
+  if (typeof page.tail_end === "number" && last < page.tail_end) {
+    notes.push(`later: read_lines {${treeArg(tree)}"tail": true, "start": ${last + 1}}`);
+  }
+  if (notes.length) out.push("", `[${notes.join("; ")}]`);
+  return out.join("\n");
+}

@@ -933,13 +933,14 @@ const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
 /**
  * `<request id>`, `<request id>.json`, `<request id>/session.json` (the
  * page's session pane), `<request id>/search` (the server's term search over
- * that tree, `?q=&limit=`), or `sessions/<Claude Code session id>.json` (every
+ * that tree, `?q=&limit=`), `<request id>/messages` (the un-indexed messages
+ * after it, `?start=&end=`), or `sessions/<Claude Code session id>.json` (every
  * page from one session, newest first); nothing that could walk the upstream
  * path. The id is the request UUID or the server's short form of it (leading
  * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
  */
 const MEMTREE_PASSTHROUGH_TARGET_RE =
-  /^(?:[A-Za-z0-9-]+(\.json|\/session\.json|\/search)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
+  /^(?:[A-Za-z0-9-]+(\.json|\/session\.json|\/search|\/messages)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
 
 /**
  * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own

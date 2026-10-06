@@ -50,6 +50,7 @@ import {
   formatNode,
   formatSearch,
   formatSearchHits,
+  formatTail,
   MemtreeIndex,
   parseNodeAddress,
   serverSearchHits,
@@ -103,7 +104,9 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "including when the embedding must be regenerated. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
   "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
   "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
-  "frozen snapshot.";
+  "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
+  "yet, and search does not see them; read_lines {\"tail\": true} reads them verbatim (with tree for another " +
+  "session's page).";
 
 const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
 
@@ -150,7 +153,9 @@ export const MEMTREE_TOOLS = [
     name: "read_lines",
     description:
       "Read exact transcript lines: a leaf's node address (its whole range), or block and 1-based inclusive start/end lines. " +
-      `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped.`,
+      `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped. ` +
+      "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there, " +
+      "and search does not see it): the newest ones, or start/end message positions; add tree for another session's page.",
     inputSchema: {
       type: "object",
       properties: {
@@ -158,7 +163,8 @@ export const MEMTREE_TOOLS = [
         block: { type: "number", description: "Block index (a leaf's first range number)." },
         start: { type: "number", description: "First line, 1-based." },
         end: { type: "number", description: "Last line, inclusive." },
-        tree: { type: "string", description: `With block/start/end: ${TREE_DESC} Omit for this session.` },
+        tree: { type: "string", description: `With block/start/end or tail: ${TREE_DESC} Omit for this session.` },
+        tail: { type: "boolean", description: "Read the un-indexed messages after the tree instead of lines; start/end are then message positions." },
       },
     },
   },
@@ -266,6 +272,8 @@ export interface TreeSource {
   currentId?(validatePage?: boolean): Promise<string>;
   /** Term search, formatted; optional so a plain index can stand in (tests). */
   search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
+  /** The un-indexed messages after the tree, read fresh from the server. */
+  tail?(tree: string | undefined, start?: number, end?: number): Promise<string>;
 }
 
 /**
@@ -334,6 +342,27 @@ export class CurrentTree implements TreeSource {
       return result;
     }
     return formatSearch(await this.get(other), query, limit, other);
+  }
+
+  /**
+   * The server's un-indexed tail after the tree (`/messages`), never cached:
+   * it grows with the conversation. With no range, the newest messages.
+   */
+  async tail(tree: string | undefined, start?: number, end?: number): Promise<string> {
+    const other = checkTreeId(tree);
+    const id = other ?? (await this.currentId());
+    const params = new URLSearchParams();
+    if (start !== undefined) params.set("start", String(start));
+    if (end !== undefined) params.set("end", String(end));
+    const query = params.toString() ? `?${params}` : "";
+    const base = proxyBase(this.deps);
+    const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/messages${query}`);
+    if (answer.status === 404) {
+      return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails).";
+    }
+    if (!answer.ok) throw new ToolInputError(`MemTree tail unavailable (page ${id}: ${answer.error})`);
+    if (!other) this.checkSession((answer.body as { session_id?: unknown }).session_id, this.requireSessionId());
+    return formatTail(answer.body, other);
   }
 
   private async loadCurrent(): Promise<MemtreeIndex> {
@@ -644,8 +673,17 @@ function treeArgument(tree: unknown): string | undefined {
   return tree === CURRENT_TREE ? undefined : checkTreeId(tree);
 }
 
-/** read_lines by leaf address (its range unless block/start/end are given) or by range. */
+/** read_lines by leaf address (its range unless block/start/end are given), by range, or the tail. */
 async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): Promise<string> {
+  if (args.tail === true) {
+    if (!tree.tail) throw new ToolInputError("read_lines: the un-indexed tail is not available here");
+    const position = (v: unknown) => (v === undefined || v === null ? undefined : Number(v));
+    const [start, end] = [position(args.start), position(args.end)];
+    if ([start, end].some((v) => v !== undefined && !Number.isInteger(v))) {
+      throw new ToolInputError("read_lines: with tail, start and end are message positions (integers)");
+    }
+    return tree.tail(treeArgument(args.tree), start, end);
+  }
   if (args.node === undefined || args.node === null || args.node === "") {
     const target = treeArgument(args.tree);
     return formatLines(await tree.get(target), Number(args.block), Number(args.start), Number(args.end), target);
