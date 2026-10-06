@@ -388,3 +388,37 @@ for (const lane of ['agent-followup', 'away-fork']) {
     } finally { h.close(); }
   });
 }
+
+for (const lane of ['main', 'tool']) {
+  test(`late ${lane} recovery selects a byte-larger replacement whose exact count fits`, async () => {
+    let compressions = 0;
+    let rideCounts = 0;
+    const h = await harness({ budget: 100_000, usage: () => undefined,
+      count: body => {
+        const serialized = JSON.stringify(body.messages);
+        return { input_tokens: serialized.includes('x'.repeat(1000)) ? 300_000
+          : serialized.length > 230_000 ? 120_000 : ++rideCounts === 1 ? 50_000 : 210_000 };
+      },
+      compress: () => compressedReply(++compressions === 1 ? 200_000 : 250_000) });
+    const original = [{ role: 'user', content: 'first' },
+      { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(1_200_000) }];
+    const suffix = lane === 'main'
+      ? [{ role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }]
+      : [{ role: 'assistant', content: [{ type: 'tool_use', id: 'next', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'next', content: 'next' }] }];
+    try {
+      assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+      assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }), 200);
+      assert.equal(h.compressions.length, 2, 'exactly one bounded late recovery');
+      assert.equal(h.compressions[1].client_input_tokens, 210_000, 'hint belongs to the counted ride');
+      assert.equal(h.counts.length, 4, 'the larger replacement receives its own exact count');
+      assert.deepEqual(h.forwards[1].messages, h.counts[3].messages);
+      assert.ok(JSON.stringify(h.forwards[1]).length > JSON.stringify(h.forwards[0]).length);
+      assert.match(JSON.stringify(h.forwards[1].messages), /memory m/);
+      assert.ok(!JSON.stringify(h.forwards[1].messages).includes('x'.repeat(1000)));
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.equal(rec.lateCountRecovery.outcome, 'compressed');
+      assert.equal(rec.overBudgetForward.reason, 'exact-count-fits-window');
+    } finally { h.close(); }
+  });
+}

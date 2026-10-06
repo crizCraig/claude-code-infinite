@@ -3384,7 +3384,7 @@ async function recoverLateCount(args) {
             !checkCompressedHistory(outcome.result, messages).usable)
             return undefined;
         const built = buildCompressedBody(body, outcome.result);
-        if (!built || built.compressedRaw.length >= args.bodyBuffer.length)
+        if (!built)
             return undefined;
         return built.compressedRaw;
     }

@@ -23,7 +23,7 @@ Function names below remain the reference when edits shift line numbers.
 | `proxy.ts`: `forwardCompressed` and `recoverToolRouteMiss` replacement preflight | Use the request policy's centralized measurement. Rejected replacements remain registered so eligible alternatives can be considered. |
 | `proxy.ts`: ordinary tool recovery's `compressedRaw.length >= ...` check | Changes route-installation/recovery outcome for no byte gain. Preflight has already registered the replacement; final selection can still choose it. It does not discard the candidate from admission. |
 | `proxy.ts`: post-delivery byte-size/backoff check | Bounds future compression attempts; it does not reject the delivery or remove its candidate. |
-| `proxy.ts`: `recoverLateCount` byte-growth check | **Additional confirmed issue awaiting approval:** a 250 KB replacement that would count at 120k is dropped before registration because the 200 KB ride is smaller in bytes, although that ride counts at 210k. Original count 300k then causes 503. Proposed correction: retain and measure the replacement centrally regardless of byte growth. |
+| `proxy.ts`: `recoverLateCount` | **Corrected with approval:** removed the byte-growth rejection. Structurally valid late replacements reach central measurement and selection regardless of byte growth. Main/tool regressions verify that a 250 KB replacement counted at 120k wins over a 200 KB ride counted at 210k; the 300k original is not sent. |
 | `proxy.ts`: `selectForwardCandidate` | Uses centralized measurements for late-recovery triggering, selects centrally, and logs the selected body's over-budget status. It calls the refusal writer only when no candidate fits. |
 | `proxy.ts`: `refuseWholeRequest` | Writes the centrally selected failure; no independent size calculation. |
 | `proxy.ts`: `forwardRaw`, `forwardAccepted` | Sends the selected body. Route installation and response attribution follow the chosen bytes. Upstream rejection is relayed, not independently predicted here. |
@@ -62,5 +62,6 @@ not whether its tokens fit. They intentionally precede candidate registration.
 | `memtree-tools.ts`, `memtree-finder.ts` | Tool/search snippets, result formatting, line counts and traversal bounds; no model-window admission. |
 | `transcript-usage.ts`, `prompt-accounting.ts`, `reqlog.ts`, CLI option parsing | Telemetry, bounded state/logs and option validation; no alternate message admission gate. |
 
-The additional late-recovery issue above is reproduced with local mock servers;
-no live provider requests were used. Server branch files were not changed.
+The additional late-recovery issue above was reproduced with local mock servers
+before its approved fix. Both main and tool regressions failed first, then passed.
+No live provider requests were used. Server branch files were not changed.

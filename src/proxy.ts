@@ -4617,7 +4617,7 @@ async function recoverLateCount(args: {
     if (!outcome.result || !didMemtreeCompress(outcome.result) ||
         !checkCompressedHistory(outcome.result, messages).usable) return undefined;
     const built = buildCompressedBody(body, outcome.result);
-    if (!built || built.compressedRaw.length >= args.bodyBuffer.length) return undefined;
+    if (!built) return undefined;
     return built.compressedRaw;
   } catch {
     return undefined;
