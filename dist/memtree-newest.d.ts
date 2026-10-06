@@ -7,7 +7,9 @@
  * trees, so the compress page goes stale as a link to show the user. The
  * server knows the newest one: `GET /v1/memtree/sessions` reports each
  * session's `latest_tree` (newest main-lane row whose tree completed), and
- * `q` matches session ids (polychat 0202eaa).
+ * `q` matches session ids (polychat 0202eaa). Follow cursors because other
+ * sessions can quote that id. The older exact-session pages endpoint excludes
+ * index-only calls and does not identify completed trees, so cannot answer this.
  *
  * Only the user-facing link uses this. The memory's source page stays what
  * `/memtree/current` (the MCP tools' `tree: "current"`) answers, since the
@@ -26,13 +28,13 @@ export declare const NEWEST_TREE_WAIT_MS = 2500;
 /** A lookup that has not answered by then is dropped; the next peek retries. */
 export declare const NEWEST_TREE_FETCH_TIMEOUT_MS = 10000;
 export interface NewestTree {
-    /** The page link to show: `/m/<short id>` on the server's origin. */
+    /** The server-selected page, including its pinned namespace and source. */
     url: string;
     /** What makes the link news: the pinned tree ref. */
     key: string;
 }
 /** GET a polychat path with the user's key (MemtreeClient.fetchMemTree). */
-export type NewestTreeFetch = (pathAndQuery: string) => Promise<{
+export type NewestTreeFetch = (pathAndQuery: string, signal: AbortSignal) => Promise<{
     status: number;
     body: Buffer;
 }>;
@@ -40,10 +42,12 @@ export declare class NewestTreeLookup {
     private readonly fetchPath;
     private readonly now;
     private readonly ttlMs;
+    private readonly fetchTimeoutMs;
     private readonly entries;
     private readonly inFlight;
+    private activeFetches;
     private unsupportedUntil;
-    constructor(fetchPath: NewestTreeFetch, now?: () => number, ttlMs?: number);
+    constructor(fetchPath: NewestTreeFetch, now?: () => number, ttlMs?: number, fetchTimeoutMs?: number);
     /** The cached answer, refreshing in the background when stale. Never waits. */
     peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
@@ -54,7 +58,8 @@ export declare class NewestTreeLookup {
      */
     invalidate(sessionId: string): void;
     private refresh;
-    /** The server's answer, or undefined when it has no such endpoint. */
+    private fetch;
+    /** All pages share one deadline; failures retain the last known answer. */
     private ask;
     private remember;
 }
@@ -64,10 +69,6 @@ export declare class NewestTreeLookup {
  * item whose `session_id` is this session counts: never another session's tree.
  */
 export declare function newestTreeFrom(body: unknown, sessionId: string): NewestTree | undefined;
-/**
- * `<origin>/m/<leading 12 hex>`: the spelling compress responses stamp, short
- * enough for a terminal line and the same page as the pinned ref link. Falls
- * back to the server's link when the request id is not a UUID.
- */
-export declare function shortTreeUrl(serverUrl: string, requestId: string): string | undefined;
+/** Preserve the server-selected reference; shortening it can select another tree. */
+export declare function validatedTreeUrl(serverUrl: string): string | undefined;
 //# sourceMappingURL=memtree-newest.d.ts.map

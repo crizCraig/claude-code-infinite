@@ -2543,7 +2543,7 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
   }
 });
 
-const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "");
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x1b\x07]*(?:\x07|\x1b\\)/g, "");
 
 // The server stamps its short spelling of the page (/m/<leading hex of the
 // id>) and the completed index the turn was compressed against.
@@ -10069,9 +10069,9 @@ test("route eligibility survives 40 reminder-only deliveries and overlapping pla
 // while /memtree/current (the MCP tools) stays on the tree the memory came from.
 
 const NEWEST_REQUEST_ID = "229f05e7-d2e5-4494-a631-25dd42d5759e";
-const NEWEST_URL = "https://app.polychat.co/m/229f05e7d2e5";
+const NEWEST_URL = `https://app.polychat.co/usage/memtree/${NEWEST_REQUEST_ID}-v3-own`;
 const OTHER_REQUEST_ID = "0badc0de-1111-4222-8333-444455556666";
-const OTHER_URL = "https://app.polychat.co/m/0badc0de1111";
+const OTHER_URL = `https://app.polychat.co/usage/memtree/${OTHER_REQUEST_ID}-v3-own`;
 
 /** A `/v1/memtree/sessions` item: `requestId` is that session's newest tree. */
 const sessionsItem = (sessionId, requestId) => ({
@@ -10214,4 +10214,81 @@ test("a resumed session links its newest tree, while MCP resumes from the stored
     proxy.close();
     upstream.close();
   }
+});
+
+test("visible hook text strips SGR and OSC 8 with either terminator", () => {
+  for (const end of ['\x1b\\', '\x07']) {
+    assert.equal(stripAnsi(`\x1b[32m• MemTree\x1b[39m\n  \x1b]8;;https://x/page${end}https://x/page\x1b]8;;${end}`), '• MemTree\n  https://x/page');
+  }
+});
+
+function setHyperlinkTerminal(t, env, isTTY) {
+  const keys = ['TERM_PROGRAM', 'TERM_PROGRAM_VERSION', 'TERMINAL_EMULATOR'];
+  const old = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+  t.after(() => {
+    for (const key of keys) {
+      if (old[key] === undefined) delete process.env[key]; else process.env[key] = old[key];
+    }
+    if (descriptor) Object.defineProperty(process.stdout, 'isTTY', descriptor);
+    else delete process.stdout.isTTY;
+  });
+  for (const key of keys) {
+    if (env[key] === undefined) delete process.env[key]; else process.env[key] = env[key];
+  }
+  Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: isTTY });
+}
+
+for (const mode of [
+  {name: 'iTerm2', env: {TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.0'}, tty: true, osc: true},
+  {name: 'JetBrains', env: {TERMINAL_EMULATOR: 'JetBrains-JediTerm'}, tty: true, osc: true},
+  {name: 'Apple Terminal', env: {TERM_PROGRAM: 'Apple_Terminal'}, tty: true, osc: false},
+  {name: 'unknown', env: {}, tty: true, osc: false},
+  {name: 'piped iTerm2', env: {TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.0'}, tty: false, osc: false},
+  {name: 'NO_COLOR iTerm2', env: {TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.0'}, tty: true, osc: false, plain: true},
+]) {
+  test(`/memtree-view hyperlink capability: ${mode.name}`, async t => {
+    setNoticeColorMode(t, !mode.plain);
+    setHyperlinkTerminal(t, mode.env, mode.tty);
+    const {lookup} = await newestLookup(q => ({sessions: [sessionsItem(q, NEWEST_REQUEST_ID)]}));
+    const proxy = await startProxy({memtree: new MemtreeClient({baseUrl:'http://127.0.0.1:1',apiKey:'k'}), newestTrees:lookup});
+    try {
+      const view = await postHook(proxy, {hook_event_name:'UserPromptSubmit',prompt:'/memtree-view',prompt_id:'view'});
+      assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL}`);
+      assert.equal(view.body.reason.includes('\x1b]8;;'), mode.osc);
+      if (mode.osc) assert.ok(view.body.reason.includes(`\x1b]8;;${NEWEST_URL}\x1b\\${NEWEST_URL}\x1b]8;;\x1b\\`));
+      else assert.equal(view.body.reason, stripAnsi(view.body.reason));
+    } finally { proxy.close(); }
+  });
+}
+
+test("a stalled newest-tree lookup does not delay messages or cross clear/fork sessions", {timeout:3000}, async () => {
+  const {NewestTreeLookup} = await import('../dist/memtree-newest.js');
+  let release;
+  const gate = new Promise(resolve=>{release=resolve;});
+  const lookup = new NewestTreeLookup(async path=> {
+    await gate;
+    const q = new URL(path,'http://x').searchParams.get('q');
+    return {status:200,body:Buffer.from(JSON.stringify({sessions:q==='session-1'?[sessionsItem(q,NEWEST_REQUEST_ID)]:[]}))};
+  });
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200,compressedOnce,pageHeaders(PAGE_URL_1,'index-a'));
+  const proxy = await startProxy({memtree:new MemtreeClient({baseUrl:memtreeSrv.origin,apiKey:'k'}),upstreamOrigin:upstream.origin,newestTrees:lookup});
+  try {
+    await armMainTurn(proxy,'turn two','p1');
+    const response = await postSessionMessages(proxy.port,followupTurn('turn two'));
+    assert.equal(response.content[0].text,'upstream answer','upstream response arrives before the finder gate opens');
+    release();
+    await new Promise(resolve=>setImmediate(resolve));
+    await lookup.settle('session-1');
+    await postHook(proxy,{hook_event_name:'SessionStart',source:'clear',session_id:'cleared'});
+    await postHook(proxy,{hook_event_name:'SessionStart',source:'startup',session_id:'forked'});
+    const views = await Promise.all(['session-1','cleared','forked'].map(session_id=>postHook(proxy,{
+      hook_event_name:'UserPromptSubmit',session_id,prompt:'/memtree-view',prompt_id:'view',
+    })));
+    assert.ok(views[0].body.reason.includes(NEWEST_URL));
+    for(const view of views.slice(1)) assert.match(view.body.reason,/no page yet/);
+    assert.equal(await getCurrentId(proxy,'cleared'),404);
+    assert.equal(await getCurrentId(proxy,'forked'),404);
+  } finally { release(); proxy.close(); upstream.close(); memtreeSrv.close(); }
 });

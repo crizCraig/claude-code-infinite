@@ -106,6 +106,21 @@ export function terminalSupportsColor(env = process.env, stream = process.stdout
     }
     return true;
 }
+/** Evaluated in the proxy's terminal, not the hook relay's piped stdout. */
+export function terminalSupportsHyperlinks(env = process.env, stream = process.stdout) {
+    if (stream.isTTY !== true || Object.prototype.hasOwnProperty.call(env, "NO_COLOR"))
+        return false;
+    if (env.TERM === "dumb" || /^(screen|tmux)(-|$)/.test(env.TERM ?? ""))
+        return false;
+    if (env.TERMINAL_EMULATOR === "JetBrains-JediTerm")
+        return true;
+    if (env.TERM_PROGRAM === "iTerm.app") {
+        const match = /^(\d+)\.(\d+)/.exec(env.TERM_PROGRAM_VERSION ?? "");
+        return !!match && (Number(match[1]) > 3 || (Number(match[1]) === 3 && Number(match[2]) >= 1));
+    }
+    // Apple Terminal and unknown terminals retain a plain, detectable URL.
+    return false;
+}
 /**
  * Single-session delivery queue. Claude Code serializes main-thread turns, so
  * one replaceable pending notice is sufficient. A new user request clears any
@@ -147,6 +162,7 @@ export class NoticeDeliveryQueue {
      */
     resumeLine(link, sessionId) {
         this.deliveryFor(sessionId).trailer = link.key;
+        this.deliveryFor(sessionId).trailerUrl = link.link;
         this.deliveryFor(sessionId).link = link.key;
         return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
     }
@@ -201,6 +217,7 @@ export class NoticeDeliveryQueue {
         const trailerDue = this.trailerPlacement !== "message" || !this.deliveryFor(input.session_id).shown;
         const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
         this.deliveryFor(input.session_id).shown = false;
+        delete this.deliveryFor(input.session_id).successPage;
         if (!prefix && !suffix && trailer === undefined)
             return null;
         if (prefix || suffix)
@@ -293,7 +310,9 @@ export class NoticeDeliveryQueue {
         if (link === undefined)
             return this.styleSuccess(text);
         this.deliveryFor(sessionId).link = link.key;
+        this.deliveryFor(sessionId).successPage = noticePageIdentity(link.link);
         this.deliveryFor(sessionId).trailer = link.key;
+        this.deliveryFor(sessionId).trailerUrl = link.link;
         return `${this.styleSuccess(text)}\n  ${link.link}`;
     }
     /** The session's current link, shown or not. Resolver failures never break a hook. */
@@ -339,11 +358,15 @@ export class NoticeDeliveryQueue {
         }
         if (!link?.link || !link.key)
             return undefined;
-        const isNew = link.key !== this.deliveryFor(sessionId).trailer;
+        const delivered = this.deliveryFor(sessionId);
+        if (this.trailerPlacement === "turn" && delivered.successPage === noticePageIdentity(link.link))
+            return undefined;
+        const isNew = link.key !== delivered.trailer && link.link !== delivered.trailerUrl;
         // "turn": one line per user turn, and only when the index changed.
         if (this.trailerPlacement === "turn" && !isNew)
             return undefined;
         this.deliveryFor(sessionId).trailer = link.key;
+        this.deliveryFor(sessionId).trailerUrl = link.link;
         const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
         return this.linkNotice(label, link);
     }
@@ -379,6 +402,17 @@ export class NoticeDeliveryQueue {
             this.pending = null;
         }
     }
+}
+/** Compare the short and pinned spellings only within a turn's success/Stop pair. */
+function noticePageIdentity(link) {
+    try {
+        const url = new URL(link);
+        const match = /^\/(?:m|usage\/memtree)\/([0-9a-f]{12}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-v[13]-(?:own|served))?$/.exec(url.pathname);
+        if (match)
+            return `${url.origin}/${match[1].replace(/-/g, "").slice(0, 12)}`;
+    }
+    catch { /* Non-page links compare literally. */ }
+    return link;
 }
 function resolveNoticeText(part) {
     try {

@@ -73,6 +73,10 @@ interface ColorCapableStream {
 }
 /** Respect explicit monochrome settings and Node's platform color detection. */
 export declare function terminalSupportsColor(env?: NodeJS.ProcessEnv, stream?: ColorCapableStream): boolean;
+/** Evaluated in the proxy's terminal, not the hook relay's piped stdout. */
+export declare function terminalSupportsHyperlinks(env?: NodeJS.ProcessEnv, stream?: {
+    isTTY?: boolean;
+}): boolean;
 export interface MessageDisplayHookInput {
     hook_event_name: "MessageDisplay";
     session_id: string;

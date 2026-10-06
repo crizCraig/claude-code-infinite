@@ -18,7 +18,7 @@ import { exec } from "node:child_process";
 import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
-import { NEWEST_TREE_FETCH_TIMEOUT_MS, NewestTreeLookup } from "./memtree-newest.js";
+import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
   createSessionNoticePlugin,
@@ -385,8 +385,8 @@ async function main() {
     memtreeLinkPlacement,
     memtreeLinkStore: new MemtreeLinkStore(),
     // The link shown to the user follows the session's newest tree on the server.
-    newestTrees: new NewestTreeLookup((path) =>
-      memtree.fetchMemTree(path, "application/json", AbortSignal.timeout(NEWEST_TREE_FETCH_TIMEOUT_MS))
+    newestTrees: new NewestTreeLookup((path, signal) =>
+      memtree.fetchMemTree(path, "application/json", signal)
     ),
     transcriptUsage,
     projectMeta,
