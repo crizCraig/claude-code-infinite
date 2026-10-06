@@ -12,6 +12,28 @@ import { type UpdateAvailable } from "./update-check.js";
 export declare const NOTICE_OPEN = "<cc-infinite-notice>";
 export declare const NOTICE_CLOSE = "</cc-infinite-notice>";
 export declare const COMPRESSED_NOTICE = "\u2713 MemTree \u00B7 conversation optimized";
+/**
+ * The success line with the newest ready MemTree page for this conversation
+ * appended, when the client has one it has not shown yet — plain text form
+ * (monochrome rendering, docs, tests). The hook renderer styles the text and
+ * leaves the URL bare so Claude Code's linkifier gets a clean link.
+ */
+/**
+ * The success line with the conversation's size before and after
+ * compression: `✓ MemTree · conversation optimized · ~861k → 426k tokens`.
+ * Without both counts, or when "after" is not smaller, the plain line.
+ */
+export declare function compressedTotalsText(originalTokens: number | undefined, compressedTokens: number | undefined): string;
+export declare function compressedNoticeText(memtreeUrl?: string): string;
+/**
+ * The trailer under a finished assistant message naming the newest MemTree
+ * page for the conversation, plain-text form. The hook renderer styles the
+ * label green the first time an index is shown and dim afterwards, with the
+ * URL shown in full either way (and, where styled, a hyperlink to itself).
+ */
+export declare function memtreeTrailerText(memtreeUrl: string, note?: string): string;
+/** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */
+export declare const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export declare const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn ran uncompressed";
@@ -70,6 +92,22 @@ export declare function stripNoticeSystem(system: any): {
     system: any;
     stripped: boolean;
 };
+/** content_block_start/delta/stop triple for a plain text block. */
+export declare function textBlockEvents(index: number, text: string): string;
+/**
+ * Claude Code keeps at most this many characters of a recap (the joined text
+ * of the reply), truncating the end. Checked against Claude Code 2.1.278.
+ */
+export declare const RECAP_MAX_CHARS = 400;
+/**
+ * The recap's link line, or undefined when it would not fit under Claude
+ * Code's cap and would come back clipped mid-URL.
+ *
+ * Ends with a newline: for its first few recaps Claude Code appends
+ * " (disable recaps in /config)" to the recap text, which would otherwise land
+ * on the URL's line and read as part of the MemTree note.
+ */
+export declare function recapLinkText(link: string, streamedTextChars: number, note?: string): string | undefined;
 /** content_block_start/delta/stop triple for a notice text block. */
 export declare function noticeBlockEvents(index: number, noticeText: string): string;
 /**
@@ -87,6 +125,12 @@ export interface SseRewriteOptions {
     beforeResponseNotice?: string;
     /** Inject this notice before the final message_delta/message_stop. */
     endOfTurnNotice?: string;
+    /**
+     * Inject this text, verbatim (no notice marker), as a final text block
+     * before message_delta/message_stop. Called once, with the number of text
+     * characters the response streamed so far; returning undefined skips it.
+     */
+    endOfTurnText?: (streamedTextChars: number) => string | undefined;
     /**
      * Diagnostics observer: called with every parsed upstream event's data
      * object BEFORE any rewriting (so it sees message_start even when the
@@ -107,6 +151,8 @@ export declare class SseNoticeRewriter {
     private maxIndexSeen;
     private injectedResponseNotice;
     private injectedEndNotice;
+    private injectedEndText;
+    private streamedTextChars;
     constructor(opts: SseRewriteOptions);
     push(chunk: Buffer): string;
     /** Anything buffered after the stream ends (normally empty). */

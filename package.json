@@ -1,6 +1,6 @@
 {
   "name": "claude-code-infinite",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "Wrapper for Claude Code CLI",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -36,5 +36,8 @@
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^25.0.0",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.3"
   }
 }

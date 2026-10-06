@@ -100,7 +100,13 @@ test("every failure mode resolves to null, never rejects", async () => {
       "timeout",
       (_url, init) =>
         new Promise((_resolve, reject) => {
-          init.signal.addEventListener("abort", () => reject(init.signal.reason));
+          // Real fetch holds an I/O handle while pending. Keep this mock
+          // alive too: AbortSignal.timeout's timer is unref'ed on Node 20.
+          const pendingIo = setInterval(() => {}, 1_000);
+          init.signal.addEventListener("abort", () => {
+            clearInterval(pendingIo);
+            reject(init.signal.reason);
+          }, { once: true });
         }),
     ],
   ];

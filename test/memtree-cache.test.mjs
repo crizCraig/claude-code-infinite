@@ -117,3 +117,38 @@ async function memtreeFixture({ hold = false, status = 200 } = {}) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
+
+
+test("identical conversations in different sessions do not share compression responses", async () => {
+  const fixture = await memtreeFixture({ hold: true });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const a = client.compress(HASH, MESSAGES, 100, undefined, { sessionId: "a" });
+    const b = client.compress(HASH, MESSAGES, 100, undefined, { sessionId: "b" });
+    assert.notStrictEqual(a, b);
+    fixture.release();
+    await Promise.all([a, b]);
+    assert.equal(fixture.calls.length, 2);
+    assert.strictEqual(client.compress(HASH, MESSAGES, 100, undefined, { sessionId: "a" }), a);
+    assert.strictEqual(client.compress(HASH, MESSAGES, 100, undefined, { sessionId: "b" }), b);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+
+test("background indexing deduplicates within each session only", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    client.indexInBackground(HASH, MESSAGES, 100, "a");
+    client.indexInBackground(HASH, MESSAGES, 100, "b");
+    client.indexInBackground(HASH, MESSAGES, 100, "a");
+    assert.equal(await client.drainBackground(), true);
+    assert.equal(fixture.calls.length, 2);
+    assert.ok(fixture.calls.every((call) => call.index_only));
+  } finally {
+    await fixture.close();
+  }
+});

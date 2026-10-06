@@ -18,22 +18,28 @@ import {
 import {
   NOTICE_OPEN,
   COMPRESSED_NOTICE,
+  NOT_COMPRESSED_NOTE,
   DEGRADED_NOTICE,
   PAYMENT_REQUIRED_NOTICE,
   wrapNotice,
 } from "../dist/notices.js";
 import { AWAY_SUMMARY_PROMPT_PREFIX } from "../dist/turns.js";
+import { SessionFinder } from "../dist/memtree-mcp.js";
 
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
 
+/** The success line, optionally with its "· ~Nk → Mk tokens" sizes, then the answer. */
+const SUCCESS_TOTALS_RE = / · ~\d+(?:\.\d+)?[km]? → \d+(?:\.\d+)?[km]? tokens/;
+
 function assertSuccessNotice(text, answer) {
   const colored = text.startsWith(GREEN);
+  const plain = text.replace(SUCCESS_TOTALS_RE, "");
   assert.equal(
-    text,
+    plain,
     `${colored ? GREEN : ""}${COMPRESSED_NOTICE}` +
       `${colored ? DEFAULT_FOREGROUND : ""}\n${answer}`,
-    "the notice is the bare copy: no latency, no token totals"
+    "the success line, with no latency"
   );
 }
 
@@ -85,22 +91,33 @@ function mockUpstream() {
  * need per-call responses — e.g. a memory message that changes between turns,
  * since an unchanged memory message no longer re-queues the success notice.
  */
-async function mockMemtree(status, bodyObj) {
+/** `headers` (object, or `(body, call) => object`) adds response headers per call. */
+/** Text of a message whose content is a string or text blocks (the compressed message carries a cache marker). */
+function flatText(message) {
+  const c = message?.content;
+  return typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => p?.text ?? "").join("") : c;
+}
+
+async function mockMemtree(status, bodyObj, headers = {}) {
   const calls = [];
+  const callHeaders = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
       calls.push(parsed);
+      callHeaders.push(req.headers);
       const resolved =
         typeof bodyObj === "function" ? bodyObj(parsed, calls.length - 1) : bodyObj;
       const body = JSON.stringify(withServerFlatten(resolved, parsed));
-      res.writeHead(status, { "content-type": "application/json" });
+      const extra =
+        typeof headers === "function" ? headers(parsed, calls.length - 1) : headers;
+      res.writeHead(status, { "content-type": "application/json", ...extra });
       res.end(body);
     });
   });
-  return { ...srv, calls };
+  return { ...srv, calls, callHeaders };
 }
 
 /**
@@ -187,6 +204,14 @@ async function postMessages(port, messages, extraHeaders = {}) {
     body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages }),
   });
   return res.json();
+}
+
+function linkText(text) {
+  return stripAnsi(text).replace(SUCCESS_TOTALS_RE, "");
+}
+
+function postSessionMessages(port, messages, extraHeaders = {}) {
+  return postMessages(port, messages, { "x-claude-code-session-id": "session-1", ...extraHeaders });
 }
 
 async function postCountTokens(port, body, extraHeaders = {}, search = "") {
@@ -722,7 +747,7 @@ test("memory route installs on a followup, so count_tokens sizes the compressed 
     const counted = seen.find((c) => c.isCount);
     assert.ok(counted, "count_tokens reached upstream");
     assert.equal(
-      counted.body.messages[0].content,
+      flatText(counted.body.messages[0]),
       "compressed context",
       "count_tokens must size the compressed context; counting the full " +
         "history is what makes Claude Code auto-compact"
@@ -805,7 +830,7 @@ test("memory route survives a mid-loop model switch", async () => {
     const routed = upstreamBodies[1];
     assert.equal(routed.model, "claude-opus-5", "model passes through untouched");
     assert.equal(
-      routed.messages[0].content,
+      flatText(routed.messages[0]),
       "compressed context",
       "the tool loop must keep riding the compressed prefix after a model switch"
     );
@@ -1168,20 +1193,71 @@ test("memory route drops stale billing headers when the one-header invariant bre
   }
 });
 
-test("typed prompt merged into a tool_result wrapper recompresses instead of sticky passthrough", async () => {
-  // The failure this pins down: a prompt typed to recover an interrupted tool
-  // loop (or queued mid-turn) is delivered merged into the pending tool_result
-  // wrapper. UserPromptSubmit has already cleared the memory route expecting
-  // this request to rebuild it, but the merged shape fails isNonToolUserMessage
-  // -- so nothing rebuilds, and every later tool turn forwards the full
-  // history until the next pure user turn.
+test("typed prompt merged into a tool wrapper reuses the API-validated route", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  try {
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    const prefix = JSON.stringify(JSON.parse(h.lastUpstream())[0]);
+    await armMainTurn(h.proxy, "continue");
+    const merged = withToolRound(base, "merged", [{ type: "text", text: "continue" }]);
+    await postSessionMessages(h.proxy.port, merged);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.match(h.lastUpstream(), /continue/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.equal(JSON.stringify(JSON.parse(h.lastUpstream())[0]), prefix, "reuse keeps compressed bytes stable");
+    await postSessionMessages(h.proxy.port, withToolRound(merged, "later"));
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.equal(h.compressCalls(), 1, "hook text cannot trigger rebuilding");
+  } finally { h.close(); }
+});
+
+test("prompt substrings in reminders cannot change route eligibility", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  try {
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "continue");
+    const decoy = withToolRound(base, "decoy", [
+      { type: "text", text: "<system-reminder>Tests continue in the background.</system-reminder>" },
+      { type: "text", text: "The build will continue after this step." },
+    ]);
+    await postSessionMessages(h.proxy.port, decoy);
+    const real = withToolRound(decoy, "real", [{ type: "text", text: "continue" }]);
+    await postSessionMessages(h.proxy.port, real);
+    assert.equal(h.compressCalls(), 1);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.match(h.lastUpstream(), /continue/);
+  } finally { h.close(); }
+});
+
+/** Claude Code 2.1.284's shape for a prompt typed while the turn is running. */
+const midTurnReminder = (prompt) =>
+  "<system-reminder>\nThe user sent a new message while you were working:\n" +
+  `${prompt}\n\nThis is how Claude Code surfaces messages the user sends mid-turn ` +
+  "— within the running turn, often alongside the next tool result, rather " +
+  "than as a separate conversation turn. Address the message above as you " +
+  "continue this turn.\n</system-reminder>";
+
+/** Appends one tool_use/tool_result round; extra parts ride the result wrapper. */
+const withToolRound = (messages, id, extraParts = []) => [
+  ...messages,
+  { role: "assistant", content: [{ type: "tool_use", id, name: "x", input: {} }] },
+  {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: id, content: "ok" }, ...extraParts],
+  },
+];
+
+async function startMidTurnHarness(extraOpts = {}, upstreamStatus = () => 200) {
   const upstreamBodies = [];
   const upstream = await listen((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
+      res.writeHead(upstreamStatus(), {
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
       });
@@ -1192,233 +1268,241 @@ test("typed prompt merged into a tool_result wrapper recompresses instead of sti
     messages: [{ role: "user", content: "compressed context" }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
-    // Out of scope: tool-route recovery would add blocking compresses to the
-    // plain tool turns below, polluting the compress-count signal this test
-    // uses to detect (non-)promotion of wrappers to user turns.
-    toolRouteRecovery: false,
+    ...extraOpts,
   });
-  const headers = { "x-claude-code-session-id": "session-recovery" };
-  // Interrupted tool loop: tool_use answered, response lost, user typed
-  // "continue". Claude Code merges the typed text into the wrapper.
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
-  try {
-    await armMainTurn(proxy, "continue");
-    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify({
-        model: "claude-x",
-        max_tokens: 64,
-        messages: recoveryMessages,
-      }),
-    });
-    await response.text();
-
-    assert.ok(
-      memtreeSrv.calls.some((c) => c.index_only !== true),
-      "recovery turn must reach MemTree as a blocking compress, not index-only"
-    );
-    assert.match(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "recovery turn forwards the compressed context"
-    );
-
-    // The rebuilt route must carry the next pure tool turn.
-    const toolMessages = [
-      ...recoveryMessages,
-      {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "t2", name: "x", input: {} }],
-      },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "t2", content: "ok" }],
-      },
-    ];
-    const toolResponse = await fetch(
-      `http://127.0.0.1:${proxy.port}/v1/messages`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({
-          model: "claude-x",
-          max_tokens: 64,
-          messages: toolMessages,
-        }),
-      }
-    );
-    await toolResponse.text();
-    const lastMessages = JSON.stringify(upstreamBodies.at(-1).messages);
-    assert.match(
-      lastMessages,
-      /compressed context/,
-      "tool turn after recovery rides the rebuilt memory route"
-    );
-    assert.doesNotMatch(
-      lastMessages,
-      /first question/,
-      "tool turn after recovery must not fall back to full history"
-    );
-
-    // A plain tool wrapper without an armed typed prompt must stay a tool
-    // turn: arm a prompt whose text the wrapper does not contain and verify
-    // no new compress fires for it.
-    const compressCallsBefore = memtreeSrv.calls.filter(
-      (c) => c.index_only !== true
-    ).length;
-    await armMainTurn(proxy, "unrelated typed prompt");
-    const plainToolMessages = [
-      ...toolMessages,
-      {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "t3", name: "x", input: {} }],
-      },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "t3", content: "ok" }],
-      },
-    ];
-    const plainToolResponse = await fetch(
-      `http://127.0.0.1:${proxy.port}/v1/messages`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({
-          model: "claude-x",
-          max_tokens: 64,
-          messages: plainToolMessages,
-        }),
-      }
-    );
-    await plainToolResponse.text();
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      compressCallsBefore,
-      "a wrapper without the typed text must not be promoted to a user turn"
-    );
-  } finally {
+  const compressCalls = () => memtreeSrv.calls.filter((c) => c.index_only !== true).length;
+  const lastUpstream = () => JSON.stringify(upstreamBodies.at(-1).messages);
+  const close = () => {
     proxy.close();
     upstream.close();
     memtreeSrv.close();
+  };
+  return { proxy, memtree, compressCalls, lastUpstream, upstreamCount: () => upstreamBodies.length, close };
+}
+
+test("a prompt typed mid-turn keeps the tool loop on its memory route (2026-10-02 overflow)", async () => {
+  // Incident: the user typed while the main turn was running. UserPromptSubmit
+  // fired at once and cleared the route; Claude Code then delivered the text
+  // inside a <system-reminder> next to the next tool_result, which the
+  // merged-prompt matcher ignores. Recovery stayed transform-only under the
+  // armed window, its retry was spent, and every later tool turn forwarded
+  // the full history until the conversation hit the 1M window. Compaction
+  // off: the session's stable prefix would otherwise carry the tool loop.
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    assert.equal(h.compressCalls(), 1, "the followup compresses and installs a route");
+
+    const round1 = withToolRound(base, "t1");
+    await postMessages(h.proxy.port, round1, headers);
+    assert.match(h.lastUpstream(), /compressed context/, "tool turn rides the route");
+
+    await postHook(h.proxy, {
+      hook_event_name: "UserPromptSubmit",
+      prompt: "do both?",
+      prompt_id: "prompt-midturn",
+    });
+    const round2 = withToolRound(round1, "t2", [
+      { type: "text", text: midTurnReminder("do both?") },
+    ]);
+    await postMessages(h.proxy.port, round2, headers);
+    assert.match(h.lastUpstream(), /compressed context/, "mid-turn prompt rides the route");
+    assert.doesNotMatch(h.lastUpstream(), /first question/, "no full-history passthrough");
+    assert.match(h.lastUpstream(), /do both\?/, "the typed prompt still reaches the model");
+
+    await postMessages(h.proxy.port, withToolRound(round2, "t3"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "later tool turns keep riding");
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.equal(h.compressCalls(), 1, "a mid-turn prompt needs no blocking compress");
+  } finally {
+    h.close();
   }
 });
 
-test("prompt substring inside a tool wrapper's system-reminder must not consume the arm", async () => {
-  // Misfire this pins down: a short prompt queued mid-turn ("continue") arms
-  // the hook and clears the route; an intermediate tool_result wrapper whose
-  // appended <system-reminder> (or unrelated mid-sentence text) happens to
-  // contain that substring must stay a plain tool turn. If it were promoted,
-  // it would consume the arm and pay a blocking compress, and the real merged
-  // wrapper arriving next would degrade to sticky full-history passthrough.
-  const upstreamBodies = [];
-  const upstream = await listen((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
-      });
-      res.end(UPSTREAM_BODY);
-    });
-  });
-  const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
-    usage: { prompt_tokens_details: { cached_tokens: 123 } },
-  });
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
-    upstreamOrigin: upstream.origin,
-    // Out of scope: recovery on the decoy tool turn would blocking-compress
-    // (transform-only under the armed window, but a compress all the same),
-    // breaking the compress-count signal for arm consumption.
-    toolRouteRecovery: false,
-  });
-  const headers = { "x-claude-code-session-id": "session-reminder-misfire" };
-  const baseMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-  ];
+test("an interrupted turn reuses its validated prefix when Stop never came", async () => {
+  // Claude Code skips Stop on an interrupt, so a real next prompt can look
+  // mid-turn to the hook. The next API request
+  // extends the same history and reuses its prefix without consulting the hook.
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
   try {
-    await armMainTurn(proxy, "continue", "prompt-misfire");
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    const round1 = withToolRound(base, "t1");
+    await postMessages(h.proxy.port, round1, headers);
 
-    // Intermediate wrapper: the armed text appears only inside an appended
-    // <system-reminder> block and mid-sentence in ordinary trailing text.
-    const decoyWrapper = [
-      ...baseMessages,
-      {
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "t1", content: "ok" },
-          {
-            type: "text",
-            text: "<system-reminder>Tests may continue running in the background.</system-reminder>",
-          },
-          { type: "text", text: "The build will continue after this step." },
-        ],
-      },
+    await armMainTurn(h.proxy, "turn three", "prompt-three");
+    const next = [
+      ...round1,
+      { role: "assistant", content: [{ type: "text", text: "interrupted" }] },
+      { role: "user", content: "turn three" },
     ];
-    await postMessages(proxy.port, decoyWrapper, headers);
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      0,
-      "reminder/mid-sentence substring must not trigger a blocking compress"
-    );
-    assert.doesNotMatch(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "decoy wrapper forwards as a plain tool turn"
-    );
+    await postMessages(h.proxy.port, next, headers);
+    assert.equal(h.compressCalls(), 1, "the matching history reuses its compressed prefix");
+    assert.match(h.lastUpstream(), /compressed context/);
 
-    // The real merged-prompt wrapper arrives next; the preserved arm must
-    // still promote it to a compressible recovery turn.
-    const recoveryWrapper = [
-      ...baseMessages,
-      {
-        role: "user",
-        content: [
-          { type: "tool_result", tool_use_id: "t1", content: "ok" },
-          { type: "text", text: "continue" },
-        ],
-      },
-    ];
-    await postMessages(proxy.port, recoveryWrapper, headers);
-    assert.equal(
-      memtreeSrv.calls.filter((c) => c.index_only !== true).length,
-      1,
-      "real merged-prompt wrapper still owns the arm and compresses"
-    );
-    assert.match(
-      JSON.stringify(upstreamBodies.at(-1).messages),
-      /compressed context/,
-      "recovery turn forwards the compressed context"
-    );
+    await postMessages(h.proxy.port, withToolRound(next, "t4"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "its tool loop rides the new route");
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
   } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
+    h.close();
   }
+});
+
+test("delivered mid-turn wrappers and a later plain prompt keep reusing the prefix", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    let messages = followupTurn("turn two");
+    await postMessages(h.proxy.port, messages, headers);
+    for (let i = 0; i < 35; i++) {
+      const prompt = i % 2 ? "repeat this prompt" : `prompt ${i}`;
+      await armMainTurn(h.proxy, prompt, `mid-${i}`);
+      messages = withToolRound(messages, `tool-${i}`, [{ type: "text", text: prompt }]);
+      await postMessages(h.proxy.port, messages, headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+    }
+    await armMainTurn(h.proxy, "repeat this prompt", "final");
+    await postMessages(h.proxy.port, [...messages, { role: "assistant", content: "done" },
+      { role: "user", content: "repeat this prompt" }], headers);
+    assert.equal(h.compressCalls(), 1, "prompt bookkeeping never forces a replacement");
+  } finally { h.close(); }
+});
+
+test("failed wrapper forwarding does not block a later matching plain turn", async () => {
+  let status = 200;
+  const h = await startMidTurnHarness({ defaultCompactTarget: null }, () => status);
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    await armMainTurn(h.proxy, "not delivered", "pending");
+    status = 529;
+    await postMessages(h.proxy.port, withToolRound(base, "failed", [
+      { type: "text", text: "not delivered" },
+    ]), headers);
+    status = 200;
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    await postMessages(h.proxy.port, [...base, { role: "assistant", content: "interrupted" },
+      { role: "user", content: "not delivered" }], headers);
+    assert.equal(h.compressCalls(), 1, "failed delivery accounting cannot veto prefix reuse");
+  } finally { h.close(); }
+});
+
+for (const stopped of [true, false]) {
+  test(`separately delivered queued prompts reuse history after ${stopped ? "Stop" : "interrupt"}`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      let messages = followupTurn("turn two");
+      await postMessages(h.proxy.port, messages, headers);
+      await armMainTurn(h.proxy, "queued alpha", "alpha");
+      await armMainTurn(h.proxy, "queued beta", "beta");
+      if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      for (const [index, prompt] of ["queued alpha", "queued beta"].entries()) {
+        const beforeMatching = h.compressCalls();
+        messages = [...messages, { role: "assistant", content: "finished" },
+          { role: "user", content: prompt }];
+        await postMessages(h.proxy.port, messages, headers);
+        assert.equal(h.compressCalls(), beforeMatching, "matching prompt history reuses its validated prefix");
+        assert.match(h.lastUpstream(), /compressed context/);
+        if (index === 0) {
+          const before = h.upstreamCount();
+          const divergent = [{ role: "user", content: "different history" }, ...messages.slice(1)];
+          await postMessages(h.proxy.port, withToolRound(divergent, "unproven-tool"), headers);
+          assert.equal(h.upstreamCount(), before + 1, "the fitting divergent request proceeds despite pending beta");
+          assert.deepEqual(JSON.parse(h.lastUpstream()), withToolRound(divergent, "unproven-tool"), "a short divergent tool request may pass through unchanged");
+        }
+        await postMessages(h.proxy.port, withToolRound(messages, `queued-tool-${index}`), headers);
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        if (stopped) await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: index === 0 ? "alpha" : "beta" });
+      }
+    } finally { h.close(); }
+  });
+}
+
+for (const overflow of [false, true]) {
+  test(`queued accounting ${overflow ? "past its bound" : "with duplicate text"} cannot block route reuse`, async () => {
+    const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+    const headers = { "x-claude-code-session-id": "session-1" };
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-two");
+      const base = followupTurn("turn two");
+      await postMessages(h.proxy.port, base, headers);
+      for (let i = 0; i < (overflow ? 33 : 2); i++) {
+        await armMainTurn(h.proxy, overflow ? `queued ${i}` : "same prompt", `queued-${i}`);
+      }
+      await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+      const count = h.upstreamCount();
+      const next = [...base, { role: "assistant", content: "done" },
+        { role: "user", content: overflow ? "queued 32" : "same prompt" }];
+      await postMessages(h.proxy.port, next, headers);
+      assert.equal(h.upstreamCount(), count + 1, "duplicate or evicted accounting cannot veto a valid route");
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.equal(h.compressCalls(), 1, "the original prefix remains reusable");
+      await postMessages(h.proxy.port, withToolRound(next, "still-owned"), headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+    } finally { h.close(); }
+  });
+}
+
+test("queued prompts before Stop keep the compressed route for tool wrappers", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    for (const prompt of ["first queued", "second queued"]) {
+      await armMainTurn(h.proxy, prompt, prompt);
+    }
+    await postHook(h.proxy, { hook_event_name: "Stop", prompt_id: "prompt-two" });
+    const next = withToolRound(base, "late-tool", [
+      { type: "text", text: "first queued" },
+      { type: "text", text: midTurnReminder("second queued") },
+    ]);
+    await postMessages(h.proxy.port, next, headers);
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+    assert.match(h.lastUpstream(), /first queued/);
+    assert.match(h.lastUpstream(), /second queued/);
+    assert.equal(h.compressCalls(), 1);
+  } finally { h.close(); }
+});
+
+test("queued accounting cannot veto independent request validation", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null, toolRouteRecovery: false });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    await armMainTurn(h.proxy, "turn two", "prompt-two");
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    await armMainTurn(h.proxy, "queued", "queued");
+    await postHook(h.proxy, { hook_event_name: "Stop" });
+    const upstreamCount = h.upstreamCount();
+    await postMessages(h.proxy.port, followupTurn("unidentified queued owner"), headers);
+    assert.equal(h.upstreamCount(), upstreamCount + 1, "matching plain history reuses the route");
+    assert.match(h.lastUpstream(), /compressed context/);
+    const mismatch = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "tool");
+    await postMessages(h.proxy.port, mismatch, headers);
+    assert.equal(h.upstreamCount(), upstreamCount + 2, "a short divergent tool request may pass through when recovery is disabled");
+    assert.deepEqual(JSON.parse(h.lastUpstream()), mismatch);
+    await postMessages(h.proxy.port, withToolRound(followupTurn("unidentified queued owner"), "valid-tool"), headers);
+    assert.match(h.lastUpstream(), /compressed context/, "uncertain mismatch must keep the route");
+  } finally { h.close(); }
 });
 
 test("retried recovery turn after an upstream 529 still compresses instead of sticky passthrough", async () => {
@@ -1458,28 +1542,16 @@ test("retried recovery turn after an upstream 529 still compresses instead of st
     });
   });
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
+    messages: [{ role: "user", content: "compressed context " + "m".repeat(2500) }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
   });
   const headers = { "x-claude-code-session-id": "session-recovery-retry" };
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
+  const recoveryMessages = largeToolTurn();
+  recoveryMessages.at(-1).content.push({ type: "text", text: "continue" });
   const postRecovery = () =>
     fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
@@ -1762,11 +1834,11 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
     });
   });
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "compressed context" }],
+    messages: [{ role: "user", content: "compressed context " + "m".repeat(2500) }],
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
@@ -1774,20 +1846,8 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
   const headers = { "x-claude-code-session-id": "session-dead-flush-retry" };
   // Interrupted tool loop: the typed "continue" is merged into the pending
   // tool_result wrapper (recovery-prompt shape).
-  const recoveryMessages = [
-    { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [
-        { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "continue" },
-      ],
-    },
-  ];
+  const recoveryMessages = largeToolTurn();
+  recoveryMessages.at(-1).content.push({ type: "text", text: "continue" });
   const requestBody = JSON.stringify({
     model: "claude-x",
     max_tokens: 64,
@@ -1835,7 +1895,7 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
       records.some(
         (record) =>
           record.kind === "messages" &&
-          record.turnType === "followup-compressed"
+          record.turnType === "tool-recompressed"
       )
     );
 
@@ -1862,10 +1922,10 @@ async function assertRetryAfterFailedDeliverySurvivesInstalledRoute() {
       records.filter(
         (record) =>
           record.kind === "messages" &&
-          record.turnType === "followup-compressed"
+          record.turnType === "tool-recompressed"
       ).length,
-      2,
-      "the retry reclassifies as a compressed followup, not a tool turn"
+      1,
+      "the retry reuses the already installed compressed route"
     );
 
     // The retry's successful delivery rebuilds the route for the tool loop.
@@ -2027,9 +2087,9 @@ test("server compressed:true is trusted over a zero cached_tokens", async () => 
     await armMainTurn(proxy, "turn two");
     const json = await postMessages(proxy.port, messages);
     assert.equal(json.content.at(-1).text, "upstream answer");
-    assert.deepEqual(forwarded.messages, [
-      { role: "user", content: "memory + recent turns" },
-    ]);
+    // The flattened compressed message carries a cache breakpoint, so Anthropic
+    // caches system + tools + compressed history for the tool turns that follow.
+    assert.deepEqual(forwarded.messages, [{ role: "user", content: [{ type: "text", text: "memory + recent turns", cache_control: { type: "ephemeral" } }] }]);
   } finally {
     proxy.close();
     upstream.close();
@@ -2296,7 +2356,7 @@ test("captured CC trailing role=system shape is still classified and compressed"
         String(m.content).includes("ambient context")),
       "ambient system block remains in the MemTree payload"
     );
-    assert.deepEqual(forwarded.messages, [{ role: "user", content: "compressed context" }]);
+    assert.deepEqual(forwarded.messages, [{ role: "user", content: [{ type: "text", text: "compressed context", cache_control: { type: "ephemeral" } }] }]);
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-trailing-system" }))).status,
       200
@@ -2372,7 +2432,7 @@ test("hidden away-summary queues nothing and cannot disarm an overlapping human 
   }
 });
 
-test("new UserPromptSubmit during async compression discards the old turn's notice", async () => {
+test("a replacement prompt's own turn discards the old turn's late notice", async () => {
   const upstream = await mockUpstream();
   let releaseFirst;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
@@ -2395,7 +2455,9 @@ test("new UserPromptSubmit during async compression discards the old turn's noti
         usage: {
           prompt_tokens: 200_000,
           completion_tokens: 100_000,
-          prompt_tokens_details: { cached_tokens: 1 },
+          // Growing coverage: the repeat-notice dedup must not mask the
+          // replacement turn's own notice.
+          prompt_tokens_details: { cached_tokens: compressCalls },
         },
       }));
     });
@@ -2407,17 +2469,18 @@ test("new UserPromptSubmit during async compression discards the old turn's noti
     const oldRequest = postMessages(proxy.port, followupTurn("old prompt"));
     await waitFor(() => compressCalls === 1);
 
-    // This clears/replaces delivery state while the old MemTree call is still
-    // in flight. Its eventual completion must not reinsert a stale notice.
+    // No Stop yet, so the hook defers this prompt as possibly mid-turn; its
+    // own request below arms it (an interrupt skips Stop). That arm replaces
+    // delivery state, so the old turn's late completion cannot surface.
     await armMainTurn(proxy, "new prompt", "prompt-new");
     releaseFirst();
     await oldRequest;
+
+    await postMessages(proxy.port, followupTurn("new prompt"));
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-old" }))).status,
       204
     );
-
-    await postMessages(proxy.port, followupTurn("new prompt"));
     assert.equal(
       (await postHook(proxy, displayHook({ prompt_id: "prompt-new" }))).status,
       200,
@@ -2475,6 +2538,1620 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
     );
   } finally {
     proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "").replace(/\x1B\]8;;[^\x1B]*\x1B\\/g, "");
+
+// The server stamps its short spelling of the page (/m/<leading hex of the
+// id>) and the completed index the turn was compressed against.
+const PAGE_URL_1 = "https://app.polychat.co/m/ea18af90658b";
+const PAGE_URL_2 = "https://app.polychat.co/m/0f1c2d3e4a5b";
+const PAGE_URL_3 = "https://app.polychat.co/m/a1b2c3d40000";
+const compressedOnce = {
+  messages: [{ role: "user", content: "compressed context" }],
+  usage: {
+    prompt_tokens: 200_000,
+    completion_tokens: 100_000,
+    prompt_tokens_details: { cached_tokens: 1 },
+  },
+};
+const stopHook = (prompt_id) => ({
+  hook_event_name: "Stop",
+  stop_hook_active: false,
+  ...(prompt_id ? { prompt_id } : {}),
+});
+const successLine = (link) => `${COMPRESSED_NOTICE}\n  ${link}`;
+/** Page + served-index headers for one compress call. */
+const pageHeaders = (url, index) => ({
+  "x-polychat-memtree-url": url,
+  ...(index ? { "x-polychat-memtree-index": index } : {}),
+});
+
+// These tests exercise both rendering modes independently of the runner's terminal.
+// Top-level tests run sequentially; restore the environment after each case.
+function setNoticeColorMode(t, color) {
+  const oldNoColor = process.env.NO_COLOR;
+  const oldTerm = process.env.TERM;
+  const oldHasColors = Object.getOwnPropertyDescriptor(process.stdout, "hasColors");
+  t.after(() => {
+    if (oldNoColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = oldNoColor;
+    if (oldTerm === undefined) delete process.env.TERM;
+    else process.env.TERM = oldTerm;
+    if (oldHasColors) Object.defineProperty(process.stdout, "hasColors", oldHasColors);
+    else delete process.stdout.hasColors;
+  });
+  if (color) delete process.env.NO_COLOR;
+  else process.env.NO_COLOR = "1";
+  process.env.TERM = "xterm-256color";
+  // A color-capable terminal must still respect NO_COLOR.
+  Object.defineProperty(process.stdout, "hasColors", {
+    configurable: true,
+    value: () => true,
+  });
+}
+
+for (const color of [false, true]) {
+test(`the first success line links the page; later ones only when a new index was served (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
+  const upstream = await mockUpstream();
+  // Turn two and three compress against the same index; turn four against a
+  // newer one (the tool loop's index finished in between).
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
+    const rendered = first.body.hookSpecificOutput.displayContent;
+    assert.equal(linkText(rendered), `${successLine(PAGE_URL_1)}\n\nupstream answer`);
+    if (color) {
+      assert.match(rendered, /\x1b\[39m\n  https:\/\/app\.polychat\.co\/m\/ea18af90658b\n\nupstream/,
+        "the link sits bare on its own line after the SGR reset, so a linkifier cannot swallow it");
+    } else {
+      assert.equal(rendered.replace(SUCCESS_TOTALS_RE, ""), `${successLine(PAGE_URL_1)}\n\nupstream answer`,
+        "NO_COLOR leaves the entire notice and URL plain");
+    }
+    assert.equal(
+      (await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }))).status,
+      204
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    // Same index, flat coverage: nothing to announce — no line at all.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index, flat coverage: the line comes back with the new page.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3" }));
+    assert.equal(
+      linkText(next.body.hookSpecificOutput.displayContent),
+      `${successLine(PAGE_URL_3)}\n\nupstream answer`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
+
+test("a tool-only turn's Stop fallback carries the success line with its link", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_2, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const stop = await postHook(proxy, stopHook("prompt-1"));
+    assert.equal(linkText(stop.body.systemMessage), successLine(PAGE_URL_2));
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a page without a served index (older server, index-only ack) is never linked", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(
+    200,
+    (body) =>
+      body.index_only
+        ? { messages: [], usage: {}, index_only: true }
+        : compressedOnce,
+    (body) => pageHeaders(body.index_only ? PAGE_URL_3 : PAGE_URL_1, undefined)
+  );
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    toolRouteRecovery: false,
+    memtreeLinkPlacement: "success",
+  });
+  try {
+    await postSessionMessages(proxy.port, toolTurn);
+    await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1" }));
+    assert.equal(
+      linkText(first.body.hookSpecificOutput.displayContent),
+      `${COMPRESSED_NOTICE}\nupstream answer`,
+      "a page that may still be building gets no link"
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+const trailerNew = (link) => `• MemTree\n  ${link}`;
+const trailerSame = (link) => `• MemTree\n  ${link}`;
+
+for (const color of [false, true]) {
+test(`placement 'message': the link trails every finished message, marked when the index is new (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
+  const upstream = await mockUpstream();
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
+  try {
+    // First index in use: the success line stays plain; the trailer under the
+    // same message announces the new index — no waiting for a later turn.
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    const rendered = first.body.hookSpecificOutput.displayContent;
+    assert.equal(
+      linkText(rendered),
+      `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
+    );
+    assert.ok(rendered.endsWith(color
+      ? `\x1b[39m\n  \x1b]8;;${PAGE_URL_1}\x1b\\${PAGE_URL_1}\x1b]8;;\x1b\\`
+      : `• MemTree\n  ${PAGE_URL_1}`),
+      "URL on its own line, after the reset and a hyperlink to itself when colored");
+    if (!color) assert.equal(rendered, stripAnsi(rendered), "NO_COLOR suppresses all ANSI styling");
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    // Same index next turn: no success line, trailer still there, dim label.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2" }))).status, 204);
+    const same = await postHook(
+      proxy,
+      displayHook({ prompt_id: "prompt-2", index: 1, final: true, delta: "done" })
+    );
+    const sameRendered = same.body.hookSpecificOutput.displayContent;
+    assert.equal(linkText(sameRendered), `done\n\n${trailerSame(PAGE_URL_2)}`);
+    if (color) {
+      assert.match(sameRendered, /\x1b\[2m• MemTree\x1b\[22m\n  /, "unchanged index is dim");
+    } else {
+      assert.equal(sameRendered, `done\n\n${trailerSame(PAGE_URL_2)}`,
+        "NO_COLOR leaves the unchanged label and URL plain");
+    }
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index: marked again.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
+    assert.equal(
+      linkText(next.body.hookSpecificOutput.displayContent),
+      `upstream answer\n\n${trailerNew(PAGE_URL_3)}`
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
+
+test("placement 'message': a turn with no rendered message gets the trailer from Stop", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const stop = await postHook(proxy, stopHook("prompt-1"));
+    assert.equal(
+      linkText(stop.body.systemMessage),
+      `${COMPRESSED_NOTICE}\n${trailerNew(PAGE_URL_1)}`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 200, "every Stop without a message repeats it");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a turn MemTree passed through whole names the unused index next to its link", async () => {
+  const upstream = await mockUpstream();
+  const stamps = [pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_2, "index-a")];
+  // First turn fits the budget (server passes it through), second compresses.
+  const bodies = [{ ...compressedOnce, compressed: false }, compressedOnce];
+  const memtreeSrv = await mockMemtree(200, (_b, call) => bodies[call], (_b, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkPlacement: "message" });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(
+      linkText(first.body.hookSpecificOutput.displayContent),
+      `upstream answer\n\n• MemTree · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_1}`
+    );
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    const second = await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }));
+    assert.equal(
+      linkText(second.body.hookSpecificOutput.displayContent),
+      `${COMPRESSED_NOTICE}\nupstream answer\n\n• MemTree\n  ${PAGE_URL_2}`
+    );
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a resumed session shows its link at SessionStart, from memory or from disk", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const file = pathMod.join(fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-resume-")), "links.json");
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const first = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  // A later ccc process resuming the same session: nothing in memory.
+  const second = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  const resume = { hook_event_name: "SessionStart", source: "resume" };
+  try {
+    await armMainTurn(first, "turn two", "prompt-1");
+    await postMessages(first.port, followupTurn("turn two"), headers);
+
+    // Same process (in-app /resume): from memory.
+    const again = await postHook(first, resume);
+    assert.equal(stripAnsi(again.body.systemMessage), `• MemTree\n  ${PAGE_URL_1}`);
+
+    // New process: from disk. Compaction and subagents get nothing.
+    assert.equal((await postHook(second, { ...resume, source: "compact" })).status, 204);
+    assert.equal((await postHook(second, { ...resume, agent_id: "a1" })).status, 204);
+    assert.equal((await postHook(second, { ...resume, session_id: "other" })).status, 204);
+    const fromDisk = await postHook(second, resume);
+    assert.equal(stripAnsi(fromDisk.body.systemMessage), `• MemTree\n  ${PAGE_URL_1}`);
+    // Shown at resume, so the end of the next turn does not repeat it.
+    await armMainTurn(second, "turn three", "prompt-2");
+    assert.equal((await postHook(second, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
+    assert.equal((await postHook(second, stopHook("prompt-2"))).status, 204);
+  } finally {
+    first.close();
+    second.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the resume relay script forwards SessionStart stdin to the proxy and prints its answer", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const { createSessionNoticePlugin } = await import("../dist/hooks.js");
+  const { spawn } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const tmp = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-relay-"));
+  const store = new MemtreeLinkStore(pathMod.join(tmp, "links.json"));
+  store.put("session-1", { url: PAGE_URL_2, index: "index-b", compressed: false });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store });
+  const plugin = createSessionNoticePlugin(proxy.hookUrl, { tempRoot: tmp, resumeLink: true });
+  try {
+    const config = JSON.parse(fs.readFileSync(pathMod.join(plugin.dir, "hooks", "hooks.json"), "utf-8"));
+    const entry = config.hooks.SessionStart.find((e) => e.matcher.includes("resume") && e.hooks[0].command.includes("resume-link"));
+    const command = entry.hooks[0].command;
+    // Async on purpose: the proxy lives in this process, so a sync spawn
+    // would block the very event loop that has to answer the relay.
+    const run = (input) =>
+      new Promise((resolve, reject) => {
+        const child = spawn("/bin/sh", ["-c", command]);
+        let out = "";
+        child.stdout.on("data", (c) => (out += c));
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, out }));
+        child.stdin.end(JSON.stringify(input));
+      });
+    const hit = await run({ hook_event_name: "SessionStart", session_id: "session-1", source: "resume" });
+    assert.equal(hit.code, 0);
+    assert.equal(
+      stripAnsi(JSON.parse(hit.out).systemMessage),
+      `• MemTree · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2}`
+    );
+    assert.deepEqual(
+      await run({ hook_event_name: "SessionStart", session_id: "nope", source: "resume" }),
+      { code: 0, out: "" }
+    );
+    proxy.close();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(
+      await run({ hook_event_name: "SessionStart", session_id: "session-1", source: "resume" }),
+      { code: 0, out: "" },
+      "proxy gone: silent, exit 0"
+    );
+  } finally {
+    plugin.close();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+function recapSse(text) {
+  const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  return (
+    ev("message_start", { message: { id: "m", type: "message", role: "assistant", content: [], usage: { input_tokens: 5, output_tokens: 0 } } }) +
+    ev("content_block_start", { index: 0, content_block: { type: "text", text: "" } }) +
+    ev("content_block_delta", { index: 0, delta: { type: "text_delta", text } }) +
+    ev("content_block_stop", { index: 0 }) +
+    ev("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } }) +
+    ev("message_stop", {})
+  );
+}
+
+async function postRecap(port, headers) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({
+      model: "claude-x",
+      max_tokens: 64,
+      stream: true,
+      messages: [
+        ...followupTurn("turn two").slice(0, 2),
+        { role: "user", content: "The user stepped away and is coming back. Recap in under 40 words." },
+      ],
+    }),
+  });
+  const body = await res.text();
+  const text = body
+    .split("\n")
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => JSON.parse(l.slice(5)))
+    .filter((d) => d.type === "content_block_delta")
+    .map((d) => d.delta.text)
+    .join("");
+  return { body, text };
+}
+
+test("the recap ends with the session's link, when it fits Claude Code's 400-char cap", async () => {
+  let recapText = "You asked for a MemTree link after the recap. Next: try it.";
+  const seen = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf-8");
+      // Only the recap asks for a stream here (its history may be compressed,
+      // so the prompt text itself need not reach upstream).
+      if (JSON.parse(body).stream === true) {
+        seen.push(req.headers["accept-encoding"]);
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(recapSse(recapText));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    // No page yet: recap untouched.
+    assert.equal((await postRecap(proxy.port, headers)).text, recapText);
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    const withLink = await postRecap(proxy.port, headers);
+    // Ends with a newline so Claude Code's "(disable recaps in /config)" hint
+    // starts its own line instead of trailing the URL.
+    assert.equal(withLink.text, `${recapText}\n• MemTree\n  ${PAGE_URL_1}\n`);
+    assert.ok(!withLink.text.includes("cc-infinite-notice"), "no marker in UI-only text");
+    assert.match(withLink.body, /"index":1/, "appended as its own block after the recap");
+    assert.ok(withLink.body.trimEnd().endsWith('data: {"type":"message_stop"}'), "stream still ends properly");
+    assert.equal(seen.at(-1), "identity", "recap stream fetched uncompressed so it can be edited");
+
+    // Too long to fit: skipped rather than clipped mid-URL.
+    recapText = "x".repeat(380);
+    assert.equal((await postRecap(proxy.port, headers)).text, recapText);
+
+    // Another session's recap never gets this session's link.
+    recapText = "short";
+    assert.equal((await postRecap(proxy.port, { "x-claude-code-session-id": "other" })).text, "short");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("/memtree-view is answered by the hook and blocked, without touching turn state", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const view = (prompt = "/memtree-view") =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, prompt_id: "p-view" });
+  try {
+    const none = await view();
+    assert.equal(none.body.decision, "block");
+    assert.match(none.body.reason, /no page yet/);
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const shown = await view("/ccc:memtree-view");
+    // In a color terminal the URL is also an OSC 8 hyperlink to itself.
+    const osc8 = /\x1b\]8;;([^\x1b]*)\x1b\\/g;
+    for (const [, target] of shown.body.reason.matchAll(osc8)) {
+      assert.ok(target === "" || target === PAGE_URL_1);
+    }
+    assert.deepEqual({ ...shown.body, reason: shown.body.reason.replace(osc8, "") }, {
+      decision: "block",
+      reason: `• MemTree\n  ${PAGE_URL_1}`,
+      hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
+    });
+
+    // The command is not a human turn: the pending notice for prompt-1 survives it.
+    const display = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(display.status, 200);
+    // Another plugin's command of the same name is left alone.
+    assert.equal((await view("/otherplugin:memtree-view")).status, 204);
+    // An ordinary prompt still arms normally (204, no body).
+    assert.equal((await view("tell me about /memtree-view")).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("/memtree-compact compacts the session's next message to its target (default half the budget)", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const command = (prompt, session_id = "session-1") =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, session_id });
+  const lastCall = () => memtreeSrv.calls.filter((c) => !c.index_only).at(-1);
+  const lastTarget = () => lastCall().compression_target_tokens;
+  // claude-x has a 200k window; this server reports no model budget, so the
+  // budget is the window-ratio fallback: 160k, half of it 80k.
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    assert.equal(lastTarget(), undefined, "automatic by default");
+
+    const on = await command("/memtree-compact");
+    assert.equal(on.body.decision, "block");
+    assert.match(on.body.reason, /compacting: your next message .* about half the budget/);
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"), headers);
+    assert.equal(lastTarget(), 80_000);
+    assert.equal(lastCall().compression_threshold_tokens, undefined, "manual: forced, no threshold");
+
+    assert.match((await command("/memtree-compact 120k")).body.reason, /about 120k tokens/);
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postMessages(proxy.port, followupTurn("turn four"), headers);
+    assert.equal(lastTarget(), 120_000);
+    // Compacted once: the next turn is back to the budget check (under it).
+    await armMainTurn(proxy, "turn 4b", "prompt-3b");
+    await postMessages(proxy.port, followupTurn("turn 4b"), headers);
+    assert.equal(lastTarget(), undefined);
+
+    // Another session is unaffected.
+    await armMainTurn(proxy, "turn five", "prompt-4");
+    await postMessages(proxy.port, followupTurn("turn five"), { "x-claude-code-session-id": "other" });
+    assert.equal(lastTarget(), undefined);
+
+    const help = await command("/memtree");
+    assert.equal(help.body.decision, "block");
+    assert.match(help.body.reason, /^• \/memtree-view · .*\n• \/memtree-compact \[tokens \| off\] · .*default half the budget, at least 20k/);
+    assert.match((await command("/memtree-compact nope")).body.reason, /usage:/);
+    assert.match((await command("/memtree-compact 19k")).body.reason, /usage:.*at least 20k/);
+    assert.match((await command("/memtree-compact 20k")).body.reason, /about 20k tokens/);
+    assert.match((await command("/memtree-compact OFF")).body.reason, /compaction off/);
+    await armMainTurn(proxy, "turn six", "prompt-5");
+    await postMessages(proxy.port, followupTurn("turn six"), headers);
+    assert.equal(lastTarget(), undefined);
+    assert.equal(lastCall().compression_threshold_tokens, undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("default placement: the success line carries the link; the end-of-turn line only for one not yet shown", async () => {
+  const upstream = await mockUpstream();
+  const stamps = [
+    pageHeaders(PAGE_URL_1, "index-a"),
+    pageHeaders(PAGE_URL_2, "index-a"),
+    pageHeaders(PAGE_URL_3, "index-b"),
+  ];
+  const memtreeSrv = await mockMemtree(200, compressedOnce, (_body, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    // The success line shows the page below it, so Stop doesn't repeat it.
+    const shown = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_1)}\n\nupstream answer`);
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+
+    // Same index, new page URL: nothing at the end of this turn.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // New index: the success line returns with the new page; Stop stays quiet.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
+    const next = await postHook(proxy, displayHook({ prompt_id: "prompt-3", final: true }));
+    assert.equal(linkText(next.body.hookSpecificOutput.displayContent), `${successLine(PAGE_URL_3)}\n\nupstream answer`);
+    assert.equal((await postHook(proxy, stopHook("prompt-3"))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("compress calls carry each assistant message's usage from the transcript", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const seen = [];
+  const transcriptUsage = {
+    usageFor(sessionId, messages) {
+      seen.push(sessionId);
+      const i = messages.findIndex((m) => m.role === "assistant");
+      return i < 0 ? {} : { [i]: { output_tokens: 50, thinking_tokens: 20 } };
+    },
+    timesFor(_sessionId, messages) {
+      return { [messages.length - 1]: "2026-09-23T20:00:00.000Z" };
+    },
+  };
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, transcriptUsage });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const call = memtreeSrv.calls.filter((c) => !c.index_only).at(-1);
+    assert.deepEqual(seen, ["session-1"]);
+    assert.deepEqual(call.message_usage, { 1: { output_tokens: 50, thinking_tokens: 20 } });
+    assert.equal(call.messages[1].role, "assistant", "keyed by position in the messages sent");
+    assert.deepEqual(call.message_times, { [call.messages.length - 1]: "2026-09-23T20:00:00.000Z" });
+
+    // No session id: nothing is looked up or sent.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"));
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).message_usage, undefined);
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).message_times, undefined);
+    assert.equal(seen.length, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("every messages log line describes the Claude Code billing header; forwarding is unchanged", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-x", max_tokens: 64,
+        system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;" },
+                 { type: "text", text: "You are a security monitor for autonomous AI coding agents." }],
+        messages: followupTurn("judge this"),
+      }),
+    });
+    assert.equal(res.status, 200);
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+    const rec = records.find((r) => r.kind === "messages");
+    assert.equal(rec.client.suspectedSideRequest, true);
+    assert.equal(rec.client.systemHead, "You are a security monitor for autonomous AI coding agents.");
+    assert.equal(rec.client.tools, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the away recap rides the main thread's last compressed prefix after Stop, with no MemTree call", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const recapQ = { role: "user", content: "The user stepped away and is coming back. Recap in under 40 words." };
+  const post = (messages, h = headers) => postMessages(proxy.port, messages, h);
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await post(followupTurn("turn two"));
+    await waitFor(() => records.some((r) => r.kind === "messages"));
+    const mainSent = bodies.at(-1).messages;
+    assert.equal((await postHook(proxy, stopHook("prompt-1"))).status >= 200, true);
+    const before = memtreeSrv.calls.length;
+
+    const recap = [...followupTurn("turn two"), { role: "assistant", content: [{ type: "text", text: "done" }] }, recapQ];
+    await post(recap);
+    await waitFor(() => records.filter((r) => r.kind === "messages").length === 2);
+    const rec = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(rec.turnType, "fork-memory");
+    assert.equal(rec.routeLane, "away");
+    assert.equal(memtreeSrv.calls.length, before, "no MemTree call for the recap");
+    const sent = bodies.at(-1).messages;
+    assert.deepEqual(sent.slice(0, mainSent.length), mainSent, "same prefix bytes the main thread sent");
+    assert.deepEqual(sent.slice(mainSent.length), recap.slice(3));
+
+    // Another session's recap cannot ride this session's prefix.
+    await post(recap, { "x-claude-code-session-id": "other" });
+    await waitFor(() => records.filter((r) => r.kind === "messages").length === 3);
+    const other = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(other.forkMiss, "session");
+    assert.notEqual(other.turnType, "fork-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a security-monitor side request skips MemTree and leaves the main tool loop's route intact", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  const msgRecs = () => records.filter((r) => r.kind === "messages");
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    await waitFor(() => msgRecs().length === 1);
+    const callsBefore = memtreeSrv.calls.length;
+
+    const monitor = JSON.stringify({
+      model: "claude-x", max_tokens: 64,
+      system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;" },
+               { type: "text", text: "You are a security monitor for autonomous AI coding agents." }],
+      messages: [
+        { role: "user", content: "CLAUDE.md config" },
+        { role: "user", content: '<transcript>\n{"user":"turn two"}\n{"Bash":{"command":"ls"}}\n</transcript>\nRespond.' },
+      ],
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: monitor });
+    assert.equal(res.status, 200);
+    await waitFor(() => msgRecs().length === 2);
+    const side = msgRecs()[1];
+    assert.equal(side.turnType, "side-request");
+    assert.equal(side.transcript.ok, true);
+    assert.equal(side.transcript.toolLines, 1);
+    assert.equal(bodies.at(-1), monitor, "forwarded byte for byte");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(memtreeSrv.calls.length, callsBefore, "no compress and no background index");
+
+    // Monitor-shaped header but no recognisable transcript (e.g. an older
+    // Claude Code main request): ordinary handling, and the reason is logged.
+    const odd = JSON.stringify({ ...JSON.parse(monitor), messages: [{ role: "user", content: "first" }, { role: "assistant", content: "a" }, { role: "user", content: "no transcript here" }] });
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: odd });
+    await waitFor(() => msgRecs().length === 3);
+    assert.notEqual(msgRecs()[2].turnType, "side-request");
+    assert.equal(msgRecs()[2].transcript.reason, "no-transcript");
+    await armMainTurn(proxy, "turn two", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    await waitFor(() => msgRecs().length === 4);
+
+    // The main thread's next tool turn still rides its compressed route.
+    const toolLoop = [
+      ...followupTurn("turn two"),
+      { role: "assistant", content: [{ type: "tool_use", id: "t9", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t9", content: "ok" }] },
+    ];
+    await postMessages(proxy.port, toolLoop, headers);
+    await waitFor(() => msgRecs().length === 5);
+    assert.equal(msgRecs()[4].turnType, "tool-memory");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("claudeCodeOnly: a request without Claude Code's session header is forwarded untouched, with no MemTree call", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    claudeCodeOnly: true,
+  });
+  const msgRecs = () => records.filter((r) => r.kind === "messages");
+  try {
+    // A script's multi-turn call: would otherwise look like a main followup.
+    const foreign = JSON.stringify({ model: "claude-opus-4-8", max_tokens: 64, messages: followupTurn("grade this") });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "user-agent": "litellm/1.80" }, body: foreign,
+    });
+    assert.equal(res.status, 200);
+    await waitFor(() => msgRecs().length === 1);
+    assert.equal(msgRecs()[0].turnType, "foreign");
+    assert.equal(msgRecs()[0].userAgent, "litellm/1.80");
+    assert.equal(bodies.at(-1), foreign, "byte for byte");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(memtreeSrv.calls.length, 0, "no compress, no background index");
+
+    // Claude Code's own request still gets MemTree.
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    await waitFor(() => msgRecs().length === 2);
+    assert.notEqual(msgRecs()[1].turnType, "foreign");
+    assert.ok(memtreeSrv.calls.length > 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("MemTree calls carry Claude Code's session id header, compress and background index alike", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = { "x-claude-code-session-id": "session-abc" };
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), headers);
+    await waitFor(() => memtreeSrv.calls.some((c) => !c.index_only));
+    const compressAt = memtreeSrv.calls.findIndex((c) => !c.index_only);
+    assert.equal(memtreeSrv.callHeaders[compressAt]["x-claude-code-session-id"], "session-abc");
+    assert.deepEqual(JSON.parse(memtreeSrv.callHeaders[compressAt]["x-client-meta"]),
+      { lane: "main", requested_model: "claude-x" });
+
+    await postMessages(proxy.port, [{ role: "user", content: "first message" }], headers);
+    await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
+    const indexAt = memtreeSrv.calls.findIndex((c) => c.index_only);
+    assert.equal(memtreeSrv.callHeaders[indexAt]["x-claude-code-session-id"], "session-abc");
+    assert.equal(JSON.parse(memtreeSrv.callHeaders[indexAt]["x-client-meta"]).lane, "main");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the compressed message's cache marker copies a 1h TTL, and a reused route stays within 4 markers", async () => {
+  const bodies = [];
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(UPSTREAM_BODY)) });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  const headers = { "content-type": "application/json", "x-claude-code-session-id": "session-1" };
+  const hour = { type: "ephemeral", ttl: "1h" };
+  const marked = (text) => [{ type: "text", text, cache_control: hour }];
+  const count = (b) => [...(Array.isArray(b.system) ? b.system : []), ...b.messages.flatMap((m) => Array.isArray(m.content) ? m.content : [])]
+    .filter((p) => p?.cache_control).length;
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    const history = followupTurn("turn two");
+    history[history.length - 1] = { role: "user", content: marked("turn two") };
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "claude-x", max_tokens: 64, system: [{ type: "text", text: "sys", cache_control: hour }], messages: history }),
+    });
+    await waitFor(() => bodies.length === 1);
+    assert.deepEqual(bodies[0].messages[0].content[0].cache_control, hour, "same TTL as Claude Code's own markers");
+
+    // Tool turn riding the route, with Claude Code marking three suffix blocks.
+    const toolLoop = [
+      ...history,
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {}, cache_control: hour }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "a", cache_control: hour }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "b", cache_control: hour }] },
+    ];
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "claude-x", max_tokens: 64, system: [{ type: "text", text: "sys", cache_control: hour }], messages: toolLoop }),
+    });
+    await waitFor(() => bodies.length === 2);
+    const routed = bodies[1];
+    assert.ok(count(routed) <= 4, `at most 4 markers, got ${count(routed)}`);
+    assert.ok(routed.messages[0].content[0].cache_control, "the compressed prefix keeps its marker");
+    assert.ok(routed.messages.at(-1).content.at(-1).cache_control, "the newest block keeps its marker");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+/** Capture the actual outgoing request, including raw bytes for fail-open checks. */
+async function cacheTtlHarness() {
+  const raws = [];
+  let failCompression = false;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      raws.push(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const memtreeSrv = await mockMemtree(200, () => failCompression ? { messages: [] } : compressedOnce);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+  });
+  return {
+    proxy,
+    raws,
+    failCompression: () => { failCompression = true; },
+    compressCalls: () => memtreeSrv.calls.filter((call) => !call.index_only),
+    post: async (body, endpoint = "messages") => {
+      const raw = JSON.stringify(body, null, 2);
+      const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/${endpoint}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "session-1" },
+        body: raw,
+      });
+      await response.text();
+      return { original: raw, forwarded: JSON.parse(raws.at(-1)) };
+    },
+    close: () => { proxy.close(); upstream.close(); memtreeSrv.close(); },
+  };
+}
+
+const cacheMarker = (ttl) => ({ type: "ephemeral", ...(ttl === undefined ? {} : { ttl }) });
+const cacheText = (text, ttl) => ({ type: "text", text, cache_control: cacheMarker(ttl) });
+
+for (const ttl of [undefined, "5m", "1h"]) {
+  test(`cache TTL: a flattened marker matches the last existing marker (${ttl ?? "default 5m"})`, async () => {
+    const h = await cacheTtlHarness();
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const body = {
+        model: "claude-x", max_tokens: 64,
+        tools: [{ name: "Bash", input_schema: { type: "object" }, cache_control: cacheMarker("1h") }],
+        system: [cacheText("sys", ttl)],
+        messages: followupTurn("turn two"),
+      };
+      const { forwarded } = await h.post(body);
+      assert.equal(forwarded.messages.length, 1, "actually compressed");
+      assert.deepEqual(forwarded.messages[0].content[0].cache_control, cacheMarker(ttl));
+      assert.deepEqual(forwarded.tools, body.tools, "user tool markers remain unchanged");
+      assert.deepEqual(forwarded.system, body.system, "user system markers remain unchanged");
+    } finally { h.close(); }
+  });
+}
+
+for (const layout of ["four tools", "mixed tools and system"]) {
+  test(`cache prefix slot: reserve a marker with ${layout}, then reuse identical prefix bytes`, async () => {
+    const h = await cacheTtlHarness();
+    const mixed = layout === "mixed tools and system";
+    const ttl = mixed ? "5m" : "1h";
+    const markerBlocks = (body) => [
+      ...(body.tools ?? []), ...(body.system ?? []),
+      ...body.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []),
+    ].filter((block) => block.cache_control);
+    try {
+      const body = {
+        model: "claude-x", max_tokens: 64,
+        tools: Array.from({ length: mixed ? 2 : 4 }, (_, n) => ({
+          name: `tool_${n}`, input_schema: { type: "object" }, cache_control: cacheMarker("1h"),
+        })),
+        ...(mixed ? { system: [cacheText("sys one", ttl), cacheText("sys two", ttl)] } : {}),
+        messages: followupTurn("turn two"),
+      };
+      assert.equal(markerBlocks(body).length, 4, "the incoming request uses exactly four valid markers");
+      const snapshot = structuredClone(body);
+      const first = await h.post({ ...body, messages: [{ role: "user", content: "first question" }] });
+      assert.equal(h.raws.at(-1), first.original, "passthrough keeps all original marker bytes");
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const { forwarded: compressed } = await h.post(body);
+      assert.equal(compressed.messages.length, 1);
+      assert.deepEqual(compressed.messages[0].content[0]?.cache_control, cacheMarker(ttl), "the flattened prefix always gets a marker");
+      assert.equal(markerBlocks(compressed).length, 4, "prefix plus three retained markers");
+      assert.deepEqual(body, snapshot, "input tools and system remain unchanged");
+
+      // Move one incoming marker to the newest result, keeping the original
+      // request valid at four markers before the proxy adds its prefix.
+      const next = structuredClone(body);
+      const field = mixed ? "system" : "tools";
+      const { cache_control: _old, ...unmarked } = next[field][0];
+      next[field][0] = unmarked;
+      next.messages.push(
+        { role: "assistant", content: [{ type: "tool_use", id: "slot-tool", name: "tool_0", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "slot-tool", content: "ok", cache_control: cacheMarker(ttl) }] },
+      );
+      assert.equal(markerBlocks(next).length, 4);
+      const nextSnapshot = structuredClone(next);
+      const { forwarded: ride } = await h.post(next);
+      assert.equal(h.compressCalls().length, 1, "compatible tool turn rides without recompressing");
+      assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compressed.messages[0]), "prefix bytes remain identical");
+      assert.equal(markerBlocks(ride).length, 4);
+      assert.deepEqual(ride.messages.at(-1).content[0].cache_control, cacheMarker(ttl), "newest suffix marker is retained");
+      assert.deepEqual(next, nextSnapshot, "reusing the prefix leaves input objects unchanged");
+      const ttls = markerBlocks(ride).map((block) => block.cache_control.ttl ?? "5m");
+      const firstShort = ttls.indexOf("5m");
+      assert.ok(firstShort < 0 || ttls.slice(firstShort).every((value) => value === "5m"), "all surviving 1h markers precede 5m markers");
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ["human", "human-failed-rebuild", "tool", "count_tokens"]) {
+  test(`cache TTL: a 5m prefix cannot precede new 1h markers (${lane})`, async () => {
+    const h = await cacheTtlHarness();
+    try {
+      await armMainTurn(h.proxy, "turn two", "prompt-1");
+      const history = followupTurn("turn two");
+      history[history.length - 1].content = [cacheText("turn two", "5m")];
+      const body = { model: "claude-x", max_tokens: 64, system: [cacheText("sys", "5m")], messages: history };
+      const { forwarded: first } = await h.post(body);
+      assert.equal(first.messages.length, 1);
+      const toolTail = [
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: cacheMarker("5m") }] },
+      ];
+      const { forwarded: ride } = await h.post({ ...body, messages: [...history, ...toolTail] });
+      assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(first.messages[0]), "compatible rides preserve prefix bytes");
+      const callsBefore = h.compressCalls().length;
+      // Every marker on the original next request is now 1h, so it is valid.
+      const nextHistory = structuredClone(history);
+      nextHistory.at(-1).content[0].cache_control = cacheMarker("1h");
+      const nextTail = lane.startsWith("human")
+        ? [{ role: "assistant", content: "answer" }, { role: "user", content: [cacheText("turn three", "1h")] }]
+        : structuredClone(toolTail);
+      if (!lane.startsWith("human")) nextTail.at(-1).content[0].cache_control = cacheMarker("1h");
+      const next = { ...body, system: [cacheText("sys", "1h")], messages: [...nextHistory, ...nextTail] };
+      if (lane.startsWith("human")) await armMainTurn(h.proxy, "turn three", "prompt-2");
+      if (lane === "human-failed-rebuild") h.failCompression();
+      const { original, forwarded } = await h.post(next, lane === "count_tokens" ? "messages/count_tokens" : "messages");
+      if (lane === "human") {
+        assert.equal(h.compressCalls().length, callsBefore + 1, "incompatible prefix is rebuilt");
+        assert.equal(forwarded.messages.length, 1);
+        assert.deepEqual(forwarded.messages[0].content[0].cache_control, cacheMarker("1h"));
+        assert.deepEqual(forwarded.system, next.system);
+      } else {
+        assert.equal(h.raws.at(-1), original, "unusable reuse/rebuild forwards the original request bytes");
+      }
+    } finally { h.close(); }
+  });
+}
+
+test("defaultCompactTarget is the target of a compaction, not a trigger: the budget still decides", async () => {
+  const upstream = await mockUpstream();
+  // A server that reports its model budget understands the threshold.
+  const memtreeSrv = await mockMemtree(200, { ...compressedOnce, model_budget_tokens: 100_000 });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    defaultCompactTarget: 20_000,
+  });
+  const compressCalls = () => memtreeSrv.calls.filter((c) => !c.index_only);
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    // First call: the server's abilities are unknown and the conversation is
+    // far under the (fallback) budget, so nothing forces a compression.
+    assert.equal(compressCalls()[0].compression_target_tokens, undefined);
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"), { "x-claude-code-session-id": "session-1" });
+    // Now the server decides against the budget it reported; the env target
+    // is what it compresses to once over.
+    assert.equal(compressCalls()[1].compression_target_tokens, 20_000);
+    assert.equal(compressCalls()[1].compression_threshold_tokens, 100_000);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a reused prefix route's tool turn stays within 4 cache markers (2026-09-28 Anthropic 400)", async () => {
+  const { __testCapCacheBreakpoints: cap } = await import("../dist/proxy.js");
+  const hour = { type: "ephemeral", ttl: "1h" };
+  // Layout of the failing request: 2 system markers, the flattened marker, a
+  // prior-turn marker now inside the installed prefix, and the newest marker.
+  const body = {
+    system: [{ type: "text", text: "hdr" }, { type: "text", text: "a" }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "memory", cache_control: hour }] },
+      { role: "assistant", content: [{ type: "text", text: "x" }] },
+      { role: "user", content: [{ type: "text", text: "turn" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "r", cache_control: hour }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "u", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "u", content: "r", cache_control: hour }] },
+    ],
+  };
+  const installedPrefix = JSON.stringify(body.messages.slice(0, 5));
+  const installedSystem = JSON.stringify(body.system);
+  assert.equal(cap(body, 5, { preserveSystem: true }), true);
+  const markers = [...body.system, ...body.messages.flatMap((m) => m.content)].filter((p) => p.cache_control);
+  assert.equal(markers.length, 4);
+  assert.equal(JSON.stringify(body.messages.slice(0, 5)), installedPrefix,
+    "every installed prefix byte is retained, including earlier-turn markers");
+  assert.equal(JSON.stringify(body.system), installedSystem,
+    "the installed system is also retained byte-for-byte");
+  assert.equal(body.messages[6].content[0].cache_control, undefined,
+    "four protected markers leave no slot for the newest suffix marker");
+
+  // A fresh compression has no installed system to protect: trim its markers.
+  const heavy = {
+    system: [{ type: "text", text: "a", cache_control: hour }, { type: "text", text: "b", cache_control: hour }, { type: "text", text: "c", cache_control: hour }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "memory", cache_control: hour }] },
+      { role: "user", content: [{ type: "text", text: "q", cache_control: hour }] },
+    ],
+  };
+  assert.equal(cap(heavy, 1), true);
+  assert.equal([...heavy.system, ...heavy.messages.flatMap((m) => m.content)].filter((p) => p.cache_control).length, 4);
+  assert.ok(heavy.messages[0].content[0].cache_control && heavy.messages[1].content[0].cache_control);
+});
+
+test("size estimate scales by the sample's bytes per token, including when the body shrank (2026-09-29)", async () => {
+  const { __testEstimateRequestTokens: est } = await import("../dist/proxy.js");
+  const sample = { tokens: 429_480, forwardedBytes: 1_136_746 };
+  const shrank = est(sample, 1_135_494);
+  assert.equal(shrank.source, "reported");
+  assert.ok(Math.abs(shrank.tokens - 429_016) < 1_000, `got ${shrank.tokens}`);
+  const grew = est(sample, 1_143_717);
+  assert.ok(grew.tokens >= 431_293 - 100 && grew.tokens <= 431_293 + 1_000, `got ${grew.tokens}`);
+  // Growth never counts fewer tokens than bytes/4 would.
+  const sparse = { tokens: 100_000, forwardedBytes: 1_000_000 };
+  assert.equal(est(sparse, 1_004_000).tokens, 101_000);
+  assert.deepEqual(est(undefined, 400_000), { tokens: 100_000, source: "bytes" });
+});
+
+test("the success line reports the size before and after compression", async () => {
+  const { compressedTotalsText } = await import("../dist/notices.js");
+  assert.equal(
+    compressedTotalsText(860_941, 425_541),
+    `${COMPRESSED_NOTICE} · ~861k → 426k tokens`
+  );
+  assert.equal(compressedTotalsText(1_250_000, 425_000), `${COMPRESSED_NOTICE} · ~1.3m → 425k tokens`);
+  assert.equal(compressedTotalsText(undefined, 425_541), COMPRESSED_NOTICE, "no before size");
+  assert.equal(compressedTotalsText(400_000, 425_541), COMPRESSED_NOTICE, "not smaller");
+});
+
+test("placements 'stop' and 'off'", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const onStop = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "stop",
+  });
+  const off = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "off",
+  });
+  try {
+    await armMainTurn(onStop, "turn two", "prompt-1");
+    await postSessionMessages(onStop.port, followupTurn("turn two"));
+    const shown = await postHook(onStop, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(linkText(shown.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal(linkText((await postHook(onStop, stopHook("prompt-1"))).body.systemMessage), trailerNew(PAGE_URL_1));
+
+    await armMainTurn(off, "turn two", "prompt-1");
+    await postSessionMessages(off.port, followupTurn("turn two"));
+    const plain = await postHook(off, displayHook({ prompt_id: "prompt-1", final: true }));
+    assert.equal(linkText(plain.body.hookSpecificOutput.displayContent), `${COMPRESSED_NOTICE}\nupstream answer`);
+    assert.equal((await postHook(off, stopHook("prompt-1"))).status, 204);
+  } finally {
+    onStop.close();
+    off.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("GET /memtree/<id>[.json] relays the user's page with the key, either id spelling", async () => {
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  const memtreeSrv = await listen((req, res) => {
+    pageGets.push({
+      url: req.url,
+      accept: req.headers.accept,
+      authorization: req.headers.authorization,
+    });
+    const json = req.url.includes(".json");
+    res.writeHead(200, {
+      "content-type": json ? "application/json" : "text/html; charset=utf-8",
+    });
+    res.end(json ? JSON.stringify({ nodes: [] }) : "<html>tree</html>");
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const get = (path, accept) =>
+    fetch(`http://127.0.0.1:${proxy.port}${path}`, { headers: accept ? { accept } : {} });
+  try {
+    const html = await get("/memtree/ea18af90658b", "text/html");
+    assert.equal(html.status, 200);
+    assert.equal(await html.text(), "<html>tree</html>");
+    assert.deepEqual(pageGets.at(-1), {
+      url: "/usage/memtree/ea18af90658b",
+      accept: "text/html",
+      authorization: "Bearer secret-key",
+    });
+
+    const json = await get("/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok");
+    assert.equal(json.status, 200);
+    assert.equal(
+      pageGets.at(-1).url,
+      "/usage/memtree/ea18af90-658b-485f-ad71-063e0ca5e724.json?share=tok"
+    );
+
+    for (const suffix of ["v1-own", "v3-served"]) {
+      const ref = `ea18af90-658b-485f-ad71-063e0ca5e724-${suffix}`;
+      assert.equal((await get(`/memtree/${ref}.json`)).status, 200);
+      assert.equal(pageGets.at(-1).url, `/usage/memtree/${ref}.json`);
+      assert.equal((await get(`/memtree/${ref}/search?q=test`)).status, 200);
+      assert.equal(pageGets.at(-1).url, `/usage/memtree/${ref}/search?q=test`);
+    }
+
+    // The page's session pane fetches this from wherever the page came from.
+    await get("/memtree/ea18af90658b/session.json");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/session.json");
+    await get("/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
+    assert.equal((await get("/memtree/sessions/..%2Fx.json")).status, 404);
+    assert.equal((await get("/memtree/sessions/a/b.json")).status, 404);
+
+    // Bad shapes never reach the server. (fetch normalizes a literal `..`;
+    // the encoded form reaches the handler.)
+    const before = pageGets.length;
+    assert.equal((await get("/memtree/ea18af90%2F..%2Fx")).status, 404);
+    assert.equal((await get("/memtree/ea18af90-v1-own%2F..%2Fsearch")).status, 404);
+    assert.equal(pageGets.length, before);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the proxy refuses browsers on other sites and rebound hostnames", async () => {
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  const memtreeSrv = await listen((req, res) => {
+    pageGets.push(req.url);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const get = (path, headers) =>
+    new Promise((resolve, reject) => {
+      const req = http.get({ host: "127.0.0.1", port: proxy.port, path, headers }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      });
+      req.on("error", reject);
+    });
+  const post = (path, headers) =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", host: "127.0.0.1", port: proxy.port, path, headers: {
+          ...headers,
+          "content-type": "application/json",
+          "x-claude-code-session-id": "rebound-session",
+        } },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", reject);
+      req.end(JSON.stringify({ model: "m", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }));
+    });
+  const local = `127.0.0.1:${proxy.port}`;
+  try {
+    // DNS rebinding: an attacker's hostname resolved to the loopback.
+    for (const path of ["/memtree/ea18af90658b.json", "/memtree/search?q=x", "/memtree/current"]) {
+      assert.equal(await get(path, { host: `evil.example:${proxy.port}` }), 403, path);
+    }
+    // A page on another site reaching the loopback directly.
+    assert.equal(await get("/memtree/search?q=x", { host: local, origin: "https://evil.example" }), 403);
+    assert.equal(await get("/memtree/search?q=x", { host: local, "sec-fetch-site": "cross-site" }), 403);
+    // Another loopback port is another site (some other local web server).
+    assert.equal(
+      await get("/memtree/search?q=x", { host: local, origin: "http://127.0.0.1:1" }),
+      403
+    );
+    assert.equal(await get("/memtree/search?q=x", { host: `${local}@evil.example` }), 403);
+    assert.equal(await post("/v1/messages", { host: `evil.example:${proxy.port}` }), 403);
+    assert.equal(pageGets.length, 0, "refused requests never reach the server with the key");
+
+    // Agents (no browser headers), and the page's own same-origin fetches, still work.
+    assert.equal(await get("/memtree/ea18af90658b.json", { host: local }), 200);
+    assert.equal(await get("/memtree/ea18af90658b.json", { host: `localhost:${proxy.port}` }), 200);
+    assert.equal(
+      await get("/memtree/ea18af90658b/session.json", {
+        host: local,
+        origin: `http://${local}`,
+        "sec-fetch-site": "same-origin",
+      }),
+      200
+    );
+    assert.equal(pageGets.length, 3);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("GET /memtree/sessions and /memtree/search relay to the finder endpoints with the key and project", async () => {
+  const upstream = await mockUpstream();
+  const seen = [];
+  const memtreeSrv = await listen((req, res) => {
+    seen.push({
+      url: req.url,
+      authorization: req.headers.authorization,
+      meta: req.headers["x-client-meta"],
+      session: req.headers["x-claude-code-session-id"],
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ sessions: [], hits: [], next_cursor: null }));
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    projectMeta: { project_dir: "polychat", git_repo: "acme/polychat", git_branch: "main", git_commit: "c6fe251" },
+  });
+  const get = (path, headers = {}) => fetch(`http://127.0.0.1:${proxy.port}${path}`, { headers });
+  try {
+    const list = await get("/memtree/sessions?since=2026-09-01&project=polychat&cursor=abc%3D&limit=5");
+    assert.equal(list.status, 200);
+    assert.deepEqual(seen.at(-1), {
+      url: "/v1/memtree/sessions?since=2026-09-01&project=polychat&cursor=abc%3D&limit=5",
+      authorization: "Bearer secret-key",
+      meta: JSON.stringify({ project_dir: "polychat", git_repo: "acme/polychat", git_branch: "main", git_commit: "c6fe251" }),
+      session: undefined,
+    });
+    await get("/memtree/search?q=%22cache+invalidation%22&mode=text", { "x-claude-code-session-id": "sess-1" });
+    assert.equal(seen.at(-1).url, "/v1/memtree/search?q=%22cache+invalidation%22&mode=text");
+    assert.equal(seen.at(-1).session, "sess-1");
+    await get("/memtree/search?q=x", { "x-claude-code-session-id": "bad id/../x" });
+    assert.equal(seen.at(-1).session, undefined, "a malformed session id is not forwarded");
+
+    // The Step 6 per-tree search goes through the page relay.
+    await get("/memtree/ea18af90658b/search?q=deploy&limit=3");
+    assert.equal(seen.at(-1).url, "/usage/memtree/ea18af90658b/search?q=deploy&limit=3");
+
+    // Nothing else reaches the server: no subpaths, no encoded walks.
+    const before = seen.length;
+    for (const path of [
+      "/memtree/sessions/x",
+      "/memtree/search/..%2F..%2Fadmin",
+      "/memtree/sessions%2F..%2Fadmin",
+      "/memtree/search%3Fq=x",
+      "/memtree/ea18af90658b/search/x",
+    ]) {
+      assert.equal((await get(path)).status, 404, path);
+    }
+    assert.equal(seen.length, before);
+    // A literal `..` is normalized by the URL parser before routing.
+    await get("/memtree/sessions/../search?q=y");
+    assert.equal(seen.at(-1).url, "/v1/memtree/search?q=y");
+    // Only GET is relayed (anything else is not a MemTree call).
+    await fetch(`http://127.0.0.1:${proxy.port}/memtree/sessions`, { method: "POST", body: "{}" });
+    assert.equal(seen.length, before + 1, "the POST never reached the MemTree server");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("list and search through the proxy against a mock MemTree server", async () => {
+  const upstream = await mockUpstream();
+  const requests = [];
+  const rid = "3f2a9c1b-7e40-4d2a-9a51-0c8e2b6f4d17";
+  const hit = (score, model) => ({
+    id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", kind: "claude_code_session",
+    session_id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f",
+    tree: { request_id: rid, created_at: "2026-09-29T01:38:02.211000+00:00",
+            links: { url: "https://api.polychat.co/m/3f2a9c1b7e40" } },
+    leaf: "leaf_node_1:2:4.txt", range: { block: 1, start: 2, end: 4 },
+    snippet: "the <b>Deploy</b> target is cloud-run", score, ...(model ? { embedding_model: model } : {}),
+  });
+  const memtreeSrv = await listen((req, res) => {
+    const url = new URL(req.url, "http://x");
+    requests.push({ path: url.pathname, params: Object.fromEntries(url.searchParams), session: req.headers["x-claude-code-session-id"] });
+    const send = (status, body) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (url.pathname === "/v1/memtree/sessions") {
+      return send(200, {
+        sessions: [{
+          id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", kind: "claude_code_session",
+          session_id: "6025e1f7-074b-4abb-a8e7-dbf07ef1e81f", title: "Usage dashboard overhaul",
+          snippet: "Restyle the usage page", first_at: "2026-09-28T17:02:11+00:00", last_at: "2026-09-29T01:40:57+00:00",
+          project: { dir: "polychat", repo: "acme/polychat", branch: "main", commit: "c6fe251" },
+          models: ["claude-opus-5-5"], request_count: 212, latest_tree: { request_id: rid, links: { url: "https://api.polychat.co/m/3f2a9c1b7e40" } },
+        }],
+        next_cursor: url.searchParams.get("cursor") ? null : "CURSOR1",
+      });
+    }
+    if (url.searchParams.get("q") === "partner") return send(403, { detail: "not available to partner keys" });
+    if (url.searchParams.get("mode") === "vector") {
+      return send(200, { query: url.searchParams.get("q"), mode: "vector", charged: true, next_cursor: "V2",
+        groups: [{ embedding_model: "voyage-3.5", has_more: true, hits: [hit(0.88, "voyage-3.5")] },
+                 { embedding_model: "gemini-embedding-001", has_more: false, hits: [hit(0.61, "gemini-embedding-001")] }] });
+    }
+    return send(200, { query: url.searchParams.get("q"), mode: "text", hits: [hit(0.0913)], next_cursor: null, matches_capped: false });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const finder = new SessionFinder({ proxyUrl: `http://127.0.0.1:${proxy.port}`, sessionId: "sess-9" });
+  try {
+    const listed = await finder.listSessions({ project: "polychat", since: "2026-09-01" });
+    assert.deepEqual(requests.at(-1), { path: "/v1/memtree/sessions", params: { since: "2026-09-01", project: "polychat" }, session: "sess-9" });
+    assert.match(listed, /^1 session, most recently active first:/);
+    assert.match(listed, /\[1\] Usage dashboard overhaul/);
+    assert.match(listed, /session 6025e1f7-074b-4abb-a8e7-dbf07ef1e81f · 2026-09-28 17:02 UTC → 2026-09-29 01:40 UTC · 212 requests/);
+    assert.match(listed, /project: acme\/polychat · main @ c6fe251/);
+    assert.match(listed, new RegExp(`read_node \\{"tree": "${rid}", "id": 0\\}`));
+    assert.match(listed, /"cursor": "CURSOR1"/);
+    assert.match(await finder.listSessions({ cursor: "CURSOR1" }), /No more results\./);
+
+    const semantic = await finder.searchSessions({ query: "how did we pick the deploy target", mode: "vector" });
+    assert.equal(requests.at(-1).params.mode, "vector");
+    assert.match(semantic, /charged: one query embedding per model/);
+    assert.match(semantic, /== voyage-3\.5 ==[\s\S]*== gemini-embedding-001 ==/, "one ranking per model");
+    assert.match(semantic, /scores are not comparable across groups/);
+    assert.match(semantic, new RegExp(`open: read_lines \\{"tree": "${rid}", "block": 1, "start": 2, "end": 4\\}`));
+    assert.match(semantic, /"cursor": "V2"/);
+
+    const exact = await finder.searchSessions({ query: "deploy", mode: "text", project: "polychat" });
+    assert.deepEqual(requests.at(-1).params, { q: "deploy", mode: "text", project: "polychat" });
+    assert.match(exact, /1 text match for "deploy":/);
+    assert.match(exact, /the \*\*Deploy\*\* target/);
+    assert.match(exact, /page: https:\/\/api\.polychat\.co\/m\/3f2a9c1b7e40/);
+    assert.match(exact, /block 1 lines 2-4/);
+    assert.match(exact, /No more results\./);
+
+    await assert.rejects(finder.searchSessions({ query: "partner" }), /HTTP 403 not available to partner keys/);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("GET /memtree/current[.json]: pages stay scoped to their sessions", async () => {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const file = pathMod.join(fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-current-")), "links.json");
+  new MemtreeLinkStore(file).put("resumed-session", { url: PAGE_URL_2, index: "index-old", compressed: true });
+  const upstream = await mockUpstream();
+  const pageGets = [];
+  // Compress POSTs stamp PAGE_URL_1; page GETs answer a tree.
+  const memtreeSrv = await listenMemtree((req, res) => {
+    if (req.method === "GET") {
+      pageGets.push(req.url);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodes: [{ id: 0, s: "root", k: [] }], blocks: [] }));
+      return;
+    }
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json", ...pageHeaders(PAGE_URL_1, "index-a") });
+      res.end(JSON.stringify(compressedOnce));
+    });
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    memtreeLinkStore: new MemtreeLinkStore(file),
+  });
+  const get = (path) => fetch(`http://127.0.0.1:${proxy.port}${path}`);
+  try {
+    assert.equal((await get("/memtree/current")).status, 404, "nothing served, no session");
+    assert.equal((await get("/memtree/current?session=unknown")).status, 404);
+    assert.equal(pageGets.length, 0);
+    // Before this proxy served a page: the session's stored page (resume).
+    assert.deepEqual(await (await get("/memtree/current?session=resumed-session")).json(), {
+      id: "0f1c2d3e4a5b",
+      url: PAGE_URL_2,
+      index: "index-old",
+      session_id: "resumed-session",
+      compressed: true,
+    });
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const pointer = await (await get("/memtree/current?session=session-1")).json();
+    assert.deepEqual(pointer, {
+      id: "ea18af90658b",
+      url: PAGE_URL_1,
+      index: "index-a",
+      session_id: "session-1",
+      compressed: true,
+    });
+    // Concurrent and cleared sessions cannot inherit the newest page of another.
+    assert.equal((await (await get("/memtree/current?session=resumed-session")).json()).id, "0f1c2d3e4a5b");
+    assert.equal((await get("/memtree/current")).status, 404);
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "clear", session_id: "cleared-session" });
+    assert.equal((await get("/memtree/current?session=cleared-session")).status, 404);
+    assert.equal((await (await get("/memtree/current?session=session-1")).json()).id, "ea18af90658b");
+    assert.equal(pageGets.length, 0, "the pointer never calls upstream");
+
+    const page = await get("/memtree/current.json?session=session-1");
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get("x-memtree-page"), PAGE_URL_1);
+    assert.deepEqual((await page.json()).nodes, [{ id: 0, s: "root", k: [] }]);
+    assert.deepEqual(pageGets, ["/usage/memtree/ea18af90658b.json"]);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("x-memtree-tools rides compress calls only when the memtree MCP tools are configured", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const run = async (memtreeTools) => {
+    const proxy = await startProxy({
+      memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k", memtreeTools }),
+      upstreamOrigin: upstream.origin,
+    });
+    const from = memtreeSrv.calls.length;
+    const headers = { "x-claude-code-session-id": `session-${from}` };
+    try {
+      await armMainTurn(proxy, "turn two", "prompt-1");
+      await postMessages(proxy.port, followupTurn("turn two"), headers);
+      await postMessages(proxy.port, [{ role: "user", content: `first message ${from}` }], headers);
+      await waitFor(() => {
+        const mine = memtreeSrv.calls.slice(from);
+        return mine.some((c) => !c.index_only) && mine.some((c) => c.index_only);
+      });
+      return memtreeSrv.calls.slice(from).map((c, i) => ({
+        indexOnly: !!c.index_only,
+        tools: memtreeSrv.callHeaders[from + i]["x-memtree-tools"],
+      }));
+    } finally {
+      proxy.close();
+    }
+  };
+  try {
+    const on = await run("search,read_node,read_lines");
+    assert.ok(on.filter((c) => !c.indexOnly).every((c) => c.tools === "search,read_node,read_lines"));
+    assert.ok(on.filter((c) => c.indexOnly).every((c) => c.tools === undefined), "index-only calls return no memory");
+    const off = await run(undefined);
+    assert.ok(off.length >= 2);
+    assert.ok(off.every((c) => c.tools === undefined));
+  } finally {
     upstream.close();
     memtreeSrv.close();
   }
@@ -3725,6 +5402,15 @@ test("a fully indexed empty memory forwards real history instead of amnesia", as
 // Tool-route miss recovery (plans/2026-08-04_PLAN_tool_turn_route_recovery.md)
 // ---------------------------------------------------------------------------
 
+/**
+ * Tool turns compress only once their estimated size reaches the budget
+ * (planToolCompaction). These tests exercise the compaction machinery with a
+ * largeToolTurn (~130k tokens), so they run under a 20k budget: the whole
+ * history is over it, a ride on the ~1k-token recovered memory is not.
+ */
+const RECOVERY_BUDGET = 20_000;
+const startRecoveryProxy = (opts) => startProxy({ budgetTokensOverride: RECOVERY_BUDGET, ...opts });
+
 /** Recording upstream that answers both /messages and /count_tokens. */
 function recordingUpstream() {
   const seen = [];
@@ -3733,11 +5419,20 @@ function recordingUpstream() {
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const isCount = req.url.startsWith("/v1/messages/count_tokens");
+      const raw = Buffer.concat(chunks);
       seen.push({
+        raw: raw.toString("utf-8"),
         isCount,
-        body: JSON.parse(Buffer.concat(chunks).toString("utf-8")),
+        body: JSON.parse(raw.toString("utf-8")),
       });
-      const body = isCount ? JSON.stringify({ input_tokens: 42 }) : UPSTREAM_BODY;
+      // Usage sized like Anthropic's (bytes/4): tool turns' budget check is
+      // anchored on the reported size of the previous request.
+      const body = isCount
+        ? JSON.stringify({ input_tokens: 42 })
+        : JSON.stringify({
+            ...JSON.parse(UPSTREAM_BODY),
+            usage: { input_tokens: Math.floor(raw.length / 4), output_tokens: 1 },
+          });
       res.writeHead(200, {
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(body)),
@@ -3792,7 +5487,7 @@ test("incident regression: a first-user side request cannot strand the tool loop
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -3852,7 +5547,7 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -3900,23 +5595,19 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
   }
 });
 
-test("recovery failure degrades to the original body and retains the background index", async () => {
+test("over-budget recovery failure returns an error and retains background indexing", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(500, { error: "boom" });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 1);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "failure forwards the original body"
-    );
+    assert.equal(upstream.seen.length, 0);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -3939,7 +5630,7 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
     messages: reqBody.messages,
   }));
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -3947,11 +5638,7 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
   const conversation = largeToolTurn();
   try {
     await postMessages(proxy.port, conversation, SESSION);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "a no-op preserves true passthrough semantics"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeRecovery.outcome, "noop");
@@ -3966,66 +5653,131 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
   }
 });
 
-test("a small tool-route miss attempts recovery once; the second miss is spent", async () => {
-  // The old 400KiB byte gate is gone: a miss well under it still buys the
-  // lane's ONE blocking attempt per epoch, and the attempt is the budget —
-  // a later miss in the same lane and epoch forwards verbatim.
+test("a tool turn under the budget makes no compress call and spends nothing; the lane compresses when it reaches the budget", async () => {
+  // Regression (requests.jsonl: routeRecovery noop 2,290 / spent 2,839): the
+  // first tool turn of a long loop was under the budget, so its blocking
+  // compress no-oped and "spent" the lane, and every later tool turn went out
+  // whole past the budget. Now a tool turn under the budget makes no call at
+  // all, and the lane compresses at the budget, however late in the turn.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
-  // ~16KB conversation: far below the deleted gate, big enough that the
-  // recovered body is a genuine byte win.
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
+  // ~4k tokens: well under the 20k budget.
   const smallishToolTurn = [
     { role: "user", content: "first question" },
-    {
-      role: "assistant",
-      content: [{ type: "text", text: "history ".repeat(2000) }],
-    },
-    {
-      role: "assistant",
-      content: [{ type: "tool_use", id: "t1", name: "x", input: {} }],
-    },
-    {
-      role: "user",
-      content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }],
-    },
+    { role: "assistant", content: [{ type: "text", text: "history ".repeat(2000) }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "x", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
   ];
   try {
     await postMessages(proxy.port, smallishToolTurn, SESSION);
-    const rec = messageRecords(records)[0];
-    assert.equal(rec.routeLane, "main");
-    assert.equal(rec.routeMiss, "missing");
-    assert.equal(rec.turnType, "tool-recompressed");
-    assert.equal(rec.routeRecovery.outcome, "compressed");
-    assert.equal(rec.routeRecovery.install, "installed");
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /recovered memory/,
-      "the small miss was worth exactly one blocking attempt"
-    );
+    const under = messageRecords(records)[0];
+    assert.equal(under.routeLane, "main");
+    assert.equal(under.routeMiss, "missing");
+    assert.equal(under.turnType, "tool");
+    assert.equal(under.routeRecovery, undefined, "no attempt, nothing spent");
+    assert.equal(under.compress, undefined);
+    assert.equal(under.compaction.budgetTokens, RECOVERY_BUDGET);
+    assert.ok(under.compaction.estimatedTokens < RECOVERY_BUDGET);
+    assert.equal(under.compaction.reason, undefined);
+    assert.equal(blockingCalls(), 0, "under the budget: no compress call");
 
-    // A same-length body whose tool_result diverged is a genuine mismatch
-    // (an identical repost would be a "replay" now), so it rejects — and the
-    // lane's budget is already spent: verbatim forward, no second blocking
-    // compress.
-    const diverged = structuredClone(smallishToolTurn);
-    diverged[3].content[0].content = "divergent result";
-    await postMessages(proxy.port, diverged, SESSION);
-    const rec2 = messageRecords(records)[1];
-    assert.equal(rec2.routeMiss, "rejected");
-    assert.equal(rec2.turnType, "tool");
-    assert.equal(rec2.routeRecovery.outcome, "spent");
-    assert.equal(rec2.routeRecovery.conversationBytes, undefined);
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /first question/,
-      "the spent miss forwards the original history"
-    );
+    // The loop keeps going; a big tool result takes it past the budget.
+    const grown = [
+      ...smallishToolTurn,
+      { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "x", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "r".repeat(200_000) }] },
+    ];
+    await postMessages(proxy.port, grown, SESSION);
+    const crossed = messageRecords(records).at(-1);
+    assert.equal(crossed.turnType, "tool-recompressed");
+    assert.equal(crossed.compaction.reason, "budget");
+    assert.equal(crossed.compaction.sizeSource, "reported");
+    assert.ok(crossed.compaction.estimatedTokens >= RECOVERY_BUDGET);
+    assert.equal(crossed.routeRecovery.outcome, "compressed");
+    assert.equal(crossed.routeRecovery.prefix, "installed");
+    assert.equal(blockingCalls(), 1);
+    assert.equal(memtreeSrv.calls.find((c) => !c.index_only).compression_target_tokens, RECOVERY_BUDGET / 2);
+    assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /recovered memory/);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a no-op that finds no tree stops the tool loop's compress calls until the tree's page is built", async () => {
+  // Live Haiku run 2026-09-29: a new conversation's loop crossed the budget
+  // before its first tree existed; each tool turn paid a blocking compress
+  // call that could only pass everything through (unindexed messages are
+  // always kept verbatim). Now the lane waits for the tree instead.
+  const upstream = await recordingUpstream();
+  let pageReady = false;
+  let pageGets = 0;
+  const calls = [];
+  const memtreeSrv = await listen((req, res) => {
+    if (req.method === "GET") {
+      pageGets++;
+      assert.match(req.url, /^\/usage\/memtree\/ea18af90658b\.json$/);
+      res.writeHead(pageReady ? 200 : 202, { "content-type": "application/json" });
+      res.end(JSON.stringify(pageReady ? { nodes: [] } : { status: "building" }));
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      calls.push(parsed);
+      const body = parsed.index_only
+        ? { messages: [], index_only: true, usage: {} }
+        : pageReady
+          ? withServerFlatten(recoveredMemory(), parsed)
+          : { messages: parsed.messages, compressed: false, usage: { prompt_tokens_details: { cached_tokens: 0 } } };
+      res.writeHead(200, { "content-type": "application/json", ...(parsed.index_only ? {} : pageHeaders(PAGE_URL_1)) });
+      res.end(JSON.stringify(body));
+    });
+  });
+  const records = [];
+  const proxy = await startRecoveryProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const blockingCalls = () => calls.filter((c) => !c.index_only).length;
+  try {
+    let loop = largeToolTurn();
+    await postMessages(proxy.port, loop, SESSION);
+    const first = messageRecords(records).at(-1);
+    assert.equal(first.routeRecovery.outcome, "noop");
+    assert.equal(first.routeRecovery.awaitingIndex, true);
+    assert.equal(blockingCalls(), 1);
+
+    for (const id of ["t2", "t3"]) {
+      loop = extendToolLoop(loop, id);
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+    }
+    assert.equal(blockingCalls(), 1, "no compress call while the tree is building");
+    await waitFor(() => pageGets >= 1);
+
+    pageReady = true;
+    loop = extendToolLoop(loop, "t4");
+    await postMessages(proxy.port, loop, SESSION);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+    await waitFor(() => pageGets >= 2);
+    await new Promise((r) => setTimeout(r, 20));
+
+    loop = extendToolLoop(loop, "t5");
+    await postMessages(proxy.port, loop, SESSION);
+    const ready = messageRecords(records).at(-1);
+    assert.equal(ready.routeRecovery.outcome, "compressed", "tree built: compresses without waiting for growth");
+    assert.equal(blockingCalls(), 2);
   } finally {
     proxy.close();
     upstream.close();
@@ -4037,7 +5789,7 @@ test("disabled recovery records the suppressed miss and never compresses", async
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4045,7 +5797,7 @@ test("disabled recovery records the suppressed miss and never compresses", async
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.match(JSON.stringify(upstream.seen[0].body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -4067,11 +5819,11 @@ test("disabled recovery records the suppressed miss and never compresses", async
   }
 });
 
-test("a recovery with no byte gain forwards the original and spends the budget", async () => {
-  // A tiny conversation's recovered body is BIGGER than the original: the
-  // no-gain check forwards the original (never worse than verbatim), installs
-  // nothing — and the lane's one attempt is still spent, so the next miss
-  // does not retry.
+test("an over-budget no-gain compaction refuses forwarding and backs off until growth", async () => {
+  // A tiny conversation's recovered body is BIGGER than the original.
+  // Neither result fits the configured budget, so no route or upstream
+  // request is created. The lane backs off: a same-size retry makes no
+  // second call, and only growth past a twentieth of the budget retries.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
@@ -4079,7 +5831,10 @@ test("a recovery with no byte gain forwards the original and spends the budget",
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
+    // toolTurn is ~60 tokens: over a 20-token budget (backoff margin: 1).
+    budgetTokensOverride: 20,
   });
+  const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
   try {
     await postMessages(proxy.port, toolTurn, SESSION);
     const rec = messageRecords(records)[0];
@@ -4087,20 +5842,21 @@ test("a recovery with no byte gain forwards the original and spends the budget",
     assert.equal(rec.routeMiss, "missing");
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.routeRecovery.install, undefined);
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "the no-gain result never replaces the original body"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(blockingCalls(), 1);
 
-    await postMessages(proxy.port, extendToolLoop(toolTurn, "t2"), SESSION);
+    const sameSize = structuredClone(toolTurn);
+    sameSize[2].content[0].content = "no";
+    await postMessages(proxy.port, sameSize, SESSION);
     const rec2 = messageRecords(records)[1];
     assert.equal(rec2.routeMiss, "missing");
-    assert.equal(rec2.routeRecovery.outcome, "spent");
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /first question/
-    );
+    assert.equal(rec2.routeRecovery.outcome, "backoff");
+    assert.equal(blockingCalls(), 1, "a backoff skip pays nothing");
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+
+    await postMessages(proxy.port, extendToolLoop(toolTurn, "t2"), SESSION);
+    assert.equal(messageRecords(records)[2].routeRecovery.outcome, "no-gain", "grown: tried again");
+    assert.equal(blockingCalls(), 2);
   } finally {
     proxy.close();
     upstream.close();
@@ -4124,7 +5880,7 @@ test("a large subagent tool turn recovers into its own lane and rides it next tu
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4178,7 +5934,7 @@ test("a compressed subagent followup installs its own lane and its tool loop rid
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4229,7 +5985,7 @@ test("a newer subagent followup owns its lane when completions reverse", async (
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4295,7 +6051,7 @@ test("a closed newer subagent followup hands its lane decision back", async () =
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4421,7 +6177,7 @@ test("an agent followup keeps its reservation through delayed activation", async
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4525,7 +6281,7 @@ test("a same-session subagent reject evicts only its own lane, never main's", as
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4552,7 +6308,9 @@ test("a same-session subagent reject evicts only its own lane, never main's", as
     const rejected = messageRecords(records).at(-1);
     assert.equal(rejected.routeLane, "agent");
     assert.equal(rejected.routeMiss, "rejected");
-    assert.equal(rejected.routeRecovery.outcome, "spent");
+    // Still over the budget with nothing to ride: the lane compresses again
+    // (a lane is no longer "spent" after one attempt per human turn).
+    assert.equal(rejected.routeRecovery.outcome, "compressed");
 
     // Main's route was never touched: its extension still rides.
     await postMessages(proxy.port, extendToolLoop(base, "t1"), SESSION);
@@ -4579,7 +6337,7 @@ test("reserved-looking agent ids cannot alias the main route lane", async () => 
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4635,7 +6393,7 @@ test("an away-summary followup compresses, stores no route, and spares main's ro
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4687,7 +6445,7 @@ test("the route map is LRU-bounded: a 33rd lane evicts the oldest", async () => 
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4707,18 +6465,6 @@ test("the route map is LRU-bounded: a 33rd lane evicts the oldest", async () => 
       );
     }
 
-    // agent-1 was the least recently used entry, so the 33rd install
-    // evicted it: its extension misses (and its budget is already spent).
-    await postMessages(
-      proxy.port,
-      extendToolLoop(largeToolTurn("AAA"), "x1"),
-      laneHeaders(1)
-    );
-    const evicted = messageRecords(records).at(-1);
-    assert.equal(evicted.routeMiss, "missing");
-    assert.equal(evicted.turnType, "tool");
-    assert.equal(evicted.routeRecovery.outcome, "spent");
-
     // agent-2 survived under the cap: its extension rides.
     await postMessages(
       proxy.port,
@@ -4726,6 +6472,19 @@ test("the route map is LRU-bounded: a 33rd lane evicts the oldest", async () => 
       laneHeaders(2)
     );
     assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
+
+    // agent-1 was the least recently used entry, so the 33rd install
+    // evicted it: its extension misses, and being over the budget with
+    // nothing to ride, compresses again.
+    await postMessages(
+      proxy.port,
+      extendToolLoop(largeToolTurn("AAA"), "x1"),
+      laneHeaders(1)
+    );
+    const evicted = messageRecords(records).at(-1);
+    assert.equal(evicted.routeMiss, "missing");
+    assert.equal(evicted.turnType, "tool-recompressed");
+    assert.equal(evicted.routeRecovery.outcome, "compressed");
   } finally {
     proxy.close();
     upstream.close();
@@ -4737,7 +6496,7 @@ test("a sessionless recovery is one-shot: compressed forward, no route", async (
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4764,29 +6523,27 @@ test("a sessionless recovery is one-shot: compressed forward, no route", async (
   }
 });
 
-test("a pending human prompt window keeps recovery transform-only", async () => {
+test("a pending human prompt cannot prevent recovery route installation", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   const conversation = largeToolTurn();
   try {
-    // Armed prompt = a typed prompt may arrive merged into a tool wrapper.
-    // The intermediate wrapper must not install a route that would veto the
-    // real merged-prompt request's recovery classification.
+    // Hooks supply accounting only; this request validates its own route.
     await armMainTurn(proxy, "typed while tools ran");
     await postMessages(proxy.port, conversation, SESSION);
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
     assert.equal(rec.routeRecovery.outcome, "compressed");
-    assert.equal(rec.routeRecovery.install, "prompt-pending");
+    assert.equal(rec.routeRecovery.install, "installed");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     const rec2 = messageRecords(records)[1];
-    assert.equal(rec2.routeMiss, "missing", "no route was installed");
+    assert.equal(rec2.turnType, "tool-memory", "the validated route is reused despite pending accounting");
   } finally {
     proxy.close();
     upstream.close();
@@ -4801,7 +6558,7 @@ test("a pending main prompt does not make an agent recovery transform-only", asy
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory("AGENT"));
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4841,7 +6598,7 @@ test("a different-session rejection preserves the owner's route; same-session re
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4878,11 +6635,11 @@ test("a different-session rejection preserves the owner's route; same-session re
   }
 });
 
-test("an in-flight recovery holds the lane budget; a concurrent miss forwards verbatim", async () => {
-  // Two concurrent recoveries in one lane and epoch are impossible now: the
-  // first miss spends the lane's one blocking attempt BEFORE its compress
-  // settles, so a miss racing it forwards verbatim instead of stacking a
-  // second blocking wait — and the in-flight attempt still installs.
+test("an in-flight recovery holds the lane; an oversized concurrent miss is refused", async () => {
+  // Two concurrent compactions in one lane are impossible: the first marks
+  // the lane in flight BEFORE its compress settles, so a miss racing it
+  // forwards verbatim ("in-flight") instead of stacking a second blocking
+  // wait — and the in-flight attempt still installs.
   const upstream = await recordingUpstream();
   const held = deferred();
   let aCompressArrived = false;
@@ -4906,7 +6663,7 @@ test("an in-flight recovery holds the lane budget; a concurrent miss forwards ve
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -4920,13 +6677,9 @@ test("an in-flight recovery holds the lane budget; a concurrent miss forwards ve
     await waitFor(() => aCompressArrived);
     await postMessages(proxy.port, convB, SESSION);
     const recB = messageRecords(records).at(-1);
-    assert.equal(recB.routeRecovery.outcome, "spent");
+    assert.equal(recB.routeRecovery.outcome, "in-flight");
     assert.equal(recB.turnType, "tool");
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /BBB first question/,
-      "the racing miss forwarded its own full history"
-    );
+    assert.equal(upstream.seen.length, 0, "the racing oversized request waits for a usable route instead of forwarding whole history");
 
     held.resolve();
     await aInFlight;
@@ -4949,7 +6702,7 @@ test("an in-flight recovery holds the lane budget; a concurrent miss forwards ve
   }
 });
 
-test("a human prompt arming during recovery compression prevents stale installation", async () => {
+test("a hook arriving during recovery cannot invalidate the API request decision", async () => {
   const upstream = await recordingUpstream();
   const held = deferred();
   let compressArrived = false;
@@ -4969,22 +6722,21 @@ test("a human prompt arming during recovery compression prevents stale installat
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   try {
     const inFlight = postMessages(proxy.port, largeToolTurn(), SESSION);
-    // The recovery must have captured its epoch (compress in flight) before
-    // the human prompt bumps it.
+    // The request captured its lane generation before the hook arrives.
     await waitFor(() => compressArrived);
-    await armMainTurn(proxy, "new human turn"); // bumps the route epoch
+    await armMainTurn(proxy, "new human turn"); // accounting only
     held.resolve();
     await inFlight;
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool-recompressed");
-    assert.equal(rec.routeRecovery.install, "stale");
+    assert.equal(rec.routeRecovery.install, "installed");
   } finally {
     proxy.close();
     upstream.close();
@@ -5005,7 +6757,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
     usage: { prompt_tokens_details: { cached_tokens: 999 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5017,11 +6769,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
     assert.equal(rec.routeRecovery.outcome, "unusable");
     assert.equal(rec.history.usable, false);
     assert.equal(rec.turnType, "tool", "not forwarded as tool-recompressed");
-    assert.match(
-      JSON.stringify(upstream.seen[0].body.messages),
-      /first question/,
-      "the real history was forwarded, not the amnesiac answer"
-    );
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     // No route: the next tool turn misses rather than riding amnesia.
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(messageRecords(records)[1].routeMiss, "missing");
@@ -5032,15 +6780,15 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
   }
 });
 
-test("a compression with no byte gain forwards the original body", async () => {
+test("an oversized compression with no byte gain never forwards the original", async () => {
   const upstream = await recordingUpstream();
   // Usable and genuinely indexed, but bigger than what it replaces.
   const memtreeSrv = await mockMemtree(200, {
-    messages: [{ role: "user", content: "bloated memory " + "m".repeat(900_000) }],
+    messages: [{ role: "user", content: "bloated memory " + "m".repeat(700_000) }],
     usage: { prompt_tokens_details: { cached_tokens: 999 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5051,7 +6799,7 @@ test("a compression with no byte gain forwards the original body", async () => {
     const rec = messageRecords(records)[0];
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.turnType, "tool");
-    assert.match(JSON.stringify(upstream.seen[0].body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(
       messageRecords(records)[1].routeMiss,
@@ -5076,7 +6824,7 @@ test("an upstream failure on the recovered leg installs no route", async () => {
   });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5102,7 +6850,7 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(500, { error: "down" });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5119,9 +6867,9 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
 
     // Every tool turn appends a tool_result and rehashes, so compress()'s
     // dedup can never absorb the repeat: without a cooldown an outage would
-    // charge the full blocking budget to each of these. Main's own lane spent
-    // its one attempt above and "spent" wins when both gates hold, so the
-    // cooldown is observed from a sibling lane whose budget is intact.
+    // charge the full blocking budget to each of these. Main's own lane is
+    // backing off after its failed attempt and "backoff" wins when both gates
+    // hold, so the cooldown is observed from a sibling lane with no backoff.
     const sibling = { ...SESSION, "x-claude-code-agent-id": "agent-fuse-probe" };
     await postMessages(proxy.port, extendToolLoop(conversation, "t2"), sibling);
     await postMessages(proxy.port, extendToolLoop(conversation, "t3"), sibling);
@@ -5132,14 +6880,13 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
       assert.equal(rec.turnType, "tool");
     }
     assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
-    assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /first question/);
+    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
 
-    // The spent lane stays visible as budget exhaustion even while the
-    // cooldown is armed: the reqlog acceptance metric needs "spent", not
-    // "cooldown", masking it during outages.
+    // Main's backoff stays visible even while the cooldown is armed: it has
+    // grown by far less than a twentieth of the budget since its attempt.
     await postMessages(proxy.port, extendToolLoop(conversation, "t4"), SESSION);
-    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "spent");
-    assert.equal(blockingCalls(), afterFirst, "a spent skip pays nothing either");
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "backoff");
+    assert.equal(blockingCalls(), afterFirst, "a backoff skip pays nothing either");
   } finally {
     proxy.close();
     upstream.close();
@@ -5155,7 +6902,7 @@ test("a large foreign-session turn recovers into its own lane and spares the own
       : recoveredMemory("AAA")
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5187,11 +6934,9 @@ test("a large foreign-session turn recovers into its own lane and spares the own
   }
 });
 
-test("a degraded main followup still clears the route it cannot rebuild", async () => {
-  // The inverse of the clear-gating fix: gating the clear on followup turns
-  // must not stop a genuine followup from clearing. A followup whose compress
-  // fails has no compressed prefix, so leaving the previous route installed
-  // would splice a prefix that no longer matches what the model was sent.
+test("a failed divergent followup keeps the previous route for its original history", async () => {
+  // A failed replacement cannot erase the old validated route. The failed
+  // request itself is small enough to pass through unchanged.
   const upstream = await recordingUpstream();
   let failCompress = false;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -5208,7 +6953,7 @@ test("a degraded main followup still clears the route it cannot rebuild", async 
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5223,23 +6968,18 @@ test("a degraded main followup still clears the route it cannot rebuild", async 
     assert.equal(messageRecords(records).at(-1).turnType, "tool-memory");
 
     failCompress = true;
-    // Deliberately NO armMainTurn here. The UserPromptSubmit hook clears the
-    // route itself, before the request under test is even sent — arming would
-    // leave nothing for the clear-on-followup path to clear, and the test
-    // would pass with both clears deleted. `followupTurn` classifies as a main
-    // followup by shape alone, which is the hookless case that matters.
+    // Changing the last covered user message is a real history divergence.
     await postMessages(proxy.port, followupTurn("turn three"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-degraded");
 
-    // The stale route must be gone: this tool turn was sent full history.
+    // Returning to the previous matching history must still reuse its route.
     await postMessages(
       proxy.port,
-      extendToolLoop(followupTurn("turn three"), "t9"),
+      extendToolLoop(base, "t9"),
       SESSION
     );
     const after = messageRecords(records).at(-1);
-    assert.equal(after.routeMiss, "missing", "the degraded followup cleared it");
-    assert.notEqual(after.turnType, "tool-memory");
+    assert.equal(after.turnType, "tool-memory", "the outage cannot invalidate a matching prefix");
   } finally {
     proxy.close();
     upstream.close();
@@ -5276,7 +7016,7 @@ test("a failed recovery releases the route decision it reserved", async () => {
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5346,7 +7086,7 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5431,7 +7171,7 @@ test("a healthy answer on the followup path lifts the tool-recovery cooldown", a
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5466,7 +7206,7 @@ test("a failed recovery releases its reservation; the in-flight followup still i
   // followup in the same lane. If the recovery fails and does NOT hand its
   // reservation back, the followup compresses successfully and still installs
   // nothing — the very bug the release exists to prevent. (Two concurrent
-  // recoveries per lane are impossible now: the second miss is "spent".)
+  // compactions per lane are impossible: the second miss is "in-flight".)
   const upstream = await recordingUpstream();
   const gates = { AAA: deferred(), BBB: deferred(), CCC: deferred() };
   const arrived = { AAA: false, BBB: false, CCC: false };
@@ -5491,7 +7231,7 @@ test("a failed recovery releases its reservation; the in-flight followup still i
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5505,13 +7245,13 @@ test("a failed recovery releases its reservation; the in-flight followup still i
     const recovery = postMessages(proxy.port, largeToolTurn("BBB"), SESSION);
     await waitFor(() => arrived.BBB);
     // A third miss while the recovery is in flight gets no attempt at all:
-    // the lane's budget is already spent, so it never reaches the mock.
+    // the lane is already compressing, so it never reaches the mock.
     await postMessages(proxy.port, largeToolTurn("CCC"), SESSION);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
-      "spent"
+      "in-flight"
     );
-    assert.equal(arrived.CCC, false, "the spent miss sent no compress");
+    assert.equal(arrived.CCC, false, "the in-flight miss sent no compress");
 
     gates.BBB.resolve();
     await recovery;
@@ -5570,7 +7310,7 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5615,10 +7355,11 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
       "a subagent's success lifted the fuse"
     );
 
-    // Main's own lane spent its budget on the failed attempt above: with the
-    // fuse lifted it still forwards verbatim for the rest of the epoch.
+    // Main's own lane backs off after its failed attempt above: with the
+    // fuse lifted it still forwards verbatim until its history has grown by
+    // a twentieth of the budget.
     await postMessages(proxy.port, largeToolTurn("EEE"), SESSION);
-    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "spent");
+    assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "backoff");
   } finally {
     proxy.close();
     upstream.close();
@@ -5653,13 +7394,24 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
     });
   });
   const records = [];
-  const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const cacheChecks = [];
+  const hasCachedCompress = memtree.hasCachedCompress.bind(memtree);
+  memtree.hasCachedCompress = (...args) => {
+    const cached = hasCachedCompress(...args);
+    cacheChecks.push(cached);
+    return cached;
+  };
+  const proxy = await startRecoveryProxy({
+    memtree,
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   const replayed = followupTurn("turn two");
   try {
+    const compact = () => postHook(proxy, { hook_event_name: "UserPromptSubmit",
+      prompt: "/memtree-compact", session_id: "session-1" });
+    await compact();
     // Warm the compress cache for this exact body while MemTree is healthy.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
@@ -5670,8 +7422,12 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
 
     // The identical retry: answered entirely from cache, zero server contact.
     const before = liveCompressCalls;
+    cacheChecks.length = 0;
+    await compact(); // Force a compress call with the identical cached target.
     await postMessages(proxy.port, replayed, SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    assert.equal(cacheChecks[0], true, "the rebuild observes a cached compression before calling compress");
+    assert.equal(messageRecords(records).at(-1).compress.ok, true);
     assert.equal(
       liveCompressCalls,
       before,
@@ -5739,7 +7495,7 @@ test("a fast-tool abort does not strand recovery in transform-only mode", async 
   });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5820,7 +7576,7 @@ test("an agent-attributed count_tokens rides its own lane during the tool loop",
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5867,7 +7623,7 @@ test("agent count_tokens without its own route forwards verbatim and spares main
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5922,7 +7678,7 @@ test("a sibling's count_tokens on the shared parent lane fails closed to verbati
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5984,7 +7740,7 @@ test("an unarmed local bang-command turn owns its compression notice", async () 
     },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6014,7 +7770,7 @@ test("an unarmed local bang-command turn owns its compression notice", async () 
     });
     assert.equal(stop.status, 200, "the unarmed bang turn queued its notice");
     assert.equal(
-      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, ""),
+      stop.body.systemMessage.replace(/\x1B\[[0-9;]*m/g, "").replace(SUCCESS_TOTALS_RE, ""),
       COMPRESSED_NOTICE
     );
     assert.equal(
@@ -6041,7 +7797,7 @@ test("route matching ignores block cache metadata but preserves nested tool data
     usage: { prompt_tokens_details: { cached_tokens: 123 } },
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6151,15 +7907,17 @@ test("route matching ignores block cache metadata but preserves nested tool data
 // ralph-review cycle 1 (2026-08-13): decided fixes
 // ---------------------------------------------------------------------------
 
-test("a hook-armed prompt's followup bump keeps spent lanes spent", async () => {
+test("a hook-armed prompt's followup bump keeps a lane's backoff", async () => {
   // One turn boundary, one budget wipe: UserPromptSubmit already cleared
   // toolRecoveryAttemptedLanes, so the same prompt's followup bump must not
   // clear it again — a lane that spent its attempt between the two bumps
   // would otherwise get a second blocking compress at the same boundary.
   const upstream = await recordingUpstream();
+  // BBB (the agent lane) is an index-warming no-op: its attempt produces no
+  // prefix, which starts the lane's backoff until the next budget wipe.
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
-      ? recoveredMemory("BBB")
+      ? { messages: reqBody.messages }
       : {
           messages: [
             { role: "user", content: "compressed context " + "c".repeat(2500) },
@@ -6168,7 +7926,7 @@ test("a hook-armed prompt's followup bump keeps spent lanes spent", async () => 
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6181,22 +7939,22 @@ test("a hook-armed prompt's followup bump keeps spent lanes spent", async () => 
     // ...the agent lane spends its one attempt after it...
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "noop"
     );
     // ...and then the armed prompt's own followup arrives and bumps again.
     await postMessages(proxy.port, followupTurn("turn two"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
     // The followup bump cleared the agent's route (new epoch) but kept its
-    // spent mark: the next agent miss forwards verbatim, no second compress.
+    // backoff: the next agent miss forwards verbatim, no second compress.
     const beforeMiss = blockingCalls();
     await postMessages(proxy.port, extendToolLoop(largeToolTurn("BBB"), "s1"), agent);
     const spent = messageRecords(records).at(-1);
     assert.equal(spent.routeMiss, "missing");
-    assert.equal(spent.routeRecovery.outcome, "spent");
+    assert.equal(spent.routeRecovery.outcome, "backoff");
     assert.equal(spent.turnType, "tool");
-    assert.equal(blockingCalls(), beforeMiss, "the spent lane paid nothing");
+    assert.equal(blockingCalls(), beforeMiss, "the backed-off lane paid nothing");
   } finally {
     proxy.close();
     upstream.close();
@@ -6204,14 +7962,14 @@ test("a hook-armed prompt's followup bump keeps spent lanes spent", async () => 
   }
 });
 
-test("a hookless followup bump still re-grants a spent lane's budget", async () => {
-  // Hookless embedders never fire UserPromptSubmit, so the followup bump is
-  // their only per-human-turn wipe. It must keep clearing, or a lane that
-  // spent its attempt would forward full history for the rest of the session.
+test("a hookless main followup leaves an unrelated agent lane backoff intact", async () => {
+  // A main request cannot reset recovery attempts belonging to a sub-agent.
   const upstream = await recordingUpstream();
+  // BBB (the agent lane) is an index-warming no-op: its attempt produces no
+  // prefix, which starts the lane's backoff until the next budget wipe.
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
-      ? recoveredMemory("BBB")
+      ? { messages: reqBody.messages }
       : {
           messages: [
             { role: "user", content: "compressed context " + "c".repeat(2500) },
@@ -6220,7 +7978,7 @@ test("a hookless followup bump still re-grants a spent lane's budget", async () 
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6230,19 +7988,18 @@ test("a hookless followup bump still re-grants a spent lane's budget", async () 
     // The agent lane spends its attempt; no hook ever fires.
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "noop"
     );
-    // A hookless main followup: the arm was never set, so this bump clears.
+    // A hookless main followup succeeds in its own lane.
     await postMessages(proxy.port, followupTurn("turn two"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss attempts again instead of logging "spent".
+    // The agent lane still has its own backoff.
     await postMessages(proxy.port, extendToolLoop(largeToolTurn("BBB"), "s1"), agent);
     const regranted = messageRecords(records).at(-1);
     assert.equal(regranted.routeMiss, "missing");
-    assert.equal(regranted.routeRecovery.outcome, "compressed");
-    assert.equal(regranted.routeRecovery.install, "installed");
+    assert.equal(regranted.routeRecovery.outcome, "backoff", "main activity cannot reset another lane");
   } finally {
     proxy.close();
     upstream.close();
@@ -6250,16 +8007,13 @@ test("a hookless followup bump still re-grants a spent lane's budget", async () 
   }
 });
 
-test("an identical tool-body retry is a replay: verbatim forward, route retained", async () => {
-  // A recovery-installed route's prefix IS the tool body that installed it.
-  // Claude Code retries a request whose socket died before the flush with the
-  // identical body; the empty suffix cannot ride, but this is a client retry,
-  // not a divergence — the route must survive so the next real tool turn
-  // rides instead of paying a rebuild.
+test("an identical tool-body retry reuses the compressed prefix with an empty suffix", async () => {
+  // The identical request has an empty suffix. It still reuses the validated
+  // compressed bytes rather than replaying raw history or rebuilding.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6274,17 +8028,17 @@ test("an identical tool-body retry is a replay: verbatim forward, route retained
 
     await postMessages(proxy.port, conversation, SESSION);
     const replay = messageRecords(records).at(-1);
-    assert.equal(replay.routeMiss, "replay");
-    assert.equal(replay.turnType, "tool");
+    assert.equal(replay.routeMiss, undefined);
+    assert.equal(replay.turnType, "tool-memory");
     assert.equal(
       replay.routeRecovery,
       undefined,
       "a replay neither attempts recovery nor spends budget"
     );
-    assert.match(
+    assert.doesNotMatch(
       JSON.stringify(upstream.seen.at(-1).body.messages),
       /first question/,
-      "the retry forwards verbatim"
+      "the retry must not replay the whole history"
     );
 
     // The route survived the replay: the next real tool turn rides it.
@@ -6324,7 +8078,7 @@ test("an upstream-failed recovery refunds the lane budget for the retry", async 
   });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6384,7 +8138,7 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6447,7 +8201,7 @@ test("a compress timeout arms the cooldown", async () => {
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({
       baseUrl: memtreeSrv.origin,
       apiKey: "k",
@@ -6515,7 +8269,7 @@ test("a client closed during the blocking compress refunds the lane budget", asy
     });
   });
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6620,7 +8374,7 @@ test("a mid-stream client abort logs client-aborted and refunds the lane", async
   });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6710,7 +8464,7 @@ test("a mid-stream client abort logs client-aborted and refunds the lane", async
   }
 });
 
-test("a route bookkeeping throw labels activation-error and keeps the lane spent", async () => {
+test("a route bookkeeping throw labels activation-error and backs the lane off", async () => {
   // The third no-install fate. The upstream serves the recovered forward to
   // protocol-complete and the client receives its complete answer, but route
   // bookkeeping throws at BOTH activation attempts (the protocol-complete
@@ -6725,7 +8479,7 @@ test("a route bookkeeping throw labels activation-error and keeps the lane spent
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6754,10 +8508,10 @@ test("a route bookkeeping throw labels activation-error and keeps the lane spent
     const liveCompresses = blockingCalls();
 
     // NO refund: the identical-shape retry on the same lane and epoch finds
-    // the budget still consumed. The empty lane (nothing installed → not a
-    // "replay") logs a plain missing miss, classifies "spent" — the
+    // the lane backing off (nothing was installed). The empty lane (not a
+    // "replay") logs a plain missing miss, classifies "backoff" — the
     // released reservation is what lets it reach that label at all — and
-    // forwards the original history without paying a second blocking
+    // refuses the over-budget original without paying a second blocking
     // compress.
     await postMessages(proxy.port, conversation, SESSION);
     await waitFor(() => messageRecords(records).length >= 2);
@@ -6765,17 +8519,13 @@ test("a route bookkeeping throw labels activation-error and keeps the lane spent
     assert.equal(retry.routeMiss, "missing", "the throw left no route behind");
     assert.equal(
       retry.routeRecovery.outcome,
-      "spent",
+      "backoff",
       "activation-error must not refund the lane budget"
     );
     assert.equal(retry.routeRecovery.conversationBytes, undefined);
     assert.equal(retry.turnType, "tool");
-    assert.equal(blockingCalls(), liveCompresses, "a spent skip pays nothing");
-    assert.match(
-      JSON.stringify(upstream.seen.at(-1).body.messages),
-      /first question/,
-      "the spent miss forwards the original history verbatim"
-    );
+    assert.equal(blockingCalls(), liveCompresses, "a backoff skip pays nothing");
+    assert.equal(upstream.seen.length, 1, "the backed-off over-budget retry cannot forward its whole history");
   } finally {
     proxy.close();
     upstream.close();
@@ -6783,16 +8533,11 @@ test("a route bookkeeping throw labels activation-error and keeps the lane spent
   }
 });
 
-test("a first-user main consumes the boundary wipe so a later hookless followup re-grants", async () => {
-  // Cycle-3 fix: a first-user-shaped main request is its boundary's only
-  // main arrival — no followup bump will ever come to consume the
-  // UserPromptSubmit flag. Left set, a LATER hookless main followup would
-  // read a stale "already wiped", keep its spent lanes spent, and the agent
-  // lane would forward full history across a human-turn boundary.
+test("first-user main traffic and a later followup cannot reset an agent lane", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
-      ? recoveredMemory("BBB")
+      ? { messages: reqBody.messages }
       : {
           messages: [
             { role: "user", content: "compressed context " + "c".repeat(2500) },
@@ -6801,51 +8546,40 @@ test("a first-user main consumes the boundary wipe so a later hookless followup 
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
   const agent = { ...SESSION, "x-claude-code-agent-id": "agent-first-user" };
   try {
-    // An agent lane spends its budget in the pre-boundary epoch...
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "noop"
     );
-    // ...the hook bump wipes the budget and flags the boundary as wiped...
     await armMainTurn(proxy, "typed prompt");
-    // ...and the prompt arrives FIRST-USER-shaped: single non-tool user
-    // message, no earlier real user turn, so no followup bump ever comes for
-    // this boundary. The flag must be consumed here.
     await postMessages(proxy.port, [{ role: "user", content: "typed prompt" }], SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "first-user");
 
-    // The agent spends its re-granted budget inside the new boundary.
     const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
     await postMessages(proxy.port, spentAgain, agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "backoff"
     );
 
-    // A hookless-shaped main followup (no UserPromptSubmit fired): its bump
-    // must wipe. The stale flag would have skipped the wipe here.
     await postMessages(proxy.port, followupTurn("hookless turn two"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss attempts recovery instead of logging
-    // "spent" — the exact regression the consume-once closes.
     await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
     const regranted = messageRecords(records).at(-1);
     assert.equal(regranted.routeMiss, "missing");
     assert.equal(
       regranted.routeRecovery.outcome,
-      "compressed",
-      "a stale boundary flag would have kept this lane spent"
+      "backoff",
+      "main requests cannot grant another lane fresh recovery attempts"
     );
-    assert.equal(regranted.routeRecovery.install, "installed");
   } finally {
     proxy.close();
     upstream.close();
@@ -6862,18 +8596,11 @@ test("a first-user main consumes the boundary wipe so a later hookless followup 
 // turn, which an external test cannot enter deterministically.
 // ---------------------------------------------------------------------------
 
-test("a first-user-shaped side call does not consume the boundary wipe", async () => {
-  // Cycle-4 fix: only the armed prompt itself may consume the
-  // UserPromptSubmit flag (the same prompt-text correlation
-  // hookOwnedMainFollowup uses). A CC-internal side call can arrive
-  // first-user shaped on the main key without being the armed prompt;
-  // letting it consume left the real followup bumping with keep=false — a
-  // second wipe in the same boundary, re-granting lanes spent moments
-  // earlier, the exact double-wipe keepRecoveryBudget closes.
+test("first-user side calls and prompt hooks cannot reset an agent lane", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, (reqBody) =>
     JSON.stringify(reqBody.messages).includes("BBB")
-      ? recoveredMemory("BBB")
+      ? { messages: reqBody.messages }
       : {
           messages: [
             { role: "user", content: "compressed context " + "c".repeat(2500) },
@@ -6882,7 +8609,7 @@ test("a first-user-shaped side call does not consume the boundary wipe", async (
         }
   );
   const records = [];
-  const proxy = await startProxy({
+  const proxy = await startRecoveryProxy({
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6890,51 +8617,1451 @@ test("a first-user-shaped side call does not consume the boundary wipe", async (
   const agent = { ...SESSION, "x-claude-code-agent-id": "agent-side-call" };
   const blockingCalls = () => memtreeSrv.calls.filter((c) => !c.index_only).length;
   try {
-    // An agent lane spends its budget in the pre-boundary epoch...
     await postMessages(proxy.port, largeToolTurn("BBB"), agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "noop"
     );
-    // ...the hook bump wipes the budget and flags the boundary as wiped...
     await armMainTurn(proxy, "typed prompt");
-    // ...and a CC-internal side call arrives first-user shaped on the main
-    // key WITHOUT carrying the armed prompt. It forwards normally, but the
-    // armed prompt's own arrival is still due — the flag must survive it.
     await postMessages(proxy.port, [{ role: "user", content: "quota check" }], SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "first-user");
 
-    // The agent spends its re-granted budget inside the new boundary.
     const spentAgain = extendToolLoop(largeToolTurn("BBB"), "b1");
     await postMessages(proxy.port, spentAgain, agent);
     assert.equal(
-      messageRecords(records).at(-1).routeRecovery.install,
-      "installed"
+      messageRecords(records).at(-1).routeRecovery.outcome,
+      "backoff"
     );
 
-    // The REAL armed prompt arrives as its hook-owned followup. Its bump must
-    // read the still-set flag and keep spent lanes spent — under the old
-    // uncorrelated consume, the side call already cleared it and this bump
-    // wiped a second time inside the same boundary.
     await postMessages(proxy.port, followupTurn("typed prompt"), SESSION);
     assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
 
-    // The agent lane's next miss forwards verbatim, no second compress — a
-    // consumed flag would have re-granted it a fresh attempt here.
     const beforeMiss = blockingCalls();
     await postMessages(proxy.port, extendToolLoop(spentAgain, "b2"), agent);
     const spent = messageRecords(records).at(-1);
     assert.equal(spent.routeMiss, "missing");
     assert.equal(
       spent.routeRecovery.outcome,
-      "spent",
-      "a consumed flag would have let the followup re-grant this lane"
+      "backoff",
+      "main prompt accounting cannot grant another lane fresh recovery attempts"
     );
     assert.equal(spent.turnType, "tool");
-    assert.equal(blockingCalls(), beforeMiss, "the spent lane paid nothing");
+    assert.equal(blockingCalls(), beforeMiss, "the backed-off lane paid nothing");
   } finally {
     proxy.close();
     upstream.close();
     memtreeSrv.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Stable compressed prefix (edge compaction)
+// ---------------------------------------------------------------------------
+
+const EPH = { type: "ephemeral" };
+const BIG = (tag, chars = 100_000) => `${tag} ` + "x".repeat(chars);
+
+/**
+ * A MemTree server that decides like the real one: a request compresses only
+ * with a target, and only when its size (chars/4) exceeds the threshold, or
+ * the target itself when no threshold was sent. `reportsBudget: false` models
+ * a server from before `model_budget_tokens` / `compression_threshold_tokens`.
+ */
+async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop = false } = {}) {
+  let compressions = 0;
+  return mockMemtree(200, (body) => {
+    if (body.index_only) {
+      return {
+        messages: [],
+        usage: { prompt_tokens: 0, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+        index_only: true,
+      };
+    }
+    const size = Math.round(JSON.stringify(body.messages).length / 4);
+    const target = body.compression_target_tokens;
+    const threshold = reportsBudget ? body.compression_threshold_tokens ?? target : target;
+    const budget = reportsBudget ? { model_budget_tokens: modelBudget } : {};
+    if (noop || target === undefined || size <= threshold) {
+      return {
+        messages: body.messages,
+        compressed: false,
+        usage: { prompt_tokens: size, completion_tokens: size, prompt_tokens_details: { cached_tokens: 1 } },
+        ...budget,
+      };
+    }
+    compressions += 1;
+    return {
+      messages: [{ role: "user", content: `memory ${compressions} ` + "m".repeat(3_000) }],
+      compressed: true,
+      usage: { prompt_tokens: size, completion_tokens: 900, prompt_tokens_details: { cached_tokens: size } },
+      ...budget,
+    };
+  });
+}
+
+/** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
+async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
+  const bodies = [];
+  const rawBodies = [];
+  const srv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      rawBodies.push(raw.toString("utf-8"));
+      bodies.push(JSON.parse(raw.toString("utf-8")));
+      const tokens = Math.floor(raw.length / bytesPerToken);
+      const body = JSON.stringify({
+        type: "message",
+        id: "msg_upstream",
+        role: "assistant",
+        model: "claude-x",
+        content: [{ type: "text", text: "upstream answer" }],
+        stop_reason: "end_turn",
+        ...(reportUsage ? { usage: { input_tokens: 3, cache_read_input_tokens: tokens - 3, output_tokens: 1 } } : {}),
+      });
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) });
+      res.end(body);
+    });
+  });
+  return { ...srv, bodies, rawBodies };
+}
+
+async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upstreamOptions = {} } = {}) {
+  const upstream = await sizingUpstream(upstreamOptions);
+  const memtreeSrv = await edgeMemtree(memtree);
+  const records = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    ...(budget === null ? {} : { budgetTokensOverride: budget }),
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    ...proxyOpts,
+  });
+  const session = "s-edge";
+  const messageRecs = () => records.filter((r) => r.kind === "messages");
+  const post = async (messages, extraHeaders = {}, extraBody = {}) => {
+    const before = messageRecs().length;
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": session,
+        ...extraHeaders,
+      },
+      body: JSON.stringify({
+        model: "claude-x",
+        max_tokens: 64,
+        system: [{ type: "text", text: "sys", cache_control: EPH }],
+        messages,
+        ...extraBody,
+      }),
+    });
+    await res.json();
+    await waitFor(() => messageRecs().length > before);
+    return messageRecs().at(-1);
+  };
+  const command = (prompt) =>
+    postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt, session_id: session });
+  return {
+    upstream,
+    memtreeSrv,
+    records,
+    proxy,
+    post,
+    command,
+    compressCalls: () => memtreeSrv.calls.filter((c) => !c.index_only),
+    indexCalls: () => memtreeSrv.calls.filter((c) => c.index_only),
+    close: () => {
+      proxy.close();
+      upstream.close();
+      memtreeSrv.close();
+    },
+  };
+}
+
+const userText = (text) => ({ role: "user", content: [{ type: "text", text }] });
+const markedUser = (text) => ({ role: "user", content: [{ type: "text", text, cache_control: EPH }] });
+const assistantText = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
+const countMarkers = (b) =>
+  [
+    ...(Array.isArray(b.system) ? b.system : []),
+    ...b.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])),
+  ].filter((p) => p?.cache_control).length;
+
+test("edge compaction: passthrough under budget, one compaction to half at the budget, then byte-identical prefix rides until the budget is reached again", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+
+    // Under budget: passes through (the server decides; nothing to compress).
+    conv.push(assistantText("a1"), markedUser("q2"));
+    const t2 = await h.post(conv);
+    assert.equal(t2.turnType, "followup-noop");
+    assert.equal(t2.compaction.budgetTokens, 20_000);
+    assert.equal(t2.compaction.budgetSource, "override");
+    assert.equal(h.compressCalls().length, 1);
+    assert.equal(h.compressCalls()[0].compression_target_tokens, undefined, "first call: server abilities unknown");
+
+    // Crossing the budget: compress to half of it, once.
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const t3 = await h.post(conv);
+    assert.equal(t3.turnType, "followup-compressed");
+    assert.equal(t3.compaction.reason, "budget");
+    assert.equal(h.compressCalls().length, 2);
+    assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[1].compression_threshold_tokens, undefined, "calibrated budget crossing forces compression");
+    const compacted = h.upstream.bodies.at(-1);
+    assert.equal(compacted.messages.length, 1);
+    assert.deepEqual(compacted.messages[0].content[0].cache_control, EPH, "the prefix carries the cache marker");
+    const prefixLength = conv.length;
+
+    // Next human turn: no compress call, the stored prefix byte for byte, then
+    // everything after it verbatim.
+    conv[conv.length - 1] = userText(BIG("q3"));
+    conv.push(assistantText("a3"), markedUser("q4"));
+    const indexBefore = h.indexCalls().length;
+    const t4 = await h.post(conv);
+    assert.equal(t4.turnType, "followup-prefix");
+    assert.equal(t4.compress, undefined);
+    assert.equal(h.compressCalls().length, 2, "no compress call while the prefix is reused");
+    const ride = h.upstream.bodies.at(-1);
+    assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.deepEqual(ride.messages.slice(1), conv.slice(prefixLength));
+    assert.ok(countMarkers(ride) <= 4);
+    assert.ok(ride.messages[0].content[0].cache_control, "the prefix keeps its marker");
+    await waitFor(() => h.indexCalls().length > indexBefore);
+
+    // The turn's tool loop rides the same prefix bytes.
+    conv[conv.length - 1] = userText("q4");
+    conv.push(
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: EPH }] }
+    );
+    assert.equal((await h.post(conv)).turnType, "tool-memory");
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+
+    // Another human turn, still under budget: another ride, still no compress.
+    conv[conv.length - 1] = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
+    conv.push(assistantText("a4"), markedUser("q5"));
+    const t5 = await h.post(conv);
+    assert.equal(t5.turnType, "followup-prefix");
+    assert.equal(t5.compaction.sizeSource, "reported");
+    assert.ok(t5.compaction.estimatedTokens < 20_000);
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.equal(h.compressCalls().length, 2);
+
+    // Prefix + new turns reach the budget: recompress, forced to the target.
+    conv[conv.length - 1] = userText("q5");
+    conv.push(assistantText("a5"), markedUser(BIG("q6")));
+    const t6 = await h.post(conv);
+    assert.equal(t6.turnType, "followup-compressed");
+    assert.equal(t6.compaction.reason, "budget");
+    assert.ok(t6.compaction.estimatedTokens >= 20_000);
+    assert.equal(h.compressCalls().length, 3);
+    assert.equal(h.compressCalls()[2].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[2].compression_threshold_tokens, undefined);
+    const recompacted = h.upstream.bodies.at(-1);
+    assert.notEqual(JSON.stringify(recompacted.messages[0]), JSON.stringify(compacted.messages[0]));
+
+    // And the new prefix is the one reused from then on.
+    conv[conv.length - 1] = userText(BIG("q6"));
+    conv.push(assistantText("a6"), markedUser("q7"));
+    assert.equal((await h.post(conv)).turnType, "followup-prefix");
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(recompacted.messages[0]));
+    assert.equal(h.compressCalls().length, 3);
+    for (const body of h.upstream.bodies) assert.ok(countMarkers(body) <= 4, `${countMarkers(body)} markers`);
+  } finally {
+    h.close();
+  }
+});
+
+/** Drive a harness session to its first compaction; returns the conversation. */
+async function compactOnce(h) {
+  const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+  await h.post(conv);
+  conv.push(assistantText("a2"), userText(BIG("q3")));
+  const rec = await h.post(conv);
+  assert.equal(rec.turnType, "followup-compressed");
+  return conv;
+}
+
+test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses instead of riding", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    const calls = h.compressCalls().length;
+
+    // An edited earlier message: the prefix no longer stands for this history.
+    const edited = [userText("q1 (edited)"), ...conv.slice(1), assistantText("a3"), userText("q4")];
+    const miss = await h.post(edited);
+    assert.equal(miss.compaction.prefixMiss, "prefix");
+    assert.equal(miss.compaction.reason, "prefix-mismatch");
+    assert.equal(miss.turnType, "followup-compressed", "still over budget: compacted again");
+    assert.equal(h.compressCalls().length, calls + 1);
+
+    // /clear: a new, small conversation passes through again.
+    const cleared = await h.post([userText("new"), assistantText("hi"), userText("small")]);
+    assert.equal(cleared.compaction.prefixMiss, "prefix");
+    assert.equal(cleared.turnType, "followup-noop");
+    assert.equal(cleared.compaction.reason, undefined);
+    assert.equal(h.compressCalls().length, calls + 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: /memtree-compact off drops the prefix and passes through", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    assert.match((await h.command("/memtree-compact off")).body.reason, /compaction off/);
+    conv.push(assistantText("a3"), userText("q4"));
+    const off = await h.post(conv);
+    assert.equal(off.compaction.mode, "off");
+    assert.equal(off.turnType, "followup-noop", "sent whole");
+    const last = h.compressCalls().at(-1);
+    assert.equal(last.compression_target_tokens, undefined);
+    assert.equal(last.compression_threshold_tokens, undefined);
+    conv.push(assistantText("a4"), userText("q5"));
+    assert.notEqual((await h.post(conv)).turnType, "followup-prefix", "no prefix to ride");
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: CCC_COMPACT_TARGET=off (defaultCompactTarget null) starts off; /memtree-compact turns it on", async () => {
+  const h = await edgeHarness({ budget: 20_000, proxyOpts: { defaultCompactTarget: null } });
+  try {
+    // Over the 20k budget from the first turn, yet nothing forces a compaction
+    // and no stable prefix is built: the /memtree-compact off state.
+    const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2"))];
+    const first = await h.post(conv);
+    assert.equal(first.compaction.mode, "off");
+    assert.equal(first.compaction.reason, undefined);
+    assert.equal(first.turnType, "followup-noop", "sent whole");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, undefined);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+
+    // `/memtree-compact` with no N pins the automatic target (budget/2) for
+    // this session, rather than falling back to the off default.
+    assert.match((await h.command("/memtree-compact")).body.reason, /about half the budget/);
+    conv.push(assistantText("a2"), userText("q3"));
+    const manual = await h.post(conv);
+    assert.equal(manual.compaction.mode, "auto");
+    assert.equal(manual.compaction.reason, "manual");
+    assert.equal(manual.turnType, "followup-compressed");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, 10_000);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: /memtree-compact N compacts now to N, then rides", async () => {
+  const h = await edgeHarness({ budget: 100_000 });
+  try {
+    // ~37k tokens: under the 100k budget, so nothing compacts on its own.
+    const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2", 150_000))];
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    conv.push(assistantText("a2"), userText("q3"));
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+
+    assert.match((await h.command("/memtree-compact 30k")).body.reason, /about 30k tokens/);
+    conv.push(assistantText("a3"), userText("q4"));
+    const manual = await h.post(conv);
+    assert.equal(manual.turnType, "followup-compressed");
+    assert.equal(manual.compaction.reason, "manual");
+    assert.equal(manual.compaction.mode, "explicit");
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, 30_000);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined, "forced");
+
+    const calls = h.compressCalls().length;
+    conv.push(assistantText("a4"), userText("q5"));
+    const next = await h.post(conv);
+    assert.equal(next.turnType, "followup-prefix");
+    assert.equal(next.compaction.targetTokens, 30_000);
+    assert.equal(h.compressCalls().length, calls);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction on a server without model_budget_tokens: the proxy's own estimate triggers the compaction", async () => {
+  const h = await edgeHarness({ budget: 20_000, memtree: { reportsBudget: false } });
+  try {
+    const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    assert.equal(h.compressCalls()[0].compression_target_tokens, undefined);
+    conv.push(assistantText("a2"), userText(BIG("q3")));
+    const crossed = await h.post(conv);
+    assert.equal(crossed.turnType, "followup-compressed");
+    assert.equal(crossed.compaction.reason, "budget");
+    assert.ok(crossed.compaction.estimatedTokens >= 20_000);
+    assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[1].compression_threshold_tokens, undefined);
+    conv.push(assistantText("a3"), userText("q4"));
+    assert.equal((await h.post(conv)).turnType, "followup-prefix");
+    assert.equal(h.compressCalls().length, 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction budget: context window x ratio until the server reports its model budget", async () => {
+  const h = await edgeHarness({ budget: null, memtree: { modelBudget: 150_000 } });
+  try {
+    const conv = [userText("q1"), assistantText("a1"), userText("q2")];
+    const first = await h.post(conv);
+    assert.equal(first.compaction.budgetSource, "window-ratio");
+    assert.equal(first.compaction.budgetTokens, 160_000, "claude-x: 200k window x 0.8");
+    conv.push(assistantText("a2"), userText("q3"));
+    const second = await h.post(conv);
+    assert.equal(second.compaction.budgetSource, "server");
+    assert.equal(second.compaction.budgetTokens, 150_000);
+    assert.equal(second.compaction.targetTokens, 75_000);
+    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, 150_000);
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: a failed recompression rides the old prefix instead of sending the whole history", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = await compactOnce(h);
+    const compacted = h.upstream.bodies.at(-1);
+    // MemTree goes away; the next turn crosses the budget again.
+    h.memtreeSrv.server.closeAllConnections();
+    h.memtreeSrv.close();
+    conv.push(assistantText("a3"), userText(BIG("q4")));
+    const failed = await h.post(conv);
+    assert.equal(failed.turnType, "followup-prefix");
+    assert.equal(failed.compaction.reason, "budget");
+    assert.equal(failed.compaction.keptPrefix, true);
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+  } finally {
+    h.close();
+  }
+});
+
+test("edge compaction: earlier thinking that Claude Code stops replaying does not break the prefix", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const thinking = { type: "thinking", thinking: "hmm", signature: "sig" };
+    const conv = [
+      userText("q1"),
+      { role: "assistant", content: [thinking, { type: "text", text: "a1" }] },
+      userText("q2"),
+    ];
+    await h.post(conv);
+    conv.push(assistantText("a2"), userText(BIG("q3")));
+    assert.equal((await h.post(conv)).turnType, "followup-compressed");
+    const replayed = [
+      conv[0],
+      { role: "assistant", content: [{ type: "text", text: "a1" }] },
+      ...conv.slice(2),
+      assistantText("a3"),
+      userText("q4"),
+    ];
+    const next = await h.post(replayed);
+    assert.equal(next.turnType, "followup-prefix");
+    assert.equal(next.compaction.prefixMiss, undefined);
+  } finally {
+    h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tool-loop compaction: tool turns follow the human-turn budget rule
+// ---------------------------------------------------------------------------
+
+/**
+ * Append one tool call and its result (~chars/4 tokens) to `conv`, with
+ * Claude Code's cache marker moved to the newest result.
+ */
+function toolStep(conv, id, chars = 20_000) {
+  for (const m of conv) {
+    if (Array.isArray(m.content)) m.content = m.content.map(({ cache_control: _c, ...p }) => p);
+  }
+  conv.push(
+    { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: {} }] },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content: `${id} ` + "r".repeat(chars), cache_control: EPH }],
+    }
+  );
+  return conv;
+}
+
+/** Run tool turns until one is not `turnType`; returns [that record, turns taken]. */
+async function toolTurnsWhile(h, conv, turnType, check = () => {}, headers = {}) {
+  for (let n = 1; n < 50; n++) {
+    toolStep(conv, `t${conv.length}`);
+    const rec = await h.post(conv, headers);
+    if (rec.turnType !== turnType) return [rec, n];
+    check(rec);
+  }
+  throw new Error(`tool turns stayed ${turnType}`);
+}
+
+test("tool-loop compaction: a single human turn's tool loop passes through under the budget, compresses once at it, rides the prefix byte for byte, and recompresses at the next crossing", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+
+    // Under the budget: every tool turn goes out whole, with no compress call
+    // and nothing spent — the old one-shot recovery no-oped here and then
+    // forwarded every later tool turn whole past the budget.
+    const [crossed, passed] = await toolTurnsWhile(h, conv, "tool", (rec) => {
+      assert.ok(rec.compaction.estimatedTokens < 20_000);
+      assert.equal(rec.routeRecovery, undefined);
+      assert.equal(rec.compress, undefined);
+      assert.equal(h.compressCalls().length, 0, "no compress call under the budget");
+    });
+    assert.ok(passed >= 3, `${passed} turns: several tool turns passed through first`);
+
+    // Crossing: exactly one compress call, forced to half the budget.
+    assert.equal(crossed.turnType, "tool-recompressed");
+    assert.equal(crossed.compaction.reason, "budget");
+    assert.equal(crossed.compaction.sizeSource, "reported");
+    assert.equal(crossed.compaction.estimatedBytes, crossed.requestBytes, "first tool compression sizes the whole request");
+    assert.ok(crossed.compaction.estimatedTokens >= 20_000);
+    assert.equal(crossed.routeRecovery.outcome, "compressed");
+    assert.equal(crossed.routeRecovery.install, "installed");
+    assert.equal(crossed.routeRecovery.prefix, "installed");
+    assert.equal(h.compressCalls().length, 1);
+    assert.equal(h.compressCalls()[0].compression_target_tokens, 10_000);
+    assert.equal(h.compressCalls()[0].compression_threshold_tokens, undefined);
+    const compacted = h.upstream.bodies.at(-1);
+    assert.equal(compacted.messages.length, 1);
+    assert.deepEqual(compacted.messages[0].content[0].cache_control, EPH, "the prefix carries the cache marker");
+
+    // Later tool turns ride it: the same prefix bytes, no compress call.
+    const [recrossed, rides] = await toolTurnsWhile(h, conv, "tool-memory", (rec) => {
+      const body = h.upstream.bodies.at(-1);
+      assert.equal(JSON.stringify(body.messages[0]), JSON.stringify(compacted.messages[0]));
+      assert.ok(countMarkers(body) <= 4, `${countMarkers(body)} markers`);
+      assert.equal(rec.compaction.sizeSource, "reported");
+      assert.ok(rec.compaction.estimatedTokens < 20_000);
+      assert.equal(h.compressCalls().length, 1);
+    });
+    assert.ok(rides >= 2, `${rides} rides before the next crossing`);
+
+    // Prefix + suffix reach the budget: one more compression.
+    assert.equal(recrossed.turnType, "tool-recompressed");
+    assert.equal(recrossed.compaction.reason, "budget");
+    assert.equal(h.compressCalls().length, 2);
+    assert.equal(h.compressCalls()[1].compression_target_tokens, 10_000);
+    const recompacted = h.upstream.bodies.at(-1);
+    assert.notEqual(JSON.stringify(recompacted.messages[0]), JSON.stringify(compacted.messages[0]));
+
+    toolStep(conv, "after");
+    assert.equal((await h.post(conv)).turnType, "tool-memory");
+    assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(recompacted.messages[0]));
+    for (const body of h.upstream.bodies) assert.ok(countMarkers(body) <= 4, `${countMarkers(body)} markers`);
+  } finally {
+    h.close();
+  }
+});
+
+test("tool-loop compaction: a human turn after a tool-turn compaction rides the same prefix", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    const [crossed] = await toolTurnsWhile(h, conv, "tool");
+    assert.equal(crossed.turnType, "tool-recompressed");
+    const compacted = h.upstream.bodies.at(-1);
+    const calls = h.compressCalls().length;
+
+    toolStep(conv, "t-last", 100);
+    conv.push(assistantText("done"), markedUser("q2"));
+    const human = await h.post(conv);
+    assert.equal(human.turnType, "followup-prefix");
+    assert.equal(human.compress, undefined);
+    assert.equal(h.compressCalls().length, calls, "no compress call");
+    const ride = h.upstream.bodies.at(-1);
+    assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.ok(ride.messages[0].content[0].cache_control, "the prefix keeps its marker");
+    assert.ok(countMarkers(ride) <= 4);
+  } finally {
+    h.close();
+  }
+});
+
+const taskNotification = (text) => ({
+  role: "system",
+  content: `<task-notification>\n<status>failed</status>\n<summary>${text}</summary>\n</task-notification>`,
+});
+
+test("a task notification after a compacted turn rides the stable prefix instead of forwarding the whole history", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    const [crossed] = await toolTurnsWhile(h, conv, "tool");
+    assert.equal(crossed.turnType, "tool-recompressed");
+    const compacted = h.upstream.bodies.at(-1);
+    const calls = h.compressCalls().length;
+
+    // The turn ends; later a background agent's notification arrives as a
+    // trailing system block after the assistant's final reply.
+    toolStep(conv, "t-last", 100);
+    conv.push(assistantText("done"), taskNotification("agent stalled"));
+    const rec = await h.post(conv);
+    assert.equal(rec.continuation, true);
+    assert.equal(rec.turnType, "tool-memory");
+    assert.equal(rec.routeMiss, undefined, "a notification never consults or evicts the lane route");
+    assert.equal(h.compressCalls().length, calls, "under the budget: no compress call");
+    const ride = h.upstream.bodies.at(-1);
+    assert.equal(JSON.stringify(ride.messages[0]), JSON.stringify(compacted.messages[0]));
+    assert.equal(ride.messages.at(-1).role, "system", "the notification itself goes out verbatim");
+  } finally {
+    h.close();
+  }
+});
+
+test("a task notification at the budget with no stable prefix compresses instead of forwarding whole", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+    conv.push(assistantText("a".repeat(100_000)), taskNotification("agent finished"));
+    const rec = await h.post(conv);
+    assert.equal(rec.continuation, true);
+    assert.equal(rec.compaction.reason, "budget");
+    assert.equal(rec.turnType, "tool-recompressed");
+    assert.equal(h.compressCalls().length, 1);
+    assert.ok(rec.forwardedBytes < rec.requestBytes / 4, "the compressed history went upstream");
+  } finally {
+    h.close();
+  }
+});
+
+test("tool-loop compaction with a typed prompt pending (headless -p): the result becomes the stable prefix and later tool turns ride it directly", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    // The prompt's UserPromptSubmit arms the main thread; a first-user
+    // request never consumes the arm, so the whole loop runs with it set.
+    await h.command("q1");
+    const conv = [userText("q1")];
+    assert.equal((await h.post(conv)).turnType, "first-user");
+    const [crossed] = await toolTurnsWhile(h, conv, "tool");
+    assert.equal(crossed.turnType, "tool-recompressed");
+    assert.equal(crossed.routeRecovery.install, "installed", "pending accounting cannot veto a valid lane route");
+    assert.equal(crossed.routeRecovery.prefix, "installed");
+    const compacted = h.upstream.bodies.at(-1);
+
+    const [recrossed, rides] = await toolTurnsWhile(h, conv, "tool-memory", () => {
+      assert.equal(JSON.stringify(h.upstream.bodies.at(-1).messages[0]), JSON.stringify(compacted.messages[0]));
+      assert.ok(countMarkers(h.upstream.bodies.at(-1)) <= 4);
+      assert.equal(h.compressCalls().length, 1);
+    });
+    assert.ok(rides >= 2);
+    assert.equal(recrossed.turnType, "tool-recompressed");
+    assert.equal(h.compressCalls().length, 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("tool-loop compaction: disabled compaction makes no compress call and refuses over-budget tool turns", async () => {
+  for (const setup of ["env-off", "command-off", "kill-switch"]) {
+    const h = await edgeHarness({
+      budget: 20_000,
+      proxyOpts:
+        setup === "env-off"
+          ? { defaultCompactTarget: null }
+          : setup === "kill-switch"
+            ? { toolRouteRecovery: false }
+            : {},
+    });
+    try {
+      if (setup === "command-off") await h.command("/memtree-compact off");
+      const conv = [userText("q1")];
+      await h.post(conv);
+      for (let n = 0; n < 6; n++) {
+        toolStep(conv, `t${n}`);
+        const rec = await h.post(conv);
+        assert.equal(rec.turnType, "tool", setup);
+        assert.equal(rec.compress, undefined, setup);
+        if (setup === "kill-switch") assert.equal(rec.compaction, undefined);
+        else assert.equal(rec.compaction.mode, "off");
+      }
+      assert.ok(h.upstream.bodies.length < 7, "over-budget tool turns do not reach upstream");
+      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 20_000), "every forwarded original fits its budget with output reservation");
+      assert.equal(h.compressCalls().length, 0, `${setup}: no compress call`);
+    } finally {
+      h.close();
+    }
+  }
+});
+
+test("tool-loop compaction: a subagent's tool loop compresses once at the budget and rides its own route", async () => {
+  const h = await edgeHarness({ budget: 20_000 });
+  try {
+    const agent = { "x-claude-code-agent-id": "agent-long" };
+    const conv = [userText("task")];
+    assert.equal((await h.post(conv, agent)).turnType, "first-user");
+    const [crossed, passed] = await toolTurnsWhile(
+      h,
+      conv,
+      "tool",
+      () => assert.equal(h.compressCalls().length, 0),
+      agent
+    );
+    assert.ok(passed >= 3);
+    assert.equal(crossed.routeLane, "agent");
+    assert.equal(crossed.turnType, "tool-recompressed");
+    assert.equal(crossed.routeRecovery.install, "installed");
+    assert.equal(crossed.routeRecovery.prefix, undefined, "a subagent builds no session prefix");
+    const [, rides] = await toolTurnsWhile(
+      h,
+      conv,
+      "tool-memory",
+      () => assert.equal(h.compressCalls().length, 1),
+      agent
+    );
+    assert.ok(rides >= 2);
+    assert.equal(h.compressCalls().length, 2, "recompressed at the next crossing");
+  } finally {
+    h.close();
+  }
+});
+
+test("tool-loop compaction: an attempt that produces nothing backs the lane off until the history grows", async () => {
+  const h = await edgeHarness({ budget: 20_000, memtree: { noop: true } });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    let rec;
+    for (let n = 0; n < 20 && !rec?.routeRecovery; n++) {
+      toolStep(conv, `t${n}`);
+      rec = await h.post(conv);
+    }
+    assert.equal(rec.routeRecovery.outcome, "noop");
+    assert.equal(rec.turnType, "tool", "sent whole");
+    assert.equal(h.compressCalls().length, 1);
+
+    // Small growth (under a twentieth of the budget): no second call.
+    toolStep(conv, "small", 200);
+    const waiting = await h.post(conv);
+    assert.equal(waiting.routeRecovery.outcome, "backoff");
+    assert.equal(waiting.compaction.reason, "budget");
+    assert.equal(h.compressCalls().length, 1);
+
+    // Grown past it: the lane tries again.
+    toolStep(conv, "big");
+    assert.equal((await h.post(conv)).routeRecovery.outcome, "noop");
+    assert.equal(h.compressCalls().length, 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("index-only calls carry message times keyed by the reminder-stripped list sent", async () => {
+  const memtreeSrv = await mockMemtree(200, compressedOnce);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const messages = [
+    { role: "user", content: "first" },
+    { role: "user", content: "<system-reminder>only a reminder</system-reminder>" },
+    { role: "assistant", content: "answer" },
+  ];
+  let seenByTimes;
+  try {
+    memtree.indexInBackground("h-times", messages, 200_000, "session-1", undefined, (sent) => {
+      seenByTimes = sent;
+      return { [sent.findIndex((m) => m.role === "assistant")]: "2026-09-23T20:00:00.000Z" };
+    });
+    await memtree.drainBackground(5_000);
+    const call = memtreeSrv.calls.find((c) => c.index_only);
+    assert.equal(seenByTimes.length, 2, "the reminder-only message was dropped before timing");
+    assert.deepEqual(call.message_times, { 1: "2026-09-23T20:00:00.000Z" });
+    assert.equal(call.messages[1].role, "assistant");
+  } finally {
+    memtreeSrv.close();
+  }
+});
+
+test("a subagent's MemTree calls are timed from that subagent's transcript", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "compressed context " + "c".repeat(2500) }],
+    usage: { prompt_tokens_details: { cached_tokens: 123 } },
+  });
+  const asked = [];
+  const transcriptUsage = {
+    usageFor(sessionId, _messages, agentId) {
+      asked.push(["usage", sessionId, agentId]);
+      return {};
+    },
+    timesFor(sessionId, messages, agentId) {
+      asked.push(["times", sessionId, agentId]);
+      return { [messages.length - 1]: "2026-09-23T20:00:00.000Z" };
+    },
+  };
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    transcriptUsage,
+  });
+  const agent = { ...SESSION, "x-claude-code-agent-id": "agent-9" };
+  const base = followupTurn("agent turn two");
+  try {
+    await postMessages(proxy.port, base, agent);
+    await postMessages(proxy.port, extendToolLoop(base, "t1"), agent);
+    await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
+    const session = SESSION["x-claude-code-session-id"];
+    assert.ok(asked.length >= 2, JSON.stringify(asked));
+    for (const call of asked) assert.deepEqual(call.slice(1), [session, "agent-9"]);
+    for (const call of memtreeSrv.calls) {
+      assert.deepEqual(call.message_times, { [call.messages.length - 1]: "2026-09-23T20:00:00.000Z" });
+    }
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+
+test("over-budget compression exceptions return retryable errors and back off", async () => {
+  for (const lane of ["human", "tool"]) {
+    const upstream = await recordingUpstream();
+    const memtreeSrv = await mockMemtree(200, recoveredMemory());
+    const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+    const records = [];
+    const proxy = await startRecoveryProxy({ memtree, upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+    try {
+      let conv = lane === "tool" ? largeToolTurn() : followupTurn("second");
+      await postMessages(proxy.port, conv, SESSION);
+      assert.match(JSON.stringify(upstream.seen.at(-1).body.messages), /recovered memory/);
+      let throws = 0;
+      memtree.compress = async () => { throws++; throw new Error("injected compress failure"); };
+      if (lane === "tool") {
+        conv = extendToolLoop(conv);
+        conv.at(-1).content[0].content = "r".repeat(1_000_000);
+      } else {
+        conv = [...conv, { role: "assistant", content: "answer" }, { role: "user", content: "q".repeat(1_000_000) }];
+      }
+      const raw = JSON.stringify({ model: "claude-x", max_tokens: 64, system: "<cc-infinite-notice>MemTree working - conversation consolidated</cc-infinite-notice>", messages: conv }, null, 2) + "\n";
+      const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: raw });
+      assert.equal(response.status, 503, `${lane}: failed oversized recovery must be retryable`);
+      await response.text();
+      assert.equal(upstream.seen.length, 1, `${lane}: neither oversized original nor unsafe prefix reaches upstream`);
+      assert.equal(throws, 1);
+      if (lane === "tool") {
+        const next = extendToolLoop(conv, "t3");
+        await postMessages(proxy.port, next, SESSION);
+        assert.equal(throws, 1, "small tool growth preserves exception backoff");
+        assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "backoff");
+      }
+    } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
+  }
+});
+
+test("first-tree waiting expires hung probes and endless 202s, and aborts probes on shutdown", async () => {
+  for (const mode of ["hung", "building", "shutdown"]) {
+    const upstream = await recordingUpstream();
+    const records = [];
+    let gets = 0, closed = 0, calls = 0, ready = false;
+    const memtreeSrv = await listen((req, res) => {
+      if (req.method === "GET") {
+        gets++;
+        res.on("close", () => closed++);
+        res.writeHead(mode === "building" ? 202 : 200, { "content-type": "application/json" });
+        if (mode === "building") res.end(JSON.stringify({ status: "building" }));
+        else res.write("{"); // Headers arrive, but reading the body never finishes.
+        return;
+      }
+      const chunks = [];
+      req.on("data", c => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks));
+        if (!body.index_only) calls++;
+        res.writeHead(200, { "content-type": "application/json", ...pageHeaders(PAGE_URL_1) });
+        res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true, usage: {} } : ready ? withServerFlatten(recoveredMemory(), body) : { messages: body.messages, compressed: false, usage: { prompt_tokens_details: { cached_tokens: 0 } } }));
+      });
+    });
+    const proxy = await startRecoveryProxy({
+      memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+      upstreamOrigin: upstream.origin,
+      awaitedIndexProbeTimeoutMs: mode === "shutdown" ? 10_000 : 25,
+      awaitedIndexWaitTimeoutMs: 150,
+      reqlog: { log: r => records.push(structuredClone(r)) },
+    });
+    try {
+      let loop = largeToolTurn();
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(calls, 1);
+      const waitStarted = Date.now();
+      loop = extendToolLoop(loop);
+      await postMessages(proxy.port, loop, SESSION);
+      assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
+      await waitFor(() => gets === 1);
+      if (mode === "shutdown") {
+        await proxy.close();
+        await waitFor(() => closed === 1, 500);
+      } else {
+        if (mode === "hung") await waitFor(() => closed === 1, 500);
+        else await waitFor(() => Date.now() >= waitStarted + 150, 500);
+        ready = true;
+        loop = extendToolLoop(loop, "t3");
+        loop.at(-1).content[0].content = "growth".repeat(10_000);
+        await postMessages(proxy.port, loop, SESSION);
+        assert.equal(calls, 2, `${mode}: finite wait allows a fresh compress`);
+        assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "compressed");
+        assert.equal(upstream.seen.length, 1, "only the final validated compressed request reaches upstream");
+      }
+    } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
+  }
+});
+
+test("an older failed human compression cannot erase a newer stable prefix", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const held = deferred();
+  const records = [];
+  let calls = 0;
+  const good = { ...recoveredMemory(), flattened_messages: recoveredMemory().messages };
+  memtree.compress = async () => { calls++; return calls === 1 ? held.promise : good; };
+  const proxy = await startRecoveryProxy({ memtree, upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+  let older;
+  try {
+    const base = followupTurn("second");
+    older = postMessages(proxy.port, base, SESSION);
+    await waitFor(() => calls === 1);
+    const newer = [...base, { role: "assistant", content: "second answer" }, { role: "user", content: "third" }];
+    await postMessages(proxy.port, newer, SESSION);
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-compressed");
+    const prefixBytes = JSON.stringify(upstream.seen.at(-1).body.messages[0]);
+    held.resolve(null);
+    await older;
+    assert.deepEqual(upstream.seen.at(-1).body.messages, base, "failed older request still forwards its own history");
+    const latest = [...newer, { role: "assistant", content: "third answer" }, { role: "user", content: "fourth" }];
+    await postMessages(proxy.port, latest, SESSION);
+    assert.equal(calls, 2, "newest turn must reuse the winning prefix without recompressing");
+    assert.equal(messageRecords(records).at(-1).turnType, "followup-prefix");
+    assert.equal(JSON.stringify(upstream.seen.at(-1).body.messages[0]), prefixBytes);
+  } finally { held.resolve(null); await older; await proxy.close(); upstream.close(); memtreeSrv.close(); }
+});
+
+test("capture files and new or reused directories are private and exclude auth headers", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-capture-permissions-"));
+  const oldUmask = process.umask(0o022);
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  try {
+    for (const mode of ["new", "existing"]) {
+      const dir = path.join(root, mode);
+      if (mode === "existing") fs.mkdirSync(dir, { mode: 0o755 });
+      const records = [];
+      const proxy = await startProxy({ memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "memtree-secret" }), upstreamOrigin: upstream.origin, captureDir: dir, reqlog: { log: r => records.push(structuredClone(r)) } });
+      try {
+        await postMessages(proxy.port, [{ role: "user", content: "hello" }], { ...SESSION, authorization: "Bearer anthropic-secret", "x-api-key": "api-secret" });
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700, `${mode} capture directory is private`);
+        const files = fs.readdirSync(dir);
+        assert.equal(files.length, 1);
+        assert.equal(fs.statSync(path.join(dir, files[0])).mode & 0o777, 0o600);
+        const contents = fs.readFileSync(path.join(dir, files[0]), "utf8");
+        assert.deepEqual(JSON.parse(contents).messages, [{ role: "user", content: "hello" }]);
+        assert.doesNotMatch(contents + JSON.stringify(records), /anthropic-secret|api-secret|memtree-secret/);
+      } finally { await proxy.close(); }
+    }
+  } finally { process.umask(oldUmask); upstream.close(); memtreeSrv.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("model churn evicts old server budgets and safely falls back to the context ratio", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await edgeMemtree({ modelBudget: 150_000 });
+  const records = [];
+  const proxy = await startProxy({ memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }), upstreamOrigin: upstream.origin, reqlog: { log: r => records.push(structuredClone(r)) } });
+  let seq = 0;
+  const postModel = async (model) => {
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: JSON.stringify({ model, max_tokens: 64, messages: followupTurn(`question ${seq++}`) }) });
+    assert.equal(response.status, 200);
+    await response.text();
+    return messageRecords(records).at(-1);
+  };
+  try {
+    assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "window-ratio");
+    const remembered = await postModel("claude-review-0");
+    assert.equal(remembered.compaction.budgetSource, "server");
+    assert.equal(remembered.compaction.budgetTokens, 150_000);
+    for (let n = 1; n <= 20; n++) await postModel(`claude-review-${n}`);
+    const evicted = await postModel("claude-review-0");
+    assert.equal(evicted.compaction.budgetSource, "window-ratio", "old model budget is evicted after churn");
+    assert.equal(evicted.compaction.budgetTokens, 160_000);
+    assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "server", "a fresh report repopulates the evicted entry");
+  } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
+});
+
+
+test("calibrated dense input forces compaction before the server threshold", async () => {
+  const h = await edgeHarness({ upstreamOptions: { bytesPerToken: 2 } });
+  try {
+    const conv = [userText("q"), assistantText("a"), userText("warm")];
+    await h.post(conv);
+    conv.push(assistantText("a"), userText("dense ".repeat(8_000)));
+    const rec = await h.post(conv);
+    assert.equal(rec.compaction.sizeSource, "reported");
+    assert.ok(rec.compaction.estimatedTokens >= 20_000);
+    const call = h.compressCalls().at(-1);
+    assert.ok(JSON.stringify(call.messages).length / 4 < 20_000);
+    assert.equal(call.compression_threshold_tokens, undefined);
+    assert.equal(call.compression_target_tokens, 10_000);
+    assert.equal(rec.turnType, "followup-compressed");
+  } finally { h.close(); }
+});
+
+for (const reportsBudget of [true, false]) {
+  for (const lane of ["human", "tool", "prefix"]) {
+    test(`uncalibrated ${lane} budget check lets ${reportsBudget ? "threshold" : "older"} server decide`, async () => {
+      const h = await edgeHarness({ memtree: { reportsBudget }, upstreamOptions: { reportUsage: false } });
+      try {
+        const conv = [userText("q"), assistantText("a"), userText("warm")];
+        await h.post(conv);
+        if (lane === "prefix") {
+          await h.command("/memtree-compact");
+          conv.push(assistantText("a"), userText(BIG("manual")));
+          assert.equal((await h.post(conv)).turnType, "followup-compressed");
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined, "manual remains explicit");
+        }
+        if (lane === "tool") toolStep(conv, "large", 100_000);
+        else conv.push(assistantText("a"), userText(BIG("cross")));
+        const rec = await h.post(conv);
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.ok(rec.compaction.estimatedTokens >= 20_000);
+        const call = h.compressCalls().at(-1);
+        assert.equal(call.compression_threshold_tokens, reportsBudget ? 20_000 : undefined);
+        assert.equal(call.compression_target_tokens, reportsBudget ? 10_000 : undefined);
+      } finally { h.close(); }
+    });
+  }
+}
+
+test("a bytes-only window alarm does not force below the calibrated budget and window", async () => {
+  const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 10 } });
+  try {
+    await h.post([userText("q"), assistantText("a"), userText("calibration ".repeat(50_000))]);
+    const conv = [userText("q"), assistantText("a"), userText("x".repeat(900_000))];
+    await h.post(conv);
+    toolStep(conv, "small", 10);
+    const rec = await h.post(conv);
+    assert.equal(rec.compaction.sizeSource, "reported");
+    assert.ok(rec.compaction.estimatedTokens < 160_000);
+    assert.ok(rec.requestBytes / 4 > 200_000);
+    const call = h.compressCalls().at(-1);
+    assert.equal(call.compression_target_tokens, 80_000);
+    assert.equal(call.compression_threshold_tokens, 160_000);
+  } finally { h.close(); }
+});
+
+for (const reportUsage of [false, true]) {
+  test(`recompaction totals use the old prefix size basis ${reportUsage ? "with" : "without"} Anthropic usage`, async () => {
+    const { compressedTotalsText } = await import("../dist/notices.js");
+    const h = await edgeHarness({ upstreamOptions: { reportUsage } });
+    try {
+      const conv = await compactOnce(h);
+      const oldBody = structuredClone(h.upstream.bodies.at(-1));
+      const suffix = [assistantText(BIG("answer")), userText("recompact")];
+      conv.push(...suffix);
+      const expectedBytes = Buffer.byteLength(JSON.stringify({ ...oldBody, messages: [...oldBody.messages, ...suffix] }));
+      await h.command("recompact");
+      const rec = await h.post(conv);
+      assert.equal(rec.turnType, "followup-compressed");
+      assert.ok(rec.requestBytes > expectedBytes * 1.5, "raw history is much larger than the old prefix ride");
+      const expectedAfter = reportUsage
+        ? rec.usage.input_tokens + rec.usage.cache_read_input_tokens
+        : Math.round(rec.compaction.estimatedTokens * rec.forwardedBytes / expectedBytes);
+      const notice = await postHook(h.proxy, displayHook({ session_id: "s-edge" }));
+      assert.equal(notice.status, 200);
+      const text = stripAnsi(notice.body.hookSpecificOutput.displayContent);
+      assert.ok(text.includes(compressedTotalsText(rec.compaction.estimatedTokens, expectedAfter)), text);
+      assert.equal(rec.compaction.estimatedBytes, expectedBytes);
+    } finally { h.close(); }
+  });
+}
+
+
+for (const reportUsage of [true, false]) {
+  test(`human output reservation ${reportUsage ? "forces with calibrated usage" : "does not force from bytes alone"}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { reportUsage } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("")];
+      const shape = { model: "claude-x", max_tokens: 64, system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv };
+      const padding = 600_268 - Buffer.byteLength(JSON.stringify(shape));
+      conv.at(-1).content[0].text = "x".repeat(padding);
+      const warm = await h.post(conv);
+      assert.equal(warm.requestBytes, 600_268);
+      assert.equal(warm.turnType, "followup-noop");
+      if (reportUsage) assert.equal(warm.usage.input_tokens + warm.usage.cache_read_input_tokens, 150_067);
+      // The larger output reservation adds three bytes. Keep total request
+      // bytes unchanged so the calibrated next input estimate is exact.
+      conv.at(-1).content[0].text = "x".repeat(padding - 3);
+      const rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.equal(rec.requestBytes, 600_268);
+      assert.equal(rec.compaction.estimatedTokens, 150_067);
+      assert.equal(rec.compaction.sizeSource, reportUsage ? "reported" : "bytes");
+      assert.ok(150_067 < 160_000 && 150_067 + 64_000 > 200_000);
+      const call = h.compressCalls().at(-1);
+      assert.equal(h.compressCalls().length, 2);
+      assert.equal(call.compression_target_tokens, 80_000);
+      assert.equal(call.compression_threshold_tokens, reportUsage ? undefined : 160_000);
+      assert.equal(rec.turnType, reportUsage ? "followup-compressed" : "followup-noop");
+      if (reportUsage) assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000);
+    } finally { h.close(); }
+  });
+}
+
+for (const mode of ["compress", "failure", "uncalibrated"]) {
+  test(`human prefix output reservation: ${mode}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
+      await h.post(conv);
+      await h.command("/memtree-compact");
+      conv.push(assistantText("a"), userText("compact"));
+      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      const calls = h.compressCalls().length;
+      const upstreamCount = h.upstream.bodies.length;
+      if (mode === "failure") {
+        h.memtreeSrv.server.closeAllConnections();
+        h.memtreeSrv.close();
+      }
+      conv.push(assistantText("a"), userText("y".repeat(290_000)));
+      const rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "transport estimate fits");
+      if (mode === "uncalibrated") {
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.equal(rec.turnType, "followup-prefix");
+        assert.equal(h.compressCalls().length, calls, "bytes alone do not force");
+      } else {
+        assert.equal(rec.compaction.sizeSource, "reported");
+        assert.ok(rec.compaction.estimatedTokens < 160_000);
+        assert.ok(rec.compaction.estimatedTokens + 64_000 > 200_000);
+        if (mode === "failure") {
+          assert.equal(rec.compress.ok, false, "attempted compression");
+          assert.equal(rec.turnType, "followup-degraded");
+          assert.equal(rec.forwardedBytes, 0, "unsafe prefix is not retained as fallback");
+          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+        } else {
+          assert.equal(h.compressCalls().length, calls + 1);
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+          assert.equal(rec.turnType, "followup-compressed");
+          assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
+        }
+      }
+    } finally { h.close(); }
+  });
+}
+
+for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
+  test(`tool prefix output reservation: ${mode}`, async () => {
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
+    try {
+      const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
+      await h.post(conv);
+      await h.command("/memtree-compact");
+      conv.push(assistantText("a"), userText("compact"));
+      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      const calls = h.compressCalls().length;
+      const upstreamCount = h.upstream.bodies.length;
+      if (mode === "failure" || mode === "backoff") {
+        h.memtreeSrv.server.closeAllConnections();
+        h.memtreeSrv.close();
+      }
+      toolStep(conv, "dense", 290_000);
+      let rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "bytes estimate fits");
+      if (mode === "uncalibrated") {
+        assert.equal(rec.compaction.sizeSource, "bytes");
+        assert.equal(h.compressCalls().length, calls, "uncalibrated estimate never forces");
+        assert.match(rec.turnType, /^tool-(memory|prefix)$/);
+      } else {
+        assert.equal(rec.compaction.sizeSource, "reported");
+        assert.ok(rec.compaction.estimatedTokens < 160_000);
+        assert.ok(rec.compaction.estimatedTokens + 64_000 > 200_000);
+        if (mode === "compress") {
+          assert.equal(h.compressCalls().length, calls + 1);
+          assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
+          assert.equal(rec.routeRecovery.outcome, "compressed");
+          assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
+        } else {
+          assert.equal(rec.compress.ok, false);
+          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+          if (mode === "backoff") {
+            toolStep(conv, "next", 10);
+            const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
+              system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv }, null, 2);
+            const count = messageRecords(h.records).length;
+            const res = await fetch(`http://127.0.0.1:${h.proxy.port}/v1/messages`, {
+              method: "POST", headers: { "content-type": "application/json", "x-claude-code-session-id": "s-edge" }, body: original,
+            });
+            await res.json();
+            await waitFor(() => messageRecords(h.records).length > count);
+            rec = messageRecords(h.records).at(-1);
+            assert.equal(rec.routeRecovery.outcome, "backoff");
+            assert.equal(rec.turnType, "tool");
+            assert.equal(res.status, 503, "backoff retains retryability within its bounded allowance");
+            assert.equal(h.upstream.bodies.length, upstreamCount, "backoff cannot forward an oversized original");
+          }
+        }
+      }
+    } finally { h.close(); }
+  });
+}
+
+
+test("concurrent session pages and late completions are ordered within each session, even with links off", async () => {
+  const upstream = await mockUpstream();
+  const pending = new Map();
+  const memtreeSrv = await listenMemtree((req, res) => {
+    req.on("end", () => {
+      const session = req.headers["x-claude-code-session-id"];
+      const queue = pending.get(session) ?? [];
+      queue.push((id) => {
+        res.writeHead(200, { "content-type": "application/json", ...pageHeaders(`https://app.polychat.co/m/${id}`, id) });
+        res.end(JSON.stringify(compressedOnce));
+      });
+      pending.set(session, queue);
+    });
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    memtreeLinkPlacement: "off",
+  });
+  const get = (session) => fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${session}`);
+  const waitFor = async (session, count) => {
+    for (let n = 0; n < 500 && (pending.get(session)?.length ?? 0) < count; n++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(pending.get(session)?.length, count);
+  };
+  const requests = [];
+  try {
+    const launch = async (session, prompt, count) => {
+      await postHook(proxy, { hook_event_name: "UserPromptSubmit", session_id: session, prompt, prompt_id: prompt });
+      const request = postMessages(proxy.port, followupTurn(prompt), { "x-claude-code-session-id": session });
+      requests.push(request);
+      await waitFor(session, count);
+    };
+    await launch("a", "a old", 1);
+    await launch("b", "b new", 1);
+    await launch("a", "a new", 2);
+    pending.get("b")[0]("bbbb22");
+    await requests[1];
+    pending.get("a")[1]("aaaa22");
+    await requests[2];
+    pending.get("a")[0]("aaaa11");
+    await requests[0];
+    assert.equal((await (await get("a")).json()).id, "aaaa22", "old A cannot replace newer A");
+    assert.equal((await (await get("b")).json()).id, "bbbb22", "A cannot replace concurrent B");
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "clear", session_id: "c" });
+    assert.equal((await get("c")).status, 404);
+    assert.equal((await (await get("a")).json()).id, "aaaa22");
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "resume", session_id: "b" });
+    assert.equal((await (await get("b")).json()).id, "bbbb22");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+for (const outcome of ["noop", "exception", "compressed"]) {
+  test(`recovery uses API validation despite pending prompts after ${outcome}`, async () => {
+    const seen = [];
+    const upstream = await listen((req, res) => {
+      const chunks = []; req.on("data", c => chunks.push(c));
+      req.on("end", () => { seen.push(Buffer.concat(chunks).toString());
+        res.writeHead(200, { "content-type": "application/json" }); res.end(UPSTREAM_BODY); });
+    });
+    let calls = 0;
+    const server = await mockMemtree(200, request => {
+      if (request.index_only) return {};
+      calls++;
+      return calls === 1 || outcome === "compressed"
+        ? { messages: [{ role: "user", content: "compressed context" }], usage: { prompt_tokens_details: { cached_tokens: 123 } }, model_budget_tokens: 20000 }
+        : { messages: request.messages, model_budget_tokens: 20000 };
+    });
+    const memtree = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+    try {
+      await armMainTurn(proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(proxy.port, base);
+      await armMainTurn(proxy, "pending owner", "pending");
+      if (outcome === "exception") memtree.compress = async () => { throw new Error("pipeline failure"); };
+      const divergent = withToolRound([{ role: "user", content: "different history" }, ...base.slice(1)], "large");
+      divergent.at(-1).content[0].content = "X".repeat(800000);
+      const result = await postSessionMessages(proxy.port, divergent);
+      if (outcome !== "compressed") {
+        assert.equal(result.type, "error");
+        assert.equal(seen.length, 1, "an over-budget original cannot be forwarded when rebuilding fails");
+      }
+      await postSessionMessages(proxy.port, withToolRound(outcome === "compressed" ? divergent : base, "original-route"));
+      assert.match(seen.at(-1), /compressed context/);
+      assert.doesNotMatch(seen.at(-1), /first question|different history/);
+    } finally { proxy.close(); server.close(); upstream.close(); }
+  });
+}
+
+test("recovered routes accept separately delivered prompts independently of accounting", async () => {
+  const h = await startMidTurnHarness();
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    await armMainTurn(h.proxy, "still queued", "later");
+    const large = withToolRound(base, "large", [{ type: "text", text: "pending owner" }]);
+    large.at(-1).content[0].content = "X".repeat(800000);
+    await postSessionMessages(h.proxy.port, large);
+    assert.equal(h.compressCalls(), 2, "the wrapper reaches recovery");
+    await armMainTurn(h.proxy, "pending owner", "new-owner");
+    let messages = [...large, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    messages = [...messages, { role: "assistant", content: "done" }, { role: "user", content: "still queued" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, messages)).type, "error");
+    assert.equal(h.compressCalls(), 2, "both plain prompts reuse the recovered prefix");
+  } finally { h.close(); }
+});
+
+for (const outcome of ["noop", "compressed"]) {
+  test(`hooks arriving during ${outcome} compression cannot change route eligibility`, async () => {
+    const h = await startMidTurnHarness();
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    try {
+      await armMainTurn(h.proxy, "turn two", "two");
+      const base = followupTurn("turn two");
+      await postSessionMessages(h.proxy.port, base);
+      const original = h.memtree.compress.bind(h.memtree);
+      h.memtree.compress = async (...args) => {
+        started(); await blocked;
+        return outcome === "noop" ? null : original(...args);
+      };
+      const large = withToolRound(base, "large", [{ type: "text", text: "arrived later" }]);
+      large.at(-1).content[0].content = "X".repeat(800000);
+      const pending = postSessionMessages(h.proxy.port, large);
+      await entered;
+      await armMainTurn(h.proxy, "arrived later", "new-hook");
+      release();
+      const response = await pending;
+      if (outcome === "noop") {
+        assert.equal(response.type, "error");
+        assert.equal(h.upstreamCount(), 1, "an over-budget original cannot pass through regardless of the hook");
+      }
+      await postSessionMessages(h.proxy.port, withToolRound(outcome === "compressed" ? large : base, "original-route"));
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+      h.memtree.compress = original;
+      const separatelyDelivered = [...(outcome === "compressed" ? large : base), { role: "assistant", content: "done" },
+        { role: "user", content: "arrived later" }];
+      assert.notEqual((await postSessionMessages(h.proxy.port, separatelyDelivered)).type, "error",
+        "a separately delivered fitting prompt never depends on hook ownership");
+    } finally { release(); h.close(); }
+  });
+}
+
+for (const recover of [false, true]) {
+  for (const longer of ["pending owner extended", "extended pending owner"]) {
+    test(`overlapping prompt text cannot block routing (${recover ? "recovery" : "ordinary"}, ${longer})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, "pending owner", "short");
+        await armMainTurn(h.proxy, longer, "long");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text", text: longer }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        assert.match(h.lastUpstream(), /compressed context/);
+        assert.doesNotMatch(h.lastUpstream(), /first question/);
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "pending owner" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error",
+          "a shorter later prompt still reuses validated history");
+        assert.equal(h.compressCalls(), recover ? 2 : 1, "overlapping accounting does not force recompression");
+      } finally { h.close(); }
+    });
+  }
+
+  for (const firstText of [" same prompt ", " same\n prompt <system-reminder>hook context</system-reminder>"]) {
+    test(`normalized duplicate prompts cannot block routing (${recover ? "recovery" : "ordinary"}, ${JSON.stringify(firstText)})`, async () => {
+      const h = await startMidTurnHarness(recover ? {} : { defaultCompactTarget: null });
+      try {
+        await armMainTurn(h.proxy, "turn two", "two");
+        const base = followupTurn("turn two");
+        await postSessionMessages(h.proxy.port, base);
+        await armMainTurn(h.proxy, firstText, "first");
+        await armMainTurn(h.proxy, "same prompt", "second");
+        const wrapper = withToolRound(base, "delivery", [{ type: "text",
+          text: "<system-reminder>ambient context</system-reminder> same\t prompt  " },
+          { type: "text", text: "same prompt" }]);
+        if (recover) wrapper.at(-1).content[0].content = "X".repeat(800000);
+        assert.notEqual((await postSessionMessages(h.proxy.port, wrapper)).type, "error");
+        const next = [...wrapper, { role: "assistant", content: "done" },
+          { role: "user", content: "same prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+        await armMainTurn(h.proxy, "same\n prompt", "third");
+        const again = [...next, { role: "assistant", content: "done" },
+          { role: "user", content: "same\n prompt" }];
+        assert.notEqual((await postSessionMessages(h.proxy.port, again)).type, "error",
+          "duplicate normalized accounting never blocks a new API request");
+        assert.equal(h.compressCalls(), recover ? 2 : 1, "duplicate accounting does not force recompression");
+      } finally { h.close(); }
+    });
+  }
+}
+
+test("reminder-only delivery cannot block a later plain request", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  try {
+    await armMainTurn(h.proxy, "turn two", "two");
+    const base = followupTurn("turn two");
+    await postSessionMessages(h.proxy.port, base);
+    await armMainTurn(h.proxy, "pending owner", "pending");
+    const wrapper = withToolRound(base, "delivery", [{ type: "text", text: midTurnReminder("pending owner") }]);
+    await postSessionMessages(h.proxy.port, wrapper);
+    const next = [...wrapper, { role: "assistant", content: "done" }, { role: "user", content: "pending owner" }];
+    assert.notEqual((await postSessionMessages(h.proxy.port, next)).type, "error");
+    assert.equal(h.compressCalls(), 1, "unresolved reminder accounting cannot block prefix reuse");
+  } finally { h.close(); }
+});
+
+test("route eligibility survives 40 reminder-only deliveries and overlapping plain prompts", async () => {
+  const h = await startMidTurnHarness({ defaultCompactTarget: null });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    const base = followupTurn("turn two");
+    await postMessages(h.proxy.port, base, headers);
+    let messages = base;
+    for (let i = 0; i < 40; i++) {
+      await armMainTurn(h.proxy, `queued ${i}`, `queued-${i}`);
+      messages = withToolRound(messages, `round-${i}`, [{ type: "text", text: midTurnReminder(`queued ${i}`) }]);
+      await postMessages(h.proxy.port, messages, headers);
+      assert.match(h.lastUpstream(), /compressed context/);
+      assert.doesNotMatch(h.lastUpstream(), /first question/);
+    }
+    await armMainTurn(h.proxy, "pending owner", "short");
+    await armMainTurn(h.proxy, "pending owner extended", "long");
+    const before = h.upstreamCount();
+    await postMessages(h.proxy.port, [...messages, { role: "assistant", content: "done" }, { role: "user", content: "pending owner extended" }], headers);
+    assert.equal(h.upstreamCount(), before + 1, "unresolved accounting never vetoes an API request");
+    assert.match(h.lastUpstream(), /compressed context/);
+    assert.doesNotMatch(h.lastUpstream(), /first question/);
+  } finally { h.close(); }
 });
