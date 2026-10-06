@@ -1549,12 +1549,14 @@ async function handleMessages(
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
   // The main lane's latest conversation: what its final index sends, plus the
   // reply the session ends with (scheduleFinalIndex, on Stop).
-  if (isMainRequest) {
-    opts.memtree.noteMainConversation(requestSessionId(req), {
+  const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
+  if (mainSessionId !== undefined) {
+    opts.memtree.noteMainConversation(mainSessionId, {
       messages: msgsForMemtree,
       modelContextLimit,
       clientMeta,
-      messageTimesFor: transcriptTimesFor(opts, requestSessionId(req)),
+      messageTimesFor: transcriptTimesFor(opts, mainSessionId),
+      readReply: () => opts.transcriptUsage?.finalReply?.(mainSessionId),
     });
   }
 

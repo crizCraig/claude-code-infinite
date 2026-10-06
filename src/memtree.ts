@@ -47,6 +47,8 @@ const DEDUPE_CACHE_MAX = 64;
  * pauses spend the server's once-per-30-minutes final index mid-session.
  */
 export const FINAL_INDEX_IDLE_MS = 10 * 60_000;
+/** Sessions finalized at exit at most (newest first), inside the 2 s drain. */
+export const FINAL_INDEX_EXIT_SESSIONS = 3;
 
 export interface MemtreeOptions {
   baseUrl: string;
@@ -1090,9 +1092,22 @@ export class MemtreeClient {
     this.pendingFinals.set(sessionId, { timer, readReply });
   }
 
-  /** At shutdown, before drainBackground: send every pending final index now. */
+  /**
+   * At shutdown, before drainBackground: send every pending final index now,
+   * and one for each of the most recent sessions that never had a Stop (`-p`
+   * and non-TTY runs install no hooks). Never throws: a failure here must not
+   * change ccc's exit code. The calls share drainBackground's bounded wait.
+   */
   flushFinalIndexes(): void {
-    for (const sessionId of [...this.pendingFinals.keys()]) this.fireFinalIndex(sessionId);
+    const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS);
+    const sessions = new Set([...this.pendingFinals.keys(), ...recent]);
+    for (const sessionId of sessions) {
+      try {
+        this.fireFinalIndex(sessionId, true);
+      } catch (err) {
+        this.log(`final index at exit failed (ignored): ${(err as Error)?.message ?? err}`);
+      }
+    }
   }
 
   private cancelFinalIndex(sessionId: string): void {
@@ -1101,12 +1116,19 @@ export class MemtreeClient {
     this.pendingFinals.delete(sessionId);
   }
 
-  private fireFinalIndex(sessionId: string): void {
+  private fireFinalIndex(sessionId: string, atExit = false): void {
     const pending = this.pendingFinals.get(sessionId);
     this.cancelFinalIndex(sessionId);
     const conversation = this.mainConversations.get(sessionId);
-    if (!pending || !conversation || this.backgroundClosing) return;
-    const messages = withFinalReply(conversation.messages, pending.readReply());
+    if ((!pending && !atExit) || !conversation || this.backgroundClosing) return;
+    const readReply = pending?.readReply ?? conversation.readReply;
+    let reply: Message | undefined;
+    try {
+      reply = readReply?.();
+    } catch {
+      reply = undefined; // no transcript reply: the conversation alone still indexes
+    }
+    const messages = withFinalReply(conversation.messages, reply);
     const key = MemtreeClient.hashMessages(messages);
     if (this.finalIndexed.get(sessionId) === key) return;
     this.finalIndexed.set(sessionId, key);
@@ -1434,6 +1456,8 @@ export interface MainConversation {
   modelContextLimit: number;
   clientMeta?: Record<string, string>;
   messageTimesFor?: (messages: Message[]) => MessageTimes;
+  /** The reply the session ended with (Claude Code's transcript), for a final index at exit. */
+  readReply?: () => Message | undefined;
 }
 
 /** The conversation plus the reply that ended it, unless it already ends with a reply. */

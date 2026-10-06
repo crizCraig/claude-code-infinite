@@ -152,9 +152,9 @@ test("the final index sends the session's conversation plus its last reply, once
     assert.equal(fixture.calls.length, 0, "no main conversation recorded: nothing to finalize");
 
     client.noteMainConversation("s1", { messages: turn, modelContextLimit: 100 });
-    client.scheduleFinalIndex("s1", readReply, 60_000);
+    client.scheduleFinalIndex("s1", readReply, 5);
     client.noteMainConversation("s1", { messages: turn, modelContextLimit: 100 });
-    client.flushFinalIndexes();
+    await new Promise((r) => setTimeout(r, 20));
     assert.equal(fixture.calls.length, 0, "a new request cancels the pending final index");
     assert.equal(reads, 0, "the transcript is read only when the call goes out");
 
@@ -188,6 +188,57 @@ test("the final index goes out at exit and is not repeated for the same conversa
     assert.equal(fixture.calls.length, 1, "draining: no new final index");
   } finally {
     await fixture.close();
+  }
+});
+
+test("exit sends the final index for a session that never had a Stop (-p, no hooks)", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const reply = { role: "assistant", content: [{ type: "text", text: "print-mode answer" }] };
+    client.noteMainConversation("p1", {
+      messages: [{ role: "user", content: "one-shot prompt" }], modelContextLimit: 100,
+      readReply: () => reply,
+    });
+    client.flushFinalIndexes();
+    assert.equal(await client.drainBackground(1_000), true);
+    assert.equal(fixture.calls.length, 1, "exit finalizes the session without a Stop hook");
+    assert.equal(fixture.calls[0].final_index, true);
+    assert.deepEqual(fixture.calls[0].messages.at(-1), reply);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("final indexes at exit stay inside the 2 s drain and never throw (memtree-bench runs -p)", async () => {
+  const hung = await memtreeFixture({ hold: true });
+  try {
+    const client = new MemtreeClient({ baseUrl: hung.origin, apiKey: "k" });
+    client.noteMainConversation("p2", {
+      messages: [{ role: "user", content: "bench arm" }], modelContextLimit: 100,
+      readReply: () => { throw new Error("transcript unreadable"); },
+    });
+    assert.doesNotThrow(() => client.flushFinalIndexes(), "a bad transcript never breaks exit");
+    const started = Date.now();
+    assert.equal(await client.drainBackground(2_000), false, "a hung server is aborted");
+    assert.ok(Date.now() - started < 2_500, `drain took ${Date.now() - started} ms`);
+    assert.equal(hung.calls.length, 1, "sent without a reply when the transcript fails");
+  } finally {
+    hung.release();
+    await hung.close();
+  }
+  const failing = await memtreeFixture({ status: 500 });
+  try {
+    const client = new MemtreeClient({ baseUrl: failing.origin, apiKey: "k" });
+    for (const id of ["s1", "s2", "s3", "s4"]) {
+      client.noteMainConversation(id, { messages: [{ role: "user", content: id }], modelContextLimit: 100 });
+    }
+    client.flushFinalIndexes();
+    assert.equal(await client.drainBackground(2_000), true, "a 500 is logged and ignored");
+    assert.deepEqual(failing.calls.map((c) => c.messages[0].content).sort(), ["s2", "s3", "s4"],
+      "only the most recent sessions are finalized at exit");
+  } finally {
+    await failing.close();
   }
 });
 

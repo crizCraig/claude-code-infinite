@@ -27,6 +27,8 @@ export declare const CLIENT_VERSION: string;
  * pauses spend the server's once-per-30-minutes final index mid-session.
  */
 export declare const FINAL_INDEX_IDLE_MS: number;
+/** Sessions finalized at exit at most (newest first), inside the 2 s drain. */
+export declare const FINAL_INDEX_EXIT_SESSIONS = 3;
 export interface MemtreeOptions {
     baseUrl: string;
     apiKey: string;
@@ -347,7 +349,12 @@ export declare class MemtreeClient {
      * it from the transcript when the call goes out, not inside the hook.
      */
     scheduleFinalIndex(sessionId: string | undefined, readReply: () => Message | undefined, delayMs?: number): void;
-    /** At shutdown, before drainBackground: send every pending final index now. */
+    /**
+     * At shutdown, before drainBackground: send every pending final index now,
+     * and one for each of the most recent sessions that never had a Stop (`-p`
+     * and non-TTY runs install no hooks). Never throws: a failure here must not
+     * change ccc's exit code. The calls share drainBackground's bounded wait.
+     */
     flushFinalIndexes(): void;
     private cancelFinalIndex;
     private fireFinalIndex;
@@ -370,6 +377,8 @@ export interface MainConversation {
     modelContextLimit: number;
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
+    /** The reply the session ended with (Claude Code's transcript), for a final index at exit. */
+    readReply?: () => Message | undefined;
 }
 /** The conversation plus the reply that ended it, unless it already ends with a reply. */
 export declare function withFinalReply(messages: Message[], reply: Message | undefined): Message[];
