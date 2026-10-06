@@ -134,3 +134,47 @@ sample replacement; explicit-threshold cache crossings remain distinct.
 major refactor was implemented. The three behavior-changing test updates were
 explicitly approved. ccc is **not ready to merge** until these two findings are
 resolved. The server remains **ready to merge independently** and unchanged.
+
+## Approved cycle 4 fixes and source audit
+
+Both cycle 4 findings were approved and fixed in `96f2b44`, with failing
+regressions first. History-valid agent tool routes, agent followup routes, and
+away-summary forks now reach request-local sizing before any size-based choice.
+Their early byte-only exclusions were removed. Compression planning still
+responds to native-window pressure, while structural checks exclude superseded
+routes. Unknown comparison budgets now distinguish absent and differing token
+hints in compression keys; known budgets retain the threshold-bit optimization.
+
+Five new regressions pass, with every existing test assertion unchanged.
+`npm test` passed **541/541** both with `NO_COLOR` unset and with `NO_COLOR=1`.
+A further fresh build left committed `dist/` unchanged.
+
+The requested exhaustive source audit is in
+[2026-10-06-sizing-path-audit.md](2026-10-06-sizing-path-audit.md). It lists
+candidate exclusions, body-size choices, native-window refusal, 400/413/503
+paths, and `fitsFallbackBudget` and related helpers, identifying central sizing
+delegation or the reason each independent check exists.
+
+The audit confirmed one additional major issue, reported for approval:
+`recoverLateCount` (`src/proxy.ts:4620`) drops a structurally valid replacement
+before registration if its serialized bytes increase. A 200 KB ride counted at
+210k can be replaced by a 250 KB body that would count at 120k and fit the 200k
+window, but the guard drops it uncounted. With the original counted at 300k, the
+request receives 503. The proposed correction is to register and centrally
+measure/select the valid late replacement regardless of byte growth. This issue
+is not fixed without approval.
+
+## Fresh review cycle 5
+
+Two independent whole-diff reviews of `main..96f2b44` found **no additional major
+or minor issues** beyond the known late-recovery guard. They confirmed both
+approved fixes, selected-body usage attribution, route-installation safeguards,
+and the source audit's coverage. An additional 82 focused counting, sizing,
+cache and proxy tests passed during review; no live API calls were made.
+
+**Current totals after five cycles and the source audit:** 14 findings
+(11 major, 3 minor), 13 fixed (10 major, 3 minor), one major awaiting approval.
+The request-local refactor is implemented. ccc remains **not ready to merge**
+because of the remaining known refusal path. The server remains **ready to merge
+independently**, clean and unchanged at `d8bbdf7`. OAuth acceptance remains the
+separate pre-publish live check described above.
