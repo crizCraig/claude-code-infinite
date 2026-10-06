@@ -16,7 +16,7 @@ export declare const LINK_LABEL = "\u2022 MemTree";
  * A MemTree link notice: the label (and note, if any) on the first line and
  * the URL alone, indented, on the next, so a long URL wraps on its own
  * rather than dragging the label or note onto a second line. Label and note
- * come pre-styled; the URL stays bare for the terminal's linkifier.
+ * come pre-styled, and so does the URL (bare, or a hyperlink to itself).
  */
 export declare function linkLines(label: string, url: string, note?: string): string;
 export declare const DEFAULT_NOTICE_TTL_MS: number;
@@ -196,7 +196,12 @@ export declare class NoticeDeliveryQueue {
      * marks the key as seen. Resolver failures never break a hook.
      */
     private renderTrailer;
-    /** The link notice with its note dim. */
+    /**
+     * The link notice with its note dim. Where output is styled, the URL is also
+     * an OSC 8 hyperlink to itself: iTerm2's URL detection otherwise runs on
+     * into the next row Claude Code draws, and the click opens the URL with
+     * that row's first character (e.g. `✻`) appended.
+     */
     private linkNotice;
     private styleDim;
     private deliveryFor;

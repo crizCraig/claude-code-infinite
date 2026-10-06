@@ -2543,7 +2543,7 @@ test("flat index coverage suppresses the repeat compression notice", async () =>
   }
 });
 
-const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "");
+const stripAnsi = (text) => text.replace(/\x1B\[[0-9;]*m/g, "").replace(/\x1B\]8;;[^\x1B]*\x1B\\/g, "");
 
 // The server stamps its short spelling of the page (/m/<leading hex of the
 // id>) and the completed index the turn was compressed against.
@@ -2738,8 +2738,10 @@ test(`placement 'message': the link trails every finished message, marked when t
       linkText(rendered),
       `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
     );
-    assert.ok(rendered.endsWith(`${color ? "\x1b[39m" : "• MemTree"}\n  ${PAGE_URL_1}`),
-      "URL is bare on its own line, after the reset when colored");
+    assert.ok(rendered.endsWith(color
+      ? `\x1b[39m\n  \x1b]8;;${PAGE_URL_1}\x1b\\${PAGE_URL_1}\x1b]8;;\x1b\\`
+      : `• MemTree\n  ${PAGE_URL_1}`),
+      "URL on its own line, after the reset and a hyperlink to itself when colored");
     if (!color) assert.equal(rendered, stripAnsi(rendered), "NO_COLOR suppresses all ANSI styling");
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 

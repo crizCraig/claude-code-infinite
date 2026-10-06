@@ -29,7 +29,7 @@ export declare function compressedNoticeText(memtreeUrl?: string): string;
  * The trailer under a finished assistant message naming the newest MemTree
  * page for the conversation, plain-text form. The hook renderer styles the
  * label green the first time an index is shown and dim afterwards, with the
- * URL bare either way.
+ * URL shown in full either way (and, where styled, a hyperlink to itself).
  */
 export declare function memtreeTrailerText(memtreeUrl: string, note?: string): string;
 /** Trailer qualifier: the index is built, but the conversation still fits the budget and went out whole. */

@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hyperlink } from "./payment-gate.js";
 
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
@@ -22,7 +23,7 @@ export const LINK_LABEL = "• MemTree";
  * A MemTree link notice: the label (and note, if any) on the first line and
  * the URL alone, indented, on the next, so a long URL wraps on its own
  * rather than dragging the label or note onto a second line. Label and note
- * come pre-styled; the URL stays bare for the terminal's linkifier.
+ * come pre-styled, and so does the URL (bare, or a hyperlink to itself).
  */
 export function linkLines(label: string, url: string, note?: string): string {
   return `${label}${note ? ` · ${note}` : ""}\n  ${url}`;
@@ -492,9 +493,15 @@ export class NoticeDeliveryQueue {
     return this.linkNotice(label, link);
   }
 
-  /** The link notice with its note dim. */
+  /**
+   * The link notice with its note dim. Where output is styled, the URL is also
+   * an OSC 8 hyperlink to itself: iTerm2's URL detection otherwise runs on
+   * into the next row Claude Code draws, and the click opens the URL with
+   * that row's first character (e.g. `✻`) appended.
+   */
   private linkNotice(label: string, link: SuccessLink): string {
-    return linkLines(label, link.link, link.note && this.styleDim(link.note));
+    const url = this.color ? hyperlink(link.link, link.link) : link.link;
+    return linkLines(label, url, link.note && this.styleDim(link.note));
   }
 
   private styleDim(text: string): string {
