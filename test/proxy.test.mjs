@@ -9897,8 +9897,10 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
         if (mode === "failure") {
           assert.equal(rec.compress.ok, false, "attempted compression");
           assert.equal(rec.turnType, "followup-degraded");
-          assert.equal(rec.forwardedBytes, 0, "unsafe prefix is not retained as fallback");
-          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+          assert.ok(rec.forwardedBytes > 0, "counting unavailable: validated prefix uses plain bytes");
+          assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "prefix plus output fits native window");
+          assert.equal(h.upstream.bodies.length, upstreamCount + 1, "fitting prefix survives failed compression");
+          assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
         } else {
           assert.equal(h.compressCalls().length, calls + 1);
           assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
@@ -9943,7 +9945,9 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
           assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
         } else {
           assert.equal(rec.compress.ok, false);
-          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+          assert.equal(h.upstream.bodies.length, upstreamCount + 1, "counting unavailable: fitting prefix forwards");
+          assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "prefix plus output fits native window");
+          assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
           if (mode === "backoff") {
             toolStep(conv, "next", 10);
             const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
@@ -9957,8 +9961,10 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
             rec = messageRecords(h.records).at(-1);
             assert.equal(rec.routeRecovery.outcome, "backoff");
             assert.equal(rec.turnType, "tool");
-            assert.equal(res.status, 503, "backoff retains retryability within its bounded allowance");
-            assert.equal(h.upstream.bodies.length, upstreamCount, "backoff cannot forward an oversized original");
+            assert.equal(res.status, 200, "backoff retains the validated byte-fitting prefix");
+            assert.equal(h.upstream.bodies.length, upstreamCount + 2, "backoff does not strand a fitting prefix");
+            assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "output reservation still fits native window");
+            assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
           }
         }
       }

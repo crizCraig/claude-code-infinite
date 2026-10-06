@@ -139,6 +139,15 @@ the plain bytes-based estimate. Such a fallback can still be rejected by the
 upstream API, which makes the final tokenization decision. An `overBudgetForward`
 field in the request log marks requests forwarded above the compression budget.
 
+Sizing belongs to the individual request. Original bodies, validated compressed
+prefixes, and replacement bodies each retain their own estimate and count result;
+the compression planner, `client_input_tokens`, and final selection consult that
+shared record. A fitting compressed candidate is preferred, with the original as
+a fallback. If counting is unavailable, candidate selection uses the conservative
+bytes-based input estimate plus the requested output reservation against the
+model's native window. Refusal requires that no eligible candidate fits; a failed
+replacement cannot discard an original or prefix that still fits.
+
 `ccc` uses Anthropic Count Tokens selectively to check uncertain sizes and before
 refusing an estimated overflow. Counts describe the particular body being sent,
 including a compressed body when applicable. A request shares a three-second

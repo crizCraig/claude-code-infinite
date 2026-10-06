@@ -39,7 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
-import { type SizeSample } from "./count-tokens.js";
+import { estimateRequestTokens } from "./request-sizing.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
@@ -183,24 +183,7 @@ export declare function memtreePageId(pageUrl: string): string | undefined;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
-/**
- * Size of a body about to be sent, scaled from the reported size of an earlier
- * request of the same shape by that request's own bytes-per-token ratio.
- * Compressed memory is denser than bytes/4 (about 2.65 bytes per token on a
- * 2026-09-29 Opus session), so a plain bytes/4 fallback undercounted a body
- * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
- * 429k reported), which would delay recompression past the budget. Growth
- * uses the denser of the sample's ratio and bytes/4, so the estimate errs
- * high. bytes/4 when there is no sample, or only an implausible one
- * (plausibleSample): a 12 tokens/byte sample once sized a 469,801-byte
- * subagent request at 5.78M tokens and refused it (2026-10-05).
- */
-declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): {
-    tokens: number;
-    source: "reported" | "bytes";
-};
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
-export {};
 //# sourceMappingURL=proxy.d.ts.map

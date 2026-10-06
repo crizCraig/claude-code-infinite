@@ -310,3 +310,34 @@ test('late recovery timeout stays bounded and forwards an already-counted fittin
     assert.equal(rec.overBudgetForward.reason, 'exact-count-fits-window');
   } finally { h.close(); }
 });
+
+for (const lane of ['main', 'tool']) {
+  test(`exact native-window overflow in byte-fitting ${lane} replacement selects fitting original`, async () => {
+    const h = await harness({ budget: 100_000,
+      count: (_body, attempt) => ({ input_tokens: attempt === 1 ? 150_000 : 210_000 }),
+      compress: () => compressedReply(500_000) });
+    try {
+      const options = lane === 'tool' ? {} : { agent: '', messages: [
+        { role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'x'.repeat(1_500_000) }] };
+      assert.equal(await h.post(1_500_000, options), 200);
+      assert.equal(h.counts.length, 2);
+      assert.match(JSON.stringify(h.forwards[0].messages), /x{1000}/);
+      assert.equal(h.compressions.length, 1);
+    } finally { h.close(); }
+  });
+}
+
+for (const enabled of [true, false]) {
+  test(`all registered candidates exceed native window: counting ${enabled}`, async () => {
+    const h = await harness({ budget: 100_000, enabled,
+      count: (_body, attempt) => ({ input_tokens: attempt === 1 ? 300_000 : 210_000 }),
+      compress: () => compressedReply(900_000) });
+    try {
+      assert.equal(await h.post(1_500_000), 503);
+      assert.equal(h.forwards.length, 0);
+      assert.equal(h.compressions.length, 1);
+      assert.equal(h.counts.length, enabled ? 2 : 0);
+    } finally { h.close(); }
+  });
+}

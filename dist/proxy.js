@@ -40,8 +40,9 @@
  */
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { fitsFallbackBudget, RouteFallbackFailures } from "./route-fallback.js";
-import { createCountTokensSession, CountTokensCooldowns, plausibleSample, shouldCountTokens, } from "./count-tokens.js";
+import { RouteFallbackFailures } from "./route-fallback.js";
+import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
+import { RequestSizing, estimateRequestTokens, fitsNative } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
 import https from "node:https";
@@ -890,16 +891,25 @@ async function handleMessages(req, res, opts, upstream, state) {
             (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms });
         },
     }, state.countTokensCooldowns);
-    const exactInputTokens = await calibrateWholeRequestSize({
-        opts, state, body, forwardBody, modelContextLimit, countSession,
-        sizeSlot: wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey),
-        rides: state.memoryRoutes.has(requestRouteKey) ||
-            (isMainRequest && requestSessionKey !== undefined &&
-                state.stablePrefixes.has(requestSessionKey)),
+    const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
+    const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey);
+    const originalCandidate = requestSizing.register(rawBody, "original", sizeSlot.get());
+    const forwardCandidate = requestSizing.register(forwardBody, "original", sizeSlot.get());
+    candidateSizeOwners.set(originalCandidate, sizeSlot);
+    candidateSizeOwners.set(forwardCandidate, sizeSlot);
+    const sizingLimits = () => ({
+        budget: resolveBudget(opts, state, body.model, modelContextLimit).tokens,
+        context: modelContextLimit,
+        output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0,
     });
-    const wholeSize = estimateRequestTokens(wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey).get(), forwardBody.length);
-    const calibratedInputTokens = exactInputTokens ??
-        (wholeSize.source === "reported" ? wholeSize.tokens : undefined);
+    const rides = state.memoryRoutes.has(requestRouteKey) ||
+        (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
+    if (!rides) {
+        const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
+        if (measured.source === "exact") {
+            sizeSlot.set({ tokens: measured.tokens, forwardedBytes: forwardCandidate.body.length });
+        }
+    }
     rec.routeLane = requestRouteLane;
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
@@ -944,24 +954,24 @@ async function handleMessages(req, res, opts, upstream, state) {
         original: rawBody,
         failedRebuild: false,
         allowed: new WeakSet(),
-        accept: (buffer) => {
-            const policy = requestSendPolicies.get(req);
-            return acceptWholeRequest({
-                opts, state, res, rec, body, modelContextLimit, countSession, req,
-                transformed: policy.allowed.has(buffer),
-                routeKey: requestRouteKey,
-                sizeSlot: wholeRequestSizeSlot(state, isMainRequest, requestSessionId(req), requestSizeKey),
-                sendBody: policy.failedRebuild && !policy.allowed.has(buffer) ? policy.original : buffer,
-            });
+        sizing: requestSizing,
+        select: (buffer) => selectForwardCandidate({
+            opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
+            preferredBody: buffer, limits: sizingLimits(),
+        }),
+        fitsNative: async (buffer) => {
+            const candidate = requestSizing.register(buffer, rec.compress ? "replacement" : "ride");
+            const measured = await requestSizing.measure(candidate, sizingLimits());
+            // A validated ride is still eligible for bounded late recovery. Final
+            // selection considers it together with the original and any replacement.
+            return candidate.kind === "ride" || fitsNative(measured.tokens, sizingLimits());
         },
-        fitsNative: (buffer) => bodyFitsNative(buffer, body, modelContextLimit, opts, countSession),
-        inputTokens: (buffer) => candidateInputTokens(buffer, resolveBudget(opts, state, body.model, modelContextLimit).tokens, opts, countSession),
         recoverLate: async (buffer, tokens) => {
             if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
                 (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
                 return undefined;
-            return recoverLateCount({ opts, state, req, rec, bodyBuffer: buffer, tokens,
-                modelContextLimit, clientMeta });
+            return recoverLateCount({ opts, state, req, rec, bodyBuffer: buffer,
+                modelContextLimit, clientMeta, sizing: requestSizing });
         },
         delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
     });
@@ -1077,7 +1087,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 sessionId: toolSessionId,
                 routeKey: requestRouteKey,
                 sizeKey: requestSizeKey,
-                exactInputTokens,
+                sizing: requestSizing,
                 isMainRequest,
                 modelContextLimit,
                 forwardBody,
@@ -1160,7 +1170,8 @@ async function handleMessages(req, res, opts, upstream, state) {
                         sizeKey: requestSizeKey,
                         isMainRequest,
                         recoveryAttempt,
-                        calibratedInputTokens,
+                        sizing: requestSizing,
+                        inputCandidate: forwardCandidate,
                         toolForwarding,
                         clientMeta,
                         compaction: { target: plan.target, threshold: plan.threshold },
@@ -1247,7 +1258,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     // recap rides the main route above; subagents keep per-turn compression.
     const edge = isMainRequest && sessionId !== undefined
         ? planEdgeCompaction({
-            exactInputTokens,
+            sizing: requestSizing,
             opts,
             state,
             body,
@@ -1459,7 +1470,8 @@ async function handleMessages(req, res, opts, upstream, state) {
             sessionId,
             agentId: agentAttributionId(req),
             clientMeta,
-            calibratedInputTokens,
+            sizing: requestSizing,
+            inputCandidate: forwardCandidate,
             ...(edge?.kind === "compress"
                 ? { compaction: { target: edge.target, threshold: edge.threshold } }
                 : edge?.kind === "off"
@@ -2187,32 +2199,6 @@ function reportedInputTokens(rec) {
         (usage.cache_read_input_tokens ?? 0) +
         (usage.cache_creation_input_tokens ?? 0));
 }
-/**
- * Size of a body about to be sent, scaled from the reported size of an earlier
- * request of the same shape by that request's own bytes-per-token ratio.
- * Compressed memory is denser than bytes/4 (about 2.65 bytes per token on a
- * 2026-09-29 Opus session), so a plain bytes/4 fallback undercounted a body
- * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
- * 429k reported), which would delay recompression past the budget. Growth
- * uses the denser of the sample's ratio and bytes/4, so the estimate errs
- * high. bytes/4 when there is no sample, or only an implausible one
- * (plausibleSample): a 12 tokens/byte sample once sized a 469,801-byte
- * subagent request at 5.78M tokens and refused it (2026-10-05).
- */
-function estimateRequestTokens(sample, bytes) {
-    if (plausibleSample(sample)) {
-        const bytesPerToken = sample.forwardedBytes / sample.tokens;
-        if (bytes <= sample.forwardedBytes) {
-            return { tokens: Math.round(bytes / bytesPerToken), source: "reported" };
-        }
-        const added = bytes - sample.forwardedBytes;
-        return {
-            tokens: sample.tokens + Math.max(approxTokensFromBytes(added), Math.round(added / bytesPerToken)),
-            source: "reported",
-        };
-    }
-    return { tokens: approxTokensFromBytes(bytes), source: "bytes" };
-}
 /** Keep the newest (largest-body) reported size of a request on this prefix. */
 function notePrefixSize(prefix, rec, bytes) {
     const sample = reportedSample(rec, bytes);
@@ -2235,7 +2221,7 @@ function notePassthroughSize(state, sessionId, rec, bytes) {
  * is dropped and the previous sample kept.
  */
 function reportedSample(rec, bytes) {
-    if (lateReplacedRecords.has(rec))
+    if (changedDeliveryRecords.has(rec))
         return undefined;
     const tokens = reportedInputTokens(rec);
     if (tokens === undefined)
@@ -2359,7 +2345,9 @@ function planEdgeCompaction(args) {
             // never rewrite the prefix's bytes or the user's marker TTLs.
             return forced("prefix-mismatch");
         }
-        const size = estimateRequestTokens(prefix.lastSize, routed.raw.length);
+        const prefixCandidate = args.sizing.register(routed.raw, "ride", prefix.lastSize);
+        candidateSizeOwners.set(prefixCandidate, prefix);
+        const size = args.sizing.plan(prefixCandidate);
         compaction.estimatedTokens = size.tokens;
         compaction.estimatedBytes = routed.raw.length;
         compaction.sizeSource = size.source;
@@ -2378,9 +2366,7 @@ function planEdgeCompaction(args) {
     }
     if (state.compactNow.has(sessionId))
         return forced("manual");
-    const size = args.exactInputTokens !== undefined
-        ? { tokens: args.exactInputTokens, source: "reported" }
-        : estimateRequestTokens(state.passthroughSizes.get(sessionId), forwardBody.length);
+    const size = args.sizing.plan(args.sizing.register(forwardBody, "original"));
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = forwardBody.length;
     compaction.sizeSource = size.source;
@@ -2435,6 +2421,8 @@ function planToolCompaction(args) {
     if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
         const routed = prefixRoutedBody(body, messages, current);
         if (routed) {
+            const prefixCandidate = args.sizing.register(routed.raw, "ride", current.lastSize);
+            candidateSizeOwners.set(prefixCandidate, current);
             if (routedBodyExceedsContext(body, routed.raw, modelContextLimit))
                 overWindow = true;
             else
@@ -2442,18 +2430,18 @@ function planToolCompaction(args) {
         }
     }
     if (!ride) {
-        overWindow ||= args.exactInputTokens !== undefined
-            ? args.exactInputTokens + Math.max(0, body.max_tokens ?? 0) > modelContextLimit
-            : routedBodyExceedsContext(body, forwardBody, modelContextLimit);
+        const originalSize = args.sizing.plan(args.sizing.register(forwardBody, "original"));
+        overWindow ||= originalSize.tokens + Math.max(0, body.max_tokens ?? 0) > modelContextLimit;
     }
     const sample = ride
         ? ride.sizeHolder.lastSize
         : stableLane
             ? state.passthroughSizes.get(sessionId)
             : state.laneSizes.get(args.sizeKey);
-    const size = !ride && args.exactInputTokens !== undefined
-        ? { tokens: args.exactInputTokens, source: "reported" }
-        : estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
+    const candidate = args.sizing.register(ride?.raw ?? forwardBody, ride ? "ride" : "original", sample);
+    if (ride)
+        candidateSizeOwners.set(candidate, ride.sizeHolder);
+    const size = args.sizing.plan(candidate);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
@@ -2848,8 +2836,8 @@ async function runBlockingCompression(args) {
         // usage or an exact count) calibrated it. Sent so the server compresses
         // whatever the fallback gate would refuse to send uncompressed; a bytes/4
         // guess is not sent, as it would force needless compression.
-        ...(args.calibratedInputTokens !== undefined
-            ? { clientInputTokens: args.calibratedInputTokens }
+        ...(args.inputCandidate && args.sizing.clientInputTokens(args.inputCandidate) !== undefined
+            ? { clientInputTokens: args.sizing.clientInputTokens(args.inputCandidate) }
             : {}),
         ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
         ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
@@ -3029,7 +3017,8 @@ async function recoverToolRouteMiss(args) {
             sessionId: requestSessionId(req),
             agentId: agentAttributionId(req),
             clientMeta: args.clientMeta,
-            calibratedInputTokens: args.calibratedInputTokens,
+            sizing: args.sizing,
+            inputCandidate: args.inputCandidate,
             ...(args.compaction ? { compaction: args.compaction } : {}),
         });
     }
@@ -3370,26 +3359,6 @@ async function handleCountTokens(req, res, opts, upstream, state) {
  * picks it up without threading a parameter through each one.
  */
 const recapLinkAppenders = new WeakMap();
-/** Check the actual candidate body before discarding a byte-heavy compression. */
-async function bodyFitsNative(buffer, body, context, opts, counts) {
-    const output = typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0;
-    let exact = counts.peek(buffer)?.tokens;
-    const estimated = approxTokensFromBytes(buffer.length);
-    if (exact === undefined && opts.countTokens && estimated + output > context) {
-        exact = (await counts.count(buffer)).tokens;
-    }
-    return (exact ?? estimated) + output <= context;
-}
-/** Size a final recovery candidate independently of every earlier body or learned sample. */
-async function candidateInputTokens(buffer, budget, opts, counts) {
-    let exact = counts.peek(buffer)?.tokens;
-    const estimated = approxTokensFromBytes(buffer.length);
-    if (exact === undefined && opts.countTokens &&
-        shouldCountTokens(undefined, buffer.length, estimated, budget)) {
-        exact = (await counts.count(buffer)).tokens;
-    }
-    return exact ?? estimated;
-}
 /** One delivery-time retry, against the assembled body whose exact count exceeded the budget. */
 async function recoverLateCount(args) {
     try {
@@ -3400,7 +3369,8 @@ async function recoverLateCount(args) {
             opts: args.opts, state: args.state, body, msgsForMemtree: messages,
             hash: MemtreeClient.hashMessages(messages), modelContextLimit: args.modelContextLimit,
             rec: args.rec, sessionId: requestSessionId(args.req), agentId: agentAttributionId(args.req),
-            clientMeta: args.clientMeta, calibratedInputTokens: args.tokens,
+            clientMeta: args.clientMeta, sizing: args.sizing,
+            inputCandidate: args.sizing.register(args.bodyBuffer, "ride"),
             compaction: { target: compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget) },
         });
         noteMemtreeHealth(args.state, outcome);
@@ -3416,76 +3386,49 @@ async function recoverLateCount(args) {
         return undefined;
     }
 }
-/** Final forwarding uses the native window; the soft budget already requested compression. */
-async function acceptWholeRequest(args) {
-    const { opts, state, body, modelContextLimit, sendBody } = args;
-    const budget = resolveBudget(opts, state, body.model, modelContextLimit).tokens;
-    const output = typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0;
-    const fits = (input) => fitsFallbackBudget(input, output, budget, modelContextLimit);
-    // Whole-history samples must never scale a compressed body's size. A ride's
-    // compaction record already measured this assembled body from its own sample.
-    const compaction = args.rec.compaction;
-    const rideSample = args.transformed && compaction?.sizeSource === "reported" &&
-        compaction.estimatedBytes === sendBody.length && compaction.estimatedTokens !== undefined
-        ? { tokens: compaction.estimatedTokens, forwardedBytes: sendBody.length } : undefined;
-    const sample = args.transformed ? rideSample : args.sizeSlot.get();
-    const estimate = estimateRequestTokens(sample, sendBody.length).tokens;
-    let counted = args.countSession.peek(sendBody);
-    const unknownTransformedSize = args.transformed &&
-        shouldCountTokens(sample, sendBody.length, estimate, budget);
-    if (counted?.tokens === undefined && opts.countTokens && (!fits(estimate) || unknownTransformedSize)) {
-        counted = await args.countSession.count(sendBody);
-    }
-    const exact = counted?.tokens;
-    const bytesFallback = !opts.countTokens || (counted !== undefined && exact === undefined);
-    const input = exact ?? (bytesFallback ? approxTokensFromBytes(sendBody.length) : estimate);
+/** Select a measured eligible body before delivery; refusing one candidate never
+ * prevents considering the original or a validated prefix retained by planning. */
+async function selectForwardCandidate(args) {
     const policy = requestSendPolicies.get(args.req);
-    if (args.transformed && exact !== undefined && exact > budget &&
-        !args.rec.compress && !args.rec.lateCountRecovery) {
+    const intended = policy.failedRebuild && !policy.allowed.has(args.preferredBody)
+        ? policy.original : args.preferredBody;
+    const preferred = policy.sizing.register(intended, policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
+    const measured = await policy.sizing.measure(preferred, args.limits);
+    let target = preferred;
+    if (preferred.kind === "ride" && measured.source === "exact" &&
+        measured.tokens > args.limits.budget && !args.rec.compress && !args.rec.lateCountRecovery) {
         args.rec.lateCountRecovery = { outcome: "forwarded" };
-        const replacement = await policy.recoverLate(sendBody, exact);
-        const replacementTokens = replacement ? await policy.inputTokens(replacement) : undefined;
-        if (replacement && replacementTokens !== undefined && fits(replacementTokens)) {
-            policy.replacement = replacement;
-            lateReplacedRecords.add(args.rec);
-            policy.allowed.delete(sendBody);
-            policy.allowed.add(replacement);
-            recordTurn(args.rec, args.rec.turnType, replacement);
-            args.rec.lateCountRecovery.outcome = "compressed";
-            delete args.rec.overBudgetForward;
-            if (replacementTokens > budget)
-                args.rec.overBudgetForward = {
-                    reason: args.countSession.peek(replacement)?.tokens !== undefined
-                        ? "exact-count-fits-window" : "bytes-fallback-fits-window",
-                };
-            return true;
-        }
-        const originalTokens = !fits(input) ? await policy.inputTokens(policy.original) : undefined;
-        if (originalTokens !== undefined && fits(originalTokens)) {
-            policy.replacement = policy.original;
-            lateReplacedRecords.add(args.rec);
-            policy.allowed.delete(sendBody);
-            recordTurn(args.rec, args.rec.turnType, policy.original);
-            args.rec.lateCountRecovery.outcome = "forwarded";
-            if (originalTokens > budget)
-                args.rec.overBudgetForward = {
-                    reason: args.countSession.peek(policy.original)?.tokens !== undefined
-                        ? "exact-count-fits-window" : "bytes-fallback-fits-window",
-                };
-            return true;
-        }
-        if (!fits(input))
+        const replacement = await policy.recoverLate(preferred.body, measured.tokens);
+        if (replacement)
+            target = policy.sizing.register(replacement, "replacement");
+    }
+    const selection = await policy.sizing.select(target, args.limits);
+    if (!selection) {
+        if (args.rec.lateCountRecovery)
             args.rec.lateCountRecovery.outcome = "refused";
+        refuseWholeRequest(args, measured.tokens, args.limits.budget);
+        return undefined;
     }
-    if (!fits(input))
-        return refuseWholeRequest(args, input, budget);
-    if (input > budget || (exact === undefined && !args.transformed && estimate > budget)) {
-        args.rec.overBudgetForward = {
-            reason: exact !== undefined ? "exact-count-fits-window"
-                : bytesFallback ? "bytes-fallback-fits-window" : "estimate-fits-window",
-        };
+    const { candidate, measurement } = selection;
+    const changed = candidate !== preferred || intended !== args.preferredBody;
+    if (changed) {
+        policy.allowed.delete(args.preferredBody);
+        changedDeliveryRecords.add(args.rec);
+        selectedCandidates.set(args.rec, candidate);
+        recordTurn(args.rec, args.rec.turnType, candidate.body);
     }
-    return true;
+    if (args.rec.lateCountRecovery)
+        args.rec.lateCountRecovery.outcome =
+            changed && candidate.kind === "replacement" ? "compressed" : "forwarded";
+    delete args.rec.overBudgetForward;
+    if (measurement.tokens > args.limits.budget ||
+        (measurement.source !== "exact" && candidate.kind === "original" &&
+            measurement.estimatedTokens > args.limits.budget)) {
+        args.rec.overBudgetForward = { reason: measurement.source === "exact"
+                ? "exact-count-fits-window" : measurement.source === "bytes"
+                ? "bytes-fallback-fits-window" : "estimate-fits-window" };
+    }
+    return changed ? candidate.body : intended;
 }
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(args, inputTokens, budgetTokens) {
@@ -3503,49 +3446,39 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     args.res.end(JSON.stringify(failure.body));
     return false;
 }
-/**
- * Count a request that would go out whole, before its compaction decision,
- * when shouldCountTokens says the estimate is unknown or a jump brought it
- * near the budget; the count becomes the slot's sample, so the decision, the
- * fallback check and `client_input_tokens` all see the exact size. A request
- * that rides a compressed prefix or route is sized from that and skipped.
- */
-async function calibrateWholeRequestSize(args) {
-    const { opts, state, body, forwardBody } = args;
-    if (!opts.countTokens || args.rides)
-        return undefined;
-    const budget = resolveBudget(opts, state, body.model, args.modelContextLimit).tokens;
-    const sample = args.sizeSlot.get();
-    const estimated = estimateRequestTokens(sample, forwardBody.length).tokens;
-    if (!shouldCountTokens(sample, forwardBody.length, estimated, budget))
-        return undefined;
-    const counted = await args.countSession.count(forwardBody);
-    if (counted.tokens === undefined)
-        return undefined;
-    args.sizeSlot.set({ tokens: counted.tokens, forwardedBytes: forwardBody.length });
-    // Exact results remain authoritative for this body even if they are unsuitable
-    // for future learned estimates, or another request replaces the shared sample.
-    return counted.tokens;
-}
-const lateReplacedRecords = new WeakSet();
+const changedDeliveryRecords = new WeakSet();
+const selectedCandidates = new WeakMap();
+const candidateSizeOwners = new WeakMap();
 const requestSendPolicies = new WeakMap();
-function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
+async function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
     const policy = requestSendPolicies.get(req);
-    const verdict = policy ? policy.accept(bodyBuffer) : true;
-    const send = () => forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete);
-    if (verdict === true)
-        return send();
-    if (verdict === false)
-        return Promise.resolve(false);
-    return verdict.then((ok) => (ok ? send() : false), () => false);
+    const selected = policy ? await policy.select(bodyBuffer) : bodyBuffer;
+    if (!selected)
+        return false;
+    const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : undefined);
+    if (delivered && rec)
+        noteSelectedCandidateSize(rec);
+    return delivered;
+}
+/** Attribute a fallback response only to the body and size owner actually sent. */
+function noteSelectedCandidateSize(rec) {
+    const candidate = selectedCandidates.get(rec);
+    const owner = candidate && candidateSizeOwners.get(candidate);
+    const tokens = reportedInputTokens(rec);
+    if (!candidate || !owner || tokens === undefined)
+        return;
+    const sample = { tokens, forwardedBytes: candidate.body.length };
+    if (!plausibleSample(sample))
+        return;
+    if ("set" in owner)
+        owner.set(sample);
+    else if (!owner.lastSize || sample.forwardedBytes >= owner.lastSize.forwardedBytes) {
+        owner.lastSize = sample;
+    }
 }
 /** forwardRaw once the request's send policy (if any) accepted the body. */
 function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
     const policy = requestSendPolicies.get(req);
-    if (policy?.replacement)
-        bodyBuffer = policy.replacement;
-    else if (policy?.failedRebuild && !policy.allowed.has(bodyBuffer))
-        bodyBuffer = policy.original;
     return new Promise((resolve) => {
         const headers = forwardableRequestHeaders(req);
         headers["content-length"] = String(bodyBuffer.length);
