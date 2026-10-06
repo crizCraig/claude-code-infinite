@@ -146,6 +146,10 @@ counting allowance across its checks; authentication failures and rate limits
 put counting on a bounded cooldown. `CCC_COUNT_TOKENS=0` disables these checks.
 The `countTokens` array in each request-log record lists the status class and
 elapsed milliseconds of each actual attempt, without bodies or credentials.
+If counting an assembled compressed prefix discovers that it is over budget,
+`ccc` makes at most one bounded recovery compression attempt before deciding
+whether to forward or refuse it. The request log records that decision under
+`lateCountRecovery.outcome` as `compressed`, `forwarded`, or `refused`.
 
 Before publishing a release, verify Claude subscription OAuth counting in a live
 session: launch this checkout's `node dist/cli.js --resume` with the normal Claude

@@ -216,6 +216,8 @@ export interface MessagesRecord {
   compaction?: CompactionRecord;
   /** Every actual counting attempt, in order; cached results add no entry. */
   countTokens?: CountTokensRecord[];
+  /** One bounded compression after an assembled ride was counted above the soft budget. */
+  lateCountRecovery?: { outcome: "compressed" | "forwarded" | "refused" };
   /** Searchable flag explaining a forward above the advisory compression budget. */
   overBudgetForward?: {
     reason: "exact-count-fits-window" | "estimate-fits-window" | "bytes-fallback-fits-window";

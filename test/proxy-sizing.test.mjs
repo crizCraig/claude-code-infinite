@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { startProxy } from '../dist/proxy.js';
 import { MemtreeClient } from '../dist/memtree.js';
+import { AWAY_SUMMARY_PROMPT_PREFIX } from '../dist/turns.js';
 
 async function listen(handler) {
   const server = http.createServer(handler);
@@ -11,7 +12,8 @@ async function listen(handler) {
 }
 
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
-  countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false } = {}) {
+  countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
+  compressBudgetMs } = {}) {
   const counts = [], forwards = [], compressions = [], records = [];
   const upstream = await listen((req, res) => {
     let raw = '';
@@ -46,18 +48,23 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
         usage: { prompt_tokens: 100, completion_tokens: 100 } }));
     });
   });
+  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret' });
+  if (compressBudgetMs !== undefined) {
+    Object.defineProperty(memtree, 'compressBudgetMs', { get: () => compressBudgetMs });
+  }
   const proxy = await startProxy({
-    memtree: new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret' }),
+    memtree,
     upstreamOrigin: upstream.origin, budgetTokensOverride: budget, countTokens: enabled,
     reqlog: { log: record => records.push(structuredClone(record)) },
   });
-  async function post(bytes, { agent = 'a', oneMillion = false, text = 'x' } = {}) {
-    const messages = [{ role: 'user', content: 'task' },
+  async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
+    session = 's', messages: suppliedMessages } = {}) {
+    const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json',
-        'x-claude-code-session-id': 's', 'x-claude-code-agent-id': agent,
+        'x-claude-code-session-id': session, 'x-claude-code-agent-id': agent,
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
       body: JSON.stringify({ model: 'claude-x', max_tokens: 64, messages }),
     });
@@ -160,5 +167,146 @@ test('compressed body gets its own count; original exact count never sizes the r
     assert.equal(rec.countTokens.length, 2);
     assert.equal(rec.overBudgetForward, undefined, 'compressed body fits soft budget');
     assert.ok(rec.countTokens.every(r => Object.keys(r).sort().join() === 'ms,statusClass'));
+  } finally { h.close(); }
+});
+
+function compressedReply(chars, budget = 100_000) {
+  const memory = [{ role: 'user', content: 'memory ' + 'm'.repeat(chars) }];
+  return { body: { messages: memory, flattened_messages: memory, compressed: true,
+    model_budget_tokens: budget, usage: { prompt_tokens: 300_000, completion_tokens: 50_000,
+      prompt_tokens_details: { cached_tokens: 250_000 } } } };
+}
+
+for (const lane of ['main', 'agent', 'away', 'sessionless']) {
+  test(`calibrated ordinary ${lane} followup supplies its own client_input_tokens`, async () => {
+    const h = await harness({ budget: 100_000, count: () => ({ input_tokens: 151_000 }),
+      compress: () => compressedReply(4_000) });
+    try {
+      const options = { agent: lane === 'agent' ? 'a' : '',
+        session: lane === 'sessionless' ? '' : 's',
+        messages: [{ role: 'user', content: 'first' },
+          { role: 'assistant', content: 'answer' },
+          { role: 'user', content: (lane === 'away' ? AWAY_SUMMARY_PROMPT_PREFIX : '') + 'x'.repeat(600_000) }] };
+      assert.equal(await h.post(0, options), 200);
+      assert.equal(h.compressions.length, 1);
+      assert.equal(h.compressions[0].client_input_tokens, 151_000);
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ['main', 'tool']) {
+  test(`byte-heavy ${lane} replacement gets exact count before rejection`, async () => {
+    const h = await harness({ budget: 100_000,
+      count: (_body, attempt) => ({ input_tokens: attempt === 1 ? 300_000 : 120_000 }),
+      compress: () => compressedReply(900_000) });
+    try {
+      const options = lane === 'tool' ? {} : { agent: '', messages: [
+        { role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'x'.repeat(1_500_000) }] };
+      assert.equal(await h.post(1_500_000, options), 200);
+      assert.equal(h.counts.length, 2);
+      assert.match(JSON.stringify(h.forwards[0].messages), /memory m/);
+      assert.equal(h.compressions.length, 1, 'replacement never recursively compresses');
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ['tool', 'main']) {
+  for (const lateTokens of [150_000, 210_000]) {
+    test(`late ${lane} ride count ${lateTokens} makes one bounded recovery`, async () => {
+      let compressions = 0;
+      const h = await harness({ budget: 100_000, usage: () => undefined,
+        count: (_body, attempt) => ({ input_tokens: [300_000, 50_000, lateTokens][attempt - 1] ?? 3_000 }),
+        compress: () => compressedReply(++compressions === 1 ? 200_000 : 10_000) });
+      const original = [{ role: 'user', content: 'first' },
+        { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(1_200_000) }];
+      try {
+        assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+        const suffix = lane === 'main'
+          ? [{ role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }]
+          : [{ role: 'assistant', content: [{ type: 'tool_use', id: 'next', name: 'Read', input: {} }] },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'next', content: 'next' }] }];
+        assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }), 200);
+        assert.equal(h.compressions.length, 2, 'exactly one extra recovery for this turn');
+        assert.equal(h.compressions[1].client_input_tokens, lateTokens);
+        assert.match(JSON.stringify(h.compressions[1].messages), /memory m/);
+        assert.ok(JSON.stringify(h.forwards[1]).length < 20_000);
+        const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+        assert.equal(rec.lateCountRecovery.outcome, 'compressed');
+        assert.equal(rec.overBudgetForward, undefined);
+      } finally { h.close(); }
+    });
+  }
+}
+
+for (const lane of ['main', 'tool']) {
+  for (const scenario of ['fits-ride', 'no-fit', 'fits-original', 'fits-replacement-above-budget']) {
+    test(`late ${lane} recovery ${scenario} logs the selected outcome and body`, async () => {
+      let compressions = 0;
+      const lateTokens = scenario === 'fits-ride' ? 150_000 : 210_000;
+      const h = await harness({ budget: 100_000, usage: () => undefined,
+        count: (_body, attempt) => ({ input_tokens: [300_000, 50_000, lateTokens,
+          scenario === 'fits-original' ? 120_000 : scenario === 'fits-replacement-above-budget' ? 150_000 : 300_000][attempt - 1] ?? 300_000 }),
+        compress: () => ++compressions === 1 ? compressedReply(200_000)
+          : scenario === 'fits-replacement-above-budget' ? compressedReply(180_000) : undefined });
+      const original = [{ role: 'user', content: 'first' },
+        { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(1_200_000) }];
+      const suffix = lane === 'main'
+        ? [{ role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }]
+        : [{ role: 'assistant', content: [{ type: 'tool_use', id: 'next', name: 'Read', input: {} }] },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'next', content: 'next' }] }];
+      try {
+        assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+        assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }),
+          scenario === 'no-fit' ? 503 : 200);
+        assert.equal(h.compressions.length, 2, 'at most one late compression');
+        const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+        assert.equal(rec.lateCountRecovery.outcome, scenario === 'no-fit' ? 'refused'
+          : scenario === 'fits-replacement-above-budget' ? 'compressed' : 'forwarded');
+        if (scenario !== 'no-fit') {
+          assert.ok(rec.overBudgetForward, 'chosen body exceeds soft budget');
+          const sent = JSON.stringify(h.forwards.at(-1));
+          assert.equal(sent.includes('x'.repeat(1000)), scenario === 'fits-original');
+        }
+      } finally { h.close(); }
+    });
+  }
+}
+
+for (const lane of ['main', 'tool']) {
+  test(`truly oversized ${lane} replacement preserves the fitting original fallback`, async () => {
+    const h = await harness({ budget: 100_000,
+      count: (_body, attempt) => ({ input_tokens: attempt === 1 ? 150_000 : 210_000 }),
+      compress: () => compressedReply(900_000) });
+    try {
+      const options = lane === 'tool' ? {} : { agent: '', messages: [
+        { role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'x'.repeat(1_500_000) }] };
+      assert.equal(await h.post(1_500_000, options), 200);
+      assert.equal(h.counts.length, 2);
+      assert.match(JSON.stringify(h.forwards[0].messages), /x{1000}/);
+      assert.equal(h.compressions.length, 1);
+    } finally { h.close(); }
+  });
+}
+
+test('late recovery timeout stays bounded and forwards an already-counted fitting ride', async () => {
+  let compressions = 0;
+  const h = await harness({ budget: 100_000, usage: () => undefined, compressBudgetMs: 100,
+    count: (_body, attempt) => ({ input_tokens: [300_000, 50_000, 150_000][attempt - 1] }),
+    compress: () => ++compressions === 1 ? compressedReply(200_000) : new Promise(() => {}) });
+  const original = [{ role: 'user', content: 'first' },
+    { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(1_200_000) }];
+  try {
+    assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+    const start = Date.now();
+    assert.equal(await h.post(0, { agent: '', messages: [...original,
+      { role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }] }), 200);
+    assert.ok(Date.now() - start < 1_000, 'late compression does not hold the request indefinitely');
+    assert.equal(h.compressions.length, 2);
+    assert.equal(h.counts.length, 3, 'one request-local count for the ride, no recount after timeout');
+    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+    assert.equal(rec.lateCountRecovery.outcome, 'forwarded');
+    assert.equal(rec.overBudgetForward.reason, 'exact-count-fits-window');
   } finally { h.close(); }
 });
