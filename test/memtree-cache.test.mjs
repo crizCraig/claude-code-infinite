@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { MemtreeClient } from "../dist/memtree.js";
+import { MemtreeClient, withFinalReply } from "../dist/memtree.js";
 
 const MESSAGES = [{ role: "user", content: "same conversation" }];
 const HASH = MemtreeClient.hashMessages(MESSAGES);
@@ -137,6 +137,68 @@ test("identical conversations in different sessions do not share compression res
   }
 });
 
+
+test("the final index sends the session's conversation plus its last reply, once, when idle or at exit", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const reply = { role: "assistant", content: [{ type: "text", text: "PR #42 opened" }] };
+    let reads = 0;
+    const readReply = () => (reads++, reply);
+    const turn = [{ role: "user", content: "open the PR" }];
+
+    client.scheduleFinalIndex("s1", readReply, 1);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(fixture.calls.length, 0, "no main conversation recorded: nothing to finalize");
+
+    client.noteMainConversation("s1", { messages: turn, modelContextLimit: 100 });
+    client.scheduleFinalIndex("s1", readReply, 60_000);
+    client.noteMainConversation("s1", { messages: turn, modelContextLimit: 100 });
+    client.flushFinalIndexes();
+    assert.equal(fixture.calls.length, 0, "a new request cancels the pending final index");
+    assert.equal(reads, 0, "the transcript is read only when the call goes out");
+
+    client.scheduleFinalIndex("s1", readReply, 1);
+    await new Promise((r) => setTimeout(r, 20));
+    await client.drainBackground(1_000);
+    assert.equal(fixture.calls.length, 1, "idle: the final index went out");
+    const [call] = fixture.calls;
+    assert.equal(call.index_only, true);
+    assert.equal(call.final_index, true);
+    assert.deepEqual(call.messages.at(-1), reply, "the reply no per-request call carries");
+    assert.equal(call.messages.length, 2);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("the final index goes out at exit and is not repeated for the same conversation", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const reply = { role: "assistant", content: [{ type: "text", text: "done" }] };
+    client.noteMainConversation("s2", { messages: [{ role: "user", content: "go" }], modelContextLimit: 100 });
+    client.scheduleFinalIndex("s2", () => reply, 60_000);
+    client.flushFinalIndexes();
+    client.scheduleFinalIndex("s2", () => reply, 60_000);
+    client.flushFinalIndexes();
+    assert.equal(await client.drainBackground(1_000), true);
+    assert.equal(fixture.calls.length, 1, "same conversation and reply: sent once");
+    client.scheduleFinalIndex("s2", () => reply, 1);
+    assert.equal(fixture.calls.length, 1, "draining: no new final index");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("withFinalReply appends only a reply the conversation does not end with", () => {
+  const user = [{ role: "user", content: "q" }];
+  const reply = { role: "assistant", content: [{ type: "text", text: "a" }] };
+  assert.deepEqual(withFinalReply(user, reply), [...user, reply]);
+  assert.equal(withFinalReply(user, undefined), user);
+  const answered = [...user, reply];
+  assert.equal(withFinalReply(answered, reply), answered);
+});
 
 test("background indexing deduplicates within each session only", async () => {
   const fixture = await memtreeFixture();

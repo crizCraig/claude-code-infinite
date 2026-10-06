@@ -370,7 +370,7 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return;
     }
     if (url.pathname === hookPath) {
-        return handleNoticeHook(req, res, state, opts.reqlog);
+        return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, () => opts.transcriptUsage?.finalReply?.(sessionId)));
     }
     if (req.method === "GET" &&
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
@@ -569,7 +569,9 @@ export function memtreePageId(pageUrl) {
     }
 }
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
-async function handleNoticeHook(req, res, state, reqlog) {
+async function handleNoticeHook(req, res, state, reqlog, 
+/** A main-lane turn ended: the session may be over (its final index). */
+onMainStop) {
     if (req.method !== "POST") {
         res.writeHead(405, { allow: "POST" });
         res.end();
@@ -686,6 +688,7 @@ async function handleNoticeHook(req, res, state, reqlog) {
         ? null
         : state.notices.claim(parsed);
     if (stopMatchesMainPrompt) {
+        onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
         state.mainNoticePending = false;
         state.mainPromptId = undefined;
         state.mainPromptText = undefined;
@@ -965,6 +968,16 @@ async function handleMessages(req, res, opts, upstream, state) {
     const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
     const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
     const hash = MemtreeClient.hashMessages(msgsForMemtree);
+    // The main lane's latest conversation: what its final index sends, plus the
+    // reply the session ends with (scheduleFinalIndex, on Stop).
+    if (isMainRequest) {
+        opts.memtree.noteMainConversation(requestSessionId(req), {
+            messages: msgsForMemtree,
+            modelContextLimit,
+            clientMeta,
+            messageTimesFor: transcriptTimesFor(opts, requestSessionId(req)),
+        });
+    }
     // Hook state controls notices only. Hidden requests cannot consume main notices.
     if (typeof body.model === "string")
         rec.model = body.model;

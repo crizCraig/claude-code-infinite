@@ -864,7 +864,8 @@ async function handleRequest(
     return;
   }
   if (url.pathname === hookPath) {
-    return handleNoticeHook(req, res, state, opts.reqlog);
+    return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) =>
+      opts.memtree.scheduleFinalIndex(sessionId, () => opts.transcriptUsage?.finalReply?.(sessionId!)));
   }
 
   if (
@@ -1106,7 +1107,9 @@ async function handleNoticeHook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: ProxyState,
-  reqlog: RequestLogSink | undefined
+  reqlog: RequestLogSink | undefined,
+  /** A main-lane turn ended: the session may be over (its final index). */
+  onMainStop?: (sessionId: string | undefined) => void
 ): Promise<void> {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
@@ -1230,6 +1233,7 @@ async function handleNoticeHook(
       ? null
       : state.notices.claim(parsed);
   if (stopMatchesMainPrompt) {
+    onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
     state.mainNoticePending = false;
     state.mainPromptId = undefined;
     state.mainPromptText = undefined;
@@ -1543,6 +1547,16 @@ async function handleMessages(
   const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
   const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
   const hash = MemtreeClient.hashMessages(msgsForMemtree);
+  // The main lane's latest conversation: what its final index sends, plus the
+  // reply the session ends with (scheduleFinalIndex, on Stop).
+  if (isMainRequest) {
+    opts.memtree.noteMainConversation(requestSessionId(req), {
+      messages: msgsForMemtree,
+      modelContextLimit,
+      clientMeta,
+      messageTimesFor: transcriptTimesFor(opts, requestSessionId(req)),
+    });
+  }
 
   // Hook state controls notices only. Hidden requests cannot consume main notices.
 

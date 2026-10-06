@@ -66,6 +66,11 @@ export interface TranscriptUsageSource {
    * knows; a subagent's (`agentId`) from its own transcript.
    */
   timesFor?(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
+  /**
+   * The session's last assistant reply when it made no tool call (the answer
+   * a turn ended with), as a message; read to the transcript's end.
+   */
+  finalReply?(sessionId: string): Message | undefined;
 }
 
 /**
@@ -118,6 +123,22 @@ export class ClaudeTranscriptUsage implements TranscriptUsageSource {
       return index.matchTimes(messages);
     } catch {
       return {};
+    }
+  }
+
+  finalReply(sessionId: string): Message | undefined {
+    try {
+      const index = this.indexFor(sessionId);
+      if (!index) return undefined;
+      let read = 0;
+      while (read < MAX_CATCH_UP_BYTES) {
+        const bytes = index.refresh();
+        if (bytes === 0) break;
+        read += bytes;
+      }
+      return index.finalReply();
+    } catch {
+      return undefined;
     }
   }
 
@@ -187,7 +208,19 @@ class TranscriptIndex {
   /** Hash of a response's text → every response id with that text, in order. */
   private readonly idsByText = new Map<string, string[]>();
 
+  /** The newest response's id, and every response that called a tool. */
+  private lastResponseId: string | undefined;
+  private readonly toolCallingIds = new Set<string>();
+
   constructor(private readonly file: string) {}
+
+  /** The newest response as a text-only assistant message, unless it called a tool. */
+  finalReply(): Message | undefined {
+    const id = this.lastResponseId;
+    if (id === undefined || this.toolCallingIds.has(id)) return undefined;
+    const text = this.textById.get(id);
+    return text && text.trim() ? { role: "assistant", content: [{ type: "text", text }] } : undefined;
+  }
 
   /** Reads the next bounded chunk; returns the bytes read (0 at the end). */
   refresh(): number {
@@ -398,6 +431,7 @@ class TranscriptIndex {
     const message = entry.message;
     const id = message?.id;
     if (typeof id !== "string") return;
+    this.lastResponseId = id;
     if (time) this.timeById.set(id, latest([this.timeById.get(id), time])!);
     const usage = toUsage(message.usage);
     if (usage) {
@@ -407,6 +441,7 @@ class TranscriptIndex {
     for (const part of Array.isArray(message.content) ? message.content : []) {
       if (part?.type === "tool_use" && typeof part.id === "string") {
         this.idByToolUse.set(part.id, id);
+        this.toolCallingIds.add(id);
       } else if (part?.type === "text" && typeof part.text === "string") {
         const text = (this.textById.get(id) ?? "") + part.text;
         this.textById.set(id, text);
@@ -446,6 +481,8 @@ class TranscriptIndex {
     this.timeByToolResult.clear();
     this.timesByUserText.clear();
     this.idsByText.clear();
+    this.lastResponseId = undefined;
+    this.toolCallingIds.clear();
   }
 }
 

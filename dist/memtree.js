@@ -32,6 +32,12 @@ const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
 const INDEX_TIMEOUT_MS = 120_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
+ * A main-lane Stop followed by this long without a new request is taken as the
+ * session's end, and its final index goes out (exit sends it at once). Shorter
+ * pauses spend the server's once-per-30-minutes final index mid-session.
+ */
+export const FINAL_INDEX_IDLE_MS = 10 * 60_000;
+/**
  * The server-flattened single user message of a compressed result, or null
  * when the server did not provide a valid one (a pre-flatten server, or a
  * malformed field). The flatten format lives server-side ONLY — the client
@@ -661,6 +667,12 @@ export class MemtreeClient {
     backgroundIndexes = new Map();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
+    /** Session → its main lane's latest conversation, for the final index. */
+    mainConversations = new Map();
+    /** Session → its final index waiting for the session to stay idle. */
+    pendingFinals = new Map();
+    /** Session → hash of the conversation its last final index sent. */
+    finalIndexed = new Map();
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     unpaidDetail = null;
     /** Complete compression request key → whether its latest failure arms fuse. */
@@ -825,6 +837,74 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexedHashes.delete(first);
         }
+        this.submitIndexOnly(messages, modelContextLimit, { sessionId, clientMeta, messageTimesFor });
+    }
+    /**
+     * The main lane's latest conversation for a session, kept for its final
+     * index (scheduleFinalIndex). A new request also means the session did not
+     * end at the last Stop: its pending final index is cancelled.
+     */
+    noteMainConversation(sessionId, conversation) {
+        if (sessionId === undefined)
+            return;
+        this.cancelFinalIndex(sessionId);
+        this.mainConversations.delete(sessionId);
+        this.mainConversations.set(sessionId, conversation);
+        if (this.mainConversations.size > DEDUPE_CACHE_MAX) {
+            const first = this.mainConversations.keys().next().value;
+            if (first !== undefined)
+                this.mainConversations.delete(first);
+        }
+    }
+    /**
+     * After a main-lane Stop: once the session has been idle `delayMs` (or at
+     * shutdown, flushFinalIndexes), send its conversation plus the reply it
+     * ended with as one index-only call flagged final_index, so the server
+     * indexes the tail even below its 10k-token minimum (at most once per
+     * conversation per 30 minutes, server-side). Every per-request index call
+     * lacks that reply: it only appears in the next request. `readReply` reads
+     * it from the transcript when the call goes out, not inside the hook.
+     */
+    scheduleFinalIndex(sessionId, readReply, delayMs = FINAL_INDEX_IDLE_MS) {
+        if (sessionId === undefined || this.backgroundClosing)
+            return;
+        if (!this.mainConversations.has(sessionId))
+            return;
+        this.cancelFinalIndex(sessionId);
+        const timer = setTimeout(() => this.fireFinalIndex(sessionId), delayMs);
+        timer.unref?.();
+        this.pendingFinals.set(sessionId, { timer, readReply });
+    }
+    /** At shutdown, before drainBackground: send every pending final index now. */
+    flushFinalIndexes() {
+        for (const sessionId of [...this.pendingFinals.keys()])
+            this.fireFinalIndex(sessionId);
+    }
+    cancelFinalIndex(sessionId) {
+        const pending = this.pendingFinals.get(sessionId);
+        if (pending)
+            clearTimeout(pending.timer);
+        this.pendingFinals.delete(sessionId);
+    }
+    fireFinalIndex(sessionId) {
+        const pending = this.pendingFinals.get(sessionId);
+        this.cancelFinalIndex(sessionId);
+        const conversation = this.mainConversations.get(sessionId);
+        if (!pending || !conversation || this.backgroundClosing)
+            return;
+        const messages = withFinalReply(conversation.messages, pending.readReply());
+        const key = MemtreeClient.hashMessages(messages);
+        if (this.finalIndexed.get(sessionId) === key)
+            return;
+        this.finalIndexed.set(sessionId, key);
+        this.submitIndexOnly(messages, conversation.modelContextLimit, {
+            sessionId,
+            clientMeta: conversation.clientMeta,
+            messageTimesFor: conversation.messageTimesFor,
+            finalIndex: true,
+        });
+    }
+    submitIndexOnly(messages, modelContextLimit, opts) {
         const stripped = [];
         const retained = [];
         for (const message of messages) {
@@ -838,12 +918,13 @@ export class MemtreeClient {
         const operation = this.callContextMemory(stripped, modelContextLimit, {
             timeoutMs: INDEX_TIMEOUT_MS,
             indexOnly: true,
+            finalIndex: opts.finalIndex,
             signal: controller.signal,
             // Match original text: trimming each block can change joined assistant
             // text. Omit dropped messages first so the times use the sent positions.
-            messageTimes: messageTimesFor?.(retained),
-            sessionId,
-            clientMeta,
+            messageTimes: opts.messageTimesFor?.(retained),
+            sessionId: opts.sessionId,
+            clientMeta: opts.clientMeta,
         })
             .then(() => undefined, (err) => {
             this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
@@ -919,6 +1000,9 @@ export class MemtreeClient {
         // (plan Phase 2.2); harmless extra field either way.
         if (opts.indexOnly)
             body.index_only = true;
+        // Older servers ignore it: the call is then an ordinary index-only call.
+        if (opts.indexOnly && opts.finalIndex)
+            body.final_index = true;
         // Both call kinds: index-only calls build most of the tree, and the
         // server stamps each input block with its messages' time range.
         if (opts.messageTimes && Object.keys(opts.messageTimes).length) {
@@ -1074,5 +1158,11 @@ function extract402Detail(bodyText) {
         // non-JSON 402 body — fall through to the generic text
     }
     return "Payment required";
+}
+/** The conversation plus the reply that ended it, unless it already ends with a reply. */
+export function withFinalReply(messages, reply) {
+    if (!reply || messages.at(-1)?.role === "assistant")
+        return messages;
+    return [...messages, reply];
 }
 //# sourceMappingURL=memtree.js.map

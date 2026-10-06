@@ -502,6 +502,40 @@ test("rawPromptTokenCount accepts only a positive finite nested usage value", ()
   );
 });
 
+test("a main-lane Stop schedules the session's final index with the conversation it last sent", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, { messages: [], usage: {}, index_only: true });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const noted = [];
+  const scheduled = [];
+  const note = memtree.noteMainConversation.bind(memtree);
+  memtree.noteMainConversation = (sessionId, conversation) => {
+    noted.push([sessionId, conversation.messages.length]);
+    note(sessionId, conversation);
+  };
+  memtree.scheduleFinalIndex = (sessionId, readReply) => scheduled.push([sessionId, typeof readReply]);
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "first question");
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-claude-code-session-id": "session-1" },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages: toolTurn }),
+    });
+    await response.text();
+    assert.deepEqual(noted.map(([id]) => id), ["session-1"], "the main lane's conversation is kept");
+    assert.equal(noted[0][1], toolTurn.length);
+    await postHook(proxy, { hook_event_name: "Stop", stop_hook_active: false, prompt_id: "prompt-main" });
+    assert.deepEqual(scheduled, [["session-1", "function"]], "Stop schedules the final index");
+    await postHook(proxy, { hook_event_name: "SubagentStop", agent_id: "a1" });
+    assert.equal(scheduled.length, 1, "a subagent's stop is not the session's end");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("successful compression leaves response untouched and prefixes MessageDisplay once", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, {
