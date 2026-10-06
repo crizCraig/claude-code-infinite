@@ -39,6 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
+import { estimateRequestTokens } from "./request-sizing.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
@@ -65,6 +66,14 @@ export interface ProxyOptions {
      * when one exists and otherwise go out whole.
      */
     toolRouteRecovery?: boolean;
+    /**
+     * Size requests exactly with Anthropic's Count Tokens endpoint, using the
+     * request's own credentials (count-tokens.ts): before a compaction decision
+     * when the estimate is unknown or a jump nears the budget, and always before
+     * refusing a request on an estimate. The CLI turns this on
+     * (`CCC_COUNT_TOKENS=0` turns it off); embedders and tests keep estimates.
+     */
+    countTokens?: boolean;
     /**
      * Handle only Claude Code's own requests. ccc launches Claude Code with
      * ANTHROPIC_BASE_URL pointing here, and every program Claude Code runs
@@ -170,12 +179,6 @@ export interface RunningProxy {
      */
     drain: (timeoutMs?: number) => Promise<boolean>;
 }
-/** A request size Anthropic reported, and the bytes of the body it was for. */
-interface SizeSample {
-    /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
-    tokens: number;
-    forwardedBytes: number;
-}
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share
  * of the model's context window (800k of Opus 5.5's 1M, matching the server's
@@ -188,22 +191,7 @@ export declare function memtreePageId(pageUrl: string): string | undefined;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
-/**
- * Size of a body about to be sent, scaled from the reported size of an earlier
- * request of the same shape by that request's own bytes-per-token ratio.
- * Compressed memory is denser than bytes/4 (about 2.65 bytes per token on a
- * 2026-09-29 Opus session), so a plain bytes/4 fallback undercounted a body
- * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
- * 429k reported), which would delay recompression past the budget. Growth
- * uses the denser of the sample's ratio and bytes/4, so the estimate errs
- * high. bytes/4 only when there is no sample.
- */
-declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): {
-    tokens: number;
-    source: "reported" | "bytes";
-};
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
-export {};
 //# sourceMappingURL=proxy.d.ts.map

@@ -104,6 +104,12 @@ export interface UsageRecord {
  * written once when the response finishes. Fields that a given path can't
  * derive cheaply are simply omitted.
  */
+/** One actual Count Tokens HTTP attempt; never includes body, credentials or token counts. */
+export interface CountTokensRecord {
+  statusClass: string;
+  ms: number;
+}
+
 export interface MessagesRecord {
   kind: "messages";
   turnType: TurnType;
@@ -208,6 +214,14 @@ export interface MessagesRecord {
    * the CCC_TOOL_ROUTE_RECOVERY=0 kill switch.
    */
   compaction?: CompactionRecord;
+  /** Every actual counting attempt, in order; cached results add no entry. */
+  countTokens?: CountTokensRecord[];
+  /** One bounded compression after an assembled ride was counted above the soft budget. */
+  lateCountRecovery?: { outcome: "compressed" | "forwarded" | "refused" };
+  /** Searchable flag explaining a forward above the advisory compression budget. */
+  overBudgetForward?: {
+    reason: "exact-count-fits-window" | "estimate-fits-window" | "bytes-fallback-fits-window";
+  };
   /**
    * Outcome of a tool-turn compaction attempt (a tool turn whose estimated
    * size reached the budget), or why none was made although one was due.

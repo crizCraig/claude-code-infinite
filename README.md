@@ -135,6 +135,45 @@ Subagents follow the same budget rule in their own tool loops: under the budget 
 
 Routing decisions, per-turn timings and usage, recovery outcomes, and delivery status are recorded in `~/.claude-code-infinite/logs/requests.jsonl`.
 
+The compression budget is a trigger to try MemTree, not a hard forwarding limit.
+If compression is unavailable, `ccc` sends the available request when its input
+plus output reservation fits the model's native window. If Count Tokens fails or
+is disabled, a learned estimate alone cannot block the turn: the final check uses
+the plain bytes-based estimate. Such a fallback can still be rejected by the
+upstream API, which makes the final tokenization decision. An `overBudgetForward`
+field in the request log marks requests forwarded above the compression budget.
+
+Sizing belongs to the individual request. Original bodies, validated compressed
+prefixes, and replacement bodies each retain their own estimate and count result;
+the compression planner, `client_input_tokens`, and final selection consult that
+shared record. A fitting compressed candidate is preferred, with the original as
+a fallback. If counting is unavailable, candidate selection uses the conservative
+bytes-based input estimate plus the requested output reservation against the
+model's native window. Refusal requires that no eligible candidate fits; a failed
+replacement cannot discard an original or prefix that still fits.
+
+`ccc` uses Anthropic Count Tokens selectively to check uncertain sizes and before
+refusing an estimated overflow. Counts describe the particular body being sent,
+including a compressed body when applicable. A request shares a three-second
+counting allowance across its checks; authentication failures and rate limits
+put counting on a bounded cooldown. `CCC_COUNT_TOKENS=0` disables these checks.
+The `countTokens` array in each request-log record lists the status class and
+elapsed milliseconds of each actual attempt, without bodies or credentials.
+If counting an assembled compressed prefix discovers that it is over budget,
+`ccc` makes at most one bounded recovery compression attempt before deciding
+whether to forward or refuse it. The request log records that decision under
+`lateCountRecovery.outcome` as `compressed`, `forwarded`, or `refused`.
+
+Before publishing a release, verify Claude subscription OAuth counting in a live
+session: launch this checkout's `node dist/cli.js --resume` with the normal Claude
+subscription login and resume a large conversation. After sending a turn, inspect
+the new `countTokens` entries in the request log for that process's `pid`. A
+successful count confirms acceptance; an authentication failure should leave the
+turn on the bytes-based fallback and suppress further counts during cooldown.
+An absent entry means no count was needed, so that turn does not verify OAuth
+acceptance. Mock tests verify header forwarding and failure behavior; they do not
+establish that Anthropic accepts subscription OAuth for this endpoint.
+
 Memory quality is evaluated offline: the weekly `memtree-bench` harness replays a fixed scenario through a ccc-wrapped arm and a vanilla Claude Code arm and grades complete outcomes blind against an answer key. (An earlier in-request memory-vs-full A/B comparison with a live grader was removed in 2026-08; it was off by default, and the offline benchmark measures the same question with a stronger instrument.)
 
 ## What this is NOT
@@ -205,4 +244,3 @@ npm install -g claude-code-infinite
 command instead.)
 
 Set `CCC_SKIP_UPDATE_CHECK=1` to disable the check (air-gapped or CI runs).
-

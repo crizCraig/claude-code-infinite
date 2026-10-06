@@ -5593,7 +5593,7 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
   }
 });
 
-test("over-budget recovery failure returns an error and retains background indexing", async () => {
+test("soft-budget recovery failure forwards the original and retains background indexing", async () => {
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(500, { error: "boom" });
   const records = [];
@@ -5604,8 +5604,8 @@ test("over-budget recovery failure returns an error and retains background index
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 0);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5636,7 +5636,7 @@ test("a MemTree no-op or unusable answer never becomes a recovered route", async
   const conversation = largeToolTurn();
   try {
     await postMessages(proxy.port, conversation, SESSION);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeRecovery.outcome, "noop");
@@ -5795,7 +5795,7 @@ test("disabled recovery records the suppressed miss and never compresses", async
   });
   try {
     await postMessages(proxy.port, largeToolTurn(), SESSION);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     const rec = messageRecords(records)[0];
     assert.equal(rec.turnType, "tool");
     assert.equal(rec.routeMiss, "missing");
@@ -5817,10 +5817,10 @@ test("disabled recovery records the suppressed miss and never compresses", async
   }
 });
 
-test("an over-budget no-gain compaction refuses forwarding and backs off until growth", async () => {
+test("an over-budget no-gain compaction forwards within the native window and backs off until growth", async () => {
   // A tiny conversation's recovered body is BIGGER than the original.
-  // Neither result fits the configured budget, so no route or upstream
-  // request is created. The lane backs off: a same-size retry makes no
+  // Neither result fits the soft budget, but the original fits its native
+  // window and is forwarded. The lane backs off: a same-size retry makes no
   // second call, and only growth past a twentieth of the budget retries.
   const upstream = await recordingUpstream();
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
@@ -5840,7 +5840,7 @@ test("an over-budget no-gain compaction refuses forwarding and backs off until g
     assert.equal(rec.routeMiss, "missing");
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.routeRecovery.install, undefined);
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "original fits the native window");
     assert.equal(blockingCalls(), 1);
 
     const sameSize = structuredClone(toolTurn);
@@ -5850,7 +5850,7 @@ test("an over-budget no-gain compaction refuses forwarding and backs off until g
     assert.equal(rec2.routeMiss, "missing");
     assert.equal(rec2.routeRecovery.outcome, "backoff");
     assert.equal(blockingCalls(), 1, "a backoff skip pays nothing");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 2, "original fits the native window");
 
     await postMessages(proxy.port, extendToolLoop(toolTurn, "t2"), SESSION);
     assert.equal(messageRecords(records)[2].routeRecovery.outcome, "no-gain", "grown: tried again");
@@ -6633,7 +6633,7 @@ test("a different-session rejection preserves the owner's route; same-session re
   }
 });
 
-test("an in-flight recovery holds the lane; an oversized concurrent miss is refused", async () => {
+test("an in-flight recovery holds the lane; a fitting concurrent miss forwards whole", async () => {
   // Two concurrent compactions in one lane are impossible: the first marks
   // the lane in flight BEFORE its compress settles, so a miss racing it
   // forwards verbatim ("in-flight") instead of stacking a second blocking
@@ -6677,7 +6677,7 @@ test("an in-flight recovery holds the lane; an oversized concurrent miss is refu
     const recB = messageRecords(records).at(-1);
     assert.equal(recB.routeRecovery.outcome, "in-flight");
     assert.equal(recB.turnType, "tool");
-    assert.equal(upstream.seen.length, 0, "the racing oversized request waits for a usable route instead of forwarding whole history");
+    assert.equal(upstream.seen.length, 1, "the racing request fits the native window");
 
     held.resolve();
     await aInFlight;
@@ -6767,7 +6767,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
     assert.equal(rec.routeRecovery.outcome, "unusable");
     assert.equal(rec.history.usable, false);
     assert.equal(rec.turnType, "tool", "not forwarded as tool-recompressed");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     // No route: the next tool turn misses rather than riding amnesia.
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(messageRecords(records)[1].routeMiss, "missing");
@@ -6778,7 +6778,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
   }
 });
 
-test("an oversized compression with no byte gain never forwards the original", async () => {
+test("an oversized compression with no byte gain forwards the original within its native window", async () => {
   const upstream = await recordingUpstream();
   // Usable and genuinely indexed, but bigger than what it replaces.
   const memtreeSrv = await mockMemtree(200, {
@@ -6797,7 +6797,7 @@ test("an oversized compression with no byte gain never forwards the original", a
     const rec = messageRecords(records)[0];
     assert.equal(rec.routeRecovery.outcome, "no-gain");
     assert.equal(rec.turnType, "tool");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 1, "the original fits the native window and reaches upstream");
     await postMessages(proxy.port, extendToolLoop(conversation), SESSION);
     assert.equal(
       messageRecords(records)[1].routeMiss,
@@ -6878,7 +6878,7 @@ test("a failed recovery puts the fuse on cooldown instead of stalling every tool
       assert.equal(rec.turnType, "tool");
     }
     assert.equal(blockingCalls(), afterFirst, "no further blocking compress");
-    assert.equal(upstream.seen.length, 0, "an oversized original must never reach upstream");
+    assert.equal(upstream.seen.length, 3, "fitting originals keep forwarding during cooldown");
 
     // Main's backoff stays visible even while the cooldown is armed: it has
     // grown by far less than a twentieth of the budget since its attempt.
@@ -8509,7 +8509,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     // the lane backing off (nothing was installed). The empty lane (not a
     // "replay") logs a plain missing miss, classifies "backoff" — the
     // released reservation is what lets it reach that label at all — and
-    // refuses the over-budget original without paying a second blocking
+    // forwards the native-window-fitting original without paying a second blocking
     // compress.
     await postMessages(proxy.port, conversation, SESSION);
     await waitFor(() => messageRecords(records).length >= 2);
@@ -8523,7 +8523,7 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
     assert.equal(retry.routeRecovery.conversationBytes, undefined);
     assert.equal(retry.turnType, "tool");
     assert.equal(blockingCalls(), liveCompresses, "a backoff skip pays nothing");
-    assert.equal(upstream.seen.length, 1, "the backed-off over-budget retry cannot forward its whole history");
+    assert.equal(upstream.seen.length, 2, "the backed-off retry fits the native window");
   } finally {
     proxy.close();
     upstream.close();
@@ -8662,10 +8662,14 @@ const BIG = (tag, chars = 100_000) => `${tag} ` + "x".repeat(chars);
 /**
  * A MemTree server that decides like the real one: a request compresses only
  * with a target, and only when its size (chars/4) exceeds the threshold, or
- * the target itself when no threshold was sent. `reportsBudget: false` models
- * a server from before `model_budget_tokens` / `compression_threshold_tokens`.
+ * the target itself when no threshold was sent, or when the client's
+ * `client_input_tokens` exceeds it. `reportsBudget: false` models a server
+ * from before `model_budget_tokens` / `compression_threshold_tokens`;
+ * `charsPerToken` above 4 models a server that undercounts dense content.
  */
-async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop = false } = {}) {
+async function edgeMemtree({
+  reportsBudget = true, modelBudget = 800_000, noop = false, charsPerToken = 4,
+} = {}) {
   let compressions = 0;
   return mockMemtree(200, (body) => {
     if (body.index_only) {
@@ -8675,11 +8679,12 @@ async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop =
         index_only: true,
       };
     }
-    const size = Math.round(JSON.stringify(body.messages).length / 4);
+    const size = Math.round(JSON.stringify(body.messages).length / charsPerToken);
     const target = body.compression_target_tokens;
     const threshold = reportsBudget ? body.compression_threshold_tokens ?? target : target;
     const budget = reportsBudget ? { model_budget_tokens: modelBudget } : {};
-    if (noop || target === undefined || size <= threshold) {
+    const clientOver = reportsBudget && body.client_input_tokens > threshold;
+    if (noop || target === undefined || (size <= threshold && !clientOver)) {
       return {
         messages: body.messages,
         compressed: false,
@@ -8697,18 +8702,33 @@ async function edgeMemtree({ reportsBudget = true, modelBudget = 800_000, noop =
   });
 }
 
-/** Anthropic stand-in that reports a request's size as bytes/4, like its usage. */
-async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
+/**
+ * Anthropic stand-in that reports a request's size as bytes/4, like its usage.
+ * `usageTokens(body, bytes)` overrides one response's reported input tokens.
+ * Count Tokens calls (kept out of `bodies`) answer bytes/4 of the counted body,
+ * after failing the first `countFailures` with a 500.
+ */
+async function sizingUpstream({
+  bytesPerToken = 4, reportUsage = true, usageTokens = () => undefined, countFailures = 0,
+} = {}) {
   const bodies = [];
   const rawBodies = [];
+  const countCalls = [];
   const srv = await listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
+      if (req.url.includes("/count_tokens")) {
+        countCalls.push({ url: req.url, headers: req.headers, body: JSON.parse(raw.toString("utf-8")) });
+        const failed = countCalls.length <= countFailures;
+        const reply = JSON.stringify(failed ? { error: "down" } : { input_tokens: Math.floor(raw.length / bytesPerToken) });
+        res.writeHead(failed ? 500 : 200, { "content-type": "application/json" });
+        return res.end(reply);
+      }
       rawBodies.push(raw.toString("utf-8"));
       bodies.push(JSON.parse(raw.toString("utf-8")));
-      const tokens = Math.floor(raw.length / bytesPerToken);
+      const tokens = usageTokens(bodies.at(-1), raw.length) ?? Math.floor(raw.length / bytesPerToken);
       const body = JSON.stringify({
         type: "message",
         id: "msg_upstream",
@@ -8722,7 +8742,7 @@ async function sizingUpstream({ bytesPerToken = 4, reportUsage = true } = {}) {
       res.end(body);
     });
   });
-  return { ...srv, bodies, rawBodies };
+  return { ...srv, bodies, rawBodies, countCalls };
 }
 
 async function edgeHarness({ budget = 20_000, memtree = {}, proxyOpts = {}, upstreamOptions = {} } = {}) {
@@ -8786,6 +8806,140 @@ const countMarkers = (b) =>
     ...(Array.isArray(b.system) ? b.system : []),
     ...b.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])),
   ].filter((p) => p?.cache_control).length;
+
+test("client_input_tokens: a server that undercounts still compresses what ccc measures over budget (2026-10-05 stuck session)", async () => {
+  // Uncalibrated proxy (no upstream usage), so ccc sends a threshold and lets
+  // the server measure; the server sees half the size ccc does. Count Tokens
+  // turns ccc's unknown estimate into an exact one before the decision.
+  const h = await edgeHarness({
+    budget: 20_000,
+    memtree: { charsPerToken: 8 },
+    upstreamOptions: { reportUsage: false },
+    proxyOpts: { countTokens: true },
+  });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    conv.push(assistantText("a1"), markedUser("q2"));
+    assert.equal((await h.post(conv)).turnType, "followup-noop", "learns the server budget");
+    assert.equal(h.upstream.countCalls.length, 0, "small requests are not counted");
+
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const forwarded = h.upstream.bodies.length;
+    const t3 = await h.post(conv);
+    assert.equal(t3.countTokens[0].statusClass, "success");
+    const call = h.compressCalls().at(-1);
+    assert.equal(call.compression_threshold_tokens, undefined, "an exact size forces compression");
+    assert.equal(call.client_input_tokens, t3.compaction.estimatedTokens);
+    assert.ok(call.client_input_tokens > 20_000, "ccc measures the request over budget");
+    assert.equal(t3.turnType, "followup-compressed");
+    assert.equal(h.upstream.bodies.length, forwarded + 1, "forwarded, not refused");
+    const counted = h.upstream.countCalls[0];
+    assert.match(counted.url, /^\/v1\/messages\/count_tokens/);
+    assert.equal(counted.body.max_tokens, undefined, "only countable fields are sent");
+    assert.ok(Array.isArray(counted.body.messages));
+  } finally {
+    h.close();
+  }
+});
+
+test("client_input_tokens: a bytes/4 guess is never sent", async () => {
+  const h = await edgeHarness({
+    budget: 20_000,
+    memtree: { charsPerToken: 8 },
+    upstreamOptions: { reportUsage: false },
+  });
+  try {
+    const conv = [userText("q1")];
+    await h.post(conv);
+    conv.push(assistantText("a1"), markedUser("q2"));
+    await h.post(conv);
+    conv[conv.length - 1] = userText("q2");
+    conv.push(assistantText("a2"), markedUser(BIG("q3")));
+    const t3 = await h.post(conv);
+    assert.equal(t3.compaction.sizeSource, "bytes");
+    assert.equal(h.compressCalls().at(-1).client_input_tokens, undefined);
+  } finally {
+    h.close();
+  }
+});
+
+/** A subagent tool turn whose request body is exactly `bytes` long in edgeHarness.post. */
+function sizedAgentTurn(bytes, extraBody = {}) {
+  const turn = (text) => [
+    userText("task"),
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: text }] },
+  ];
+  const envelope = JSON.stringify({
+    model: "claude-x",
+    max_tokens: 64,
+    system: [{ type: "text", text: "sys", cache_control: EPH }],
+    messages: turn(""),
+    ...extraBody,
+  }).length;
+  return turn("x".repeat(bytes - envelope));
+}
+
+test("a skewed size sample cannot refuse a 469,801-byte subagent request (2026-10-05)", async () => {
+  // A web-search helper's usage counts its server tool results as input:
+  // 12,040 tokens for a tiny body. Neither a helper on the subagent's lane
+  // (parent id only, another model) nor the subagent itself may teach the
+  // subagent that ratio. MemTree is no help here (noop), so before the fix
+  // the inflated estimate hit the fallback refusal.
+  const h = await edgeHarness({
+    budget: 800_000,
+    memtree: { noop: true },
+    upstreamOptions: { usageTokens: (_body, bytes) => (bytes < 2_000 ? 12_040 : undefined) },
+  });
+  try {
+    const search = [userText("Perform a web search for the query: Muse Spark pricing")];
+    await h.post(search, { "x-claude-code-parent-agent-id": "a1" }, { model: "claude-haiku-4-5" });
+    await h.post(search, { "x-claude-code-agent-id": "a2" });
+
+    for (const agent of ["a1", "a2"]) {
+      const forwarded = h.upstream.bodies.length;
+      const rec = await h.post(sizedAgentTurn(469_801), { "x-claude-code-agent-id": agent });
+      assert.equal(rec.routeLane, "agent");
+      assert.equal(rec.requestBytes, 469_801);
+      assert.ok(rec.compaction.estimatedTokens < 200_000, `${agent}: ${rec.compaction.estimatedTokens}`);
+      assert.equal(rec.forwardedBytes, 469_801, `${agent} forwarded whole`);
+      assert.equal(h.upstream.bodies.length, forwarded + 1);
+    }
+  } finally {
+    h.close();
+  }
+});
+
+test("a failed count is reused and native-window fallback ignores a stale learned estimate", async () => {
+  // A plausible stale sample sizes this request at ~422k; Count fails and
+  // MemTree returns unchanged. The plain bytes estimate fits the native
+  // window, so the request goes out without retrying the failed Count call.
+  const h = await edgeHarness({
+    budget: 200_000,
+    memtree: { noop: true },
+    proxyOpts: { countTokens: true },
+    upstreamOptions: {
+      usageTokens: (_body, bytes) => (bytes < 20_000 ? Math.floor(bytes * 0.9) : undefined),
+      countFailures: 1,
+    },
+  });
+  try {
+    const agent = { "x-claude-code-agent-id": "a3" };
+    await h.post(sizedAgentTurn(10_000), agent);
+    const forwarded = h.upstream.bodies.length;
+    const rec = await h.post(sizedAgentTurn(469_801), agent);
+    assert.ok(rec.compaction.estimatedTokens > 400_000, "the stale estimate is over budget");
+    assert.equal(h.upstream.countCalls.length, 1, "failed count is reused");
+    assert.equal(rec.countTokens[0].statusClass, "server-error");
+    assert.equal(rec.overBudgetForward.reason, "bytes-fallback-fits-window");
+    assert.equal(rec.forwardedBytes, 469_801, "sent whole on the exact count");
+    assert.equal(h.upstream.bodies.length, forwarded + 1);
+  } finally {
+    h.close();
+  }
+});
 
 test("edge compaction: passthrough under budget, one compaction to half at the budget, then byte-identical prefix rides until the budget is reached again", async () => {
   const h = await edgeHarness({ budget: 20_000 });
@@ -9266,7 +9420,7 @@ test("tool-loop compaction with a typed prompt pending (headless -p): the result
   }
 });
 
-test("tool-loop compaction: disabled compaction makes no compress call and refuses over-budget tool turns", async () => {
+test("tool-loop compaction: disabled compaction makes no compress call and forwards tool turns within the native window", async () => {
   for (const setup of ["env-off", "command-off", "kill-switch"]) {
     const h = await edgeHarness({
       budget: 20_000,
@@ -9289,8 +9443,8 @@ test("tool-loop compaction: disabled compaction makes no compress call and refus
         if (setup === "kill-switch") assert.equal(rec.compaction, undefined);
         else assert.equal(rec.compaction.mode, "off");
       }
-      assert.ok(h.upstream.bodies.length < 7, "over-budget tool turns do not reach upstream");
-      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 20_000), "every forwarded original fits its budget with output reservation");
+      assert.equal(h.upstream.bodies.length, 7, "all tool turns fit the native window");
+      assert.ok(h.upstream.bodies.every(body => Buffer.byteLength(JSON.stringify(body)) / 4 + 64 < 200_000), "every forwarded original fits the native window with output reservation");
       assert.equal(h.compressCalls().length, 0, `${setup}: no compress call`);
     } finally {
       h.close();
@@ -9512,7 +9666,7 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
         await postMessages(proxy.port, loop, SESSION);
         assert.equal(calls, 2, `${mode}: finite wait allows a fresh compress`);
         assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "compressed");
-        assert.equal(upstream.seen.length, 1, "only the final validated compressed request reaches upstream");
+        assert.equal(upstream.seen.length, 3, "fitting originals forward while the tree is building");
       }
     } finally { await proxy.close(); upstream.close(); memtreeSrv.server.closeAllConnections(); memtreeSrv.close(); }
   }
@@ -9748,8 +9902,10 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
         if (mode === "failure") {
           assert.equal(rec.compress.ok, false, "attempted compression");
           assert.equal(rec.turnType, "followup-degraded");
-          assert.equal(rec.forwardedBytes, 0, "unsafe prefix is not retained as fallback");
-          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+          assert.ok(rec.forwardedBytes > 0, "counting unavailable: validated prefix uses plain bytes");
+          assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "prefix plus output fits native window");
+          assert.equal(h.upstream.bodies.length, upstreamCount + 1, "fitting prefix survives failed compression");
+          assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
         } else {
           assert.equal(h.compressCalls().length, calls + 1);
           assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, undefined);
@@ -9794,7 +9950,9 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
           assert.ok(rec.forwardedBytes / 2 + 64_000 < 200_000);
         } else {
           assert.equal(rec.compress.ok, false);
-          assert.equal(h.upstream.bodies.length, upstreamCount, "unsafe prefix and oversized original are both refused");
+          assert.equal(h.upstream.bodies.length, upstreamCount + 1, "counting unavailable: fitting prefix forwards");
+          assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "prefix plus output fits native window");
+          assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
           if (mode === "backoff") {
             toolStep(conv, "next", 10);
             const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
@@ -9808,8 +9966,10 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
             rec = messageRecords(h.records).at(-1);
             assert.equal(rec.routeRecovery.outcome, "backoff");
             assert.equal(rec.turnType, "tool");
-            assert.equal(res.status, 503, "backoff retains retryability within its bounded allowance");
-            assert.equal(h.upstream.bodies.length, upstreamCount, "backoff cannot forward an oversized original");
+            assert.equal(res.status, 200, "backoff retains the validated byte-fitting prefix");
+            assert.equal(h.upstream.bodies.length, upstreamCount + 2, "backoff does not strand a fitting prefix");
+            assert.ok(rec.forwardedBytes / 4 + 64_000 < 200_000, "output reservation still fits native window");
+            assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
           }
         }
       }

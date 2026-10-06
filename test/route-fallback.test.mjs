@@ -2,14 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fitsFallbackBudget, RouteFallbackFailures } from "../dist/route-fallback.js";
 
-test("unchanged fallback: input within the budget, input plus output within the window", () => {
+test("fallback: soft budget is advisory, input plus output must fit the native window", () => {
   assert.equal(fitsFallbackBudget(80, 20, 100, 200), true);
-  assert.equal(fitsFallbackBudget(101, 0, 100, 200), false, "over-budget input is never sent whole");
+  assert.equal(fitsFallbackBudget(101, 0, 100, 200), true, "soft-budget fallback fits the window");
   assert.equal(fitsFallbackBudget(80, 20, 200, 99), false, "must fit the window with its output");
   // 2026-10-03 benchmark: the server leaves 777k input under its 800k budget alone,
   // so ccc must not refuse it for the 128k output reservation on a 1M window.
   assert.equal(fitsFallbackBudget(776_924, 128_000, 800_000, 1_000_000), true);
-  assert.equal(fitsFallbackBudget(800_001, 0, 800_000, 1_000_000), false);
+  assert.equal(fitsFallbackBudget(800_001, 0, 800_000, 1_000_000), true);
   for (const bad of [NaN, Infinity, -1]) {
     assert.equal(fitsFallbackBudget(bad, 20, 100, 200), false);
     assert.equal(fitsFallbackBudget(80, bad, 100, 200), false);

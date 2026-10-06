@@ -41,7 +41,15 @@
 
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { fitsFallbackBudget, RouteFallbackFailures } from "./route-fallback.js";
+import { RouteFallbackFailures } from "./route-fallback.js";
+import {
+  createCountTokensSession,
+  CountTokensCooldowns,
+  plausibleSample,
+  type SizeSample,
+} from "./count-tokens.js";
+import { RequestSizing, estimateRequestTokens, fitsNative,
+  type RequestCandidate, type SizingLimits } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
 import https from "node:https";
@@ -183,6 +191,14 @@ export interface ProxyOptions {
    * when one exists and otherwise go out whole.
    */
   toolRouteRecovery?: boolean;
+  /**
+   * Size requests exactly with Anthropic's Count Tokens endpoint, using the
+   * request's own credentials (count-tokens.ts): before a compaction decision
+   * when the estimate is unknown or a jump nears the budget, and always before
+   * refusing a request on an estimate. The CLI turns this on
+   * (`CCC_COUNT_TOKENS=0` turns it off); embedders and tests keep estimates.
+   */
+  countTokens?: boolean;
   /**
    * Handle only Claude Code's own requests. ccc launches Claude Code with
    * ANTHROPIC_BASE_URL pointing here, and every program Claude Code runs
@@ -403,10 +419,13 @@ interface ProxyState {
    * forwarded whole (no prefix), with its body bytes, to estimate the next
    * one while the session is still passing through.
    */
+  countTokensCooldowns: CountTokensCooldowns;
   passthroughSizes: Map<string, SizeSample>;
   /**
-   * The same, per route lane, for lanes other than the main thread's
-   * (subagents): the anchor of their tool turns' budget check.
+   * The same for requests other than the main thread's (subagents), keyed by
+   * laneSizeKey: the lane, the requester's own agent id and the model, so a
+   * helper sharing a subagent's lane (a web-search call reporting server tool
+   * results as input) cannot teach that subagent its ratio (2026-10-05).
    */
   laneSizes: Map<string, SizeSample>;
   /** Process lifetime identity; hooks never advance it. */
@@ -451,12 +470,6 @@ interface MemoryRoute {
   lastSize?: SizeSample;
 }
 
-/** A request size Anthropic reported, and the bytes of the body it was for. */
-interface SizeSample {
-  /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
-  tokens: number;
-  forwardedBytes: number;
-}
 
 /**
  * A session's stable compressed prefix (see ProxyState.stablePrefixes). The
@@ -739,6 +752,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     stablePrefixes: new Map(),
     serverBudgets: new Map(),
     serverReportsBudget: false,
+    countTokensCooldowns: new CountTokensCooldowns(),
     passthroughSizes: new Map(),
     laneSizes: new Map(),
   };
@@ -1453,6 +1467,44 @@ async function handleMessages(
   );
   const isSubagentRequest = requestRouteLane === "agent";
   const isMainRequest = requestRouteLane === "main";
+  const requestSizeKey = laneSizeKey(req, requestRouteKey, body.model);
+  // Extended 1M context arrives as the `context-1m` beta header (Claude Code
+  // strips the `[1m]` model suffix on the wire). Current native-1M models send
+  // neither, so contextLimitForModel also needs the launcher's native setting.
+  const modelContextLimit = contextLimitForModel(
+    body.model,
+    headerText(req.headers, "anthropic-beta"),
+    opts.nativeOneMillionContext !== false
+  );
+  // Before anything reads the size sample: replace an unknown or stale
+  // estimate with an exact count where it would decide the outcome.
+  const requestSessionKey = requestSessionId(req);
+  const countSession = createCountTokensSession({
+    upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
+    signal: state.shutdownSignal,
+    onAttempt: (result) => {
+      (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms });
+    },
+  }, state.countTokensCooldowns);
+  const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
+  const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey);
+  const originalCandidate = requestSizing.register(rawBody, "original", sizeSlot.get());
+  const forwardCandidate = requestSizing.register(forwardBody, "original", sizeSlot.get());
+  candidateSizeOwners.set(originalCandidate, sizeSlot);
+  candidateSizeOwners.set(forwardCandidate, sizeSlot);
+  const sizingLimits = (): SizingLimits => ({
+    budget: resolveBudget(opts, state, body.model, modelContextLimit).tokens,
+    context: modelContextLimit,
+    output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0,
+  });
+  const rides = state.memoryRoutes.has(requestRouteKey) ||
+    (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
+  if (!rides) {
+    const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
+    if (measured.source === "exact") {
+      sizeSlot.set({ tokens: measured.tokens, forwardedBytes: forwardCandidate.body.length });
+    }
+  }
   rec.routeLane = requestRouteLane;
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
@@ -1500,42 +1552,27 @@ async function handleMessages(
     state.activeSubagents.size === 0;
   const noticePromptId = state.mainPromptId;
   const noticePromptGeneration = state.mainPromptGeneration;
-  // Extended 1M context arrives as the `context-1m` beta header (Claude Code
-  // strips the `[1m]` model suffix on the wire). Current native-1M models send
-  // neither, so contextLimitForModel also needs the launcher's native setting.
-  const modelContextLimit = contextLimitForModel(
-    body.model,
-    headerText(req.headers, "anthropic-beta"),
-    opts.nativeOneMillionContext !== false
-  );
   requestSendPolicies.set(req, {
     original: rawBody,
     failedRebuild: false,
     allowed: new WeakSet<Buffer>(),
-    accept: (buffer) => {
-      const allowed = requestSendPolicies.get(req)!.allowed;
-      if (allowed.has(buffer)) {
-        if (!routedBodyExceedsContext(body, buffer, modelContextLimit)) return true;
-        allowed.delete(buffer);
-      }
-      const budget = resolveBudget(opts, state, body.model, modelContextLimit);
-      const sample = isMainRequest && requestSessionId(req)
-        ? state.passthroughSizes.get(requestSessionId(req)!) : state.laneSizes.get(requestRouteKey);
-      const estimatedInput = estimateRequestTokens(sample, rawBody.length).tokens;
-      if (fitsFallbackBudget(estimatedInput,
-          typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0,
-          budget.tokens, modelContextLimit)) return true;
-      const failure = state.fallbackFailures.fail(requestRouteKey);
-      rec.forwardedBytes = 0;
-      rec.approxInputTokens = 0;
-      console.error("[ccc proxy] request exceeds compaction budget; recovery failed", {
-        lane: requestRouteKey, attempt: failure.attempt, status: failure.status,
-        inputTokens: estimatedInput, outputTokens: body.max_tokens ?? 0,
-        budgetTokens: budget.tokens, modelContextLimit,
-      });
-      res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
-      res.end(JSON.stringify(failure.body));
-      return false;
+    sizing: requestSizing,
+    select: (buffer) => selectForwardCandidate({
+      opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
+      preferredBody: buffer, limits: sizingLimits(),
+    }),
+    fitsNative: async (buffer) => {
+      const candidate = requestSizing.register(buffer, rec.compress ? "replacement" : "ride");
+      const measured = await requestSizing.measure(candidate, sizingLimits());
+      // A validated ride is still eligible for bounded late recovery. Final
+      // selection considers it together with the original and any replacement.
+      return candidate.kind === "ride" || fitsNative(measured.tokens, sizingLimits());
+    },
+    recoverLate: async (buffer, tokens) => {
+      if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
+          (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false)) return undefined;
+      return recoverLateCount({ opts, state, req, rec, bodyBuffer: buffer,
+        modelContextLimit, clientMeta, sizing: requestSizing });
     },
     delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
   });
@@ -1564,6 +1601,7 @@ async function handleMessages(
     }
     let routedBody = forwardBody;
     let routedTool = false;
+    let routedCandidate: RequestCandidate | undefined;
     let routeMiss: "missing" | "rejected" | "superseded" | undefined;
     if (isToolResultTurn || isContinuationTurn || isUserTurn) {
       // Reuse only this API session/lane's independently validated prefix.
@@ -1576,9 +1614,16 @@ async function handleMessages(
           state.mainRouteEpoch,
           requestSessionId(req)
         );
-        const overContextWindow = rewritten !== null &&
-          routedBodyExceedsContext(body, rewritten, modelContextLimit);
-        if (rewritten && !overContextWindow) {
+        if (rewritten) {
+          const owner = activeRoute.stablePrefix ?? activeRoute;
+          routedCandidate = requestSizing.register(rewritten, "ride", owner.lastSize);
+          candidateSizeOwners.set(routedCandidate, owner);
+          // Advisory window pressure can request recovery, but never removes a
+          // structurally valid candidate before request-local counting/selection.
+          if (!fitsNative(requestSizing.plan(routedCandidate).tokens, sizingLimits())) {
+            routeMiss = "rejected";
+            regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
+          }
           routedBody = rewritten;
           routedTool = true;
           if (opts.debug) {
@@ -1592,12 +1637,7 @@ async function handleMessages(
           // always carries this requester's session id — installMemoryRoute
           // derives both from the same request — so this is by construction a
           // same-session divergence: rebuild while retaining the previous route.
-          // A matching route that outgrew the request's resolved window must
-          // also rebuild; a smaller window lifts the lane's backoff.
           routeMiss = "rejected";
-          if (overContextWindow) {
-            regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
-          }
           if (opts.debug) {
             console.error("[ccc proxy] tool turn rejected active memory route");
           }
@@ -1618,6 +1658,7 @@ async function handleMessages(
       toolSessionId !== undefined &&
       rideableCandidate?.stablePrefix !== state.stablePrefixes.get(toolSessionId)
     ) {
+      if (routedCandidate) requestSizing.excludeFallback(routedCandidate);
       routedTool = false;
       routedBody = forwardBody;
       routeMiss = "superseded";
@@ -1655,6 +1696,8 @@ async function handleMessages(
         messages,
         sessionId: toolSessionId,
         routeKey: requestRouteKey,
+        sizeKey: requestSizeKey,
+        sizing: requestSizing,
         isMainRequest,
         modelContextLimit,
         forwardBody,
@@ -1734,8 +1777,11 @@ async function handleMessages(
               rec,
               conversationBytes,
               routeKey: requestRouteKey,
+              sizeKey: requestSizeKey,
               isMainRequest,
               recoveryAttempt,
+              sizing: requestSizing,
+              inputCandidate: forwardCandidate,
               toolForwarding,
               clientMeta,
               compaction: { target: plan.target, threshold: plan.threshold },
@@ -1792,7 +1838,7 @@ async function handleMessages(
         toolForwarding.settle(delivered);
         if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
         else {
-          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestRouteKey, rec, sendBody.length);
+          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, rec, sendBody.length);
         }
       })
     );
@@ -1808,10 +1854,10 @@ async function handleMessages(
       body,
       messages,
       state.lastMainRoute,
-      requestSessionId(req),
-      modelContextLimit
+      requestSessionId(req)
     );
     if ("body" in fork) {
+      requestSizing.register(fork.body, "ride");
       requestSendPolicies.get(req)?.allowed.add(fork.body);
       releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
       recordTurn(rec, "fork-memory", fork.body);
@@ -1850,6 +1896,7 @@ async function handleMessages(
   const edge =
     isMainRequest && sessionId !== undefined
       ? planEdgeCompaction({
+          sizing: requestSizing,
           opts,
           state,
           body,
@@ -1870,14 +1917,14 @@ async function handleMessages(
    * prefix — and make it the route for the rest of this human turn's tool
    * loop (and, for a compaction, the session's new stable prefix).
    */
-  const forwardCompressed = (
+  const forwardCompressed = async (
     compressedBody: Record<string, any>,
     compressedRaw: Buffer,
     turnType: "followup-compressed" | "followup-prefix",
     stable: StablePrefixInstall | { ride: StablePrefix } | undefined,
     result: CompressResult | undefined
   ): Promise<void> => {
-    if (routedBodyExceedsContext(body, compressedRaw, modelContextLimit)) {
+    if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
       releaseUncommittedRouteDecision();
       recordTurn(rec, "followup-degraded", rawBody);
       return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
@@ -2042,8 +2089,10 @@ async function handleMessages(
     );
   };
 
-  if (existingRide && (!edge || edge.kind === "off") &&
-      !routedBodyExceedsContext(body, existingRide, modelContextLimit)) {
+  if (existingRide && (!edge || edge.kind === "off")) {
+    const owner = rideableCandidate!.stablePrefix ?? rideableCandidate!;
+    const candidate = requestSizing.register(existingRide, "ride", owner.lastSize);
+    candidateSizeOwners.set(candidate, owner);
     return forwardCompressed(JSON.parse(existingRide.toString("utf-8")), existingRide,
       "followup-prefix", undefined, undefined);
   }
@@ -2115,6 +2164,8 @@ async function handleMessages(
       sessionId,
       agentId: agentAttributionId(req),
       clientMeta,
+      sizing: requestSizing,
+      inputCandidate: forwardCandidate,
       ...(edge?.kind === "compress"
         ? { compaction: { target: edge.target, threshold: edge.threshold } }
         : edge?.kind === "off"
@@ -2826,17 +2877,14 @@ function forkRoutedBody(
   body: Record<string, any>,
   messages: Message[],
   route: MemoryRoute | undefined,
-  sessionId: string | undefined,
-  modelContextLimit: number
+  sessionId: string | undefined
 ): { body: Buffer } | { miss: ForkMiss } {
   if (!route) return { miss: "no-route" };
   const miss = prefixMismatch(body, messages, route, sessionId);
   if (miss) return { miss };
   const routed = prefixRoutedBody(body, messages, route);
   if (!routed) return { miss: "prefix" };
-  const buffer = routed.raw;
-  if (routedBodyExceedsContext(body, buffer, modelContextLimit)) return { miss: "too-large" };
-  return { body: buffer };
+  return { body: routed.raw };
 }
 
 /** The compressed-prefix fields a route and a stable prefix share. */
@@ -3072,38 +3120,19 @@ function reportedInputTokens(rec: MessagesRecord): number | undefined {
  * that had shrunk slightly since the sample (1.25 KB less: 284k estimated vs
  * 429k reported), which would delay recompression past the budget. Growth
  * uses the denser of the sample's ratio and bytes/4, so the estimate errs
- * high. bytes/4 only when there is no sample.
+ * high. bytes/4 when there is no sample, or only an implausible one
+ * (plausibleSample): a 12 tokens/byte sample once sized a 469,801-byte
+ * subagent request at 5.78M tokens and refused it (2026-10-05).
  */
-function estimateRequestTokens(
-  sample: SizeSample | undefined,
-  bytes: number
-): { tokens: number; source: "reported" | "bytes" } {
-  if (sample && sample.tokens > 0 && sample.forwardedBytes > 0) {
-    const bytesPerToken = sample.forwardedBytes / sample.tokens;
-    if (bytes <= sample.forwardedBytes) {
-      return { tokens: Math.round(bytes / bytesPerToken), source: "reported" };
-    }
-    const added = bytes - sample.forwardedBytes;
-    return {
-      tokens: sample.tokens + Math.max(
-        approxTokensFromBytes(added),
-        Math.round(added / bytesPerToken)
-      ),
-      source: "reported",
-    };
-  }
-  return { tokens: approxTokensFromBytes(bytes), source: "bytes" };
-}
-
 /** Something a request's reported size is recorded on: a stable prefix or a route. */
 type SizeHolder = { lastSize?: SizeSample };
 
 /** Keep the newest (largest-body) reported size of a request on this prefix. */
 function notePrefixSize(prefix: SizeHolder, rec: MessagesRecord, bytes: number): void {
-  const tokens = reportedInputTokens(rec);
-  if (tokens === undefined) return;
+  const sample = reportedSample(rec, bytes);
+  if (sample === undefined) return;
   if (prefix.lastSize && bytes < prefix.lastSize.forwardedBytes) return;
-  prefix.lastSize = { tokens, forwardedBytes: bytes };
+  prefix.lastSize = sample;
 }
 
 /** Record the reported size of a main-thread request forwarded whole. */
@@ -3113,9 +3142,60 @@ function notePassthroughSize(
   rec: MessagesRecord,
   bytes: number
 ): void {
+  const sample = reportedSample(rec, bytes);
+  if (sessionId === undefined || sample === undefined) return;
+  boundedSet(state.passthroughSizes, sessionId, sample);
+}
+
+/**
+ * The size Anthropic reported for a body of `bytes`, if it can describe one:
+ * an implausible ratio would mis-size every later request it anchors, so it
+ * is dropped and the previous sample kept.
+ */
+function reportedSample(rec: MessagesRecord, bytes: number): SizeSample | undefined {
+  if (changedDeliveryRecords.has(rec)) return undefined;
   const tokens = reportedInputTokens(rec);
-  if (sessionId === undefined || tokens === undefined) return;
-  boundedSet(state.passthroughSizes, sessionId, { tokens, forwardedBytes: bytes });
+  if (tokens === undefined) return undefined;
+  const sample = { tokens, forwardedBytes: bytes };
+  return plausibleSample(sample) ? sample : undefined;
+}
+
+/**
+ * Key of a non-main request's size sample (ProxyState.laneSizes): its lane,
+ * its own agent id (helpers that carry only a parent id stay apart from the
+ * agent), and its model, whose tokenizer the ratio belongs to.
+ */
+function laneSizeKey(req: http.IncomingMessage, routeKey: string, model: unknown): string {
+  return JSON.stringify([
+    routeKey,
+    firstNonEmptyHeader(req, "x-claude-code-agent-id") ?? null,
+    typeof model === "string" ? model : null,
+  ]);
+}
+
+/** Where a request forwarded whole keeps its size sample, read and written. */
+interface SizeSlot {
+  get(): SizeSample | undefined;
+  /** Stores a plausible sample; an implausible one is dropped. */
+  set(sample: SizeSample): void;
+}
+
+/** The session's passthrough size on the main thread, else the lane's. */
+function wholeRequestSizeSlot(
+  state: ProxyState,
+  isMainRequest: boolean,
+  sessionId: string | undefined,
+  sizeKey: string
+): SizeSlot {
+  const main = isMainRequest && sessionId !== undefined;
+  return {
+    get: () => (main ? state.passthroughSizes.get(sessionId!) : state.laneSizes.get(sizeKey)),
+    set: (sample) => {
+      if (!plausibleSample(sample)) return;
+      if (main) boundedSet(state.passthroughSizes, sessionId!, sample);
+      else boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
+    },
+  };
 }
 
 /** Size of a tool turn sent on a ride, recorded on its prefix or route. */
@@ -3129,7 +3209,7 @@ function noteWholeRequestSize(
   state: ProxyState,
   isMainRequest: boolean,
   sessionId: string | undefined,
-  routeKey: string,
+  sizeKey: string,
   rec: MessagesRecord,
   bytes: number
 ): void {
@@ -3137,9 +3217,9 @@ function noteWholeRequestSize(
     notePassthroughSize(state, sessionId, rec, bytes);
     return;
   }
-  const tokens = reportedInputTokens(rec);
-  if (tokens === undefined) return;
-  boundedSet(state.laneSizes, routeKey, { tokens, forwardedBytes: bytes }, MEMORY_ROUTE_MAX_LANES);
+  const sample = reportedSample(rec, bytes);
+  if (sample === undefined) return;
+  boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
 }
 
 function boundedSet<V>(
@@ -3193,6 +3273,7 @@ type EdgePlan =
  * Fills rec.compaction with the budget, estimate and reason.
  */
 function planEdgeCompaction(args: {
+  sizing: RequestSizing;
   opts: ProxyOptions;
   state: ProxyState;
   body: Record<string, any>;
@@ -3256,7 +3337,9 @@ function planEdgeCompaction(args: {
       // never rewrite the prefix's bytes or the user's marker TTLs.
       return forced("prefix-mismatch");
     }
-    const size = estimateRequestTokens(prefix.lastSize, routed.raw.length);
+    const prefixCandidate = args.sizing.register(routed.raw, "ride", prefix.lastSize);
+    candidateSizeOwners.set(prefixCandidate, prefix);
+    const size = args.sizing.plan(prefixCandidate);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = routed.raw.length;
     compaction.sizeSource = size.source;
@@ -3275,10 +3358,7 @@ function planEdgeCompaction(args: {
   }
 
   if (state.compactNow.has(sessionId)) return forced("manual");
-  const size = estimateRequestTokens(
-    state.passthroughSizes.get(sessionId),
-    forwardBody.length
-  );
+  const size = args.sizing.plan(args.sizing.register(forwardBody, "original"));
   compaction.estimatedTokens = size.tokens;
   compaction.estimatedBytes = forwardBody.length;
   compaction.sizeSource = size.source;
@@ -3351,12 +3431,15 @@ type ToolPlan =
  * Fills rec.compaction.
  */
 function planToolCompaction(args: {
+  sizing: RequestSizing;
   opts: ProxyOptions;
   state: ProxyState;
   body: Record<string, any>;
   messages: Message[];
   sessionId: string | undefined;
   routeKey: string;
+  /** laneSizeKey: where a non-main request's size sample lives. */
+  sizeKey: string;
   isMainRequest: boolean;
   modelContextLimit: number;
   forwardBody: Buffer;
@@ -3385,23 +3468,30 @@ function planToolCompaction(args: {
   if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
     const routed = prefixRoutedBody(body, messages, current);
     if (routed) {
+      const prefixCandidate = args.sizing.register(routed.raw, "ride", current.lastSize);
+      candidateSizeOwners.set(prefixCandidate, current);
       if (routedBodyExceedsContext(body, routed.raw, modelContextLimit)) overWindow = true;
       else ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
     }
   }
   if (!ride) {
-    overWindow ||= routedBodyExceedsContext(body, forwardBody, modelContextLimit);
+    const originalSize = args.sizing.plan(args.sizing.register(forwardBody, "original"));
+    overWindow ||= originalSize.tokens + Math.max(0, body.max_tokens ?? 0) > modelContextLimit;
   }
   const sample = ride
     ? ride.sizeHolder.lastSize
     : stableLane
       ? state.passthroughSizes.get(sessionId!)
-      : state.laneSizes.get(args.routeKey);
-  const size = estimateRequestTokens(sample, (ride?.raw ?? forwardBody).length);
+      : state.laneSizes.get(args.sizeKey);
+  const candidate = args.sizing.register(ride?.raw ?? forwardBody,
+    ride ? "ride" : "original", sample);
+  if (ride) candidateSizeOwners.set(candidate, ride.sizeHolder);
+  const size = args.sizing.plan(candidate);
   compaction.estimatedTokens = size.tokens;
   compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
   compaction.sizeSource = size.source;
-  overWindow ||= calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+  overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
+    output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0 });
   if (!args.canCompress) {
     if (overWindow) return { kind: "pass", original: true };
     return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3476,7 +3566,7 @@ function routedBodyExceedsContext(
   const outputTokens = typeof body.max_tokens === "number" &&
     Number.isFinite(body.max_tokens) ? Math.max(0, body.max_tokens) : 0;
   // This is the existing local byte estimate, not a tokenizer or a hard cap.
-  // Recovery remains best-effort and never calls the provider to count tokens.
+  // Final forwarding checks can replace this estimate with Count Tokens.
   return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
 }
 
@@ -3833,6 +3923,8 @@ async function runBlockingCompression(args: {
   /** The subagent this request belongs to: its transcript has the usage and times. */
   agentId?: string;
   clientMeta?: Record<string, string>;
+  sizing: RequestSizing;
+  inputCandidate?: RequestCandidate;
   /**
    * compression_target_tokens / compression_threshold_tokens for this call.
    * Omitted: laneCompaction's (never a bare forcing target).
@@ -3866,6 +3958,13 @@ async function runBlockingCompression(args: {
       : {}),
     ...(compaction.threshold !== undefined
       ? { compressionThresholdTokens: compaction.threshold }
+      : {}),
+    // The size this request was judged by, when a plausible sample (reported
+    // usage or an exact count) calibrated it. Sent so the server compresses
+    // whatever the fallback gate would refuse to send uncompressed; a bytes/4
+    // guess is not sent, as it would force needless compression.
+    ...(args.inputCandidate && args.sizing.clientInputTokens(args.inputCandidate) !== undefined
+      ? { clientInputTokens: args.sizing.clientInputTokens(args.inputCandidate) }
       : {}),
     ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
@@ -3990,8 +4089,12 @@ async function recoverToolRouteMiss(args: {
   rec: MessagesRecord;
   conversationBytes: number;
   routeKey: string;
+  /** laneSizeKey: where a non-main request's size sample lives. */
+  sizeKey: string;
   isMainRequest: boolean;
   recoveryAttempt: ToolRecoveryAttempt;
+  sizing: RequestSizing;
+  inputCandidate?: RequestCandidate;
   toolForwarding: ReturnType<typeof capturePromptDelivery>;
   clientMeta?: Record<string, string>;
   /** compression_target_tokens / threshold for the compress call. */
@@ -4092,7 +4195,7 @@ async function recoverToolRouteMiss(args: {
       rec
     ).then((delivered) => {
       toolForwarding.settle(delivered);
-      noteWholeRequestSize(state, isMainRequest, sessionId, routeKey, rec, args.originalBody.length);
+      noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, rec, args.originalBody.length);
     });
   };
 
@@ -4120,6 +4223,8 @@ async function recoverToolRouteMiss(args: {
       sessionId: requestSessionId(req),
       agentId: agentAttributionId(req),
       clientMeta: args.clientMeta,
+      sizing: args.sizing,
+      inputCandidate: args.inputCandidate,
       ...(args.compaction ? { compaction: args.compaction } : {}),
     });
   } catch {
@@ -4249,7 +4354,7 @@ async function recoverToolRouteMiss(args: {
     return forwardOriginal();
   }
   const { compressedBody, compressedRaw } = built;
-  if (routedBodyExceedsContext(body, compressedRaw, modelContextLimit)) {
+  if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
     rec.routeRecovery = { conversationBytes, outcome: "unusable" };
     releaseOwnReservation();
     return forwardOriginal();
@@ -4526,12 +4631,148 @@ const recapLinkAppenders = new WeakMap<
   (streamedTextChars: number) => string | undefined
 >();
 
+/** One delivery-time retry, against the assembled body whose exact count exceeded the budget. */
+async function recoverLateCount(args: {
+  opts: ProxyOptions; state: ProxyState; req: http.IncomingMessage; rec: MessagesRecord;
+  bodyBuffer: Buffer; modelContextLimit: number; sizing: RequestSizing;
+  clientMeta: Record<string, string>;
+}): Promise<Buffer | undefined> {
+  try {
+    const body = JSON.parse(args.bodyBuffer.toString("utf-8"));
+    const messages = normalizeMessagesForMemtree(messagesWithSystem(body.messages, body.system));
+    const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
+    const outcome = await runBlockingCompression({
+      opts: args.opts, state: args.state, body, msgsForMemtree: messages,
+      hash: MemtreeClient.hashMessages(messages), modelContextLimit: args.modelContextLimit,
+      rec: args.rec, sessionId: requestSessionId(args.req), agentId: agentAttributionId(args.req),
+      clientMeta: args.clientMeta, sizing: args.sizing,
+      inputCandidate: args.sizing.register(args.bodyBuffer, "ride"),
+      compaction: { target: compactionTarget(
+        compactionMode(args.opts, args.state, requestSessionId(args.req)), budget) },
+    });
+    noteMemtreeHealth(args.state, outcome);
+    if (!outcome.result || !didMemtreeCompress(outcome.result) ||
+        !checkCompressedHistory(outcome.result, messages).usable) return undefined;
+    const built = buildCompressedBody(body, outcome.result);
+    if (!built) return undefined;
+    return built.compressedRaw;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Select a measured eligible body before delivery; refusing one candidate never
+ * prevents considering the original or a validated prefix retained by planning. */
+async function selectForwardCandidate(args: {
+  opts: ProxyOptions; state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
+  body: Record<string, any>; modelContextLimit: number; req: http.IncomingMessage;
+  routeKey: string; preferredBody: Buffer; limits: SizingLimits;
+}): Promise<Buffer | undefined> {
+  const policy = requestSendPolicies.get(args.req)!;
+  const intended = policy.failedRebuild && !policy.allowed.has(args.preferredBody)
+    ? policy.original : args.preferredBody;
+  const preferred = policy.sizing.register(intended,
+    policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
+  const measured = await policy.sizing.measure(preferred, args.limits);
+  let target = preferred;
+  if (preferred.kind === "ride" && measured.source === "exact" &&
+      measured.tokens > args.limits.budget && !args.rec.compress && !args.rec.lateCountRecovery) {
+    args.rec.lateCountRecovery = { outcome: "forwarded" };
+    const replacement = await policy.recoverLate(preferred.body, measured.tokens);
+    if (replacement) target = policy.sizing.register(replacement, "replacement");
+  }
+  const selection = await policy.sizing.select(target, args.limits);
+  if (!selection) {
+    if (args.rec.lateCountRecovery) args.rec.lateCountRecovery.outcome = "refused";
+    refuseWholeRequest(args, measured.tokens, args.limits.budget);
+    return undefined;
+  }
+  const { candidate, measurement } = selection;
+  const changed = candidate !== preferred || intended !== args.preferredBody;
+  if (changed) {
+    policy.allowed.delete(args.preferredBody);
+    changedDeliveryRecords.add(args.rec);
+    selectedCandidates.set(args.rec, candidate);
+    recordTurn(args.rec, args.rec.turnType, candidate.body);
+  }
+  if (args.rec.lateCountRecovery) args.rec.lateCountRecovery.outcome =
+    changed && candidate.kind === "replacement" ? "compressed" : "forwarded";
+  delete args.rec.overBudgetForward;
+  if (measurement.tokens > args.limits.budget ||
+      (measurement.source !== "exact" && candidate.kind === "original" &&
+        measurement.estimatedTokens > args.limits.budget)) {
+    args.rec.overBudgetForward = { reason: measurement.source === "exact"
+      ? "exact-count-fits-window" : measurement.source === "bytes"
+        ? "bytes-fallback-fits-window" : "estimate-fits-window" };
+  }
+  return changed ? candidate.body : intended;
+}
+
+/** Write the bounded fallback refusal (route-fallback.ts); always false. */
+function refuseWholeRequest(
+  args: { state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
+    body: Record<string, any>; modelContextLimit: number; routeKey: string },
+  inputTokens: number,
+  budgetTokens: number
+): false {
+  const failure = args.state.fallbackFailures.fail(args.routeKey);
+  args.rec.forwardedBytes = 0;
+  args.rec.approxInputTokens = 0;
+  console.error("[ccc proxy] request exceeds native context window; recovery failed", {
+    lane: args.routeKey, attempt: failure.attempt, status: failure.status,
+    inputTokens, outputTokens: args.body.max_tokens ?? 0,
+    budgetTokens, modelContextLimit: args.modelContextLimit,
+  });
+  if (args.res.headersSent || args.res.destroyed) return false;
+  args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
+  args.res.end(JSON.stringify(failure.body));
+  return false;
+}
+
+const changedDeliveryRecords = new WeakSet<MessagesRecord>();
+const selectedCandidates = new WeakMap<MessagesRecord, RequestCandidate>();
+const candidateSizeOwners = new WeakMap<RequestCandidate, SizeHolder | SizeSlot>();
+
 const requestSendPolicies = new WeakMap<http.IncomingMessage, {
-  original: Buffer; failedRebuild: boolean; allowed: WeakSet<Buffer>; accept: (body: Buffer) => boolean;
+  original: Buffer; failedRebuild: boolean; allowed: WeakSet<Buffer>;
+  sizing: RequestSizing;
+  fitsNative: (body: Buffer) => Promise<boolean>;
+  recoverLate: (body: Buffer, tokens: number) => Promise<Buffer | undefined>;
+  /** The exact body selected for delivery, or undefined after a refusal. */
+  select: (body: Buffer) => Promise<Buffer | undefined>;
   delivered: () => void;
 }>();
 
-function forwardRaw(
+async function forwardRaw(
+  req: http.IncomingMessage, res: http.ServerResponse, bodyBuffer: Buffer,
+  opts: ProxyOptions, upstream: Upstream, shutdownSignal: AbortSignal,
+  rec?: MessagesRecord, onProtocolComplete?: () => void
+): Promise<boolean> {
+  const policy = requestSendPolicies.get(req);
+  const selected = policy ? await policy.select(bodyBuffer) : bodyBuffer;
+  if (!selected) return false;
+  const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec,
+    selected === bodyBuffer ? onProtocolComplete : undefined);
+  if (delivered && rec) noteSelectedCandidateSize(rec);
+  return delivered;
+}
+
+/** Attribute a fallback response only to the body and size owner actually sent. */
+function noteSelectedCandidateSize(rec: MessagesRecord): void {
+  const candidate = selectedCandidates.get(rec);
+  const owner = candidate && candidateSizeOwners.get(candidate);
+  const tokens = reportedInputTokens(rec);
+  if (!candidate || !owner || tokens === undefined) return;
+  const sample = { tokens, forwardedBytes: candidate.body.length };
+  if (!plausibleSample(sample)) return;
+  if ("set" in owner) owner.set(sample);
+  else if (!owner.lastSize || sample.forwardedBytes >= owner.lastSize.forwardedBytes) {
+    owner.lastSize = sample;
+  }
+}
+
+/** forwardRaw once the request's send policy (if any) accepted the body. */
+function forwardAccepted(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   bodyBuffer: Buffer,
@@ -4542,8 +4783,6 @@ function forwardRaw(
   onProtocolComplete?: () => void
 ): Promise<boolean> {
   const policy = requestSendPolicies.get(req);
-  if (policy && !policy.accept(bodyBuffer)) return Promise.resolve(false);
-  if (policy?.failedRebuild && !policy.allowed.has(bodyBuffer)) bodyBuffer = policy.original;
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
     headers["content-length"] = String(bodyBuffer.length);
