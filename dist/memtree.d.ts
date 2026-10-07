@@ -16,11 +16,20 @@
  * amplify identical HTTP calls, and budget-changing inputs never reuse a
  * stale compression result.
  */
+import { type FinalReplyReader } from "./final-index.js";
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 export declare const CLIENT_VERSION: string;
+/**
+ * A main-lane Stop followed by this long without a new request is taken as the
+ * session's end, and its final index goes out (exit sends it at once). Shorter
+ * pauses spend the server's once-per-30-minutes final index mid-session.
+ */
+export declare const FINAL_INDEX_IDLE_MS: number;
+/** Sessions finalized at exit at most (newest first), inside the 2 s drain. */
+export declare const FINAL_INDEX_EXIT_SESSIONS = 3;
 export interface MemtreeOptions {
     baseUrl: string;
     apiKey: string;
@@ -252,6 +261,14 @@ export declare class MemtreeClient {
     private backgroundIndexes;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
+    /** Session → its main lane's latest conversation, for the final index. */
+    private readonly mainConversations;
+    /** Session → its final index waiting for the session to stay idle. */
+    private readonly pendingFinals;
+    /** Session → hash of the conversation its last final index sent. */
+    private readonly finalIndexed;
+    private readonly finalPreparing;
+    private finalDrainDeadline;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     private unpaidDetail;
     /** Complete compression request key → whether its latest failure arms fuse. */
@@ -329,6 +346,33 @@ export declare class MemtreeClient {
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes): void;
     /**
+     * The main lane's latest conversation for a session, kept for its final
+     * index (scheduleFinalIndex). A new request also means the session did not
+     * end at the last Stop: its pending final index is cancelled.
+     */
+    noteMainConversation(sessionId: string | undefined, conversation: MainConversation): void;
+    /**
+     * After a main-lane Stop: once the session has been idle `delayMs` (or at
+     * shutdown, flushFinalIndexes), send its conversation plus the reply it
+     * ended with as one index-only call flagged final_index, so the server
+     * indexes the tail even below its 10k-token minimum (at most once per
+     * conversation per 30 minutes, server-side). Every per-request index call
+     * lacks that reply: it only appears in the next request. `readReply` reads
+     * it from the transcript when the call goes out, not inside the hook.
+     */
+    scheduleFinalIndex(sessionId: string | undefined, readReply: FinalReplyReader, delayMs?: number): void;
+    /**
+     * At shutdown, before drainBackground: finalize at most the three newest
+     * sessions, including sessions that never had a Stop (`-p`
+     * and non-TTY runs install no hooks). Never throws: a failure here must not
+     * change ccc's exit code. The calls share drainBackground's bounded wait.
+     */
+    flushFinalIndexes(timeoutMs?: number): void;
+    private cancelFinalIndex;
+    private fireFinalIndex;
+    private sendFinalIndex;
+    private submitIndexOnly;
+    /**
      * Stop accepting background indexes and wait boundedly for those already in
      * flight. Calls still running after the grace period are aborted, and this
      * method does not return until their final request-log records are produced.
@@ -340,4 +384,15 @@ export declare class MemtreeClient {
     private callContextMemory;
     private log;
 }
+/** What noteMainConversation keeps: the last main-lane request as sent to MemTree. */
+export interface MainConversation {
+    messages: Message[];
+    modelContextLimit: number;
+    clientMeta?: Record<string, string>;
+    messageTimesFor?: (messages: Message[]) => MessageTimes;
+    /** The reply the session ended with (Claude Code's transcript), for a final index at exit. */
+    readReply?: FinalReplyReader;
+}
+/** The conversation plus the reply that ended it, unless it already ends with a reply. */
+export declare function withFinalReply(messages: Message[], reply: Message | undefined): Message[];
 //# sourceMappingURL=memtree.d.ts.map

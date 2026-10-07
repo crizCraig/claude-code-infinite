@@ -18,6 +18,12 @@ export interface TranscriptUsageSource {
      * knows; a subagent's (`agentId`) from its own transcript.
      */
     timesFor?(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
+    /**
+     * The session's last assistant reply when it made no tool call (the answer
+     * a turn ended with), as a message; read to the transcript's end.
+     */
+    finalReply?(sessionId: string): Message | undefined;
+    finalReplyAsync?(sessionId: string, signal?: AbortSignal): Promise<Message | undefined>;
 }
 /**
  * Reads transcripts incrementally: each session's file is opened once and
@@ -36,6 +42,8 @@ export declare class ClaudeTranscriptUsage implements TranscriptUsageSource {
      */
     catchUp(sessionId: string): void;
     timesFor(sessionId: string, messages: Message[], agentId?: string): MessageTimes;
+    finalReply(sessionId: string): Message | undefined;
+    finalReplyAsync(sessionId: string, signal?: AbortSignal): Promise<Message | undefined>;
     private indexFor;
 }
 /** `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`. */

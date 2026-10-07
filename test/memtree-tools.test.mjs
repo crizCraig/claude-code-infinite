@@ -230,6 +230,96 @@ test("CurrentTree follows the proxy's current page and caches it until the page 
   await assert.rejects(new CurrentTree({}).get(), /need a running ccc session/);
 });
 
+test("A tree the server will never build (410) is a final answer, not 'still being built'", async () => {
+  const gone = {
+    status: "unavailable", reason: "failed", request_id: "ddd444",
+    detail: "Indexing this request's conversation failed and will not be retried. The tree will not appear here; open a newer page of the session instead.",
+  };
+  const fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/memtree/current") {
+      return Response.json({ session_id: "session-1", id: "ddd444", url: "https://app/m/ddd444" });
+    }
+    return Response.json(gone, { status: 410 });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "session-1", fetch });
+  await assert.rejects(tree.get(), (err) => {
+    assert.match(err.message, /HTTP 410 .*will not be retried.*newer page/);
+    assert.doesNotMatch(err.message, /still being built|try again/);
+    return true;
+  });
+  await assert.rejects(tree.search("deploy", undefined, "ddd444"), /HTTP 410 .*newer page/);
+});
+
+test("read_lines {tail: true} reads the un-indexed messages fresh from the server", async () => {
+  const urls = [];
+  let session = "session-1";
+  let tailStatus = 200;
+  const body = () => ({
+    session_id: session, request_id: "aaa111", tail_start: 2050, tail_end: 2052, start: 2051, end: 2052,
+    messages: [
+      { i: 2051, k: "user", x: "open the PR", at: "2026-10-06T01:00:00Z" },
+      { i: 2052, k: "assistant", x: "PR #42 opened: https://example/pr/42" },
+    ],
+  });
+  const fetch = async (url) => {
+    const u = new URL(url);
+    urls.push(u.pathname + u.search);
+    if (u.pathname === "/memtree/current") {
+      return Response.json({ session_id: "session-1", id: "aaa111", url: "https://app/m/aaa111" });
+    }
+    return tailStatus === 200 ? Response.json(body()) : Response.json({ detail: "No un-indexed messages after this tree" }, { status: tailStatus });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "session-1", fetch });
+  const call = async (args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "read_lines", arguments: args } }, tree))
+      .result.content[0].text;
+
+  const text = await call({ tail: true });
+  assert.match(text, /^After this tree: messages 2051-2052 of the conversation's newest record/);
+  assert.match(text, /no tree covers it yet/, "older servers send no not_indexed_from");
+  assert.match(text, /\[2052\] assistant\nPR #42 opened/);
+  assert.match(text, /\[2051\] user · 2026-10-06T01:00:00Z\nopen the PR/);
+  assert.match(text, /earlier: read_lines \{"tail": true, "end": 2050\}/);
+  assert.equal(urls.at(-1), "/memtree/aaa111/messages", "no range: the server's newest messages");
+  await call({ tail: true, start: 2050, end: 2051 });
+  assert.equal(urls.at(-1), "/memtree/aaa111/messages?start=2050&end=2051");
+  await call({ tail: true, tree: "bbb222-v1-own", start: 2051 });
+  assert.equal(urls.at(-1), "/memtree/bbb222-v1-own/messages?start=2051", "another session's page by ref");
+  assert.match(await call({ tail: true, start: "x" }), /message positions/);
+  session = "someone-else";
+  assert.match(await call({ tail: true }), /different or unknown session/, "current tail must be this session's");
+  session = "session-1";
+  tailStatus = 404;
+  assert.match(await call({ tail: true }), /^No un-indexed messages after this tree/);
+  tailStatus = 410;
+  assert.match(await call({ tail: true }), /MemTree tail unavailable .*HTTP 410/);
+  tailStatus = 416;
+  assert.match(await call({ tail: true, start: 9000 }), /^read_lines: No un-indexed messages after this tree/,
+    "an out-of-range read is a plain read_lines error carrying the server's detail");
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /read_lines \{"tail": true\}/);
+  const readLines = MEMTREE_TOOLS.find((t) => t.name === "read_lines");
+  assert.match(readLines.description, /tail: true/);
+  assert.equal(readLines.inputSchema.properties.tail.type, "boolean");
+});
+
+test("formatTail shows which tail messages a newer tree already covers", async () => {
+  const { formatTail } = await import("../dist/memtree-tools.js");
+  const text = formatTail({
+    tail_start: 10, tail_end: 12, not_indexed_from: 12,
+    messages: [
+      { i: 11, k: "assistant", x: "covered", state: "in_newer_tree" },
+      { i: 12, k: "assistant", x: "PR opened", state: "not_indexed" },
+    ],
+  });
+  assert.match(text, /a newer tree covers it up to 11; from 12 on, no tree yet/);
+  assert.match(text, /\[11\] assistant · in a newer tree\ncovered/);
+  assert.match(text, /\[12\] assistant\nPR opened/);
+  const whole = formatTail({ tail_start: 10, tail_end: 10, not_indexed_from: null,
+    messages: [{ i: 10, k: "user", x: "x", state: "in_newer_tree" }] });
+  assert.match(whole, /a newer tree of this conversation covers all of it/);
+});
+
 test("CurrentTree serves a prefix through its cooldown, refreshes after it, then caches completion", async () => {
   let now = 0;
   let pageFetches = 0;

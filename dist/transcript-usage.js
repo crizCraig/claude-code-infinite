@@ -27,6 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { setImmediate as yieldTurn } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 /** Session and agent ids name files: no path separators or dots. */
@@ -95,6 +96,46 @@ export class ClaudeTranscriptUsage {
             return {};
         }
     }
+    finalReply(sessionId) {
+        try {
+            const index = this.indexFor(sessionId);
+            if (!index)
+                return undefined;
+            let read = 0;
+            while (read < MAX_CATCH_UP_BYTES) {
+                const bytes = index.refresh();
+                if (bytes === 0)
+                    break;
+                read += bytes;
+            }
+            return index.finalReply();
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async finalReplyAsync(sessionId, signal) {
+        await yieldTurn(undefined, { signal });
+        try {
+            const index = this.indexFor(sessionId);
+            if (!index)
+                return undefined;
+            let read = 0;
+            while (read < MAX_CATCH_UP_BYTES) {
+                await yieldTurn(undefined, { signal });
+                const bytes = index.refresh();
+                if (bytes === 0)
+                    return index.finalReply();
+                read += bytes;
+            }
+            // A partial transcript cannot establish the latest turn's answer.
+            return undefined;
+        }
+        catch {
+            signal?.throwIfAborted();
+            return undefined;
+        }
+    }
     indexFor(sessionId, agentId) {
         if (!SAFE_ID.test(sessionId))
             return undefined;
@@ -159,8 +200,19 @@ class TranscriptIndex {
     timesByUserText = new Map();
     /** Hash of a response's text → every response id with that text, in order. */
     idsByText = new Map();
+    /** The newest response's id, and every response that called a tool. */
+    lastResponseId;
+    toolCallingIds = new Set();
     constructor(file) {
         this.file = file;
+    }
+    /** The newest response as a text-only assistant message, unless it called a tool. */
+    finalReply() {
+        const id = this.lastResponseId;
+        if (id === undefined || this.toolCallingIds.has(id))
+            return undefined;
+        const text = this.textById.get(id);
+        return text && text.trim() ? { role: "assistant", content: [{ type: "text", text }] } : undefined;
     }
     /** Reads the next bounded chunk; returns the bytes read (0 at the end). */
     refresh() {
@@ -376,6 +428,9 @@ class TranscriptIndex {
         }
         const time = entryTime(entry);
         if (entry?.type === "user") {
+            // A later user/tool-result entry starts an unanswered turn. An exit
+            // before its response must not append the preceding turn's answer.
+            this.lastResponseId = undefined;
             if (time)
                 this.ingestUserTime(entry.message, time);
             return;
@@ -386,6 +441,7 @@ class TranscriptIndex {
         const id = message?.id;
         if (typeof id !== "string")
             return;
+        this.lastResponseId = id;
         if (time)
             this.timeById.set(id, latest([this.timeById.get(id), time]));
         const usage = toUsage(message.usage);
@@ -397,6 +453,7 @@ class TranscriptIndex {
         for (const part of Array.isArray(message.content) ? message.content : []) {
             if (part?.type === "tool_use" && typeof part.id === "string") {
                 this.idByToolUse.set(part.id, id);
+                this.toolCallingIds.add(id);
             }
             else if (part?.type === "text" && typeof part.text === "string") {
                 const text = (this.textById.get(id) ?? "") + part.text;
@@ -438,6 +495,8 @@ class TranscriptIndex {
         this.timeByToolResult.clear();
         this.timesByUserText.clear();
         this.idsByText.clear();
+        this.lastResponseId = undefined;
+        this.toolCallingIds.clear();
     }
 }
 function toUsage(raw) {

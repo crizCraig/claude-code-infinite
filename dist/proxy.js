@@ -373,7 +373,9 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return;
     }
     if (url.pathname === hookPath) {
-        return handleNoticeHook(req, res, state, opts.reqlog);
+        return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
+            ? opts.transcriptUsage.finalReplyAsync(sessionId, signal)
+            : opts.transcriptUsage?.finalReply?.(sessionId)));
     }
     if (req.method === "GET" &&
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
@@ -438,12 +440,13 @@ const MEMTREE_PASSTHROUGH_PREFIX = "/memtree/";
 /**
  * `<request id>`, `<request id>.json`, `<request id>/session.json` (the
  * page's session pane), `<request id>/search` (the server's term search over
- * that tree, `?q=&limit=`), or `sessions/<Claude Code session id>.json` (every
+ * that tree, `?q=&limit=`), `<request id>/messages` (the un-indexed messages
+ * after it, `?start=&end=`), or `sessions/<Claude Code session id>.json` (every
  * page from one session, newest first); nothing that could walk the upstream
  * path. The id is the request UUID or the server's short form of it (leading
  * hex, as in the `/m/<id>` links it hands out) — the server accepts both.
  */
-const MEMTREE_PASSTHROUGH_TARGET_RE = /^(?:[A-Za-z0-9-]+(\.json|\/session\.json|\/search)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
+const MEMTREE_PASSTHROUGH_TARGET_RE = /^(?:[A-Za-z0-9-]+(\.json|\/session\.json|\/search|\/messages)?|sessions\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json)$/;
 /**
  * `GET /memtree/<id>[.json][?share=…]` on the loopback: read the user's own
  * MemTree page with their key. Claude Code's child env already carries this
@@ -571,7 +574,9 @@ export function memtreePageId(pageUrl) {
     }
 }
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
-async function handleNoticeHook(req, res, state, reqlog) {
+async function handleNoticeHook(req, res, state, reqlog, 
+/** A main-lane turn ended: the session may be over (its final index). */
+onMainStop) {
     if (req.method !== "POST") {
         res.writeHead(405, { allow: "POST" });
         res.end();
@@ -688,6 +693,7 @@ async function handleNoticeHook(req, res, state, reqlog) {
         ? null
         : state.notices.claim(parsed);
     if (stopMatchesMainPrompt) {
+        onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
         state.mainNoticePending = false;
         state.mainPromptId = undefined;
         state.mainPromptText = undefined;
@@ -991,6 +997,20 @@ async function handleMessages(req, res, opts, upstream, state) {
     const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
     const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
     const hash = MemtreeClient.hashMessages(msgsForMemtree);
+    // The main lane's latest conversation: what its final index sends, plus the
+    // reply the session ends with (scheduleFinalIndex, on Stop).
+    const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
+    if (mainSessionId !== undefined) {
+        opts.memtree.noteMainConversation(mainSessionId, {
+            messages: msgsForMemtree,
+            modelContextLimit,
+            clientMeta,
+            messageTimesFor: transcriptTimesFor(opts, mainSessionId),
+            readReply: (signal) => opts.transcriptUsage?.finalReplyAsync
+                ? opts.transcriptUsage.finalReplyAsync(mainSessionId, signal)
+                : opts.transcriptUsage?.finalReply?.(mainSessionId),
+        });
+    }
     // Hook state controls notices only. Hidden requests cannot consume main notices.
     if (typeof body.model === "string")
         rec.model = body.model;

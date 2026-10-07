@@ -370,4 +370,39 @@ export function formatLines(index, block, start, end, tree) {
     const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;
     return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
 }
+/**
+ * read_lines {"tail": true}: the messages after the tree that no tree covers
+ * yet, verbatim, by position in the conversation's newest record.
+ */
+export function formatTail(body, tree) {
+    const page = body;
+    const messages = Array.isArray(page?.messages) ? page.messages : [];
+    if (!messages.length) {
+        return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}).`;
+    }
+    const first = messages[0].i;
+    const last = messages[messages.length - 1].i;
+    const from = page.not_indexed_from;
+    const coverage = from === undefined || from === page.tail_start ? "no tree covers it yet"
+        : from === null ? "a newer tree of this conversation covers all of it (see later_trees)"
+            : `a newer tree covers it up to ${from - 1}; from ${from} on, no tree yet`;
+    const out = [
+        `After this tree: messages ${first}-${last} of the conversation's newest record ` +
+            `(the whole tail is ${page.tail_start}-${page.tail_end}; ${coverage}).`,
+    ];
+    for (const m of messages) {
+        const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
+        out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}`, m.x ?? "");
+    }
+    const notes = [];
+    if (typeof page.tail_start === "number" && first > page.tail_start) {
+        notes.push(`earlier: read_lines {${treeArg(tree)}"tail": true, "end": ${first - 1}}`);
+    }
+    if (typeof page.tail_end === "number" && last < page.tail_end) {
+        notes.push(`later: read_lines {${treeArg(tree)}"tail": true, "start": ${last + 1}}`);
+    }
+    if (notes.length)
+        out.push("", `[${notes.join("; ")}]`);
+    return out.join("\n");
+}
 //# sourceMappingURL=memtree-tools.js.map

@@ -380,6 +380,9 @@ async function main() {
         // stop and drain it too before waiting for scheduled JSONL appends on
         // disk.
         await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+        // A session ending now sends its final index at once (the idle timer
+        // would never fire), inside the same bounded background drain.
+        memtree.flushFinalIndexes();
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
         await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
         process.exit(code);

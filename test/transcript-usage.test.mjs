@@ -464,3 +464,49 @@ test("catchUp reads a resumed transcript to its end before the first lookup", (t
   resumed.catchUp(SESSION);
   assert.equal(resumed.usageFor(SESSION, messages)["0"].thinking_tokens, 40);
 });
+
+test("finalReply is the newest response's text, unless it called a tool", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file,
+    entry("r1", [{ type: "tool_use", id: "t1", name: "Bash", input: {} }], usage(5, 0)) +
+    JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }) + "\n" +
+    entry("r2", [{ type: "thinking", thinking: "hmm" }], usage(10, 5)) +
+    entry("r2", [{ type: "text", text: "PR #42 " }], usage(10, 5)) +
+    entry("r2", [{ type: "text", text: "opened." }], usage(12, 5)));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.deepEqual(source.finalReply(SESSION),
+    { role: "assistant", content: [{ type: "text", text: "PR #42 opened." }] });
+  fs.appendFileSync(file, entry("r3", [{ type: "tool_use", id: "t2", name: "Read", input: {} }], usage(3, 0)));
+  assert.equal(source.finalReply(SESSION), undefined, "a turn that ended in a tool call has no final reply");
+  assert.equal(source.finalReply("../escape"), undefined);
+  assert.equal(new ClaudeTranscriptUsage(root).finalReply("00000000-0000-0000-0000-000000000000"), undefined);
+});
+
+test("finalReply never reuses an earlier answer after an unanswered user turn", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, entry("old", [{ type: "text", text: "old answer" }], usage(10, 0)));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.ok(source.finalReply(SESSION));
+  fs.appendFileSync(file, JSON.stringify({ type: "user", message: {
+    role: "user", content: "new unanswered request"
+  } }) + "\n");
+  assert.equal(source.finalReply(SESSION), undefined);
+  fs.appendFileSync(file, entry("new", [{ type: "text", text: "new answer" }], usage(10, 0)));
+  assert.deepEqual(source.finalReply(SESSION), {
+    role: "assistant", content: [{ type: "text", text: "new answer" }]
+  });
+});
+
+test("final transcript preparation yields and respects cancellation", async (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(file, entry("new", [{ type: "text", text: "answer" }], usage(10, 0)));
+  const source = new ClaudeTranscriptUsage(root);
+  const controller = new AbortController();
+  const pending = source.finalReplyAsync(SESSION, controller.signal);
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.deepEqual(await source.finalReplyAsync(SESSION), {
+    role: "assistant", content: [{ type: "text", text: "answer" }]
+  });
+});

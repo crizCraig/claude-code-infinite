@@ -97,4 +97,9 @@ export declare function serverSearchHits(body: unknown): {
 export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string): string;
 export declare function formatNode(index: MemtreeIndex, id: number, tree?: string): string;
 export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number, tree?: string): string;
+/**
+ * read_lines {"tail": true}: the messages after the tree that no tree covers
+ * yet, verbatim, by position in the conversation's newest record.
+ */
+export declare function formatTail(body: unknown, tree?: string): string;
 //# sourceMappingURL=memtree-tools.d.ts.map
