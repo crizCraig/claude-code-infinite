@@ -17,6 +17,7 @@
  * stale compression result.
  */
 import { createHash } from "node:crypto";
+import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
@@ -675,6 +676,8 @@ export class MemtreeClient {
     pendingFinals = new Map();
     /** Session → hash of the conversation its last final index sent. */
     finalIndexed = new Map();
+    finalPreparing = new Map();
+    finalDrainDeadline;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     unpaidDetail = null;
     /** Complete compression request key → whether its latest failure arms fuse. */
@@ -850,6 +853,7 @@ export class MemtreeClient {
         if (sessionId === undefined)
             return;
         this.cancelFinalIndex(sessionId);
+        this.finalPreparing.get(sessionId)?.abort();
         this.mainConversations.delete(sessionId);
         this.mainConversations.set(sessionId, conversation);
         if (this.mainConversations.size > DEDUPE_CACHE_MAX) {
@@ -878,22 +882,20 @@ export class MemtreeClient {
         this.pendingFinals.set(sessionId, { timer, readReply });
     }
     /**
-     * At shutdown, before drainBackground: send every pending final index now,
-     * and one for each of the most recent sessions that never had a Stop (`-p`
+     * At shutdown, before drainBackground: finalize at most the three newest
+     * sessions, including sessions that never had a Stop (`-p`
      * and non-TTY runs install no hooks). Never throws: a failure here must not
      * change ccc's exit code. The calls share drainBackground's bounded wait.
      */
-    flushFinalIndexes() {
-        const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS);
-        const sessions = new Set([...this.pendingFinals.keys(), ...recent]);
-        for (const sessionId of sessions) {
-            try {
-                this.fireFinalIndex(sessionId, true);
-            }
-            catch (err) {
-                this.log(`final index at exit failed (ignored): ${err?.message ?? err}`);
-            }
-        }
+    flushFinalIndexes(timeoutMs = 2_000) {
+        if (this.backgroundClosing)
+            return;
+        this.finalDrainDeadline ??= Date.now() + Math.max(0, timeoutMs);
+        const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS).reverse();
+        for (const sessionId of recent)
+            this.fireFinalIndex(sessionId, true);
+        for (const sessionId of this.pendingFinals.keys())
+            this.cancelFinalIndex(sessionId);
     }
     cancelFinalIndex(sessionId) {
         const pending = this.pendingFinals.get(sessionId);
@@ -907,24 +909,32 @@ export class MemtreeClient {
         const conversation = this.mainConversations.get(sessionId);
         if ((!pending && !atExit) || !conversation || this.backgroundClosing)
             return;
-        const readReply = pending?.readReply ?? conversation.readReply;
-        let reply;
-        try {
-            reply = readReply?.();
-        }
-        catch {
-            reply = undefined; // no transcript reply: the conversation alone still indexes
-        }
-        const messages = withFinalReply(conversation.messages, reply);
-        const key = MemtreeClient.hashMessages(messages);
-        if (this.finalIndexed.get(sessionId) === key)
+        if (this.finalPreparing.has(sessionId))
             return;
-        this.finalIndexed.set(sessionId, key);
-        this.submitIndexOnly(messages, conversation.modelContextLimit, {
-            sessionId,
-            clientMeta: conversation.clientMeta,
-            messageTimesFor: conversation.messageTimesFor,
-            finalIndex: true,
+        const controller = new AbortController();
+        this.finalPreparing.set(sessionId, controller);
+        const operation = this.sendFinalIndex(sessionId, conversation, pending?.readReply ?? conversation.readReply, controller.signal)
+            .catch(err => this.log(`final index failed (ignored): ${err?.message ?? err}`))
+            .finally(() => {
+            this.backgroundIndexes.delete(operation);
+            if (this.finalPreparing.get(sessionId) === controller)
+                this.finalPreparing.delete(sessionId);
+        });
+        this.backgroundIndexes.set(operation, controller);
+    }
+    async sendFinalIndex(sessionId, conversation, reader, signal) {
+        const reply = await readFinalReply(reader, signal);
+        const prepared = await prepareFinalMessages(withFinalReply(conversation.messages, reply), signal);
+        if (this.mainConversations.get(sessionId) !== conversation ||
+            this.finalIndexed.get(sessionId) === prepared.key)
+            return;
+        signal.throwIfAborted();
+        this.finalIndexed.set(sessionId, prepared.key);
+        const messageTimes = conversation.messageTimesFor?.(prepared.retained);
+        await this.callContextMemory(prepared.messages, conversation.modelContextLimit, {
+            sessionId, clientMeta: conversation.clientMeta, messageTimes,
+            indexOnly: true, finalIndex: true, signal, timeoutMs: INDEX_TIMEOUT_MS,
+            serializedMessages: prepared.serialized,
         });
     }
     submitIndexOnly(messages, modelContextLimit, opts) {
@@ -971,12 +981,14 @@ export class MemtreeClient {
         const boundedMs = Number.isFinite(timeoutMs) && timeoutMs >= 0
             ? Math.floor(timeoutMs)
             : 2_000;
+        const remainingMs = this.finalDrainDeadline === undefined ? boundedMs
+            : Math.min(boundedMs, Math.max(0, this.finalDrainDeadline - Date.now()));
         const pending = [...this.backgroundIndexes.keys()];
         let timer;
         const completed = await Promise.race([
             Promise.allSettled(pending).then(() => true),
             new Promise((resolve) => {
-                timer = setTimeout(() => resolve(false), boundedMs);
+                timer = setTimeout(() => resolve(false), remainingMs);
             }),
         ]);
         if (timer)
@@ -1063,7 +1075,15 @@ export class MemtreeClient {
             // omit `flattened_messages`, which degrades to passthrough upstream.
             body.flatten = true;
         }
-        const payload = JSON.stringify(body);
+        let payload;
+        if (opts.serializedMessages !== undefined) {
+            delete body.messages;
+            payload = JSON.stringify(body).slice(0, -1) + ',"messages":' + opts.serializedMessages + "}";
+        }
+        else {
+            payload = JSON.stringify(body);
+        }
+        opts.signal?.throwIfAborted();
         const started = Date.now();
         let status;
         let ok = false;

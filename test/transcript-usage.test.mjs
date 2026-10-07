@@ -496,3 +496,17 @@ test("finalReply never reuses an earlier answer after an unanswered user turn", 
     role: "assistant", content: [{ type: "text", text: "new answer" }]
   });
 });
+
+test("final transcript preparation yields and respects cancellation", async (t) => {
+  const { root, file } = transcriptDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(file, entry("new", [{ type: "text", text: "answer" }], usage(10, 0)));
+  const source = new ClaudeTranscriptUsage(root);
+  const controller = new AbortController();
+  const pending = source.finalReplyAsync(SESSION, controller.signal);
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.deepEqual(await source.finalReplyAsync(SESSION), {
+    role: "assistant", content: [{ type: "text", text: "answer" }]
+  });
+});

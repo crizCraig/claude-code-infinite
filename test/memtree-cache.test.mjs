@@ -265,3 +265,35 @@ test("background indexing deduplicates within each session only", async () => {
     await fixture.close();
   }
 });
+
+test("exit caps pending Stop sessions too and chooses the newest three", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    for (const id of ["s1", "s2", "s3", "s4", "s5"]) {
+      client.noteMainConversation(id, { messages: [{ role: "user", content: id }], modelContextLimit: 100 });
+      client.scheduleFinalIndex(id, () => undefined);
+    }
+    client.flushFinalIndexes();
+    await client.drainBackground(1_000);
+    assert.deepEqual(fixture.calls.map(c => c.messages[0].content).sort(), ["s3", "s4", "s5"]);
+  } finally { await fixture.close(); }
+});
+
+test("final preparation yields and shares the exit upload deadline", async () => {
+  const fixture = await memtreeFixture();
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    let read = false;
+    client.noteMainConversation("s", {
+      messages: MESSAGES, modelContextLimit: 100,
+      readReply: () => { read = true; return new Promise(() => {}); },
+    });
+    const started = Date.now();
+    client.flushFinalIndexes(50);
+    assert.equal(read, false, "preparation must yield before reading the transcript");
+    assert.equal(await client.drainBackground(1_000), false);
+    assert.ok(Date.now() - started < 300, "one deadline includes preparation");
+    assert.equal(fixture.calls.length, 0, "no upload after the deadline");
+  } finally { await fixture.close(); }
+});

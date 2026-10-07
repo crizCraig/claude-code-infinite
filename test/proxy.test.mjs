@@ -10329,3 +10329,39 @@ test("a stalled newest-tree lookup does not delay messages or cross clear/fork s
     assert.equal(await getCurrentId(proxy,'forked'),404);
   } finally { release(); proxy.close(); upstream.close(); memtreeSrv.close(); }
 });
+
+for (const ending of ["Stop", "exit"]) {
+  test(`short main request sends final_index through the real ${ending} path`, async () => {
+    const upstream = await mockUpstream();
+    const server = await mockMemtree(200, { messages: [], usage: {}, index_only: true });
+    const memtree = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const schedule = memtree.scheduleFinalIndex.bind(memtree);
+    memtree.scheduleFinalIndex = (id, read) => schedule(id, read, 1);
+    const reads = [];
+    const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+      transcriptUsage: { usageFor: () => ({}), finalReplyAsync: async (id, signal) => {
+        reads.push(id);
+        signal?.throwIfAborted();
+        return { role: "assistant", content: `reply for ${id}` };
+      } },
+    });
+    try {
+      if (ending === "Stop") await armMainTurn(proxy, "short question");
+      await postSessionMessages(proxy.port, [{ role: "user", content: "short question" }]);
+      if (ending === "Stop") {
+        await postHook(proxy, stopHook("prompt-main"));
+        for (let n = 0; n < 100 && !server.calls.some(c => c.final_index); n++) {
+          await new Promise(r => setTimeout(r, 5));
+        }
+      } else memtree.flushFinalIndexes();
+      await memtree.drainBackground(2000);
+      const finals = server.calls.filter(c => c.final_index);
+      assert.equal(finals.length, 1);
+      assert.equal(finals[0].index_only, true);
+      assert.match(JSON.stringify(finals[0].messages), /reply for session-1/);
+      assert.deepEqual(reads, ["session-1"]);
+    } finally {
+      proxy.close(); upstream.close(); server.close();
+    }
+  });
+}

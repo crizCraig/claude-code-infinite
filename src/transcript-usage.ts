@@ -27,6 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { setImmediate as yieldTurn } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Message } from "./turns.js";
@@ -71,6 +72,7 @@ export interface TranscriptUsageSource {
    * a turn ended with), as a message; read to the transcript's end.
    */
   finalReply?(sessionId: string): Message | undefined;
+  finalReplyAsync?(sessionId: string, signal?: AbortSignal): Promise<Message | undefined>;
 }
 
 /**
@@ -138,6 +140,26 @@ export class ClaudeTranscriptUsage implements TranscriptUsageSource {
       }
       return index.finalReply();
     } catch {
+      return undefined;
+    }
+  }
+
+  async finalReplyAsync(sessionId: string, signal?: AbortSignal): Promise<Message | undefined> {
+    await yieldTurn(undefined, { signal });
+    try {
+      const index = this.indexFor(sessionId);
+      if (!index) return undefined;
+      let read = 0;
+      while (read < MAX_CATCH_UP_BYTES) {
+        await yieldTurn(undefined, { signal });
+        const bytes = index.refresh();
+        if (bytes === 0) return index.finalReply();
+        read += bytes;
+      }
+      // A partial transcript cannot establish the latest turn's answer.
+      return undefined;
+    } catch {
+      signal?.throwIfAborted();
       return undefined;
     }
   }

@@ -865,7 +865,9 @@ async function handleRequest(
   }
   if (url.pathname === hookPath) {
     return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) =>
-      opts.memtree.scheduleFinalIndex(sessionId, () => opts.transcriptUsage?.finalReply?.(sessionId!)));
+      opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
+        ? opts.transcriptUsage.finalReplyAsync(sessionId!, signal)
+        : opts.transcriptUsage?.finalReply?.(sessionId!)));
   }
 
   if (
@@ -1556,7 +1558,9 @@ async function handleMessages(
       modelContextLimit,
       clientMeta,
       messageTimesFor: transcriptTimesFor(opts, mainSessionId),
-      readReply: () => opts.transcriptUsage?.finalReply?.(mainSessionId),
+      readReply: (signal) => opts.transcriptUsage?.finalReplyAsync
+        ? opts.transcriptUsage.finalReplyAsync(mainSessionId, signal)
+        : opts.transcriptUsage?.finalReply?.(mainSessionId),
     });
   }
 

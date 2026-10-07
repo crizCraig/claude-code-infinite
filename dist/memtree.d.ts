@@ -16,6 +16,7 @@
  * amplify identical HTTP calls, and budget-changing inputs never reuse a
  * stale compression result.
  */
+import { type FinalReplyReader } from "./final-index.js";
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import { type Message } from "./turns.js";
@@ -257,6 +258,8 @@ export declare class MemtreeClient {
     private readonly pendingFinals;
     /** Session → hash of the conversation its last final index sent. */
     private readonly finalIndexed;
+    private readonly finalPreparing;
+    private finalDrainDeadline;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     private unpaidDetail;
     /** Complete compression request key → whether its latest failure arms fuse. */
@@ -348,16 +351,17 @@ export declare class MemtreeClient {
      * lacks that reply: it only appears in the next request. `readReply` reads
      * it from the transcript when the call goes out, not inside the hook.
      */
-    scheduleFinalIndex(sessionId: string | undefined, readReply: () => Message | undefined, delayMs?: number): void;
+    scheduleFinalIndex(sessionId: string | undefined, readReply: FinalReplyReader, delayMs?: number): void;
     /**
-     * At shutdown, before drainBackground: send every pending final index now,
-     * and one for each of the most recent sessions that never had a Stop (`-p`
+     * At shutdown, before drainBackground: finalize at most the three newest
+     * sessions, including sessions that never had a Stop (`-p`
      * and non-TTY runs install no hooks). Never throws: a failure here must not
      * change ccc's exit code. The calls share drainBackground's bounded wait.
      */
-    flushFinalIndexes(): void;
+    flushFinalIndexes(timeoutMs?: number): void;
     private cancelFinalIndex;
     private fireFinalIndex;
+    private sendFinalIndex;
     private submitIndexOnly;
     /**
      * Stop accepting background indexes and wait boundedly for those already in
@@ -378,7 +382,7 @@ export interface MainConversation {
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
     /** The reply the session ended with (Claude Code's transcript), for a final index at exit. */
-    readReply?: () => Message | undefined;
+    readReply?: FinalReplyReader;
 }
 /** The conversation plus the reply that ended it, unless it already ends with a reply. */
 export declare function withFinalReply(messages: Message[], reply: Message | undefined): Message[];

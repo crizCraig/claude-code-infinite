@@ -370,7 +370,9 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return;
     }
     if (url.pathname === hookPath) {
-        return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, () => opts.transcriptUsage?.finalReply?.(sessionId)));
+        return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
+            ? opts.transcriptUsage.finalReplyAsync(sessionId, signal)
+            : opts.transcriptUsage?.finalReply?.(sessionId)));
     }
     if (req.method === "GET" &&
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
@@ -977,7 +979,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             modelContextLimit,
             clientMeta,
             messageTimesFor: transcriptTimesFor(opts, mainSessionId),
-            readReply: () => opts.transcriptUsage?.finalReply?.(mainSessionId),
+            readReply: (signal) => opts.transcriptUsage?.finalReplyAsync
+                ? opts.transcriptUsage.finalReplyAsync(mainSessionId, signal)
+                : opts.transcriptUsage?.finalReply?.(mainSessionId),
         });
     }
     // Hook state controls notices only. Hidden requests cannot consume main notices.
