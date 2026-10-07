@@ -481,3 +481,18 @@ test("finalReply is the newest response's text, unless it called a tool", () => 
   assert.equal(source.finalReply("../escape"), undefined);
   assert.equal(new ClaudeTranscriptUsage(root).finalReply("00000000-0000-0000-0000-000000000000"), undefined);
 });
+
+test("finalReply never reuses an earlier answer after an unanswered user turn", () => {
+  const { root, file } = transcriptDir();
+  fs.writeFileSync(file, entry("old", [{ type: "text", text: "old answer" }], usage(10, 0)));
+  const source = new ClaudeTranscriptUsage(root);
+  assert.ok(source.finalReply(SESSION));
+  fs.appendFileSync(file, JSON.stringify({ type: "user", message: {
+    role: "user", content: "new unanswered request"
+  } }) + "\n");
+  assert.equal(source.finalReply(SESSION), undefined);
+  fs.appendFileSync(file, entry("new", [{ type: "text", text: "new answer" }], usage(10, 0)));
+  assert.deepEqual(source.finalReply(SESSION), {
+    role: "assistant", content: [{ type: "text", text: "new answer" }]
+  });
+});

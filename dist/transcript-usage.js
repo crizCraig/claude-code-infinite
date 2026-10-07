@@ -405,6 +405,9 @@ class TranscriptIndex {
         }
         const time = entryTime(entry);
         if (entry?.type === "user") {
+            // A later user/tool-result entry starts an unanswered turn. An exit
+            // before its response must not append the preceding turn's answer.
+            this.lastResponseId = undefined;
             if (time)
                 this.ingestUserTime(entry.message, time);
             return;
