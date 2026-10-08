@@ -4,16 +4,65 @@
 
 # Claude Code Infinite
 
-MemTree learns from your agent's work the way intelligence always has: by abstracting it. As your
-agent works, MemTree consolidates each stretch of experience into summaries, then summaries of
-summaries: a hierarchy of abstractions across time. Nothing is thrown away.
+Memory for long-running agents. Claude Code Infinite indexes your Claude Code sessions with
+[MemTree](https://memtree.dev) so their history can be easily searched, navigated, and understood,
+by you and by Claude, within a session and across all of them.
 
-* Maximize Claude's intelligence with context-management from [MemTree.dev](https://memtree.dev)
-* Supports unlimited-length coding sessions
-* Feels fast and fresh with every message
-* Automatically recalls relevant past information
-* Never compact again
- 
+While Claude works, MemTree summarizes each new batch of messages in the background and files it
+under a topic. Each topic gets its own summary, and the whole session gets one at the top. When a
+session outgrows the context window, Claude works from these summaries plus your most recent
+messages, so the session can keep going indefinitely. When it needs a detail, it opens a branch and
+follows it down to the original messages.
+
+* **Search across every session.** Claude can find what was decided, tried or ruled out in any of
+  your past sessions, by exact words or by meaning, filtered by project and date
+* **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
+* **Replaces `/compact` without losing the thread.** In a blind-graded benchmark, MemTree matched
+  full-context Claude Code and beat Claude Code's built-in `/compact` by 20 points
+  ([details](#long-session-benchmark))
+* **Unlimited-length sessions**, with relevant past information recalled automatically
+
+## Search across sessions
+
+Every `ccc` session is indexed as it runs, and Claude gets read-only `memtree` tools over all of
+your indexed sessions, so you can just ask:
+
+* "What did we decide about the retry limit last week?"
+* "Find the session where we fixed the token-count bug, and show me the fix."
+* "We tried this before. What went wrong last time?"
+
+| Tool | What it does |
+| --- | --- |
+| `search` | Searches this session's tree or all of your sessions. Text mode (default, free) matches exact words, ids, paths and errors; vector mode matches meaning. Filter by project, `since` and `until`. |
+| `list` | Lists your sessions, most recently active first, with title, first message, project (directory, repo, branch), models and times. Filter by time, project or words. |
+| `read_node` | Opens a node: its summary, its path from the root, and its children. |
+| `read_lines` | Reads the exact original transcript lines under a leaf. |
+
+Hits name their node, so Claude goes from a search hit to the summary around it and then to the
+exact lines. Type `/memtree-view` for the link to this session's tree. Details are under
+[Memory tools](#memory-tools).
+
+## Long-session benchmark
+
+In a blind-graded benchmark on a 775k-token Claude Code session, MemTree matched full-context
+Claude Code and beat Claude Code's built-in `/compact` by 20 points, finishing in about half the
+time. That is the same score as full context with a third of the tokens.
+
+| Setup | Score | Input tokens / run | Wall time | How it handles the history |
+| --- | --- | --- | --- | --- |
+| **Claude Code Infinite** | **69** | **39M** | **11–22 min** | Sent whole until the 800k budget, then compressed once to ~420k; never compacted |
+| Full context | 69 | 113M | 24–54 min | Grew to ~970k and hit Claude Code's auto-compaction mid-task every round |
+| `/compact` | 49 | 17M | 29–40 min | Claude Code's `/compact` before the task, 789k → 13k |
+
+Every setup resumes the same ~775k-token history and is given one task: fix the security issues
+found earlier in the session, which are listed only in the conversation. Claude Opus 5.5, 3
+rounds, graded blind against a fixed answer key by an independent grader. Scores are 0–100 means
+(68.7 / 69.3 / 48.7 in table order); the noise floor is 10 points, so MemTree vs full context is parity, not a
+win, while MemTree was ahead of `/compact` in every round. Average wall time was 16 min
+for MemTree and 38 min for full context. Input tokens count uncached, cache-read and cache-write
+tokens; `/compact`'s exclude the one-time `/compact` step. This is one task family, one model and
+3 rounds, not a general benchmark.
+
 ## Requirements
 
 * [node.js 20.3 or newer](https://nodejs.org/en/download/)
@@ -23,15 +72,14 @@ summaries: a hierarchy of abstractions across time. Nothing is thrown away.
 ## Setup
 
 > [!TIP]
-> No Anthropic subscription? See [Using Without an Anthropic Subscription](#using-without-an-anthropic-subscription) below.
+> No Claude subscription? Use an Anthropic API key exactly as with vanilla Claude Code
+> (`ANTHROPIC_API_KEY` or a Console login). `ccc` forwards it unchanged to api.anthropic.com, and
+> you pay Anthropic per token.
 
 1. Install (Node ≥ 20.3; no git needed)
   ```bash
-  npm install -g https://github.com/crizCraig/claude-code-infinite/tarball/main
+  npm install -g claude-code-infinite
   ```
-  The npm package (`npm install -g claude-code-infinite`) is temporarily behind — the
-  version there still uses the retired `/cc` proxy. It will be current again shortly;
-  until then install from the GitHub tarball above.
 2. Run Claude Code Infinite with
   ```bash
   ccc
@@ -45,7 +93,6 @@ The tool supports multiple environments (this selects the MemTree compression AP
 
 - **Production** (default): `ccc` - Uses https://api.polychat.co
 - **Local**: `ccc local` - Uses http://localhost:8080 for local development
-- **Staging**: `ccc staging` - Uses https://polychat-staging-421312241218.us-west2.run.app
 
 Each environment maintains its own separate API key.
 
@@ -98,23 +145,24 @@ Claude Code ──▶ localhost proxy (ccc)
 
 In interactive sessions, `ccc` reports these MemTree states as display-only lines in Claude Code:
 
-- `✓ MemTree · conversation optimized in 4.5s · ~330.3k → 94.6k tokens` when indexed conversation history was used and the completed memory response was selected. The success line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles. Latency is the client-observed MemTree request time. The before-count uses MemTree's informational `usage.raw_prompt_tokens` estimate, including visual-token estimates instead of image transport bytes; the after-count is Anthropic's actual full compressed-input usage. Claude's Count Tokens estimate remains a fallback for older MemTree servers. If neither before-count is available, `ccc` shows latency only.
+- `✓ MemTree · conversation optimized · ~813k → 408k tokens`, with the session's newest completed MemTree page on its own line below it and a blank line before the answer, when a compressed turn reflects new indexing (MemTree's index covers more of the conversation than before) or a newly finished MemTree page. The before-count is `ccc`'s size estimate for the request that would otherwise have been sent (MemTree's `usage.raw_prompt_tokens` when `ccc` has none); the after-count is Anthropic's reported compressed input, estimated from bytes until usage arrives. Counts under a million are whole thousands, larger ones one decimal (`1.3m`). Without both counts, or when the result is not smaller, the line reads just `✓ MemTree · conversation optimized`. The line is green when terminal color is available, and plain when `NO_COLOR` or a monochrome terminal is configured. `ccc` uses the standard ANSI green foreground sequence and Node's capability detection, so the same path works in ANSI terminals on macOS/Linux and supported Windows consoles.
 - `⚠ MemTree degraded — this turn ran uncompressed` when a blocking compression call fails or times out.
 - `⚠ MemTree is off — payment required…` once when compression and indexing are disabled for payment.
-- `✓ MemTree · conversation optimized · ~813k → 408k tokens` with the session's newest completed MemTree page on its own line below it and a blank line before the answer, whenever a turn is compressed.
 - `• MemTree` with the page on its own line below it, once at the end of a user turn, when the turn used a MemTree index whose link has not been shown yet (the first one of the session, then each newly finished index), unless the turn's success line already showed it. The line comes from the `Stop` hook, so it lands after the turn's last message. When MemTree passed the conversation through whole because it already fits the model's budget, the label line reads `• MemTree · /memtree-compact to compact session`. The URL always gets a line to itself, so a long link does not wrap the label or note. The displayed link follows the server's newest completed tree for this session, preserving its pinned namespace and own/served selection. If that lookup is unavailable, it falls back to the compression page; that page can show a completed prefix while its own tree builds. Open it in a browser, read it as JSON with `ccc fetch <url>`, or, from an agent inside the session, `GET $ANTHROPIC_BASE_URL/memtree/<short id>.json` on the loopback proxy without handling the key. Every MemTree call carries Claude Code's session id, so `GET $ANTHROPIC_BASE_URL/memtree/sessions/<session id>.json` lists every page from one session, newest first (the session id is the `--resume` id and the name of the transcript under `~/.claude/projects/`). `/memtree` lists the MemTree commands. Type `/memtree-view` at any time to print the session's latest link. `/memtree-compact` is MemTree's replacement for Claude Code's `/compact`: your next message is sent compressed to half the budget (or `/memtree-compact 400k` for another target), and from then on the session follows the compaction rules under [How it works](#how-it-works) with that target. `/memtree-compact off` goes back to sending the conversation whole. `CCC_COMPACT_TARGET=500k` sets the target of every compaction for every session from launch, for benchmarks and headless (`-p`) runs, where the slash command is unavailable; it does not compact by itself, the budget still decides when, and `/memtree-compact off` still turns compaction off for one session. `CCC_COMPACT_TARGET=off` starts every session in the `/memtree-compact off` state instead (`/memtree-compact [N]` still turns it back on). `ccc` answers these commands locally, so they cost no model turn and nothing is added to the conversation; the compaction setting lasts for the life of the `ccc` process. When a session starts and already has a page, which in practice means a resumed one (`ccc --resume`, or `/resume` inside a running session), its latest link is shown right away: `ccc` remembers the newest page per session in `~/.claude-code-infinite/memtree-links.json` (most recent 200 sessions) and a `SessionStart` hook prints it. `CCC_MEMTREE_LINK` changes where the link appears: `turn` (default), `message` (under every finished assistant message, green when the index is new, dim otherwise), `stop` (every turn, on `Stop`), `success` (only on the line below `✓ MemTree · conversation optimized`), or `off`.
 
 The newest-tree lookup runs in the background with a 60-second cache, at most eight outstanding fetches, and one 10-second deadline across at most 32 finder pages. `/memtree-view` and resume hooks wait at most 2.5 seconds. Servers with the finder session-ID search (polychat `0202eaa` and later, including reviewed `c67cadb`) use `/v1/memtree/sessions?q=<id>`, following cursors and accepting only the exact session ID. A missing endpoint falls back to the compression page and is not retried for 30 minutes. The older exact route `/usage/memtree/sessions/<id>.json` accepts the bearer key, but excludes index-only calls and does not report completed trees, so it cannot supply this link. No verified server version provides a suitable exact newest-completed-tree lookup yet.
 
-`/memtree-view` emits OSC 8 hyperlinks only when the ccc proxy has a TTY and detects iTerm2 3.1+ (`TERM_PROGRAM=iTerm.app` plus its version) or JetBrains (`TERMINAL_EMULATOR=JetBrains-JediTerm`). Detection happens in the proxy, before hook output is relayed through pipes. `NO_COLOR`, dumb/unknown terminals, tmux/screen, and non-TTY output get a plain URL. Apple Terminal also gets the full visible URL for its normal URL handling. The success and Stop notices retain their visible URLs, and a late lookup cannot repeat the same page already linked by that turn's success notice.
-
-**Memory tools.** Interactive `ccc` sessions also get a small MCP server, `memtree`, so the agent can look up details that were summarized out of its context: `mcp__memtree__search` (`query`, optional `limit`; case-insensitive term matching over node summaries and the verbatim transcript lines under each leaf), `mcp__memtree__read_node` (`id`: summary, path from the root, children, leaf line range) and `mcp__memtree__read_lines` (`block`, `start`, `end`: exact transcript lines, at most 400 lines / 40k characters per call). They read the tree the current request was served from: the server asks the `ccc` proxy for `GET $ANTHROPIC_BASE_URL/memtree/current?session=<id>` (only that session's compression source page, or its stored source page on resume; `current.json?session=<id>` returns the page itself). Completed pages are cached. If the proxy temporarily serves an older prefix while a newer tree is indexing, the tools reuse that prefix during a 45-second cooldown, then check the page again. `ccc` registers it with `--mcp-config=<temp file>`, which keeps working under `--strict-mcp-config`, and pre-allows the three read-only tools; `CCC_MEMTREE_MCP=0` turns it off. The MCP process requires `CLAUDE_CODE_SESSION_ID` and checks that both the pointer and page belong to it. If Claude Code retains an MCP process with an old session ID after `/clear` or a session switch, reconnect the MCP server with the current session ID; it cannot infer a new identity from another session using the proxy. Print (`-p`) and non-TTY runs get it only when their own `--mcp-config` names a server `memtree` run by `ccc memtree-mcp` (add `--allowedTools mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines`). Whenever the tools are configured, compress calls carry `x-memtree-tools: search,read_node,read_lines` so MemTree tells the model how to use them.
+`/memtree-view` emits OSC 8 hyperlinks only when the ccc proxy has a TTY and detects iTerm2 3.1+ (`TERM_PROGRAM=iTerm.app` plus its version), JetBrains (`TERMINAL_EMULATOR=JetBrains-JediTerm`), Ghostty, WezTerm, VS Code, kitty, or Windows Terminal (`WT_SESSION`). Detection happens in the proxy, before hook output is relayed through pipes. `NO_COLOR`, dumb/unknown terminals, tmux/screen, and non-TTY output get a plain URL. Apple Terminal also gets the full visible URL for its normal URL handling. The success and Stop notices retain their visible URLs, and a late lookup cannot repeat the same page already linked by that turn's success notice.
 
 **The end of a session.** MemTree indexes once about 10k new tokens build up, and each index call carries a request's messages, so a session's last turns, including the reply it ended with (often where a PR was opened), would never be indexed. `ccc` therefore sends one final index call per session: the main conversation plus that last reply, read from Claude Code's transcript, flagged so MemTree indexes the tail even below its minimum (at most once per conversation per 30 minutes; two conversations with an identical first message share that allowance). It goes out 10 minutes after a turn ends with no new request, or at exit for the 3 most recent sessions, inside the 2-second background drain; `-p` and non-TTY runs, which have no `Stop` hook, get it at exit. A failure is logged and never changes `ccc`'s exit code. Until then, `read_lines` with `"tail": true` reads the messages after the tree verbatim. When `ccc` runs inside another Claude Code session, the inner Claude Code writes no transcript unless `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` is set; without it the final index still covers everything through the last request, just not the final reply.
 
-`ccc` installs a minimal session-only Claude Code plugin using the repeatable `--plugin-dir` option. Its `MessageDisplay` hook changes only what the terminal renders and never alters stored assistant content; a `Stop` hook supplies a fallback for tool-only responses. That fallback may be saved by Claude Code as non-model hook UI metadata, but it is excluded from resumed model and recap requests. Notices are never added to model context, and Anthropic responses are left untouched with one exception: the hidden recap request Claude Code sends when you come back to an idle session gets a final `• MemTree` / `<url>` text block, so the recap ends with the link. Claude Code keeps that recap as a UI-only system entry, never as conversation content, and the block is skipped when it would push the recap past Claude Code's 400-character cap, and `-p`/non-TTY output is left unchanged. Legacy marker cleanup remains for transcripts created by older `ccc` releases. The payment state can also produce a separate terminal warning at startup.
+`ccc` installs a minimal session-only Claude Code plugin using the repeatable `--plugin-dir` option. Its `MessageDisplay` hook changes only what the terminal renders and never alters stored assistant content; a `Stop` hook supplies a fallback for tool-only responses. That fallback may be saved by Claude Code as non-model hook UI metadata, but it is excluded from resumed model and recap requests. Notices are never added to model context, and Anthropic responses are left untouched with one exception: the hidden recap request Claude Code sends when you come back to an idle session gets a final `• MemTree` / `<url>` text block, so the recap ends with the link (not added when `CCC_MEMTREE_LINK=off`). Claude Code keeps that recap as a UI-only system entry, never as conversation content, and the block is skipped when it would push the recap past Claude Code's 400-character cap, and `-p`/non-TTY output is left unchanged. Legacy marker cleanup remains for transcripts created by older `ccc` releases. The payment state can also produce a separate terminal warning at startup.
 
 Claude Code currently displays the original assistant text instead of `MessageDisplay` replacements while verbose mode is enabled. Turn verbose mode off to see the inline MemTree line.
+
+### Memory tools
+
+Interactive `ccc` sessions also get a small MCP server, `memtree`, with four read-only tools (see [Search across sessions](#search-across-sessions)): `mcp__memtree__search` (`query`; optional `tree`, `"current"` for this session or omitted for all of your sessions; `mode` `text` (default, free) or `vector` (meaning, first page charged); `project`, `since`, `until`, `cursor`, `limit` (default 10, at most 50)), `mcp__memtree__read_node` (`node`, an address `<tree>#<id>` from search, or `id` with optional `tree`: summary, path from the root, children, leaf line range), `mcp__memtree__read_lines` (a leaf's `node`, or `block`, `start`, `end` with optional `tree`: exact transcript lines, at most 400 lines / 40k characters per call) (with `tail: true` instead, the newest messages after the tree that are not indexed yet) and `mcp__memtree__list` (your sessions, most recently active first; `since`, `until`, `project`, `q`, `cursor`, `limit`). Other sessions' trees are named explicitly by reference and authorized by your MemTree key. This session's tree (`tree: "current"`, or no `tree` on `read_node`/`read_lines`) is the one the current request was served from: the server asks the `ccc` proxy for `GET $ANTHROPIC_BASE_URL/memtree/current?session=<id>` (only that session's compression source page, or its stored source page on resume; `current.json?session=<id>` returns the page itself). Completed pages are cached. If the proxy temporarily serves an older prefix while a newer tree is indexing, the tools reuse that prefix during a 45-second cooldown, then check the page again. `ccc` registers it with `--mcp-config=<temp file>`, which keeps working under `--strict-mcp-config`, and pre-allows the four read-only tools; `CCC_MEMTREE_MCP=0` turns it off. The MCP process requires `CLAUDE_CODE_SESSION_ID` and checks that both the pointer and page belong to it. If Claude Code retains an MCP process with an old session ID after `/clear` or a session switch, reconnect the MCP server with the current session ID; it cannot infer a new identity from another session using the proxy. Print (`-p`) and non-TTY runs get it only when their own `--mcp-config` names a server `memtree` run by `ccc memtree-mcp` (add `--allowedTools mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines,mcp__memtree__list`). Whenever the tools are configured, compress calls carry `x-memtree-tools: search,read_node,read_lines,list` so MemTree tells the model how to use them.
 
 ## How it works
 
@@ -178,34 +226,12 @@ establish that Anthropic accepts subscription OAuth for this endpoint.
 
 Memory quality is evaluated offline: the weekly `memtree-bench` harness replays a fixed scenario through a ccc-wrapped arm and a vanilla Claude Code arm and grades complete outcomes blind against an answer key. (An earlier in-request memory-vs-full A/B comparison with a live grader was removed in 2026-08; it was off by default, and the offline benchmark measures the same question with a stronger instrument.)
 
-## What this is NOT
+## More than a memory-retrieval tool
 
-This is not a MPC or tool for simply retrieving memories. While we are compatible with all MPC's, tools, and other Anthropic features, these do not prevent your context window from becoming detrimentally large. MCP's and tools are some of the biggest token bloaters and it's exactly these types of messages that we heavily reduce during our compression phase.
-
-## Why it works
-
-LLMs get exponentially less intelligent as their input grows. 
-
-References:
-- [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172) (2023)
-- [RULER: What's the Real Context Size of Your Long-Context Language Models?](https://arxiv.org/abs/2404.06654) (2024)
-- <a href="https://research.trychroma.com/context-rot" target="_blank" rel="noopener noreferrer">Context Rot from Chroma</a> (2025)
- 
-<a href="https://www.youtube.com/watch?v=TUjQuC4ugak" target="_blank" rel="noopener noreferrer">
-  <img src="https://img.youtube.com/vi/TUjQuC4ugak/0.jpg" alt="Context Rot Video">
-</a>
-
-
-Furthermore, the above research primarily tests on needle-in-a-haystack tasks, which underestimates the effect for more difficult tasks encountered in coding.
-
-This is why starting sessions from scratch provides such a significant uplift in ability. What we're essentially doing is keeping each session as close to from-scratch as possible by limiting the tokens in Claude's context window to around 30k, filled precisely with the information relevant to your **last** message. Read more about how MemTree works [here](https://api.polychat.co/context-memory).
-
-### Operating System Analogy
-
-It may seem strange that we are advocating for small context windows in a product called Claude Code Infinite. But Infinite is referring to the size of a new memory layer, the MemTree, which is a layer above the context window. This layer is larger and updated more slowly than the LLMs main input, just as disk is larger + slower than RAM.
-
-So you can think of MemTree as an operating system's virtual memory manager. Just as an OS manages RAM by swapping less-used data to disk, MemTree manages the model's context window by intelligently recalling only the most relevant information from past interactions. This ensures that the model always has access to the most pertinent data without being overwhelmed by the entire history of the conversation.
-
+Search tools alone don't keep a long session's context from growing until the model degrades.
+Claude Code Infinite does both: it indexes and searches your history, and it manages what the model
+sees, keeping it within budget. It works alongside your MCP servers, tools and other Claude Code
+features, and their output, often the biggest source of tokens, is exactly what MemTree reduces most.
 
 ## Usage Tips
 
@@ -219,7 +245,7 @@ So you can think of MemTree as an operating system's virtual memory manager. Jus
 
 * You can resume previous threads with `/resume`
 
-For `ccc --resume <id>`, an optional repair can unblock a transcript whose last response already exceeds Claude Code’s local refusal limit. It changes only that response’s usage totals and the iteration Claude Code counts, after writing an exclusive, uniquely named backup under `~/.claude-code-infinite/transcript-backups`. Earlier iterations and conversation content stay intact. The installed Claude Code 2.1.288 computes its blocking limit as the context window minus the output allowance (capped at 20,000) minus 3,000 tokens: 977,000 for the supported 1M models. Other versions use the conservative full-window threshold. The window comes from ccc’s model table, explicit `[1m]` transcript model signals, and any `--model` or `ANTHROPIC_MODEL` override, conservatively keeping the largest supported window. A successful response with input already beyond that inferred window disproves the inference and is never repaired. Unknown model overrides (including unresolved aliases), models or usage shapes, threshold overrides, possible running writers, changed snapshots, backup collisions, and filesystem errors all skip repair and continue the original resume. Process and file checks are bounded; other running JavaScript runtimes may conservatively prevent repair.
+For `ccc --resume <id>`, an automatic, best-effort repair can unblock a transcript whose last response already exceeds Claude Code’s local refusal limit. It changes only that response’s usage totals and the iteration Claude Code counts, after writing an exclusive, uniquely named backup under `~/.claude-code-infinite/transcript-backups`. Earlier iterations and conversation content stay intact. The installed Claude Code 2.1.288 computes its blocking limit as the context window minus the output allowance (capped at 20,000) minus 3,000 tokens: 977,000 for the supported 1M models. Other versions use the conservative full-window threshold. The window comes from ccc’s model table, explicit `[1m]` transcript model signals, and any `--model` or `ANTHROPIC_MODEL` override, conservatively keeping the largest supported window. A successful response with input already beyond that inferred window disproves the inference and is never repaired. Unknown model overrides (including unresolved aliases), models or usage shapes, threshold overrides, possible running writers, changed snapshots, backup collisions, and filesystem errors all skip repair and continue the original resume. Process and file checks are bounded; other running JavaScript runtimes may conservatively prevent repair.
 
 
 ## Troubleshooting
@@ -241,8 +267,5 @@ the upgrade command. Upgrading is never automatic:
 ```bash
 npm install -g claude-code-infinite
 ```
-
-(While the npm package is behind — see Install above — upgrade with the GitHub tarball
-command instead.)
 
 Set `CCC_SKIP_UPDATE_CHECK=1` to disable the check (air-gapped or CI runs).
