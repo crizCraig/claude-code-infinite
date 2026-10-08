@@ -880,12 +880,12 @@ async function handleMessages(req, res, opts, upstream, state) {
     }
     if (isAwaySummary && state.memtreeLinkPlacement !== "off") {
         const sessionId = requestSessionId(req);
+        // Warm the newest-tree lookup now (never waits) so it can answer by the
+        // time the recap finishes streaming.
+        state.newestTrees?.peek(sessionId);
         recapLinkAppenders.set(req, (streamedTextChars) => {
-            const latest = currentMemtreePage(state, sessionId);
-            if (!latest || (sessionId !== undefined && latest.sessionId !== undefined && latest.sessionId !== sessionId)) {
-                return undefined;
-            }
-            return recapLinkText(latest.url, streamedTextChars, latest.compressed ? undefined : NOT_COMPRESSED_NOTE);
+            const link = recapLink(state, sessionId);
+            return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
     }
     const isLocalBashCommand = isLocalBashCommandTurn(messages);
@@ -1875,6 +1875,17 @@ function sessionLink(state, sessionId, source) {
     if (newest)
         return { key: newest.key, link: newest.url, ...note };
     return source ? { key: source.index, link: source.url, ...note } : undefined;
+}
+/**
+ * The recap's link: the session's newest tree like the Stop trailer, since the
+ * recap rides the stable compressed prefix and its compress page goes stale.
+ * Falls back to that page; never another session's.
+ */
+function recapLink(state, sessionId) {
+    const page = currentMemtreePage(state, sessionId);
+    const foreign = page !== undefined && sessionId !== undefined &&
+        page.sessionId !== undefined && page.sessionId !== sessionId;
+    return sessionLink(state, sessionId, foreign ? undefined : page);
 }
 function nextMemtreeCallSeq(state) {
     return ++state.memtreeCallSeq;

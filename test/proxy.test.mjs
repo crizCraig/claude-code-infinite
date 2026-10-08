@@ -10413,6 +10413,87 @@ test("a resumed session links its newest tree, while MCP resumes from the stored
   }
 });
 
+/** An upstream that streams `recapText` for the recap and answers others plainly. */
+async function recapUpstream(recapText) {
+  return listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      if (JSON.parse(Buffer.concat(chunks).toString("utf-8")).stream === true) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(recapSse(recapText));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+}
+
+async function storeWithPage(page) {
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-recap-"));
+  const store = new MemtreeLinkStore(pathMod.join(dir, "links.json"));
+  store.put("session-1", { url: page, index: "index-a", compressed: true });
+  return store;
+}
+
+test("the recap links the newest tree, not the stale compress page it rides", async () => {
+  const upstream = await recapUpstream("Recap text.");
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: await storeWithPage(PAGE_URL_1),
+    newestTrees: lookup,
+  });
+  try {
+    await lookup.settle("session-1");
+    const recap = await postRecap(proxy.port, { "x-claude-code-session-id": "session-1" });
+    assert.equal(recap.text, `Recap text.\n• MemTree\n  ${NEWEST_URL}\n`);
+    assert.ok(!recap.text.includes(PAGE_URL_1), "not the memory's source page");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the recap warms the newest-tree lookup on arrival, and falls back without one", async () => {
+  const upstream = await recapUpstream("Recap text.");
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  let known = true;
+  const { lookup, asked } = await newestLookup((q) =>
+    ({ sessions: known ? [sessionsItem(q, NEWEST_REQUEST_ID)] : [] }));
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: await storeWithPage(PAGE_URL_1),
+    newestTrees: lookup,
+  });
+  const headers = { "x-claude-code-session-id": "session-1" };
+  try {
+    // Nothing asked before the recap: its own arrival starts the lookup, which
+    // answers while the recap streams.
+    const warmed = await postRecap(proxy.port, headers);
+    assert.equal(asked[0], "session-1");
+    assert.equal(warmed.text, `Recap text.\n• MemTree\n  ${NEWEST_URL}\n`);
+
+    // The server knows no tree: the compress page as before.
+    known = false;
+    lookup.invalidate("session-1");
+    await lookup.settle("session-1");
+    const fallback = await postRecap(proxy.port, headers);
+    assert.equal(fallback.text, `Recap text.\n• MemTree\n  ${PAGE_URL_1}\n`);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("visible hook text strips SGR and OSC 8 with either terminator", () => {
   for (const end of ['\x1b\\', '\x07']) {
     assert.equal(stripAnsi(`\x1b[32m• MemTree\x1b[39m\n  \x1b]8;;https://x/page${end}https://x/page\x1b]8;;${end}`), '• MemTree\n  https://x/page');
