@@ -69,6 +69,8 @@ const PLACEHOLDER_WORDS = new Set([
     "redacted", "your_api_key", "xxx", "todo", "dummy", "test", "default",
 ]);
 const HEX = /^[0-9a-fA-F]+$/;
+// YOUR_PASSWORD_HERE, db_password, my-db-pass: names and placeholders, not passwords.
+const WORDS_IDENT = /^(?:[A-Z]+(?:[_-][A-Z]+)+|[a-z]+(?:[_-][a-z]+)+)$/;
 const DOTTED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/;
 const MIN_PASSWORD_ENTROPY = 2.0;
 const TOK_CHAR = /[A-Za-z0-9_-]/;
@@ -332,7 +334,7 @@ function plausiblePassword(value) {
     if (isPlaceholder(value) || value.length < 6 || entropy(value) < MIN_PASSWORD_ENTROPY) {
         return false;
     }
-    if (DOTTED_IDENT.test(value))
+    if (DOTTED_IDENT.test(value) || WORDS_IDENT.test(value))
         return false;
     if (value.length >= 12)
         return true;
