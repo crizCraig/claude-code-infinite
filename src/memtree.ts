@@ -22,6 +22,8 @@ import { prepareFinalMessages, readFinalReply, type FinalReplyReader } from "./f
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
+import { formatCounts, polychatRedactionEnabled, redactSerializedJson, redactValue,
+  type RedactionCounts } from "./secret-redaction.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -1353,10 +1355,24 @@ export class MemtreeClient {
       // omit `flattened_messages`, which degrades to passthrough upstream.
       body.flatten = true;
     }
+    // Opt-in (CCC_REDACT_POLYCHAT=on): secrets never leave the machine for Polychat. Off by
+    // default until the compressed tail question is decided (plan item 15): on a compressed
+    // turn the server's flatten echoes this body's live tail and system, which ccc forwards
+    // upstream, so the model would see [REDACTED:...] there too.
+    let serialized = opts.serializedMessages;
+    if (polychatRedactionEnabled()) {
+      const counts: RedactionCounts = {};
+      body.messages = redactValue(body.messages, counts);
+      if (body.tools !== undefined) body.tools = redactValue(body.tools, counts);
+      if (serialized !== undefined) serialized = redactSerializedJson(serialized, counts);
+      if (this.debug && Object.keys(counts).length) {
+        console.error(`[ccc] redacted before upload: ${formatCounts(counts)}`);
+      }
+    }
     let payload: string;
-    if (opts.serializedMessages !== undefined) {
+    if (serialized !== undefined) {
       delete body.messages;
-      payload = JSON.stringify(body).slice(0, -1) + ',"messages":' + opts.serializedMessages + "}";
+      payload = JSON.stringify(body).slice(0, -1) + ',"messages":' + serialized + "}";
     } else {
       payload = JSON.stringify(body);
     }

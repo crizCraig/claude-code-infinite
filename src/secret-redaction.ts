@@ -118,6 +118,19 @@ export function redactValue<T>(value: T, counts: RedactionCounts = {}): T {
   return value;
 }
 
+/** CCC_REDACT_POLYCHAT=on: redact everything ccc sends to Polychat (opt-in for now). */
+export function polychatRedactionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(on|1|true|yes)$/i.test(env.CCC_REDACT_POLYCHAT ?? "");
+}
+
+/** A pre-serialized JSON value, redacted; the same string when it holds no secret. */
+export function redactSerializedJson(serialized: string, counts: RedactionCounts): string {
+  const parsed: unknown = JSON.parse(serialized);
+  const redacted = redactValue(parsed, counts);
+  if (redacted === parsed) return serialized;
+  return JSON.stringify(redacted);
+}
+
 export function formatCounts(counts: RedactionCounts): string {
   const keys = Object.keys(counts).sort();
   return keys.length ? keys.map((k) => `${k}=${counts[k]}`).join(", ") : "none";

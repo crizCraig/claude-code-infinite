@@ -80,3 +80,61 @@ test("a real-shaped session (all of src/, ~0.6 MB) without secrets is returned u
   assert.equal(out, messages);
   assert.ok(JSON.stringify(messages).length > 5e5);
 });
+
+test("CCC_REDACT_POLYCHAT=on redacts the context_memory upload; off or secret-free is unchanged",
+  async (t) => {
+    const http = await import("node:http");
+    const { MemtreeClient } = await import("../dist/memtree.js");
+    const seen = [];
+    const server = http.createServer((req, res) => {
+      let data = "";
+      req.on("data", (c) => { data += c; });
+      req.on("end", () => { seen.push(data); res.writeHead(200, { "content-type":
+        "application/json" }); res.end("{}"); });
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    t.after(() => server.close());
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const key = "sk-" + "ant-api03-" + "aB3dE5fG7h".repeat(6);
+    const secretFree = [{ role: "user", content: "hello there" }];
+    const withSecret = [{ role: "user", content: `ANTHROPIC_API_KEY=${key}` }];
+    const send = async (messages, serialized) => {
+      await client.callContextMemory(messages, 200000, { timeoutMs: 5000, indexOnly: true,
+        serializedMessages: serialized }).catch(() => null);
+      return seen.at(-1);
+    };
+    const previous = process.env.CCC_REDACT_POLYCHAT;
+    t.after(() => { if (previous === undefined) delete process.env.CCC_REDACT_POLYCHAT;
+      else process.env.CCC_REDACT_POLYCHAT = previous; });
+    delete process.env.CCC_REDACT_POLYCHAT;
+    const offFree = await send(secretFree);
+    const offFreeSerialized = await send(secretFree, JSON.stringify(secretFree));
+    const offSecret = await send(withSecret);
+    assert.ok(offSecret.includes(key), "off: unchanged");
+    process.env.CCC_REDACT_POLYCHAT = "on";
+    assert.equal(await send(secretFree), offFree, "secret-free payload is byte-identical");
+    const onSecret = await send(withSecret);
+    assert.ok(!onSecret.includes(key) && onSecret.includes("[REDACTED:anthropic_key]"));
+    const onSerialized = await send(withSecret, JSON.stringify(withSecret));
+    assert.ok(!onSerialized.includes(key), "pre-serialized (final index) path too");
+    assert.equal(await send(secretFree, JSON.stringify(secretFree)), offFreeSerialized);
+  });
+
+test("a secret mid-conversation redacts the same way every turn (server prefix hashes agree)",
+  () => {
+    const pw = "Qz7" + "!pw9Lm";
+    const turns = [[{ role: "user", content: "deploy it" }]];
+    turns.push([...turns[0], { role: "assistant", content: "Need the DB password." },
+      { role: "user", content: `PGPASSWORD=${pw} run migrate` }]);
+    turns.push([...turns[1], { role: "assistant", content: [{ type: "tool_use", id: "t",
+      name: "Bash", input: { command: `PGPASSWORD=${pw} ./migrate.sh` } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] }]);
+    const uploads = turns.map((m) => redactValue(m).map((x) => JSON.stringify(x)));
+    for (let i = 1; i < uploads.length; i += 1) {
+      assert.deepEqual(uploads[i].slice(0, uploads[i - 1].length), uploads[i - 1],
+        `turn ${i} keeps the earlier turns' bytes`);
+    }
+    assert.ok(!uploads.flat().join("").includes(pw));
+    assert.equal(uploads[0][0], JSON.stringify(turns[0][0]), "secret-free messages untouched");
+  });

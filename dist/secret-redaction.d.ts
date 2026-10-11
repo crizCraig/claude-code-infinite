@@ -11,5 +11,9 @@ export declare function redact(text: string): {
  * Returns the same object when nothing was redacted (so unchanged payloads stay identical).
  */
 export declare function redactValue<T>(value: T, counts?: RedactionCounts): T;
+/** CCC_REDACT_POLYCHAT=on: redact everything ccc sends to Polychat (opt-in for now). */
+export declare function polychatRedactionEnabled(env?: NodeJS.ProcessEnv): boolean;
+/** A pre-serialized JSON value, redacted; the same string when it holds no secret. */
+export declare function redactSerializedJson(serialized: string, counts: RedactionCounts): string;
 export declare function formatCounts(counts: RedactionCounts): string;
 //# sourceMappingURL=secret-redaction.d.ts.map
