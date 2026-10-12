@@ -228,6 +228,25 @@ export function cachedPromptTokenCount(
   return nonNegativeCount((details as Record<string, unknown>).cached_tokens);
 }
 
+/**
+ * Share of the prompt left unindexed at or above which a compressed result
+ * that still does not fit the window is blamed on indexing lag.
+ */
+export const INDEX_LAG_MIN_UNINDEXED_SHARE = 0.1;
+
+/**
+ * Whether the server answered from an index that trails the conversation:
+ * it keeps every unindexed message verbatim, so a large unindexed share means
+ * a later compress (once indexing catches up) can shrink what this one could
+ * not. Unknown coverage (older servers) is not lag: refuse as before.
+ */
+export function indexBehind(result: CompressResult): boolean {
+  const indexed = cachedPromptTokenCount(result);
+  const raw = rawPromptTokenCount(result);
+  if (indexed === undefined || raw === undefined) return false;
+  return (raw - indexed) / raw >= INDEX_LAG_MIN_UNINDEXED_SHARE;
+}
+
 function nonNegativeCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value

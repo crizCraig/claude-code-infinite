@@ -132,6 +132,13 @@ export interface MessagesRecord {
    * the signal that Claude Code changed the format.
    */
   transcript?: TranscriptShape;
+  /** The request's max_tokens (output reservation counted against the window). */
+  maxTokens?: number;
+  /**
+   * A compress result did not fit the native window while MemTree's index
+   * trailed the conversation (indexBehind): a refusal waits for indexing.
+   */
+  indexBehind?: true;
   /** Body bytes actually sent to Anthropic (after notice strip / compression). */
   forwardedBytes?: number;
   /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
@@ -259,8 +266,8 @@ export interface MessagesRecord {
       /**
        * This lane's last attempt this human turn produced no prefix to ride
        * (no-op, no gain, failure, a forward that installed nothing, or a
-       * result still over the window); the next one waits until the
-       * conversation has grown by a twentieth of the budget, so a lane that
+       * result still over the window from a complete index); the next one
+       * waits until the conversation has grown by a twentieth of the budget, so a lane that
        * cannot compress does not pay a blocking call on every tool turn.
        */
       | "backoff"

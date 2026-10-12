@@ -13,17 +13,37 @@ export interface RouteFallbackError {
         };
     };
 }
+/** How long a lane may wait for MemTree to finish indexing before refusing. */
+export declare const INDEX_WAIT_DEADLINE_MS: number;
+/** Seconds Claude Code waits between retries while the index catches up. */
+export declare const INDEX_WAIT_RETRY_AFTER_SECONDS = 30;
+export declare const FINAL_REFUSAL_MESSAGE: string;
+export interface FallbackFailureContext {
+    /**
+     * This request's compress result did not fit only because MemTree's index
+     * is behind the conversation (most of it still verbatim). Retries then wait
+     * for indexing instead of spending the strike budget.
+     */
+    awaitingIndex?: boolean;
+    now?: number;
+}
 /**
  * Claude Code 2.1.288 retries 503 itself, even with SDK maxRetries=0.
  * 529 has extra overload handling (including indefinite watchdog retries).
  * Use ordinary 503 retries and bound the episode in the proxy itself.
  * Successful delivery ends an episode; hook events and elapsed time do not.
+ * An episode waiting on the index is bounded by wall clock instead of strikes.
  */
 export declare class RouteFallbackFailures {
     private readonly capacity;
+    private readonly indexWaitMs;
     private readonly failures;
-    constructor(capacity?: number);
-    fail(lane: string): RouteFallbackError;
+    /** Lane -> when its index wait began. */
+    private readonly indexWaits;
+    constructor(capacity?: number, indexWaitMs?: number);
+    fail(lane: string, context?: FallbackFailureContext): RouteFallbackError;
     succeeded(lane: string): void;
+    /** A 503 while the lane's wait is within its deadline; a 400 after it. */
+    private waitForIndex;
 }
 //# sourceMappingURL=route-fallback.d.ts.map

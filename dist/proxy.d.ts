@@ -105,6 +105,8 @@ export interface ProxyOptions {
     /** Test-only overrides for the first-tree probe (5s) and total wait (60s). */
     awaitedIndexProbeTimeoutMs?: number;
     awaitedIndexWaitTimeoutMs?: number;
+    /** Bound on retrying an unfit request while MemTree indexes (route-fallback.ts). */
+    indexWaitDeadlineMs?: number;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,

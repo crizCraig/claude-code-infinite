@@ -70,6 +70,7 @@ import {
   cachedPromptTokenCount,
   checkCompressedHistory,
   didMemtreeCompress,
+  indexBehind,
   MemtreeClient,
   modelBudgetTokens,
   normalizeMessagesForMemtree,
@@ -230,6 +231,8 @@ export interface ProxyOptions {
   /** Test-only overrides for the first-tree probe (5s) and total wait (60s). */
   awaitedIndexProbeTimeoutMs?: number;
   awaitedIndexWaitTimeoutMs?: number;
+  /** Bound on retrying an unfit request while MemTree indexes (route-fallback.ts). */
+  indexWaitDeadlineMs?: number;
   debug?: boolean;
   /**
    * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,
@@ -539,8 +542,10 @@ interface ToolRecoveryAttempt {
   retryAtTokens?: number;
   /**
    * Set when the attempt's reply showed no finished tree for the conversation
-   * (a no-op with no indexed tokens). Until then a compress call cannot shrink
-   * anything: the server keeps every unindexed message verbatim. The lane
+   * (a no-op with no indexed tokens), or a compressed reply too large for the
+   * window because its index trails the conversation (indexBehind). Until the
+   * tree catches up a compress call cannot shrink that history: the server
+   * keeps every unindexed message verbatim. The lane
    * makes no compress call (routeRecovery outcome "awaiting-index") and
    * instead checks, in the background and one at a time, whether that
    * reply's MemTree page has finished building. A window overflow still
@@ -584,6 +589,23 @@ function checkAwaitedIndex(
     .finally(() => {
       waiting.checking = false;
     });
+}
+
+/** Mark a lane as waiting for the tree behind `result`'s MemTree page. */
+function awaitIndex(
+  opts: ProxyOptions,
+  attempt: ToolRecoveryAttempt,
+  record: NonNullable<MessagesRecord["routeRecovery"]>,
+  result: CompressResult
+): void {
+  const pageId = result.memtreeUrl ? memtreePageId(result.memtreeUrl) : undefined;
+  if (!pageId) return;
+  attempt.awaitingIndex = {
+    pageId,
+    checking: false,
+    deadline: Date.now() + (opts.awaitedIndexWaitTimeoutMs ?? 60_000),
+  };
+  record.awaitingIndex = true;
 }
 
 /** Growth (share of the budget) a lane waits for after an attempt that failed. */
@@ -730,7 +752,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainNoticePending: false,
     mainPromptGeneration: 0,
     promptAccounting: new PromptAccounting(),
-    fallbackFailures: new RouteFallbackFailures(),
+    fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs),
     activeSubagents: new Set(),
     memoryRoutes: new Map(),
     mainRouteEpoch: 0,
@@ -1600,6 +1622,7 @@ async function handleMessages(
   // Hook state controls notices only. Hidden requests cannot consume main notices.
 
   if (typeof body.model === "string") rec.model = body.model;
+  if (typeof body.max_tokens === "number") rec.maxTokens = body.max_tokens;
   rec.stream = body.stream === true;
   // Observation only: which requests carry Claude Code's turn origin.
   if (clientInfo) rec.client = clientInfo;
@@ -1942,6 +1965,8 @@ async function handleMessages(
     result: CompressResult | undefined
   ): Promise<void> => {
     if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
+      // A lagging index left history verbatim: a refusal waits for indexing.
+      if (result && indexBehind(result)) rec.indexBehind = true;
       releaseUncommittedRouteDecision();
       recordTurn(rec, "followup-degraded", rawBody);
       return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
@@ -4192,9 +4217,9 @@ async function recoverToolRouteMiss(args: {
    * The attempt produced nothing: send what the turn would have sent without
    * it — the old ride (kept prefix) or the whole history — and back off.
    */
-  const forwardOriginal = () => {
+  const forwardOriginal = (growthBackoff = true) => {
     requestSendPolicies.get(req)!.failedRebuild = true;
-    backOff();
+    if (growthBackoff) backOff();
     if (fallback) {
       requestSendPolicies.get(req)?.allowed.add(fallback.raw);
       if (rec.compaction) rec.compaction.keptPrefix = true;
@@ -4330,14 +4355,8 @@ async function recoverToolRouteMiss(args: {
     };
     // No tree yet (nothing indexed): wait for it to be built rather than
     // retrying on growth, which on a fast-growing loop is every tool turn.
-    const pageId = result.memtreeUrl ? memtreePageId(result.memtreeUrl) : undefined;
-    if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0) && pageId) {
-      recoveryAttempt.awaitingIndex = {
-        pageId,
-        checking: false,
-        deadline: Date.now() + (opts.awaitedIndexWaitTimeoutMs ?? 60_000),
-      };
-      rec.routeRecovery.awaitingIndex = true;
+    if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0)) {
+      awaitIndex(opts, recoveryAttempt, rec.routeRecovery, result);
     }
     releaseOwnReservation();
     return forwardOriginal();
@@ -4387,7 +4406,14 @@ async function recoverToolRouteMiss(args: {
   if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
     rec.routeRecovery = { conversationBytes, outcome: "unusable" };
     releaseOwnReservation();
-    return forwardOriginal();
+    if (!indexBehind(result)) return forwardOriginal();
+    // The index trails the conversation, so this result kept most of it
+    // verbatim. Growth cannot help; the next compress after indexing can.
+    // Skip the growth backoff so retries compress again, and let a refusal
+    // wait for the index rather than spend the strike budget.
+    rec.indexBehind = true;
+    awaitIndex(opts, recoveryAttempt, rec.routeRecovery, result);
+    return forwardOriginal(false);
   }
   if (compressedRaw.length >= (fallback?.raw ?? forwardBody).length) {
     // The final transformed body is the proof of payload recovery; a result
@@ -4745,12 +4771,13 @@ function refuseWholeRequest(
   inputTokens: number,
   budgetTokens: number
 ): false {
-  const failure = args.state.fallbackFailures.fail(args.routeKey);
+  const failure = args.state.fallbackFailures.fail(args.routeKey,
+    { awaitingIndex: args.rec.indexBehind === true });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   console.error("[ccc proxy] request exceeds native context window; recovery failed", {
     lane: args.routeKey, attempt: failure.attempt, status: failure.status,
-    inputTokens, outputTokens: args.body.max_tokens ?? 0,
+    inputTokens, outputTokens: args.body.max_tokens ?? 0, indexBehind: args.rec.indexBehind === true,
     budgetTokens, modelContextLimit: args.modelContextLimit,
   });
   if (args.res.headersSent || args.res.destroyed) return false;

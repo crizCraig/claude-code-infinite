@@ -172,6 +172,18 @@ export declare function didMemtreeCompress(result: CompressResult): boolean;
  * when a tree covers the prompt. Older servers only send `cached_tokens`.
  */
 export declare function cachedPromptTokenCount(result: CompressResult): number | undefined;
+/**
+ * Share of the prompt left unindexed at or above which a compressed result
+ * that still does not fit the window is blamed on indexing lag.
+ */
+export declare const INDEX_LAG_MIN_UNINDEXED_SHARE = 0.1;
+/**
+ * Whether the server answered from an index that trails the conversation:
+ * it keeps every unindexed message verbatim, so a large unindexed share means
+ * a later compress (once indexing catches up) can shrink what this one could
+ * not. Unknown coverage (older servers) is not lag: refuse as before.
+ */
+export declare function indexBehind(result: CompressResult): boolean;
 /** The server-reported model budget, when present and sane. */
 export declare function modelBudgetTokens(result: CompressResult): number | undefined;
 /**

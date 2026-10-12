@@ -146,7 +146,7 @@ const toolBody = (max_tokens = 100) => JSON.stringify({ model: "claude-x", max_t
 
 async function waitingHarness(indexWaitDeadlineMs) {
   const records = [];
-  const h = await harness(20_000, { indexWaitDeadlineMs,
+  const h = await harness(20_000, { indexWaitDeadlineMs, defaultCompactTarget: undefined,
     reqlog: { log: record => records.push(structuredClone(record)) } });
   h.memtree.compress = async () => unfitResult(25_000, 230_000);
   return { ...h, records };
