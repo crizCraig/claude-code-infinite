@@ -48,7 +48,7 @@ import {
   plausibleSample,
   type SizeSample,
 } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, fitsNative, outputReservation,
+import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation,
   type RequestCandidate, type SizingLimits } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
@@ -1611,7 +1611,7 @@ async function handleMessages(
       const measured = await requestSizing.measure(candidate, sizingLimits());
       // A validated ride is still eligible for bounded late recovery. Final
       // selection considers it together with the original and any replacement.
-      return candidate.kind === "ride" || fitsNative(measured.tokens, sizingLimits());
+      return candidate.kind === "ride" || fitsMeasured(measured, sizingLimits());
     },
     recoverLate: async (buffer, tokens) => {
       if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
@@ -1680,7 +1680,7 @@ async function handleMessages(
           candidateSizeOwners.set(routedCandidate, owner);
           // Advisory window pressure can request recovery, but never removes a
           // structurally valid candidate before request-local counting/selection.
-          if (!fitsNative(requestSizing.plan(routedCandidate).tokens, sizingLimits())) {
+          if (!fitsMeasured(plannedMeasurement(requestSizing, routedCandidate), sizingLimits())) {
             routeMiss = "rejected";
             regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
           }
@@ -3146,7 +3146,8 @@ function calibratedSizeExceedsWindow(
   body: Record<string, any>,
   modelContextLimit: number
 ): boolean {
-  const outputTokens = bodyOutputReservation(body);
+  // A planning estimate, so the full max_tokens (the floor needs an exact count).
+  const outputTokens = bodyOutputReservation(body, false);
   return record.sizeSource === "reported" &&
     (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit;
 }
@@ -3552,8 +3553,9 @@ function planToolCompaction(args: {
     }
   }
   if (!ride) {
-    const originalSize = args.sizing.plan(args.sizing.register(forwardBody, "original"));
-    overWindow ||= originalSize.tokens + bodyOutputReservation(body) > modelContextLimit;
+    const original = args.sizing.register(forwardBody, "original");
+    overWindow ||= args.sizing.plan(original).tokens +
+      bodyOutputReservation(body, args.sizing.isExact(original)) > modelContextLimit;
   }
   const sample = ride
     ? ride.sizeHolder.lastSize
@@ -3568,7 +3570,7 @@ function planToolCompaction(args: {
   compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
   compaction.sizeSource = size.source;
   overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
-    output: bodyOutputReservation(body) });
+    output: bodyOutputReservation(body, args.sizing.isExact(candidate)) });
   if (!args.canCompress) {
     if (overWindow) return { kind: "pass", original: true };
     return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3640,16 +3642,24 @@ function routedBodyExceedsContext(
   routedBody: Buffer,
   modelContextLimit: number
 ): boolean {
-  const outputTokens = bodyOutputReservation(body);
+  const outputTokens = bodyOutputReservation(body, false);
   // This is the existing local byte estimate, not a tokenizer or a hard cap.
   // Final forwarding checks can replace this estimate with Count Tokens.
   return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
 }
 
-/** Output room every native-fit check reserves for this request's model. */
-function bodyOutputReservation(body: Record<string, any>): number {
-  return outputReservation(typeof body.model === "string" ? body.model : undefined,
+/** Output room a native-fit check reserves: the model's floor for an exact
+ * count, else (an estimate) the full max_tokens. */
+function bodyOutputReservation(body: Record<string, any>, exact = true): number {
+  return outputReservation(exact && typeof body.model === "string" ? body.model : undefined,
     body.max_tokens);
+}
+
+/** A planned size as a measurement, exact only when Count Tokens measured it. */
+function plannedMeasurement(sizing: RequestSizing, candidate: RequestCandidate):
+  { tokens: number; source: "exact" | "reported" | "bytes" } {
+  const planned = sizing.plan(candidate);
+  return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source };
 }
 
 function regrantSmallerWindowRecovery(

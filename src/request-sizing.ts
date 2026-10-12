@@ -15,10 +15,11 @@ export type CandidateKind = "original" | "ride" | "replacement";
 export interface SizingLimits {
   budget: number;
   context: number;
-  /** Output room admission reserves (see outputReservation). */
+  /** Output room an exact count must leave (see outputReservation). */
   output: number;
-  /** Full max_tokens: an estimate that would not fit with it is counted exactly
-   * before delivery, so a relaxed `output` floor never admits an uncounted guess. */
+  /** Full max_tokens, reserved for every estimate: an estimate that would not
+   * fit with it is counted before delivery, and only an exact count may use
+   * the relaxed `output` floor. */
   recountOutput?: number;
 }
 export interface PlannedSize { tokens: number; source: "reported" | "bytes" }
@@ -67,6 +68,11 @@ export class RequestSizing {
     return exact !== undefined ? { tokens: exact, source: "reported" } : candidate.estimate;
   }
 
+  /** Whether this body's size is an exact Count Tokens result. */
+  isExact(candidate: RequestCandidate): boolean {
+    return this.counts.peek(candidate.body)?.tokens !== undefined;
+  }
+
   clientInputTokens(candidate: RequestCandidate): number | undefined {
     const size = this.plan(candidate);
     return size.source === "reported" ? size.tokens : undefined;
@@ -78,8 +84,7 @@ export class RequestSizing {
     let count = this.counts.peek(candidate.body);
     const estimate = candidate.estimate.tokens;
     const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
-      (phase === "delivery" && !fitsNative(estimate,
-        { ...limits, output: Math.max(limits.output, limits.recountOutput ?? 0) }));
+      (phase === "delivery" && !fitsNative(estimate, estimateLimits(limits)));
     if (!count && this.enabled && needed) count = await this.counts.count(candidate.body);
     if (count?.tokens !== undefined) return {
       tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,
@@ -108,7 +113,7 @@ export class RequestSizing {
       : [preferred, ...others];
     for (const candidate of ordered) {
       const measurement = await this.measure(candidate, limits);
-      if (fitsNative(measurement.tokens, limits)) return { candidate, measurement };
+      if (fitsMeasured(measurement, limits)) return { candidate, measurement };
     }
     return undefined;
   }
@@ -123,6 +128,20 @@ export function outputReservation(model: string | undefined, maxTokens: unknown)
   if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens)) return 0;
   const output = Math.max(0, maxTokens);
   return acceptsContextOverflow(model) ? Math.min(output, OUTPUT_FLOOR_TOKENS) : output;
+}
+
+/** Admission: the relaxed output floor applies only to an exact count of this
+ * body; estimates and fallbacks (failed or disabled counting) keep max_tokens. */
+export function fitsMeasured(
+  measurement: Pick<CandidateMeasurement, "tokens" | "source">, limits: SizingLimits,
+): boolean {
+  return fitsNative(measurement.tokens,
+    measurement.source === "exact" ? limits : estimateLimits(limits));
+}
+
+/** The limits an estimate is judged by: the full max_tokens reservation. */
+export function estimateLimits(limits: SizingLimits): SizingLimits {
+  return { ...limits, output: Math.max(limits.output, limits.recountOutput ?? 0) };
 }
 
 /** `limits.output` is the reservation from outputReservation, not raw max_tokens. */

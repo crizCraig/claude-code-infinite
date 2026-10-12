@@ -6,10 +6,11 @@ export type CandidateKind = "original" | "ride" | "replacement";
 export interface SizingLimits {
     budget: number;
     context: number;
-    /** Output room admission reserves (see outputReservation). */
+    /** Output room an exact count must leave (see outputReservation). */
     output: number;
-    /** Full max_tokens: an estimate that would not fit with it is counted exactly
-     * before delivery, so a relaxed `output` floor never admits an uncounted guess. */
+    /** Full max_tokens, reserved for every estimate: an estimate that would not
+     * fit with it is counted before delivery, and only an exact count may use
+     * the relaxed `output` floor. */
     recountOutput?: number;
 }
 export interface PlannedSize {
@@ -43,6 +44,8 @@ export declare class RequestSizing {
     excludeFallback(candidate: RequestCandidate): void;
     /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
     plan(candidate: RequestCandidate): PlannedSize;
+    /** Whether this body's size is an exact Count Tokens result. */
+    isExact(candidate: RequestCandidate): boolean;
     clientInputTokens(candidate: RequestCandidate): number | undefined;
     /** Count only when a size decision needs it; all views reuse the same result. */
     measure(candidate: RequestCandidate, limits: SizingLimits, phase?: "plan" | "delivery"): Promise<CandidateMeasurement>;
@@ -59,6 +62,11 @@ export declare class RequestSizing {
  * behavior"), so those models reserve min(max_tokens, OUTPUT_FLOOR_TOKENS);
  * older and unknown models reserve the full max_tokens. */
 export declare function outputReservation(model: string | undefined, maxTokens: unknown): number;
+/** Admission: the relaxed output floor applies only to an exact count of this
+ * body; estimates and fallbacks (failed or disabled counting) keep max_tokens. */
+export declare function fitsMeasured(measurement: Pick<CandidateMeasurement, "tokens" | "source">, limits: SizingLimits): boolean;
+/** The limits an estimate is judged by: the full max_tokens reservation. */
+export declare function estimateLimits(limits: SizingLimits): SizingLimits;
 /** `limits.output` is the reservation from outputReservation, not raw max_tokens. */
 export declare function fitsNative(input: number, limits: SizingLimits): boolean;
 /** One shared estimator for planner telemetry and request-local snapshots. */

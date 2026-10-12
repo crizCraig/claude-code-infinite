@@ -42,7 +42,7 @@ import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures } from "./route-fallback.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, fitsNative, outputReservation } from "./request-sizing.js";
+import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
 import https from "node:https";
@@ -1009,7 +1009,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             const measured = await requestSizing.measure(candidate, sizingLimits());
             // A validated ride is still eligible for bounded late recovery. Final
             // selection considers it together with the original and any replacement.
-            return candidate.kind === "ride" || fitsNative(measured.tokens, sizingLimits());
+            return candidate.kind === "ride" || fitsMeasured(measured, sizingLimits());
         },
         recoverLate: async (buffer, tokens) => {
             if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
@@ -1073,7 +1073,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     candidateSizeOwners.set(routedCandidate, owner);
                     // Advisory window pressure can request recovery, but never removes a
                     // structurally valid candidate before request-local counting/selection.
-                    if (!fitsNative(requestSizing.plan(routedCandidate).tokens, sizingLimits())) {
+                    if (!fitsMeasured(plannedMeasurement(requestSizing, routedCandidate), sizingLimits())) {
                         routeMiss = "rejected";
                         regrantSmallerWindowRecovery(state, requestRouteKey, modelContextLimit);
                     }
@@ -2260,7 +2260,8 @@ function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
 }
 /** Calibrated input must leave room for the requested output as well. */
 function calibratedSizeExceedsWindow(record, body, modelContextLimit) {
-    const outputTokens = bodyOutputReservation(body);
+    // A planning estimate, so the full max_tokens (the floor needs an exact count).
+    const outputTokens = bodyOutputReservation(body, false);
     return record.sizeSource === "reported" &&
         (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit;
 }
@@ -2521,8 +2522,9 @@ function planToolCompaction(args) {
         }
     }
     if (!ride) {
-        const originalSize = args.sizing.plan(args.sizing.register(forwardBody, "original"));
-        overWindow ||= originalSize.tokens + bodyOutputReservation(body) > modelContextLimit;
+        const original = args.sizing.register(forwardBody, "original");
+        overWindow ||= args.sizing.plan(original).tokens +
+            bodyOutputReservation(body, args.sizing.isExact(original)) > modelContextLimit;
     }
     const sample = ride
         ? ride.sizeHolder.lastSize
@@ -2537,7 +2539,7 @@ function planToolCompaction(args) {
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
     overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
-        output: bodyOutputReservation(body) });
+        output: bodyOutputReservation(body, args.sizing.isExact(candidate)) });
     if (!args.canCompress) {
         if (overWindow)
             return { kind: "pass", original: true };
@@ -2601,14 +2603,20 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
 }
 /** Size the assembled input (including system/tools) and reserve output room. */
 function routedBodyExceedsContext(body, routedBody, modelContextLimit) {
-    const outputTokens = bodyOutputReservation(body);
+    const outputTokens = bodyOutputReservation(body, false);
     // This is the existing local byte estimate, not a tokenizer or a hard cap.
     // Final forwarding checks can replace this estimate with Count Tokens.
     return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
 }
-/** Output room every native-fit check reserves for this request's model. */
-function bodyOutputReservation(body) {
-    return outputReservation(typeof body.model === "string" ? body.model : undefined, body.max_tokens);
+/** Output room a native-fit check reserves: the model's floor for an exact
+ * count, else (an estimate) the full max_tokens. */
+function bodyOutputReservation(body, exact = true) {
+    return outputReservation(exact && typeof body.model === "string" ? body.model : undefined, body.max_tokens);
+}
+/** A planned size as a measurement, exact only when Count Tokens measured it. */
+function plannedMeasurement(sizing, candidate) {
+    const planned = sizing.plan(candidate);
+    return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source };
 }
 function regrantSmallerWindowRecovery(state, key, modelContextLimit) {
     const previous = state.toolRecoveryAttemptedLanes.get(key);
