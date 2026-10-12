@@ -165,6 +165,12 @@ export interface CompressResult {
    * predate it. A new value means a new index finished and is now in use.
    */
   memtreeIndex?: string;
+  /**
+   * Proposed server field: true when messages in this request are not yet in
+   * the tree it answered from and an indexing job will cover them. Absent on
+   * current servers, which then report no lag (see indexBehind).
+   */
+  index_pending?: boolean;
 }
 
 /**
@@ -229,22 +235,25 @@ export function cachedPromptTokenCount(
 }
 
 /**
- * Share of the prompt left unindexed at or above which a compressed result
- * that still does not fit the window is blamed on indexing lag.
- */
-export const INDEX_LAG_MIN_UNINDEXED_SHARE = 0.1;
-
-/**
- * Whether the server answered from an index that trails the conversation:
- * it keeps every unindexed message verbatim, so a large unindexed share means
- * a later compress (once indexing catches up) can shrink what this one could
- * not. Unknown coverage (older servers) is not lag: refuse as before.
+ * Whether the server says its index trails this conversation (`index_pending`):
+ * unindexed messages stay verbatim, so a compress once indexing catches up can
+ * shrink what this one could not. Usage counters cannot say this —
+ * `indexed_tokens` is a billing figure that counts a still-running job as
+ * covered — so a server without the field reports no lag.
  */
 export function indexBehind(result: CompressResult): boolean {
-  const indexed = cachedPromptTokenCount(result);
-  const raw = rawPromptTokenCount(result);
-  if (indexed === undefined || raw === undefined) return false;
-  return (raw - indexed) / raw >= INDEX_LAG_MIN_UNINDEXED_SHARE;
+  return result.index_pending === true;
+}
+
+/**
+ * Evidence that MemTree's index has not caught up with this conversation:
+ * the server says so, or it passed the conversation through with nothing
+ * indexed and a page for the tree it is building.
+ */
+export function indexLagEvidence(result: CompressResult): boolean {
+  if (indexBehind(result)) return true;
+  return !didMemtreeCompress(result) && !(cachedPromptTokenCount(result) ?? 0) &&
+    typeof result.memtreeUrl === "string" && result.memtreeUrl.length > 0;
 }
 
 function nonNegativeCount(value: unknown): number | undefined {
@@ -876,6 +885,9 @@ export class MemtreeClient {
   private memtreeTools: string | undefined;
   /** Complete compression request key → in-flight/settled promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
+  /** When a cached compress result stops answering (expireCompressResult). */
+  private readonly compressExpiry = new Map<string, number>();
+  private readonly compressResultKeys = new WeakMap<CompressResult, string>();
   /** Message hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
   /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
@@ -982,7 +994,7 @@ export class MemtreeClient {
     modelContextLimit: number,
     meta?: CompressRequestMeta
   ): boolean {
-    return this.compressCache.has(this.compressKey(hash, modelContextLimit, meta));
+    return this.liveCompress(this.compressKey(hash, modelContextLimit, meta)) !== undefined;
   }
 
   /**
@@ -1025,7 +1037,7 @@ export class MemtreeClient {
     meta?: CompressRequestMeta
   ): Promise<CompressResult | null> {
     const cacheKey = this.compressKey(hash, modelContextLimit, meta);
-    const cached = this.compressCache.get(cacheKey);
+    const cached = this.liveCompress(cacheKey);
     if (cached) return cached;
 
     const promise = this.callContextMemory(messages, modelContextLimit, {
@@ -1065,10 +1077,37 @@ export class MemtreeClient {
         this.compressCache.delete(cacheKey);
       }
       return null;
+    }).then((result) => {
+      if (result) this.compressResultKeys.set(result, cacheKey);
+      return result;
     });
 
     this.remember(cacheKey, promise);
     return promise;
+  }
+
+  /**
+   * Let `result` answer identical requests for `afterMs` more, then ask the
+   * server again: an answer from a lagging index goes stale once indexing
+   * catches up. In-flight calls are untouched (still deduplicated), and an
+   * earlier expiry is kept, so retries cannot postpone the refresh.
+   */
+  expireCompressResult(result: CompressResult, afterMs: number): void {
+    const key = this.compressResultKeys.get(result);
+    if (key === undefined || !this.compressCache.has(key)) return;
+    const at = Date.now() + Math.max(0, afterMs);
+    const current = this.compressExpiry.get(key);
+    if (current === undefined || at < current) this.compressExpiry.set(key, at);
+  }
+
+  /** The cached compress promise for `key`, dropping one past its expiry. */
+  private liveCompress(key: string): Promise<CompressResult | null> | undefined {
+    const expiry = this.compressExpiry.get(key);
+    if (expiry !== undefined && Date.now() >= expiry) {
+      this.compressExpiry.delete(key);
+      this.compressCache.delete(key);
+    }
+    return this.compressCache.get(key);
   }
 
   /**
@@ -1297,10 +1336,14 @@ export class MemtreeClient {
   }
 
   private remember(cacheKey: string, promise: Promise<CompressResult | null>) {
+    this.compressExpiry.delete(cacheKey);
     this.compressCache.set(cacheKey, promise);
     if (this.compressCache.size > DEDUPE_CACHE_MAX) {
       const first = this.compressCache.keys().next().value;
-      if (first !== undefined) this.compressCache.delete(first);
+      if (first !== undefined) {
+        this.compressCache.delete(first);
+        this.compressExpiry.delete(first);
+      }
     }
   }
 

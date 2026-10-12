@@ -142,6 +142,12 @@ export interface CompressResult {
      * predate it. A new value means a new index finished and is now in use.
      */
     memtreeIndex?: string;
+    /**
+     * Proposed server field: true when messages in this request are not yet in
+     * the tree it answered from and an indexing job will cover them. Absent on
+     * current servers, which then report no lag (see indexBehind).
+     */
+    index_pending?: boolean;
 }
 /**
  * The server-flattened single user message of a compressed result, or null
@@ -173,17 +179,19 @@ export declare function didMemtreeCompress(result: CompressResult): boolean;
  */
 export declare function cachedPromptTokenCount(result: CompressResult): number | undefined;
 /**
- * Share of the prompt left unindexed at or above which a compressed result
- * that still does not fit the window is blamed on indexing lag.
- */
-export declare const INDEX_LAG_MIN_UNINDEXED_SHARE = 0.1;
-/**
- * Whether the server answered from an index that trails the conversation:
- * it keeps every unindexed message verbatim, so a large unindexed share means
- * a later compress (once indexing catches up) can shrink what this one could
- * not. Unknown coverage (older servers) is not lag: refuse as before.
+ * Whether the server says its index trails this conversation (`index_pending`):
+ * unindexed messages stay verbatim, so a compress once indexing catches up can
+ * shrink what this one could not. Usage counters cannot say this —
+ * `indexed_tokens` is a billing figure that counts a still-running job as
+ * covered — so a server without the field reports no lag.
  */
 export declare function indexBehind(result: CompressResult): boolean;
+/**
+ * Evidence that MemTree's index has not caught up with this conversation:
+ * the server says so, or it passed the conversation through with nothing
+ * indexed and a page for the tree it is building.
+ */
+export declare function indexLagEvidence(result: CompressResult): boolean;
 /** The server-reported model budget, when present and sane. */
 export declare function modelBudgetTokens(result: CompressResult): number | undefined;
 /**
@@ -267,6 +275,9 @@ export declare class MemtreeClient {
     private memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     private compressCache;
+    /** When a cached compress result stops answering (expireCompressResult). */
+    private readonly compressExpiry;
+    private readonly compressResultKeys;
     /** Message hashes already submitted for background indexing. */
     private indexedHashes;
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
@@ -345,6 +356,15 @@ export declare class MemtreeClient {
      * the caller can distinguish "unpaid" from "outage".
      */
     compress(hash: string, messages: Message[], modelContextLimit: number, signal?: AbortSignal, meta?: CompressRequestMeta): Promise<CompressResult | null>;
+    /**
+     * Let `result` answer identical requests for `afterMs` more, then ask the
+     * server again: an answer from a lagging index goes stale once indexing
+     * catches up. In-flight calls are untouched (still deduplicated), and an
+     * earlier expiry is kept, so retries cannot postpone the refresh.
+     */
+    expireCompressResult(result: CompressResult, afterMs: number): void;
+    /** The cached compress promise for `key`, dropping one past its expiry. */
+    private liveCompress;
     /**
      * Fire-and-forget background indexing for tool and first-user turns. Keeps
      * the server index fed during tool loops; adds zero latency to the response

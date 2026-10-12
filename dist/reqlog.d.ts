@@ -111,8 +111,9 @@ export interface MessagesRecord {
     /** The request's max_tokens (output reservation counted against the window). */
     maxTokens?: number;
     /**
-     * A compress result did not fit the native window while MemTree's index
-     * trailed the conversation (indexBehind): a refusal waits for indexing.
+     * The compress result showed MemTree's index trailing the conversation
+     * (indexLagEvidence: the server's index_pending, or a cold pass-through with
+     * its page). If the request then cannot fit, the refusal waits for indexing.
      */
     indexBehind?: true;
     /** Body bytes actually sent to Anthropic (after notice strip / compression). */

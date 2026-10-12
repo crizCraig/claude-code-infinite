@@ -107,6 +107,11 @@ export interface ProxyOptions {
     awaitedIndexWaitTimeoutMs?: number;
     /** Bound on retrying an unfit request while MemTree indexes (route-fallback.ts). */
     indexWaitDeadlineMs?: number;
+    /**
+     * How long a compress answer from a lagging index keeps answering identical
+     * retries before MemTree is asked again (default: the 503 retry-after).
+     */
+    indexWaitRefreshMs?: number;
     debug?: boolean;
     /**
      * Always-on request/timing JSONL log (see reqlog.ts). Includes messages,

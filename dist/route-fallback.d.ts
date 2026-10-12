@@ -38,12 +38,22 @@ export declare class RouteFallbackFailures {
     private readonly capacity;
     private readonly indexWaitMs;
     private readonly failures;
-    /** Lane -> when its index wait began. */
+    /** Lane -> its index wait, least recently seen first. */
     private readonly indexWaits;
     constructor(capacity?: number, indexWaitMs?: number);
     fail(lane: string, context?: FallbackFailureContext): RouteFallbackError;
     succeeded(lane: string): void;
-    /** A 503 while the lane's wait is within its deadline; a 400 after it. */
+    /**
+     * A 503 while the lane's wait is within its deadline; a 400 after it. An
+     * expired wait stays refused while its lane keeps retrying, so retries
+     * cannot reopen it.
+     */
     private waitForIndex;
+    /**
+     * Make room for one more wait: drop waits idle for a whole deadline
+     * (abandoned sessions and subagents), else the least recently seen one, so
+     * a new lane always gets its wait.
+     */
+    private reclaimIndexWaits;
 }
 //# sourceMappingURL=route-fallback.d.ts.map

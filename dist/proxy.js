@@ -40,7 +40,7 @@
  */
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { RouteFallbackFailures } from "./route-fallback.js";
+import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures } from "./route-fallback.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsNative } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
@@ -50,7 +50,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexBehind, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
@@ -134,6 +134,19 @@ function checkAwaitedIndex(opts, attempt, shutdownSignal) {
         .finally(() => {
         waiting.checking = false;
     });
+}
+/**
+ * Record lag evidence from `result` (indexLagEvidence): a refusal of this
+ * request then waits for the index, and the cached answer expires after the
+ * retry interval so a later retry asks MemTree again — at most one fresh
+ * compress per interval for the same request.
+ */
+function noteIndexLag(opts, rec, result) {
+    if (!indexLagEvidence(result))
+        return false;
+    rec.indexBehind = true;
+    opts.memtree.expireCompressResult?.(result, opts.indexWaitRefreshMs ?? INDEX_WAIT_RETRY_AFTER_SECONDS * 1000);
+    return true;
 }
 /** Mark a lane as waiting for the tree behind `result`'s MemTree page. */
 function awaitIndex(opts, attempt, record, result) {
@@ -1334,8 +1347,8 @@ async function handleMessages(req, res, opts, upstream, state) {
     const forwardCompressed = async (compressedBody, compressedRaw, turnType, stable, result) => {
         if (!(await requestSendPolicies.get(req).fitsNative(compressedRaw))) {
             // A lagging index left history verbatim: a refusal waits for indexing.
-            if (result && indexBehind(result))
-                rec.indexBehind = true;
+            if (result)
+                noteIndexLag(opts, rec, result);
             releaseUncommittedRouteDecision();
             recordTurn(rec, "followup-degraded", rawBody);
             return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
@@ -1615,6 +1628,10 @@ async function handleMessages(req, res, opts, upstream, state) {
         usable: historyCheck.usable,
     };
     if (!actuallyCompressed || !historyCheck.usable) {
+        // A pass-through from a cold index: if the history cannot go out whole,
+        // the refusal waits for the tree instead of spending its strikes.
+        if (!actuallyCompressed)
+            noteIndexLag(opts, rec, result);
         const kept = rideOldPrefix(!actuallyCompressed);
         if (kept)
             return kept;
@@ -3164,11 +3181,11 @@ async function recoverToolRouteMiss(args) {
         };
         // No tree yet (nothing indexed): wait for it to be built rather than
         // retrying on growth, which on a fast-growing loop is every tool turn.
-        if (!actuallyCompressed && !(cachedPromptTokenCount(result) ?? 0)) {
-            awaitIndex(opts, recoveryAttempt, rec.routeRecovery, result);
-        }
         releaseOwnReservation();
-        return forwardOriginal();
+        if (actuallyCompressed || !noteIndexLag(opts, rec, result))
+            return forwardOriginal();
+        awaitIndex(opts, recoveryAttempt, rec.routeRecovery, result);
+        return forwardOriginal(false);
     }
     // Serializing the compressed body is the one synchronous step here that can
     // realistically throw: these are the multi-megabyte payloads that court
@@ -3206,13 +3223,12 @@ async function recoverToolRouteMiss(args) {
     if (!(await requestSendPolicies.get(req).fitsNative(compressedRaw))) {
         rec.routeRecovery = { conversationBytes, outcome: "unusable" };
         releaseOwnReservation();
-        if (!indexBehind(result))
+        if (!noteIndexLag(opts, rec, result))
             return forwardOriginal();
         // The index trails the conversation, so this result kept most of it
         // verbatim. Growth cannot help; the next compress after indexing can.
         // Skip the growth backoff so retries compress again, and let a refusal
         // wait for the index rather than spend the strike budget.
-        rec.indexBehind = true;
         awaitIndex(opts, recoveryAttempt, rec.routeRecovery, result);
         return forwardOriginal(false);
     }

@@ -23,7 +23,7 @@ export class RouteFallbackFailures {
     capacity;
     indexWaitMs;
     failures = new Map();
-    /** Lane -> when its index wait began. */
+    /** Lane -> its index wait, least recently seen first. */
     indexWaits = new Map();
     constructor(capacity = 128, indexWaitMs = INDEX_WAIT_DEADLINE_MS) {
         this.capacity = capacity;
@@ -49,20 +49,39 @@ export class RouteFallbackFailures {
         this.failures.delete(lane);
         this.indexWaits.delete(lane);
     }
-    /** A 503 while the lane's wait is within its deadline; a 400 after it. */
+    /**
+     * A 503 while the lane's wait is within its deadline; a 400 after it. An
+     * expired wait stays refused while its lane keeps retrying, so retries
+     * cannot reopen it.
+     */
     waitForIndex(lane, now) {
-        let started = this.indexWaits.get(lane);
-        if (started === undefined) {
-            // Full: no new waits, so the lane falls back to the bounded strikes.
-            if (this.indexWaits.size >= this.capacity)
-                return undefined;
-            started = now;
-            this.indexWaits.set(lane, started);
-        }
+        const wait = this.indexWaits.get(lane) ?? { started: now, seen: now };
+        this.indexWaits.delete(lane);
+        if (this.indexWaits.size >= this.capacity)
+            this.reclaimIndexWaits(now);
+        wait.seen = now;
+        this.indexWaits.set(lane, wait);
         const attempt = this.failures.get(lane) ?? 0;
-        if (now - started >= this.indexWaitMs)
+        if (now - wait.started >= this.indexWaitMs)
             return refusal(Math.max(attempt, 3));
         return retryError(attempt, String(INDEX_WAIT_RETRY_AFTER_SECONDS), INDEX_WAIT_MESSAGE);
+    }
+    /**
+     * Make room for one more wait: drop waits idle for a whole deadline
+     * (abandoned sessions and subagents), else the least recently seen one, so
+     * a new lane always gets its wait.
+     */
+    reclaimIndexWaits(now) {
+        for (const [lane, wait] of this.indexWaits) {
+            if (now - wait.seen < this.indexWaitMs)
+                break;
+            this.indexWaits.delete(lane);
+        }
+        if (this.indexWaits.size < this.capacity)
+            return;
+        const oldest = this.indexWaits.keys().next().value;
+        if (oldest !== undefined)
+            this.indexWaits.delete(oldest);
     }
 }
 const RETRY_MESSAGE = "MemTree could not produce a usable compressed request; retrying within a bounded limit.";
@@ -81,7 +100,10 @@ function refusal(attempt) {
         status: 400,
         attempt,
         headers: { "x-should-retry": "false" },
-        body: { type: "error", error: { type: "invalid_request_error", message: FINAL_REFUSAL_MESSAGE } },
+        body: {
+            type: "error",
+            error: { type: "invalid_request_error", message: FINAL_REFUSAL_MESSAGE },
+        },
     };
 }
 //# sourceMappingURL=route-fallback.js.map
