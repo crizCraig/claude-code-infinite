@@ -12,7 +12,15 @@ import { acceptsContextOverflow } from "./turns.js";
 export const OUTPUT_FLOOR_TOKENS = 16_000;
 
 export type CandidateKind = "original" | "ride" | "replacement";
-export interface SizingLimits { budget: number; context: number; output: number }
+export interface SizingLimits {
+  budget: number;
+  context: number;
+  /** Output room admission reserves (see outputReservation). */
+  output: number;
+  /** Full max_tokens: an estimate that would not fit with it is counted exactly
+   * before delivery, so a relaxed `output` floor never admits an uncounted guess. */
+  recountOutput?: number;
+}
 export interface PlannedSize { tokens: number; source: "reported" | "bytes" }
 export interface CandidateMeasurement {
   tokens: number;
@@ -70,7 +78,8 @@ export class RequestSizing {
     let count = this.counts.peek(candidate.body);
     const estimate = candidate.estimate.tokens;
     const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
-      (phase === "delivery" && !fitsNative(estimate, limits));
+      (phase === "delivery" && !fitsNative(estimate,
+        { ...limits, output: Math.max(limits.output, limits.recountOutput ?? 0) }));
     if (!count && this.enabled && needed) count = await this.counts.count(candidate.body);
     if (count?.tokens !== undefined) return {
       tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,

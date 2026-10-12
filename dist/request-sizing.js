@@ -47,7 +47,7 @@ export class RequestSizing {
         let count = this.counts.peek(candidate.body);
         const estimate = candidate.estimate.tokens;
         const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
-            (phase === "delivery" && !fitsNative(estimate, limits));
+            (phase === "delivery" && !fitsNative(estimate, { ...limits, output: Math.max(limits.output, limits.recountOutput ?? 0) }));
         if (!count && this.enabled && needed)
             count = await this.counts.count(candidate.body);
         if (count?.tokens !== undefined)

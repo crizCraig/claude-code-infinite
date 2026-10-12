@@ -6,7 +6,11 @@ export type CandidateKind = "original" | "ride" | "replacement";
 export interface SizingLimits {
     budget: number;
     context: number;
+    /** Output room admission reserves (see outputReservation). */
     output: number;
+    /** Full max_tokens: an estimate that would not fit with it is counted exactly
+     * before delivery, so a relaxed `output` floor never admits an uncounted guess. */
+    recountOutput?: number;
 }
 export interface PlannedSize {
     tokens: number;

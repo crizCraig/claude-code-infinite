@@ -216,7 +216,7 @@ test("unknown suffixes on 4.5+ names keep the conservative rule", () => {
   }
   for (const model of ["claude-opus-4-5-20251101", "claude-opus-5-5[1m]",
     "claude-haiku-4-5-20251001[1m]", "claude-fable-5-1", "claude-mythos-5-1",
-    "claude-opus-5-1", "claude-sonnet-5-5-20261001"]) {
+    "claude-sonnet-5-5-20261001"]) {
     assert.equal(acceptsContextOverflow(model), true, model);
   }
 });

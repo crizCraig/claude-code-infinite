@@ -268,23 +268,28 @@ const CONTEXT_OVERFLOW_MODELS = new Set([
     "claude-sonnet-5-5",
     "claude-haiku-4-5",
     "claude-haiku-5-5",
+    "claude-mythos-5-1",
 ]);
-/** Whether the model accepts input + max_tokens over its window (4.5+ only;
- * unknown models are treated as older). */
+/** Whether the model accepts input + max_tokens over its window (4.5+ only).
+ * Exact allowlist after stripping a date and `[1m]`: unknown suffixes and
+ * unknown models are treated as older. */
 export function acceptsContextOverflow(model) {
-    return knownModelFamily(model, CONTEXT_OVERFLOW_MODELS);
+    return model !== undefined && CONTEXT_OVERFLOW_MODELS.has(normalizeModelId(model));
 }
 function isNativeOneMillionModel(model) {
     return knownModelFamily(model, NATIVE_ONE_MILLION_MODELS);
 }
-function knownModelFamily(model, family) {
-    if (!model)
-        return false;
-    const normalized = model
+function normalizeModelId(model) {
+    return model
         .trim()
         .toLowerCase()
         .replace(/(?:\[1m\])+$/i, "")
         .replace(/-\d{8}$/, "");
+}
+function knownModelFamily(model, family) {
+    if (!model)
+        return false;
+    const normalized = normalizeModelId(model);
     if (family.has(normalized))
         return true;
     // Point releases / variants of a known model (e.g. "claude-fable-5-1"

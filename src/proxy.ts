@@ -1540,6 +1540,7 @@ async function handleMessages(
     budget: resolveBudget(opts, state, body.model, modelContextLimit).tokens,
     context: modelContextLimit,
     output: bodyOutputReservation(body),
+    recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
   });
   const rides = state.memoryRoutes.has(requestRouteKey) ||
     (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));

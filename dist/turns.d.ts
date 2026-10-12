@@ -60,8 +60,9 @@ export declare function stripCcSystemReminders(messages: Message[]): Message[];
  * `system` param becomes a leading system-role message (mirrors cc_api.py).
  */
 export declare function messagesWithSystem(messages: Message[], system: string | any[] | undefined | null): Message[];
-/** Whether the model accepts input + max_tokens over its window (4.5+ only;
- * unknown models are treated as older). */
+/** Whether the model accepts input + max_tokens over its window (4.5+ only).
+ * Exact allowlist after stripping a date and `[1m]`: unknown suffixes and
+ * unknown models are treated as older. */
 export declare function acceptsContextOverflow(model: string | undefined): boolean;
 export declare function contextLimitForModel(model: string | undefined, anthropicBeta?: string, nativeOneMillionContext?: boolean): number;
 /**
