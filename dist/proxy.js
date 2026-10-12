@@ -53,7 +53,7 @@ import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
-import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
+import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
 import { hyperlink } from "./payment-gate.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
@@ -1892,12 +1892,15 @@ function memtreeViewLine(state, sessionId) {
         return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
     }
     // Blocked-prompt reasons need an explicit hyperlink in styled terminals.
-    const url = terminalSupportsHyperlinks() ? hyperlink(link.link, link.link) : link.link;
-    const lines = linkLines(LINK_LABEL, url, link.note);
+    const lines = linkLines(LINK_LABEL, viewUrl(link.link), link.note);
     // The memory the agent works from can be an older tree than the newest one.
     return page?.compressed && page.url !== link.link
-        ? `${lines}\n  memory from ${page.url}`
+        ? `${lines}\n${urlLine(viewUrl(page.url), "memory from ")}`
         : lines;
+}
+/** A `/memtree-view` URL: an explicit OSC 8 link where the terminal has them. */
+function viewUrl(url) {
+    return terminalSupportsHyperlinks() ? hyperlink(url, url) : url;
 }
 /**
  * The link shown for a session: its newest completed tree when the server

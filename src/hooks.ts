@@ -19,13 +19,28 @@ export const TRAILER_LABEL = "• MemTree ·";
 export const LINK_LABEL = "• MemTree";
 
 /**
+ * Closes every URL line. Terminal linkifiers run a bare URL into whatever is
+ * drawn right after it when the row joins the next one: a URL that ended a
+ * hook's output once opened as `…/m/<id>` plus Claude Code's prompt border
+ * (`────…❯`). A space always ends the URL, and a visible mark after it
+ * survives Claude Code trimming trailing whitespace and newlines.
+ */
+export const URL_END = " ↗";
+
+/** An indented line carrying one URL (bare or OSC 8), closed by URL_END. */
+export function urlLine(url: string, lead = ""): string {
+  return `  ${lead}${url}${URL_END}`;
+}
+
+/**
  * A MemTree link notice: the label (and note, if any) on the first line and
- * the URL alone, indented, on the next, so a long URL wraps on its own
- * rather than dragging the label or note onto a second line. Label and note
- * come pre-styled; the URL stays bare for the terminal's linkifier.
+ * the URL, indented, on the next, so a long URL wraps on its own rather than
+ * dragging the label or note onto a second line. Label and note come
+ * pre-styled; the URL stays bare for the terminal's linkifier, closed by
+ * URL_END so it is never the last thing in the output.
  */
 export function linkLines(label: string, url: string, note?: string): string {
-  return `${label}${note ? ` · ${note}` : ""}\n  ${url}`;
+  return `${label}${note ? ` · ${note}` : ""}\n${urlLine(url)}`;
 }
 export const DEFAULT_NOTICE_TTL_MS = 60 * 60 * 1000;
 const ANSI_GREEN = "\x1b[32m";
@@ -467,7 +482,7 @@ export class NoticeDeliveryQueue {
     this.deliveryFor(sessionId).successPage = noticePageIdentity(link.link);
     this.deliveryFor(sessionId).trailer = link.key;
     this.deliveryFor(sessionId).trailerUrl = link.link;
-    return `${this.styleSuccess(text)}\n  ${link.link}`;
+    return `${this.styleSuccess(text)}\n${urlLine(link.link)}`;
   }
 
   /** The session's current link, shown or not. Resolver failures never break a hook. */

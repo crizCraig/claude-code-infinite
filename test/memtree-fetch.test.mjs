@@ -113,7 +113,7 @@ test("the success line carries the MemTree link only when there is one to show",
   assert.equal(compressedNoticeText(undefined), COMPRESSED_NOTICE);
   assert.equal(
     compressedNoticeText("https://app.polychat.co/m/0f1c2d3e4a5b"),
-    `${COMPRESSED_NOTICE}\n  https://app.polychat.co/m/0f1c2d3e4a5b`
+    `${COMPRESSED_NOTICE}\n  https://app.polychat.co/m/0f1c2d3e4a5b ↗`
   );
 });
 
