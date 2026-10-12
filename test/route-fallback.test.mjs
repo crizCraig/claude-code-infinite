@@ -100,3 +100,29 @@ test("lag needs the server's index_pending; billing counters are not coverage", 
   assert.equal(indexBehind({ messages: [],
     usage: { raw_prompt_tokens: 230_000, prompt_tokens_details: { cached_tokens: 25_000 } } }), false);
 });
+
+test("a full wait table never evicts an active wait or restarts its deadline", () => {
+  // Codex cycle 2: capacity + 1 lanes retrying round-robin answered 503 forever.
+  const failures = new RouteFallbackFailures(2, 1_000);
+  const lanes = ["a", "b", "c"];
+  const firstRefusal = {};
+  for (let now = 0; now <= 3_000; now += 100) {
+    for (const lane of lanes) {
+      const status = failures.fail(lane, { awaitingIndex: true, now }).status;
+      if (status === 400) firstRefusal[lane] ??= now;
+      else assert.equal(firstRefusal[lane], undefined, `${lane} stays refused`);
+    }
+  }
+  assert.equal(firstRefusal.a, 1_000, "a reaches its 400 at its deadline");
+  assert.equal(firstRefusal.b, 1_000, "b reaches its 400 at its deadline");
+  assert.ok(firstRefusal.c <= 1_000, "the lane without a slot refuses by then too");
+});
+
+test("another lane taking a freed slot cannot reopen an expired episode", () => {
+  const failures = new RouteFallbackFailures(1, 1_000);
+  const sequence = [failures.fail("a", { awaitingIndex: true, now: 0 }).status,
+    failures.fail("a", { awaitingIndex: true, now: 1_000 }).status,
+    failures.fail("b", { awaitingIndex: true, now: 1_001 }).status,
+    failures.fail("a", { awaitingIndex: true, now: 1_002 }).status];
+  assert.deepEqual(sequence, [503, 400, 503, 400]);
+});
