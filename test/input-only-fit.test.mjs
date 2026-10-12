@@ -56,7 +56,8 @@ test("native and fallback fit judge 4.5+ input against window minus the floor", 
   assert.equal(fitsFallbackBudget(971_000, MAX_TOKENS, 500_000, WINDOW), false);
 });
 
-// Through the proxy: no Count Tokens, so delivery sizes bodies at bytes / 4.
+// Through the proxy: Count Tokens reports bytes / 4 exactly (the reduced floor
+// applies only to exact counts).
 const bodyOf = (tokens) => "x".repeat(tokens * 4);
 
 async function serve(handler) {
@@ -75,8 +76,11 @@ async function serve(handler) {
 async function harness(state) {
   const h = { state, delivered: [] };
   const upstream = await serve((req, res, raw) => {
-    h.delivered.push(raw.length);
     res.setHeader("content-type", "application/json");
+    if (req.url.includes("/count_tokens")) {
+      return res.end(JSON.stringify({ input_tokens: Math.ceil(raw.length / 4) }));
+    }
+    h.delivered.push(raw.length);
     res.end(JSON.stringify({ type: "message", role: "assistant",
       content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }));
   });
@@ -94,7 +98,7 @@ async function harness(state) {
   });
   const memtree = new MemtreeClient({ baseUrl: memory.url, apiKey: "offline" });
   h.proxy = await startProxy({ memtree, upstreamOrigin: upstream.url,
-    budgetTokensOverride: 500_000, indexWaitRefreshMs: 0 });
+    budgetTokensOverride: 500_000, indexWaitRefreshMs: 0, countTokens: true });
   h.close = () => { h.proxy.close(); upstream.close(); memory.close(); };
   return h;
 }
@@ -164,16 +168,43 @@ test("an estimate near the window is still counted before delivery", async () =>
   assert.equal(fitsNative(measured.tokens, limits), false);
 });
 
-test("proxy replay: small growth past a 950k calibrated sample is recounted", async () => {
-  const counts = [];
-  const forwards = [];
+// Review cycle 2 (codex, d964b01): when the recount fails or counting is
+// disabled, the ~974k estimate must be judged with the full max_tokens.
+for (const mode of ["counted", "count-error", "count-disabled"]) {
+  test(`proxy replay (${mode}): small growth past a 950k sample is not forwarded`, async () => {
+    const h = await replayHarness(mode);
+    try {
+      assert.equal(await h.send(3_800_000, 16_000), 200);
+      assert.notEqual(await h.send(3_896_000, MAX_TOKENS), 200, "near-window input not forwarded");
+      assert.equal(h.counts.length, mode === "count-disabled" ? 0 : 2);
+      assert.equal(h.forwards.length, 1);
+    } finally { h.close(); }
+  });
+}
+
+test("a near-window estimate whose count fails is not admitted on the floor", async () => {
+  const sizing = new RequestSizing({ peek: () => undefined,
+    async count() { return { outcome: "server-error", ms: 1 }; } }, true);
+  const sample = { tokens: 950_000, forwardedBytes: 3_800_000 };
+  const candidate = sizing.register(Buffer.from("x".repeat(3_896_000)), "original", sample);
+  const limits = { budget: 1_500_000, context: WINDOW,
+    output: outputReservation("claude-opus-4-7", MAX_TOKENS), recountOutput: MAX_TOKENS };
+  assert.equal(await sizing.select(candidate, limits), undefined);
+});
+
+async function replayHarness(mode) {
+  const h = { counts: [], forwards: [] };
   const upstream = await serve((req, res, raw) => {
     res.setHeader("content-type", "application/json");
     if (req.url.includes("/count_tokens")) {
-      counts.push(raw.length);
-      return res.end(JSON.stringify({ input_tokens: counts.length === 1 ? 950_000 : 1_010_000 }));
+      h.counts.push(raw.length);
+      if (mode === "count-error" && h.counts.length > 1) {
+        res.statusCode = 503;
+        return res.end(JSON.stringify({ type: "error", error: { type: "api_error" } }));
+      }
+      return res.end(JSON.stringify({ input_tokens: h.counts.length === 1 ? 950_000 : 1_010_000 }));
     }
-    forwards.push(raw.length);
+    h.forwards.push(raw.length);
     res.end(JSON.stringify({ type: "message", role: "assistant",
       content: [{ type: "text", text: "ok" }], usage: { input_tokens: 950_000, output_tokens: 1 } }));
   });
@@ -186,8 +217,8 @@ test("proxy replay: small growth past a 950k calibrated sample is recounted", as
   });
   const memtree = new MemtreeClient({ baseUrl: memory.url, apiKey: "offline" });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.url,
-    budgetTokensOverride: 500_000, countTokens: true });
-  const send = async (bytes, maxTokens) => {
+    budgetTokensOverride: 500_000, countTokens: mode !== "count-disabled" });
+  h.send = async (bytes, maxTokens) => {
     const messages = [{ role: "user", content: "task" },
       { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "t",
@@ -200,13 +231,9 @@ test("proxy replay: small growth past a 950k calibrated sample is recounted", as
     await response.text();
     return response.status;
   };
-  try {
-    assert.equal(await send(3_800_000, 16_000), 200);
-    assert.notEqual(await send(3_896_000, MAX_TOKENS), 200, "over-window input is not forwarded");
-    assert.equal(counts.length, 2, "the near-window growth was counted");
-    assert.equal(forwards.length, 1);
-  } finally { proxy.close(); upstream.close(); memory.close(); }
-});
+  h.close = () => { proxy.close(); upstream.close(); memory.close(); };
+  return h;
+}
 
 test("unknown suffixes on 4.5+ names keep the conservative rule", () => {
   for (const model of ["claude-opus-4-5-custom", "claude-sonnet-4-5-thirdparty",
