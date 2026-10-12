@@ -332,7 +332,9 @@ async function main() {
             noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
                 messageDisplay: installedClaudeSupportsMessageDisplay(),
                 startupMessage: startupNoticeText(terminalSupportsColor(), updateAvailable),
-                resumeLink: memtreeLinkPlacement !== "off",
+                // Also carries the unpaid-key notice on resume, so it is on even
+                // when MemTree links are off (the proxy then answers links-free).
+                resumeLink: true,
             });
             // Global option must precede a user-supplied `--`, positional prompt, or
             // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
