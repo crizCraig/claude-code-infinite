@@ -121,3 +121,78 @@ for (const lane of ["human", "tool"]) {
     } finally { h.close(); }
   });
 }
+
+// 2026-10-12 incident: a broken prefix match left MemTree compressing against a
+// stale tree; for ~7 minutes its results kept the unindexed history verbatim and
+// did not fit the window. Claude Code's quick retries used the strike budget in
+// seconds. While the index is behind, retries must wait for it instead.
+const pageUrl = "https://memtree.example/usage/memtree/page-1";
+const unfitResult = (indexed, raw) => {
+  const content = "y".repeat(900_000);
+  return { compressed: true, messages: [{ role: "user", content }],
+    flattened_messages: [{ role: "user", content }], memtreeUrl: pageUrl,
+    usage: { indexed_tokens: indexed, raw_prompt_tokens: raw } };
+};
+const fitResult = () => {
+  const content = "saved memory ".repeat(200);
+  return { compressed: true, messages: [{ role: "user", content }],
+    flattened_messages: [{ role: "user", content }], memtreeUrl: pageUrl,
+    usage: { indexed_tokens: 220_000, raw_prompt_tokens: 230_000 } };
+};
+const toolBody = (max_tokens = 100) => JSON.stringify({ model: "claude-x", max_tokens, messages: [
+  { role: "user", content: "x".repeat(900_000) },
+  { role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "done" }] }] });
+
+async function waitingHarness(indexWaitDeadlineMs) {
+  const records = [];
+  const h = await harness(20_000, { indexWaitDeadlineMs,
+    reqlog: { log: record => records.push(structuredClone(record)) } });
+  h.memtree.compress = async () => unfitResult(25_000, 230_000);
+  return { ...h, records };
+}
+
+for (const [lane, send] of [["human", () => body("x".repeat(900_000))], ["tool", toolBody]]) {
+  test(`${lane}: an unfit result while the index is behind waits for it, then delivers`, async () => {
+    const h = await waitingHarness(60_000);
+    try {
+      for (let retry = 0; retry < 6; retry++) {
+        const response = await request(h.proxy, send());
+        assert.equal(response.status, 503, `retry ${retry} waits for the index`);
+        assert.equal(response.headers["retry-after"], "30");
+        assert.equal(response.headers["x-should-retry"], "true");
+      }
+      assert.equal(h.seen.length, 0, "the oversized history is never forwarded");
+      h.memtree.compress = async () => fitResult();
+      assert.equal((await request(h.proxy, send())).status, 200, "delivery resumes once indexed");
+      assert.equal(h.seen.length, 1);
+      assert.ok(!h.seen[0].includes("y".repeat(1000)));
+    } finally { h.close(); }
+  });
+
+  test(`${lane}: the index wait is bounded by a wall-clock deadline`, async () => {
+    const h = await waitingHarness(150);
+    try {
+      assert.equal((await request(h.proxy, send())).status, 503);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const response = await request(h.proxy, send());
+      assert.equal(response.status, 400);
+      assert.match(JSON.parse(response.body).error.message,
+        /couldn't fit this request in the model's context window.*\/ccc:memtree-compact or \/clear/);
+    } finally { h.close(); }
+  });
+
+  test(`${lane}: an unfit result from a complete index refuses promptly`, async () => {
+    const h = await waitingHarness(60_000);
+    h.memtree.compress = async () => unfitResult(229_000, 230_000);
+    try {
+      for (const expected of [503, 503, 400]) {
+        const response = await request(h.proxy, send());
+        assert.equal(response.status, expected);
+        if (expected === 503) assert.equal(response.headers["retry-after"], "1");
+      }
+      const decision = h.records.filter(r => r.kind === "messages").at(-1);
+      assert.equal(decision.maxTokens, 100, "max_tokens is logged with the decision");
+    } finally { h.close(); }
+  });
+}

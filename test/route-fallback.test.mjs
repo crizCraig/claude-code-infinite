@@ -39,3 +39,43 @@ test("failure state remains bounded without reopening failed lanes after evictio
   failures.succeeded("a");
   assert.equal(failures.fail("c").status, 503);
 });
+
+test("an index wait answers 503 with a longer retry-after and spends no strikes", () => {
+  const failures = new RouteFallbackFailures(128, 1_000);
+  for (let now = 0; now < 1_000; now += 100) {
+    const error = failures.fail("session/main", { awaitingIndex: true, now });
+    assert.equal(error.status, 503);
+    assert.equal(error.headers["x-should-retry"], "true");
+    assert.equal(error.headers["retry-after"], "30");
+    assert.match(error.body.error.message, /indexing/);
+  }
+  // The strike budget is untouched by the wait.
+  assert.equal(failures.fail("session/main", { now: 1_000 }).status, 503);
+});
+
+test("an index wait refuses with actionable wording once its deadline passes", () => {
+  const failures = new RouteFallbackFailures(128, 1_000);
+  assert.equal(failures.fail("lane", { awaitingIndex: true, now: 0 }).status, 503);
+  const error = failures.fail("lane", { awaitingIndex: true, now: 1_000 });
+  assert.equal(error.status, 400);
+  assert.equal(error.headers["x-should-retry"], "false");
+  assertActionable(error.body.error.message);
+  assert.equal(failures.fail("lane", { awaitingIndex: true, now: 1_001 }).status, 400);
+  failures.succeeded("lane");
+  assert.equal(failures.fail("lane", { awaitingIndex: true, now: 5_000 }).status, 503,
+    "a delivery starts a new wait");
+});
+
+test("with no index wait the third failure refuses with actionable wording", () => {
+  const failures = new RouteFallbackFailures();
+  failures.fail("lane");
+  failures.fail("lane");
+  assertActionable(failures.fail("lane").body.error.message);
+});
+
+function assertActionable(message) {
+  assert.match(message, /couldn't fit this request in the model's context window/);
+  assert.match(message, /still indexing/);
+  assert.match(message, /\/ccc:memtree-compact/);
+  assert.match(message, /\/clear/);
+}
