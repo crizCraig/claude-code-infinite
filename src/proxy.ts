@@ -48,7 +48,7 @@ import {
   plausibleSample,
   type SizeSample,
 } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, fitsNative,
+import { RequestSizing, estimateRequestTokens, fitsNative, outputReservation,
   type RequestCandidate, type SizingLimits } from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import http from "node:http";
@@ -1539,7 +1539,7 @@ async function handleMessages(
   const sizingLimits = (): SizingLimits => ({
     budget: resolveBudget(opts, state, body.model, modelContextLimit).tokens,
     context: modelContextLimit,
-    output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0,
+    output: bodyOutputReservation(body),
   });
   const rides = state.memoryRoutes.has(requestRouteKey) ||
     (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
@@ -3145,8 +3145,7 @@ function calibratedSizeExceedsWindow(
   body: Record<string, any>,
   modelContextLimit: number
 ): boolean {
-  const outputTokens = typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)
-    ? Math.max(0, body.max_tokens) : 0;
+  const outputTokens = bodyOutputReservation(body);
   return record.sizeSource === "reported" &&
     (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit;
 }
@@ -3553,7 +3552,7 @@ function planToolCompaction(args: {
   }
   if (!ride) {
     const originalSize = args.sizing.plan(args.sizing.register(forwardBody, "original"));
-    overWindow ||= originalSize.tokens + Math.max(0, body.max_tokens ?? 0) > modelContextLimit;
+    overWindow ||= originalSize.tokens + bodyOutputReservation(body) > modelContextLimit;
   }
   const sample = ride
     ? ride.sizeHolder.lastSize
@@ -3568,7 +3567,7 @@ function planToolCompaction(args: {
   compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
   compaction.sizeSource = size.source;
   overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
-    output: typeof body.max_tokens === "number" ? Math.max(0, body.max_tokens) : 0 });
+    output: bodyOutputReservation(body) });
   if (!args.canCompress) {
     if (overWindow) return { kind: "pass", original: true };
     return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3640,11 +3639,16 @@ function routedBodyExceedsContext(
   routedBody: Buffer,
   modelContextLimit: number
 ): boolean {
-  const outputTokens = typeof body.max_tokens === "number" &&
-    Number.isFinite(body.max_tokens) ? Math.max(0, body.max_tokens) : 0;
+  const outputTokens = bodyOutputReservation(body);
   // This is the existing local byte estimate, not a tokenizer or a hard cap.
   // Final forwarding checks can replace this estimate with Count Tokens.
   return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
+}
+
+/** Output room every native-fit check reserves for this request's model. */
+function bodyOutputReservation(body: Record<string, any>): number {
+  return outputReservation(typeof body.model === "string" ? body.model : undefined,
+    body.max_tokens);
 }
 
 function regrantSmallerWindowRecovery(
@@ -4800,7 +4804,8 @@ function refuseWholeRequest(
   args.rec.approxInputTokens = 0;
   console.error("[ccc proxy] request exceeds native context window; recovery failed", {
     lane: args.routeKey, attempt: failure.attempt, status: failure.status,
-    inputTokens, outputTokens: args.body.max_tokens ?? 0, indexBehind: args.rec.indexBehind === true,
+    inputTokens, outputTokens: args.body.max_tokens ?? 0,
+    outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
     budgetTokens, modelContextLimit: args.modelContextLimit,
   });
   if (args.res.headersSent || args.res.destroyed) return false;

@@ -1,4 +1,7 @@
 import { type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
+/** Output room kept free on models that accept input + max_tokens over the
+ * window, so the model can still answer a request that barely fits. */
+export declare const OUTPUT_FLOOR_TOKENS = 16000;
 export type CandidateKind = "original" | "ride" | "replacement";
 export interface SizingLimits {
     budget: number;
@@ -46,6 +49,13 @@ export declare class RequestSizing {
         measurement: CandidateMeasurement;
     } | undefined>;
 }
+/** Tokens a fit check must leave free for output. Claude 4.5+ rejects a
+ * request only when its input alone exceeds the window (platform.claude.com/
+ * docs/en/build-with-claude/context-windows, "Context window overflow
+ * behavior"), so those models reserve min(max_tokens, OUTPUT_FLOOR_TOKENS);
+ * older and unknown models reserve the full max_tokens. */
+export declare function outputReservation(model: string | undefined, maxTokens: unknown): number;
+/** `limits.output` is the reservation from outputReservation, not raw max_tokens. */
 export declare function fitsNative(input: number, limits: SizingLimits): boolean;
 /** One shared estimator for planner telemetry and request-local snapshots. */
 export declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): PlannedSize;

@@ -1,8 +1,11 @@
+import { fitsNative, outputReservation } from "./request-sizing.js";
 import { MEMTREE_COMPACT_COMMAND, MEMTREE_VIEW_COMMAND, SESSION_PLUGIN_NAME } from "./hooks.js";
 /** After attempting compression at the soft budget, forward input that fits
- * the model's native context together with its output reservation. */
-export function fitsFallbackBudget(inputTokens, outputTokens, budgetTokens, contextTokens) {
-    return [inputTokens, outputTokens, budgetTokens, contextTokens].every((value) => Number.isFinite(value) && value >= 0) && inputTokens + outputTokens <= contextTokens;
+ * the model's native context together with its output reservation (the full
+ * max_tokens, or a floor on Claude 4.5+: see outputReservation). */
+export function fitsFallbackBudget(inputTokens, outputTokens, budgetTokens, contextTokens, model) {
+    return [inputTokens, outputTokens, budgetTokens, contextTokens].every((value) => Number.isFinite(value) && value >= 0) && fitsNative(inputTokens, { budget: budgetTokens, context: contextTokens,
+        output: outputReservation(model, outputTokens) });
 }
 /** How long a lane may wait for MemTree to finish indexing before refusing. */
 export const INDEX_WAIT_DEADLINE_MS = 10 * 60_000;

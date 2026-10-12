@@ -6,6 +6,7 @@ import { MemtreeClient } from "../dist/memtree.js";
 
 const LARGE_MODEL = "claude-opus-5";
 const SMALL_MODEL = "claude-haiku-4-5";
+const PRE_45_SMALL_MODEL = "claude-sonnet-4-20250514";
 const WIDE_MEMORY = "retained wide-window memory ".repeat(40_000);
 /** Text of a message whose content is a string or text blocks (the compressed message carries a cache marker). */
 function flatText(message) {
@@ -234,7 +235,10 @@ for (const overhead of ["system", "tools", "max_tokens"]) {
     });
     try {
       await fixture.post(FOLLOWUP, extra);
-      await fixture.post(extend(FOLLOWUP, "t1"), { ...extra, model: SMALL_MODEL });
+      // Claude 4.5+ reserves only an output floor (input-only overflow rule),
+      // so the full max_tokens reservation is checked on a pre-4.5 model.
+      const model = overhead === "max_tokens" ? PRE_45_SMALL_MODEL : SMALL_MODEL;
+      await fixture.post(extend(FOLLOWUP, "t1"), { ...extra, model });
       assert.equal(fixture.calls.length, 2, "message bytes alone understate request capacity");
       assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
     } finally {

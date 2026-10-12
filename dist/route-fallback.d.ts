@@ -1,6 +1,7 @@
 /** After attempting compression at the soft budget, forward input that fits
- * the model's native context together with its output reservation. */
-export declare function fitsFallbackBudget(inputTokens: number, outputTokens: number, budgetTokens: number, contextTokens: number): boolean;
+ * the model's native context together with its output reservation (the full
+ * max_tokens, or a floor on Claude 4.5+: see outputReservation). */
+export declare function fitsFallbackBudget(inputTokens: number, outputTokens: number, budgetTokens: number, contextTokens: number, model?: string): boolean;
 export interface RouteFallbackError {
     status: 503 | 400;
     attempt: number;

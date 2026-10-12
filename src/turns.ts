@@ -274,19 +274,49 @@ const NATIVE_ONE_MILLION_MODELS = new Set([
   "claude-mythos-preview",
 ]);
 
+/**
+ * Claude 4.5 and newer: the API rejects a request only when its input alone
+ * exceeds the window; input + max_tokens over the window is accepted and
+ * generation stops with stop_reason "model_context_window_exceeded". Older
+ * models return a validation error instead (unless the request opts in with
+ * the model-context-window-exceeded-2025-08-26 beta header). See
+ * https://platform.claude.com/docs/en/build-with-claude/context-windows
+ * ("Context window overflow behavior").
+ */
+const CONTEXT_OVERFLOW_MODELS = new Set([
+  ...NATIVE_ONE_MILLION_MODELS,
+  "claude-opus-4-5",
+  "claude-opus-4-6",
+  "claude-sonnet-4-5",
+  "claude-sonnet-4-6",
+  "claude-sonnet-5-5",
+  "claude-haiku-4-5",
+  "claude-haiku-5-5",
+]);
+
+/** Whether the model accepts input + max_tokens over its window (4.5+ only;
+ * unknown models are treated as older). */
+export function acceptsContextOverflow(model: string | undefined): boolean {
+  return knownModelFamily(model, CONTEXT_OVERFLOW_MODELS);
+}
+
 function isNativeOneMillionModel(model: string | undefined): boolean {
+  return knownModelFamily(model, NATIVE_ONE_MILLION_MODELS);
+}
+
+function knownModelFamily(model: string | undefined, family: Set<string>): boolean {
   if (!model) return false;
   const normalized = model
     .trim()
     .toLowerCase()
     .replace(/(?:\[1m\])+$/i, "")
     .replace(/-\d{8}$/, "");
-  if (NATIVE_ONE_MILLION_MODELS.has(normalized)) return true;
-  // Point releases / variants of a native-1M model (e.g. "claude-fable-5-1"
-  // before it was listed, or a future "claude-opus-5-1") keep the 1M window,
-  // mirroring the server's "dated/variant id of a known model" rule. Without
-  // this the server clamps their 500k budget to a 200k window.
-  for (const base of NATIVE_ONE_MILLION_MODELS) {
+  if (family.has(normalized)) return true;
+  // Point releases / variants of a known model (e.g. "claude-fable-5-1"
+  // before it was listed, or a future "claude-opus-5-1") inherit its
+  // behavior, mirroring the server's "dated/variant id of a known model"
+  // rule. Without this the server clamps their 500k budget to a 200k window.
+  for (const base of family) {
     if (normalized.startsWith(`${base}-`)) return true;
   }
   return false;

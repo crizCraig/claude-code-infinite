@@ -4,6 +4,10 @@
 import { createHash } from "node:crypto";
 import { plausibleSample, shouldCountTokens } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
+import { acceptsContextOverflow } from "./turns.js";
+/** Output room kept free on models that accept input + max_tokens over the
+ * window, so the model can still answer a request that barely fits. */
+export const OUTPUT_FLOOR_TOKENS = 16_000;
 export class RequestSizing {
     counts;
     enabled;
@@ -76,6 +80,18 @@ export class RequestSizing {
         return undefined;
     }
 }
+/** Tokens a fit check must leave free for output. Claude 4.5+ rejects a
+ * request only when its input alone exceeds the window (platform.claude.com/
+ * docs/en/build-with-claude/context-windows, "Context window overflow
+ * behavior"), so those models reserve min(max_tokens, OUTPUT_FLOOR_TOKENS);
+ * older and unknown models reserve the full max_tokens. */
+export function outputReservation(model, maxTokens) {
+    if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens))
+        return 0;
+    const output = Math.max(0, maxTokens);
+    return acceptsContextOverflow(model) ? Math.min(output, OUTPUT_FLOOR_TOKENS) : output;
+}
+/** `limits.output` is the reservation from outputReservation, not raw max_tokens. */
 export function fitsNative(input, limits) {
     return [input, limits.output, limits.context].every(value => Number.isFinite(value) && value >= 0) &&
         input + limits.output <= limits.context;
