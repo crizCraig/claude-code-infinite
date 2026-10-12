@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
-import { OUTPUT_FLOOR_TOKENS, fitsNative, outputReservation } from "../dist/request-sizing.js";
+import { OUTPUT_FLOOR_TOKENS, RequestSizing, fitsNative, outputReservation }
+  from "../dist/request-sizing.js";
 import { fitsFallbackBudget } from "../dist/route-fallback.js";
 import { acceptsContextOverflow } from "../dist/turns.js";
 
@@ -142,3 +143,80 @@ for (const model of ["claude-sonnet-4-20250514[1m]", "claude-x[1m]"]) {
     } finally { h.close(); }
   });
 }
+
+// Review (codex, a748d8f): the relaxed floor must not suppress the exact
+// recount. A calibrated 950k sample plus ~96KB estimates ~974k: inside the
+// floor, but the real count may exceed the window, so delivery must count.
+test("an estimate near the window is still counted before delivery", async () => {
+  const counts = [];
+  const sizing = new RequestSizing({ peek: () => undefined, async count(body) {
+    counts.push(body.length);
+    return { outcome: "success", ms: 1, tokens: 1_010_000 };
+  } }, true);
+  const sample = { tokens: 950_000, forwardedBytes: 3_800_000 };
+  const candidate = sizing.register(Buffer.from("x".repeat(3_896_000)), "original", sample);
+  const limits = { budget: 1_500_000, context: WINDOW,
+    output: outputReservation("claude-opus-4-7", MAX_TOKENS), recountOutput: MAX_TOKENS };
+  assert.ok(candidate.estimate.tokens < WINDOW - OUTPUT_FLOOR_TOKENS, "estimate fits the floor");
+  const measured = await sizing.measure(candidate, limits);
+  assert.equal(counts.length, 1, "near-window estimate is counted");
+  assert.equal(measured.tokens, 1_010_000);
+  assert.equal(fitsNative(measured.tokens, limits), false);
+});
+
+test("proxy replay: small growth past a 950k calibrated sample is recounted", async () => {
+  const counts = [];
+  const forwards = [];
+  const upstream = await serve((req, res, raw) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.includes("/count_tokens")) {
+      counts.push(raw.length);
+      return res.end(JSON.stringify({ input_tokens: counts.length === 1 ? 950_000 : 1_010_000 }));
+    }
+    forwards.push(raw.length);
+    res.end(JSON.stringify({ type: "message", role: "assistant",
+      content: [{ type: "text", text: "ok" }], usage: { input_tokens: 950_000, output_tokens: 1 } }));
+  });
+  const memory = await serve((req, res, raw) => {
+    res.setHeader("content-type", "application/json");
+    const body = raw ? JSON.parse(raw) : {};
+    res.end(JSON.stringify({ messages: body.messages ?? [], compressed: false,
+      index_only: body.index_only, model_budget_tokens: 500_000,
+      usage: { prompt_tokens: 100, completion_tokens: 100 } }));
+  });
+  const memtree = new MemtreeClient({ baseUrl: memory.url, apiKey: "offline" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.url,
+    budgetTokensOverride: 500_000, countTokens: true });
+  const send = async (bytes, maxTokens) => {
+    const messages = [{ role: "user", content: "task" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t",
+        content: "x".repeat(bytes) }] }];
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json",
+        "x-claude-code-session-id": "s", "x-claude-code-agent-id": "a" },
+      body: JSON.stringify({ model: "claude-opus-4-7", max_tokens: maxTokens, messages }),
+    });
+    await response.text();
+    return response.status;
+  };
+  try {
+    assert.equal(await send(3_800_000, 16_000), 200);
+    assert.notEqual(await send(3_896_000, MAX_TOKENS), 200, "over-window input is not forwarded");
+    assert.equal(counts.length, 2, "the near-window growth was counted");
+    assert.equal(forwards.length, 1);
+  } finally { proxy.close(); upstream.close(); memory.close(); }
+});
+
+test("unknown suffixes on 4.5+ names keep the conservative rule", () => {
+  for (const model of ["claude-opus-4-5-custom", "claude-sonnet-4-5-thirdparty",
+    "claude-haiku-4-5-x", "claude-opus-5-5-preview-foo", "claude-sonnet-5-beta"]) {
+    assert.equal(acceptsContextOverflow(model), false, model);
+    assert.equal(outputReservation(model, MAX_TOKENS), MAX_TOKENS, model);
+  }
+  for (const model of ["claude-opus-4-5-20251101", "claude-opus-5-5[1m]",
+    "claude-haiku-4-5-20251001[1m]", "claude-fable-5-1", "claude-mythos-5-1",
+    "claude-opus-5-1", "claude-sonnet-5-5-20261001"]) {
+    assert.equal(acceptsContextOverflow(model), true, model);
+  }
+});
