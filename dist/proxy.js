@@ -3468,6 +3468,10 @@ async function recoverLateCount(args) {
             compaction: { target: compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget) },
         });
         noteMemtreeHealth(args.state, outcome);
+        // Like every compress path: a refusal after a lagging answer waits for
+        // the index, and the cached answer expires so a retry asks again.
+        if (outcome.result)
+            noteIndexLag(args.opts, args.rec, outcome.result);
         if (!outcome.result || !didMemtreeCompress(outcome.result) ||
             !checkCompressedHistory(outcome.result, messages).usable)
             return undefined;

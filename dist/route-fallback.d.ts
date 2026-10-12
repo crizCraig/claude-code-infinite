@@ -38,22 +38,29 @@ export declare class RouteFallbackFailures {
     private readonly capacity;
     private readonly indexWaitMs;
     private readonly failures;
-    /** Lane -> its index wait, least recently seen first. */
+    /** Lane -> when its index wait began (its deadline is fixed from then). */
     private readonly indexWaits;
     constructor(capacity?: number, indexWaitMs?: number);
     fail(lane: string, context?: FallbackFailureContext): RouteFallbackError;
     succeeded(lane: string): void;
+    /** The bounded three-strike episode: 503, 503, then 400 until delivery. */
+    private strike;
     /**
-     * A 503 while the lane's wait is within its deadline; a 400 after it. An
-     * expired wait stays refused while its lane keeps retrying, so retries
-     * cannot reopen it.
+     * A 503 while the lane's wait is within its deadline; a 400 once it passes.
+     * The deadline is fixed when the wait starts and only a delivery clears it:
+     * an expired wait becomes a terminal strike state, and an active wait is
+     * never evicted. A lane already refused, or arriving while every wait slot
+     * is active, gets no wait (undefined) and falls back to the strikes.
      */
     private waitForIndex;
+    private indexWaitError;
+    /** Free the slots of waits past their deadline, keeping them refused. */
+    private retireExpiredWaits;
     /**
-     * Make room for one more wait: drop waits idle for a whole deadline
-     * (abandoned sessions and subagents), else the least recently seen one, so
-     * a new lane always gets its wait.
+     * An expired wait's lane moves to the terminal strike state. If the strike
+     * table is full the wait keeps its slot instead (still expired, still
+     * refused), so no lane can be re-admitted with a fresh deadline.
      */
-    private reclaimIndexWaits;
+    private retire;
 }
 //# sourceMappingURL=route-fallback.d.ts.map

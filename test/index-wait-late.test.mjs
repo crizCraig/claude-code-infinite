@@ -46,7 +46,7 @@ async function harness() {
     h.compressCalls++;
     res.end(JSON.stringify(h.phase === "install" ? reply("memory " + "m".repeat(200_000))
       : h.phase === "lag" ? reply("y".repeat(900_000), { index_pending: true })
-        : reply("saved memory ".repeat(100))));
+        : reply("saved memory ".repeat(200))));
   });
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "offline" });
   h.proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,

@@ -50,8 +50,8 @@ export interface FallbackFailureContext {
  */
 export class RouteFallbackFailures {
   private readonly failures = new Map<string, number>();
-  /** Lane -> its index wait, least recently seen first. */
-  private readonly indexWaits = new Map<string, { started: number; seen: number }>();
+  /** Lane -> when its index wait began (its deadline is fixed from then). */
+  private readonly indexWaits = new Map<string, number>();
 
   constructor(
     private readonly capacity = 128,
@@ -63,6 +63,16 @@ export class RouteFallbackFailures {
       const waiting = this.waitForIndex(lane, context.now ?? Date.now());
       if (waiting) return waiting;
     }
+    return this.strike(lane);
+  }
+
+  succeeded(lane: string): void {
+    this.failures.delete(lane);
+    this.indexWaits.delete(lane);
+  }
+
+  /** The bounded three-strike episode: 503, 503, then 400 until delivery. */
+  private strike(lane: string): RouteFallbackError {
     const previous = this.failures.get(lane);
     // Fail closed when full rather than evicting a lane and granting it
     // another retry budget. A successful lane frees its slot.
@@ -74,40 +84,48 @@ export class RouteFallbackFailures {
     return attempt <= 2 ? retryError(attempt, "1", RETRY_MESSAGE) : refusal(attempt);
   }
 
-  succeeded(lane: string): void {
-    this.failures.delete(lane);
-    this.indexWaits.delete(lane);
-  }
-
   /**
-   * A 503 while the lane's wait is within its deadline; a 400 after it. An
-   * expired wait stays refused while its lane keeps retrying, so retries
-   * cannot reopen it.
+   * A 503 while the lane's wait is within its deadline; a 400 once it passes.
+   * The deadline is fixed when the wait starts and only a delivery clears it:
+   * an expired wait becomes a terminal strike state, and an active wait is
+   * never evicted. A lane already refused, or arriving while every wait slot
+   * is active, gets no wait (undefined) and falls back to the strikes.
    */
   private waitForIndex(lane: string, now: number): RouteFallbackError | undefined {
-    const wait = this.indexWaits.get(lane) ?? { started: now, seen: now };
-    this.indexWaits.delete(lane);
-    if (this.indexWaits.size >= this.capacity) this.reclaimIndexWaits(now);
-    wait.seen = now;
-    this.indexWaits.set(lane, wait);
-    const attempt = this.failures.get(lane) ?? 0;
-    if (now - wait.started >= this.indexWaitMs) return refusal(Math.max(attempt, 3));
-    return retryError(attempt, String(INDEX_WAIT_RETRY_AFTER_SECONDS), INDEX_WAIT_MESSAGE);
+    const wait = this.indexWaits.get(lane);
+    if (wait === undefined) {
+      if ((this.failures.get(lane) ?? 0) >= 3) return undefined;
+      this.retireExpiredWaits(now);
+      if (this.indexWaits.size >= this.capacity) return undefined;
+      this.indexWaits.set(lane, now);
+      return this.indexWaitError(lane);
+    }
+    if (now - wait < this.indexWaitMs) return this.indexWaitError(lane);
+    this.retire(lane);
+    return refusal(3);
+  }
+
+  private indexWaitError(lane: string): RouteFallbackError {
+    return retryError(this.failures.get(lane) ?? 0, String(INDEX_WAIT_RETRY_AFTER_SECONDS),
+      INDEX_WAIT_MESSAGE);
+  }
+
+  /** Free the slots of waits past their deadline, keeping them refused. */
+  private retireExpiredWaits(now: number): void {
+    for (const [lane, started] of this.indexWaits) {
+      if (now - started >= this.indexWaitMs) this.retire(lane);
+    }
   }
 
   /**
-   * Make room for one more wait: drop waits idle for a whole deadline
-   * (abandoned sessions and subagents), else the least recently seen one, so
-   * a new lane always gets its wait.
+   * An expired wait's lane moves to the terminal strike state. If the strike
+   * table is full the wait keeps its slot instead (still expired, still
+   * refused), so no lane can be re-admitted with a fresh deadline.
    */
-  private reclaimIndexWaits(now: number): void {
-    for (const [lane, wait] of this.indexWaits) {
-      if (now - wait.seen < this.indexWaitMs) break;
-      this.indexWaits.delete(lane);
-    }
-    if (this.indexWaits.size < this.capacity) return;
-    const oldest = this.indexWaits.keys().next().value;
-    if (oldest !== undefined) this.indexWaits.delete(oldest);
+  private retire(lane: string): void {
+    if (!this.failures.has(lane) && this.failures.size >= this.capacity) return;
+    this.failures.set(lane, 3);
+    this.indexWaits.delete(lane);
   }
 }
 
