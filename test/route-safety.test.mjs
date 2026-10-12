@@ -127,11 +127,11 @@ for (const lane of ["human", "tool"]) {
 // did not fit the window. Claude Code's quick retries used the strike budget in
 // seconds. While the index is behind, retries must wait for it instead.
 const pageUrl = "https://memtree.example/usage/memtree/page-1";
-const unfitResult = (indexed, raw) => {
+const unfitResult = (pending) => {
   const content = "y".repeat(900_000);
   return { compressed: true, messages: [{ role: "user", content }],
     flattened_messages: [{ role: "user", content }], memtreeUrl: pageUrl,
-    usage: { indexed_tokens: indexed, raw_prompt_tokens: raw } };
+    ...(pending ? { index_pending: true } : {}) };
 };
 const fitResult = () => {
   const content = "saved memory ".repeat(200);
@@ -148,7 +148,7 @@ async function waitingHarness(indexWaitDeadlineMs) {
   const records = [];
   const h = await harness(20_000, { indexWaitDeadlineMs, defaultCompactTarget: undefined,
     reqlog: { log: record => records.push(structuredClone(record)) } });
-  h.memtree.compress = async () => unfitResult(25_000, 230_000);
+  h.memtree.compress = async () => unfitResult(true);
   return { ...h, records };
 }
 
@@ -184,7 +184,7 @@ for (const [lane, send] of [["human", () => body("x".repeat(900_000))], ["tool",
 
   test(`${lane}: an unfit result from a complete index refuses promptly`, async () => {
     const h = await waitingHarness(60_000);
-    h.memtree.compress = async () => unfitResult(229_000, 230_000);
+    h.memtree.compress = async () => unfitResult(false);
     try {
       for (const expected of [503, 503, 400]) {
         const response = await request(h.proxy, send());

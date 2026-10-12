@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fitsFallbackBudget, RouteFallbackFailures } from "../dist/route-fallback.js";
+import { indexBehind } from "../dist/memtree.js";
 
 test("fallback: soft budget is advisory, input plus output must fit the native window", () => {
   assert.equal(fitsFallbackBudget(80, 20, 100, 200), true);
@@ -79,3 +80,23 @@ function assertActionable(message) {
   assert.match(message, /\/ccc:memtree-compact/);
   assert.match(message, /\/clear/);
 }
+
+test("expired or abandoned index waits free their slot for new lanes", () => {
+  const failures = new RouteFallbackFailures(1, 1_000);
+  assert.equal(failures.fail("old", { awaitingIndex: true, now: 0 }).status, 503);
+  assert.equal(failures.fail("old", { awaitingIndex: true, now: 1_000 }).status, 400);
+  assert.equal(failures.fail("old", { awaitingIndex: true, now: 1_500 }).status, 400,
+    "a retried expired episode stays refused");
+  const fresh = failures.fail("new", { awaitingIndex: true, now: 3_000 });
+  assert.equal(fresh.status, 503, "an idle expired lane does not hold the only slot");
+  assert.equal(fresh.headers["retry-after"], "30");
+});
+
+test("lag needs the server's index_pending; billing counters are not coverage", () => {
+  assert.equal(indexBehind({ messages: [], index_pending: true }), true);
+  assert.equal(indexBehind({ messages: [], index_pending: false }), false);
+  assert.equal(indexBehind({ messages: [],
+    usage: { indexed_tokens: 25_000, raw_prompt_tokens: 230_000 } }), false);
+  assert.equal(indexBehind({ messages: [],
+    usage: { raw_prompt_tokens: 230_000, prompt_tokens_details: { cached_tokens: 25_000 } } }), false);
+});
