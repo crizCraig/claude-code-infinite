@@ -10,7 +10,7 @@ import { MemtreeClient } from "../dist/memtree.js";
 
 const SESSION = "source-session";
 
-async function harness() {
+async function harness({ failRequest } = {}) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -18,6 +18,11 @@ async function harness() {
     req.on("end", () => {
       seen.push(Buffer.concat(chunks).toString());
       res.setHeader("content-type", "application/json");
+      if (seen.length === failRequest) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "boom" } }));
+        return;
+      }
       res.end(JSON.stringify({ type: "message", role: "assistant",
         content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }));
     });
@@ -75,8 +80,8 @@ function compactNow(h) {
 }
 
 /** Human turn adopting A, then a `/memtree-compact` turn whose answer is `second`. */
-async function compactTwice(second) {
-  const h = await harness();
+async function compactTwice(second, options) {
+  const h = await harness(options);
   let calls = 0;
   h.memtree.compress = async () => (++calls === 1 ? adopted(memoryA, A) : second);
   const msgs = [{ role: "user", content: "q" }, { role: "assistant", content: "a" },
@@ -85,14 +90,14 @@ async function compactTwice(second) {
   assert.equal(await pointer(h), `${A}-s`);
   await compactNow(h);
   msgs.push({ role: "assistant", content: "a" }, { role: "user", content: "next" });
-  assert.equal(await send(h, msgs), 200);
+  assert.equal(await send(h, msgs), options?.failRequest === 2 ? 500 : 200);
   assert.equal(calls, 2);
-  return h;
+  return { h, msgs };
 }
 
 for (const [name, result] of [["unusable", unusable(B)], ["no-flatten", noFlatten(B)]]) {
   test(`human turn: a rejected (${name}) answer keeps current at the prefix's tree`, async () => {
-    const h = await compactTwice(result);
+    const { h } = await compactTwice(result);
     try {
       assert.equal(firstText(h, 1), memoryA, "the old prefix rides");
       assert.equal(await pointer(h), `${A}-s`);
@@ -101,7 +106,7 @@ for (const [name, result] of [["unusable", unusable(B)], ["no-flatten", noFlatte
 }
 
 test("human turn: an adopted answer moves current to its tree", async () => {
-  const h = await compactTwice(adopted(memoryB, B));
+  const { h } = await compactTwice(adopted(memoryB, B));
   try {
     assert.equal(firstText(h, 1), memoryB);
     assert.equal(await pointer(h), `${B}-s`);
@@ -109,8 +114,8 @@ test("human turn: an adopted answer moves current to its tree", async () => {
 });
 
 /** Human turn adopting A, then a tool turn that outgrows the route: recovery gets `second`. */
-async function toolRecovery(second) {
-  const h = await harness();
+async function toolRecovery(second, options) {
+  const h = await harness(options);
   let calls = 0;
   h.memtree.compress = async () => (++calls === 1 ? adopted(memoryA, A) : second);
   const msgs = [{ role: "user", content: "q" }, { role: "assistant", content: "a" },
@@ -118,14 +123,14 @@ async function toolRecovery(second) {
   assert.equal(await send(h, msgs), 200);
   msgs.push({ role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "z".repeat(160_000) }] });
-  assert.equal(await send(h, msgs), 200);
+  assert.equal(await send(h, msgs), options?.failRequest === 2 ? 500 : 200);
   assert.equal(calls, 2, "the tool turn recompressed");
-  return h;
+  return { h, msgs };
 }
 
 for (const [name, result] of [["unusable", unusable(B)], ["no-flatten", noFlatten(B)]]) {
   test(`tool turn: a rejected (${name}) recovery answer keeps current at A`, async () => {
-    const h = await toolRecovery(result);
+    const { h } = await toolRecovery(result);
     try {
       assert.ok(!firstText(h, 1).includes("MEMORY B"));
       assert.equal(await pointer(h), `${A}-s`);
@@ -134,9 +139,25 @@ for (const [name, result] of [["unusable", unusable(B)], ["no-flatten", noFlatte
 }
 
 test("tool turn: an adopted recovery answer moves current to its tree", async () => {
-  const h = await toolRecovery(adopted(memoryB, B));
+  const { h } = await toolRecovery(adopted(memoryB, B));
   try {
     assert.equal(firstText(h, 1), memoryB);
     assert.equal(await pointer(h), `${B}-s`);
   } finally { h.close(); }
 });
+
+// Forwarded B, upstream 500: B never became the prefix. The human retry rides
+// A (current must stay A); the tool retry recompresses and installs B (current
+// then moves to B). Either way current names the memory the retry carried.
+for (const [lane, run, retryTree] of [["human", compactTwice, A], ["tool", toolRecovery, B]]) {
+  test(`${lane} turn: an upstream failure after forwarding B keeps current at A`, async () => {
+    const { h, msgs } = await run(adopted(memoryB, B), { failRequest: 2 });
+    try {
+      assert.equal(firstText(h, 1), memoryB, "B was forwarded");
+      assert.equal(await pointer(h), `${A}-s`, "a failed forward adopts nothing");
+      assert.equal(await send(h, msgs), 200);
+      assert.equal(firstText(h, 2), retryTree === A ? memoryA : memoryB);
+      assert.equal(await pointer(h), `${retryTree}-s`, "current names the retry's memory");
+    } finally { h.close(); }
+  });
+}

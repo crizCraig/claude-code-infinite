@@ -379,7 +379,8 @@ interface ProxyState {
   memtreePages: Map<string, MemtreePage>;
   /**
    * Per session, the page whose memory the prompt carries: set only when a
-   * main-lane compress answer is forwarded as the prompt, so `/memtree/current`
+   * main-lane compress answer's route is installed after a complete upstream
+   * response (the prefix later requests reuse), so `/memtree/current`
    * (the MCP tools' "current" tree, where bare node ids resolve) never moves to
    * a tree whose memory was rejected while an older prefix rides on. The link
    * (memtreePages) still follows every answer.
@@ -2010,8 +2011,6 @@ async function handleMessages(
       return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
     }
     requestSendPolicies.get(req)?.allowed.add(compressedRaw);
-    // A fresh answer's memory is now the prompt's; a ride keeps the prior source.
-    if (result && linkSeq !== undefined) noteMemorySource(state, linkSeq, sessionId, result);
     if (opts.debug) {
       console.error(
         `[ccc proxy] user turn ${turnType}: ${forwardBody.length} → ` +
@@ -2058,6 +2057,11 @@ async function handleMessages(
         routeDecisionGeneration,
         stable
       );
+      // The answer's memory is now what future requests reuse; a ride keeps
+      // the prior source, and a failed or stale forward adopts nothing.
+      if (installed && result && linkSeq !== undefined) {
+        noteMemorySource(state, linkSeq, sessionId, result);
+      }
       commitRouteDecision();
       // Leave this false if installMemoryRoute unexpectedly throws: the
       // delivery-complete fallback then gets one safe retry.
@@ -4535,6 +4539,10 @@ async function recoverToolRouteMiss(args: {
     activationAttempted = true;
     installedRoute = installed;
     installFate = installed ? "installed" : "stale";
+    // Only an installed route makes this answer's memory the reused one.
+    if (installed && linkSeq !== undefined) {
+      noteMemorySource(state, linkSeq, requestSessionId(req), result);
+    }
     // A tool continuation can arrive after message_stop while this HTTP
     // stream is still draining. Its route is already complete, so a smaller
     // window may buy recovery now. Mutate only this attempt's object: a late
@@ -4555,7 +4563,6 @@ async function recoverToolRouteMiss(args: {
         `${compressedRaw.length} body bytes`
     );
   }
-  if (linkSeq !== undefined) noteMemorySource(state, linkSeq, requestSessionId(req), result);
   recordTurn(rec, "tool-recompressed", compressedRaw);
   // Tagged as a TOOL memory leg, not a followup one: capture-based tooling
   // must be able to tell a recovered tool request from a normal compressed

@@ -1362,9 +1362,6 @@ async function handleMessages(req, res, opts, upstream, state) {
             return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
         }
         requestSendPolicies.get(req)?.allowed.add(compressedRaw);
-        // A fresh answer's memory is now the prompt's; a ride keeps the prior source.
-        if (result && linkSeq !== undefined)
-            noteMemorySource(state, linkSeq, sessionId, result);
         if (opts.debug) {
             console.error(`[ccc proxy] user turn ${turnType}: ${forwardBody.length} → ` +
                 `${compressedRaw.length} body bytes`);
@@ -1400,6 +1397,11 @@ async function handleMessages(req, res, opts, upstream, state) {
                 return;
             }
             const installed = installMemoryRoute(state, requestRouteKey, req, body, messages, compressedBody, routeEpoch, routeDecisionGeneration, stable);
+            // The answer's memory is now what future requests reuse; a ride keeps
+            // the prior source, and a failed or stale forward adopts nothing.
+            if (installed && result && linkSeq !== undefined) {
+                noteMemorySource(state, linkSeq, sessionId, result);
+            }
             commitRouteDecision();
             // Leave this false if installMemoryRoute unexpectedly throws: the
             // delivery-complete fallback then gets one safe retry.
@@ -3303,6 +3305,10 @@ async function recoverToolRouteMiss(args) {
         activationAttempted = true;
         installedRoute = installed;
         installFate = installed ? "installed" : "stale";
+        // Only an installed route makes this answer's memory the reused one.
+        if (installed && linkSeq !== undefined) {
+            noteMemorySource(state, linkSeq, requestSessionId(req), result);
+        }
         // A tool continuation can arrive after message_stop while this HTTP
         // stream is still draining. Its route is already complete, so a smaller
         // window may buy recovery now. Mutate only this attempt's object: a late
@@ -3317,8 +3323,6 @@ async function recoverToolRouteMiss(args) {
         console.error(`[ccc proxy] tool-route miss recovered: ${forwardBody.length} → ` +
             `${compressedRaw.length} body bytes`);
     }
-    if (linkSeq !== undefined)
-        noteMemorySource(state, linkSeq, requestSessionId(req), result);
     recordTurn(rec, "tool-recompressed", compressedRaw);
     // Tagged as a TOOL memory leg, not a followup one: capture-based tooling
     // must be able to tell a recovered tool request from a normal compressed
