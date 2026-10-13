@@ -284,6 +284,8 @@ export function startProxy(opts) {
         memorySourcePages: new Map(),
         memtreeCallSeq: 0,
         memtreeLinkStore: opts.memtreeLinkStore,
+        stablePrefixStore: opts.stablePrefixStore,
+        storedPrefixLookups: new Map(),
         newestTrees: opts.newestTrees,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
@@ -958,6 +960,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         output: bodyOutputReservation(body),
         recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
     });
+    if (isMainRequest && requestSessionKey !== undefined) {
+        adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
+    }
     const rides = state.memoryRoutes.has(requestRouteKey) ||
         (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
     if (!rides) {
@@ -1888,6 +1893,7 @@ function sessionCommandReply(state, sessionId, prompt) {
         state.memoryRoutes.delete(JSON.stringify([sessionId, "main"]));
         state.compactNow.delete(sessionId);
         state.stablePrefixes.delete(sessionId);
+        state.stablePrefixStore?.delete(sessionId);
         return `${TRAILER_LABEL} compaction off: the conversation is sent whole, and MemTree compresses only when it outgrows the model's budget.`;
     }
     if (args === "") {
@@ -2159,6 +2165,9 @@ stable) {
         // request carried, and the compressed bytes sent for them. Later requests
         // reuse these bytes unchanged, so the prefix stays a cache read.
         route.stablePrefix = storeStablePrefix(state, sessionId, originalMessages, route, stable);
+        if (route.stablePrefix && key === JSON.stringify([sessionId, "main"])) {
+            persistStablePrefix(state, sessionId, route.stablePrefix);
+        }
     }
     setMemoryRoute(state, key, route);
     state.routeDecisionsLive.set(key, new Set([decisionGeneration]));
@@ -2193,6 +2202,63 @@ function storeStablePrefix(state, sessionId, originalMessages, compressed, stabl
     boundedSet(state.stablePrefixes, sessionId, prefix);
     state.compactNow.delete(sessionId);
     return prefix;
+}
+/**
+ * Persist the main lane's newly adopted prefix with its memory-source page.
+ * Deferred one tick so the page noted right after the install is included,
+ * and skipped when a newer prefix replaced this one meanwhile.
+ */
+function persistStablePrefix(state, sessionId, prefix) {
+    const store = state.stablePrefixStore;
+    if (!store)
+        return;
+    setImmediate(() => {
+        if (state.stablePrefixes.get(sessionId) !== prefix)
+            return;
+        const page = state.memorySourcePages.get(sessionId);
+        store.save(sessionId, {
+            originalSystemHash: prefix.originalSystemHash,
+            originalPrefixHashes: prefix.originalPrefixHashes,
+            compressedMessages: prefix.compressedMessages,
+            compressedSystem: prefix.compressedSystem,
+            hasCompressedSystem: prefix.hasCompressedSystem,
+            targetTokens: prefix.targetTokens,
+            explicitTarget: prefix.explicitTarget,
+            modelContextLimit: prefix.modelContextLimit,
+        }, page && { url: page.url, index: page.index, compressed: page.compressed });
+    });
+}
+/**
+ * A fresh process's first main-lane request for a session: adopt the session's
+ * persisted prefix when this history passes the checks the in-memory prefix
+ * would (same session, system and covered messages; same window; a routable
+ * body). Anything else deletes the entry and leaves the request as it would
+ * have been with nothing stored. Looked up once per session per process.
+ */
+function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelContextLimit) {
+    const store = state.stablePrefixStore;
+    if (!store || state.stablePrefixes.has(sessionId) ||
+        state.storedPrefixLookups.has(sessionId))
+        return;
+    boundedSet(state.storedPrefixLookups, sessionId, true, MEMTREE_LINKS_MAX_SESSIONS);
+    if (compactionMode(opts, state, sessionId).mode === "off")
+        return;
+    const entry = store.load(sessionId);
+    if (!entry)
+        return;
+    const prefix = { sessionId, ...entry.prefix };
+    if (prefix.modelContextLimit !== modelContextLimit ||
+        prefixMismatch(body, messages, prefix, sessionId, stablePrefixMessageHash) ||
+        !prefixRoutedBody(body, messages, prefix)) {
+        store.delete(sessionId);
+        rec.storedPrefix = "discarded";
+        return;
+    }
+    boundedSet(state.stablePrefixes, sessionId, prefix);
+    if (entry.source && !state.memorySourcePages.has(sessionId)) {
+        rememberPage(state.memorySourcePages, sessionId, { sessionId, ...entry.source, seq: 0 });
+    }
+    rec.storedPrefix = "adopted";
 }
 /**
  * A fork of the main conversation (the away recap) sent on the main thread's

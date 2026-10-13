@@ -43,6 +43,7 @@ import { estimateRequestTokens } from "./request-sizing.js";
 import { MemtreeClient } from "./memtree.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
+import type { StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
@@ -145,6 +146,12 @@ export interface ProxyOptions {
      * the CLI passes the default store under ~/.claude-code-infinite.
      */
     memtreeLinkStore?: MemtreeLinkStore;
+    /**
+     * Where each session's adopted compressed prefix is persisted so a resumed
+     * session's first turn can ride it (prefix-store.ts). Omitted means no
+     * persistence (tests); the CLI passes the store under ~/.claude-code-infinite.
+     */
+    stablePrefixStore?: StablePrefixStore;
     /**
      * The session's newest completed tree, asked of the server, which the link
      * shown to the user points at (the compress page is only the tree the memory
