@@ -459,9 +459,20 @@ export class NoticeDeliveryQueue {
     return this.style(text, ANSI_GREEN);
   }
 
-  /** Warnings get the same own-line treatment as success, in yellow. */
+  /** Warning text styled as a queued warning would be, for direct hook replies. */
+  warningText(text: string): string {
+    return this.styleWarning(text);
+  }
+
+  /**
+   * Warnings get the same own-line treatment as success, in yellow. A line
+   * that is only an indented URL stays bare for the terminal's linkifier.
+   */
   private styleWarning(text: string): string {
-    return this.style(text, ANSI_YELLOW);
+    return text
+      .split("\n")
+      .map((line) => (isUrlLine(line) ? line : this.style(line, ANSI_YELLOW)))
+      .join("\n");
   }
 
   /**
@@ -569,6 +580,11 @@ export class NoticeDeliveryQueue {
       this.pending = null;
     }
   }
+}
+
+/** An indented line holding nothing but a URL (a link line in a notice). */
+function isUrlLine(line: string): boolean {
+  return /^\s+https?:\/\/\S+$/.test(line);
 }
 
 /** Compare the short and pinned spellings only within a turn's success/Stop pair. */

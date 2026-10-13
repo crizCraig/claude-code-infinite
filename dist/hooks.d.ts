@@ -190,7 +190,12 @@ export declare class NoticeDeliveryQueue {
     private claimForDisplay;
     private promptMatches;
     private styleSuccess;
-    /** Warnings get the same own-line treatment as success, in yellow. */
+    /** Warning text styled as a queued warning would be, for direct hook replies. */
+    warningText(text: string): string;
+    /**
+     * Warnings get the same own-line treatment as success, in yellow. A line
+     * that is only an indented URL stays bare for the terminal's linkifier.
+     */
     private styleWarning;
     /**
      * The success line with the session's current MemTree page on its own

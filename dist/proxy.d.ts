@@ -56,6 +56,11 @@ export interface ProxyOptions {
      */
     nativeOneMillionContext?: boolean;
     /**
+     * How often the unpaid-key (402) notice may repeat in a session; defaults
+     * to PAYMENT_NOTICE_INTERVAL_MS. Tests shorten it.
+     */
+    paymentNoticeIntervalMs?: number;
+    /**
      * Tool-turn compaction (default true): a tool turn on any lane whose
      * estimated size reaches the budget compresses once to the target, like a
      * main human turn (planToolCompaction); on the main thread the result is

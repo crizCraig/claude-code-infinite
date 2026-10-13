@@ -52,9 +52,10 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
-import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, PAYMENT_REQUIRED_NOTICE, SseNoticeRewriter, sanitizeNoticeDetail, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
+import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
 import { hyperlink } from "./payment-gate.js";
+import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
@@ -260,7 +261,8 @@ export function startProxy(opts) {
     const acceptedRequests = new Set();
     const shutdownAbort = new AbortController();
     const state = {
-        paymentNoticeShown: false,
+        paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
+        unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
         mainPromptGeneration: 0,
@@ -640,7 +642,7 @@ onMainStop) {
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
         }
-        const line = resumeLinkLine(state, parsed);
+        const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed));
         if (!line) {
             res.writeHead(204);
             res.end();
@@ -1596,21 +1598,17 @@ async function handleMessages(req, res, opts, upstream, state) {
         // it. Degrade to passthrough and queue a display-only hook notice for a
         // visible turn. The hidden away-summary request deliberately stays quiet.
         // Unpaid key (402, from this compress OR an earlier background index) gets
-        // a payment-specific notice instead of the generic degraded one, at most
-        // once per proxy process after it has actually been delivered.
+        // a payment-specific notice with the subscribe link instead of the generic
+        // degraded one: on the first 402, then at most once per throttle interval
+        // (counted from actual delivery). In between, unpaid turns stay quiet.
         recordTurn(rec, "followup-degraded", forwardBody);
         releaseForOriginalFallback();
         sendingWhole();
         capture(opts, "anthropic-request", forwardBody);
         const paymentDetail = opts.memtree.paymentRequiredDetail;
         const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
-        if (mayQueueNotice && paymentDetail !== null && !state.paymentNoticeShown) {
-            const detailFirstLine = sanitizeNoticeDetail(paymentDetail.split(/[\r\n]/, 1)[0]);
-            state.notices.queueSuffix(detailFirstLine
-                ? `${PAYMENT_REQUIRED_NOTICE}\n${detailFirstLine}`
-                : PAYMENT_REQUIRED_NOTICE, () => {
-                state.paymentNoticeShown = true;
-            }, noticePromptId);
+        if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
+            state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link), () => state.paymentNotice.markShown(), noticePromptId);
         }
         else if (mayQueueNotice && paymentDetail === null) {
             state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
@@ -1830,6 +1828,25 @@ function resumeLinkLine(state, input) {
         });
     }
     return state.notices.resumeLine(link, sessionId);
+}
+/**
+ * The unpaid-key notice for a resumed main session whose key the server has
+ * already answered 402 for: a resume is a fresh look at the session, so it
+ * says again why it runs uncompressed, regardless of the throttle. The link
+ * line above it already names the session's MemTree page.
+ */
+function resumePaymentNotice(state, input) {
+    if (input.agent_id !== undefined || input.source !== "resume")
+        return undefined;
+    const detail = state.unpaidDetail();
+    if (detail === null)
+        return undefined;
+    state.paymentNotice.markShown();
+    return state.notices.warningText(paymentNoticeText(detail));
+}
+function joinNoticeLines(...parts) {
+    const present = parts.filter((part) => !!part);
+    return present.length ? present.join("\n") : undefined;
 }
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */

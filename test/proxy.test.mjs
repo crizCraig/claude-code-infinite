@@ -20,10 +20,13 @@ import {
   COMPRESSED_NOTICE,
   NOT_COMPRESSED_NOTE,
   DEGRADED_NOTICE,
-  PAYMENT_REQUIRED_NOTICE,
   wrapNotice,
 } from "../dist/notices.js";
 import { AWAY_SUMMARY_PROMPT_PREFIX } from "../dist/turns.js";
+import {
+  PAYMENT_CONTINUES_LINE,
+  PAYMENT_PAUSED_HEADLINE,
+} from "../dist/payment-notice.js";
 import { SessionFinder } from "../dist/memtree-mcp.js";
 
 const GREEN = "\x1b[32m";
@@ -47,6 +50,11 @@ const PAYMENT_DETAIL =
   "Payment required for user@example.com on polychat.co for use of MemTree API" +
   "\n\nVisit polychat.co to add payment.\n\nMemTree compresses your context.";
 const DETAIL_FIRST_LINE = PAYMENT_DETAIL.split("\n")[0];
+const CHECKOUT_URL =
+  "https://app.polychat.co/payment?user_id=u-1&user_email=user%40example.com&price_id=p_1";
+const PAYMENT_DETAIL_WITH_LINK =
+  "Payment required for user@example.com on polychat.co for use of MemTree API" +
+  `\n\nWe recommend Starter plan for $5/month: ${CHECKOUT_URL}\n\nMemTree compresses.`;
 
 function listen(handler) {
   return new Promise((resolve) => {
@@ -4549,13 +4557,90 @@ test("402 payment becomes shown only when hook claims it, then later turns stay 
     assert.equal(second.content[0].text, "upstream answer");
     const delivered = await postHook(proxy, displayHook({ final: true }));
     const text = delivered.body.hookSpecificOutput.displayContent;
-    assert.ok(text.includes(PAYMENT_REQUIRED_NOTICE));
+    assert.ok(text.includes(PAYMENT_PAUSED_HEADLINE));
+    assert.ok(text.includes(PAYMENT_CONTINUES_LINE));
     assert.ok(text.includes(DETAIL_FIRST_LINE));
+    // No checkout link in this detail: the pricing page, bare on its own line.
+    assert.match(text, /\n  https:\/\/polychat\.co\/pricing(\n|$)/);
     assert.ok(!text.includes(DEGRADED_NOTICE));
     assert.ok(!text.includes("Visit polychat.co to add payment."), "only detail first line");
 
     await armMainTurn(proxy, "turn four");
     await postMessages(proxy.port, followupTurn("turn four"));
+    assert.equal((await postHook(proxy, displayHook({ final: true }))).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("402 notice carries the server's checkout link tagged source=ccc", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(402, { detail: PAYMENT_DETAIL_WITH_LINK });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const hook = await postHook(proxy, displayHook({ final: true }));
+    const text = hook.body.hookSpecificOutput.displayContent;
+    // The URL line is bare (no SGR) in either colour mode: linkifier-safe.
+    assert.ok(text.includes(`\n  ${CHECKOUT_URL}&source=ccc\n`), text);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("402 notice repeats once the throttle interval has passed", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(402, { detail: PAYMENT_DETAIL });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    paymentNoticeIntervalMs: 0,
+  });
+  try {
+    for (const q of ["turn two", "turn three"]) {
+      await armMainTurn(proxy, q);
+      await postMessages(proxy.port, followupTurn(q));
+      const hook = await postHook(proxy, displayHook({ final: true }));
+      assert.ok(hook.body.hookSpecificOutput.displayContent.includes(PAYMENT_PAUSED_HEADLINE));
+    }
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a resume re-shows the 402 notice even inside the throttle window", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(402, { detail: PAYMENT_DETAIL_WITH_LINK });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    const fresh = { hook_event_name: "SessionStart", source: "resume" };
+    // Paid (no 402 yet): a resume says nothing about payment.
+    assert.equal((await postHook(proxy, fresh)).status, 204);
+
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    await postHook(proxy, displayHook({ final: true }));
+
+    const resumed = await postHook(proxy, fresh);
+    assert.ok(resumed.body.systemMessage.includes(PAYMENT_PAUSED_HEADLINE));
+    assert.ok(resumed.body.systemMessage.includes(`${CHECKOUT_URL}&source=ccc`));
+    // A subagent or a compaction is not a resume.
+    const compact = { hook_event_name: "SessionStart", source: "compact" };
+    assert.equal((await postHook(proxy, compact)).status, 204);
+
+    // The resume counted as shown: the next unpaid turn stays quiet.
+    await armMainTurn(proxy, "turn three");
+    await postMessages(proxy.port, followupTurn("turn three"));
     assert.equal((await postHook(proxy, displayHook({ final: true }))).status, 204);
   } finally {
     proxy.close();
@@ -4612,7 +4697,7 @@ test("402 on background index sets unpaid state; next user turn shows payment no
     const userResp = await postMessages(proxy.port, followupTurn("turn two"));
     assert.equal(userResp.content[0].text, "upstream answer");
     const hook = await postHook(proxy, displayHook({ final: true }));
-    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(PAYMENT_REQUIRED_NOTICE));
+    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(PAYMENT_PAUSED_HEADLINE));
   } finally {
     proxy.close();
     upstream.close();
