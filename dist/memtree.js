@@ -753,6 +753,15 @@ export class MemtreeClient {
     get compressBudgetMs() {
         return this.compressTimeoutMs;
     }
+    /**
+     * Non-secret identity of the MemTree backend and account this client uses:
+     * a hash over the origin and a hash of the key. Persisted state is valid only
+     * for the identity that wrote it (prefix-store.ts).
+     */
+    get storageIdentity() {
+        const keyHash = createHash("sha256").update(this.apiKey).digest("hex");
+        return createHash("sha256").update(`${this.baseUrl}\n${keyHash}`).digest("hex");
+    }
     /** The budget for a compress with nothing else to send (no fallback). */
     get longCompressBudgetMs() {
         return this.longCompressTimeoutMs;
@@ -1102,39 +1111,40 @@ export class MemtreeClient {
         return false;
     }
     compressKey(hash, modelContextLimit, meta) {
-        const model = transmittedModel(meta?.model);
-        const tools = transmittedTools(meta?.tools);
-        const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
-        const toolsHash = createHash("sha256").update(toolsJson).digest("hex");
         return createHash("sha256")
             .update(JSON.stringify([
-            hash,
-            meta?.sessionId ?? null,
-            model ?? null,
-            modelContextLimit,
-            toolsHash,
-            meta?.compressionTargetTokens ?? null,
-            meta?.compressionThresholdTokens ?? null,
+            ...this.requestIdentity(hash, modelContextLimit, meta),
             clientOverThreshold(meta),
         ]))
             .digest("hex");
     }
     /**
-     * Identity for joining an in-flight compress: session, history, window,
-     * model and requested target/threshold — everything but the size hint, which
-     * a retry may measure differently. Sessionless calls never join here.
+     * Every transmitted field that can change the server's answer, except the
+     * size hint (clientInputTokens) and the abort budget: the complete key adds
+     * the hint's verdict, and the in-flight join key compares hints itself.
+     */
+    requestIdentity(hash, modelContextLimit, meta) {
+        const tools = transmittedTools(meta?.tools);
+        const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
+        return [
+            hash,
+            meta?.sessionId ?? null,
+            transmittedModel(meta?.model) ?? null,
+            modelContextLimit,
+            createHash("sha256").update(toolsJson).digest("hex"),
+            meta?.compressionTargetTokens ?? null,
+            meta?.compressionThresholdTokens ?? null,
+        ];
+    }
+    /**
+     * Identity for joining an in-flight compress: the complete request identity
+     * minus the size hint, which a retry may measure differently (the join
+     * compares hints itself). Sessionless calls never join here.
      */
     inFlightKey(hash, modelContextLimit, meta) {
         if (meta?.sessionId === undefined)
             return "";
-        return JSON.stringify([
-            meta.sessionId,
-            hash,
-            modelContextLimit,
-            transmittedModel(meta.model) ?? null,
-            meta.compressionTargetTokens ?? null,
-            meta.compressionThresholdTokens ?? null,
-        ]);
+        return JSON.stringify(this.requestIdentity(hash, modelContextLimit, meta));
     }
     /**
      * The same request's compress still in flight, when it is at least as

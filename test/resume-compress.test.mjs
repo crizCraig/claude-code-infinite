@@ -29,10 +29,10 @@ async function listen(handler) {
     close() { server.closeAllConnections(); server.close(); } };
 }
 
-/** Anthropic stand-in: Count Tokens and usage both report bytes/4. */
+/** Anthropic stand-in: Count Tokens and usage report `h.tokensPerByte` (bytes/4). */
 function upstreamHandler(h) {
   return (req, res, raw) => {
-    const tokens = Math.floor(raw.length / 4);
+    const tokens = Math.floor(raw.length * h.tokensPerByte);
     res.writeHead(200, { "content-type": "application/json" });
     if (req.url.includes("/count_tokens")) return res.end(JSON.stringify({ input_tokens: tokens }));
     h.forwarded.push(JSON.parse(raw.toString("utf-8")));
@@ -65,14 +65,14 @@ function memtreeHandler(h) {
   };
 }
 
-async function harness() {
-  const h = { forwarded: [], records: [], compressCalls: 0, delayMs: SLOW_MS };
+async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
+  const h = { forwarded: [], records: [], compressCalls: 0, delayMs: SLOW_MS, tokensPerByte };
   const upstream = await listen(upstreamHandler(h));
   const memory = await listen(memtreeHandler(h));
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k",
     compressTimeoutMs: SHORT_MS, longCompressTimeoutMs: LONG_MS });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
-    budgetTokensOverride: 20_000, countTokens: true,
+    budgetTokensOverride: 20_000, countTokens,
     reqlog: { log: (r) => h.records.push(structuredClone(r)) } });
   h.post = async (messages) => {
     const started = Date.now();
@@ -193,3 +193,39 @@ test("MemtreeClient: an in-flight compress is shared by a retry that forces no m
       assert.equal(h.compressCalls, 5);
     } finally { memory.close(); }
   });
+
+test("a calibrated overflow keeps the short budget when delivery could still send it by bytes",
+  async () => {
+    // Counting off and a 0.5 tokens/byte sample: 600 KB is ~300k calibrated
+    // tokens, over the 200k window, but delivery would still send it whole on
+    // its bytes/4 estimate (150k), so a timeout is not a refusal.
+    const h = await harness({ countTokens: false, tokensPerByte: 0.5 });
+    try {
+      assert.equal((await h.post([user("q " + "s".repeat(100_000))])).status, 200);
+      const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 600_000))]);
+      assert.equal(result.status, 200);
+      assert.ok(result.ms < SLOW_MS, `short budget (took ${result.ms} ms)`);
+      const rec = h.lastRecord();
+      assert.equal(rec.turnType, "followup-degraded");
+      assert.equal(rec.compress.timedOut, true);
+    } finally { h.close(); }
+  });
+
+test("MemtreeClient: a compress with different tools never joins one in flight", async () => {
+  const h = { compressCalls: 0, delayMs: 200 };
+  const memory = await listen(memtreeHandler(h));
+  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k",
+    compressTimeoutMs: 2_000 });
+  try {
+    const messages = resumed();
+    const hash = MemtreeClient.hashMessages(messages);
+    const meta = { model: "claude-x", sessionId: "s", compressionTargetTokens: 10_000,
+      compressionThresholdTokens: 20_000, clientInputTokens: 250_000 };
+    const tools = [{ name: "Read", input_schema: { type: "object" } }];
+    await Promise.all([
+      memtree.compress(hash, messages, 200_000, undefined, { ...meta, tools }),
+      memtree.compress(hash, messages, 200_000, undefined, meta),
+    ]);
+    assert.equal(h.compressCalls, 2);
+  } finally { memory.close(); }
+});

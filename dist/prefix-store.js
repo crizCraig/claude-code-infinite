@@ -4,26 +4,36 @@
  * instead of blocking on a fresh compress: a new ccc process starts with no
  * prefix, and a large session's compress can outrun its budget.
  *
- * One file per session under ~/.claude-code-infinite/stable-prefixes/, named
- * by a hash of the session id, mode 600, written whole through a temporary
- * file and a rename. The total size and the number of sessions are bounded;
- * the oldest saves are evicted first. An entry holds only what reproduces the
- * prefix byte for byte: the compressed messages and system, and the identity
- * of the raw prefix they replace (system hash, per-message hashes), plus the
- * target and window it was built for and the page its memory came from. The
- * proxy validates an entry exactly as it validates the in-memory prefix
- * before adopting it. Every failure is swallowed (a missing prefix only costs
- * a compress), and contents are never logged.
+ * One file per session and owner under ~/.claude-code-infinite/
+ * stable-prefixes/. The owner is MemtreeClient.storageIdentity, a hash over the
+ * MemTree origin and a hash of the key (never the key): an entry, and the
+ * memory-source page in it, is only ever read back for the same backend and
+ * account, so a staging/production or key switch never adopts it.
+ *
+ * Files are mode 600 in a 700 directory owned by this user, written through an
+ * exclusive, unpredictably named temporary file and a rename, and opened
+ * without following symlinks. The total size and the number of sessions are
+ * bounded, the oldest saves are evicted first, and stale temporary files are
+ * removed. An entry holds only what reproduces the prefix byte for byte (the
+ * compressed messages and system, the identity of the raw prefix they replace)
+ * plus the target and window it was built for and its memory-source page. It
+ * is schema-checked on load and, by the proxy, validated against the request
+ * exactly like the in-memory prefix before adoption. Every failure is
+ * swallowed (a missing prefix only costs a compress); contents are never
+ * logged.
  */
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getConfigDir } from "./config.js";
-const ENTRY_VERSION = 1;
+const ENTRY_VERSION = 2;
 export const STABLE_PREFIX_STORE_LIMITS = {
     maxBytes: 256 * 1024 * 1024,
     maxEntries: 64,
 };
+/** A temporary file this old belongs to a failed or killed write. */
+const STALE_TEMP_MS = 60_000;
+const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 export class StablePrefixStore {
     dir;
     limits;
@@ -31,82 +41,170 @@ export class StablePrefixStore {
         this.dir = dir;
         this.limits = limits;
     }
-    /** The session's entry; a corrupt or foreign one is deleted (undefined). */
-    load(sessionId) {
-        const file = this.fileFor(sessionId);
-        let text;
-        try {
-            text = fs.readFileSync(file, "utf-8");
-        }
-        catch {
+    /** The session's entry for `owner`; an unreadable or invalid one is deleted. */
+    load(sessionId, owner) {
+        if (!this.privateDir(false))
             return undefined;
-        }
+        const text = readPrivateFile(this.entryPath(sessionId, owner), this.limits.maxBytes);
+        if (text === undefined)
+            return undefined;
         const entry = parseEntry(text);
-        if (entry?.sessionId === sessionId)
+        if (entry?.sessionId === sessionId && entry.owner === owner)
             return entry;
-        this.delete(sessionId);
+        this.delete(sessionId, owner);
         return undefined;
     }
     /** Replace the session's entry, then evict down to the limits. */
-    save(sessionId, prefix, source, now = Date.now()) {
+    save(sessionId, owner, prefix, source, now = Date.now()) {
+        if (!this.privateDir(true))
+            return;
+        const entry = {
+            version: ENTRY_VERSION, sessionId, owner, savedAt: now, prefix,
+            ...(source ? { source } : {}),
+        };
+        if (!isEntry(entry))
+            return;
+        const file = this.entryPath(sessionId, owner);
+        if (writeAtomically(this.dir, file, JSON.stringify(entry)))
+            this.evict(now);
+    }
+    delete(sessionId, owner) {
+        unlinkQuietly(this.entryPath(sessionId, owner));
+    }
+    /** Where the entry for this session and owner lives. */
+    entryPath(sessionId, owner) {
+        const name = createHash("sha256").update(`${owner}\0${sessionId}`).digest("hex");
+        return path.join(this.dir, `${name.slice(0, 40)}.json`);
+    }
+    /**
+     * The directory exists (created when `create`), is a real directory (not a
+     * symlink) owned by this user, and is mode 700 (repaired when it is not).
+     */
+    privateDir(create) {
         try {
-            const entry = {
-                version: ENTRY_VERSION, sessionId, savedAt: now, prefix,
-                ...(source ? { source } : {}),
-            };
-            fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-            const file = this.fileFor(sessionId);
-            const tmp = `${file}.${process.pid}.tmp`;
-            fs.writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
-            fs.renameSync(tmp, file);
-            this.evict();
+            if (create)
+                fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+            const stat = fs.lstatSync(this.dir);
+            if (!stat.isDirectory() || !ownedByMe(stat))
+                return false;
+            if ((stat.mode & 0o777) !== 0o700)
+                fs.chmodSync(this.dir, 0o700);
+            return true;
         }
         catch {
-            // A lost prefix only costs a compress on the next resume.
+            return false;
         }
     }
-    delete(sessionId) {
-        try {
-            fs.unlinkSync(this.fileFor(sessionId));
-        }
-        catch {
-            // Already gone.
-        }
-    }
-    /** Drop the oldest saves until the entry count and total size fit. */
-    evict() {
-        const entries = this.listEntries().sort((a, b) => b.savedAt - a.savedAt);
-        let bytes = 0;
+    /** Drop stale temporaries, then the oldest saves until the limits fit. */
+    evict(now) {
+        const { entries, pendingBytes } = this.scan(now);
+        entries.sort((a, b) => b.savedAt - a.savedAt);
+        let bytes = pendingBytes;
         entries.forEach((entry, i) => {
             bytes += entry.bytes;
-            if (i >= this.limits.maxEntries || bytes > this.limits.maxBytes) {
-                try {
-                    fs.unlinkSync(entry.file);
-                }
-                catch { /* already gone */ }
-            }
+            if (i >= this.limits.maxEntries || bytes > this.limits.maxBytes)
+                unlinkQuietly(entry.file);
         });
     }
-    /** Entry files with their size and save time (file mtime). */
-    listEntries() {
-        const found = [];
-        for (const name of fs.readdirSync(this.dir)) {
-            if (!name.endsWith(".json"))
-                continue;
+    /**
+     * Entry files with size and save time. Symlinks and stale temporaries are
+     * removed; recent temporaries (writes in progress) count toward the size.
+     */
+    scan(now) {
+        const entries = [];
+        let pendingBytes = 0;
+        for (const name of safeReaddir(this.dir)) {
             const file = path.join(this.dir, name);
-            try {
-                const stat = fs.statSync(file);
-                found.push({ file, bytes: stat.size, savedAt: savedAtOf(file, stat.mtimeMs) });
+            const stat = safeLstat(file);
+            if (!stat)
+                continue;
+            if (stat.isSymbolicLink()) {
+                unlinkQuietly(file);
             }
-            catch {
-                // Removed concurrently.
+            else if (!stat.isFile()) {
+                continue;
+            }
+            else if (name.endsWith(".tmp")) {
+                if (now - stat.mtimeMs >= STALE_TEMP_MS)
+                    unlinkQuietly(file);
+                else
+                    pendingBytes += stat.size;
+            }
+            else if (name.endsWith(".json")) {
+                entries.push({ file, bytes: stat.size, savedAt: savedAtOf(file, stat.mtimeMs) });
             }
         }
-        return found;
+        return { entries, pendingBytes };
     }
-    fileFor(sessionId) {
-        const name = createHash("sha256").update(sessionId).digest("hex").slice(0, 32);
-        return path.join(this.dir, `${name}.json`);
+}
+/** Write through an exclusive, unpredictable temporary file and rename it. */
+function writeAtomically(dir, file, text) {
+    const tmp = path.join(dir, `.${randomBytes(12).toString("hex")}.tmp`);
+    try {
+        const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW, 0o600);
+        try {
+            fs.writeFileSync(fd, text);
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, file);
+        return true;
+    }
+    catch {
+        unlinkQuietly(tmp);
+        return false;
+    }
+}
+/** A regular file of ours, opened without following a symlink; mode repaired to 600. */
+function readPrivateFile(file, maxBytes) {
+    let fd;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | NO_FOLLOW);
+    }
+    catch {
+        return undefined;
+    }
+    try {
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile() || !ownedByMe(stat) || stat.size > maxBytes)
+            return undefined;
+        if ((stat.mode & 0o777) !== 0o600)
+            fs.fchmodSync(fd, 0o600);
+        return fs.readFileSync(fd, "utf-8");
+    }
+    catch {
+        return undefined;
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+}
+function ownedByMe(stat) {
+    return typeof process.getuid !== "function" || stat.uid === process.getuid();
+}
+function unlinkQuietly(file) {
+    try {
+        fs.unlinkSync(file);
+    }
+    catch {
+        // Already gone.
+    }
+}
+function safeReaddir(dir) {
+    try {
+        return fs.readdirSync(dir);
+    }
+    catch {
+        return [];
+    }
+}
+function safeLstat(file) {
+    try {
+        return fs.lstatSync(file);
+    }
+    catch {
+        return undefined;
     }
 }
 /**
@@ -115,9 +213,9 @@ export class StablePrefixStore {
  */
 function savedAtOf(file, mtimeMs) {
     try {
-        const fd = fs.openSync(file, "r");
+        const fd = fs.openSync(file, fs.constants.O_RDONLY | NO_FOLLOW);
         try {
-            const head = Buffer.alloc(256);
+            const head = Buffer.alloc(512);
             const n = fs.readSync(fd, head, 0, head.length, 0);
             const match = /"savedAt":(\d+)/.exec(head.subarray(0, n).toString("utf-8"));
             return match ? Number(match[1]) : mtimeMs;
@@ -140,22 +238,48 @@ function parseEntry(text) {
     }
 }
 function isEntry(v) {
-    return !!v && typeof v === "object" && v.version === ENTRY_VERSION &&
-        typeof v.sessionId === "string" && typeof v.savedAt === "number" &&
-        isPrefix(v.prefix) && (v.source === undefined || isSource(v.source));
+    return isObject(v) && v.version === ENTRY_VERSION &&
+        typeof v.sessionId === "string" && nonEmptyString(v.owner) &&
+        Number.isFinite(v.savedAt) && isPrefix(v.prefix) &&
+        (v.source === undefined || isSource(v.source));
 }
+/** The prefix's invariants: the identity of a covered history, and well-formed bytes. */
 function isPrefix(p) {
-    return !!p && typeof p === "object" && typeof p.originalSystemHash === "string" &&
-        Array.isArray(p.originalPrefixHashes) &&
-        p.originalPrefixHashes.every((h) => typeof h === "string") &&
+    return isObject(p) && nonEmptyString(p.originalSystemHash) &&
+        Array.isArray(p.originalPrefixHashes) && p.originalPrefixHashes.length > 0 &&
+        p.originalPrefixHashes.every(nonEmptyString) &&
         Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
+        p.compressedMessages.every(isMessage) &&
         typeof p.hasCompressedSystem === "boolean" &&
-        Number.isFinite(p.targetTokens) && typeof p.explicitTarget === "boolean" &&
-        Number.isFinite(p.modelContextLimit);
+        (p.hasCompressedSystem ? isSystem(p.compressedSystem) : p.compressedSystem == null) &&
+        positiveNumber(p.targetTokens) && typeof p.explicitTarget === "boolean" &&
+        Number.isInteger(p.modelContextLimit) && p.modelContextLimit > 0;
+}
+/** An Anthropic message: user/assistant role, string or typed-block content. */
+function isMessage(m) {
+    const message = m;
+    return isObject(message) && (message.role === "user" || message.role === "assistant") &&
+        (typeof message.content === "string" || isBlockList(message.content));
+}
+/** A top-level system prompt: a string or typed blocks. */
+function isSystem(system) {
+    return typeof system === "string" || isBlockList(system);
+}
+function isBlockList(value) {
+    return Array.isArray(value) && value.length > 0 &&
+        value.every((block) => isObject(block) && nonEmptyString(block.type));
 }
 function isSource(s) {
-    return !!s && typeof s === "object" && typeof s.url === "string" &&
-        /^https?:\/\//.test(s.url) && typeof s.index === "string" &&
-        typeof s.compressed === "boolean";
+    return isObject(s) && typeof s.url === "string" && /^https?:\/\//.test(s.url) &&
+        nonEmptyString(s.index) && typeof s.compressed === "boolean";
+}
+function isObject(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function nonEmptyString(value) {
+    return typeof value === "string" && value.length > 0;
+}
+function positiveNumber(value) {
+    return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 //# sourceMappingURL=prefix-store.js.map

@@ -286,6 +286,8 @@ export function startProxy(opts) {
         memtreeLinkStore: opts.memtreeLinkStore,
         stablePrefixStore: opts.stablePrefixStore,
         storedPrefixLookups: new Map(),
+        storageOwner: typeof opts.memtree.storageIdentity === "string"
+            ? opts.memtree.storageIdentity : undefined,
         newestTrees: opts.newestTrees,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
@@ -1272,8 +1274,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                         ...(plan.fallback ? { fallback: plan.fallback } : {}),
                         retryAtTokens: plan.estimateTokens +
                             Math.floor(plan.budgetTokens * TOOL_COMPACTION_RETRY_BUDGET_RATIO),
-                        longBudget: !plan.fallback &&
-                            knownOverWindow(requestSizing, originalCandidate, sizingLimits()),
+                        ...(plan.fallback ? {} : { wholeRefused: () => wholeRequestRefused(requestSizing, originalCandidate, sizingLimits()) }),
                     }).finally(() => {
                         recoveryAttempt.inFlight = false;
                     }));
@@ -1577,7 +1578,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             // Riding the old prefix, or sending a raw request that fits, keeps the
             // short budget; with neither, a timeout could only end in a refusal.
             longBudget: !(edge?.kind === "compress" && edge.fallback) &&
-                knownOverWindow(requestSizing, forwardCandidate, sizingLimits()),
+                await wholeRequestRefused(requestSizing, forwardCandidate, sizingLimits()),
         });
     }
     catch {
@@ -1895,7 +1896,9 @@ function sessionCommandReply(state, sessionId, prompt) {
         state.memoryRoutes.delete(JSON.stringify([sessionId, "main"]));
         state.compactNow.delete(sessionId);
         state.stablePrefixes.delete(sessionId);
-        state.stablePrefixStore?.delete(sessionId);
+        if (state.storageOwner)
+            state.stablePrefixStore?.delete(sessionId, state.storageOwner);
+        state.storedPrefixLookups.set(sessionId, null);
         return `${TRAILER_LABEL} compaction off: the conversation is sent whole, and MemTree compresses only when it outgrows the model's budget.`;
     }
     if (args === "") {
@@ -2212,13 +2215,15 @@ function storeStablePrefix(state, sessionId, originalMessages, compressed, stabl
  */
 function persistStablePrefix(state, sessionId, prefix) {
     const store = state.stablePrefixStore;
-    if (!store)
+    const owner = state.storageOwner;
+    if (!store || !owner)
         return;
+    state.storedPrefixLookups.set(sessionId, null);
     setImmediate(() => {
         if (state.stablePrefixes.get(sessionId) !== prefix)
             return;
         const page = state.memorySourcePages.get(sessionId);
-        store.save(sessionId, {
+        store.save(sessionId, owner, {
             originalSystemHash: prefix.originalSystemHash,
             originalPrefixHashes: prefix.originalPrefixHashes,
             compressedMessages: prefix.compressedMessages,
@@ -2231,28 +2236,35 @@ function persistStablePrefix(state, sessionId, prefix) {
     });
 }
 /**
- * A fresh process's first main-lane request for a session: adopt the session's
+ * A fresh process's main-lane requests for a session: adopt the session's
  * persisted prefix when this history passes the checks the in-memory prefix
  * would (same session, system and covered messages; same window; a routable
- * body). Anything else deletes the entry and leaves the request as it would
- * have been with nothing stored. Looked up once per session per process.
+ * body). Only an authoritative main history may discard it: one with the same
+ * system and window, no server tools, and at least the covered length, whose
+ * covered messages differ. Anything else (a side or helper request such as
+ * the Haiku WebSearch call) leaves it for a later request. The disk is read
+ * once per session; the store checks the backend/account owner.
  */
 function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelContextLimit) {
-    const store = state.stablePrefixStore;
-    if (!store || state.stablePrefixes.has(sessionId) ||
-        state.storedPrefixLookups.has(sessionId))
+    const { stablePrefixStore: store, storageOwner: owner } = state;
+    if (!store || !owner || state.stablePrefixes.has(sessionId))
         return;
-    boundedSet(state.storedPrefixLookups, sessionId, true, MEMTREE_LINKS_MAX_SESSIONS);
     if (compactionMode(opts, state, sessionId).mode === "off")
         return;
-    const entry = store.load(sessionId);
-    if (!entry)
+    let entry = state.storedPrefixLookups.get(sessionId);
+    if (entry === undefined) {
+        entry = store.load(sessionId, owner) ?? null;
+        boundedSet(state.storedPrefixLookups, sessionId, entry);
+    }
+    if (entry === null)
         return;
     const prefix = { sessionId, ...entry.prefix };
-    if (prefix.modelContextLimit !== modelContextLimit ||
-        prefixMismatch(body, messages, prefix, sessionId, stablePrefixMessageHash) ||
-        !prefixRoutedBody(body, messages, prefix)) {
-        store.delete(sessionId);
+    const verdict = storedPrefixVerdict(body, messages, prefix, modelContextLimit);
+    if (verdict === "defer")
+        return;
+    state.storedPrefixLookups.set(sessionId, null);
+    if (verdict === "discard") {
+        store.delete(sessionId, owner);
         rec.storedPrefix = "discarded";
         return;
     }
@@ -2261,6 +2273,17 @@ function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelCon
         rememberPage(state.memorySourcePages, sessionId, { sessionId, ...entry.source, seq: 0 });
     }
     rec.storedPrefix = "adopted";
+}
+/** What this request says about a persisted prefix (adoptStoredPrefix). */
+function storedPrefixVerdict(body, messages, prefix, modelContextLimit) {
+    if (carriesServerTools(body) || prefix.modelContextLimit !== modelContextLimit)
+        return "defer";
+    const miss = prefixMismatch(body, messages, prefix, prefix.sessionId, stablePrefixMessageHash);
+    if (miss === null)
+        return prefixRoutedBody(body, messages, prefix) ? "adopt" : "defer";
+    const authoritative = miss === "prefix" &&
+        messages.length >= prefix.originalPrefixHashes.length;
+    return authoritative ? "discard" : "defer";
 }
 /**
  * A fork of the main conversation (the away recap) sent on the main thread's
@@ -3292,7 +3315,7 @@ async function recoverToolRouteMiss(args) {
             sizing: args.sizing,
             inputCandidate: args.inputCandidate,
             ...(args.compaction ? { compaction: args.compaction } : {}),
-            longBudget: args.longBudget === true,
+            longBudget: args.wholeRefused ? await args.wholeRefused() : false,
         });
     }
     catch {
@@ -3713,13 +3736,15 @@ async function selectForwardCandidate(args) {
     return changed ? candidate.body : intended;
 }
 /**
- * Whether `candidate` is known not to fit the window: an exact Count Tokens
- * result or a calibrated estimate over it even with the relaxed output floor.
- * A bytes/4 guess is not knowledge, so it keeps the short compress budget.
+ * Whether delivery would refuse `candidate` sent whole: it is planned over the
+ * window, and the measurement selection would use (an exact count, else the
+ * same estimate or bytes/4 fallback) does not fit either. Only then is there
+ * no fallback, and only then may a compress take the long budget.
  */
-function knownOverWindow(sizing, candidate, limits) {
-    const size = sizing.plan(candidate);
-    return size.source === "reported" && !fitsNative(size.tokens, limits);
+async function wholeRequestRefused(sizing, candidate, limits) {
+    if (fitsNative(sizing.plan(candidate).tokens, limits))
+        return false;
+    return !fitsMeasured(await sizing.measure(candidate, limits), limits);
 }
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(args, inputTokens, budgetTokens) {
@@ -3758,6 +3783,9 @@ function noteSelectedCandidateSize(rec) {
     const owner = candidate && candidateSizeOwners.get(candidate);
     const tokens = reportedInputTokens(rec);
     if (!candidate || !owner || tokens === undefined)
+        return;
+    // Server tools' injected results inflate the reported input (reportedSample).
+    if (serverToolRecords.has(rec) || usedServerTools(rec))
         return;
     const sample = { tokens, forwardedBytes: candidate.body.length };
     if (!plausibleSample(sample))

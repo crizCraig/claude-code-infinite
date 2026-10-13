@@ -324,6 +324,12 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /**
+     * Non-secret identity of the MemTree backend and account this client uses:
+     * a hash over the origin and a hash of the key. Persisted state is valid only
+     * for the identity that wrote it (prefix-store.ts).
+     */
+    get storageIdentity(): string;
     /** The budget for a compress with nothing else to send (no fallback). */
     get longCompressBudgetMs(): number;
     /** Change the `x-memtree-tools` value for later calls (undefined: none). */
@@ -431,9 +437,15 @@ export declare class MemtreeClient {
     drainBackground(timeoutMs?: number): Promise<boolean>;
     private compressKey;
     /**
-     * Identity for joining an in-flight compress: session, history, window,
-     * model and requested target/threshold — everything but the size hint, which
-     * a retry may measure differently. Sessionless calls never join here.
+     * Every transmitted field that can change the server's answer, except the
+     * size hint (clientInputTokens) and the abort budget: the complete key adds
+     * the hint's verdict, and the in-flight join key compares hints itself.
+     */
+    private requestIdentity;
+    /**
+     * Identity for joining an in-flight compress: the complete request identity
+     * minus the size hint, which a retry may measure differently (the join
+     * compares hints itself). Sessionless calls never join here.
      */
     private inFlightKey;
     /**
