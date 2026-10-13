@@ -80,6 +80,13 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "yet, and search does not see them; read_lines {\"tail\": true} reads them verbatim (with tree for another " +
     "session's page).";
 const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
+/**
+ * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
+ * first turn, not deferred behind tool search. ccc's own --mcp-config also sets
+ * the server's `alwaysLoad`; this covers caller-supplied configs too (the
+ * recall probe, `ccc memtree-mcp`).
+ */
+export const MEMTREE_TOOL_META = { "anthropic/alwaysLoad": true };
 export const MEMTREE_TOOLS = [
     {
         name: "search",
@@ -152,7 +159,7 @@ export const MEMTREE_TOOLS = [
             },
         },
     },
-];
+].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
 /** A request id in either spelling (UUID or the short leading-hex form). */
 const TREE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /** Other sessions' pages kept in memory at once (each can be several MB). */

@@ -384,6 +384,15 @@ interface ProxyState {
    * to a staler tree.
    */
   memtreePages: Map<string, MemtreePage>;
+  /**
+   * Per session, the page whose memory the prompt carries: set only when a
+   * main-lane compress answer's route is installed after a complete upstream
+   * response (the prefix later requests reuse), so `/memtree/current`
+   * (the MCP tools' "current" tree, where bare node ids resolve) never moves to
+   * a tree whose memory was rejected while an older prefix rides on. The link
+   * (memtreePages) still follows every answer.
+   */
+  memorySourcePages: Map<string, MemtreePage>;
   /** Submission counter behind the pages' `seq`. */
   memtreeCallSeq: number;
   memtreeLinkStore?: MemtreeLinkStore;
@@ -791,6 +800,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     shutdownSignal: shutdownAbort.signal,
     routeInstallFault: opts.routeInstallFault,
     memtreePages: new Map(),
+    memorySourcePages: new Map(),
     memtreeCallSeq: 0,
     memtreeLinkStore: opts.memtreeLinkStore,
     newestTrees: opts.newestTrees,
@@ -1108,7 +1118,7 @@ async function handleMemTreeCurrent(
   url: URL
 ): Promise<void> {
   const sessionId = url.searchParams.get("session") || undefined;
-  const page = currentMemtreePage(state, sessionId);
+  const page = currentMemorySourcePage(state, sessionId);
   const id = page ? memtreePageId(page.url) : undefined;
   if (!page || !id) {
     res.writeHead(404, { "content-type": "application/json" });
@@ -1145,6 +1155,15 @@ async function handleMemTreeCurrent(
 }
 
 const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+
+/** The page whose memory is in the prompt, else (none adopted yet) the newest page. */
+function currentMemorySourcePage(
+  state: ProxyState,
+  sessionId: string | undefined
+): { url: string; index: string; compressed: boolean; sessionId?: string } | undefined {
+  if (!sessionId) return undefined;
+  return state.memorySourcePages.get(sessionId) ?? currentMemtreePage(state, sessionId);
+}
 
 function currentMemtreePage(
   state: ProxyState,
@@ -2049,6 +2068,11 @@ async function handleMessages(
         routeDecisionGeneration,
         stable
       );
+      // The answer's memory is now what future requests reuse; a ride keeps
+      // the prior source, and a failed or stale forward adopts nothing.
+      if (installed && result && linkSeq !== undefined) {
+        noteMemorySource(state, linkSeq, sessionId, result);
+      }
       commitRouteDecision();
       // Leave this false if installMemoryRoute unexpectedly throws: the
       // delivery-complete fallback then gets one safe retry.
@@ -2783,12 +2807,35 @@ function noteMemtreePage(
   state.newestTrees?.invalidate(sessionId);
 }
 
-/** Bound optional page state independently of how many sessions use the proxy. */
+/**
+ * Record a compress answer's page as the source of the memory now forwarded
+ * (memorySourcePages), unless a later-submitted call's memory already is.
+ */
+function noteMemorySource(
+  state: ProxyState,
+  seq: number,
+  sessionId: string | undefined,
+  result: CompressResult
+): void {
+  const url = result.memtreeUrl;
+  const index = result.memtreeIndex;
+  if (!sessionId || !url || !index) return;
+  const latest = state.memorySourcePages.get(sessionId);
+  if (latest && latest.seq >= seq) return;
+  const page = { sessionId, url, index, compressed: didMemtreeCompress(result), seq };
+  rememberPage(state.memorySourcePages, sessionId, page);
+}
+
 function rememberMemtreePage(state: ProxyState, sessionId: string, page: MemtreePage): void {
-  state.memtreePages.delete(sessionId);
-  state.memtreePages.set(sessionId, page);
-  while (state.memtreePages.size > MEMTREE_LINKS_MAX_SESSIONS) {
-    state.memtreePages.delete(state.memtreePages.keys().next().value!);
+  rememberPage(state.memtreePages, sessionId, page);
+}
+
+/** Bound optional page state independently of how many sessions use the proxy. */
+function rememberPage(pages: Map<string, MemtreePage>, sessionId: string, page: MemtreePage): void {
+  pages.delete(sessionId);
+  pages.set(sessionId, page);
+  while (pages.size > MEMTREE_LINKS_MAX_SESSIONS) {
+    pages.delete(pages.keys().next().value!);
   }
 }
 
@@ -4545,6 +4592,10 @@ async function recoverToolRouteMiss(args: {
     activationAttempted = true;
     installedRoute = installed;
     installFate = installed ? "installed" : "stale";
+    // Only an installed route makes this answer's memory the reused one.
+    if (installed && linkSeq !== undefined) {
+      noteMemorySource(state, linkSeq, requestSessionId(req), result);
+    }
     // A tool continuation can arrive after message_stop while this HTTP
     // stream is still draining. Its route is already complete, so a smaller
     // window may buy recovery now. Mutate only this attempt's object: a late

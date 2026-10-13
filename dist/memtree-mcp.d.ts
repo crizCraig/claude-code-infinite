@@ -10,7 +10,19 @@ export declare const CURRENT_TREE = "current";
  * before any memory message exists. Constant, so the prompt cache holds.
  */
 export declare const MEMTREE_MCP_INSTRUCTIONS: string;
+/**
+ * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
+ * first turn, not deferred behind tool search. ccc's own --mcp-config also sets
+ * the server's `alwaysLoad`; this covers caller-supplied configs too (the
+ * recall probe, `ccc memtree-mcp`).
+ */
+export declare const MEMTREE_TOOL_META: {
+    readonly "anthropic/alwaysLoad": true;
+};
 export declare const MEMTREE_TOOLS: ({
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
     name: string;
     description: string;
     inputSchema: {
@@ -60,6 +72,9 @@ export declare const MEMTREE_TOOLS: ({
         required: string[];
     };
 } | {
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
     name: string;
     description: string;
     inputSchema: {
@@ -93,6 +108,9 @@ export declare const MEMTREE_TOOLS: ({
         required?: undefined;
     };
 } | {
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
     name: string;
     description: string;
     inputSchema: {
@@ -135,6 +153,9 @@ export declare const MEMTREE_TOOLS: ({
         required?: undefined;
     };
 } | {
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
     name: string;
     description: string;
     inputSchema: {

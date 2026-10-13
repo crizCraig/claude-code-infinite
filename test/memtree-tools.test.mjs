@@ -466,6 +466,8 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
     "list",
   ]);
   assert.equal(list.result.tools, MEMTREE_TOOLS);
+  // Non-deferred even under a caller-supplied --mcp-config without alwaysLoad.
+  for (const t of list.result.tools) assert.equal(t._meta?.["anthropic/alwaysLoad"], true, t.name);
 
   const call = (name, args) =>
     handleMcpMessage({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }, tree);
@@ -560,6 +562,8 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
   const server = config.mcpServers.memtree;
   assert.equal(server.env.CCC_MEMTREE_PROXY, "http://127.0.0.1:1234");
   assert.match(server.args[0], /dist\/memtree-mcp\.js$/);
+  // Claude Code's per-server key: its tools load up front, never deferred behind tool search.
+  assert.equal(server.alwaysLoad, true);
 
   assert.deepEqual(withMemtreeMcpArgs(["hello"], "/tmp/m.json"), [
     "--mcp-config=/tmp/m.json",
