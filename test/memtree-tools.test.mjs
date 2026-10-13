@@ -560,6 +560,8 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
   const server = config.mcpServers.memtree;
   assert.equal(server.env.CCC_MEMTREE_PROXY, "http://127.0.0.1:1234");
   assert.match(server.args[0], /dist\/memtree-mcp\.js$/);
+  // Claude Code's per-server key: its tools load up front, never deferred behind tool search.
+  assert.equal(server.alwaysLoad, true);
 
   assert.deepEqual(withMemtreeMcpArgs(["hello"], "/tmp/m.json"), [
     "--mcp-config=/tmp/m.json",

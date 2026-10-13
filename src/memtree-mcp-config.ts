@@ -12,8 +12,12 @@
  *   `--strict-mcp-config`. The `=` form matters: `--mcp-config` is variadic,
  *   and a following positional prompt would otherwise be read as a config.
  *   The tools are read-only views of the user's own session, so they are
- *   pre-allowed with `--allowedTools=` as well. `CCC_MEMTREE_MCP=0` turns this
- *   off.
+ *   pre-allowed with `--allowedTools=` as well. The server sets Claude Code's
+ *   `alwaysLoad: true`, so its tools are in the prompt from the first turn
+ *   (and after --resume) instead of deferred behind tool search; this applies
+ *   to this server only, not the user's other MCP servers. Claude Code also
+ *   waits (up to its 5s connect timeout) for the server before that turn.
+ *   `CCC_MEMTREE_MCP=0` turns this off.
  * - Print (`-p`) and non-TTY runs get nothing automatically (their output and
  *   tool set stay vanilla). A caller that wants the tools passes its own
  *   `--mcp-config` naming a server `memtree` run by `ccc memtree-mcp` (or
@@ -46,6 +50,7 @@ export function memtreeMcpConfig(proxyUrl: string): object {
         command: process.execPath,
         args: [MEMTREE_MCP_SCRIPT],
         env: { CCC_MEMTREE_PROXY: proxyUrl },
+        alwaysLoad: true,
       },
     },
   };
