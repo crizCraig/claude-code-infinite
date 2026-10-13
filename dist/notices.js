@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { LINK_LABEL, linkLines } from "./hooks.js";
+import { LINK_LABEL, linkLines, urlLine } from "./hooks.js";
 import { UPGRADE_COMMAND } from "./update-check.js";
 export const NOTICE_OPEN = "<cc-infinite-notice>";
 export const NOTICE_CLOSE = "</cc-infinite-notice>";
@@ -40,7 +40,7 @@ function formatTokenCount(tokens) {
     }).format(tokens).toLowerCase();
 }
 export function compressedNoticeText(memtreeUrl) {
-    return memtreeUrl ? `${COMPRESSED_NOTICE}\n  ${memtreeUrl}` : COMPRESSED_NOTICE;
+    return memtreeUrl ? `${COMPRESSED_NOTICE}\n${urlLine(memtreeUrl)}` : COMPRESSED_NOTICE;
 }
 /**
  * The trailer under a finished assistant message naming the newest MemTree

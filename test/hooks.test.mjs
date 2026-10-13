@@ -126,7 +126,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
       hookEventName: "MessageDisplay",
       displayContent:
         "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
-        "  https://app.polychat.co/m/aaaaaaaaaaaa\n\nanswer",
+        "  https://app.polychat.co/m/aaaaaaaaaaaa ↗\n\nanswer",
     },
   });
   assert.equal(queue.linkPending("session-1"), false);
@@ -136,7 +136,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   assert.deepEqual(queue.claim(stop()), {
     systemMessage:
       "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
-      "  https://app.polychat.co/m/aaaaaaaaaaab",
+      "  https://app.polychat.co/m/aaaaaaaaaaab ↗",
   });
 
   // A new index: Stop fallback carries its page on the success line, once.
@@ -145,7 +145,7 @@ test("a pending link rides the success line once per key, in display or Stop, ne
   assert.deepEqual(queue.claim(stop()), {
     systemMessage:
       "\x1b[32m✓ MemTree · conversation optimized\x1b[39m\n" +
-      "  https://app.polychat.co/m/bbbbbbbbbbbb",
+      "  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
   });
   assert.equal(queue.claim(stop()), null);
 
@@ -178,7 +178,7 @@ test("trailer follows every finished message, is green once per key, falls back 
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
-        "done\n\n\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/aaaaaaaaaaaa",
+        "done\n\n\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/aaaaaaaaaaaa ↗",
     },
   });
   // Stop after a message carried it: nothing more this turn.
@@ -187,29 +187,29 @@ test("trailer follows every finished message, is green once per key, falls back 
   // Same key on the next message: dim label, still shown.
   assert.equal(
     queue.claim(display({ final: true, delta: "again" })).hookSpecificOutput.displayContent,
-    "again\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/aaaaaaaaaaaa"
+    "again\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/aaaaaaaaaaaa ↗"
   );
   assert.equal(queue.claim(stop()), null);
 
   // A turn that renders no message: Stop carries the trailer, once.
   link = { key: "index-b", link: "https://app.polychat.co/m/bbbbbbbbbbbb" };
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/bbbbbbbbbbbb",
+    systemMessage: "\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
   });
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb",
+    systemMessage: "\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
   });
 
   // With a success line on the same (single-flush) message: line, answer, trailer.
   queue.queuePrefix("✓ ok");
   assert.equal(
     queue.claim(display({ final: true, delta: "answer" })).hookSpecificOutput.displayContent,
-    "\x1b[32m✓ ok\x1b[39m\nanswer\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb"
+    "\x1b[32m✓ ok\x1b[39m\nanswer\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗"
   );
   // Delta ending in a newline gets no extra separator before the blank line.
   assert.equal(
     queue.claim(display({ final: true, delta: "text\n" })).hookSpecificOutput.displayContent,
-    "text\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb"
+    "text\n\n\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗"
   );
 
   // Other sessions, subagents, a throwing resolver, no resolver: nothing.
@@ -229,16 +229,16 @@ test("trailer note follows the bare link, dim", () => {
   queue.setTrailer(() => link, "message");
   assert.equal(
     queue.claim(display({ final: true, delta: "a" })).hookSpecificOutput.displayContent,
-    "a\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1"
+    "a\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1 ↗"
   );
   assert.equal(
     queue.claim(display({ final: true, delta: "b" })).hookSpecificOutput.displayContent,
-    "b\n\n\x1b[2m• MemTree\x1b[22m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1"
+    "b\n\n\x1b[2m• MemTree\x1b[22m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1 ↗"
   );
   link = { key: "k1", link: "https://x/m/2" };
   assert.equal(
     queue.claim(display({ final: true, delta: "c" })).hookSpecificOutput.displayContent,
-    "c\n\n\x1b[2m• MemTree\x1b[22m\n  https://x/m/2",
+    "c\n\n\x1b[2m• MemTree\x1b[22m\n  https://x/m/2 ↗",
     "no note once the turn compressed"
   );
 });
@@ -247,10 +247,10 @@ test("trailer placement 'stop' shows it once per turn on Stop only", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, false);
   queue.setTrailer(() => ({ key: "k", link: "https://x/m/1" }), "stop");
   assert.equal(queue.claim(display({ final: true })), null);
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1 ↗" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1 ↗" });
   queue.queueSuffix("⚠ warn");
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1" });
+  assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1 ↗" });
 });
 
 test("subagent hooks cannot claim and expired notices are dropped", () => {
@@ -485,7 +485,7 @@ test("a finder key replacing a source hash must not repeat the same success URL 
   queue.setLink(() => link);
   queue.setTrailer(() => link, "turn");
   queue.queuePrefix("optimized");
-  assert.match(queue.claim(display()).hookSpecificOutput.displayContent, /https:\/\/x\/page\n\nanswer/);
+  assert.match(queue.claim(display()).hookSpecificOutput.displayContent, /https:\/\/x\/page ↗\n\nanswer/);
   link = { ...link, key: "request-v3-own" };
   assert.equal(queue.claim(stop()), null);
   link = { key: "different-tree", link: "https://x/new-page" };
@@ -530,3 +530,52 @@ test("a pinned spelling of the same MemTree page does not repeat at Stop", () =>
   // It may still be announced on a later turn; only this turn's duplicate is suppressed.
   assert.match(queue.claim(stop()).systemMessage, /v3-own/);
 });
+
+/**
+ * Whether a hook's rendered text leaves a URL open at its end or glued to the
+ * next character: as the terminal sees it after Claude Code trims trailing
+ * whitespace, with styling and OSC 8 wrappers removed. A bare URL ending the
+ * output once ran into Claude Code's prompt border (`…/m/<id>────❯`).
+ */
+function urlLeftOpen(text) {
+  const plain = text
+    .replace(/\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .trimEnd();
+  if (/https?:\/\/\S+$/.test(plain)) return true;
+  return [...plain.matchAll(/https?:\/\/[^\s]+/g)].some((m) => !/\/[A-Za-z0-9-]+$/.test(m[0]));
+}
+
+for (const color of [false, true]) {
+  test(`no link notice ends with a URL or glues one to what follows (${color ? "color" : "NO_COLOR"})`, async () => {
+    const { recapLinkText, compressedNoticeText, memtreeTrailerText } = await import("../dist/notices.js");
+    const { linkLines, URL_END } = await import("../dist/hooks.js");
+    const url = "https://app.polychat.co/m/QcKOo5mtvgAp-s";
+    const rendered = [];
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    let link = { key: "a", link: url, note: "/memtree-compact to compact session" };
+    queue.setLink(() => link);
+    queue.setTrailer(() => link, "message");
+    // Success line (display, then Stop), newest-tree trailer under a message, Stop trailer.
+    queue.queuePrefix("✓ MemTree · conversation optimized");
+    rendered.push(queue.claim(display({ delta: "" })).hookSpecificOutput.displayContent);
+    link = { key: "b", link: "https://app.polychat.co/m/3nekuyfuvKX8" };
+    queue.queuePrefix("✓ MemTree · conversation optimized");
+    rendered.push(queue.claim(stop()).systemMessage);
+    link = { key: "c", link: url };
+    rendered.push(queue.claim(display({ final: true, delta: "" })).hookSpecificOutput.displayContent);
+    link = { key: "d", link: "https://app.polychat.co/m/3nekuyfuvKX8" };
+    queue.setTrailer(() => link, "stop");
+    rendered.push(queue.claim(stop()).systemMessage);
+    rendered.push(queue.resumeLine({ key: "e", link: url }, "session-1"));
+    rendered.push(recapLinkText(url, 0), compressedNoticeText(url), memtreeTrailerText(url));
+    rendered.push(linkLines("• MemTree", `\x1b]8;;${url}\x1b\\${url}\x1b]8;;\x1b\\`));
+    for (const text of rendered) {
+      assert.ok(text.includes("https://"), text);
+      assert.equal(urlLeftOpen(text), false, JSON.stringify(text));
+      assert.ok(!text.trimEnd().endsWith(url), JSON.stringify(text));
+    }
+    assert.equal(URL_END, " ↗");
+    assert.equal(urlLeftOpen(`• MemTree\n  ${url}\n`), true, "the bug: a bare URL ends the output");
+  });
+}
