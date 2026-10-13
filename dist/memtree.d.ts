@@ -34,6 +34,8 @@ export interface MemtreeOptions {
     baseUrl: string;
     apiKey: string;
     compressTimeoutMs?: number;
+    /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
+    longCompressTimeoutMs?: number;
     debug?: boolean;
     /** Always-on JSONL diagnostics; every MemTree call logs one line. */
     reqlog?: RequestLogSink;
@@ -95,6 +97,12 @@ export interface CompressRequestMeta {
     sessionId?: string;
     /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */
     clientMeta?: Record<string, string>;
+    /**
+     * This call's abort budget, when it is not the normal one (the proxy's long
+     * budget). Not part of the cache key; a call joining one in flight shares
+     * that call's budget.
+     */
+    timeoutMs?: number;
 }
 export interface CompressResult {
     /** Processed (compressed) messages from the server; system role may be included. */
@@ -270,11 +278,19 @@ export declare class MemtreeClient {
     private baseUrl;
     private apiKey;
     private compressTimeoutMs;
+    private longCompressTimeoutMs;
     private debug;
     private reqlog;
     private memtreeTools;
     /** Complete compression request key → in-flight/settled promise (retry dedupe). */
     private compressCache;
+    /**
+     * Session + history identity → its compress still in flight, with the size
+     * hint it sent. A Claude Code retry joins it when that call is at least as
+     * forcing (see joinableInFlight), even though the complete key differs; the
+     * entry is dropped when the call settles.
+     */
+    private readonly inFlightCompress;
     /** When a cached compress result stops answering (expireCompressResult). */
     private readonly compressExpiry;
     private readonly compressResultKeys;
@@ -308,6 +324,8 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** The budget for a compress with nothing else to send (no fallback). */
+    get longCompressBudgetMs(): number;
     /** Change the `x-memtree-tools` value for later calls (undefined: none). */
     setMemtreeTools(value: string | undefined): void;
     /**
@@ -412,6 +430,21 @@ export declare class MemtreeClient {
      */
     drainBackground(timeoutMs?: number): Promise<boolean>;
     private compressKey;
+    /**
+     * Identity for joining an in-flight compress: session, history, window,
+     * model and requested target/threshold — everything but the size hint, which
+     * a retry may measure differently. Sessionless calls never join here.
+     */
+    private inFlightKey;
+    /**
+     * The same request's compress still in flight, when it is at least as
+     * forcing as this one: this call sends no size hint, or one no larger than
+     * the running call's. A newly counted hint never joins an unhinted call,
+     * whose server verdict may be a passthrough the hint exists to prevent.
+     */
+    private joinableInFlight;
+    /** Bounded like the result cache; settling removes the entry (compress). */
+    private rememberInFlight;
     private remember;
     private callContextMemory;
     private log;

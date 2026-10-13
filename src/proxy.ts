@@ -154,6 +154,8 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 // Long enough that a real outage costs one stall, short enough that a
 // transient blip does not disable recovery for a working session.
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
+/** Safety cap on a long-budget compress, should a transport ignore its abort. */
+const MAX_LONG_COMPRESS_WAIT_MS = 10 * 60_000;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -1889,6 +1891,8 @@ async function handleMessages(
               retryAtTokens:
                 plan.estimateTokens +
                 Math.floor(plan.budgetTokens * TOOL_COMPACTION_RETRY_BUDGET_RATIO),
+              longBudget: !plan.fallback &&
+                knownOverWindow(requestSizing, originalCandidate, sizingLimits()),
             }).finally(() => {
               recoveryAttempt.inFlight = false;
             })
@@ -2268,6 +2272,10 @@ async function handleMessages(
         : edge?.kind === "off"
           ? { compaction: {} }
           : {}),
+      // Riding the old prefix, or sending a raw request that fits, keeps the
+      // short budget; with neither, a timeout could only end in a refusal.
+      longBudget: !(edge?.kind === "compress" && edge.fallback) &&
+        knownOverWindow(requestSizing, forwardCandidate, sizingLimits()),
     });
   } catch {
     const kept = rideOldPrefix(false);
@@ -4122,6 +4130,11 @@ async function runBlockingCompression(args: {
    * Omitted: laneCompaction's (never a bare forcing target).
    */
   compaction?: { target?: number; threshold?: number };
+  /**
+   * Nothing else could be sent if this compress fails (no prefix to ride, raw
+   * request known over the window): use the long budget. See longCompressFor.
+   */
+  longBudget?: boolean;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
@@ -4134,6 +4147,8 @@ async function runBlockingCompression(args: {
       : undefined;
   const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
   const compressStarted = Date.now();
+  const budgetMs = args.longBudget
+    ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetMs;
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
     // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -4162,6 +4177,7 @@ async function runBlockingCompression(args: {
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
     ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
+    ...(args.longBudget ? { timeoutMs: budgetMs } : {}),
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -4173,8 +4189,8 @@ async function runBlockingCompression(args: {
   // compress() maps every failure to a resolved null (it never rejects).
   // Keep foreground work finite even if a transport ignores its abort signal.
   let deadline: ReturnType<typeof setTimeout> | undefined;
-  const maximumWait = Math.min(30_000, Math.max(1,
-    Number.isFinite(opts.memtree.compressBudgetMs) ? opts.memtree.compressBudgetMs : 15_000));
+  const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : 30_000,
+    Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
   const result = await Promise.race([
     opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta),
     new Promise<null>((resolve) => { deadline = setTimeout(() => resolve(null), maximumWait); }),
@@ -4198,7 +4214,7 @@ async function runBlockingCompression(args: {
     // Budget-consumed heuristic: the client maps every failure to null, so a
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
-    timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
+    timedOut: result === null && compressMs >= budgetMs,
   };
   return {
     result,
@@ -4297,6 +4313,8 @@ async function recoverToolRouteMiss(args: {
   fallback?: ToolRide;
   /** The lane's backoff size, set when the attempt produces no prefix. */
   retryAtTokens?: number;
+  /** No fallback can be sent: compress on the long budget. */
+  longBudget?: boolean;
 }): Promise<void> {
   const {
     opts,
@@ -4418,6 +4436,7 @@ async function recoverToolRouteMiss(args: {
       sizing: args.sizing,
       inputCandidate: args.inputCandidate,
       ...(args.compaction ? { compaction: args.compaction } : {}),
+      longBudget: args.longBudget === true,
     });
   } catch {
     releaseOwnReservation();
@@ -4904,6 +4923,18 @@ async function selectForwardCandidate(args: {
         ? "bytes-fallback-fits-window" : "estimate-fits-window" };
   }
   return changed ? candidate.body : intended;
+}
+
+/**
+ * Whether `candidate` is known not to fit the window: an exact Count Tokens
+ * result or a calibrated estimate over it even with the relaxed output floor.
+ * A bytes/4 guess is not knowledge, so it keeps the short compress budget.
+ */
+function knownOverWindow(
+  sizing: RequestSizing, candidate: RequestCandidate, limits: SizingLimits
+): boolean {
+  const size = sizing.plan(candidate);
+  return size.source === "reported" && !fitsNative(size.tokens, limits);
 }
 
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */

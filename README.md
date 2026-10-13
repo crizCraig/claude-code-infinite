@@ -214,6 +214,14 @@ If counting an assembled compressed prefix discovers that it is over budget,
 whether to forward or refuse it. The request log records that decision under
 `lateCountRecovery.outcome` as `compressed`, `forwarded`, or `refused`.
 
+A blocking compression call normally gets 15 seconds; when it fails, the request
+goes out on the old prefix or whole. When there is neither (no compressed prefix
+to ride, as on the first turn after `--resume`, and a whole request counted or
+calibrated over the window), the call gets 120 seconds instead, since a timeout
+could only end in a refusal. `CCC_COMPRESS_TIMEOUT_MS` overrides both. A Claude
+Code retry that arrives while the same session's compression of the same history
+is running waits for that call instead of starting another.
+
 Before publishing a release, verify Claude subscription OAuth counting in a live
 session: launch this checkout's `node dist/cli.js --resume` with the normal Claude
 subscription login and resume a large conversation. After sending a turn, inspect
