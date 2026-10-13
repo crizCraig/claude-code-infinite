@@ -110,6 +110,14 @@ export const MEMTREE_MCP_INSTRUCTIONS =
 
 const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
 
+/**
+ * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
+ * first turn, not deferred behind tool search. ccc's own --mcp-config also sets
+ * the server's `alwaysLoad`; this covers caller-supplied configs too (the
+ * recall probe, `ccc memtree-mcp`).
+ */
+export const MEMTREE_TOOL_META = { "anthropic/alwaysLoad": true } as const;
+
 export const MEMTREE_TOOLS = [
   {
     name: "search",
@@ -186,7 +194,7 @@ export const MEMTREE_TOOLS = [
       },
     },
   },
-];
+].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
 
 export interface MemtreeMcpDeps {
   /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */

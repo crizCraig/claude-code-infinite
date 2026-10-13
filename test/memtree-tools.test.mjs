@@ -466,6 +466,8 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
     "list",
   ]);
   assert.equal(list.result.tools, MEMTREE_TOOLS);
+  // Non-deferred even under a caller-supplied --mcp-config without alwaysLoad.
+  for (const t of list.result.tools) assert.equal(t._meta?.["anthropic/alwaysLoad"], true, t.name);
 
   const call = (name, args) =>
     handleMcpMessage({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }, tree);
