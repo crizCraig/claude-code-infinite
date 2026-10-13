@@ -96,6 +96,8 @@ export interface UsageRecord {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   output_tokens?: number;
+  /** Server tool calls (e.g. web_search_requests); their results count as input. */
+  server_tool_use?: Record<string, number>;
 }
 
 /**
@@ -548,6 +550,16 @@ function mergeUsage(usage: unknown, rec: MessagesRecord): void {
     rec.usage = rec.usage ?? {};
     rec.usage[field] = value;
   }
+  const serverTools = serverToolUse((usage as Record<string, unknown>).server_tool_use);
+  if (serverTools) (rec.usage ??= {}).server_tool_use = serverTools;
+}
+
+/** The numeric counts of a usage `server_tool_use` object, if it has any. */
+function serverToolUse(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const counts = Object.entries(value as Record<string, unknown>)
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number");
+  return counts.length ? Object.fromEntries(counts) : undefined;
 }
 
 /** Startup size protection: one rotation slot, old .1 is overwritten. */

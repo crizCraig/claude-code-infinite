@@ -949,7 +949,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         },
     }, state.countTokensCooldowns);
     const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
-    const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey);
+    if (carriesServerTools(body))
+        serverToolRecords.add(rec);
+    const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey, body.model);
     const originalCandidate = requestSizing.register(rawBody, "original", sizeSlot.get());
     const forwardCandidate = requestSizing.register(forwardBody, "original", sizeSlot.get());
     candidateSizeOwners.set(originalCandidate, sizeSlot);
@@ -1298,7 +1300,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (toolRide)
                 noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
             else {
-                noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, rec, sendBody.length);
+                noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec, sendBody.length);
             }
         }));
     }
@@ -1537,7 +1539,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     const sendingWhole = () => { requestSendPolicies.get(req).failedRebuild = true; };
     const noteWholeSize = () => {
         if (isMainRequest)
-            notePassthroughSize(state, sessionId, rec, forwardBody.length);
+            notePassthroughSize(state, sessionId, body.model, rec, forwardBody.length);
     };
     // The complete request upload can outlive its downstream subscriber while
     // MemTree compression is in flight. Track that subscriber locally without
@@ -1588,7 +1590,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
             .then((delivered) => {
             if (isMainRequest)
-                notePassthroughSize(state, sessionId, rec, rawBody.length);
+                notePassthroughSize(state, sessionId, body.model, rec, rawBody.length);
             if (delivered)
                 markMainPromptDelivered();
         }));
@@ -2441,11 +2443,31 @@ function notePrefixSize(prefix, rec, bytes) {
     prefix.lastSize = sample;
 }
 /** Record the reported size of a main-thread request forwarded whole. */
-function notePassthroughSize(state, sessionId, rec, bytes) {
+function notePassthroughSize(state, sessionId, model, rec, bytes) {
     const sample = reportedSample(rec, bytes);
     if (sessionId === undefined || sample === undefined)
         return;
-    boundedSet(state.passthroughSizes, sessionId, sample);
+    boundedSet(state.passthroughSizes, sessionSizeKey(sessionId, model), sample);
+}
+/** Key of a main-thread size sample (ProxyState.passthroughSizes). */
+function sessionSizeKey(sessionId, model) {
+    return JSON.stringify([sessionId, typeof model === "string" ? model : null]);
+}
+/** Requests whose reported input includes server-injected tool results. */
+const serverToolRecords = new WeakSet();
+/**
+ * Whether the request offers server tools (web search, web fetch, code
+ * execution, tool search): their results are added to the input server-side,
+ * so the reported size says nothing about the body's bytes.
+ */
+function carriesServerTools(body) {
+    return Array.isArray(body.tools) && body.tools.some((tool) => typeof tool?.type === "string" && SERVER_TOOL_TYPE.test(tool.type));
+}
+const SERVER_TOOL_TYPE = /^(web_search|web_fetch|code_execution|tool_search_tool)_/;
+/** Whether the response reports any server tool use (server_tool_use counts). */
+function usedServerTools(rec) {
+    const used = rec.usage?.server_tool_use;
+    return !!used && Object.values(used).some((count) => count > 0);
 }
 /**
  * The size Anthropic reported for a body of `bytes`, if it can describe one:
@@ -2454,6 +2476,8 @@ function notePassthroughSize(state, sessionId, rec, bytes) {
  */
 function reportedSample(rec, bytes) {
     if (changedDeliveryRecords.has(rec))
+        return undefined;
+    if (serverToolRecords.has(rec) || usedServerTools(rec))
         return undefined;
     const tokens = reportedInputTokens(rec);
     if (tokens === undefined)
@@ -2474,15 +2498,16 @@ function laneSizeKey(req, routeKey, model) {
     ]);
 }
 /** The session's passthrough size on the main thread, else the lane's. */
-function wholeRequestSizeSlot(state, isMainRequest, sessionId, sizeKey) {
+function wholeRequestSizeSlot(state, isMainRequest, sessionId, sizeKey, model) {
     const main = isMainRequest && sessionId !== undefined;
+    const mainKey = main ? sessionSizeKey(sessionId, model) : "";
     return {
-        get: () => (main ? state.passthroughSizes.get(sessionId) : state.laneSizes.get(sizeKey)),
+        get: () => (main ? state.passthroughSizes.get(mainKey) : state.laneSizes.get(sizeKey)),
         set: (sample) => {
             if (!plausibleSample(sample))
                 return;
             if (main)
-                boundedSet(state.passthroughSizes, sessionId, sample);
+                boundedSet(state.passthroughSizes, mainKey, sample);
             else
                 boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
         },
@@ -2494,9 +2519,9 @@ const noteRideSize = notePrefixSize;
  * Record the reported size of a request forwarded whole: the session's
  * passthrough size on the main thread, else its lane's.
  */
-function noteWholeRequestSize(state, isMainRequest, sessionId, sizeKey, rec, bytes) {
+function noteWholeRequestSize(state, isMainRequest, sessionId, sizeKey, model, rec, bytes) {
     if (isMainRequest && sessionId !== undefined) {
-        notePassthroughSize(state, sessionId, rec, bytes);
+        notePassthroughSize(state, sessionId, model, rec, bytes);
         return;
     }
     const sample = reportedSample(rec, bytes);
@@ -2669,7 +2694,7 @@ function planToolCompaction(args) {
     const sample = ride
         ? ride.sizeHolder.lastSize
         : stableLane
-            ? state.passthroughSizes.get(sessionId)
+            ? state.passthroughSizes.get(sessionSizeKey(sessionId, body.model))
             : state.laneSizes.get(args.sizeKey);
     const candidate = args.sizing.register(ride?.raw ?? forwardBody, ride ? "ride" : "original", sample);
     if (ride)
@@ -3238,7 +3263,7 @@ async function recoverToolRouteMiss(args) {
         capture(opts, "anthropic-request", args.originalBody);
         return forwardRaw(req, res, args.originalBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
             toolForwarding.settle(delivered);
-            noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, rec, args.originalBody.length);
+            noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, body.model, rec, args.originalBody.length);
         });
     };
     // Same downstream-close tracking as the followup path: compression

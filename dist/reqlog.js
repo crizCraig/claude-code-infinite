@@ -132,6 +132,17 @@ function mergeUsage(usage, rec) {
         rec.usage = rec.usage ?? {};
         rec.usage[field] = value;
     }
+    const serverTools = serverToolUse(usage.server_tool_use);
+    if (serverTools)
+        (rec.usage ??= {}).server_tool_use = serverTools;
+}
+/** The numeric counts of a usage `server_tool_use` object, if it has any. */
+function serverToolUse(value) {
+    if (!value || typeof value !== "object")
+        return undefined;
+    const counts = Object.entries(value)
+        .filter((entry) => typeof entry[1] === "number");
+    return counts.length ? Object.fromEntries(counts) : undefined;
 }
 /** Startup size protection: one rotation slot, old .1 is overwritten. */
 function rotateIfLarge(path) {

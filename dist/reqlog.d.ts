@@ -74,6 +74,8 @@ export interface UsageRecord {
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
     output_tokens?: number;
+    /** Server tool calls (e.g. web_search_requests); their results count as input. */
+    server_tool_use?: Record<string, number>;
 }
 /**
  * One /v1/messages request through the proxy. Built up mutably as the request

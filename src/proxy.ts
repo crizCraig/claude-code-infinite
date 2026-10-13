@@ -450,12 +450,14 @@ interface ProxyState {
    * size estimate.
    */
   serverReportsBudget: boolean;
-  /**
-   * Per session: Anthropic's reported size of the last main-thread request
-   * forwarded whole (no prefix), with its body bytes, to estimate the next
-   * one while the session is still passing through.
-   */
   countTokensCooldowns: CountTokensCooldowns;
+  /**
+   * Per session and model (sessionSizeKey): Anthropic's reported size of the
+   * last main-thread request forwarded whole (no prefix), with its body bytes,
+   * to estimate the next one while the session is still passing through. The
+   * model is part of the key because the ratio is its tokenizer's: a Haiku
+   * side request on the main lane once replaced the Opus sample (2026-10-13).
+   */
   passthroughSizes: Map<string, SizeSample>;
   /**
    * The same for requests other than the main thread's (subagents), keyed by
@@ -1575,7 +1577,9 @@ async function handleMessages(
     },
   }, state.countTokensCooldowns);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
-  const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey);
+  if (carriesServerTools(body)) serverToolRecords.add(rec);
+  const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey,
+    body.model);
   const originalCandidate = requestSizing.register(rawBody, "original", sizeSlot.get());
   const forwardCandidate = requestSizing.register(forwardBody, "original", sizeSlot.get());
   candidateSizeOwners.set(originalCandidate, sizeSlot);
@@ -1947,7 +1951,8 @@ async function handleMessages(
         toolForwarding.settle(delivered);
         if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
         else {
-          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, rec, sendBody.length);
+          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec,
+            sendBody.length);
         }
       })
     );
@@ -2249,7 +2254,7 @@ async function handleMessages(
   /** A main request about to go out whole: size it and drop any stale prefix. */
   const sendingWhole = () => { requestSendPolicies.get(req)!.failedRebuild = true; };
   const noteWholeSize = () => {
-    if (isMainRequest) notePassthroughSize(state, sessionId, rec, forwardBody.length);
+    if (isMainRequest) notePassthroughSize(state, sessionId, body.model, rec, forwardBody.length);
   };
 
   // The complete request upload can outlive its downstream subscriber while
@@ -2301,7 +2306,7 @@ async function handleMessages(
     return logged(
       forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
         .then((delivered) => {
-          if (isMainRequest) notePassthroughSize(state, sessionId, rec, rawBody.length);
+          if (isMainRequest) notePassthroughSize(state, sessionId, body.model, rec, rawBody.length);
           if (delivered) markMainPromptDelivered();
         })
     );
@@ -3401,12 +3406,39 @@ function notePrefixSize(prefix: SizeHolder, rec: MessagesRecord, bytes: number):
 function notePassthroughSize(
   state: ProxyState,
   sessionId: string | undefined,
+  model: unknown,
   rec: MessagesRecord,
   bytes: number
 ): void {
   const sample = reportedSample(rec, bytes);
   if (sessionId === undefined || sample === undefined) return;
-  boundedSet(state.passthroughSizes, sessionId, sample);
+  boundedSet(state.passthroughSizes, sessionSizeKey(sessionId, model), sample);
+}
+
+/** Key of a main-thread size sample (ProxyState.passthroughSizes). */
+function sessionSizeKey(sessionId: string, model: unknown): string {
+  return JSON.stringify([sessionId, typeof model === "string" ? model : null]);
+}
+
+/** Requests whose reported input includes server-injected tool results. */
+const serverToolRecords = new WeakSet<MessagesRecord>();
+
+/**
+ * Whether the request offers server tools (web search, web fetch, code
+ * execution, tool search): their results are added to the input server-side,
+ * so the reported size says nothing about the body's bytes.
+ */
+function carriesServerTools(body: Record<string, any>): boolean {
+  return Array.isArray(body.tools) && body.tools.some((tool: any) =>
+    typeof tool?.type === "string" && SERVER_TOOL_TYPE.test(tool.type));
+}
+
+const SERVER_TOOL_TYPE = /^(web_search|web_fetch|code_execution|tool_search_tool)_/;
+
+/** Whether the response reports any server tool use (server_tool_use counts). */
+function usedServerTools(rec: MessagesRecord): boolean {
+  const used = rec.usage?.server_tool_use;
+  return !!used && Object.values(used).some((count) => count > 0);
 }
 
 /**
@@ -3416,6 +3448,7 @@ function notePassthroughSize(
  */
 function reportedSample(rec: MessagesRecord, bytes: number): SizeSample | undefined {
   if (changedDeliveryRecords.has(rec)) return undefined;
+  if (serverToolRecords.has(rec) || usedServerTools(rec)) return undefined;
   const tokens = reportedInputTokens(rec);
   if (tokens === undefined) return undefined;
   const sample = { tokens, forwardedBytes: bytes };
@@ -3447,14 +3480,16 @@ function wholeRequestSizeSlot(
   state: ProxyState,
   isMainRequest: boolean,
   sessionId: string | undefined,
-  sizeKey: string
+  sizeKey: string,
+  model: unknown
 ): SizeSlot {
   const main = isMainRequest && sessionId !== undefined;
+  const mainKey = main ? sessionSizeKey(sessionId!, model) : "";
   return {
-    get: () => (main ? state.passthroughSizes.get(sessionId!) : state.laneSizes.get(sizeKey)),
+    get: () => (main ? state.passthroughSizes.get(mainKey) : state.laneSizes.get(sizeKey)),
     set: (sample) => {
       if (!plausibleSample(sample)) return;
-      if (main) boundedSet(state.passthroughSizes, sessionId!, sample);
+      if (main) boundedSet(state.passthroughSizes, mainKey, sample);
       else boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
     },
   };
@@ -3472,11 +3507,12 @@ function noteWholeRequestSize(
   isMainRequest: boolean,
   sessionId: string | undefined,
   sizeKey: string,
+  model: unknown,
   rec: MessagesRecord,
   bytes: number
 ): void {
   if (isMainRequest && sessionId !== undefined) {
-    notePassthroughSize(state, sessionId, rec, bytes);
+    notePassthroughSize(state, sessionId, model, rec, bytes);
     return;
   }
   const sample = reportedSample(rec, bytes);
@@ -3744,7 +3780,7 @@ function planToolCompaction(args: {
   const sample = ride
     ? ride.sizeHolder.lastSize
     : stableLane
-      ? state.passthroughSizes.get(sessionId!)
+      ? state.passthroughSizes.get(sessionSizeKey(sessionId!, body.model))
       : state.laneSizes.get(args.sizeKey);
   const candidate = args.sizing.register(ride?.raw ?? forwardBody,
     ride ? "ride" : "original", sample);
@@ -4481,7 +4517,8 @@ async function recoverToolRouteMiss(args: {
       rec
     ).then((delivered) => {
       toolForwarding.settle(delivered);
-      noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, rec, args.originalBody.length);
+      noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, body.model, rec,
+        args.originalBody.length);
     });
   };
 
