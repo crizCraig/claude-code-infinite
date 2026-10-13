@@ -3095,6 +3095,51 @@ test("/memtree-view is answered by the hook and blocked, without touching turn s
   }
 });
 
+for (const color of [false, true]) {
+test(`ccc commands typed in a subagent's view are answered, never left to the fallback (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const inAgent = (prompt) =>
+    postHook(proxy, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "session-1",
+      agent_id: "agent-1",
+      prompt,
+      prompt_id: "p-agent",
+    });
+  const osc8 = /\x1b\]8;;[^\x1b]*\x1b\\/g;
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
+    const shown = await inAgent("/ccc:memtree-view");
+    assert.deepEqual({ ...shown.body, reason: shown.body.reason.replace(osc8, "") }, {
+      decision: "block",
+      reason: `• MemTree\n  ${PAGE_URL_1} ↗\n(main session's page; subagent pages aren't linked yet)`,
+      hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
+    });
+    assert.equal((await inAgent("/memtree-view")).body.decision, "block");
+
+    const compact = await inAgent("/ccc:memtree-compact 100k");
+    assert.equal(compact.body.decision, "block");
+    assert.equal(compact.body.reason, "• MemTree · MemTree compact applies to the main session only.");
+    // Nothing was armed for the main session.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postMessages(proxy.port, followupTurn("turn three"), { "x-claude-code-session-id": "session-1" });
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).at(-1).compression_target_tokens, undefined);
+
+    // An ordinary subagent prompt is still not answered.
+    assert.equal((await inAgent("look at /memtree-view")).status, 204);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
+
 test("/memtree-compact compacts the session's next message to its target (default half the budget)", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));

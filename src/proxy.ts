@@ -1227,15 +1227,15 @@ async function handleNoticeHook(
     // `/memtree-view`: answered here and blocked, so no model turn runs and
     // the prompt never enters the conversation. Not a human turn either, so
     // none of the turn state below is touched.
-    if (parsed.agent_id === undefined) {
-      // `/memtree-view` waits briefly for the newest tree; a prompt only warms it.
-      if (isMemtreeViewCommand(parsed.prompt)) await state.newestTrees?.settle(parsed.session_id);
-      else state.newestTrees?.peek(parsed.session_id);
-    }
+    // `/memtree-view` waits briefly for the newest tree; a prompt only warms it.
+    // In a subagent's view the command is answered too (with the main
+    // session's page): unanswered, the plugin's fallback body would run.
+    if (isMemtreeViewCommand(parsed.prompt)) await state.newestTrees?.settle(parsed.session_id);
+    else if (parsed.agent_id === undefined) state.newestTrees?.peek(parsed.session_id);
     const commandReply =
       parsed.agent_id === undefined
         ? sessionCommandReply(state, parsed.session_id, parsed.prompt)
-        : undefined;
+        : subagentCommandReply(state, parsed.session_id, parsed.prompt);
     if (commandReply !== undefined) {
       const body = Buffer.from(
         JSON.stringify({
@@ -2641,6 +2641,28 @@ function sessionCommandReply(
   state.compactTargets.set(sessionId, target);
   state.compactNow.add(sessionId);
   return `${TRAILER_LABEL} compacting: your next message is sent compressed to about ${Math.round(target / 1000)}k tokens, ${keep}`;
+}
+
+export const SUBAGENT_VIEW_NOTE = "(main session's page; subagent pages aren't linked yet)";
+export const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main session only.";
+
+/**
+ * The reply to a ccc slash command typed in a subagent's view. `sessionId` is
+ * the parent session's: the view shows its page, and compaction (per session)
+ * is refused rather than applied to the main conversation from here.
+ */
+function subagentCommandReply(
+  state: ProxyState,
+  sessionId: string,
+  prompt: string
+): string | undefined {
+  if (isMemtreeViewCommand(prompt)) {
+    return `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
+  }
+  if (sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND) !== undefined) {
+    return `${TRAILER_LABEL} ${SUBAGENT_COMPACT_REPLY}`;
+  }
+  return sessionCommandReply(state, sessionId, prompt);
 }
 
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */

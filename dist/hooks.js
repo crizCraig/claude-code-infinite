@@ -59,7 +59,7 @@ export const MEMTREE_VIEW_COMMAND = "memtree-view";
  * and keep that compressed history until the budget is reached again.
  */
 export const MEMTREE_COMPACT_COMMAND = "memtree-compact";
-const UNAVAILABLE_BODY = "Reply with exactly this one line and nothing else: \"MemTree is not reachable right now; try again in a moment.\"\n";
+const UNAVAILABLE_BODY = "Reply with exactly this one line and nothing else: \"MemTree commands couldn't be answered here (ccc proxy not reached).\"\n";
 /**
  * Listed in the slash-command menu. The proxy answers each one from the
  * UserPromptSubmit hook and blocks it, so no model turn runs; a body only
