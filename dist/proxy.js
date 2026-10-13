@@ -277,6 +277,7 @@ export function startProxy(opts) {
         shutdownSignal: shutdownAbort.signal,
         routeInstallFault: opts.routeInstallFault,
         memtreePages: new Map(),
+        memorySourcePages: new Map(),
         memtreeCallSeq: 0,
         memtreeLinkStore: opts.memtreeLinkStore,
         newestTrees: opts.newestTrees,
@@ -547,7 +548,7 @@ async function handleMemTreeFinder(req, res, opts, upstreamPath, url) {
  */
 async function handleMemTreeCurrent(req, res, opts, state, url) {
     const sessionId = url.searchParams.get("session") || undefined;
-    const page = currentMemtreePage(state, sessionId);
+    const page = currentMemorySourcePage(state, sessionId);
     const id = page ? memtreePageId(page.url) : undefined;
     if (!page || !id) {
         res.writeHead(404, { "content-type": "application/json" });
@@ -579,6 +580,12 @@ async function handleMemTreeCurrent(req, res, opts, state, url) {
     }
 }
 const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+/** The page whose memory is in the prompt, else (none adopted yet) the newest page. */
+function currentMemorySourcePage(state, sessionId) {
+    if (!sessionId)
+        return undefined;
+    return state.memorySourcePages.get(sessionId) ?? currentMemtreePage(state, sessionId);
+}
 function currentMemtreePage(state, sessionId) {
     if (!sessionId)
         return undefined;
@@ -1355,6 +1362,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
         }
         requestSendPolicies.get(req)?.allowed.add(compressedRaw);
+        // A fresh answer's memory is now the prompt's; a ride keeps the prior source.
+        if (result && linkSeq !== undefined)
+            noteMemorySource(state, linkSeq, sessionId, result);
         if (opts.debug) {
             console.error(`[ccc proxy] user turn ${turnType}: ${forwardBody.length} → ` +
                 `${compressedRaw.length} body bytes`);
@@ -1947,12 +1957,30 @@ function noteMemtreePage(state, seq, sessionId, result) {
     // A cached newest tree may predate this page; ask again.
     state.newestTrees?.invalidate(sessionId);
 }
-/** Bound optional page state independently of how many sessions use the proxy. */
+/**
+ * Record a compress answer's page as the source of the memory now forwarded
+ * (memorySourcePages), unless a later-submitted call's memory already is.
+ */
+function noteMemorySource(state, seq, sessionId, result) {
+    const url = result.memtreeUrl;
+    const index = result.memtreeIndex;
+    if (!sessionId || !url || !index)
+        return;
+    const latest = state.memorySourcePages.get(sessionId);
+    if (latest && latest.seq >= seq)
+        return;
+    const page = { sessionId, url, index, compressed: didMemtreeCompress(result), seq };
+    rememberPage(state.memorySourcePages, sessionId, page);
+}
 function rememberMemtreePage(state, sessionId, page) {
-    state.memtreePages.delete(sessionId);
-    state.memtreePages.set(sessionId, page);
-    while (state.memtreePages.size > MEMTREE_LINKS_MAX_SESSIONS) {
-        state.memtreePages.delete(state.memtreePages.keys().next().value);
+    rememberPage(state.memtreePages, sessionId, page);
+}
+/** Bound optional page state independently of how many sessions use the proxy. */
+function rememberPage(pages, sessionId, page) {
+    pages.delete(sessionId);
+    pages.set(sessionId, page);
+    while (pages.size > MEMTREE_LINKS_MAX_SESSIONS) {
+        pages.delete(pages.keys().next().value);
     }
 }
 /**
@@ -3289,6 +3317,8 @@ async function recoverToolRouteMiss(args) {
         console.error(`[ccc proxy] tool-route miss recovered: ${forwardBody.length} → ` +
             `${compressedRaw.length} body bytes`);
     }
+    if (linkSeq !== undefined)
+        noteMemorySource(state, linkSeq, requestSessionId(req), result);
     recordTurn(rec, "tool-recompressed", compressedRaw);
     // Tagged as a TOOL memory leg, not a followup one: capture-based tooling
     // must be able to tell a recovered tool request from a normal compressed
