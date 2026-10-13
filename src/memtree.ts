@@ -39,6 +39,14 @@ export const CLIENT_VERSION: string = createRequire(import.meta.url)(
 // server-side compression — so this is a circuit breaker for a hung server, not a
 // latency target. Override via CCC_COMPRESS_TIMEOUT_MS (read below).
 const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
+/**
+ * The budget for a compress with nothing else to send: no compressed prefix to
+ * ride and a raw request known not to fit the window (the first turn after
+ * `--resume`). A timeout there can only end in a refusal, and a large
+ * session's compress can take 13-24 s. CCC_COMPRESS_TIMEOUT_MS overrides this
+ * too.
+ */
+const DEFAULT_LONG_COMPRESS_TIMEOUT_MS = 120_000;
 /** Indexing runs off the response path; give it room. */
 const INDEX_TIMEOUT_MS = 120_000;
 const DEDUPE_CACHE_MAX = 64;
@@ -55,6 +63,8 @@ export interface MemtreeOptions {
   baseUrl: string;
   apiKey: string;
   compressTimeoutMs?: number;
+  /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
+  longCompressTimeoutMs?: number;
   debug?: boolean;
   /** Always-on JSONL diagnostics; every MemTree call logs one line. */
   reqlog?: RequestLogSink;
@@ -117,6 +127,12 @@ export interface CompressRequestMeta {
   sessionId?: string;
   /** Sent as `x-client-meta`; stored on the usage row. Not part of the cache key. */
   clientMeta?: Record<string, string>;
+  /**
+   * This call's abort budget, when it is not the normal one (the proxy's long
+   * budget). Not part of the cache key; a call joining one in flight shares
+   * that call's budget.
+   */
+  timeoutMs?: number;
 }
 
 export interface CompressResult {
@@ -876,15 +892,29 @@ function clientOverThreshold(meta: CompressRequestMeta | undefined): true | numb
   return meta.clientInputTokens > budget ? true : null;
 }
 
+/** A compress in flight and the size hint it sent (clientInputTokens). */
+interface InFlightCompress {
+  promise: Promise<CompressResult | null>;
+  hint: number | undefined;
+}
+
 export class MemtreeClient {
   private baseUrl: string;
   private apiKey: string;
   private compressTimeoutMs: number;
+  private longCompressTimeoutMs: number;
   private debug: boolean;
   private reqlog: RequestLogSink | undefined;
   private memtreeTools: string | undefined;
   /** Complete compression request key → in-flight/settled promise (retry dedupe). */
   private compressCache = new Map<string, Promise<CompressResult | null>>();
+  /**
+   * Session + history identity → its compress still in flight, with the size
+   * hint it sent. A Claude Code retry joins it when that call is at least as
+   * forcing (see joinableInFlight), even though the complete key differs; the
+   * entry is dropped when the call settles.
+   */
+  private readonly inFlightCompress = new Map<string, InFlightCompress>();
   /** When a cached compress result stops answering (expireCompressResult). */
   private readonly compressExpiry = new Map<string, number>();
   private readonly compressResultKeys = new WeakMap<CompressResult, string>();
@@ -925,6 +955,21 @@ export class MemtreeClient {
    */
   get compressBudgetMs(): number {
     return this.compressTimeoutMs;
+  }
+
+  /**
+   * Non-secret identity of the MemTree backend and account this client uses:
+   * a hash over the origin and a hash of the key. Persisted state is valid only
+   * for the identity that wrote it (prefix-store.ts).
+   */
+  get storageIdentity(): string {
+    const keyHash = createHash("sha256").update(this.apiKey).digest("hex");
+    return createHash("sha256").update(`${this.baseUrl}\n${keyHash}`).digest("hex");
+  }
+
+  /** The budget for a compress with nothing else to send (no fallback). */
+  get longCompressBudgetMs(): number {
+    return this.longCompressTimeoutMs;
   }
 
   /** Change the `x-memtree-tools` value for later calls (undefined: none). */
@@ -968,6 +1013,9 @@ export class MemtreeClient {
     this.compressTimeoutMs =
       opts.compressTimeoutMs ??
       Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
+    this.longCompressTimeoutMs =
+      opts.longCompressTimeoutMs ??
+      Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_LONG_COMPRESS_TIMEOUT_MS);
     this.debug = opts.debug ?? false;
     this.reqlog = opts.reqlog;
     this.memtreeTools = opts.memtreeTools || undefined;
@@ -994,7 +1042,8 @@ export class MemtreeClient {
     modelContextLimit: number,
     meta?: CompressRequestMeta
   ): boolean {
-    return this.liveCompress(this.compressKey(hash, modelContextLimit, meta)) !== undefined;
+    return this.liveCompress(this.compressKey(hash, modelContextLimit, meta)) !== undefined ||
+      this.joinableInFlight(hash, modelContextLimit, meta) !== undefined;
   }
 
   /**
@@ -1039,9 +1088,12 @@ export class MemtreeClient {
     const cacheKey = this.compressKey(hash, modelContextLimit, meta);
     const cached = this.liveCompress(cacheKey);
     if (cached) return cached;
+    const joined = this.joinableInFlight(hash, modelContextLimit, meta);
+    if (joined) return joined;
+    const inFlightKey = this.inFlightKey(hash, modelContextLimit, meta);
 
     const promise = this.callContextMemory(messages, modelContextLimit, {
-      timeoutMs: this.compressTimeoutMs,
+      timeoutMs: meta?.timeoutMs ?? this.compressTimeoutMs,
       signal,
       model: meta?.model,
       tools: meta?.tools,
@@ -1079,10 +1131,14 @@ export class MemtreeClient {
       return null;
     }).then((result) => {
       if (result) this.compressResultKeys.set(result, cacheKey);
+      if (this.inFlightCompress.get(inFlightKey)?.promise === promise) {
+        this.inFlightCompress.delete(inFlightKey);
+      }
       return result;
     });
 
     this.remember(cacheKey, promise);
+    this.rememberInFlight(inFlightKey, { promise, hint: meta?.clientInputTokens });
     return promise;
   }
 
@@ -1315,24 +1371,77 @@ export class MemtreeClient {
     modelContextLimit: number,
     meta?: CompressRequestMeta
   ): string {
-    const model = transmittedModel(meta?.model);
+    return createHash("sha256")
+      .update(JSON.stringify([
+        ...this.requestIdentity(hash, modelContextLimit, meta),
+        clientOverThreshold(meta),
+      ]))
+      .digest("hex");
+  }
+
+  /**
+   * Every transmitted field that can change the server's answer, except the
+   * size hint (clientInputTokens) and the abort budget: the complete key adds
+   * the hint's verdict, and the in-flight join key compares hints itself.
+   */
+  private requestIdentity(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): unknown[] {
     const tools = transmittedTools(meta?.tools);
     const toolsJson = tools === undefined ? "" : JSON.stringify(tools);
-    const toolsHash = createHash("sha256").update(toolsJson).digest("hex");
-    return createHash("sha256")
-      .update(
-        JSON.stringify([
-          hash,
-          meta?.sessionId ?? null,
-          model ?? null,
-          modelContextLimit,
-          toolsHash,
-          meta?.compressionTargetTokens ?? null,
-          meta?.compressionThresholdTokens ?? null,
-          clientOverThreshold(meta),
-        ])
-      )
-      .digest("hex");
+    return [
+      hash,
+      meta?.sessionId ?? null,
+      transmittedModel(meta?.model) ?? null,
+      modelContextLimit,
+      createHash("sha256").update(toolsJson).digest("hex"),
+      meta?.compressionTargetTokens ?? null,
+      meta?.compressionThresholdTokens ?? null,
+    ];
+  }
+
+  /**
+   * Identity for joining an in-flight compress: the complete request identity
+   * minus the size hint, which a retry may measure differently (the join
+   * compares hints itself). Sessionless calls never join here.
+   */
+  private inFlightKey(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): string {
+    if (meta?.sessionId === undefined) return "";
+    return JSON.stringify(this.requestIdentity(hash, modelContextLimit, meta));
+  }
+
+  /**
+   * The same request's compress still in flight, when it is at least as
+   * forcing as this one: this call sends no size hint, or one no larger than
+   * the running call's. A newly counted hint never joins an unhinted call,
+   * whose server verdict may be a passthrough the hint exists to prevent.
+   */
+  private joinableInFlight(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): Promise<CompressResult | null> | undefined {
+    const entry = this.inFlightCompress.get(this.inFlightKey(hash, modelContextLimit, meta));
+    const hint = meta?.clientInputTokens;
+    if (!entry) return undefined;
+    if (hint === undefined) return entry.promise;
+    return entry.hint !== undefined && hint <= entry.hint ? entry.promise : undefined;
+  }
+
+  /** Bounded like the result cache; settling removes the entry (compress). */
+  private rememberInFlight(key: string, entry: InFlightCompress): void {
+    if (key === "") return;
+    this.inFlightCompress.set(key, entry);
+    if (this.inFlightCompress.size > DEDUPE_CACHE_MAX) {
+      const first = this.inFlightCompress.keys().next().value;
+      if (first !== undefined) this.inFlightCompress.delete(first);
+    }
   }
 
   private remember(cacheKey: string, promise: Promise<CompressResult | null>) {

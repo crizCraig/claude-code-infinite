@@ -120,6 +120,7 @@ import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
+import type { PersistedEntry, StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import {
   describeClaudeCodeRequest,
@@ -154,6 +155,8 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 // Long enough that a real outage costs one stall, short enough that a
 // transient blip does not disable recovery for a working session.
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
+/** Safety cap on a long-budget compress, should a transport ignore its abort. */
+const MAX_LONG_COMPRESS_WAIT_MS = 10 * 60_000;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -271,6 +274,12 @@ export interface ProxyOptions {
    * the CLI passes the default store under ~/.claude-code-infinite.
    */
   memtreeLinkStore?: MemtreeLinkStore;
+  /**
+   * Where each session's adopted compressed prefix is persisted so a resumed
+   * session's first turn can ride it (prefix-store.ts). Omitted means no
+   * persistence (tests); the CLI passes the store under ~/.claude-code-infinite.
+   */
+  stablePrefixStore?: StablePrefixStore;
   /**
    * The session's newest completed tree, asked of the server, which the link
    * shown to the user points at (the compress page is only the tree the memory
@@ -396,6 +405,14 @@ interface ProxyState {
   /** Submission counter behind the pages' `seq`. */
   memtreeCallSeq: number;
   memtreeLinkStore?: MemtreeLinkStore;
+  stablePrefixStore?: StablePrefixStore;
+  /**
+   * Session → its persisted prefix as loaded (null: none, or already adopted
+   * or discarded), so the disk is read once per session. Bounded.
+   */
+  storedPrefixLookups: Map<string, PersistedEntry | null>;
+  /** MemtreeClient.storageIdentity: whose persisted prefixes this process may use. */
+  storageOwner?: string;
   newestTrees?: NewestTreeLookup;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
@@ -438,12 +455,14 @@ interface ProxyState {
    * size estimate.
    */
   serverReportsBudget: boolean;
-  /**
-   * Per session: Anthropic's reported size of the last main-thread request
-   * forwarded whole (no prefix), with its body bytes, to estimate the next
-   * one while the session is still passing through.
-   */
   countTokensCooldowns: CountTokensCooldowns;
+  /**
+   * Per session and model (sessionSizeKey): Anthropic's reported size of the
+   * last main-thread request forwarded whole (no prefix), with its body bytes,
+   * to estimate the next one while the session is still passing through. The
+   * model is part of the key because the ratio is its tokenizer's: a Haiku
+   * side request on the main lane once replaced the Opus sample (2026-10-13).
+   */
   passthroughSizes: Map<string, SizeSample>;
   /**
    * The same for requests other than the main thread's (subagents), keyed by
@@ -803,6 +822,10 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     memorySourcePages: new Map(),
     memtreeCallSeq: 0,
     memtreeLinkStore: opts.memtreeLinkStore,
+    stablePrefixStore: opts.stablePrefixStore,
+    storedPrefixLookups: new Map(),
+    storageOwner: typeof opts.memtree.storageIdentity === "string"
+      ? opts.memtree.storageIdentity : undefined,
     newestTrees: opts.newestTrees,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
@@ -1561,7 +1584,9 @@ async function handleMessages(
     },
   }, state.countTokensCooldowns);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
-  const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey);
+  if (carriesServerTools(body)) serverToolRecords.add(rec);
+  const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey,
+    body.model);
   const originalCandidate = requestSizing.register(rawBody, "original", sizeSlot.get());
   const forwardCandidate = requestSizing.register(forwardBody, "original", sizeSlot.get());
   candidateSizeOwners.set(originalCandidate, sizeSlot);
@@ -1572,6 +1597,9 @@ async function handleMessages(
     output: bodyOutputReservation(body),
     recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
   });
+  if (isMainRequest && requestSessionKey !== undefined) {
+    adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
+  }
   const rides = state.memoryRoutes.has(requestRouteKey) ||
     (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
   if (!rides) {
@@ -1889,6 +1917,8 @@ async function handleMessages(
               retryAtTokens:
                 plan.estimateTokens +
                 Math.floor(plan.budgetTokens * TOOL_COMPACTION_RETRY_BUDGET_RATIO),
+              ...(plan.fallback ? {} : { wholeRefused: () =>
+                wholeRequestRefused(requestSizing, originalCandidate, sizingLimits()) }),
             }).finally(() => {
               recoveryAttempt.inFlight = false;
             })
@@ -1928,7 +1958,8 @@ async function handleMessages(
         toolForwarding.settle(delivered);
         if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
         else {
-          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, rec, sendBody.length);
+          noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec,
+            sendBody.length);
         }
       })
     );
@@ -2230,7 +2261,7 @@ async function handleMessages(
   /** A main request about to go out whole: size it and drop any stale prefix. */
   const sendingWhole = () => { requestSendPolicies.get(req)!.failedRebuild = true; };
   const noteWholeSize = () => {
-    if (isMainRequest) notePassthroughSize(state, sessionId, rec, forwardBody.length);
+    if (isMainRequest) notePassthroughSize(state, sessionId, body.model, rec, forwardBody.length);
   };
 
   // The complete request upload can outlive its downstream subscriber while
@@ -2268,6 +2299,10 @@ async function handleMessages(
         : edge?.kind === "off"
           ? { compaction: {} }
           : {}),
+      // Riding the old prefix, or sending a raw request that fits, keeps the
+      // short budget; with neither, a timeout could only end in a refusal.
+      longBudget: !(edge?.kind === "compress" && edge.fallback) &&
+        await wholeRequestRefused(requestSizing, forwardCandidate, sizingLimits()),
     });
   } catch {
     const kept = rideOldPrefix(false);
@@ -2278,7 +2313,7 @@ async function handleMessages(
     return logged(
       forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
         .then((delivered) => {
-          if (isMainRequest) notePassthroughSize(state, sessionId, rec, rawBody.length);
+          if (isMainRequest) notePassthroughSize(state, sessionId, body.model, rec, rawBody.length);
           if (delivered) markMainPromptDelivered();
         })
     );
@@ -2673,6 +2708,8 @@ function sessionCommandReply(
     state.memoryRoutes.delete(JSON.stringify([sessionId, "main"]));
     state.compactNow.delete(sessionId);
     state.stablePrefixes.delete(sessionId);
+    if (state.storageOwner) state.stablePrefixStore?.delete(sessionId, state.storageOwner);
+    state.storedPrefixLookups.set(sessionId, null);
     return `${TRAILER_LABEL} compaction off: the conversation is sent whole, and MemTree compresses only when it outgrows the model's budget.`;
   }
   if (args === "") {
@@ -2997,6 +3034,9 @@ function installMemoryRoute(
     // request carried, and the compressed bytes sent for them. Later requests
     // reuse these bytes unchanged, so the prefix stays a cache read.
     route.stablePrefix = storeStablePrefix(state, sessionId, originalMessages, route, stable);
+    if (route.stablePrefix && key === JSON.stringify([sessionId, "main"])) {
+      persistStablePrefix(state, sessionId, route.stablePrefix);
+    }
   }
   setMemoryRoute(state, key, route);
   state.routeDecisionsLive.set(key, new Set([decisionGeneration]));
@@ -3041,6 +3081,84 @@ function storeStablePrefix(
   boundedSet(state.stablePrefixes, sessionId, prefix);
   state.compactNow.delete(sessionId);
   return prefix;
+}
+
+/**
+ * Persist the main lane's newly adopted prefix with its memory-source page.
+ * Deferred one tick so the page noted right after the install is included,
+ * and skipped when a newer prefix replaced this one meanwhile.
+ */
+function persistStablePrefix(state: ProxyState, sessionId: string, prefix: StablePrefix): void {
+  const store = state.stablePrefixStore;
+  const owner = state.storageOwner;
+  if (!store || !owner) return;
+  state.storedPrefixLookups.set(sessionId, null);
+  setImmediate(() => {
+    if (state.stablePrefixes.get(sessionId) !== prefix) return;
+    const page = state.memorySourcePages.get(sessionId);
+    store.save(sessionId, owner, {
+      originalSystemHash: prefix.originalSystemHash,
+      originalPrefixHashes: prefix.originalPrefixHashes,
+      compressedMessages: prefix.compressedMessages,
+      compressedSystem: prefix.compressedSystem,
+      hasCompressedSystem: prefix.hasCompressedSystem,
+      targetTokens: prefix.targetTokens,
+      explicitTarget: prefix.explicitTarget,
+      modelContextLimit: prefix.modelContextLimit,
+    }, page && { url: page.url, index: page.index, compressed: page.compressed });
+  });
+}
+
+/**
+ * A fresh process's main-lane requests for a session: adopt the session's
+ * persisted prefix when this history passes the checks the in-memory prefix
+ * would (same session, system and covered messages; same window; a routable
+ * body). Only an authoritative main history may discard it: one with the same
+ * system and window, no server tools, and at least the covered length, whose
+ * covered messages differ. Anything else (a side or helper request such as
+ * the Haiku WebSearch call) leaves it for a later request. The disk is read
+ * once per session; the store checks the backend/account owner.
+ */
+function adoptStoredPrefix(
+  opts: ProxyOptions, state: ProxyState, rec: MessagesRecord, sessionId: string,
+  body: Record<string, any>, messages: Message[], modelContextLimit: number
+): void {
+  const { stablePrefixStore: store, storageOwner: owner } = state;
+  if (!store || !owner || state.stablePrefixes.has(sessionId)) return;
+  if (compactionMode(opts, state, sessionId).mode === "off") return;
+  let entry = state.storedPrefixLookups.get(sessionId);
+  if (entry === undefined) {
+    entry = store.load(sessionId, owner) ?? null;
+    boundedSet(state.storedPrefixLookups, sessionId, entry);
+  }
+  if (entry === null) return;
+  const prefix: StablePrefix = { sessionId, ...entry.prefix };
+  const verdict = storedPrefixVerdict(body, messages, prefix, modelContextLimit);
+  if (verdict === "defer") return;
+  state.storedPrefixLookups.set(sessionId, null);
+  if (verdict === "discard") {
+    store.delete(sessionId, owner);
+    rec.storedPrefix = "discarded";
+    return;
+  }
+  boundedSet(state.stablePrefixes, sessionId, prefix);
+  if (entry.source && !state.memorySourcePages.has(sessionId)) {
+    rememberPage(state.memorySourcePages, sessionId, { sessionId, ...entry.source, seq: 0 });
+  }
+  rec.storedPrefix = "adopted";
+}
+
+/** What this request says about a persisted prefix (adoptStoredPrefix). */
+function storedPrefixVerdict(
+  body: Record<string, any>, messages: Message[], prefix: StablePrefix,
+  modelContextLimit: number
+): "adopt" | "discard" | "defer" {
+  if (carriesServerTools(body) || prefix.modelContextLimit !== modelContextLimit) return "defer";
+  const miss = prefixMismatch(body, messages, prefix, prefix.sessionId, stablePrefixMessageHash);
+  if (miss === null) return prefixRoutedBody(body, messages, prefix) ? "adopt" : "defer";
+  const authoritative = miss === "prefix" &&
+    messages.length >= prefix.originalPrefixHashes.length;
+  return authoritative ? "discard" : "defer";
 }
 
 type ForkMiss = NonNullable<MessagesRecord["forkMiss"]>;
@@ -3317,12 +3435,39 @@ function notePrefixSize(prefix: SizeHolder, rec: MessagesRecord, bytes: number):
 function notePassthroughSize(
   state: ProxyState,
   sessionId: string | undefined,
+  model: unknown,
   rec: MessagesRecord,
   bytes: number
 ): void {
   const sample = reportedSample(rec, bytes);
   if (sessionId === undefined || sample === undefined) return;
-  boundedSet(state.passthroughSizes, sessionId, sample);
+  boundedSet(state.passthroughSizes, sessionSizeKey(sessionId, model), sample);
+}
+
+/** Key of a main-thread size sample (ProxyState.passthroughSizes). */
+function sessionSizeKey(sessionId: string, model: unknown): string {
+  return JSON.stringify([sessionId, typeof model === "string" ? model : null]);
+}
+
+/** Requests whose reported input includes server-injected tool results. */
+const serverToolRecords = new WeakSet<MessagesRecord>();
+
+/**
+ * Whether the request offers server tools (web search, web fetch, code
+ * execution, tool search): their results are added to the input server-side,
+ * so the reported size says nothing about the body's bytes.
+ */
+function carriesServerTools(body: Record<string, any>): boolean {
+  return Array.isArray(body.tools) && body.tools.some((tool: any) =>
+    typeof tool?.type === "string" && SERVER_TOOL_TYPE.test(tool.type));
+}
+
+const SERVER_TOOL_TYPE = /^(web_search|web_fetch|code_execution|tool_search_tool)_/;
+
+/** Whether the response reports any server tool use (server_tool_use counts). */
+function usedServerTools(rec: MessagesRecord): boolean {
+  const used = rec.usage?.server_tool_use;
+  return !!used && Object.values(used).some((count) => count > 0);
 }
 
 /**
@@ -3332,6 +3477,7 @@ function notePassthroughSize(
  */
 function reportedSample(rec: MessagesRecord, bytes: number): SizeSample | undefined {
   if (changedDeliveryRecords.has(rec)) return undefined;
+  if (serverToolRecords.has(rec) || usedServerTools(rec)) return undefined;
   const tokens = reportedInputTokens(rec);
   if (tokens === undefined) return undefined;
   const sample = { tokens, forwardedBytes: bytes };
@@ -3363,14 +3509,16 @@ function wholeRequestSizeSlot(
   state: ProxyState,
   isMainRequest: boolean,
   sessionId: string | undefined,
-  sizeKey: string
+  sizeKey: string,
+  model: unknown
 ): SizeSlot {
   const main = isMainRequest && sessionId !== undefined;
+  const mainKey = main ? sessionSizeKey(sessionId!, model) : "";
   return {
-    get: () => (main ? state.passthroughSizes.get(sessionId!) : state.laneSizes.get(sizeKey)),
+    get: () => (main ? state.passthroughSizes.get(mainKey) : state.laneSizes.get(sizeKey)),
     set: (sample) => {
       if (!plausibleSample(sample)) return;
-      if (main) boundedSet(state.passthroughSizes, sessionId!, sample);
+      if (main) boundedSet(state.passthroughSizes, mainKey, sample);
       else boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
     },
   };
@@ -3388,11 +3536,12 @@ function noteWholeRequestSize(
   isMainRequest: boolean,
   sessionId: string | undefined,
   sizeKey: string,
+  model: unknown,
   rec: MessagesRecord,
   bytes: number
 ): void {
   if (isMainRequest && sessionId !== undefined) {
-    notePassthroughSize(state, sessionId, rec, bytes);
+    notePassthroughSize(state, sessionId, model, rec, bytes);
     return;
   }
   const sample = reportedSample(rec, bytes);
@@ -3660,7 +3809,7 @@ function planToolCompaction(args: {
   const sample = ride
     ? ride.sizeHolder.lastSize
     : stableLane
-      ? state.passthroughSizes.get(sessionId!)
+      ? state.passthroughSizes.get(sessionSizeKey(sessionId!, body.model))
       : state.laneSizes.get(args.sizeKey);
   const candidate = args.sizing.register(ride?.raw ?? forwardBody,
     ride ? "ride" : "original", sample);
@@ -4122,6 +4271,11 @@ async function runBlockingCompression(args: {
    * Omitted: laneCompaction's (never a bare forcing target).
    */
   compaction?: { target?: number; threshold?: number };
+  /**
+   * Nothing else could be sent if this compress fails (no prefix to ride, raw
+   * request known over the window): use the long budget. See longCompressFor.
+   */
+  longBudget?: boolean;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
@@ -4134,6 +4288,8 @@ async function runBlockingCompression(args: {
       : undefined;
   const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
   const compressStarted = Date.now();
+  const budgetMs = args.longBudget
+    ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetMs;
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
     // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -4162,6 +4318,7 @@ async function runBlockingCompression(args: {
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
     ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
+    ...(args.longBudget ? { timeoutMs: budgetMs } : {}),
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -4173,8 +4330,8 @@ async function runBlockingCompression(args: {
   // compress() maps every failure to a resolved null (it never rejects).
   // Keep foreground work finite even if a transport ignores its abort signal.
   let deadline: ReturnType<typeof setTimeout> | undefined;
-  const maximumWait = Math.min(30_000, Math.max(1,
-    Number.isFinite(opts.memtree.compressBudgetMs) ? opts.memtree.compressBudgetMs : 15_000));
+  const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : 30_000,
+    Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
   const result = await Promise.race([
     opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta),
     new Promise<null>((resolve) => { deadline = setTimeout(() => resolve(null), maximumWait); }),
@@ -4198,7 +4355,7 @@ async function runBlockingCompression(args: {
     // Budget-consumed heuristic: the client maps every failure to null, so a
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
-    timedOut: result === null && compressMs >= opts.memtree.compressBudgetMs,
+    timedOut: result === null && compressMs >= budgetMs,
   };
   return {
     result,
@@ -4297,6 +4454,11 @@ async function recoverToolRouteMiss(args: {
   fallback?: ToolRide;
   /** The lane's backoff size, set when the attempt produces no prefix. */
   retryAtTokens?: number;
+  /**
+   * Without a ride fallback: whether delivery would refuse the whole request
+   * too, in which case the compress gets the long budget.
+   */
+  wholeRefused?: () => Promise<boolean>;
 }): Promise<void> {
   const {
     opts,
@@ -4387,7 +4549,8 @@ async function recoverToolRouteMiss(args: {
       rec
     ).then((delivered) => {
       toolForwarding.settle(delivered);
-      noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, rec, args.originalBody.length);
+      noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, body.model, rec,
+        args.originalBody.length);
     });
   };
 
@@ -4418,6 +4581,7 @@ async function recoverToolRouteMiss(args: {
       sizing: args.sizing,
       inputCandidate: args.inputCandidate,
       ...(args.compaction ? { compaction: args.compaction } : {}),
+      longBudget: args.wholeRefused ? await args.wholeRefused() : false,
     });
   } catch {
     releaseOwnReservation();
@@ -4906,6 +5070,19 @@ async function selectForwardCandidate(args: {
   return changed ? candidate.body : intended;
 }
 
+/**
+ * Whether delivery would refuse `candidate` sent whole: it is planned over the
+ * window, and the measurement selection would use (an exact count, else the
+ * same estimate or bytes/4 fallback) does not fit either. Only then is there
+ * no fallback, and only then may a compress take the long budget.
+ */
+async function wholeRequestRefused(
+  sizing: RequestSizing, candidate: RequestCandidate, limits: SizingLimits
+): Promise<boolean> {
+  if (fitsNative(sizing.plan(candidate).tokens, limits)) return false;
+  return !fitsMeasured(await sizing.measure(candidate, limits), limits);
+}
+
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(
   args: { state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
@@ -4963,6 +5140,8 @@ function noteSelectedCandidateSize(rec: MessagesRecord): void {
   const owner = candidate && candidateSizeOwners.get(candidate);
   const tokens = reportedInputTokens(rec);
   if (!candidate || !owner || tokens === undefined) return;
+  // Server tools' injected results inflate the reported input (reportedSample).
+  if (serverToolRecords.has(rec) || usedServerTools(rec)) return;
   const sample = { tokens, forwardedBytes: candidate.body.length };
   if (!plausibleSample(sample)) return;
   if ("set" in owner) owner.set(sample);

@@ -74,6 +74,8 @@ export interface UsageRecord {
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
     output_tokens?: number;
+    /** Server tool calls (e.g. web_search_requests); their results count as input. */
+    server_tool_use?: Record<string, number>;
 }
 /**
  * One /v1/messages request through the proxy. Built up mutably as the request
@@ -189,6 +191,12 @@ export interface MessagesRecord {
      * rode (turnType "fork-memory") or was not a fork.
      */
     forkMiss?: "no-route" | "session" | "system" | "prefix" | "too-large";
+    /**
+     * A fresh process's first main-lane request of a session that had a
+     * persisted compressed prefix (prefix-store.ts): adopted, or discarded
+     * because this history no longer validates against it.
+     */
+    storedPrefix?: "adopted" | "discarded";
     /**
      * Stable-prefix (edge) compaction: the budget the turn was measured
      * against, the size estimate, and, when it compacted, why. Recorded on
