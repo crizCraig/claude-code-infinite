@@ -317,35 +317,44 @@ function isBlock(value: unknown): boolean {
   if (!isObject(value)) return false;
   const block = value as Record<string, unknown>;
   if (block.cache_control !== undefined && !isObject(block.cache_control)) return false;
-  const check = BLOCK_CHECKS[block.type as string];
-  return typeof block.type === "string" && check !== undefined && check(block);
+  // Maps, not object literals: a type such as "toString" or "__proto__" must
+  // not find an inherited property.
+  const check = typeof block.type === "string" ? BLOCK_CHECKS.get(block.type) : undefined;
+  return check !== undefined && check(block);
 }
 
-const BLOCK_CHECKS: Record<string, (block: Record<string, unknown>) => boolean> = {
-  text: (b) => typeof b.text === "string",
-  image: (b) => isSource(b.source, IMAGE_SOURCES),
-  document: (b) => isSource(b.source, DOCUMENT_SOURCES),
-  tool_use: (b) => nonEmptyString(b.id) && nonEmptyString(b.name) && isObject(b.input),
-  tool_result: (b) => nonEmptyString(b.tool_use_id) &&
+type BlockCheck = (block: Record<string, unknown>) => boolean;
+
+const BLOCK_CHECKS = new Map<string, BlockCheck>([
+  ["text", (b) => typeof b.text === "string"],
+  ["image", (b) => isSource(b.source, IMAGE_SOURCES)],
+  ["document", (b) => isSource(b.source, DOCUMENT_SOURCES)],
+  ["tool_use", (b) => nonEmptyString(b.id) && nonEmptyString(b.name) && isObject(b.input)],
+  ["tool_result", (b) => nonEmptyString(b.tool_use_id) &&
     (b.content === undefined || typeof b.content === "string" || isBlockList(b.content)) &&
-    (b.is_error === undefined || typeof b.is_error === "boolean"),
-  thinking: (b) => typeof b.thinking === "string" && typeof b.signature === "string",
-  redacted_thinking: (b) => nonEmptyString(b.data),
-};
+    (b.is_error === undefined || typeof b.is_error === "boolean")],
+  ["thinking", (b) => typeof b.thinking === "string" && typeof b.signature === "string"],
+  ["redacted_thinking", (b) => nonEmptyString(b.data)],
+]);
 
 /** Source kinds and their required string fields. */
-const IMAGE_SOURCES: Record<string, string[]> = {
-  base64: ["media_type", "data"], url: ["url"], file: ["file_id"],
-};
-const DOCUMENT_SOURCES: Record<string, string[]> = {
-  ...IMAGE_SOURCES, text: ["media_type", "data"],
-};
+const IMAGE_SOURCES = new Map<string, string[]>([
+  ["base64", ["media_type", "data"]], ["url", ["url"]], ["file", ["file_id"]],
+]);
+const DOCUMENT_SOURCES = new Map<string, string[]>([
+  ...IMAGE_SOURCES, ["text", ["media_type", "data"]],
+]);
 
-function isSource(value: unknown, kinds: Record<string, string[]>): boolean {
+function isSource(value: unknown, kinds: Map<string, string[]>): boolean {
   if (!isObject(value)) return false;
   const source = value as Record<string, unknown>;
-  const fields = typeof source.type === "string" ? kinds[source.type] : undefined;
-  return fields !== undefined && fields.every((field) => nonEmptyString(source[field]));
+  const fields = typeof source.type === "string" ? kinds.get(source.type) : undefined;
+  return fields !== undefined && fields.every((field) => ownString(source, field));
+}
+
+/** An own (not inherited) non-empty string property. */
+function ownString(record: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(record, key) && nonEmptyString(record[key]);
 }
 
 function isPageSource(s: PersistedSource): boolean {

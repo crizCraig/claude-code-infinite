@@ -241,6 +241,12 @@ const MALFORMED_BLOCKS = [
   ["a thinking block without a signature", { type: "thinking", thinking: "hm" }],
   ["a redacted_thinking block without data", { type: "redacted_thinking" }],
   ["an unknown block type", { type: "mystery", text: "m" }],
+  // Inherited object keys are not block or source types (Codex cycle 3).
+  ...["toString", "constructor", "__proto__", "hasOwnProperty"].flatMap((key) => [
+    [`a block typed ${key}`, { type: key, text: "m" }],
+    [`an image source typed ${key}`, { type: "image",
+      source: { type: key, media_type: "image/png", data: "AA==", url: "https://x" } }],
+  ]),
 ];
 
 /** One well-formed block per supported type. */
