@@ -228,6 +228,55 @@ test("the store is bounded by total size and evicts the oldest sessions", () => 
   assert.equal(big.load("huge", OWNER), undefined, "an entry over the whole bound is not kept");
 });
 
+/** One malformed block per supported type, plus an unknown type (Codex cycle 2). */
+const MALFORMED_BLOCKS = [
+  ["a text block without text", { type: "text" }],
+  ["an image without a valid source", { type: "image", source: { type: "base64" } }],
+  ["a document with an unknown source type", { type: "document",
+    source: { type: "ftp", url: "ftp://x" } }],
+  ["a tool_use without input", { type: "tool_use", id: "t", name: "Read" }],
+  ["a tool_result without tool_use_id", { type: "tool_result", content: "done" }],
+  ["a tool_result with malformed content", { type: "tool_result", tool_use_id: "t",
+    content: [{ type: "text" }] }],
+  ["a thinking block without a signature", { type: "thinking", thinking: "hm" }],
+  ["a redacted_thinking block without data", { type: "redacted_thinking" }],
+  ["an unknown block type", { type: "mystery", text: "m" }],
+];
+
+/** One well-formed block per supported type. */
+const VALID_BLOCKS = [
+  { type: "text", text: "m", cache_control: { type: "ephemeral" } },
+  { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
+  { type: "image", source: { type: "url", url: "https://example.com/a.png" } },
+  { type: "document", source: { type: "text", media_type: "text/plain", data: "doc" } },
+  { type: "document", source: { type: "base64", media_type: "application/pdf", data: "AA==" } },
+  { type: "tool_use", id: "t", name: "Read", input: {} },
+  { type: "tool_result", tool_use_id: "t", content: "done" },
+  { type: "tool_result", tool_use_id: "t", content: [{ type: "text", text: "done" }],
+    is_error: false },
+  { type: "thinking", thinking: "hm", signature: "sig" },
+  { type: "redacted_thinking", data: "opaque" },
+];
+
+for (const block of VALID_BLOCKS) {
+  test(`a well-formed ${block.type} block (${block.source?.type ?? "plain"}) is stored and loaded`,
+    () => {
+      const store = new StablePrefixStore(tempDir());
+      store.save("s", OWNER, { ...PREFIX("p"),
+        compressedMessages: [{ role: "assistant", content: [block] }] }, undefined);
+      assert.deepEqual(store.load("s", OWNER)?.prefix.compressedMessages[0].content, [block]);
+    });
+}
+
+for (const [label, block] of MALFORMED_BLOCKS) {
+  test(`the store rejects ${label}`, () => {
+    const store = new StablePrefixStore(tempDir());
+    store.save("s", OWNER, { ...PREFIX("p"),
+      compressedMessages: [{ role: "assistant", content: [block] }] }, undefined);
+    assert.equal(store.load("s", OWNER), undefined);
+  });
+}
+
 /** Compact and ride once, then let the entry reach the disk. */
 async function persistOnce(dir) {
   const before = await proxyProcess(new StablePrefixStore(dir));
@@ -288,6 +337,11 @@ for (const [label, corrupt] of [
   ["a malformed system", (entry) => {
     entry.prefix.hasCompressedSystem = true; entry.prefix.compressedSystem = [null]; }],
   ["no covered messages", (entry) => { entry.prefix.originalPrefixHashes = []; }],
+  ...MALFORMED_BLOCKS.map(([label, block]) => [label, (entry) => {
+    entry.prefix.compressedMessages = [{ role: "user", content: [block] }]; }]),
+  ["a system text block without text", (entry) => {
+    entry.prefix.hasCompressedSystem = true;
+    entry.prefix.compressedSystem = [{ type: "text" }]; }],
 ]) {
   test(`a persisted prefix with ${label} is discarded and the turn behaves as today`,
     async () => {

@@ -241,7 +241,7 @@ function isEntry(v) {
     return isObject(v) && v.version === ENTRY_VERSION &&
         typeof v.sessionId === "string" && nonEmptyString(v.owner) &&
         Number.isFinite(v.savedAt) && isPrefix(v.prefix) &&
-        (v.source === undefined || isSource(v.source));
+        (v.source === undefined || isPageSource(v.source));
 }
 /** The prefix's invariants: the identity of a covered history, and well-formed bytes. */
 function isPrefix(p) {
@@ -266,10 +266,49 @@ function isSystem(system) {
     return typeof system === "string" || isBlockList(system);
 }
 function isBlockList(value) {
-    return Array.isArray(value) && value.length > 0 &&
-        value.every((block) => isObject(block) && nonEmptyString(block.type));
+    return Array.isArray(value) && value.length > 0 && value.every(isBlock);
 }
-function isSource(s) {
+/**
+ * A content block of a type a compressed prefix can carry, with that type's
+ * required fields. Anything else (an unknown type, a missing field) fails, so
+ * the entry is deleted and the session rebuilds instead of sending a body
+ * Anthropic rejects.
+ */
+function isBlock(value) {
+    if (!isObject(value))
+        return false;
+    const block = value;
+    if (block.cache_control !== undefined && !isObject(block.cache_control))
+        return false;
+    const check = BLOCK_CHECKS[block.type];
+    return typeof block.type === "string" && check !== undefined && check(block);
+}
+const BLOCK_CHECKS = {
+    text: (b) => typeof b.text === "string",
+    image: (b) => isSource(b.source, IMAGE_SOURCES),
+    document: (b) => isSource(b.source, DOCUMENT_SOURCES),
+    tool_use: (b) => nonEmptyString(b.id) && nonEmptyString(b.name) && isObject(b.input),
+    tool_result: (b) => nonEmptyString(b.tool_use_id) &&
+        (b.content === undefined || typeof b.content === "string" || isBlockList(b.content)) &&
+        (b.is_error === undefined || typeof b.is_error === "boolean"),
+    thinking: (b) => typeof b.thinking === "string" && typeof b.signature === "string",
+    redacted_thinking: (b) => nonEmptyString(b.data),
+};
+/** Source kinds and their required string fields. */
+const IMAGE_SOURCES = {
+    base64: ["media_type", "data"], url: ["url"], file: ["file_id"],
+};
+const DOCUMENT_SOURCES = {
+    ...IMAGE_SOURCES, text: ["media_type", "data"],
+};
+function isSource(value, kinds) {
+    if (!isObject(value))
+        return false;
+    const source = value;
+    const fields = typeof source.type === "string" ? kinds[source.type] : undefined;
+    return fields !== undefined && fields.every((field) => nonEmptyString(source[field]));
+}
+function isPageSource(s) {
     return isObject(s) && typeof s.url === "string" && /^https?:\/\//.test(s.url) &&
         nonEmptyString(s.index) && typeof s.compressed === "boolean";
 }
