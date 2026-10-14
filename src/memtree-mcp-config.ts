@@ -15,7 +15,9 @@
  *   pre-allowed with `--allowedTools=` as well. The server sets Claude Code's
  *   `alwaysLoad: true`, so its tools are in the prompt from the first turn
  *   (and after --resume) instead of deferred behind tool search; this applies
- *   to this server only, not the user's other MCP servers. Claude Code also
+ *   to this server only, not the user's other MCP servers. A resumed session
+ *   whose transcript recorded them as deferred keeps that placement in Claude
+ *   Code; the proxy adds their schemas there (memtree-tool-inject.ts). Claude Code also
  *   waits (up to its 5s connect timeout) for the server before that turn.
  *   `CCC_MEMTREE_MCP=0` turns this off.
  * - Print (`-p`) and non-TTY runs get nothing automatically (their output and

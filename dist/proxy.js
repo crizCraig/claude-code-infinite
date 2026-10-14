@@ -58,6 +58,7 @@ import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { withMemtreeToolDefinitions } from "./memtree-tool-inject.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -854,6 +855,13 @@ async function handleMessages(req, res, opts, upstream, state) {
         forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
         if (opts.debug)
             console.error("[ccc proxy] stripped legacy notice span(s) from request");
+    }
+    // A resumed session whose transcript latched ccc's memtree tools as
+    // deferred gets their schemas anyway (memtree-tool-inject.ts).
+    if (opts.memtree.hasMemtreeTools === true && withMemtreeToolDefinitions(body).length > 0) {
+        forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
+        if (opts.debug)
+            console.error("[ccc proxy] added memtree tool schemas to a deferred-latched request");
     }
     const messages = body.messages;
     // CC 2.1.207 appends ambient role=system blocks after the typed prompt. Use

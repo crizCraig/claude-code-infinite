@@ -132,6 +132,7 @@ import {
 } from "./cc-request.js";
 import type { MessageTimes, TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
+import { withMemtreeToolDefinitions } from "./memtree-tool-inject.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -1476,6 +1477,12 @@ async function handleMessages(
     else body.system = strippedSystem.system;
     forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
     if (opts.debug) console.error("[ccc proxy] stripped legacy notice span(s) from request");
+  }
+  // A resumed session whose transcript latched ccc's memtree tools as
+  // deferred gets their schemas anyway (memtree-tool-inject.ts).
+  if (opts.memtree.hasMemtreeTools === true && withMemtreeToolDefinitions(body).length > 0) {
+    forwardBody = Buffer.from(JSON.stringify(body), "utf-8");
+    if (opts.debug) console.error("[ccc proxy] added memtree tool schemas to a deferred-latched request");
   }
 
   const messages: Message[] = body.messages;

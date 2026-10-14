@@ -10766,3 +10766,35 @@ for (const ending of ["Stop", "exit"]) {
     }
   });
 }
+
+test("a resumed session latched to deferred memtree tools gets their schemas only when ccc serves them", async () => {
+  const names = ["list", "read_lines", "read_node", "search"].map((n) => `mcp__memtree__${n}`);
+  const body = {
+    model: "claude-x",
+    max_tokens: 64,
+    tools: [{ name: "ToolSearch", description: "t", input_schema: { type: "object" } }],
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "system", content: [{ type: "text", text: `The following deferred tools are now available via ToolSearch:\n${names.join("\n")}` }] },
+    ],
+  };
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  try {
+    for (const memtreeTools of ["search,read_node,read_lines,list", undefined]) {
+      const proxy = await startProxy({
+        memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k", memtreeTools }),
+        upstreamOrigin: upstream.origin,
+      });
+      try {
+        const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+          method: "POST", headers: { "content-type": "application/json", ...SESSION }, body: JSON.stringify(body),
+        });
+        await res.text();
+        const sent = upstream.seen.filter((s) => !s.isCount).at(-1).body.tools.map((t) => t.name);
+        assert.deepEqual(sent.filter((n) => n.startsWith("mcp__memtree__")).sort(), memtreeTools ? names : [],
+          memtreeTools ? "schemas added for ccc's own server" : "untouched without ccc's server");
+      } finally { await proxy.close(); }
+    }
+  } finally { upstream.close(); memtreeSrv.close(); }
+});

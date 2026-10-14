@@ -770,6 +770,10 @@ export class MemtreeClient {
     setMemtreeTools(value) {
         this.memtreeTools = value || undefined;
     }
+    /** Whether this session has ccc's `memtree` MCP server (the header is sent). */
+    get hasMemtreeTools() {
+        return this.memtreeTools !== undefined;
+    }
     /**
      * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
      * polychat host with this client's key. Backs the loopback `/memtree/*`

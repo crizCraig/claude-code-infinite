@@ -334,6 +334,8 @@ export declare class MemtreeClient {
     get longCompressBudgetMs(): number;
     /** Change the `x-memtree-tools` value for later calls (undefined: none). */
     setMemtreeTools(value: string | undefined): void;
+    /** Whether this session has ccc's `memtree` MCP server (the header is sent). */
+    get hasMemtreeTools(): boolean;
     /**
      * GET a MemTree view path (`/usage/memtree/<id>[.json][?share=…]`) on the
      * polychat host with this client's key. Backs the loopback `/memtree/*`
