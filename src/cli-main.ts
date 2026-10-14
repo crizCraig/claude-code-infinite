@@ -80,7 +80,8 @@ import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
-const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true";
+// utm_source=ccc: signups from this link are attributed to ccc (polychat docs/signup_sources.md).
+const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
