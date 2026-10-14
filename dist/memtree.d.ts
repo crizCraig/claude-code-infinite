@@ -318,6 +318,8 @@ export declare class MemtreeClient {
      * background-indexing calls; cleared by any subsequent success.
      */
     get paymentRequiredDetail(): string | null;
+    /** polychat's usage dashboard for this client's environment (its base URL). */
+    get usageDashboardUrl(): string | undefined;
     /**
      * The blocking-compress abort budget. Exposed so the proxy's request log
      * can label a failed compress that consumed (roughly) the whole budget as a

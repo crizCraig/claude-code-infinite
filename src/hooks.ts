@@ -73,7 +73,7 @@ const UNAVAILABLE_BODY =
  */
 const SESSION_COMMANDS: Record<string, string> = {
   [MEMTREE_HELP_COMMAND]:
-    "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact)\n---\n" + UNAVAILABLE_BODY,
+    "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact) and the usage dashboard link\n---\n" + UNAVAILABLE_BODY,
   [MEMTREE_VIEW_COMMAND]:
     "---\ndescription: Show the link to this session's MemTree page\n---\n" + UNAVAILABLE_BODY,
   [MEMTREE_COMPACT_COMMAND]:

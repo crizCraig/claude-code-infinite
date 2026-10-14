@@ -66,7 +66,7 @@ const UNAVAILABLE_BODY = "Reply with exactly this one line and nothing else: \"M
  * runs if that hook could not answer (proxy gone).
  */
 const SESSION_COMMANDS = {
-    [MEMTREE_HELP_COMMAND]: "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact)\n---\n" + UNAVAILABLE_BODY,
+    [MEMTREE_HELP_COMMAND]: "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact) and the usage dashboard link\n---\n" + UNAVAILABLE_BODY,
     [MEMTREE_VIEW_COMMAND]: "---\ndescription: Show the link to this session's MemTree page\n---\n" + UNAVAILABLE_BODY,
     [MEMTREE_COMPACT_COMMAND]: "---\ndescription: Compact this session with MemTree now and keep the compressed history (optional token target, or off)\n" +
         "argument-hint: [tokens | off]\n---\n" + UNAVAILABLE_BODY,
