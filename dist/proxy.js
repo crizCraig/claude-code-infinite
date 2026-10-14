@@ -1031,12 +1031,14 @@ async function handleMessages(req, res, opts, upstream, state) {
             // selection considers it together with the original and any replacement.
             return candidate.kind === "ride" || fitsMeasured(measured, sizingLimits());
         },
-        recoverLate: async (buffer, tokens) => {
+        // The ride's bytes are only what failed; recovery always compresses the
+        // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
+        recoverLate: async (_ride, rideTokens) => {
             if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
                 (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
                 return undefined;
-            return recoverLateCount({ opts, state, req, rec, bodyBuffer: buffer,
-                modelContextLimit, clientMeta, sizing: requestSizing });
+            return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
+                modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate });
         },
         delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
     });
@@ -3660,19 +3662,23 @@ async function handleCountTokens(req, res, opts, upstream, state) {
  * picks it up without threading a parameter through each one.
  */
 const recapLinkAppenders = new WeakMap();
-/** One delivery-time retry, against the assembled body whose exact count exceeded the budget. */
+/**
+ * One delivery-time retry after a ride's exact count exceeded the budget. It
+ * compresses the request's ORIGINAL conversation at a tighter target: the
+ * ride carries a memory prefix MemTree never indexed, so compressing it would
+ * miss the tree, index a divergent conversation and bill for it.
+ */
 async function recoverLateCount(args) {
     try {
-        const body = JSON.parse(args.bodyBuffer.toString("utf-8"));
-        const messages = normalizeMessagesForMemtree(messagesWithSystem(body.messages, body.system));
+        const { body, msgsForMemtree: messages } = args;
         const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
+        const target = lateRecoveryTarget(compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget), budget, args.rideTokens);
         const outcome = await runBlockingCompression({
             opts: args.opts, state: args.state, body, msgsForMemtree: messages,
-            hash: MemtreeClient.hashMessages(messages), modelContextLimit: args.modelContextLimit,
+            hash: args.hash, modelContextLimit: args.modelContextLimit,
             rec: args.rec, sessionId: requestSessionId(args.req), agentId: agentAttributionId(args.req),
-            clientMeta: args.clientMeta, sizing: args.sizing,
-            inputCandidate: args.sizing.register(args.bodyBuffer, "ride"),
-            compaction: { target: compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget) },
+            clientMeta: args.clientMeta, sizing: args.sizing, inputCandidate: args.inputCandidate,
+            compaction: { target },
         });
         noteMemtreeHealth(args.state, outcome);
         // Like every compress path: a refusal after a lagging answer waits for
@@ -3690,6 +3696,15 @@ async function recoverLateCount(args) {
     catch {
         return undefined;
     }
+}
+/**
+ * The ride compressed to `target` still counted `rideTokens` (over the
+ * budget), so the recompression of the original aims proportionally lower.
+ */
+function lateRecoveryTarget(target, budget, rideTokens) {
+    if (!(rideTokens > budget) || !(budget > 0))
+        return target;
+    return Math.max(SERVER_MIN_TARGET_TOKENS, Math.floor(target * budget / rideTokens));
 }
 /** Select a measured eligible body before delivery; refusing one candidate never
  * prevents considering the original or a validated prefix retained by planning. */
