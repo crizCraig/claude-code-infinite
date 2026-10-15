@@ -619,3 +619,43 @@ test('original over the 64 MiB request limit: no count, compressed instead of fo
     assert.equal(rec.compaction.uncountedOverWindow, true);
   } finally { h.close(); }
 });
+
+function imageFlattenReply(imageChars, budget = 100_000) {
+  const memory = [{ role: 'user', content: [{ type: 'text', text: 'memory m' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(imageChars) } }] }];
+  return { body: { messages: memory, flattened_messages: memory, compressed: true,
+    model_budget_tokens: budget, usage: { prompt_tokens: 300_000, completion_tokens: 50_000 } } };
+}
+
+for (const turn of ['human', 'tool']) {
+  test(`a ${turn} turn rides a prefix that kept images by its sized tokens, not its base64 bytes`, async () => {
+    let compressions = 0;
+    const hasMemory = body => JSON.stringify(body.messages).includes('memory m');
+    const h = await harness({ budget: 100_000,
+      usage: body => hasMemory(body) ? 50_000 : 10_000,
+      count: body => ({ input_tokens: hasMemory(body) ? 60_000 : 300_000 }),
+      compress: () => ++compressions === 1 ? imageFlattenReply(1_000_000) : undefined });
+    const original = [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+      { role: 'user', content: 'x'.repeat(600_000) }];
+    try {
+      assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+      assert.equal(h.compressions.length, 1);
+      const human = [{ role: 'assistant', content: 'next answer' }, { role: 'user', content: 'next question' }];
+      const tool = [{ role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'next result' }] }];
+      // The tool turn follows a human turn on the prefix, so it rides the
+      // session's stable prefix (planToolCompaction), not the lane's route.
+      assert.equal(await h.post(0, { agent: '', messages: [...original, ...human] }), 200);
+      if (turn === 'tool') {
+        assert.equal(await h.post(0, { agent: '', messages: [...original, ...human, ...tool] }), 200);
+      }
+      // bytes/4 of the 1 MB image payload alone (250k) exceeds the 200k window.
+      assert.equal(h.compressions.length, 1, 'no recompression from base64 bytes');
+      const sent = JSON.stringify(h.forwards.at(-1).messages);
+      assert.match(sent, /"type":"image"/);
+      assert.match(sent, turn === 'human' ? /next question/ : /next result/);
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.match(rec.turnType, turn === 'human' ? /^followup-prefix$/ : /^tool-(memory|prefix)$/);
+    } finally { h.close(); }
+  });
+}

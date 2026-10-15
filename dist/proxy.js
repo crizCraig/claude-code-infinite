@@ -59,6 +59,7 @@ import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { conservativeBodyTokens } from "./token-estimate.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -2667,8 +2668,10 @@ async function planEdgeCompaction(args) {
         compaction.estimatedBytes = routed.raw.length;
         compaction.sizeSource = size.source;
         noteUncountedBound(compaction, args.sizing, prefixCandidate, body, modelContextLimit);
-        const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit) ||
-            calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+        // Request-local sizing (an exact count, a calibrated sample, or the
+        // image-aware bound), not bytes: a flatten that kept images is mostly
+        // base64 that costs a fixed amount per image.
+        const overWindow = calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
         const fallback = overWindow ? undefined : { prefix, routed };
         if (state.compactNow.has(sessionId))
             return forced("manual", fallback);
@@ -2742,10 +2745,9 @@ async function planToolCompaction(args) {
         if (routed) {
             const prefixCandidate = args.sizing.register(routed.raw, "ride", current.lastSize);
             candidateSizeOwners.set(prefixCandidate, current);
-            if (routedBodyExceedsContext(body, routed.raw, modelContextLimit))
-                overWindow = true;
-            else
-                ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
+            // Sized below with the request-local sizing; an over-window ride is not
+            // kept as a fallback.
+            ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
         }
     }
     if (!ride) {
@@ -2856,12 +2858,15 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
         record.uncountedOverWindow = true;
     }
 }
-/** Size the assembled input (including system/tools) and reserve output room. */
-function routedBodyExceedsContext(body, routedBody, modelContextLimit) {
-    const outputTokens = bodyOutputReservation(body, false);
-    // This is the existing local byte estimate, not a tokenizer or a hard cap.
-    // Final forwarding checks can replace this estimate with Count Tokens.
-    return approxTokensFromBytes(routedBody.length) + outputTokens > modelContextLimit;
+/**
+ * Whether a forwarded compressed body still overflows the window: its reported
+ * input tokens when usage came back, else its conservative image-aware bound
+ * (token-estimate.ts), never bytes/4, which reads base64 images as text.
+ */
+function compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit) {
+    const tokens = reportedSample(rec, compressedRaw.length)?.tokens ??
+        conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
+    return tokens + bodyOutputReservation(body, false) > modelContextLimit;
 }
 /** Output room a native-fit check reserves: the model's floor for an exact
  * count, else (an estimate) the full max_tokens. */
@@ -3650,8 +3655,9 @@ async function recoverToolRouteMiss(args) {
     // Nothing to ride next turn, or a result that still does not fit the
     // window (the next turn would reject it and compress again): wait for
     // growth before the lane tries again.
-    if (!sizeHolder || routedBodyExceedsContext(body, compressedRaw, modelContextLimit))
+    if (!sizeHolder || compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit)) {
         backOff();
+    }
     // A reservation that lost its race (stale) or never reached
     // protocol-complete (upstream 5xx, truncated stream) installed nothing, so
     // it must stop suppressing whoever is still trying to install.
