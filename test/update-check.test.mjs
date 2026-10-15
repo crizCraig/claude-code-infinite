@@ -129,3 +129,128 @@ test("an unparseable current version disables the check", async () => {
   );
   assert.equal(calls.length, 0);
 });
+
+// ---- 1.0.20: cache, opt-outs, prereleases, tighter timeout ----
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  NO_UPDATE_CHECK_ENV,
+  UPDATE_CHECK_CACHE_TTL_MS,
+  UPDATE_CHECK_TIMEOUT_MS,
+  updateCheckEnabled,
+} from "../dist/update-check.js";
+
+function tmpCacheFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-update-check-"));
+  return path.join(dir, "update-check.json");
+}
+
+test("the registry fetch is bounded to at most 1.5 seconds", () => {
+  assert.ok(UPDATE_CHECK_TIMEOUT_MS <= 1500, String(UPDATE_CHECK_TIMEOUT_MS));
+});
+
+test("an older installed version gets the hint and the answer is cached", async () => {
+  const cacheFile = tmpCacheFile();
+  const { fetchImpl, calls } = registry({ version: "1.0.20" });
+  const result = await checkForUpdate({
+    currentVersion: "1.0.14", fetchImpl, env: {}, cacheFile, now: () => 1_000,
+  });
+  assert.deepEqual(result, { latest: "1.0.20", current: "1.0.14" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(cacheFile, "utf8")), {
+    checkedAt: 1_000, latest: "1.0.20",
+  });
+});
+
+test("a fresh cache answers without contacting the registry", async () => {
+  const cacheFile = tmpCacheFile();
+  fs.writeFileSync(cacheFile, JSON.stringify({ checkedAt: 1_000, latest: "1.0.20" }));
+  const { fetchImpl, calls } = registry({ version: "9.9.9" });
+  const now = () => 1_000 + UPDATE_CHECK_CACHE_TTL_MS - 1;
+  assert.deepEqual(
+    await checkForUpdate({ currentVersion: "1.0.14", fetchImpl, env: {}, cacheFile, now }),
+    { latest: "1.0.20", current: "1.0.14" }
+  );
+  // After upgrading, the same cached answer is no longer an update.
+  assert.equal(
+    await checkForUpdate({ currentVersion: "1.0.20", fetchImpl, env: {}, cacheFile, now }),
+    null
+  );
+  assert.equal(calls.length, 0, "cache hit must not fetch");
+});
+
+test("a stale, future-dated or corrupt cache is refreshed from the registry", async () => {
+  const stale = { checkedAt: 1_000, latest: "1.0.15" };
+  const cases = [
+    ["stale", JSON.stringify(stale), 1_000 + UPDATE_CHECK_CACHE_TTL_MS + 1],
+    ["future", JSON.stringify(stale), 0],
+    ["corrupt", "{not json", 5_000],
+    ["bad version", JSON.stringify({ checkedAt: 5_000, latest: "\u001b[2J" }), 5_000],
+  ];
+  for (const [name, contents, nowMs] of cases) {
+    const cacheFile = tmpCacheFile();
+    fs.writeFileSync(cacheFile, contents);
+    const { fetchImpl, calls } = registry({ version: "1.0.20" });
+    const result = await checkForUpdate({
+      currentVersion: "1.0.14", fetchImpl, env: {}, cacheFile, now: () => nowMs,
+    });
+    assert.deepEqual(result, { latest: "1.0.20", current: "1.0.14" }, name);
+    assert.equal(calls.length, 1, name);
+  }
+});
+
+test("registry down or timing out: silent, and nothing is cached", async () => {
+  for (const fetchImpl of [
+    registry({ version: "9.9.9" }, 503).fetchImpl,
+    async () => { throw new TypeError("fetch failed"); },
+  ]) {
+    const cacheFile = tmpCacheFile();
+    assert.equal(
+      await checkForUpdate({ currentVersion: "1.0.14", fetchImpl, env: {}, cacheFile }),
+      null
+    );
+    assert.equal(fs.existsSync(cacheFile), false);
+  }
+});
+
+test("an unwritable cache location never breaks the check", async () => {
+  const { fetchImpl } = registry({ version: "1.0.20" });
+  const cacheFile = path.join(tmpCacheFile(), "nested", "x", "update-check.json");
+  fs.writeFileSync(path.dirname(path.dirname(path.dirname(cacheFile))), "file, not dir");
+  assert.deepEqual(
+    await checkForUpdate({ currentVersion: "1.0.14", fetchImpl, env: {}, cacheFile }),
+    { latest: "1.0.20", current: "1.0.14" }
+  );
+});
+
+test("a prerelease on the latest tag is never offered", async () => {
+  for (const latest of ["1.0.21-beta.1", "2.0.0-rc.0"]) {
+    const { fetchImpl } = registry({ version: latest });
+    assert.equal(
+      await checkForUpdate({ currentVersion: "1.0.14", fetchImpl, env: {} }),
+      null,
+      latest
+    );
+  }
+});
+
+test("opt-outs: CCC_NO_UPDATE_CHECK=1, CCC_SKIP_UPDATE_CHECK=1, updateCheck: false", async () => {
+  const optedOut = [
+    [{ [NO_UPDATE_CHECK_ENV]: "1" }, {}],
+    [{ [SKIP_UPDATE_CHECK_ENV]: "1" }, {}],
+    [{}, { updateCheck: false }],
+  ];
+  for (const [env, config] of optedOut) {
+    assert.equal(updateCheckEnabled(env, config), false, JSON.stringify([env, config]));
+    const { fetchImpl, calls } = registry({ version: "9.9.9" });
+    const result = await checkForUpdate({
+      currentVersion: "1.0.14", fetchImpl, env, config, cacheFile: tmpCacheFile(),
+    });
+    assert.equal(result, null);
+    assert.equal(calls.length, 0, "registry must not be contacted");
+  }
+  assert.equal(updateCheckEnabled({ [NO_UPDATE_CHECK_ENV]: "0" }, { updateCheck: true }), true);
+  assert.equal(updateCheckEnabled({}, {}), true);
+});

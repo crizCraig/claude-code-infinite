@@ -2,6 +2,8 @@ export interface Config {
     polychatApiKey?: string;
     stagingPolychatApiKey?: string;
     localPolychatApiKey?: string;
+    /** false turns off the startup check for a newer ccc on npm (update-check.ts). */
+    updateCheck?: boolean;
 }
 export declare function getConfigDir(): string;
 export declare function loadConfig(): Config;
