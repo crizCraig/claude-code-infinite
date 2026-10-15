@@ -307,7 +307,7 @@ install fails, you get the usual `• ccc 1.0.21 is available … · npm i -g
 claude-code-infinite@latest` line instead, and `ccc` waits a day before trying again; it
 tries each version at most twice. The npm output of the last attempt is in
 `~/.claude-code-infinite/auto-update.log`, and its result in `update-state.json` next to
-it. Only one session installs at a time (`update.lock` there).
+it. Only one session installs at a time (`update.lock.d` there).
 
 **When it doesn't.** `ccc` updates itself only when it is a plain global npm install
 (`npm i -g`) whose files are in `npm root -g` and writable by you. It never uses `sudo`.

@@ -13,10 +13,14 @@
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
- * Bounded: npm runs in its own process group and a timeout sends the group
- * SIGTERM, then SIGKILL; a hard deadline (and SIGTERM/SIGINT/SIGHUP to the
- * runner) records a failure, frees the lock and exits, so the lock's stale
- * age (auto-update.ts UPDATE_LOCK_STALE_MS) is never reached by a live runner.
+ * Bounded: each npm command runs in its own process group, recorded in the
+ * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,
+ * then SIGKILL, until no member is left, so a descendant that outlives npm
+ * cannot go on writing the package. The lock is released only once the group
+ * is confirmed gone; otherwise the entry stays live for as long as the group
+ * is (update-lock.ts). A hard deadline and SIGTERM/SIGINT/SIGHUP to the runner
+ * kill the group, record a failure and exit, so the lock's stale age is never
+ * reached by a live runner.
  */
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
@@ -27,7 +31,8 @@ export interface RunnerConfig {
     npmRoot: string;
     prefix: string;
     stateFile: string;
-    lockFile: string;
+    /** update-lock.ts directory; this runner owns `<lockDir>/<token>.json`. */
+    lockDir: string;
     logFile: string;
     token: string;
     timeoutMs: number;

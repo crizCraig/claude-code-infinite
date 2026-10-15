@@ -21,22 +21,18 @@
  * modules at startup, and the hooks it registers are HTTP calls into it or
  * files in its own temp plugin dir. See README "Automatic updates".
  */
+export { UPDATE_LOCK_STALE_MS, acquireUpdateLock, releaseUpdateLock } from "./update-lock.js";
 import { type UpdateAvailable, type UpdateCheckConfig } from "./update-check.js";
 export declare const DISABLE_AUTOUPDATE_ENV = "CCC_DISABLE_AUTOUPDATE";
 /** Claude Code's own opt-out, honored too. */
 export declare const CLAUDE_DISABLE_AUTOUPDATER_ENV = "DISABLE_AUTOUPDATER";
 export declare const UPDATE_STATE_FILE = "update-state.json";
-export declare const UPDATE_LOCK_FILE = "update.lock";
+/** One entry per acquirer (update-lock.ts). */
+export declare const UPDATE_LOCK_DIR = "update.lock.d";
 export declare const UPDATE_LOG_FILE = "auto-update.log";
 export declare const AUTO_UPDATE_BACKOFF_MS: number;
 export declare const MAX_ATTEMPTS_PER_VERSION = 2;
 export declare const INSTALL_TIMEOUT_MS: number;
-/**
- * A lock is stale when its holder has exited, or when it is older than this.
- * The runner exits by its hard deadline (install timeout plus kill grace, see
- * auto-update-runner.ts), so a holder still "alive" past this is a reused pid.
- */
-export declare const UPDATE_LOCK_STALE_MS: number;
 /** Wait after launch so the install never competes with Claude Code starting. */
 export declare const AUTO_UPDATE_DELAY_MS = 5000;
 /** This package's own directory (dist/..), as Node resolved it. */
@@ -100,7 +96,7 @@ export interface PlanOptions {
 }
 export interface UpdateFiles {
     stateFile: string;
-    lockFile: string;
+    lockDir: string;
     logFile: string;
 }
 export type SpawnLike = (command: string, args: string[], options: {
@@ -169,12 +165,4 @@ export declare function updateFiles(configDir: string): UpdateFiles;
 export declare function readUpdateState(file: string): UpdateState;
 /** Best effort and atomic: a failed write only loses bookkeeping. */
 export declare function writeUpdateState(file: string, state: UpdateState): void;
-/**
- * Create the lock exclusively, reclaiming it once when stale (its holder has
- * exited, or it is impossibly old). Returns the owner token, or null when
- * another session holds it or is reclaiming it.
- */
-export declare function acquireUpdateLock(lockFile: string, now: number): string | null;
-/** Remove the lock only when this token still owns it. */
-export declare function releaseUpdateLock(lockFile: string, token: string): void;
 //# sourceMappingURL=auto-update.d.ts.map

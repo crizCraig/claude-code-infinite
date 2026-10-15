@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   AUTO_UPDATE_BACKOFF_MS,
   AutoUpdateNotices,
@@ -262,54 +262,91 @@ test("linked installs plan no install, and a forged plan never spawns", () => {
   const forged = { action: "install", version: "1.0.21", method };
   assert.equal(startAutoUpdateInstall({ decision: forged, files, spawnImpl }), "not-planned");
   assert.equal(calls.length, 0);
-  assert.equal(fs.existsSync(files.lockFile), false);
+  assert.deepEqual(lockEntries(files.lockDir), []);
 });
 
 // ---------------------------------------------------------------------------
 // Lock
 // ---------------------------------------------------------------------------
 
+/** The lock's entries (update-lock.ts), excluding temp files. */
+function lockEntries(lockDir) {
+  try {
+    return fs.readdirSync(lockDir).filter((n) => n.endsWith(".json") && !n.startsWith("."));
+  } catch {
+    return [];
+  }
+}
+
+function writeEntry(lockDir, data, name = `${data.token}.json`) {
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, name), typeof data === "string" ? data : JSON.stringify(data));
+  return path.join(lockDir, name);
+}
+
 test("the lock admits one installer; only its token releases it", () => {
-  const { lockFile } = filesIn();
+  const { lockDir } = filesIn();
   const now = Date.now();
-  const token = acquireUpdateLock(lockFile, now);
+  const token = acquireUpdateLock(lockDir, now);
   assert.ok(token);
-  assert.equal(acquireUpdateLock(lockFile, now + 1000), null, "held by a live session");
-  releaseUpdateLock(lockFile, "someone-else");
-  assert.ok(fs.existsSync(lockFile));
-  releaseUpdateLock(lockFile, token);
-  assert.equal(fs.existsSync(lockFile), false);
-  assert.ok(acquireUpdateLock(lockFile, now));
+  assert.equal(acquireUpdateLock(lockDir, now + 1000), null, "held by a live session");
+  assert.deepEqual(lockEntries(lockDir), [`${token}.json`], "the loser removed its own entry");
+  releaseUpdateLock(lockDir, "00000000-0000-0000-0000-000000000000");
+  releaseUpdateLock(lockDir, "../../etc/passwd");
+  assert.equal(lockEntries(lockDir).length, 1);
+  releaseUpdateLock(lockDir, token);
+  assert.deepEqual(lockEntries(lockDir), []);
+  assert.ok(acquireUpdateLock(lockDir, now));
 });
 
-test("a stale lock is taken over: too old, or its holder has exited", () => {
-  const { lockFile } = filesIn();
+test("two acquirers that both wrote before looking both back off; never two owners", () => {
+  const { lockDir } = filesIn();
   const now = Date.now();
-  const write = (data) => fs.writeFileSync(lockFile, JSON.stringify(data));
-  write({ token: "live-20m", startedAt: now - 20 * 60_000, pid: process.pid });
-  assert.equal(acquireUpdateLock(lockFile, now), null, "a live installer is never reclaimed by age alone");
-  write({ token: "old", startedAt: now - UPDATE_LOCK_STALE_MS - 1, pid: process.pid });
-  assert.ok(acquireUpdateLock(lockFile, now), "older than any runner can live: a reused pid");
+  // B's entry appears while A is acquiring (A looks after B wrote).
+  writeEntry(lockDir, { token: "b", startedAt: now, pid: process.pid });
+  assert.equal(acquireUpdateLock(lockDir, now), null);
+  assert.deepEqual(lockEntries(lockDir), ["b.json"], "A left nothing behind");
+});
 
+test("stale entries: holder and npm group gone, or older than any runner can live", () => {
+  const { lockDir } = filesIn();
+  const now = Date.now();
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
-  write({ token: "dead", startedAt: now - 60_000, pid: dead });
-  assert.ok(acquireUpdateLock(lockFile, now), "holder exited");
-
-  write({ token: "young", startedAt: now - 5_000, pid: dead });
-  assert.equal(acquireUpdateLock(lockFile, now), null, "a just-started holder gets a grace period");
-  write({ token: "live", startedAt: now - 60_000, pid: process.pid });
-  assert.equal(acquireUpdateLock(lockFile, now), null, "live holder keeps it");
+  const tryWith = (data) => {
+    for (const n of lockEntries(lockDir)) fs.rmSync(path.join(lockDir, n));
+    writeEntry(lockDir, data);
+    const token = acquireUpdateLock(lockDir, now);
+    if (token) releaseUpdateLock(lockDir, token);
+    return token !== null;
+  };
+  assert.equal(tryWith({ token: "live-20m", startedAt: now - 20 * 60_000, pid: process.pid }), false,
+    "a live installer is never reclaimed by age alone");
+  assert.equal(tryWith({ token: "old", startedAt: now - UPDATE_LOCK_STALE_MS - 1, pid: process.pid }), true,
+    "older than any runner can live: a reused pid");
+  assert.equal(tryWith({ token: "dead", startedAt: now - 60_000, pid: dead }), true, "holder exited");
+  assert.equal(tryWith({ token: "young", startedAt: now - 5_000, pid: dead }), false, "startup grace");
+  // The runner died but npm's group lives on: still held.
+  const npmGroup = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  try {
+    assert.equal(tryWith({ token: "grp", startedAt: now - 60_000, pid: dead, group: npmGroup.pid }), false);
+  } finally {
+    process.kill(-npmGroup.pid, "SIGKILL");
+  }
+  // Stale entries are cleared by the next owner.
+  for (const n of lockEntries(lockDir)) fs.rmSync(path.join(lockDir, n));
+  writeEntry(lockDir, { token: "dead2", startedAt: now - 60_000, pid: dead });
+  const token = acquireUpdateLock(lockDir, now);
+  assert.deepEqual(lockEntries(lockDir), [`${token}.json`]);
 });
 
-test("an unreadable lock is left alone while fresh (being written), taken when old", () => {
-  const { lockFile } = filesIn();
+test("an unreadable entry counts as live while fresh, stale once old", () => {
+  const { lockDir } = filesIn();
   const now = Date.now();
-  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
-  fs.writeFileSync(lockFile, "");
-  assert.equal(acquireUpdateLock(lockFile, now), null);
+  const file = writeEntry(lockDir, "", "garbage.json");
+  assert.equal(acquireUpdateLock(lockDir, now), null);
   const old = new Date(now - 120_000);
-  fs.utimesSync(lockFile, old, old);
-  assert.ok(acquireUpdateLock(lockFile, now));
+  fs.utimesSync(file, old, old);
+  assert.ok(acquireUpdateLock(lockDir, now));
 });
 
 // ---------------------------------------------------------------------------
@@ -345,9 +382,8 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   const state = readUpdateState(files.stateFile);
   assert.deepEqual(state.attempts, { "1.0.21": 1 });
   assert.equal(state.last.status, "running");
-  const lock = JSON.parse(fs.readFileSync(files.lockFile, "utf8"));
-  assert.equal(lock.pid, 777, "the runner, not this session, holds the lock");
-  assert.equal(lock.token, config.token);
+  assert.deepEqual(lockEntries(files.lockDir), [`${config.token}.json`], "held under the runner's token");
+  assert.equal(config.lockDir, files.lockDir);
 
   // A second session meanwhile: locked, nothing spawned.
   const second = mockSpawn();
@@ -366,7 +402,7 @@ test("a runner that cannot start is a recorded failure and frees the lock", asyn
     const last = readUpdateState(files.stateFile).last;
     assert.equal(last.status, "failed", mode);
     assert.match(last.error, /could not start the installer/);
-    assert.equal(fs.existsSync(files.lockFile), false, mode);
+    assert.deepEqual(lockEntries(files.lockDir), [], mode);
   }
 });
 
@@ -501,6 +537,15 @@ if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
   process.on("SIGTERM", () => {});
   setInterval(() => {}, 1000);
 } else if (args[0] === "install") {
+  if (process.env.FAKE_NPM_DESCENDANT) {
+    // A lifecycle script that outlives npm, ignores SIGTERM and holds the pipes.
+    const { spawn } = require("node:child_process");
+    const kid = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 100)"], {
+      stdio: "inherit",
+    });
+    fs.writeFileSync(process.env.FAKE_NPM_DESCENDANT, String(kid.pid));
+    kid.unref();
+  }
   const code = Number(process.env.FAKE_NPM_EXIT || 0);
   if (code === 0) {
     const spec = args.find((a) => a.startsWith("claude-code-infinite@"));
@@ -517,14 +562,13 @@ if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
 
 function runRunner({
   global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot, hang = false,
-  timeoutMs = 30_000, killGraceMs, pipeGraceMs,
+  timeoutMs = 30_000, killGraceMs, pipeGraceMs, descendant = false,
 }) {
   const dir = tmpdir("ccc-au-run-");
   const npm = path.join(dir, "npm");
   fs.writeFileSync(npm, FAKE_NPM, { mode: 0o755 });
   const files = updateFiles(path.join(dir, "cfg"));
-  fs.mkdirSync(path.dirname(files.lockFile), { recursive: true });
-  fs.writeFileSync(files.lockFile, JSON.stringify({ token: "t1", startedAt: Date.now() }));
+  writeEntry(files.lockDir, { token: "t1", startedAt: Date.now(), pid: process.pid });
   const log = path.join(dir, "npm-calls.log");
   fs.writeFileSync(log, "");
   const config = {
@@ -540,13 +584,14 @@ function runRunner({
       FAKE_NPM_ROOT: reportedRoot ?? g.npmRoot,
       FAKE_NPM_EXIT: String(exit),
       ...(hang ? { FAKE_NPM_HANG: pidFile } : {}),
+      ...(descendant ? { FAKE_NPM_DESCENDANT: pidFile } : {}),
     },
     encoding: "utf8",
     timeout: 30_000,
   });
   assert.ok(result.status === 0 || result.status === 1, result.stderr);
   const calls = fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  return { files, calls, state: readUpdateState(files.stateFile), lockLeft: fs.existsSync(files.lockFile), pidFile };
+  return { files, calls, state: readUpdateState(files.stateFile), lockLeft: lockEntries(files.lockDir).length > 0, pidFile };
 }
 
 test("runner: installs exactly that version into this prefix, records ok, frees the lock", () => {
@@ -595,27 +640,6 @@ test("runner: re-validates the version and never calls npm for a hostile one", (
   assert.equal(lockLeft, false);
 });
 
-test("reclaiming serializes on a reclaim file; an orphaned one is cleared, not reclaimed through", () => {
-  const { lockFile } = filesIn();
-  const now = Date.now();
-  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
-  const staleLock = JSON.stringify({ token: "dead", startedAt: now - 60_000, pid: dead });
-  fs.writeFileSync(lockFile, staleLock);
-  // Another session is reclaiming right now: stay out.
-  fs.writeFileSync(`${lockFile}.reclaim`, JSON.stringify({ token: "r", startedAt: now, pid: process.pid }));
-  assert.equal(acquireUpdateLock(lockFile, now), null);
-  assert.equal(fs.readFileSync(lockFile, "utf8"), staleLock, "the lock was not touched");
-  // Its holder crashed inside that window: the next try clears it and still yields...
-  fs.writeFileSync(`${lockFile}.reclaim`, JSON.stringify({ token: "r", startedAt: now - 60_000, pid: dead }));
-  assert.equal(acquireUpdateLock(lockFile, now), null);
-  assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
-  // ...and the one after reclaims the stale lock, leaving no reclaim file.
-  const token = acquireUpdateLock(lockFile, now);
-  assert.ok(token);
-  assert.equal(JSON.parse(fs.readFileSync(lockFile, "utf8")).token, token);
-  assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
-});
-
 test("the plan is rechecked under the lock: racing sessions cannot bypass backoff or downgrade", () => {
   const g = makeGlobal();
   const files = filesIn();
@@ -626,7 +650,7 @@ test("the plan is rechecked under the lock: racing sessions cannot bypass backof
   assert.deepEqual(results, ["spawn-failed", "skipped", "skipped"]);
   assert.equal(calls.length, 1);
   assert.deepEqual(readUpdateState(files.stateFile).attempts, { "1.0.21": 1 });
-  assert.equal(fs.existsSync(files.lockFile), false, "a skip frees the lock");
+  assert.deepEqual(lockEntries(files.lockDir), [], "a skip frees the lock");
 
   // Someone installed 1.0.22 after this session planned 1.0.21.
   const newer = makeGlobal();
@@ -649,4 +673,15 @@ test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the l
   assert.equal(lockLeft, false);
   const pid = Number(fs.readFileSync(pidFile, "utf8"));
   assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
+});
+
+test("runner: a descendant npm leaves behind is reaped before the lock is freed", () => {
+  const g = makeGlobal();
+  const { state, lockLeft, pidFile } = runRunner({
+    global: g, descendant: true, killGraceMs: 300, pipeGraceMs: 300,
+  });
+  assert.equal(state.last.status, "ok", state.last.error);
+  assert.equal(lockLeft, false);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.throws(() => process.kill(pid, 0), /ESRCH/, "the SIGTERM-ignoring descendant is gone");
 });

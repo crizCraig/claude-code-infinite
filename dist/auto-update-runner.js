@@ -13,10 +13,14 @@
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
- * Bounded: npm runs in its own process group and a timeout sends the group
- * SIGTERM, then SIGKILL; a hard deadline (and SIGTERM/SIGINT/SIGHUP to the
- * runner) records a failure, frees the lock and exits, so the lock's stale
- * age (auto-update.ts UPDATE_LOCK_STALE_MS) is never reached by a live runner.
+ * Bounded: each npm command runs in its own process group, recorded in the
+ * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,
+ * then SIGKILL, until no member is left, so a descendant that outlives npm
+ * cannot go on writing the package. The lock is released only once the group
+ * is confirmed gone; otherwise the entry stays live for as long as the group
+ * is (update-lock.ts). A hard deadline and SIGTERM/SIGINT/SIGHUP to the runner
+ * kill the group, record a failure and exit, so the lock's stale age is never
+ * reached by a live runner.
  */
 export const RUNNER_SOURCE = String.raw `"use strict";
 const { spawn } = require("node:child_process");
@@ -29,21 +33,17 @@ const ROOT_TIMEOUT_MS = 60000;
 const cfg = JSON.parse(process.argv[1]);
 const KILL_GRACE_MS = cfg.killGraceMs || 10000;
 const PIPE_GRACE_MS = cfg.pipeGraceMs || 5000;
+const ENTRY = path.join(cfg.lockDir, cfg.token + ".json");
 let logFd = null;
-let current = null;
+let group = null;
 let done = false;
 
-// Hard deadline: whatever npm does, this process records a result, frees the
-// lock and exits, so a live holder never outlasts the lock's stale age.
-const DEADLINE_MS = ROOT_TIMEOUT_MS + cfg.timeoutMs + 2 * (KILL_GRACE_MS + PIPE_GRACE_MS) + 30000;
+// Hard deadline: whatever npm does, this process kills its group, records a
+// result and exits, so a live holder never outlasts the lock's stale age.
+const DEADLINE_MS = ROOT_TIMEOUT_MS + cfg.timeoutMs + 2 * (2 * KILL_GRACE_MS + 2 * PIPE_GRACE_MS) + 30000;
 setTimeout(() => abort("runner deadline passed"), DEADLINE_MS);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => abort("runner stopped by " + signal));
-}
-
-function abort(reason) {
-  if (current) killGroup(current, "SIGKILL");
-  finishRun("failed", reason);
 }
 
 function note(line) {
@@ -52,21 +52,67 @@ function note(line) {
   } catch {}
 }
 
-// npm runs in its own process group, so a timeout reaches everything it
-// started: SIGTERM, then SIGKILL, then give up waiting on its pipes.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function groupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+function signalGroup(pgid, signal) {
+  try { process.kill(-pgid, signal); } catch {}
+}
+
+async function goneWithin(pgid, ms) {
+  const until = Date.now() + ms;
+  while (groupAlive(pgid)) {
+    if (Date.now() >= until) return false;
+    await sleep(100);
+  }
+  return true;
+}
+
+// Every member of the command's group, not only npm: SIGTERM, then SIGKILL.
+async function reapGroup(pgid) {
+  if (!groupAlive(pgid)) return true;
+  signalGroup(pgid, "SIGTERM");
+  if (await goneWithin(pgid, KILL_GRACE_MS)) return true;
+  signalGroup(pgid, "SIGKILL");
+  return goneWithin(pgid, PIPE_GRACE_MS);
+}
+
+// The lock entry names the group while it may be alive (update-lock.ts).
+function recordGroup(pgid) {
+  try {
+    const entry = JSON.parse(fs.readFileSync(ENTRY, "utf8"));
+    if (!entry || entry.token !== cfg.token) return;
+    entry.pid = process.pid;
+    if (pgid === null) delete entry.group; else entry.group = pgid;
+    const tmp = path.join(cfg.lockDir, "." + cfg.token + "." + process.pid + ".tmp");
+    fs.writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
+    fs.renameSync(tmp, ENTRY);
+  } catch {}
+}
+
+// Resolves when the command is over: it closed, it exited (its pipes are not
+// waited on for long), or it timed out. The caller then reaps its group.
 function run(command, args, timeoutMs, capture) {
   return new Promise((resolve) => {
     let out = "";
-    let timedOut = false;
     let settled = false;
     let child;
     const timers = [];
     const finish = (result) => {
       if (settled) return;
       settled = true;
-      current = null;
       timers.forEach(clearTimeout);
-      resolve(Object.assign({ timedOut, out }, result));
+      resolve(Object.assign({ out, pgid: child ? child.pid : null }, result));
     };
     try {
       child = spawn(command, args, {
@@ -76,16 +122,14 @@ function run(command, args, timeoutMs, capture) {
         detached: true,
       });
     } catch (err) {
-      resolve({ code: null, error: String(err), out: "" });
+      finish({ code: null, error: String(err) });
       return;
     }
-    current = child;
-    timers.push(setTimeout(() => {
-      timedOut = true;
-      killGroup(child, "SIGTERM");
-      timers.push(setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS));
-      timers.push(setTimeout(() => finish({ code: null, signal: "SIGKILL" }), KILL_GRACE_MS + PIPE_GRACE_MS));
-    }, timeoutMs));
+    if (child.pid) {
+      group = child.pid;
+      recordGroup(group);
+    }
+    timers.push(setTimeout(() => finish({ code: null, timedOut: true }), timeoutMs));
     const logChunk = (chunk) => {
       try { if (logFd !== null) fs.writeSync(logFd, chunk); } catch {}
     };
@@ -95,7 +139,6 @@ function run(command, args, timeoutMs, capture) {
     });
     child.stderr.on("data", logChunk);
     child.on("error", (err) => finish({ code: null, error: String(err) }));
-    // A descendant holding the pipes open must not keep us waiting for close.
     child.on("exit", (code, signal) => {
       timers.push(setTimeout(() => finish({ code, signal }), PIPE_GRACE_MS));
     });
@@ -103,12 +146,19 @@ function run(command, args, timeoutMs, capture) {
   });
 }
 
-function killGroup(child, signal) {
-  try {
-    process.kill(-child.pid, signal);
-  } catch {
-    try { child.kill(signal); } catch {}
+// Run a command and make sure nothing it started is left running.
+async function runReaped(command, args, timeoutMs, capture) {
+  const result = await run(command, args, timeoutMs, capture);
+  if (result.pgid) {
+    if (!(await reapGroup(result.pgid))) {
+      const err = new Error("could not stop npm's processes (group " + result.pgid + ")");
+      err.groupAlive = true;
+      throw err;
+    }
+    group = null;
+    recordGroup(null);
   }
+  return result;
 }
 
 function realpath(p) {
@@ -124,7 +174,7 @@ function describe(result, what) {
 
 async function install() {
   if (!VERSION_RE.test(cfg.version)) throw new Error("refusing version " + JSON.stringify(cfg.version));
-  const rootRun = await run(cfg.npm, ["root", "--global"], ROOT_TIMEOUT_MS, true);
+  const rootRun = await runReaped(cfg.npm, ["root", "--global"], ROOT_TIMEOUT_MS, true);
   const rootFailure = describe(rootRun, "npm root -g");
   if (rootFailure) throw new Error(rootFailure);
   const npmRoot = realpath(rootRun.out.trim());
@@ -137,7 +187,7 @@ async function install() {
   const spec = cfg.packageName + "@" + cfg.version;
   const args = ["install", "--global", "--prefix=" + cfg.prefix, spec, "--no-fund", "--no-audit"];
   note("npm " + args.join(" "));
-  const failure = describe(await run(cfg.npm, args, cfg.timeoutMs, false), "npm install");
+  const failure = describe(await runReaped(cfg.npm, args, cfg.timeoutMs, false), "npm install");
   if (failure) throw new Error(failure);
   const pkg = JSON.parse(fs.readFileSync(path.join(cfg.packageDir, "package.json"), "utf8"));
   if (pkg.version !== cfg.version) throw new Error("installed version is " + pkg.version);
@@ -157,24 +207,33 @@ function record(status, error) {
   }
 }
 
-function releaseLock() {
-  try {
-    const held = JSON.parse(fs.readFileSync(cfg.lockFile, "utf8"));
-    if (held && held.token === cfg.token) fs.rmSync(cfg.lockFile, { force: true });
-  } catch {}
-}
-
+// Record, release the lock unless npm's group may still be alive (its entry
+// then stays live exactly as long as the group: update-lock.ts), and exit.
 function finishRun(status, error) {
   if (done) return;
   done = true;
   note(status === "ok" ? "installed " + cfg.version : "failed: " + error);
   record(status, error);
-  releaseLock();
+  if (group === null || !groupAlive(group)) {
+    try { fs.rmSync(ENTRY, { force: true }); } catch {}
+  } else {
+    note("npm's processes are still exiting; the lock stays held until they are gone");
+  }
   try { if (logFd !== null) fs.closeSync(logFd); } catch {}
   process.exit(status === "ok" ? 0 : 1);
 }
 
+async function abort(reason) {
+  if (done) return;
+  if (group !== null) {
+    signalGroup(group, "SIGKILL");
+    await goneWithin(group, 2000);
+  }
+  finishRun("failed", reason);
+}
+
 (async () => {
+  recordGroup(null); // the lock's holder is this runner from now on
   try { logFd = fs.openSync(cfg.logFile, "w", 0o600); } catch {}
   note("installing " + cfg.packageName + "@" + cfg.version + " into " + cfg.prefix);
   try {
