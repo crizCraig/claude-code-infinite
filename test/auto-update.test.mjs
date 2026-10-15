@@ -10,6 +10,7 @@ import {
   UPDATE_LOCK_STALE_MS,
   acquireUpdateLock,
   autoUpdateEnabled,
+  liveLockSince,
   detectInstallMethod,
   planAutoUpdate,
   readUpdateState,
@@ -308,7 +309,7 @@ test("two acquirers that both wrote before looking both back off; never two owne
   assert.deepEqual(lockEntries(lockDir), ["b.json"], "A left nothing behind");
 });
 
-test("stale entries: holder and npm group gone, or older than any runner can live", () => {
+test("an entry is stale only when every process it names is gone, however old", () => {
   const { lockDir } = filesIn();
   const now = Date.now();
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
@@ -319,12 +320,13 @@ test("stale entries: holder and npm group gone, or older than any runner can liv
     if (token) releaseUpdateLock(lockDir, token);
     return token !== null;
   };
-  assert.equal(tryWith({ token: "live-20m", startedAt: now - 20 * 60_000, pid: process.pid }), false,
-    "a live installer is never reclaimed by age alone");
-  assert.equal(tryWith({ token: "old", startedAt: now - UPDATE_LOCK_STALE_MS - 1, pid: process.pid }), true,
-    "older than any runner can live: a reused pid");
-  assert.equal(tryWith({ token: "dead", startedAt: now - 60_000, pid: dead }), true, "holder exited");
-  assert.equal(tryWith({ token: "young", startedAt: now - 5_000, pid: dead }), false, "startup grace");
+  assert.equal(tryWith({ token: "live-20m", startedAt: now - 20 * 60_000, pid: process.pid }), false);
+  assert.equal(tryWith({ token: "old", startedAt: now - 3 * UPDATE_LOCK_STALE_MS, pid: process.pid }), false,
+    "never taken from a live process by age");
+  assert.equal(tryWith({ token: "dead", startedAt: now - 60_000, pid: dead }), true, "launcher exited");
+  assert.equal(tryWith({ token: "young", startedAt: now, pid: dead }), true, "no grace needed: it names its processes");
+  // The launcher exited, the runner it handed over to has not run a line yet.
+  assert.equal(tryWith({ token: "handed", startedAt: now - 60_000, pid: dead, runner: process.pid }), false);
   // The runner died but npm's group lives on: still held.
   const npmGroup = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
   try {
@@ -383,6 +385,8 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   assert.deepEqual(state.attempts, { "1.0.21": 1 });
   assert.equal(state.last.status, "running");
   assert.deepEqual(lockEntries(files.lockDir), [`${config.token}.json`], "held under the runner's token");
+  const entry = JSON.parse(fs.readFileSync(path.join(files.lockDir, `${config.token}.json`), "utf8"));
+  assert.equal(entry.runner, 777, "handed over to the runner right after spawning it");
   assert.equal(config.lockDir, files.lockDir);
 
   // A second session meanwhile: locked, nothing spawned.
@@ -529,10 +533,25 @@ const path = require("node:path");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_NPM_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "root") {
-  process.stdout.write(process.env.FAKE_NPM_ROOT + "\\n");
-  process.exit(0);
-}
-if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
+  if (process.env.FAKE_NPM_ABORT) {
+    // A descendant that, when the runner reaps it, stops the runner (SIGTERM).
+    const { spawn } = require("node:child_process");
+    const runner = process.ppid;
+    const kid = spawn(process.execPath, ["-e",
+      "process.on('SIGTERM', () => { try { process.kill(" + runner + ", 'SIGTERM'); } catch {} });" +
+      "process.stdout.write('ready'); setInterval(() => {}, 100)",
+    ], { stdio: ["ignore", "pipe", "ignore"] });
+    kid.stdout.once("data", () => {
+      kid.stdout.destroy();
+      kid.unref();
+      process.stdout.write(process.env.FAKE_NPM_ROOT + "\\n");
+      process.exit(0);
+    });
+  } else {
+    process.stdout.write(process.env.FAKE_NPM_ROOT + "\\n");
+    process.exit(0);
+  }
+} else if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
   fs.writeFileSync(process.env.FAKE_NPM_HANG, String(process.pid));
   process.on("SIGTERM", () => {});
   setInterval(() => {}, 1000);
@@ -560,23 +579,25 @@ if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
 }
 `;
 
-function runRunner({
+async function runRunner({
   global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot, hang = false,
   timeoutMs = 30_000, killGraceMs, pipeGraceMs, descendant = false,
+  handoff = "ok", handoffMs, abortDuringRoot = false,
 }) {
   const dir = tmpdir("ccc-au-run-");
   const npm = path.join(dir, "npm");
   fs.writeFileSync(npm, FAKE_NPM, { mode: 0o755 });
   const files = updateFiles(path.join(dir, "cfg"));
-  writeEntry(files.lockDir, { token: "t1", startedAt: Date.now(), pid: process.pid });
+  const entry = { token: "t1", startedAt: Date.now(), pid: process.pid };
+  if (handoff !== "lost") writeEntry(files.lockDir, entry);
   const log = path.join(dir, "npm-calls.log");
   fs.writeFileSync(log, "");
   const config = {
     npm, packageName: PKG, version, packageDir: g.packageDir, npmRoot: npmRoot ?? g.npmRoot,
-    prefix: g.prefix, ...files, token: "t1", timeoutMs, killGraceMs, pipeGraceMs,
+    prefix: g.prefix, ...files, token: "t1", timeoutMs, killGraceMs, pipeGraceMs, handoffMs,
   };
   const pidFile = path.join(dir, "npm.pid");
-  const result = spawnSync(process.execPath, ["-e", RUNNER_SOURCE, JSON.stringify(config)], {
+  const child = spawn(process.execPath, ["-e", RUNNER_SOURCE, JSON.stringify(config)], {
     env: {
       ...process.env,
       PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`,
@@ -585,18 +606,23 @@ function runRunner({
       FAKE_NPM_EXIT: String(exit),
       ...(hang ? { FAKE_NPM_HANG: pidFile } : {}),
       ...(descendant ? { FAKE_NPM_DESCENDANT: pidFile } : {}),
+      ...(abortDuringRoot ? { FAKE_NPM_ABORT: "1" } : {}),
     },
-    encoding: "utf8",
-    timeout: 30_000,
+    stdio: ["ignore", "ignore", "pipe"],
   });
-  assert.ok(result.status === 0 || result.status === 1, result.stderr);
+  let stderr = "";
+  child.stderr.on("data", (c) => (stderr += c));
+  // The launcher's handoff (startAutoUpdateInstall does the same via setLockRunner).
+  if (handoff === "ok") writeEntry(files.lockDir, { ...entry, runner: child.pid });
+  const status = await new Promise((resolve) => child.on("close", (code) => resolve(code)));
+  assert.ok(status === 0 || status === 1, stderr);
   const calls = fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
   return { files, calls, state: readUpdateState(files.stateFile), lockLeft: lockEntries(files.lockDir).length > 0, pidFile };
 }
 
-test("runner: installs exactly that version into this prefix, records ok, frees the lock", () => {
+test("runner: installs exactly that version into this prefix, records ok, frees the lock", async () => {
   const g = makeGlobal();
-  const { calls, state, lockLeft, files } = runRunner({ global: g });
+  const { calls, state, lockLeft, files } = await runRunner({ global: g });
   assert.deepEqual(calls[0], ["root", "--global"]);
   assert.deepEqual(calls[1], [
     "install", "--global", `--prefix=${g.prefix}`, `${PKG}@1.0.21`, "--no-fund", "--no-audit",
@@ -607,17 +633,17 @@ test("runner: installs exactly that version into this prefix, records ok, frees 
   assert.match(fs.readFileSync(files.logFile, "utf8"), /fake npm install[\s\S]*installed 1\.0\.21/);
 });
 
-test("runner: npm failure is recorded and frees the lock", () => {
-  const { state, lockLeft } = runRunner({ global: makeGlobal(), exit: 1 });
+test("runner: npm failure is recorded and frees the lock", async () => {
+  const { state, lockLeft } = await runRunner({ global: makeGlobal(), exit: 1 });
   assert.equal(state.last.status, "failed");
   assert.match(state.last.error, /npm install exited with 1/);
   assert.equal(lockLeft, false);
 });
 
-test("runner: a different npm root or a linked entry installs nothing", () => {
+test("runner: a different npm root or a linked entry installs nothing", async () => {
   const g = makeGlobal();
   const elsewhere = makeGlobal();
-  const wrong = runRunner({ global: g, reportedRoot: elsewhere.npmRoot });
+  const wrong = await runRunner({ global: g, reportedRoot: elsewhere.npmRoot });
   assert.match(wrong.state.last.error, /wrong prefix/);
   assert.deepEqual(wrong.calls.map((c) => c[0]), ["root"], "never ran install");
 
@@ -627,14 +653,14 @@ test("runner: a different npm root or a linked entry installs nothing", () => {
   fs.rmSync(linked.packageDir, { recursive: true });
   const checkout = makePackage(path.join(root, "src", PKG));
   fs.symlinkSync(checkout, linked.packageDir);
-  const result = runRunner({ global: { ...linked, packageDir: checkout } });
+  const result = await runRunner({ global: { ...linked, packageDir: checkout } });
   assert.match(result.state.last.error, /symlink \(npm link\)/);
   assert.deepEqual(result.calls.map((c) => c[0]), ["root"]);
   assert.equal(JSON.parse(fs.readFileSync(path.join(checkout, "package.json"), "utf8")).version, "1.0.20");
 });
 
-test("runner: re-validates the version and never calls npm for a hostile one", () => {
-  const { state, calls, lockLeft } = runRunner({ global: makeGlobal(), version: "1.0.21; touch /tmp/x" });
+test("runner: re-validates the version and never calls npm for a hostile one", async () => {
+  const { state, calls, lockLeft } = await runRunner({ global: makeGlobal(), version: "1.0.21; touch /tmp/x" });
   assert.equal(state.last, undefined, "a hostile version is not even recorded as an attempt");
   assert.deepEqual(calls, []);
   assert.equal(lockLeft, false);
@@ -661,10 +687,10 @@ test("the plan is rechecked under the lock: racing sessions cannot bypass backof
   assert.equal(second.calls.length, 0);
 });
 
-test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", () => {
+test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", async () => {
   const g = makeGlobal();
   const started = Date.now();
-  const { state, lockLeft, pidFile } = runRunner({
+  const { state, lockLeft, pidFile } = await runRunner({
     global: g, hang: true, timeoutMs: 300, killGraceMs: 300, pipeGraceMs: 300,
   });
   assert.ok(Date.now() - started < 20_000, "bounded");
@@ -675,13 +701,46 @@ test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the l
   assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
 });
 
-test("runner: a descendant npm leaves behind is reaped before the lock is freed", () => {
+test("runner: a descendant npm leaves behind is reaped before the lock is freed", async () => {
   const g = makeGlobal();
-  const { state, lockLeft, pidFile } = runRunner({
+  const { state, lockLeft, pidFile } = await runRunner({
     global: g, descendant: true, killGraceMs: 300, pipeGraceMs: 300,
   });
   assert.equal(state.last.status, "ok", state.last.error);
   assert.equal(lockLeft, false);
   const pid = Number(fs.readFileSync(pidFile, "utf8"));
   assert.throws(() => process.kill(pid, 0), /ESRCH/, "the SIGTERM-ignoring descendant is gone");
+});
+
+test("a lock held for over an hour (stuck installer or reused pid) falls back to the hint", () => {
+  const { lockDir } = filesIn();
+  const now = Date.now();
+  assert.equal(liveLockSince(lockDir, now), null);
+  writeEntry(lockDir, { token: "stuck", startedAt: now - 2 * UPDATE_LOCK_STALE_MS, pid: process.pid });
+  assert.equal(liveLockSince(lockDir, now), now - 2 * UPDATE_LOCK_STALE_MS);
+  const g = makeGlobal();
+  assert.match(plan({ global: g, now, lockHeldSince: now - 2 * UPDATE_LOCK_STALE_MS }).reason, /held for over an hour/);
+  assert.equal(plan({ global: g, now, lockHeldSince: now - 60_000 }).action, "install", "another session installing now");
+  const s = setup(g.packageDir, { configDir: path.dirname(lockDir) });
+  assert.deepEqual(s.bannerUpdate, UPDATE, "the hint shows");
+});
+
+test("runner: without the launcher's handoff it installs nothing", async () => {
+  const lost = await runRunner({ global: makeGlobal(), handoff: "lost" });
+  assert.deepEqual(lost.calls, [], "the entry was reclaimed: not ours");
+  assert.equal(lost.state.last, undefined, "and records nothing over the new owner's state");
+  const never = await runRunner({ global: makeGlobal(), handoff: "never", handoffMs: 200 });
+  assert.deepEqual(never.calls, []);
+  assert.match(never.state.last.error, /never handed over/);
+  assert.equal(never.lockLeft, false);
+});
+
+test("runner: stopped while reaping npm root, it starts no further npm command", async () => {
+  const { calls, state, lockLeft } = await runRunner({
+    global: makeGlobal(), abortDuringRoot: true, killGraceMs: 300, pipeGraceMs: 300,
+  });
+  assert.deepEqual(calls.map((c) => c[0]), ["root"], "npm install never launched");
+  assert.equal(state.last.status, "failed");
+  assert.match(state.last.error, /runner stopped by SIGTERM/);
+  assert.equal(lockLeft, false);
 });

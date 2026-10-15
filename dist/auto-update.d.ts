@@ -21,7 +21,7 @@
  * modules at startup, and the hooks it registers are HTTP calls into it or
  * files in its own temp plugin dir. See README "Automatic updates".
  */
-export { UPDATE_LOCK_STALE_MS, acquireUpdateLock, releaseUpdateLock } from "./update-lock.js";
+export { UPDATE_LOCK_STALE_MS, acquireUpdateLock, liveLockSince, releaseUpdateLock, } from "./update-lock.js";
 import { type UpdateAvailable, type UpdateCheckConfig } from "./update-check.js";
 export declare const DISABLE_AUTOUPDATE_ENV = "CCC_DISABLE_AUTOUPDATE";
 /** Claude Code's own opt-out, honored too. */
@@ -93,6 +93,8 @@ export interface PlanOptions {
     now: number;
     /** The version in the package's package.json now (may be newer than running). */
     installedVersion: string | null;
+    /** liveLockSince: when the install lock was taken, if it is held. */
+    lockHeldSince?: number | null;
 }
 export interface UpdateFiles {
     stateFile: string;

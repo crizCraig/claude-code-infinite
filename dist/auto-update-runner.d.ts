@@ -7,6 +7,12 @@
  * It outlives the ccc that started it (detached, own process group), records
  * the result in update-state.json and releases the lock by its token.
  *
+ * Ownership: the launcher created this runner's lock entry and records the
+ * runner's pid in it right after spawning; the runner waits for that handoff,
+ * exits without touching anything if the entry is gone, and re-checks the
+ * entry before every npm command. Once stopping (abort or lost lock) it never
+ * starts another command.
+ *
  * Steps: re-validate the version; confirm `npm root -g` is the directory this
  * ccc lives in and that the entry there is not a symlink (an `npm link`); run
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
@@ -36,6 +42,8 @@ export interface RunnerConfig {
     logFile: string;
     token: string;
     timeoutMs: number;
+    /** Test-only: how long to wait for the launcher's handoff (default 10 s). */
+    handoffMs?: number;
     /** Test-only: SIGTERM→SIGKILL and SIGKILL→give-up waits (default 10 s, 5 s). */
     killGraceMs?: number;
     pipeGraceMs?: number;

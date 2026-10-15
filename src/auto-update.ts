@@ -30,10 +30,17 @@ import { RUNNER_SOURCE, type RunnerConfig } from "./auto-update-runner.js";
 import {
   UPDATE_LOCK_STALE_MS,
   acquireUpdateLock,
+  liveLockSince,
   releaseUpdateLock,
+  setLockRunner,
 } from "./update-lock.js";
 
-export { UPDATE_LOCK_STALE_MS, acquireUpdateLock, releaseUpdateLock } from "./update-lock.js";
+export {
+  UPDATE_LOCK_STALE_MS,
+  acquireUpdateLock,
+  liveLockSince,
+  releaseUpdateLock,
+} from "./update-lock.js";
 import {
   PACKAGE_NAME,
   compareVersions,
@@ -134,6 +141,8 @@ export interface PlanOptions {
   now: number;
   /** The version in the package's package.json now (may be newer than running). */
   installedVersion: string | null;
+  /** liveLockSince: when the install lock was taken, if it is held. */
+  lockHeldSince?: number | null;
 }
 
 export interface UpdateFiles {
@@ -212,6 +221,11 @@ export function planAutoUpdate(opts: PlanOptions): AutoUpdateDecision {
   }
   const blocked = attemptBlocked(opts.state, version, opts.now);
   if (blocked) return { action: "skip", reason: blocked };
+  const heldSince = opts.lockHeldSince ?? null;
+  if (heldSince !== null && opts.now - heldSince > UPDATE_LOCK_STALE_MS) {
+    // A live entry this old is a stuck installer or a reused pid: say so with the hint.
+    return { action: "skip", reason: "the install lock has been held for over an hour" };
+  }
   return { action: "install", version, method: opts.method };
 }
 
@@ -244,6 +258,8 @@ export function startAutoUpdateInstall(opts: StartInstallOptions): StartInstallR
     );
     child.on("error", (err) => spawnFailed(opts.files, token, version, packageDir, err));
     child.unref();
+    // The handoff the runner waits for: without it the runner never installs.
+    if (child.pid !== undefined) setLockRunner(opts.files.lockDir, token, child.pid);
     return "started";
   } catch (err) {
     spawnFailed(opts.files, token, version, packageDir, err);

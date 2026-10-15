@@ -10,29 +10,34 @@
  * owns or may be creating: an entry is removed only by its owner, or by anyone
  * once it is stale, and a stale entry's owner is gone and never writes again.
  *
- * Each entry has one writer at a time: the launching ccc creates it, then the
- * runner (which owns it from then on) records its own pid and npm's group.
- * An entry is live while its holder process (the runner, once started) or the
- * npm process group it recorded is alive. The runner kills that group and
- * exits by a hard deadline (auto-update-runner.ts), so an entry older than
- * UPDATE_LOCK_STALE_MS whose pid still answers belongs to a reused pid.
+ * Each entry has one writer at a time. The launching ccc creates it and,
+ * right after spawning the runner, records the runner's pid; the runner waits
+ * for that handoff before it writes or runs anything (auto-update-runner.ts),
+ * and from then on owns the entry, adding npm's process group while one runs.
+ * An entry is live while any process it names is alive (the launcher, the
+ * runner, or npm's group), however old: a lock is never taken from a live
+ * installer by age. A pid reused by an unrelated process can keep it held;
+ * callers treat a lock held for over UPDATE_LOCK_STALE_MS as stuck and fall
+ * back to the update hint (auto-update.ts).
  */
 
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-/** Longer than any runner can live (install timeout + kill graces + deadline). */
+/** Longer than a healthy runner lives (install timeout + kill graces + deadline). */
 export const UPDATE_LOCK_STALE_MS = 60 * 60 * 1000;
-/** A fresh entry whose holder is gone is stale only after this (startup grace). */
+/** An unreadable entry (never written whole) is garbage only after this. */
 export const DEAD_HOLDER_GRACE_MS = 30 * 1000;
 const ENTRY_SUFFIX = ".json";
 
 export interface LockEntry {
   token: string;
   startedAt: number;
-  /** The holder: the launching ccc, then the runner. */
+  /** The launching ccc (or the runner, once it owns the entry). */
   pid?: number;
+  /** The runner, recorded by the launcher right after spawning it. */
+  runner?: number;
   /** The npm process group the runner started, while it may be alive. */
   group?: number;
 }
@@ -54,6 +59,22 @@ export function acquireUpdateLock(lockDir: string, now: number): string | null {
 export function releaseUpdateLock(lockDir: string, token: string): void {
   if (!/^[0-9a-f-]{36}$/.test(token)) return;
   fs.rmSync(entryPath(lockDir, token), { force: true });
+}
+
+/**
+ * The launcher's one write after creating the entry: the runner's pid, so the
+ * entry stays live while the runner exists, even before it has run a line.
+ */
+export function setLockRunner(lockDir: string, token: string, runnerPid: number): boolean {
+  const entry = readEntry(entryPath(lockDir, token))?.data;
+  if (entry?.token !== token) return false;
+  return writeLockEntry(lockDir, { ...entry, runner: runnerPid });
+}
+
+/** When the oldest live entry was taken, or null when the lock is free. */
+export function liveLockSince(lockDir: string, now: number): number | null {
+  const live = otherEntries(lockDir, "").filter((e) => e.data && !entryIsStale(e, now));
+  return live.length ? Math.min(...live.map((e) => e.data!.startedAt)) : null;
 }
 
 export function entryPath(lockDir: string, token: string): string {
@@ -105,20 +126,27 @@ function readEntry(file: string): ReadEntry | null {
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
     if (typeof data?.token !== "string" || typeof data.startedAt !== "number") return { file, data: null, mtimeMs };
     const int = (v: unknown) => (Number.isInteger(v) && (v as number) > 0 ? (v as number) : undefined);
-    return { file, data: { token: data.token, startedAt: data.startedAt, pid: int(data.pid), group: int(data.group) }, mtimeMs };
+    const entry: LockEntry = {
+      token: data.token,
+      startedAt: data.startedAt,
+      pid: int(data.pid),
+      runner: int(data.runner),
+      group: int(data.group),
+    };
+    return { file, data: entry, mtimeMs };
   } catch {
     return { file, data: null, mtimeMs };
   }
 }
 
+/** Stale only when no process it names is alive (or it was never written whole). */
 function entryIsStale(entry: ReadEntry, now: number): boolean {
-  if (entry.data === null) return now - entry.mtimeMs > DEAD_HOLDER_GRACE_MS; // never written whole
-  const age = now - entry.data.startedAt;
-  if (age > UPDATE_LOCK_STALE_MS || age < -UPDATE_LOCK_STALE_MS) return true;
-  if (age <= DEAD_HOLDER_GRACE_MS) return false;
-  const holderAlive = entry.data.pid !== undefined && processAlive(entry.data.pid);
-  const groupAlive = entry.data.group !== undefined && processAlive(-entry.data.group);
-  return !holderAlive && !groupAlive;
+  if (entry.data === null) return now - entry.mtimeMs > DEAD_HOLDER_GRACE_MS;
+  const { pid, runner, group } = entry.data;
+  if (pid !== undefined && processAlive(pid)) return false;
+  if (runner !== undefined && processAlive(runner)) return false;
+  if (group !== undefined && processAlive(-group)) return false;
+  return true;
 }
 
 /** Signal 0 to a pid (or, negative, a process group). */

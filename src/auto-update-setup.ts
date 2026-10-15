@@ -11,6 +11,7 @@ import {
   AutoUpdateNotices,
   PACKAGE_DIR,
   detectInstallMethod,
+  liveLockSince,
   planAutoUpdate,
   readInstalledVersion,
   readUpdateState,
@@ -70,6 +71,7 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
         config: opts.config,
         now: now(),
         installedVersion: readInstalledVersion(method.packageDir),
+        lockHeldSince: liveLockSince(files.lockDir, now()),
       })
     : ({ action: "skip", reason: "no update available" } as const);
   const notices = new AutoUpdateNotices({

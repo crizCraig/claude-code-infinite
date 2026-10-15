@@ -5,7 +5,7 @@
  * startup path).
  */
 import { spawn } from "node:child_process";
-import { AUTO_UPDATE_DELAY_MS, AutoUpdateNotices, PACKAGE_DIR, detectInstallMethod, planAutoUpdate, readInstalledVersion, readUpdateState, startAutoUpdateInstall, updateFiles, } from "./auto-update.js";
+import { AUTO_UPDATE_DELAY_MS, AutoUpdateNotices, PACKAGE_DIR, detectInstallMethod, liveLockSince, planAutoUpdate, readInstalledVersion, readUpdateState, startAutoUpdateInstall, updateFiles, } from "./auto-update.js";
 import { updateInstalledNoticeText, updateNoticeText } from "./notices.js";
 export function setupAutoUpdate(opts) {
     const env = opts.env ?? process.env;
@@ -22,6 +22,7 @@ export function setupAutoUpdate(opts) {
             config: opts.config,
             now: now(),
             installedVersion: readInstalledVersion(method.packageDir),
+            lockHeldSince: liveLockSince(files.lockDir, now()),
         })
         : { action: "skip", reason: "no update available" };
     const notices = new AutoUpdateNotices({

@@ -7,6 +7,12 @@
  * It outlives the ccc that started it (detached, own process group), records
  * the result in update-state.json and releases the lock by its token.
  *
+ * Ownership: the launcher created this runner's lock entry and records the
+ * runner's pid in it right after spawning; the runner waits for that handoff,
+ * exits without touching anything if the entry is gone, and re-checks the
+ * entry before every npm command. Once stopping (abort or lost lock) it never
+ * starts another command.
+ *
  * Steps: re-validate the version; confirm `npm root -g` is the directory this
  * ccc lives in and that the entry there is not a symlink (an `npm link`); run
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
@@ -34,9 +40,12 @@ const cfg = JSON.parse(process.argv[1]);
 const KILL_GRACE_MS = cfg.killGraceMs || 10000;
 const PIPE_GRACE_MS = cfg.pipeGraceMs || 5000;
 const ENTRY = path.join(cfg.lockDir, cfg.token + ".json");
+const HANDOFF_MS = cfg.handoffMs || 10000;
 let logFd = null;
 let group = null;
 let done = false;
+// Set first thing on abort or a lost lock: no command starts after it.
+let stopping = null;
 
 // Hard deadline: whatever npm does, this process kills its group, records a
 // result and exits, so a live holder never outlasts the lock's stale age.
@@ -89,15 +98,43 @@ async function reapGroup(pgid) {
 
 // The lock entry names the group while it may be alive (update-lock.ts).
 function recordGroup(pgid) {
+  const entry = readEntry();
+  if (!entry) {
+    stopping = stopping || "lost the install lock";
+    if (pgid !== null) signalGroup(pgid, "SIGKILL"); // started without the lock: stop it
+    return;
+  }
   try {
-    const entry = JSON.parse(fs.readFileSync(ENTRY, "utf8"));
-    if (!entry || entry.token !== cfg.token) return;
     entry.pid = process.pid;
+    entry.runner = process.pid;
     if (pgid === null) delete entry.group; else entry.group = pgid;
     const tmp = path.join(cfg.lockDir, "." + cfg.token + "." + process.pid + ".tmp");
     fs.writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
     fs.renameSync(tmp, ENTRY);
   } catch {}
+}
+
+function readEntry() {
+  try {
+    const entry = JSON.parse(fs.readFileSync(ENTRY, "utf8"));
+    return entry && entry.token === cfg.token ? entry : null;
+  } catch {
+    return null;
+  }
+}
+
+// The launcher records this runner's pid in the entry right after spawning
+// it; until then the entry is not provably ours. Gone means another session
+// took the lock: leave everything to it.
+async function awaitHandoff() {
+  const until = Date.now() + HANDOFF_MS;
+  for (;;) {
+    const entry = readEntry();
+    if (!entry) return "lost";
+    if (entry.runner === process.pid) return "ok";
+    if (Date.now() >= until) return "timeout";
+    await sleep(50);
+  }
 }
 
 // Resolves when the command is over: it closed, it exited (its pipes are not
@@ -114,6 +151,10 @@ function run(command, args, timeoutMs, capture) {
       timers.forEach(clearTimeout);
       resolve(Object.assign({ out, pgid: child ? child.pid : null }, result));
     };
+    if (stopping || !readEntry()) {
+      finish({ code: null, error: stopping || "lost the install lock" });
+      return;
+    }
     try {
       child = spawn(command, args, {
         cwd: os.homedir(),
@@ -213,7 +254,8 @@ function finishRun(status, error) {
   if (done) return;
   done = true;
   note(status === "ok" ? "installed " + cfg.version : "failed: " + error);
-  record(status, error);
+  // Without the lock the state belongs to whoever holds it now.
+  if (readEntry()) record(status, error);
   if (group === null || !groupAlive(group)) {
     try { fs.rmSync(ENTRY, { force: true }); } catch {}
   } else {
@@ -224,7 +266,8 @@ function finishRun(status, error) {
 }
 
 async function abort(reason) {
-  if (done) return;
+  if (done || stopping) return;
+  stopping = reason;
   if (group !== null) {
     signalGroup(group, "SIGKILL");
     await goneWithin(group, 2000);
@@ -233,6 +276,13 @@ async function abort(reason) {
 }
 
 (async () => {
+  const handoff = await awaitHandoff();
+  if (handoff === "lost") process.exit(1); // not ours: record nothing, touch nothing
+  if (handoff === "timeout") {
+    stopping = "the launcher never handed over the install lock";
+    finishRun("failed", stopping);
+    return;
+  }
   recordGroup(null); // the lock's holder is this runner from now on
   try { logFd = fs.openSync(cfg.logFile, "w", 0o600); } catch {}
   note("installing " + cfg.packageName + "@" + cfg.version + " into " + cfg.prefix);
