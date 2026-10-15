@@ -256,6 +256,29 @@ features, and their output, often the biggest source of tokens, is exactly what 
 For `ccc --resume <id>`, an automatic, best-effort repair can unblock a transcript whose last response already exceeds Claude Code’s local refusal limit. It changes only that response’s usage totals and the iteration Claude Code counts, after writing an exclusive, uniquely named backup under `~/.claude-code-infinite/transcript-backups`. Earlier iterations and conversation content stay intact. The installed Claude Code 2.1.288 computes its blocking limit as the context window minus the output allowance (capped at 20,000) minus 3,000 tokens: 977,000 for the supported 1M models. Other versions use the conservative full-window threshold. The window comes from ccc’s model table, explicit `[1m]` transcript model signals, and any `--model` or `ANTHROPIC_MODEL` override, conservatively keeping the largest supported window. A successful response with input already beyond that inferred window disproves the inference and is never repaired. Unknown model overrides (including unresolved aliases), models or usage shapes, threshold overrides, possible running writers, changed snapshots, backup collisions, and filesystem errors all skip repair and continue the original resume. Process and file checks are bounded; other running JavaScript runtimes may conservatively prevent repair.
 
 
+## Releasing
+
+Releases are staged by GitHub Actions through npm Trusted Publishing (OIDC), so no npm
+token, passkey or browser is needed to build and upload them, and each one is approved by a
+maintainer before it goes live:
+
+1. On a clean `main`, run `./publish.sh` (or `./publish.sh minor` / `major`). It builds,
+   checks that `dist/` is committed, runs `npm version`, and pushes the commit and the
+   `vX.Y.Z` tag.
+2. The tag push runs [`.github/workflows/publish.yml`](.github/workflows/publish.yml): `npm ci`,
+   the test suite with `NO_COLOR=1` and with `FORCE_COLOR=1`, a check that the rebuilt
+   `dist/` matches the commit and that the tag equals `package.json`'s version, then
+   `npm stage publish --provenance`.
+3. Approve the staged version (2FA) on
+   [npmjs.com](https://www.npmjs.com/package/claude-code-infinite) under the **Staged
+   Packages** tab, or with `npm stage list claude-code-infinite` and
+   `npm stage approve <stage-id>`. Until then it is not installable.
+
+The trusted publisher on npmjs.com is bound to the workflow file name `publish.yml` with no
+GitHub environment, and allows only staged publishing; renaming the workflow breaks it.
+`./publish.sh --local` is the fallback: it publishes directly from your machine with npm web
+auth, as before.
+
 ## Troubleshooting
 
 ### Anthropic auth errors (401s, login prompts)
