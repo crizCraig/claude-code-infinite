@@ -2997,12 +2997,18 @@ function withFlattenCacheBreakpoint(body, ttl) {
     if (messages.length !== 1)
         return messages;
     const only = messages[0];
-    const text = typeof only.content === "string" ? only.content : undefined;
-    if (text === undefined)
-        return messages;
     const cacheControl = { type: "ephemeral" };
     if (ttl !== undefined)
         cacheControl.ttl = ttl;
+    if (Array.isArray(only.content) && only.content.length > 0) {
+        // A flatten that kept images: the breakpoint goes on its last block.
+        const blocks = only.content.map((block) => ({ ...block }));
+        blocks[blocks.length - 1].cache_control = cacheControl;
+        return [{ ...only, content: blocks }];
+    }
+    const text = typeof only.content === "string" ? only.content : undefined;
+    if (text === undefined)
+        return messages;
     return [{ ...only, content: [{ type: "text", text, cache_control: cacheControl }] }];
 }
 /**

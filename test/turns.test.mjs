@@ -193,6 +193,30 @@ test("serverFlattenedMessages returns a fresh array, not the result's own", () =
   assert.notEqual(flat[0], result.flattened_messages[0]);
 });
 
+test("serverFlattenedMessages accepts a flatten that kept images (flatten_images)", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0K" } };
+  const content = [{ type: "text", text: "[USER]\nlook" }, image, { type: "text", text: "(tool_use_id=t1)" }];
+  const result = { messages: [], flattened_messages: [{ role: "user", content }] };
+  const flat = serverFlattenedMessages(result);
+  assert.deepEqual(flat, [{ role: "user", content }]);
+  assert.notEqual(flat[0].content, content, "fresh copy");
+  assert.notEqual(flat[0].content[1], image, "fresh blocks");
+  for (const bad of [
+    [{ type: "text", text: "no image" }],
+    [image, { type: "text", text: "  " }],
+    [{ type: "image", source: { type: "base64", media_type: "image/png", data: "" } }],
+    [{ type: "image", source: { type: "file", file_id: "f" } }],
+    [image, { type: "tool_result", tool_use_id: "t", content: "x" }],
+    [image, null],
+  ]) {
+    assert.equal(
+      serverFlattenedMessages({ messages: [], flattened_messages: [{ role: "user", content: bad }] }),
+      null,
+      `should reject ${JSON.stringify(bad)}`
+    );
+  }
+});
+
 test("serverFlattenedMessages rejects pre-flatten and malformed responses", () => {
   const base = { messages: [{ role: "user", content: "hi" }] };
   // Pre-flatten server: field absent entirely.
