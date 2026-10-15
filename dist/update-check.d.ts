@@ -1,8 +1,8 @@
 /**
  * Startup check for a newer claude-code-infinite release on npm.
  *
- * Detect-and-tell only: ccc is Claude Code's parent process, so a silent
- * `npm -g` write mid-session is never acceptable. The result is surfaced
+ * The check only detects; installing is auto-update.ts, which acts on this
+ * result in the background where that is safe. The result is surfaced
  * inside Claude Code through the SessionStart banner (see notices.ts) — the
  * pre-launch terminal is covered by the TUI within a second, so a line printed
  * there is never read. Bounded by a short timeout and silent on every failure
@@ -10,7 +10,8 @@
  * on the registry. The registry's answer is cached for a day, so most starts
  * make no request at all. `CCC_NO_UPDATE_CHECK=1` (or the older
  * `CCC_SKIP_UPDATE_CHECK=1`), or `"updateCheck": false` in
- * ~/.claude-code-infinite/config.json, disables the check entirely.
+ * ~/.claude-code-infinite/config.json, disables the check entirely (and
+ * with it auto-update).
  */
 export declare const PACKAGE_NAME = "claude-code-infinite";
 export declare const NPM_LATEST_URL = "https://registry.npmjs.org/claude-code-infinite/latest";

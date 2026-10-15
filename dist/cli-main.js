@@ -26,6 +26,7 @@ import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, hyperlink, } from "./payment-gate.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
+import { setupAutoUpdate } from "./auto-update-setup.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
@@ -233,12 +234,13 @@ async function main() {
     // resolve rather than reject, so Promise.all cannot throw.
     // The project (directory, git repo, branch, commit) goes with every MemTree
     // call so sessions can be found by project; read once, never fails.
+    const config = loadConfig();
     const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
         fetchPaymentStatus(memtreeBaseUrl, polychatApiKey),
         interactiveUi
             ? checkForUpdate({
                 currentVersion: CLIENT_VERSION,
-                config: loadConfig(),
+                config,
                 cacheFile: path.join(getConfigDir(), UPDATE_CHECK_CACHE_FILE),
             })
             : Promise.resolve(null),
@@ -255,6 +257,18 @@ async function main() {
     if (isDebugMode && updateAvailable) {
         console.log(`[DEBUG] Update available: ${updateAvailable.current} → ${updateAvailable.latest}`);
     }
+    // Interactive only (print/non-TTY runs never install): see auto-update.ts.
+    const autoUpdate = interactiveUi
+        ? setupAutoUpdate({
+            update: updateAvailable,
+            currentVersion: CLIENT_VERSION,
+            config,
+            configDir: getConfigDir(),
+            color: terminalSupportsColor(),
+        })
+        : null;
+    if (isDebugMode && autoUpdate)
+        console.log(`[DEBUG] ${autoUpdate.debugLine}`);
     // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
@@ -315,6 +329,9 @@ async function main() {
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
         transcriptUsage,
         projectMeta,
+        // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
+        // install) on a later SessionStart of this session, once.
+        sessionStartNotice: autoUpdate ? () => autoUpdate.notices.sessionStartLine() : undefined,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
@@ -344,7 +361,7 @@ async function main() {
         try {
             noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
                 messageDisplay: installedClaudeSupportsMessageDisplay(),
-                startupMessage: startupNoticeText(terminalSupportsColor(), updateAvailable),
+                startupMessage: startupNoticeText(terminalSupportsColor(), autoUpdate?.bannerUpdate ?? null, autoUpdate?.bannerInstalled ?? null),
                 // Also carries the unpaid-key notice on resume, so it is on even
                 // when MemTree links are off (the proxy then answers links-free).
                 resumeLink: true,
@@ -422,6 +439,9 @@ async function main() {
     });
     process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
     process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+    // The background install starts once Claude Code is up; it outlives this
+    // process if the session ends first.
+    autoUpdate?.scheduleInstall();
     child.on("error", (err) => {
         if (err.code === "ENOENT") {
             console.error("Could not find 'claude' command. Make sure Claude Code is installed.");

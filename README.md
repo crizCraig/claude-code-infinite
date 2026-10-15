@@ -269,11 +269,12 @@ If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notic
 ## Upgrading
 
 `ccc` checks npm at startup (bounded to 1.5 seconds, silent if offline, and cached for a
-day in `~/.claude-code-infinite/update-check.json`) and, when a newer release exists,
-shows one line under the MemTree banner inside Claude Code, e.g.
-`• ccc 1.0.20 is available (you have 1.0.14) · npm i -g claude-code-infinite@latest`.
-Prereleases are never offered, and print (`-p`) or non-TTY runs skip the check. Upgrading
-is never automatic:
+day in `~/.claude-code-infinite/update-check.json`). Prereleases are never offered, and
+print (`-p`) or non-TTY runs skip the check. When a newer release exists and `ccc` can
+update itself, it does (see [Automatic updates](#automatic-updates)); otherwise it shows
+one line under the MemTree banner inside Claude Code, e.g.
+`• ccc 1.0.21 is available (you have 1.0.20) · npm i -g claude-code-infinite@latest`.
+To upgrade by hand:
 
 ```bash
 npm i -g claude-code-infinite@latest
@@ -281,4 +282,64 @@ npm i -g claude-code-infinite@latest
 
 Set `CCC_NO_UPDATE_CHECK=1` (or the older `CCC_SKIP_UPDATE_CHECK=1`), or add
 `"updateCheck": false` to `~/.claude-code-infinite/config.json`, to disable the check
-(air-gapped or CI runs).
+(air-gapped or CI runs). That also turns off automatic updates.
+
+## Automatic updates
+
+Like Claude Code, `ccc` installs a newer release for you in the background. A few
+seconds after an interactive session starts, if the update check found a newer
+release, `ccc` runs
+
+```bash
+npm install --global --prefix=<your npm prefix> claude-code-infinite@<that version> --no-fund --no-audit
+```
+
+in a detached process, so the session never waits for it and quitting `ccc` does not
+stop it. When it has finished, the next session start inside Claude Code (a new
+conversation, `/clear`, or a resume) shows, once:
+
+```
+✔ ccc 1.0.21 installed · restart ccc to use it
+```
+
+The session keeps running the version it started with until you restart `ccc`. If the
+install fails, you get the usual `• ccc 1.0.21 is available … · npm i -g
+claude-code-infinite@latest` line instead, and `ccc` waits a day before trying again; it
+tries each version at most twice. The npm output of the last attempt is in
+`~/.claude-code-infinite/auto-update.log`, and its result in `update-state.json` next to
+it. Only one session installs at a time (`update.lock.d` there). If an installer was
+killed in a way `ccc` cannot verify, that lock stays held rather than risk two installs
+at once; after an hour `ccc` shows the update line instead, and deleting
+`~/.claude-code-infinite/update.lock.d` clears it.
+
+**When it doesn't.** `ccc` updates itself only when it is a plain global npm install
+(`npm i -g`) whose files are in `npm root -g` and writable by you. It never uses `sudo`.
+In every other case it only shows the update line:
+
+- `npm link`ed or git checkouts (a development copy is never touched),
+- `npx` and project-local installs,
+- pnpm, yarn, bun and Volta global installs (update with your tool's own command),
+- a global prefix that needs `sudo` to write, or `ccc` running as root,
+- Windows,
+- print (`-p`) and non-TTY runs, which never install anything.
+
+`ccc --debug` prints which install method was detected and what it decided.
+
+**Sessions running during an update.** npm replaces `ccc`'s files while other `ccc`
+sessions may be running. They are unaffected: each `ccc` loads all of its code when it
+starts, and the Claude Code hooks it registers either call into that running `ccc` over
+localhost or run files in its own temporary plugin directory, never the installed
+package. The one exception is the `memtree` MCP server, which Claude Code starts from the
+installed files: a server started after the update (for example, Claude Code restarting
+it with `/mcp`) runs the new version against the old session. It keeps working, and if a
+tool call fails it says that the versions differ and to restart `ccc`. If Claude Code
+starts it in the few seconds while npm is writing the files, it can fail to start; `/mcp`
+reconnects it.
+
+**Turning it off.** Any of these keeps the update line but never installs:
+
+- `CCC_DISABLE_AUTOUPDATE=1`,
+- `"autoUpdate": false` in `~/.claude-code-infinite/config.json`,
+- Claude Code's own `DISABLE_AUTOUPDATER=1`.
+
+The update-check opt-outs above turn off both the check and automatic updates.

@@ -27,7 +27,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MEMTREE_MCP_SERVER_NAME, MEMTREE_TOOL_NAMES } from "./memtree-mcp.js";
+import {
+  MEMTREE_MCP_SERVER_NAME,
+  MEMTREE_TOOL_NAMES,
+  PROXY_VERSION_ENV,
+} from "./memtree-mcp.js";
+import { CLIENT_VERSION } from "./memtree.js";
 
 /** `x-memtree-tools` value. */
 export const MEMTREE_TOOLS_HEADER_VALUE = MEMTREE_TOOL_NAMES.join(",");
@@ -49,7 +54,8 @@ export function memtreeMcpConfig(proxyUrl: string): object {
         type: "stdio",
         command: process.execPath,
         args: [MEMTREE_MCP_SCRIPT],
-        env: { CCC_MEMTREE_PROXY: proxyUrl },
+        // The proxy's version, so a server started after an update can tell.
+        env: { CCC_MEMTREE_PROXY: proxyUrl, [PROXY_VERSION_ENV]: CLIENT_VERSION },
         alwaysLoad: true,
       },
     },

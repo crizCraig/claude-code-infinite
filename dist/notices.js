@@ -69,12 +69,24 @@ export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
  * as `<hookName> says: <content>` on one line, so the first breaks the banner
  * off the label and the second leaves a blank line between them.
  */
-export function startupNoticeText(color, update = null) {
+export function startupNoticeText(color, update = null, installedVersion = null) {
     const banner = color
         ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
             "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
         : `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
+    if (installedVersion)
+        return `${banner}\n${updateInstalledNoticeText(installedVersion, color)}`;
     return update ? `${banner}\n${updateNoticeText(update, color)}` : banner;
+}
+/**
+ * After a background install (auto-update.ts): the running session keeps its
+ * version until ccc restarts. `✔ ccc 1.0.21 installed · restart ccc to use it`.
+ */
+export function updateInstalledNoticeText(version, color) {
+    const v = sanitizeNoticeDetail(version, 40);
+    if (!color)
+        return `✔ ccc ${v} installed · restart ccc to use it`;
+    return `\x1b[32m✔ ccc ${v} installed\x1b[39m · \x1b[1mrestart ccc\x1b[22m to use it`;
 }
 /**
  * One line under the banner when npm has a newer release. Versions come from

@@ -798,3 +798,22 @@ test("project meta: owner/repo only from any remote form, failures leave parts o
   const outside = await readProjectMeta(os.tmpdir());
   assert.equal(outside.project_dir, path.basename(os.tmpdir()));
 });
+
+test("an MCP server started after a mid-session update says so on failed calls", async () => {
+  const { versionMismatchNote, PROXY_VERSION_ENV } = await import("../dist/memtree-mcp.js");
+  const { CLIENT_VERSION } = await import("../dist/memtree.js");
+  const server = memtreeMcpConfig("http://127.0.0.1:1234").mcpServers.memtree;
+  assert.equal(server.env[PROXY_VERSION_ENV], CLIENT_VERSION, "the proxy's version rides the config");
+  assert.equal(versionMismatchNote(undefined, "1.0.21"), undefined, "older ccc, or a caller's own config");
+  assert.equal(versionMismatchNote("1.0.21", "1.0.21"), undefined);
+  const note = versionMismatchNote("1.0.20\x1b[2J", "1.0.21");
+  assert.match(note, /tools are ccc 1\.0\.21 but this session runs ccc 1\.0\.202J: .*Restart ccc/);
+  assert.ok(!note.includes("\x1b"));
+  const failing = { get: async () => { throw new Error("HTTP 404 not found"); } };
+  const call = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "read_node", arguments: { id: 0 } } };
+  const withNote = await handleMcpMessage(call, failing, undefined, note);
+  assert.equal(withNote.result.isError, true);
+  assert.equal(withNote.result.content[0].text, `HTTP 404 not found\n${note}`);
+  const without = await handleMcpMessage(call, failing);
+  assert.equal(without.result.content[0].text, "HTTP 404 not found");
+});

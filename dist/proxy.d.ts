@@ -171,6 +171,12 @@ export interface ProxyOptions {
      * user can find sessions by project. Omitted means none is sent.
      */
     projectMeta?: ProjectMeta;
+    /**
+     * An extra line for a main session's SessionStart (not compaction), e.g.
+     * the auto-update result (auto-update.ts). Called on every such hook; the
+     * provider decides how often it has something to say.
+     */
+    sessionStartNotice?: () => string | undefined;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */

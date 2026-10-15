@@ -302,6 +302,12 @@ export interface ProxyOptions {
    * user can find sessions by project. Omitted means none is sent.
    */
   projectMeta?: ProjectMeta;
+  /**
+   * An extra line for a main session's SessionStart (not compaction), e.g.
+   * the auto-update result (auto-update.ts). Called on every such hook; the
+   * provider decides how often it has something to say.
+   */
+  sessionStartNotice?: () => string | undefined;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -364,6 +370,8 @@ interface ProxyState {
   unpaidDetail: () => string | null;
   /** polychat's usage dashboard for the MemTree environment, if known. */
   usageUrl: string | undefined;
+  /** ProxyOptions.sessionStartNotice. */
+  sessionStartNotice?: () => string | undefined;
   notices: NoticeDeliveryQueue;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
@@ -809,6 +817,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
+    sessionStartNotice: opts.sessionStartNotice,
     notices: new NoticeDeliveryQueue(),
     mainNoticePending: false,
     mainPromptGeneration: 0,
@@ -1265,7 +1274,8 @@ async function handleNoticeHook(
     }
     const line = joinNoticeLines(
       resumeLinkLine(state, parsed),
-      resumePaymentNotice(state, parsed)
+      resumePaymentNotice(state, parsed),
+      extraSessionStartLine(state.sessionStartNotice, parsed)
     );
     if (!line) {
       res.writeHead(204);
@@ -2687,6 +2697,19 @@ function resumePaymentNotice(
   if (detail === null) return undefined;
   state.paymentNotice.markShown();
   return state.notices.warningText(paymentNoticeText(detail));
+}
+
+/** The caller's extra SessionStart line; a throwing provider shows nothing. */
+function extraSessionStartLine(
+  provider: (() => string | undefined) | undefined,
+  input: SessionStartHookInput
+): string | undefined {
+  if (!provider || input.agent_id !== undefined || input.source === "compact") return undefined;
+  try {
+    return provider();
+  } catch {
+    return undefined;
+  }
 }
 
 function joinNoticeLines(...parts: (string | undefined)[]): string | undefined {
