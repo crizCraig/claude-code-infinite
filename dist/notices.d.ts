@@ -50,7 +50,12 @@ export declare const STARTUP_NOTICE = "\u221E MemTree \u00B7 Infinite Context En
  * as `<hookName> says: <content>` on one line, so the first breaks the banner
  * off the label and the second leaves a blank line between them.
  */
-export declare function startupNoticeText(color: boolean, update?: UpdateAvailable | null): string;
+export declare function startupNoticeText(color: boolean, update?: UpdateAvailable | null, installedVersion?: string | null): string;
+/**
+ * After a background install (auto-update.ts): the running session keeps its
+ * version until ccc restarts. `✔ ccc 1.0.21 installed · restart ccc to use it`.
+ */
+export declare function updateInstalledNoticeText(version: string, color: boolean): string;
 /**
  * One line under the banner when npm has a newer release. Versions come from
  * the registry document and are re-validated here so a hostile or malformed

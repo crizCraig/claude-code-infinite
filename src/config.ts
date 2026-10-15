@@ -8,6 +8,8 @@ export interface Config {
   localPolychatApiKey?: string;
   /** false turns off the startup check for a newer ccc on npm (update-check.ts). */
   updateCheck?: boolean;
+  /** false keeps the update hint but never installs in the background (auto-update.ts). */
+  autoUpdate?: boolean;
 }
 
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");

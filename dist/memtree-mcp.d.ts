@@ -1,5 +1,16 @@
 import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
+/**
+ * The version of the ccc whose proxy this server talks to, set in the config
+ * ccc writes (memtree-mcp-config.ts). Claude Code may (re)start this server
+ * mid-session, after an update replaced ccc's files: the server then runs the
+ * new code against the old proxy. The proxy's /memtree endpoints only grow, and
+ * this server already tolerates a missing one (404), so it keeps working; a
+ * failing tool call says why, so the fix (restart ccc) is clear.
+ */
+export declare const PROXY_VERSION_ENV = "CCC_PROXY_VERSION";
+/** The note added to failed tool calls when this server and its proxy differ. */
+export declare function versionMismatchNote(proxyVersion: string | undefined, ownVersion?: string): string | undefined;
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list"];
 /** `tree` value naming this session's own current tree. */
@@ -280,7 +291,9 @@ export declare class SessionFinder implements SessionFinderSource {
  * One JSON-RPC message in, the response out (undefined for notifications).
  * Exposed for tests; the stdio loop below is only framing.
  */
-export declare function handleMcpMessage(input: unknown, tree: TreeSource, finder?: SessionFinderSource): Promise<object | undefined>;
+export declare function handleMcpMessage(input: unknown, tree: TreeSource, finder?: SessionFinderSource, 
+/** versionMismatchNote: appended to failed tool calls. */
+versionNote?: string): Promise<object | undefined>;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

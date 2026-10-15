@@ -87,13 +87,25 @@ export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
  */
 export function startupNoticeText(
   color: boolean,
-  update: UpdateAvailable | null = null
+  update: UpdateAvailable | null = null,
+  installedVersion: string | null = null
 ): string {
   const banner = color
     ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
       "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
     : `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
+  if (installedVersion) return `${banner}\n${updateInstalledNoticeText(installedVersion, color)}`;
   return update ? `${banner}\n${updateNoticeText(update, color)}` : banner;
+}
+
+/**
+ * After a background install (auto-update.ts): the running session keeps its
+ * version until ccc restarts. `✔ ccc 1.0.21 installed · restart ccc to use it`.
+ */
+export function updateInstalledNoticeText(version: string, color: boolean): string {
+  const v = sanitizeNoticeDetail(version, 40);
+  if (!color) return `✔ ccc ${v} installed · restart ccc to use it`;
+  return `\x1b[32m✔ ccc ${v} installed\x1b[39m · \x1b[1mrestart ccc\x1b[22m to use it`;
 }
 
 /**

@@ -64,6 +64,25 @@ import {
 import { CLIENT_VERSION } from "./memtree.js";
 
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
+/**
+ * The version of the ccc whose proxy this server talks to, set in the config
+ * ccc writes (memtree-mcp-config.ts). Claude Code may (re)start this server
+ * mid-session, after an update replaced ccc's files: the server then runs the
+ * new code against the old proxy. The proxy's /memtree endpoints only grow, and
+ * this server already tolerates a missing one (404), so it keeps working; a
+ * failing tool call says why, so the fix (restart ccc) is clear.
+ */
+export const PROXY_VERSION_ENV = "CCC_PROXY_VERSION";
+
+/** The note added to failed tool calls when this server and its proxy differ. */
+export function versionMismatchNote(
+  proxyVersion: string | undefined,
+  ownVersion: string = CLIENT_VERSION
+): string | undefined {
+  if (!proxyVersion || proxyVersion === ownVersion) return undefined;
+  const safe = proxyVersion.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
+  return `(These MemTree tools are ccc ${ownVersion} but this session runs ccc ${safe}: ccc was updated during the session. Restart ccc to use one version.)`;
+}
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export const MEMTREE_TOOL_NAMES = [
   "search",
@@ -564,7 +583,9 @@ interface JsonRpcRequest {
 export async function handleMcpMessage(
   input: unknown,
   tree: TreeSource,
-  finder?: SessionFinderSource
+  finder?: SessionFinderSource,
+  /** versionMismatchNote: appended to failed tool calls. */
+  versionNote?: string
 ): Promise<object | undefined> {
   if (!isRpcRequest(input)) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
@@ -599,7 +620,8 @@ export async function handleMcpMessage(
         return reply({ content: [{ type: "text", text }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
-        const text = err instanceof Error ? err.message : String(err);
+        const message = err instanceof Error ? err.message : String(err);
+        const text = versionNote ? `${message}\n${versionNote}` : message;
         return reply({ content: [{ type: "text", text }], isError: true });
       }
     }
@@ -721,6 +743,8 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
   };
   const tree = new CurrentTree(deps);
   const finder = new SessionFinder(deps);
+  const versionNote = versionMismatchNote(env[PROXY_VERSION_ENV]);
+  if (versionNote) process.stderr.write(`memtree MCP: ${versionNote}\n`);
   let buffer = "";
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
@@ -741,7 +765,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
         continue;
       }
       queue = queue.then(async () => {
-        const response = await handleMcpMessage(message, tree, finder).catch((err) => ({
+        const response = await handleMcpMessage(message, tree, finder, versionNote).catch((err) => ({
           jsonrpc: "2.0",
           id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },

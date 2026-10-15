@@ -2923,6 +2923,39 @@ test("a resumed session shows its link at SessionStart, from memory or from disk
   }
 });
 
+test("SessionStart carries the auto-update line for main sessions, not compaction or subagents", async () => {
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:9", apiKey: "k" });
+  let calls = 0;
+  const proxy = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    sessionStartNotice: () => (++calls === 1 ? "✔ ccc 1.0.21 installed · restart ccc to use it" : undefined),
+  });
+  const start = { hook_event_name: "SessionStart", source: "clear" };
+  try {
+    assert.equal((await postHook(proxy, { ...start, source: "compact" })).status, 204);
+    assert.equal((await postHook(proxy, { ...start, agent_id: "a1" })).status, 204);
+    assert.equal(calls, 0, "not asked for compaction or subagents");
+    const first = await postHook(proxy, start);
+    assert.equal(first.body.systemMessage, "✔ ccc 1.0.21 installed · restart ccc to use it");
+    assert.equal((await postHook(proxy, start)).status, 204, "the provider said it once");
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+  const throwing = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    sessionStartNotice: () => { throw new Error("boom"); },
+  });
+  try {
+    assert.equal((await postHook(throwing, { hook_event_name: "SessionStart", source: "startup" })).status, 204);
+  } finally {
+    throwing.close();
+  }
+});
+
 test("the resume relay script forwards SessionStart stdin to the proxy and prints its answer", async () => {
   const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
   const { createSessionNoticePlugin } = await import("../dist/hooks.js");

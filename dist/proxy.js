@@ -267,6 +267,7 @@ export function startProxy(opts) {
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
+        sessionStartNotice: opts.sessionStartNotice,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
         mainPromptGeneration: 0,
@@ -657,7 +658,7 @@ onMainStop) {
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
         }
-        const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed));
+        const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed), extraSessionStartLine(state.sessionStartNotice, parsed));
         if (!line) {
             res.writeHead(204);
             res.end();
@@ -1876,6 +1877,17 @@ function resumePaymentNotice(state, input) {
         return undefined;
     state.paymentNotice.markShown();
     return state.notices.warningText(paymentNoticeText(detail));
+}
+/** The caller's extra SessionStart line; a throwing provider shows nothing. */
+function extraSessionStartLine(provider, input) {
+    if (!provider || input.agent_id !== undefined || input.source === "compact")
+        return undefined;
+    try {
+        return provider();
+    }
+    catch {
+        return undefined;
+    }
 }
 function joinNoticeLines(...parts) {
     const present = parts.filter((part) => !!part);
