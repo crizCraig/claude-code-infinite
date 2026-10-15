@@ -1,0 +1,101 @@
+# Stages each release on npm via Trusted Publishing (OIDC): no npm token, passkey
+# or browser in CI. The trusted publisher on npmjs.com is bound to this exact file
+# name (publish.yml) with no GitHub environment, so do not rename this file or add
+# `environment:`. It allows only `npm stage publish`, so a maintainer must approve
+# the staged version on npmjs.com (with 2FA) before it is installable.
+name: Stage npm release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for npm trusted publishing (and provenance)
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1; `npm stage publish` needs >= 11.15.0.
+      - name: Update npm
+        run: |
+          npm install -g npm@latest
+          NPM_VERSION="$(npm --version)"
+          echo "npm $NPM_VERSION"
+          node -e '
+            const [a, b] = process.argv[1].split(".").map(Number);
+            if (a < 11 || (a === 11 && b < 15)) {
+              console.error("npm >= 11.15.0 required for npm stage publish");
+              process.exit(1);
+            }' "$NPM_VERSION"
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - name: Test (NO_COLOR)
+        run: npm test
+        env:
+          NO_COLOR: "1"
+
+      - name: Test (colour)
+        run: npm test
+        env:
+          FORCE_COLOR: "1"
+          TERM: xterm-256color
+
+      - name: Verify committed dist matches source
+        run: |
+          npm run build
+          if [ -n "$(git status --porcelain dist)" ]; then
+            echo "::error::dist/ is out of date with src/. Run npm run build and commit dist."
+            git status --porcelain dist
+            git diff --stat dist
+            exit 1
+          fi
+
+      # No NODE_AUTH_TOKEN: npm exchanges the GitHub OIDC token for a short-lived
+      # credential. Provenance is automatic for a public repo under trusted
+      # publishing; --provenance just makes that explicit.
+      - name: Stage on npm
+        run: |
+          set -o pipefail
+          npm stage publish --provenance 2>&1 | tee stage.log
+
+      - name: Summary (approval needed)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "::notice::claude-code-infinite@$VERSION is staged. Approve it at https://www.npmjs.com/package/claude-code-infinite (Staged Packages tab)."
+          {
+            echo "## claude-code-infinite@$VERSION is staged, not yet published"
+            echo
+            echo "Approve it (2FA) before it is installable:"
+            echo
+            echo "- Web: https://www.npmjs.com/package/claude-code-infinite"
+            echo "  (Staged Packages tab, then Approve)"
+            echo "- CLI: \`npm stage list claude-code-infinite\`, then"
+            echo "  \`npm stage approve <stage-id>\`"
+            echo
+            echo '```'
+            tail -n 5 stage.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
