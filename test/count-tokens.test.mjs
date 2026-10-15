@@ -377,3 +377,22 @@ test("a body over Anthropic's 64 MiB request limit is never uploaded", async () 
     assert.equal((await session.count(messagesBody)).tokens, 42, "allowance untouched");
   } finally { srv.close(); }
 });
+
+test("preparing each count body is charged to the shared allowance", async () => {
+  const srv = await countServer((_req, res) => {
+    if (srv.seen.length <= 3) res.end('{"input_tokens":42}');
+  });
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", timeoutMs: 2_000, onAttempt: (r) => attempts.push(r) });
+    for (const fill of ["a", "b", "c"]) {
+      const body = Buffer.from(JSON.stringify({ model: "m", messages: [], p: fill.repeat(8e6) }));
+      assert.equal((await session.count(body)).tokens, 42);
+    }
+    const last = await session.count(messagesBody);
+    const spent = attempts.slice(0, 3).reduce((total, r) => total + r.ms, 0);
+    assert.equal(last.outcome, "timeout");
+    assert.ok(last.timeoutMs <= 2_000 - spent + 5, `${last.timeoutMs} left after ${spent}ms`);
+  } finally { srv.close(); }
+});

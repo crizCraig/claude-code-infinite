@@ -206,7 +206,7 @@ export function createCountTokensSession(
           : remaining <= 0 ? "deadline" : undefined;
       const attempt = skipped
         ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped, bytes: body.length })
-        : clock.track(countUpstreamTokens({ ...options, body, timeoutMs: remaining }))
+        : clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs: remaining }))
           .then((result) => recordAttempt(options, cooldowns, account, result));
       if (skipped === "too-large") attempt.then((result) => notifyAttempt(options, result));
       const saved = attempt.then((result) => { completed.set(key, result); return result; });
@@ -387,9 +387,10 @@ class CountingClock {
     return this.total + (this.inFlight > 0 ? Date.now() - this.since : 0);
   }
 
-  track<T>(attempt: Promise<T>): Promise<T> {
+  /** Starts the clock before `start` runs: preparing the count body is counting time too. */
+  track<T>(start: () => Promise<T>): Promise<T> {
     if (this.inFlight++ === 0) this.since = Date.now();
-    return attempt.finally(() => {
+    return start().finally(() => {
       if (--this.inFlight === 0) this.total += Date.now() - this.since;
     });
   }
