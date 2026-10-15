@@ -556,6 +556,10 @@ if (args[0] === "root") {
   process.on("SIGTERM", () => {});
   setInterval(() => {}, 1000);
 } else if (args[0] === "install") {
+  if (process.env.FAKE_NPM_SNAPSHOT) {
+    // What the lock entry says while npm runs.
+    fs.copyFileSync(process.env.FAKE_NPM_ENTRY, process.env.FAKE_NPM_SNAPSHOT);
+  }
   if (process.env.FAKE_NPM_DESCENDANT) {
     // A lifecycle script that outlives npm, ignores SIGTERM and holds the pipes.
     const { spawn } = require("node:child_process");
@@ -582,7 +586,7 @@ if (args[0] === "root") {
 async function runRunner({
   global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot, hang = false,
   timeoutMs = 30_000, killGraceMs, pipeGraceMs, descendant = false,
-  handoff = "ok", handoffMs, abortDuringRoot = false,
+  handoff = "ok", handoffMs, abortDuringRoot = false, snapshot = false,
 }) {
   const dir = tmpdir("ccc-au-run-");
   const npm = path.join(dir, "npm");
@@ -607,6 +611,10 @@ async function runRunner({
       ...(hang ? { FAKE_NPM_HANG: pidFile } : {}),
       ...(descendant ? { FAKE_NPM_DESCENDANT: pidFile } : {}),
       ...(abortDuringRoot ? { FAKE_NPM_ABORT: "1" } : {}),
+      ...(snapshot ? {
+        FAKE_NPM_ENTRY: path.join(files.lockDir, "t1.json"),
+        FAKE_NPM_SNAPSHOT: path.join(dir, "entry-during-npm.json"),
+      } : {}),
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -617,7 +625,11 @@ async function runRunner({
   const status = await new Promise((resolve) => child.on("close", (code) => resolve(code)));
   assert.ok(status === 0 || status === 1, stderr);
   const calls = fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  return { files, calls, state: readUpdateState(files.stateFile), lockLeft: lockEntries(files.lockDir).length > 0, pidFile };
+  return {
+    files, calls, state: readUpdateState(files.stateFile),
+    lockLeft: lockEntries(files.lockDir).length > 0, pidFile,
+    snapshotFile: path.join(dir, "entry-during-npm.json"),
+  };
 }
 
 test("runner: installs exactly that version into this prefix, records ok, frees the lock", async () => {
@@ -764,4 +776,24 @@ test("a handoff landing while an entry is judged stale keeps it: the acquirer ba
   fs.writeFileSync(file, JSON.stringify({ token: "a", startedAt: now, pid: dead }));
   assert.ok(acquireUpdateLock(lockDir, now, () => {}));
   assert.equal(fs.existsSync(file), false);
+});
+
+test("runner: while npm runs its lock entry already protects it (spawning or group)", async () => {
+  const { state, snapshotFile } = await runRunner({ global: makeGlobal(), snapshot: true });
+  assert.equal(state.last.status, "ok");
+  const during = JSON.parse(fs.readFileSync(snapshotFile, "utf8"));
+  assert.ok(during.spawning === true || Number.isInteger(during.group), JSON.stringify(during));
+  assert.equal(during.runner, during.pid, "held by the runner");
+});
+
+test("a runner that died while starting npm leaves the lock held (fail closed), then the hint", () => {
+  const { lockDir } = filesIn();
+  const now = Date.now();
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  writeEntry(lockDir, { token: "crashed", startedAt: now - 60_000, pid: dead, runner: dead, spawning: true });
+  assert.equal(acquireUpdateLock(lockDir, now), null, "an unrecorded npm may be running");
+  assert.deepEqual(lockEntries(lockDir), ["crashed.json"]);
+  assert.equal(liveLockSince(lockDir, now), now - 60_000);
+  const later = now + 2 * UPDATE_LOCK_STALE_MS;
+  assert.match(plan({ now: later, lockHeldSince: liveLockSince(lockDir, later) }).reason, /held for over an hour/);
 });

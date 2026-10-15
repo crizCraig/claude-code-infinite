@@ -119,21 +119,28 @@ async function reapGroup(pgid) {
 }
 
 // The lock entry names the group while it may be alive (update-lock.ts).
-function recordGroup(pgid) {
+// "spawning" is set before every npm spawn and cleared only once its group is
+// recorded: if this runner dies in between, the entry stays live (fail
+// closed) because an unrecorded npm may be running (update-lock.ts).
+function recordGroup(pgid, spawning) {
   const entry = readEntry();
   if (!entry) {
     stopping = stopping || "lost the install lock";
     if (pgid !== null) signalGroup(pgid, "SIGKILL"); // started without the lock: stop it
-    return;
+    return false;
   }
   try {
     entry.pid = process.pid;
     entry.runner = process.pid;
     if (pgid === null) delete entry.group; else entry.group = pgid;
+    if (spawning) entry.spawning = true; else delete entry.spawning;
     const tmp = path.join(cfg.lockDir, "." + cfg.token + "." + process.pid + ".tmp");
     fs.writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
     fs.renameSync(tmp, ENTRY);
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readEntry() {
@@ -173,7 +180,7 @@ function run(command, args, timeoutMs, capture) {
       timers.forEach(clearTimeout);
       resolve(Object.assign({ out, pgid: child ? child.pid : null }, result));
     };
-    if (stopping || !readEntry()) {
+    if (stopping || !recordGroup(null, true)) {
       finish({ code: null, error: stopping || "lost the install lock" });
       return;
     }
@@ -185,12 +192,15 @@ function run(command, args, timeoutMs, capture) {
         detached: true,
       });
     } catch (err) {
+      recordGroup(null, false);
       finish({ code: null, error: String(err) });
       return;
     }
     if (child.pid) {
       group = child.pid;
-      recordGroup(group);
+      recordGroup(group, false);
+    } else {
+      recordGroup(null, false); // spawn failed; its 'error' event follows
     }
     timers.push(setTimeout(() => finish({ code: null, timedOut: true }), timeoutMs));
     const logChunk = (chunk) => {
@@ -219,7 +229,7 @@ async function runReaped(command, args, timeoutMs, capture) {
       throw err;
     }
     group = null;
-    recordGroup(null);
+    recordGroup(null, false);
   }
   return result;
 }
@@ -305,7 +315,7 @@ async function abort(reason) {
     finishRun("failed", stopping);
     return;
   }
-  recordGroup(null); // the lock's holder is this runner from now on
+  recordGroup(null, false); // the lock's holder is this runner from now on
   try { logFd = fs.openSync(cfg.logFile, "w", 0o600); } catch {}
   note("installing " + cfg.packageName + "@" + cfg.version + " into " + cfg.prefix);
   try {

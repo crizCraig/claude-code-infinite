@@ -18,9 +18,11 @@
  * runner, or npm's group), however old: a lock is never taken from a live
  * installer by age. A pid reused by an unrelated process can keep it held;
  * callers treat a lock held for over UPDATE_LOCK_STALE_MS as stuck and fall
- * back to the update hint (auto-update.ts). One window is not covered: a
- * runner killed outright (SIGKILL) between starting npm and recording npm's
- * group leaves that npm unrecorded.
+ * back to the update hint (auto-update.ts). The runner marks its entry
+ * `spawning` before starting npm and clears it once npm's group is recorded:
+ * an entry left `spawning` by a dead runner may have an unrecorded npm
+ * running, so it stays live (fail closed) and, after an hour, the hint shows.
+ * Removing update.lock.d by hand clears it.
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -140,6 +142,7 @@ function parseEntry(raw) {
             pid: int(data.pid),
             runner: int(data.runner),
             group: int(data.group),
+            ...(data.spawning === true ? { spawning: true } : {}),
         };
     }
     catch {
@@ -157,7 +160,8 @@ function entryIsStale(entry, now) {
         return false;
     if (group !== undefined && processAlive(-group))
         return false;
-    return true;
+    // Its runner died while starting npm: npm may be running unrecorded.
+    return entry.data.spawning !== true;
 }
 /** Signal 0 to a pid (or, negative, a process group). */
 function processAlive(pid) {

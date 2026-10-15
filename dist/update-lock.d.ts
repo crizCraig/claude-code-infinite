@@ -18,9 +18,11 @@
  * runner, or npm's group), however old: a lock is never taken from a live
  * installer by age. A pid reused by an unrelated process can keep it held;
  * callers treat a lock held for over UPDATE_LOCK_STALE_MS as stuck and fall
- * back to the update hint (auto-update.ts). One window is not covered: a
- * runner killed outright (SIGKILL) between starting npm and recording npm's
- * group leaves that npm unrecorded.
+ * back to the update hint (auto-update.ts). The runner marks its entry
+ * `spawning` before starting npm and clears it once npm's group is recorded:
+ * an entry left `spawning` by a dead runner may have an unrecorded npm
+ * running, so it stays live (fail closed) and, after an hour, the hint shows.
+ * Removing update.lock.d by hand clears it.
  */
 /** Longer than a healthy runner lives (install timeout + kill graces + deadline). */
 export declare const UPDATE_LOCK_STALE_MS: number;
@@ -35,6 +37,8 @@ export interface LockEntry {
     runner?: number;
     /** The npm process group the runner started, while it may be alive. */
     group?: number;
+    /** Set by the runner just before starting npm, cleared once `group` is recorded. */
+    spawning?: boolean;
 }
 /**
  * Acquire the lock: the owner token, or null when another entry is live (or
