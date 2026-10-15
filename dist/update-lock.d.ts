@@ -18,7 +18,9 @@
  * runner, or npm's group), however old: a lock is never taken from a live
  * installer by age. A pid reused by an unrelated process can keep it held;
  * callers treat a lock held for over UPDATE_LOCK_STALE_MS as stuck and fall
- * back to the update hint (auto-update.ts).
+ * back to the update hint (auto-update.ts). One window is not covered: a
+ * runner killed outright (SIGKILL) between starting npm and recording npm's
+ * group leaves that npm unrecorded.
  */
 /** Longer than a healthy runner lives (install timeout + kill graces + deadline). */
 export declare const UPDATE_LOCK_STALE_MS: number;
@@ -34,8 +36,21 @@ export interface LockEntry {
     /** The npm process group the runner started, while it may be alive. */
     group?: number;
 }
-/** Acquire the lock: the owner token, or null when another live entry exists. */
-export declare function acquireUpdateLock(lockDir: string, now: number): string | null;
+/**
+ * Acquire the lock: the owner token, or null when another entry is live (or
+ * changed while being judged).
+ *
+ * Each other entry is read, its named processes checked, then read again: it
+ * counts as stale only if every named process was gone and the entry is
+ * unchanged. Only named processes ever write an entry (the launcher hands
+ * over to the runner, which adds npm's group), and a process found gone
+ * before the second read cannot write after it, so an entry unchanged across
+ * the check stays dead and is safe to remove. A change (say, a handoff landing
+ * mid-check) means it may have a live owner: back off.
+ */
+export declare function acquireUpdateLock(lockDir: string, now: number, 
+/** Test-only: runs between the liveness checks and the second read. */
+afterLivenessCheck?: () => void): string | null;
 /** Remove this token's entry (only its owner ever does, or anyone once stale). */
 export declare function releaseUpdateLock(lockDir: string, token: string): void;
 /**

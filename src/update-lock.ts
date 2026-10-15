@@ -18,7 +18,9 @@
  * runner, or npm's group), however old: a lock is never taken from a live
  * installer by age. A pid reused by an unrelated process can keep it held;
  * callers treat a lock held for over UPDATE_LOCK_STALE_MS as stuck and fall
- * back to the update hint (auto-update.ts).
+ * back to the update hint (auto-update.ts). One window is not covered: a
+ * runner killed outright (SIGKILL) between starting npm and recording npm's
+ * group leaves that npm unrecorded.
  */
 
 import { randomUUID } from "node:crypto";
@@ -42,12 +44,30 @@ export interface LockEntry {
   group?: number;
 }
 
-/** Acquire the lock: the owner token, or null when another live entry exists. */
-export function acquireUpdateLock(lockDir: string, now: number): string | null {
+/**
+ * Acquire the lock: the owner token, or null when another entry is live (or
+ * changed while being judged).
+ *
+ * Each other entry is read, its named processes checked, then read again: it
+ * counts as stale only if every named process was gone and the entry is
+ * unchanged. Only named processes ever write an entry (the launcher hands
+ * over to the runner, which adds npm's group), and a process found gone
+ * before the second read cannot write after it, so an entry unchanged across
+ * the check stays dead and is safe to remove. A change (say, a handoff landing
+ * mid-check) means it may have a live owner: back off.
+ */
+export function acquireUpdateLock(
+  lockDir: string,
+  now: number,
+  /** Test-only: runs between the liveness checks and the second read. */
+  afterLivenessCheck?: () => void
+): string | null {
   const token = randomUUID();
   if (!writeLockEntry(lockDir, { token, startedAt: now, pid: process.pid })) return null;
   const others = otherEntries(lockDir, token);
-  if (others.some((entry) => !entryIsStale(entry, now))) {
+  const allStale = others.every((entry) => entryIsStale(entry, now));
+  afterLivenessCheck?.();
+  if (!allStale || others.some((entry) => changedSince(entry))) {
     releaseUpdateLock(lockDir, token);
     return null;
   }
@@ -99,6 +119,14 @@ interface ReadEntry {
   file: string;
   data: LockEntry | null;
   mtimeMs: number;
+  /** The bytes read, to tell whether the entry changed since. */
+  raw: string;
+}
+
+/** True when the entry is no longer exactly what was read (gone counts as unchanged). */
+function changedSince(entry: ReadEntry): boolean {
+  const again = readEntry(entry.file);
+  return again !== null && (again.raw !== entry.raw || again.mtimeMs !== entry.mtimeMs);
 }
 
 function otherEntries(lockDir: string, token: string): ReadEntry[] {
@@ -117,25 +145,30 @@ function otherEntries(lockDir: string, token: string): ReadEntry[] {
 /** null when the file is gone (released meanwhile). */
 function readEntry(file: string): ReadEntry | null {
   let mtimeMs: number;
+  let raw: string;
   try {
     mtimeMs = fs.statSync(file).mtimeMs;
+    raw = fs.readFileSync(file, "utf8");
   } catch {
     return null;
   }
+  return { file, data: parseEntry(raw), mtimeMs, raw };
+}
+
+function parseEntry(raw: string): LockEntry | null {
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (typeof data?.token !== "string" || typeof data.startedAt !== "number") return { file, data: null, mtimeMs };
+    const data = JSON.parse(raw);
+    if (typeof data?.token !== "string" || typeof data.startedAt !== "number") return null;
     const int = (v: unknown) => (Number.isInteger(v) && (v as number) > 0 ? (v as number) : undefined);
-    const entry: LockEntry = {
+    return {
       token: data.token,
       startedAt: data.startedAt,
       pid: int(data.pid),
       runner: int(data.runner),
       group: int(data.group),
     };
-    return { file, data: entry, mtimeMs };
   } catch {
-    return { file, data: null, mtimeMs };
+    return null;
   }
 }
 

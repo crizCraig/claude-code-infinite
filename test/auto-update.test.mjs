@@ -744,3 +744,24 @@ test("runner: stopped while reaping npm root, it starts no further npm command",
   assert.match(state.last.error, /runner stopped by SIGTERM/);
   assert.equal(lockLeft, false);
 });
+
+test("a handoff landing while an entry is judged stale keeps it: the acquirer backs off", () => {
+  const { lockDir } = filesIn();
+  const now = Date.now();
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  // Launcher A's entry, read while it names only A; A then hands over to its
+  // (live) runner and exits before B checks A's pid.
+  const file = writeEntry(lockDir, { token: "a", startedAt: now, pid: dead });
+  const handoff = () => {
+    const later = new Date(Date.now() + 2000);
+    fs.writeFileSync(file, JSON.stringify({ token: "a", startedAt: now, pid: dead, runner: process.pid }));
+    fs.utimesSync(file, later, later);
+  };
+  assert.equal(acquireUpdateLock(lockDir, now, handoff), null);
+  assert.ok(fs.existsSync(file), "the live runner's entry was not removed");
+  assert.deepEqual(lockEntries(lockDir), ["a.json"], "B left nothing behind");
+  // Unchanged across the check and still dead: reclaimed.
+  fs.writeFileSync(file, JSON.stringify({ token: "a", startedAt: now, pid: dead }));
+  assert.ok(acquireUpdateLock(lockDir, now, () => {}));
+  assert.equal(fs.existsSync(file), false);
+});
