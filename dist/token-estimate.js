@@ -44,7 +44,8 @@ export function conservativeTokensFromBytes(bytes, model) {
     return Math.ceil(bytes / bytesPerTokenForModel(model));
 }
 /** Tokens a request body may cost on `model`: its text at the family ratio,
- * each image block (base64 or URL, at any depth) at one image's maximum.
+ * each image content block (base64 or URL, in a message or a tool_result) at
+ * one image's maximum.
  * A body that does not parse is all text, an over-estimate. */
 export function conservativeBodyTokens(body, model) {
     const { imageBytes, imageTokens } = imagePayloads(body);
@@ -62,29 +63,35 @@ function imagePayloads(body) {
     catch {
         return totals;
     }
-    walkImages(parsed, totals);
+    const messages = parsed?.messages;
+    if (Array.isArray(messages)) {
+        for (const message of messages) {
+            const content = message?.content;
+            if (Array.isArray(content))
+                countImageBlocks(content, totals);
+        }
+    }
     return totals;
 }
-/** Visit every `{type: "image", source}` block, whatever its key order. */
-function walkImages(value, totals) {
-    if (Array.isArray(value)) {
-        for (const item of value)
-            walkImages(item, totals);
-        return;
-    }
-    if (!value || typeof value !== "object")
-        return;
-    const block = value;
-    const source = block.source;
-    if (block.type === "image" && source && typeof source === "object") {
-        totals.imageTokens += MAX_IMAGE_TOKENS;
-        // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
-        if (source.type === "base64" && typeof source.data === "string") {
-            totals.imageBytes += source.data.length;
+/** Count image blocks among content blocks: a message's content, and
+ * recursively a tool_result's content. Image-shaped JSON anywhere else (tool
+ * inputs, schemas, system, metadata) is ordinary text and stays counted as such. */
+function countImageBlocks(blocks, totals) {
+    for (const item of blocks) {
+        if (!item || typeof item !== "object")
+            continue;
+        const block = item;
+        const source = block.source;
+        if (block.type === "image" && source && typeof source === "object") {
+            totals.imageTokens += MAX_IMAGE_TOKENS;
+            // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
+            if (source.type === "base64" && typeof source.data === "string") {
+                totals.imageBytes += source.data.length;
+            }
         }
-        return;
+        else if (block.type === "tool_result" && Array.isArray(block.content)) {
+            countImageBlocks(block.content, totals);
+        }
     }
-    for (const child of Object.values(block))
-        walkImages(child, totals);
 }
 //# sourceMappingURL=token-estimate.js.map

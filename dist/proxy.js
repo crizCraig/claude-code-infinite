@@ -973,6 +973,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     const rides = state.memoryRoutes.has(requestRouteKey) ||
         (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
     if (!rides) {
+        await requestSizing.countIfOverBound(forwardCandidate, sizingLimits());
         const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
         if (measured.source === "exact") {
             sizeSlot.set({ tokens: measured.tokens, forwardedBytes: forwardCandidate.body.length });
@@ -2818,12 +2819,16 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 /**
- * Mark a planned candidate that has no exact count and no calibration ("bytes")
- * whose per-model conservative bound plus max_tokens exceeds the window:
- * delivery would refuse it uncounted, so it is over the window for planning.
+ * Mark a planned candidate with no exact count whose per-model conservative
+ * bound plus max_tokens exceeds the window, when it is uncalibrated ("bytes")
+ * or cannot be counted any more (counting off, or its count failed): delivery
+ * would refuse it uncounted, so it is over the window for planning. A sampled
+ * estimate that can still be counted is left to delivery's count.
  */
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
-    if (sizing.isExact(candidate) || sizing.plan(candidate).source !== "bytes")
+    if (sizing.isExact(candidate))
+        return;
+    if (sizing.plan(candidate).source !== "bytes" && sizing.canCount(candidate))
         return;
     if (candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
         record.uncountedOverWindow = true;
@@ -3791,13 +3796,16 @@ async function selectForwardCandidate(args) {
     return changed ? candidate.body : intended;
 }
 /**
- * Whether delivery would refuse `candidate` sent whole: it is planned over the
- * window, and the measurement selection would use (an exact count, else the
- * same estimate or bytes/4 fallback) does not fit either. Only then is there
- * no fallback, and only then may a compress take the long budget.
+ * Whether delivery would refuse `candidate` sent whole, by delivery's own
+ * admission: it is sendable only when its plan fits and either an exact count
+ * or its conservative per-model bound (with the full max_tokens) fits too;
+ * otherwise the measurement delivery would use (a count, else that bound)
+ * decides. Only when it is refused is there no fallback, and only then may a
+ * compress take the long budget.
  */
 async function wholeRequestRefused(sizing, candidate, limits) {
-    if (fitsNative(sizing.plan(candidate).tokens, limits))
+    if (fitsNative(sizing.plan(candidate).tokens, limits) &&
+        (sizing.isExact(candidate) || sizing.boundFits(candidate, limits)))
         return false;
     return !fitsMeasured(await sizing.measure(candidate, limits), limits);
 }

@@ -49,6 +49,14 @@ export declare class RequestSizing {
     excludeFallback(candidate: RequestCandidate): void;
     /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
     plan(candidate: RequestCandidate): PlannedSize;
+    /** Whether this body could still get an exact count: counting is on and
+     * no attempt for these bytes has completed (a failed one is reused). */
+    canCount(candidate: RequestCandidate): boolean;
+    /** Whether the conservative bound alone admits this body under `limits`. */
+    boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean;
+    /** Count a body at planning when only a count could admit it: no exact
+     * count and its conservative bound does not fit. Delivery reuses the result. */
+    countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void>;
     /** Whether this body's size is an exact Count Tokens result. */
     isExact(candidate: RequestCandidate): boolean;
     clientInputTokens(candidate: RequestCandidate): number | undefined;

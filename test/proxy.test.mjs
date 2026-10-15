@@ -10103,7 +10103,12 @@ for (const reportUsage of [true, false]) {
       conv.at(-1).content[0].text = "x".repeat(padding - 3);
       const rec = await h.post(conv, {}, { max_tokens: 64_000 });
       assert.equal(rec.requestBytes, 600_268);
-      assert.equal(rec.compaction.estimatedTokens, 150_067);
+      // Its bound is over the window, so it is counted at planning (the count
+      // omits max_tokens and other uncountable fields, a few tokens fewer);
+      // the count, like the calibrated usage, still forces with 64k output.
+      assert.ok(Math.abs(rec.compaction.estimatedTokens - 150_067) <= 10,
+        `${rec.compaction.estimatedTokens}`);
+      assert.equal(h.upstream.countCalls.length, 2, "warm-up and this turn, each counted once");
       assert.equal(rec.compaction.sizeSource, reportUsage ? "reported" : "bytes");
       assert.ok(150_067 < 160_000 && 150_067 + 64_000 > 200_000);
       const call = h.compressCalls().at(-1);

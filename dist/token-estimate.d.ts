@@ -28,7 +28,8 @@ export declare function bytesPerTokenForModel(model: string | undefined): number
 /** Tokens `bytes` of text may cost on `model` (rounded up). */
 export declare function conservativeTokensFromBytes(bytes: number, model: string | undefined): number;
 /** Tokens a request body may cost on `model`: its text at the family ratio,
- * each image block (base64 or URL, at any depth) at one image's maximum.
+ * each image content block (base64 or URL, in a message or a tool_result) at
+ * one image's maximum.
  * A body that does not parse is all text, an over-estimate. */
 export declare function conservativeBodyTokens(body: Buffer, model: string | undefined): number;
 //# sourceMappingURL=token-estimate.d.ts.map

@@ -1127,7 +1127,9 @@ export class MemtreeClient {
     /**
      * Every transmitted field that can change the server's answer, except the
      * size hint (clientInputTokens) and the abort budget: the complete key adds
-     * the hint's verdict, and the in-flight join key compares hints itself.
+     * the hint's verdict, and the in-flight join key compares hints itself. The
+     * hint's provenance is included: only an exact count may loosen the
+     * server's sizing, so exact and projected hints never share an answer.
      */
     requestIdentity(hash, modelContextLimit, meta) {
         const tools = transmittedTools(meta?.tools);
@@ -1140,6 +1142,7 @@ export class MemtreeClient {
             createHash("sha256").update(toolsJson).digest("hex"),
             meta?.compressionTargetTokens ?? null,
             meta?.compressionThresholdTokens ?? null,
+            meta?.clientInputTokens !== undefined && meta.clientInputTokensExact === true,
         ];
     }
     /**

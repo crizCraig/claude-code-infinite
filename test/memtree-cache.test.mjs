@@ -433,3 +433,35 @@ test("final preparation yields and shares the exit upload deadline", async () =>
     assert.equal(fixture.calls.length, 0, "no upload after the deadline");
   } finally { await fixture.close(); }
 });
+
+test("count provenance is part of compress identity: exact and projected hints never share an answer", async () => {
+  // Codex round 2: the server loosens its ratio only for an exact count, so an
+  // exact hint's passthrough is not a valid answer for the same projected hint.
+  const passthrough = { messages: MESSAGES, compressed: false };
+  const meta = (exact) => ({ sessionId: "s", model: "claude-opus-5-5",
+    compressionTargetTokens: 400_000, compressionThresholdTokens: 900_000,
+    clientInputTokens: 550_000, ...(exact ? { clientInputTokensExact: true } : {}) });
+  const cached = await memtreeFixture({ result: () => passthrough });
+  try {
+    const client = new MemtreeClient({ baseUrl: cached.origin, apiKey: "k" });
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(true));
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(false));
+    assert.equal(cached.calls.length, 2, "the completed exact answer is not reused");
+    assert.equal(cached.calls[0].client_input_tokens_exact, true);
+    assert.equal(cached.calls[1].client_input_tokens_exact, undefined);
+  } finally { await cached.close(); }
+
+  const held = await memtreeFixture({ hold: true, result: () => passthrough });
+  try {
+    const client = new MemtreeClient({ baseUrl: held.origin, apiKey: "k" });
+    const exact = client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(true));
+    const projected = client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(false));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    held.release();
+    await Promise.all([exact, projected]);
+    assert.equal(held.calls.length, 2, "a projected hint does not join an exact one in flight");
+  } finally {
+    held.release();
+    await held.close();
+  }
+});

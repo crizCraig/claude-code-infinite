@@ -75,6 +75,24 @@ export class RequestSizing {
     return exact !== undefined ? { tokens: exact, source: "reported" } : candidate.estimate;
   }
 
+  /** Whether this body could still get an exact count: counting is on and
+   * no attempt for these bytes has completed (a failed one is reused). */
+  canCount(candidate: RequestCandidate): boolean {
+    return this.enabled && this.counts.peek(candidate.body) === undefined;
+  }
+
+  /** Whether the conservative bound alone admits this body under `limits`. */
+  boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean {
+    return fitsNative(candidate.conservativeTokens, estimateLimits(limits));
+  }
+
+  /** Count a body at planning when only a count could admit it: no exact
+   * count and its conservative bound does not fit. Delivery reuses the result. */
+  async countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void> {
+    if (this.isExact(candidate) || !this.canCount(candidate) || this.boundFits(candidate, limits)) return;
+    await this.counts.count(candidate.body);
+  }
+
   /** Whether this body's size is an exact Count Tokens result. */
   isExact(candidate: RequestCandidate): boolean {
     return this.counts.peek(candidate.body)?.tokens !== undefined;

@@ -46,7 +46,8 @@ export function conservativeTokensFromBytes(bytes: number, model: string | undef
 }
 
 /** Tokens a request body may cost on `model`: its text at the family ratio,
- * each image block (base64 or URL, at any depth) at one image's maximum.
+ * each image content block (base64 or URL, in a message or a tool_result) at
+ * one image's maximum.
  * A body that does not parse is all text, an over-estimate. */
 export function conservativeBodyTokens(body: Buffer, model: string | undefined): number {
   const { imageBytes, imageTokens } = imagePayloads(body);
@@ -63,26 +64,32 @@ function imagePayloads(body: Buffer): { imageBytes: number; imageTokens: number 
   } catch {
     return totals;
   }
-  walkImages(parsed, totals);
+  const messages = (parsed as { messages?: unknown } | null)?.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      const content = (message as { content?: unknown } | null)?.content;
+      if (Array.isArray(content)) countImageBlocks(content, totals);
+    }
+  }
   return totals;
 }
 
-/** Visit every `{type: "image", source}` block, whatever its key order. */
-function walkImages(value: unknown, totals: { imageBytes: number; imageTokens: number }): void {
-  if (Array.isArray(value)) {
-    for (const item of value) walkImages(item, totals);
-    return;
-  }
-  if (!value || typeof value !== "object") return;
-  const block = value as Record<string, unknown>;
-  const source = block.source as Record<string, unknown> | undefined;
-  if (block.type === "image" && source && typeof source === "object") {
-    totals.imageTokens += MAX_IMAGE_TOKENS;
-    // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
-    if (source.type === "base64" && typeof source.data === "string") {
-      totals.imageBytes += source.data.length;
+/** Count image blocks among content blocks: a message's content, and
+ * recursively a tool_result's content. Image-shaped JSON anywhere else (tool
+ * inputs, schemas, system, metadata) is ordinary text and stays counted as such. */
+function countImageBlocks(blocks: unknown[], totals: { imageBytes: number; imageTokens: number }): void {
+  for (const item of blocks) {
+    if (!item || typeof item !== "object") continue;
+    const block = item as Record<string, unknown>;
+    const source = block.source as Record<string, unknown> | undefined;
+    if (block.type === "image" && source && typeof source === "object") {
+      totals.imageTokens += MAX_IMAGE_TOKENS;
+      // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
+      if (source.type === "base64" && typeof source.data === "string") {
+        totals.imageBytes += source.data.length;
+      }
+    } else if (block.type === "tool_result" && Array.isArray(block.content)) {
+      countImageBlocks(block.content, totals);
     }
-    return;
   }
-  for (const child of Object.values(block)) walkImages(child, totals);
 }

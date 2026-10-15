@@ -122,3 +122,28 @@ test('with counting disabled the conservative bound decides, per model', async (
   assert.equal(selected.measurement.tokens, 188);
   assert.equal(selected.measurement.source, 'bytes');
 });
+
+test('image-shaped JSON outside content-block positions stays text (Codex round 2)', () => {
+  const model = 'claude-opus-5-5';
+  const data = 'A'.repeat(1_200_000);
+  const fake = { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
+  const inToolInput = Buffer.from(JSON.stringify({ model, messages: [
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Edit', input: { payload: fake } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] }] }));
+  const inSchema = Buffer.from(JSON.stringify({ model, tools: [{ name: 'x',
+    input_schema: { type: 'object', default: fake } }], messages: [{ role: 'user', content: 'go' }] }));
+  const inSystem = Buffer.from(JSON.stringify({ model, system: [fake],
+    messages: [{ role: 'user', content: 'go' }] }));
+  const stray = Buffer.from(JSON.stringify({ model, metadata: { fake },
+    messages: [{ role: 'user', content: 'go' }] }));
+  for (const body of [inToolInput, inSchema, inSystem, stray]) {
+    assert.equal(conservativeBodyTokens(body, model), conservativeTokensFromBytes(body.length, model));
+  }
+  // Real positions still count: a user content block and a tool_result's content.
+  const real = Buffer.from(JSON.stringify({ model, messages: [
+    { role: 'user', content: [fake] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: [fake] }] }] }));
+  assert.equal(conservativeBodyTokens(real, model),
+    conservativeTokensFromBytes(real.length - 2 * data.length, model) + 2 * MAX_IMAGE_TOKENS);
+});

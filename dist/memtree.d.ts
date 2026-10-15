@@ -81,9 +81,8 @@ export interface CompressRequestMeta {
     /**
      * Server `client_input_tokens_exact`: `clientInputTokens` is a Count Tokens
      * result for this very body, not a projection from an older usage sample.
-     * Only then may the server loosen its chars-per-token sizing. Not part of the
-     * cache key: an exact and a projected hint for the same messages both yield a
-     * safe answer for them.
+     * Only then may the server loosen its chars-per-token sizing, so it is part
+     * of the cache key and of in-flight join identity.
      */
     clientInputTokensExact?: boolean;
     /**
@@ -449,7 +448,9 @@ export declare class MemtreeClient {
     /**
      * Every transmitted field that can change the server's answer, except the
      * size hint (clientInputTokens) and the abort budget: the complete key adds
-     * the hint's verdict, and the in-flight join key compares hints itself.
+     * the hint's verdict, and the in-flight join key compares hints itself. The
+     * hint's provenance is included: only an exact count may loosen the
+     * server's sizing, so exact and projected hints never share an answer.
      */
     private requestIdentity;
     /**

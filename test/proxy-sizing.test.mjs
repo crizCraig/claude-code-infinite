@@ -508,3 +508,53 @@ test('client_input_tokens_exact is omitted for a size projected from a usage sam
     assert.equal(call.client_input_tokens_exact, undefined);
   } finally { h.close(); }
 });
+
+// Codex round 2, finding 1: a projected usage sample cannot hide a body whose
+// conservative bound is over the window when the body cannot be counted.
+for (const mode of ['disabled', 'timeout']) {
+  test(`a sampled ~2 MB (Codex: 2,000,260-byte) Opus 5.5 tool turn over its bound compresses when uncountable (${mode})`, async () => {
+    const h = await harness({ budget: 800_000, enabled: mode !== 'disabled', timeout: mode === 'timeout',
+      usage: (_body, bytes) => Math.floor(bytes / 4) });
+    try {
+      // 1 MB: bound 526k fits 1M; it goes out and teaches a 0.25 tokens/byte sample.
+      assert.equal(await h.post(1_000_000, { model: 'claude-opus-5-5' }), 200);
+      assert.equal(h.compressions.length, 0);
+      await h.post(2_000_000, { model: 'claude-opus-5-5' });
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.ok(rec.requestBytes > 2_000_000, `${rec.requestBytes}`);
+      assert.equal(rec.compaction.sizeSource, 'reported');
+      assert.ok(rec.compaction.estimatedTokens < 800_000, `${rec.compaction.estimatedTokens}`);
+      assert.equal(rec.compaction.uncountedOverWindow, true);
+      assert.equal(h.compressions.length, 1, 'compression is attempted, not a pass');
+      assert.equal(h.compressions[0].compression_threshold_tokens, undefined, 'forced');
+      assert.ok(h.counts.length <= 1, 'at most one count, reused at delivery');
+    } finally { h.close(); }
+  });
+}
+
+test('a sampled over-bound turn is counted once at planning and a fitting count passes', async () => {
+  const h = await harness({ budget: 800_000, usage: (_body, bytes) => Math.floor(bytes / 4),
+    count: () => ({ input_tokens: 520_000 }) });
+  try {
+    assert.equal(await h.post(1_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.counts.length, 0);
+    assert.equal(await h.post(2_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.counts.length, 1, 'counted once; delivery reuses it');
+    assert.equal(h.compressions.length, 0, 'the exact count fits: no compression');
+    assert.equal(h.forwards.length, 2);
+  } finally { h.close(); }
+});
+
+// Codex round 2, finding 4: with no fallback (the original cannot go out
+// uncounted), compression gets the long no-fallback budget.
+test('an uncounted over-bound Opus 5.5 tool turn compresses on the long budget', async () => {
+  const h = await harness({ budget: 800_000, enabled: false, compressBudgetMs: 100,
+    longCompressBudgetMs: 3_000,
+    compress: () => new Promise(resolve => setTimeout(() => resolve(compressedReply(4_000, 800_000)), 500)) });
+  try {
+    assert.equal(await h.post(2_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.compressions.length, 1);
+    assert.equal(h.forwards.length, 1);
+    assert.match(JSON.stringify(h.forwards[0].messages), /memory m/);
+  } finally { h.close(); }
+});
