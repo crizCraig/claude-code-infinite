@@ -2,7 +2,7 @@
  * exact counts remain attached to immutable body bytes, and every candidate
  * shares the request's Count Tokens deadline and account cooldown. */
 import { createHash } from "node:crypto";
-import { plausibleSample, shouldCountTokens } from "./count-tokens.js";
+import { exceedsRequestLimit, plausibleSample, shouldCountTokens } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
@@ -46,11 +46,17 @@ export class RequestSizing {
     /** Whether this body could still get an exact count: counting is on and
      * no attempt for these bytes has completed (a failed one is reused). */
     canCount(candidate) {
-        return this.enabled && this.counts.peek(candidate.body) === undefined;
+        return this.enabled && this.counts.peek(candidate.body) === undefined &&
+            !this.exceedsRequestLimit(candidate);
+    }
+    /** Whether Anthropic would refuse this body's size (413) before reading it. */
+    exceedsRequestLimit(candidate) {
+        return exceedsRequestLimit(candidate.body.length);
     }
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate, limits) {
-        return fitsNative(candidate.conservativeTokens, estimateLimits(limits));
+        return !this.exceedsRequestLimit(candidate) &&
+            fitsNative(candidate.conservativeTokens, estimateLimits(limits));
     }
     /** Count a body at planning when only a count could admit it: no exact
      * count and its conservative bound does not fit. Delivery reuses the result. */
@@ -71,6 +77,11 @@ export class RequestSizing {
     async measure(candidate, limits, phase = "delivery") {
         let count = this.counts.peek(candidate.body);
         const estimate = candidate.estimate.tokens;
+        if (this.exceedsRequestLimit(candidate))
+            return {
+                tokens: Math.max(estimate, candidate.conservativeTokens), source: "bytes",
+                estimatedTokens: estimate, ...(count ? { count } : {}), tooLarge: true,
+            };
         // Delivery counts whenever an estimate is all that says the body fits: the
         // learned estimate, or the conservative bound, does not fit on its own.
         const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
@@ -124,7 +135,7 @@ export function outputReservation(model, maxTokens) {
 /** Admission: the relaxed output floor applies only to an exact count of this
  * body; estimates and fallbacks (failed or disabled counting) keep max_tokens. */
 export function fitsMeasured(measurement, limits) {
-    return fitsNative(measurement.tokens, measurement.source === "exact" ? limits : estimateLimits(limits));
+    return !measurement.tooLarge && fitsNative(measurement.tokens, measurement.source === "exact" ? limits : estimateLimits(limits));
 }
 /** The limits an estimate is judged by: the full max_tokens reservation. */
 export function estimateLimits(limits) {

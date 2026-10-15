@@ -110,6 +110,9 @@ export interface UsageRecord {
 export interface CountTokensRecord {
   statusClass: string;
   ms: number;
+  /** Count payload bytes, and the allowance the attempt had (count-tokens.ts). */
+  bytes: number;
+  timeoutMs: number;
 }
 
 export interface MessagesRecord {

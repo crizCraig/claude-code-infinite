@@ -16,8 +16,27 @@
 import { createHash } from "node:crypto";
 import https from "node:https";
 import { approxTokensFromBytes } from "./reqlog.js";
-/** Bound on a count call: past it the caller keeps its estimate. */
+/**
+ * A request's counting allowance: past it the caller keeps its estimate.
+ * Measured 2026-10-15 (reports/2026-10-15-count-tokens-latency.md): latency is
+ * upload-bound, ~0.2 s plus body bytes at ~12 MB/s on a fast uplink (27 MB in
+ * ~2.5 s, text or images alike), so a flat 3 s timed out on the 17-27 MB
+ * image-heavy bodies that most needed a count. The allowance is 3 s plus 1 ms
+ * per kB (a 1 MB/s, 8 Mbit/s uplink), capped at 30 s. It only binds when the
+ * count is slow: a fast count returns as soon as it is done.
+ */
 export const COUNT_TOKENS_TIMEOUT_MS = 3_000;
+/** Upload rate the allowance still covers, in bytes per ms (1 MB/s). */
+export const COUNT_UPLOAD_BYTES_PER_MS = 1_000;
+/** Most a request waits on counting, however large its bodies. */
+export const COUNT_DEADLINE_MAX_MS = 30_000;
+/**
+ * Anthropic's request size limit, the same on Messages and Count Tokens:
+ * 67,108,864 bytes (64 MiB) is accepted, one byte more is answered 413
+ * request_too_large from Content-Length alone (measured 2026-10-15). A body
+ * over it cannot be sent natively at all, so it is never counted.
+ */
+export const ANTHROPIC_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MAX_COUNT_RESPONSE_BYTES = 64 * 1024;
 const MAX_COUNT_COOLDOWNS = 128;
 const COUNT_COOLDOWN_MS = 60_000;
@@ -43,6 +62,15 @@ const COUNTABLE_FIELDS = [
     "context_management", "output_config", "output_format", "cache_control",
     "mcp_servers", "speed", "compaction",
 ];
+/** The counting allowance for a body of `bytes` (see COUNT_TOKENS_TIMEOUT_MS). */
+export function countDeadlineMs(bytes) {
+    const extra = Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes / COUNT_UPLOAD_BYTES_PER_MS) : 0;
+    return Math.min(COUNT_DEADLINE_MAX_MS, COUNT_TOKENS_TIMEOUT_MS + extra);
+}
+/** Whether Anthropic rejects a body of `bytes` as too large (413), unseen. */
+export function exceedsRequestLimit(bytes) {
+    return bytes > ANTHROPIC_MAX_REQUEST_BYTES;
+}
 /** Whether a sample's tokens-per-byte ratio can describe a request body. */
 export function plausibleSample(sample) {
     if (!sample || !(sample.tokens > 0) || !(sample.forwardedBytes > 0))
@@ -100,12 +128,18 @@ export class CountTokensCooldowns {
         this.entries.set(key, now + cooldownDuration(result.retryAfter, now));
     }
 }
-/** Exact results belong to this request and body, never a shared sample slot. */
+/**
+ * Exact results belong to this request and body, never a shared sample slot.
+ * All counts of one request share one allowance: the largest body's
+ * (countDeadlineMs), spent only while a count is in flight, so time between
+ * counts (a compression before the replacement is counted) is not charged.
+ */
 export function createCountTokensSession(options, cooldowns = new CountTokensCooldowns()) {
     const pending = new Map();
     const completed = new Map();
     const account = countAccountKey(options);
-    let deadline;
+    const clock = new CountingClock();
+    let allowance = 0;
     return {
         peek: (body) => completed.get(bodyHash(body)),
         count: (body) => {
@@ -113,22 +147,19 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
             const existing = pending.get(key);
             if (existing)
                 return existing;
-            deadline ??= Date.now() + (options.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS);
-            const remaining = deadline - Date.now();
+            const tooLarge = exceedsRequestLimit(body.length);
+            if (!tooLarge)
+                allowance = Math.max(allowance, requestAllowance(options, body.length));
+            const remaining = allowance - clock.spent();
             const skipped = options.signal?.aborted ? "aborted"
-                : cooldowns.active(account) ? "cooldown" : remaining <= 0 ? "deadline" : undefined;
+                : tooLarge ? "too-large" : cooldowns.active(account) ? "cooldown"
+                    : remaining <= 0 ? "deadline" : undefined;
             const attempt = skipped
-                ? Promise.resolve({ ms: 0, outcome: skipped })
-                : countUpstreamTokens({ ...options, body, timeoutMs: remaining }).then((result) => {
-                    cooldowns.record(account, result);
-                    if (result.outcome !== "invalid-request" && result.outcome !== "deadline") {
-                        try {
-                            options.onAttempt?.(result);
-                        }
-                        catch { /* diagnostics cannot break forwarding */ }
-                    }
-                    return result;
-                });
+                ? Promise.resolve({ ms: 0, outcome: skipped, bytes: body.length })
+                : clock.track(countUpstreamTokens({ ...options, body, timeoutMs: remaining }))
+                    .then((result) => recordAttempt(options, cooldowns, account, result));
+            if (skipped === "too-large")
+                attempt.then((result) => notifyAttempt(options, result));
             const saved = attempt.then((result) => { completed.set(key, result); return result; });
             pending.set(key, saved);
             return saved;
@@ -138,12 +169,16 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
 /** All failures resolve without tokens, including synchronous request errors. */
 export function countUpstreamTokens(args) {
     const started = Date.now();
+    const timeoutMs = args.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS;
     const payload = countTokensBody(args.body);
     if (!payload || args.signal?.aborted)
         return Promise.resolve({
             ms: 0, outcome: args.signal?.aborted ? "aborted" : "invalid-request",
         });
-    const remaining = (args.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS) - (Date.now() - started);
+    const bytes = payload.length;
+    if (exceedsRequestLimit(bytes))
+        return Promise.resolve({ ms: 0, outcome: "too-large", bytes });
+    const remaining = timeoutMs - (Date.now() - started);
     if (remaining <= 0)
         return Promise.resolve({ ms: Date.now() - started, outcome: "deadline" });
     return new Promise((resolve) => {
@@ -156,7 +191,7 @@ export function countUpstreamTokens(args) {
             done = true;
             clearTimeout(timer);
             args.signal?.removeEventListener("abort", abort);
-            resolve({ ...result, ms: Date.now() - started });
+            resolve({ ...result, ms: Date.now() - started, bytes, timeoutMs: remaining });
             request?.destroy();
         };
         const abort = () => finish({ outcome: "aborted" });
@@ -273,5 +308,38 @@ function cooldownDuration(retryAfter, now) {
     const duration = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - now;
     return Number.isFinite(duration)
         ? Math.max(1000, Math.min(COUNT_COOLDOWN_MS, duration)) : COUNT_COOLDOWN_MS;
+}
+function requestAllowance(options, bytes) {
+    return options.timeoutMs ?? (options.deadlineMs ?? countDeadlineMs)(bytes);
+}
+function recordAttempt(options, cooldowns, account, result) {
+    cooldowns.record(account, result);
+    if (result.outcome !== "invalid-request" && result.outcome !== "deadline") {
+        notifyAttempt(options, result);
+    }
+    return result;
+}
+function notifyAttempt(options, result) {
+    try {
+        options.onAttempt?.(result);
+    }
+    catch { /* diagnostics cannot break forwarding */ }
+}
+/** Wall time with at least one count in flight: what a request's allowance is spent on. */
+class CountingClock {
+    inFlight = 0;
+    since = 0;
+    total = 0;
+    spent() {
+        return this.total + (this.inFlight > 0 ? Date.now() - this.since : 0);
+    }
+    track(attempt) {
+        if (this.inFlight++ === 0)
+            this.since = Date.now();
+        return attempt.finally(() => {
+            if (--this.inFlight === 0)
+                this.total += Date.now() - this.since;
+        });
+    }
 }
 //# sourceMappingURL=count-tokens.js.map

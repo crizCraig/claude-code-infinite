@@ -23,6 +23,8 @@ export interface CandidateMeasurement {
     /** Advisory estimate retained for compression and stale-estimate diagnostics. */
     estimatedTokens: number;
     count?: CountTokensResult;
+    /** Over Anthropic's request size limit: it cannot be sent natively at any size. */
+    tooLarge?: true;
 }
 export interface RequestCandidate {
     readonly key: string;
@@ -52,6 +54,8 @@ export declare class RequestSizing {
     /** Whether this body could still get an exact count: counting is on and
      * no attempt for these bytes has completed (a failed one is reused). */
     canCount(candidate: RequestCandidate): boolean;
+    /** Whether Anthropic would refuse this body's size (413) before reading it. */
+    exceedsRequestLimit(candidate: RequestCandidate): boolean;
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean;
     /** Count a body at planning when only a count could admit it: no exact
@@ -77,7 +81,7 @@ export declare class RequestSizing {
 export declare function outputReservation(model: string | undefined, maxTokens: unknown): number;
 /** Admission: the relaxed output floor applies only to an exact count of this
  * body; estimates and fallbacks (failed or disabled counting) keep max_tokens. */
-export declare function fitsMeasured(measurement: Pick<CandidateMeasurement, "tokens" | "source">, limits: SizingLimits): boolean;
+export declare function fitsMeasured(measurement: Pick<CandidateMeasurement, "tokens" | "source" | "tooLarge">, limits: SizingLimits): boolean;
 /** The limits an estimate is judged by: the full max_tokens reservation. */
 export declare function estimateLimits(limits: SizingLimits): SizingLimits;
 /** `limits.output` is the reservation from outputReservation, not raw max_tokens. */

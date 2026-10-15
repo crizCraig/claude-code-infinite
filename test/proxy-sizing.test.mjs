@@ -130,7 +130,7 @@ test('exact low-ratio count stays authoritative for an image-sized request', asy
     const rec = h.records.find(r => r.kind === 'messages');
     assert.equal(rec.compaction.estimatedTokens, 10_000);
     assert.equal(rec.overBudgetForward, undefined, 'known exact input fits the soft budget');
-    assert.deepEqual(Object.keys(rec.countTokens[0]).sort(), ['ms', 'statusClass']);
+    assert.deepEqual(Object.keys(rec.countTokens[0]).sort(), ['bytes', 'ms', 'statusClass', 'timeoutMs']);
   } finally { h.close(); }
 });
 
@@ -188,7 +188,7 @@ test('compressed body gets its own count; original exact count never sizes the r
     assert.equal(rec.compaction.estimatedTokens, 210_000);
     assert.equal(rec.countTokens.length, 2);
     assert.equal(rec.overBudgetForward, undefined, 'compressed body fits soft budget');
-    assert.ok(rec.countTokens.every(r => Object.keys(r).sort().join() === 'ms,statusClass'));
+    assert.ok(rec.countTokens.every(r => Object.keys(r).sort().join() === 'bytes,ms,statusClass,timeoutMs'));
   } finally { h.close(); }
 });
 
@@ -601,3 +601,21 @@ for (const stale of [false, true]) {
     } finally { h.close(); }
   });
 }
+
+test('original over the 64 MiB request limit: no count, compressed instead of forwarded', async () => {
+  const memory = [{ role: 'user', content: 'memory ' + 'm'.repeat(100_000) }];
+  const h = await harness({ budget: 800_000, count: () => ({ input_tokens: 50_000 }),
+    compress: () => ({ body: { messages: memory, flattened_messages: memory, compressed: true,
+      model_budget_tokens: 800_000, usage: { prompt_tokens: 300_000, completion_tokens: 50_000,
+        prompt_tokens_details: { cached_tokens: 250_000 } } } }) });
+  try {
+    // A learned sample from a cheap image-heavy turn would call it small.
+    assert.equal(await h.post(64 * 1024 * 1024 + 1, { oneMillion: true }), 200);
+    assert.ok(h.counts.every(c => JSON.stringify(c).length < 1_000_000), 'never counted');
+    assert.equal(h.compressions.length, 1);
+    assert.equal(h.forwards.length, 1);
+    assert.ok(JSON.stringify(h.forwards[0]).length < 200_000, 'the compressed body was sent');
+    const rec = h.records.find(r => r.kind === 'messages');
+    assert.equal(rec.compaction.uncountedOverWindow, true);
+  } finally { h.close(); }
+});

@@ -950,7 +950,8 @@ async function handleMessages(req, res, opts, upstream, state) {
         upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
         signal: state.shutdownSignal,
         onAttempt: (result) => {
-            (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms });
+            (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
+                bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
         },
     }, state.countTokensCooldowns);
     const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined);
@@ -2838,7 +2839,8 @@ async function countIfOverBound(sizing, candidate, body, modelContextLimit) {
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
     if (sizing.isExact(candidate))
         return;
-    if (candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
+    if (sizing.exceedsRequestLimit(candidate) ||
+        candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
         record.uncountedOverWindow = true;
     }
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RequestSizing } from '../dist/request-sizing.js';
+import { RequestSizing, fitsMeasured } from '../dist/request-sizing.js';
 
 const limits = { budget: 100, context: 200, output: 10 };
 function fakeCounts(values = new Map()) {
@@ -118,4 +118,23 @@ test('native admission rounds bytes upward and includes reserved output', async 
   const sizing = new RequestSizing(fakeCounts(), false);
   const original = sizing.register(Buffer.from('x'.repeat(401)), 'original');
   assert.equal(await sizing.select(original, { budget: 100, context: 110, output: 10 }), undefined);
+});
+
+test('a body over the 64 MiB request limit is known not to fit natively: no count', async () => {
+  const counts = fakeCounts();
+  const sizing = new RequestSizing(counts, true, 'claude-opus-5-5');
+  const big = { budget: 800_000, context: 1_000_000, output: 64 };
+  // Image-like filler: a bound or a learned sample could call it small.
+  const huge = sizing.register(Buffer.alloc(64 * 1024 * 1024 + 1, 0x20), 'original',
+    { tokens: 100_000, forwardedBytes: 60_000_000 });
+  assert.equal(sizing.exceedsRequestLimit(huge), true);
+  assert.equal(sizing.boundFits(huge, big), false);
+  assert.equal(sizing.canCount(huge), false);
+  await sizing.countIfOverBound(huge, big);
+  const measured = await sizing.measure(huge, big);
+  assert.equal(counts.calls.length, 0, 'Count Tokens would answer 413');
+  assert.equal(measured.source, 'bytes');
+  assert.equal(measured.tooLarge, true);
+  assert.equal(fitsMeasured(measured, big), false);
+  assert.equal(await sizing.select(huge, big), undefined);
 });
