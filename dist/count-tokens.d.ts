@@ -1,7 +1,26 @@
 import type http from "node:http";
 import https from "node:https";
-/** Bound on a count call: past it the caller keeps its estimate. */
+/**
+ * A request's counting allowance: past it the caller keeps its estimate.
+ * Measured 2026-10-15 (reports/2026-10-15-count-tokens-latency.md): latency is
+ * upload-bound, ~0.2 s plus body bytes at ~12 MB/s on a fast uplink (27 MB in
+ * ~2.5 s, text or images alike), so a flat 3 s timed out on the 17-27 MB
+ * image-heavy bodies that most needed a count. The allowance is 3 s plus 1 ms
+ * per kB (a 1 MB/s, 8 Mbit/s uplink), capped at 30 s. It only binds when the
+ * count is slow: a fast count returns as soon as it is done.
+ */
 export declare const COUNT_TOKENS_TIMEOUT_MS = 3000;
+/** Upload rate the allowance still covers, in bytes per ms (1 MB/s). */
+export declare const COUNT_UPLOAD_BYTES_PER_MS = 1000;
+/** Most a request waits on counting, however large its bodies. */
+export declare const COUNT_DEADLINE_MAX_MS = 30000;
+/**
+ * Anthropic's request size limit, the same on Messages and Count Tokens:
+ * 67,108,864 bytes (64 MiB) is accepted, one byte more is answered 413
+ * request_too_large from Content-Length alone (measured 2026-10-15). A body
+ * over it cannot be sent natively at all, so it is never counted.
+ */
+export declare const ANTHROPIC_MAX_REQUEST_BYTES: number;
 /**
  * Plausible tokens per byte for a sample. Text runs ~0.25-0.5. Above 1 the
  * sample measured something other than the body (server tool results), as on
@@ -24,7 +43,7 @@ export interface CountTokensUpstream {
     host: string;
     port: number;
 }
-export type CountTokensOutcome = "success" | "timeout" | "network-error" | "invalid-response" | "http-error" | "server-error" | "auth" | "rate-limit" | "cooldown" | "aborted" | "deadline" | "invalid-request";
+export type CountTokensOutcome = "success" | "timeout" | "network-error" | "invalid-response" | "http-error" | "server-error" | "auth" | "rate-limit" | "cooldown" | "aborted" | "deadline" | "invalid-request" | "too-large";
 export interface CountTokensResult {
     outcome: CountTokensOutcome;
     /** Internal cooldown metadata; never log it. */
@@ -33,7 +52,15 @@ export interface CountTokensResult {
     tokens?: number;
     ms: number;
     status?: number;
+    /** Body bytes the attempt was for (diagnostics). */
+    bytes?: number;
+    /** Allowance the attempt had (diagnostics). */
+    timeoutMs?: number;
 }
+/** The counting allowance for a body of `bytes` (see COUNT_TOKENS_TIMEOUT_MS). */
+export declare function countDeadlineMs(bytes: number): number;
+/** Whether Anthropic rejects a body of `bytes` as too large (413), unseen. */
+export declare function exceedsRequestLimit(bytes: number): boolean;
 /** Whether a sample's tokens-per-byte ratio can describe a request body. */
 export declare function plausibleSample(sample: SizeSample | undefined): sample is SizeSample;
 /**
@@ -57,7 +84,10 @@ export interface CountTokensSessionOptions {
     headers: Record<string, string>;
     requestUrl: string | undefined;
     signal?: AbortSignal;
+    /** A fixed allowance for the whole request instead of one scaled by size. */
     timeoutMs?: number;
+    /** Allowance for a body of `bytes`; defaults to countDeadlineMs. */
+    deadlineMs?: (bytes: number) => number;
     /** Called once per attempt; log only outcome and ms, never tokens or headers. */
     onAttempt?: (result: CountTokensResult) => void;
 }
@@ -65,7 +95,12 @@ export interface CountTokensSession {
     count(body: Buffer): Promise<CountTokensResult>;
     peek(body: Buffer): CountTokensResult | undefined;
 }
-/** Exact results belong to this request and body, never a shared sample slot. */
+/**
+ * Exact results belong to this request and body, never a shared sample slot.
+ * All counts of one request share one allowance: the largest body's
+ * (countDeadlineMs), spent only while a count is in flight, so time between
+ * counts (a compression before the replacement is counted) is not charged.
+ */
 export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
 /** All failures resolve without tokens, including synchronous request errors. */
 export declare function countUpstreamTokens(args: CountTokensSessionOptions & {

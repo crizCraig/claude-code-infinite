@@ -110,6 +110,13 @@ export interface CompressRequestMeta {
    */
   clientInputTokens?: number;
   /**
+   * Server `client_input_tokens_exact`: `clientInputTokens` is a Count Tokens
+   * result for this very body, not a projection from an older usage sample.
+   * Only then may the server loosen its chars-per-token sizing, so it is part
+   * of the cache key and of in-flight join identity.
+   */
+  clientInputTokensExact?: boolean;
+  /**
    * Each assistant message's response usage (output, thinking, input), keyed
    * by its position in the messages sent. Archived by the server for the
    * MemTree page; never hashed, never part of the compression cache key.
@@ -879,20 +886,6 @@ function transmittedTools(tools: unknown[] | undefined): unknown[] | undefined {
   return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 
-/**
- * With a known comparison budget, only crossing it changes the server's
- * verdict, so same-side retries share a key. Before the server reports its
- * budget, callers can omit both target and threshold: preserve the full hint
- * then, since any differing value may cross the unknown model-policy budget.
- * In particular, a newly counted retry must not reuse an unhinted passthrough.
- */
-function clientOverThreshold(meta: CompressRequestMeta | undefined): true | number | null {
-  const budget = meta?.compressionThresholdTokens ?? meta?.compressionTargetTokens;
-  if (meta?.clientInputTokens === undefined) return null;
-  if (budget === undefined) return meta.clientInputTokens;
-  return meta.clientInputTokens > budget ? true : null;
-}
-
 /** A compress in flight and the size hint it sent (clientInputTokens). */
 interface InFlightCompress {
   promise: Promise<CompressResult | null>;
@@ -1106,6 +1099,7 @@ export class MemtreeClient {
       compressionTargetTokens: meta?.compressionTargetTokens,
       compressionThresholdTokens: meta?.compressionThresholdTokens,
       clientInputTokens: meta?.clientInputTokens,
+      clientInputTokensExact: meta?.clientInputTokensExact,
       messageUsage: meta?.messageUsage,
       messageTimes: meta?.messageTimes,
       sessionId: meta?.sessionId,
@@ -1380,7 +1374,9 @@ export class MemtreeClient {
     return createHash("sha256")
       .update(JSON.stringify([
         ...this.requestIdentity(hash, modelContextLimit, meta),
-        clientOverThreshold(meta),
+        // The numeric hint itself: the server calibrates its chars-per-token
+        // from it, so even same-side hints can change its verdict.
+        meta?.clientInputTokens ?? null,
       ]))
       .digest("hex");
   }
@@ -1388,7 +1384,9 @@ export class MemtreeClient {
   /**
    * Every transmitted field that can change the server's answer, except the
    * size hint (clientInputTokens) and the abort budget: the complete key adds
-   * the hint's verdict, and the in-flight join key compares hints itself.
+   * the hint's value, and the in-flight join key compares hints itself. The
+   * hint's provenance is included: only an exact count may loosen the
+   * server's sizing, so exact and projected hints never share an answer.
    */
   private requestIdentity(
     hash: string,
@@ -1405,6 +1403,7 @@ export class MemtreeClient {
       createHash("sha256").update(toolsJson).digest("hex"),
       meta?.compressionTargetTokens ?? null,
       meta?.compressionThresholdTokens ?? null,
+      meta?.clientInputTokens !== undefined && meta.clientInputTokensExact === true,
     ];
   }
 
@@ -1477,6 +1476,7 @@ export class MemtreeClient {
       compressionTargetTokens?: number;
       compressionThresholdTokens?: number;
       clientInputTokens?: number;
+      clientInputTokensExact?: boolean;
       messageUsage?: MessageUsage;
       messageTimes?: MessageTimes;
       sessionId?: string;
@@ -1515,6 +1515,7 @@ export class MemtreeClient {
       }
       if (opts.clientInputTokens !== undefined) {
         body.client_input_tokens = opts.clientInputTokens;
+        if (opts.clientInputTokensExact) body.client_input_tokens_exact = true;
       }
       // Compress calls only: the server adds the thinking tokens (stripped
       // from `messages` above) to its budget, since a passthrough forwards

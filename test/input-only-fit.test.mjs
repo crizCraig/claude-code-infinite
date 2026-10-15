@@ -173,11 +173,17 @@ test("an estimate near the window is still counted before delivery", async () =>
 for (const mode of ["counted", "count-error", "count-disabled"]) {
   test(`proxy replay (${mode}): small growth past a 950k sample is not forwarded`, async () => {
     const h = await replayHarness(mode);
+    // Uncounted, 3.8 MB on Opus 4.7 is ~2M tokens by the conservative byte
+    // bound (token-estimate.ts), so with counting disabled not even the first
+    // (950k) turn is forwarded on an estimate; bytes/4 (950k) used to admit it.
+    const disabled = mode === "count-disabled";
     try {
-      assert.equal(await h.send(3_800_000, 16_000), 200);
+      const first = await h.send(3_800_000, 16_000);
+      if (disabled) assert.notEqual(first, 200, "uncounted 3.8 MB is over its conservative bound");
+      else assert.equal(first, 200);
       assert.notEqual(await h.send(3_896_000, MAX_TOKENS), 200, "near-window input not forwarded");
-      assert.equal(h.counts.length, mode === "count-disabled" ? 0 : 2);
-      assert.equal(h.forwards.length, 1);
+      assert.equal(h.counts.length, disabled ? 0 : 2);
+      assert.equal(h.forwards.length, disabled ? 0 : 1);
     } finally { h.close(); }
   });
 }

@@ -225,7 +225,10 @@ async function memtreeFixture({ hold = false, status = 200, result = () => RESUL
   };
 }
 
-test("client token threshold crossings replace passthroughs while same-side retries deduplicate", async () => {
+test("each distinct size hint is its own compress answer; identical retries deduplicate", async () => {
+  // The server calibrates its chars-per-token from the numeric hint (Codex
+  // round 3), so even two hints on the same side of the threshold can change
+  // its verdict; only a retry with the same hint may reuse an answer.
   const fixture = await memtreeFixture({ hold: true, result: body => ({
     ...RESULT, compressed: body.client_input_tokens > 800_000,
   }) });
@@ -235,23 +238,39 @@ test("client token threshold crossings replace passthroughs while same-side retr
     const compress = tokens => client.compress(HASH, MESSAGES, 1_000_000, undefined, {
       ...meta, ...(tokens === undefined ? {} : { clientInputTokens: tokens }),
     });
-    const below = compress(undefined);
-    assert.strictEqual(compress(799_999), below);
-    assert.strictEqual(compress(800_000), below, "equality is still under threshold");
+    const unhinted = compress(undefined);
+    assert.strictEqual(compress(undefined), unhinted);
+    const below = compress(799_999);
+    assert.notStrictEqual(below, unhinted, "a hint is not interchangeable with none");
+    assert.strictEqual(compress(799_999), below, "the same hint dedups");
     const above = compress(800_001);
     assert.notStrictEqual(above, below, "cannot reuse an under-budget passthrough");
-    assert.strictEqual(compress(904_036), above, "changing only the over-budget count dedups");
+    const otherAbove = compress(904_036);
+    assert.notStrictEqual(otherAbove, above, "a different over-budget hint asks again");
     fixture.release();
+    await Promise.all([unhinted, otherAbove]);
     assert.equal((await below).compressed, false);
     assert.equal((await above).compressed, true);
-    assert.strictEqual(compress(950_000), above, "settled over-budget retry dedups too");
-    assert.equal(fixture.calls.length, 2);
-    assert.equal(fixture.calls.find(call => call.client_input_tokens !== undefined)
-      .client_input_tokens, 800_001);
+    assert.strictEqual(compress(800_001), above, "settled same-hint retry dedups too");
+    assert.equal(fixture.calls.length, 4);
   } finally {
     fixture.release();
     await fixture.close();
   }
+});
+
+test("projected hints of 500k and 850k for the same messages are two compress calls", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: MESSAGES, compressed: false }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const meta = (tokens) => ({ sessionId: "s", model: "claude-opus-5-5",
+      compressionTargetTokens: 400_000, compressionThresholdTokens: 900_000,
+      clientInputTokens: tokens });
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(500_000));
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(850_000));
+    assert.equal(fixture.calls.length, 2);
+    assert.deepEqual(fixture.calls.map(c => c.client_input_tokens), [500_000, 850_000]);
+  } finally { await fixture.close(); }
 });
 
 
@@ -432,4 +451,36 @@ test("final preparation yields and shares the exit upload deadline", async () =>
     assert.ok(Date.now() - started < 300, "one deadline includes preparation");
     assert.equal(fixture.calls.length, 0, "no upload after the deadline");
   } finally { await fixture.close(); }
+});
+
+test("count provenance is part of compress identity: exact and projected hints never share an answer", async () => {
+  // Codex round 2: the server loosens its ratio only for an exact count, so an
+  // exact hint's passthrough is not a valid answer for the same projected hint.
+  const passthrough = { messages: MESSAGES, compressed: false };
+  const meta = (exact) => ({ sessionId: "s", model: "claude-opus-5-5",
+    compressionTargetTokens: 400_000, compressionThresholdTokens: 900_000,
+    clientInputTokens: 550_000, ...(exact ? { clientInputTokensExact: true } : {}) });
+  const cached = await memtreeFixture({ result: () => passthrough });
+  try {
+    const client = new MemtreeClient({ baseUrl: cached.origin, apiKey: "k" });
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(true));
+    await client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(false));
+    assert.equal(cached.calls.length, 2, "the completed exact answer is not reused");
+    assert.equal(cached.calls[0].client_input_tokens_exact, true);
+    assert.equal(cached.calls[1].client_input_tokens_exact, undefined);
+  } finally { await cached.close(); }
+
+  const held = await memtreeFixture({ hold: true, result: () => passthrough });
+  try {
+    const client = new MemtreeClient({ baseUrl: held.origin, apiKey: "k" });
+    const exact = client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(true));
+    const projected = client.compress(HASH, MESSAGES, 1_000_000, undefined, meta(false));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    held.release();
+    await Promise.all([exact, projected]);
+    assert.equal(held.calls.length, 2, "a projected hint does not join an exact one in flight");
+  } finally {
+    held.release();
+    await held.close();
+  }
 });

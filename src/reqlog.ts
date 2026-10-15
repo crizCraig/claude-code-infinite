@@ -110,6 +110,9 @@ export interface UsageRecord {
 export interface CountTokensRecord {
   statusClass: string;
   ms: number;
+  /** Count payload bytes, and the allowance the attempt had (count-tokens.ts). */
+  bytes: number;
+  timeoutMs: number;
 }
 
 export interface MessagesRecord {
@@ -395,6 +398,13 @@ export interface CompactionRecord {
    * "bytes": bytes/4 of the whole body (no earlier usage to start from).
    */
   sizeSource?: "reported" | "bytes";
+  /**
+   * Uncounted and uncalibrated ("bytes"), and over the window by its per-model
+   * conservative bound (token-estimate.ts) plus max_tokens: delivery could not
+   * send it without an exact count, so planning compresses it now, through
+   * the normal gated path.
+   */
+  uncountedOverWindow?: true;
   /** Set when the turn compressed (or tried to) for one of these reasons. */
   reason?: RecompressReason;
   /** For "prefix-mismatch": which check failed. */

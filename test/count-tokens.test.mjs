@@ -306,3 +306,93 @@ test("aborting an in-flight count releases its wait promptly", async () => {
     assert.ok(result.ms < 500);
   } finally { srv.close(); }
 });
+
+// Deadline scaled with body size (reports/2026-10-15-count-tokens-latency.md):
+// Count Tokens latency is upload-bound (~12 MB/s measured, 27 MB in ~2.5 s),
+// so the request's counting allowance grows from 3 s by 1 ms per kB (a 1 MB/s
+// uplink) up to 30 s.
+test("countDeadlineMs: 3 s floor, 1 ms per kB, 30 s cap", () => {
+  assert.equal(counting.COUNT_TOKENS_TIMEOUT_MS, 3_000);
+  assert.equal(counting.countDeadlineMs(0), 3_000);
+  assert.equal(counting.countDeadlineMs(50_000), 3_050);
+  assert.equal(counting.countDeadlineMs(1_000_000), 4_000);
+  assert.equal(counting.countDeadlineMs(17_000_000), 20_000, "incident low end");
+  assert.equal(counting.countDeadlineMs(27_000_000), 30_000, "incident high end");
+  assert.equal(counting.countDeadlineMs(64 * 1024 * 1024), counting.COUNT_DEADLINE_MAX_MS);
+  assert.equal(counting.COUNT_DEADLINE_MAX_MS, 30_000);
+  assert.equal(counting.countDeadlineMs(Number.NaN), 3_000);
+});
+
+test("session allowance follows the largest body counted so far", async () => {
+  const srv = await countServer(() => {});
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", deadlineMs: (bytes) => bytes,
+      onAttempt: (r) => attempts.push(r) });
+    const small = Buffer.from(JSON.stringify({ model: "m", messages: [], p: "s".repeat(40) }));
+    const first = await session.count(small);
+    assert.equal(first.outcome, "timeout");
+    assert.ok(first.ms < small.length + 40, "small body gets its own allowance");
+    const large = Buffer.from(JSON.stringify({ model: "m", messages: [], p: "l".repeat(300) }));
+    const second = await session.count(large);
+    assert.equal(second.outcome, "timeout", "a larger body extends the request allowance");
+    assert.ok(second.ms >= large.length - small.length - 20, `${second.ms}ms`);
+    assert.ok(first.ms + second.ms < large.length + 60, "total stays the largest allowance");
+    assert.equal(attempts[1].timeoutMs <= large.length - first.ms + 5, true);
+    assert.equal(attempts[1].bytes > 0, true, "attempts log the count payload bytes");
+  } finally { srv.close(); }
+});
+
+test("time between counts (e.g. a compression) does not use up the allowance", async () => {
+  const srv = await countServer((_req, res) => {
+    if (srv.seen.length === 1) res.end('{"input_tokens":42}');
+  });
+  try {
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", timeoutMs: 150 });
+    assert.equal((await session.count(messagesBody)).tokens, 42);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const changed = Buffer.from('{"model":"replacement","messages":[]}');
+    const result = await session.count(changed);
+    assert.equal(result.outcome, "timeout", "not 'deadline': idle time is not counting time");
+    assert.ok(result.ms >= 80, `${result.ms}ms`);
+  } finally { srv.close(); }
+});
+
+test("a body over Anthropic's 64 MiB request limit is never uploaded", async () => {
+  assert.equal(counting.ANTHROPIC_MAX_REQUEST_BYTES, 64 * 1024 * 1024);
+  const srv = await countServer((_req, res) => res.end('{"input_tokens":42}'));
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", onAttempt: (r) => attempts.push(r) });
+    const huge = Buffer.alloc(counting.ANTHROPIC_MAX_REQUEST_BYTES + 1, 0x20);
+    const result = await session.count(huge);
+    assert.equal(result.outcome, "too-large");
+    assert.equal(result.tokens, undefined);
+    assert.equal(srv.seen.length, 0);
+    assert.equal(counting.exceedsRequestLimit(huge.length), true);
+    assert.equal(counting.exceedsRequestLimit(counting.ANTHROPIC_MAX_REQUEST_BYTES), false);
+    assert.equal((await session.count(messagesBody)).tokens, 42, "allowance untouched");
+  } finally { srv.close(); }
+});
+
+test("preparing each count body is charged to the shared allowance", async () => {
+  const srv = await countServer((_req, res) => {
+    if (srv.seen.length <= 3) res.end('{"input_tokens":42}');
+  });
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", timeoutMs: 2_000, onAttempt: (r) => attempts.push(r) });
+    for (const fill of ["a", "b", "c"]) {
+      const body = Buffer.from(JSON.stringify({ model: "m", messages: [], p: fill.repeat(8e6) }));
+      assert.equal((await session.count(body)).tokens, 42);
+    }
+    const last = await session.count(messagesBody);
+    const spent = attempts.slice(0, 3).reduce((total, r) => total + r.ms, 0);
+    assert.equal(last.outcome, "timeout");
+    assert.ok(last.timeoutMs <= 2_000 - spent + 5, `${last.timeoutMs} left after ${spent}ms`);
+  } finally { srv.close(); }
+});

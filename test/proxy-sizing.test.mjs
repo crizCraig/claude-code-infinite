@@ -11,6 +11,8 @@ async function listen(handler) {
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
 }
 
+const HANG = Symbol('hang');
+
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
   compressBudgetMs, longCompressBudgetMs } = {}) {
@@ -23,8 +25,10 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       if (req.url.includes('/count_tokens')) {
         counts.push(body);
         if (timeout) return;
-        res.writeHead(countStatus, { 'content-type': 'application/json' });
+        // `count` may answer HANG: that one call never answers (a timeout).
         const result = count(body, counts.length);
+        if (result === HANG) return;
+        res.writeHead(countStatus, { 'content-type': 'application/json' });
         res.end(typeof result === 'string' ? result : JSON.stringify(result));
       } else {
         forwards.push(body);
@@ -61,7 +65,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     reqlog: { log: record => records.push(structuredClone(record)) },
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
-    session = 's', messages: suppliedMessages } = {}) {
+    session = 's', messages: suppliedMessages, model = 'claude-x' } = {}) {
     const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
@@ -69,7 +73,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       method: 'POST', headers: { 'content-type': 'application/json',
         'x-claude-code-session-id': session, 'x-claude-code-agent-id': agent,
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model: 'claude-x', max_tokens: 64, messages }),
+      body: JSON.stringify({ model, max_tokens: 64, messages }),
     });
     await response.text();
     return response.status;
@@ -90,7 +94,10 @@ for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {
     try {
       assert.equal(await h.post(10_000), 200);
       const start = Date.now();
-      assert.equal(await h.post(469_550), 200);
+      // 300 kB fits the 200k window by its conservative bound (bytes/1.9,
+      // token-estimate.ts) while the stale 0.9 tokens/byte sample says 270k.
+      // (469,550 bytes, the size this test used under bytes/4, no longer does.)
+      assert.equal(await h.post(300_000), 200);
       assert.ok(Date.now() - start < 4_000, 'one total 3s Count deadline');
       assert.equal(h.forwards.length, 2);
       assert.ok(h.counts.length <= 1, 'failed count not immediately retried');
@@ -103,7 +110,10 @@ test('soft budget attempts compression, no-ready-tree 413 forwards original with
   const h = await harness({ budget: 100_000, enabled: false,
     compress: () => ({ status: 413, body: { detail: 'Memory indexing in background' } }) });
   try {
-    assert.equal(await h.post(500_000), 200);
+    // Over the 100k budget by bytes/4 (the uncalibrated planning estimate),
+    // inside the 200k window by the conservative bound: 450 kB is 188k on
+    // Haiku 4.5's tokenizer (2.4 bytes/token); the 4.7+ bound (1.9) is 237k.
+    assert.equal(await h.post(450_000, { model: 'claude-haiku-4-5' }), 200);
     assert.equal(h.compressions.length, 1);
     assert.equal(h.forwards.length, 1);
     assert.ok(h.records.find(r => r.kind === 'messages').overBudgetForward);
@@ -120,15 +130,20 @@ test('exact low-ratio count stays authoritative for an image-sized request', asy
     const rec = h.records.find(r => r.kind === 'messages');
     assert.equal(rec.compaction.estimatedTokens, 10_000);
     assert.equal(rec.overBudgetForward, undefined, 'known exact input fits the soft budget');
-    assert.deepEqual(Object.keys(rec.countTokens[0]).sort(), ['ms', 'statusClass']);
+    assert.deepEqual(Object.keys(rec.countTokens[0]).sort(), ['bytes', 'ms', 'statusClass', 'timeoutMs']);
   } finally { h.close(); }
 });
 
 test('concurrent lane sample cannot replace this request exact over-window count', async () => {
   let release, reached;
   const waiting = new Promise(resolve => { reached = resolve; });
-  const h = await harness({ count: () => ({ input_tokens: 210_000 }), usage: () => 90_000,
-    compress: async () => { reached(); await new Promise(resolve => { release = resolve; }); } });
+  // The concurrent 900 kB request is over its conservative byte bound
+  // (token-estimate.ts), so it is counted too (90k: fits) rather than sent on
+  // the large request's learned ratio.
+  const h = await harness({ count: body => ({
+    input_tokens: JSON.stringify(body).length > 950_000 ? 210_000 : 90_000 }),
+  usage: () => 90_000,
+  compress: async () => { reached(); await new Promise(resolve => { release = resolve; }); } });
   try {
     const large = h.post(1_000_000);
     await waiting;
@@ -136,12 +151,16 @@ test('concurrent lane sample cannot replace this request exact over-window count
     release();
     assert.equal(await large, 503);
     assert.equal(h.forwards.length, 1);
-    assert.equal(h.counts.length, 1);
+    assert.equal(h.counts.length, 2, 'one count per request; the large one is not recounted');
   } finally { release?.(); h.close(); }
 });
 
 test('2026-10-05 20:04 UTC pid84669: 469801-byte subagent formerly 5778216 tokens forwards', async () => {
-  const h = await harness({ budget: 800_000, enabled: false,
+  // The real request counted 117,450 tokens. Its conservative byte bound
+  // (247k on a 200k window) no longer admits it uncounted, so Count Tokens
+  // runs and admits it; the skewed 12 tokens/byte helper sample still cannot
+  // refuse it.
+  const h = await harness({ budget: 800_000, count: () => ({ input_tokens: 117_450 }),
     usage: (_body, bytes) => bytes < 2_000 ? 12_040 : 117_450 });
   try {
     await h.post(728);
@@ -169,7 +188,7 @@ test('compressed body gets its own count; original exact count never sizes the r
     assert.equal(rec.compaction.estimatedTokens, 210_000);
     assert.equal(rec.countTokens.length, 2);
     assert.equal(rec.overBudgetForward, undefined, 'compressed body fits soft budget');
-    assert.ok(rec.countTokens.every(r => Object.keys(r).sort().join() === 'ms,statusClass'));
+    assert.ok(rec.countTokens.every(r => Object.keys(r).sort().join() === 'bytes,ms,statusClass,timeoutMs'));
   } finally { h.close(); }
 });
 
@@ -193,6 +212,7 @@ for (const lane of ['main', 'agent', 'away', 'sessionless']) {
       assert.equal(await h.post(0, options), 200);
       assert.equal(h.compressions.length, 1);
       assert.equal(h.compressions[0].client_input_tokens, 151_000);
+      assert.equal(h.compressions[0].client_input_tokens_exact, true, 'an exact count says so');
     } finally { h.close(); }
   });
 }
@@ -477,3 +497,125 @@ for (const lane of ['main', 'tool']) {
     } finally { h.close(); }
   });
 }
+
+test('client_input_tokens_exact is omitted for a size projected from a usage sample', async () => {
+  // Counting off: a 0.3 tokens/byte sample projects the 400 kB followup at
+  // ~120k, over the 100k budget, so ccc sends that projection as a hint, but
+  // it is not a count of these bytes and must not loosen the server's sizing.
+  const h = await harness({ enabled: false, budget: 100_000,
+    usage: (_body, bytes) => Math.floor(bytes * 0.3) });
+  try {
+    assert.equal(await h.post(200_000), 200);
+    await h.post(400_000);
+    const call = h.compressions.at(-1);
+    assert.ok(call.client_input_tokens > 100_000, `${call.client_input_tokens}`);
+    assert.equal(call.client_input_tokens_exact, undefined);
+  } finally { h.close(); }
+});
+
+// Codex round 2, finding 1: a projected usage sample cannot hide a body whose
+// conservative bound is over the window when the body cannot be counted.
+for (const mode of ['disabled', 'timeout']) {
+  test(`a sampled ~2 MB (Codex: 2,000,260-byte) Opus 5.5 tool turn over its bound compresses when uncountable (${mode})`, async () => {
+    const h = await harness({ budget: 800_000, enabled: mode !== 'disabled', timeout: mode === 'timeout',
+      usage: (_body, bytes) => Math.floor(bytes / 4) });
+    try {
+      // 1 MB: bound 526k fits 1M; it goes out and teaches a 0.25 tokens/byte sample.
+      assert.equal(await h.post(1_000_000, { model: 'claude-opus-5-5' }), 200);
+      assert.equal(h.compressions.length, 0);
+      await h.post(2_000_000, { model: 'claude-opus-5-5' });
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.ok(rec.requestBytes > 2_000_000, `${rec.requestBytes}`);
+      assert.equal(rec.compaction.sizeSource, 'reported');
+      assert.ok(rec.compaction.estimatedTokens < 800_000, `${rec.compaction.estimatedTokens}`);
+      assert.equal(rec.compaction.uncountedOverWindow, true);
+      assert.equal(h.compressions.length, 1, 'compression is attempted, not a pass');
+      assert.equal(h.compressions[0].compression_threshold_tokens, undefined, 'forced');
+      assert.ok(h.counts.length <= 1, 'at most one count, reused at delivery');
+    } finally { h.close(); }
+  });
+}
+
+test('a sampled over-bound turn is counted once at planning and a fitting count passes', async () => {
+  const h = await harness({ budget: 800_000, usage: (_body, bytes) => Math.floor(bytes / 4),
+    count: () => ({ input_tokens: 520_000 }) });
+  try {
+    assert.equal(await h.post(1_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.counts.length, 0);
+    assert.equal(await h.post(2_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.counts.length, 1, 'counted once; delivery reuses it');
+    assert.equal(h.compressions.length, 0, 'the exact count fits: no compression');
+    assert.equal(h.forwards.length, 2);
+  } finally { h.close(); }
+});
+
+// Codex round 2, finding 4: with no fallback (the original cannot go out
+// uncounted), compression gets the long no-fallback budget.
+test('an uncounted over-bound Opus 5.5 tool turn compresses on the long budget', async () => {
+  const h = await harness({ budget: 800_000, enabled: false, compressBudgetMs: 100,
+    longCompressBudgetMs: 3_000,
+    compress: () => new Promise(resolve => setTimeout(() => resolve(compressedReply(4_000, 800_000)), 500)) });
+  try {
+    assert.equal(await h.post(2_000_000, { model: 'claude-opus-5-5' }), 200);
+    assert.equal(h.compressions.length, 1);
+    assert.equal(h.forwards.length, 1);
+    assert.match(JSON.stringify(h.forwards[0].messages), /memory m/);
+  } finally { h.close(); }
+});
+
+// Codex round 3: the judged candidate itself is counted at planning, whether
+// it is a sampled ride or the original behind a stored route that fails to
+// match; if that count fails, its bound sends it to compression, not refusal.
+function compressedHistory() {
+  return [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'x'.repeat(3_400_000) }];
+}
+const bigToolStep = (id) => [
+  { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: {} }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'y'.repeat(2_000_000) }] }];
+
+for (const stale of [false, true]) {
+  test(`a sampled over-bound ${stale ? 'original behind a stale route' : 'ride'} whose count times out compresses`, async () => {
+    // The first count (the 3.4 MB human turn) answers bytes/4 (~850k): over
+    // the 800k budget, so it compresses and installs a route. Later counts hang.
+    const h = await harness({ budget: 800_000, usage: (_body, bytes) => Math.floor(bytes / 4),
+      count: (body, n) => n === 1 ? { input_tokens: Math.floor(JSON.stringify(body).length / 4) } : HANG,
+      compress: () => compressedReply(4_000, 800_000) });
+    try {
+      const history = compressedHistory();
+      assert.equal(await h.post(0, { agent: '', model: 'claude-opus-5-5', messages: history }), 200);
+      assert.equal(h.compressions.length, 1);
+      // Stale: an edited, short history the stored route cannot validate; its
+      // ~2 MB original is projected at ~500k from the lane's 0.25 sample.
+      const next = stale
+        ? [{ role: 'user', content: 'first, edited' }, { role: 'assistant', content: 'answer' },
+          { role: 'user', content: 'go' }, ...bigToolStep('t1')]
+        : [...history, ...bigToolStep('t1')];
+      const status = await h.post(0, { agent: '', model: 'claude-opus-5-5', messages: next });
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.ok(rec.compaction.estimatedTokens < 800_000, 'planned under budget by its sample');
+      assert.equal(rec.compaction.uncountedOverWindow, true, JSON.stringify(rec.compaction));
+      assert.equal(h.compressions.length, 2, 'compressed through the normal path, not refused');
+      assert.equal(status, 200);
+      assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+    } finally { h.close(); }
+  });
+}
+
+test('original over the 64 MiB request limit: no count, compressed instead of forwarded', async () => {
+  const memory = [{ role: 'user', content: 'memory ' + 'm'.repeat(100_000) }];
+  const h = await harness({ budget: 800_000, count: () => ({ input_tokens: 50_000 }),
+    compress: () => ({ body: { messages: memory, flattened_messages: memory, compressed: true,
+      model_budget_tokens: 800_000, usage: { prompt_tokens: 300_000, completion_tokens: 50_000,
+        prompt_tokens_details: { cached_tokens: 250_000 } } } }) });
+  try {
+    // A learned sample from a cheap image-heavy turn would call it small.
+    assert.equal(await h.post(64 * 1024 * 1024 + 1, { oneMillion: true }), 200);
+    assert.ok(h.counts.every(c => JSON.stringify(c).length < 1_000_000), 'never counted');
+    assert.equal(h.compressions.length, 1);
+    assert.equal(h.forwards.length, 1);
+    assert.ok(JSON.stringify(h.forwards[0]).length < 200_000, 'the compressed body was sent');
+    const rec = h.records.find(r => r.kind === 'messages');
+    assert.equal(rec.compaction.uncountedOverWindow, true);
+  } finally { h.close(); }
+});

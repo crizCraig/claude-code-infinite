@@ -18,8 +18,27 @@ import type http from "node:http";
 import https from "node:https";
 import { approxTokensFromBytes } from "./reqlog.js";
 
-/** Bound on a count call: past it the caller keeps its estimate. */
+/**
+ * A request's counting allowance: past it the caller keeps its estimate.
+ * Measured 2026-10-15 (reports/2026-10-15-count-tokens-latency.md): latency is
+ * upload-bound, ~0.2 s plus body bytes at ~12 MB/s on a fast uplink (27 MB in
+ * ~2.5 s, text or images alike), so a flat 3 s timed out on the 17-27 MB
+ * image-heavy bodies that most needed a count. The allowance is 3 s plus 1 ms
+ * per kB (a 1 MB/s, 8 Mbit/s uplink), capped at 30 s. It only binds when the
+ * count is slow: a fast count returns as soon as it is done.
+ */
 export const COUNT_TOKENS_TIMEOUT_MS = 3_000;
+/** Upload rate the allowance still covers, in bytes per ms (1 MB/s). */
+export const COUNT_UPLOAD_BYTES_PER_MS = 1_000;
+/** Most a request waits on counting, however large its bodies. */
+export const COUNT_DEADLINE_MAX_MS = 30_000;
+/**
+ * Anthropic's request size limit, the same on Messages and Count Tokens:
+ * 67,108,864 bytes (64 MiB) is accepted, one byte more is answered 413
+ * request_too_large from Content-Length alone (measured 2026-10-15). A body
+ * over it cannot be sent natively at all, so it is never counted.
+ */
+export const ANTHROPIC_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MAX_COUNT_RESPONSE_BYTES = 64 * 1024;
 const MAX_COUNT_COOLDOWNS = 128;
 const COUNT_COOLDOWN_MS = 60_000;
@@ -62,7 +81,7 @@ export interface CountTokensUpstream {
 
 export type CountTokensOutcome = "success" | "timeout" | "network-error" |
   "invalid-response" | "http-error" | "server-error" | "auth" | "rate-limit" |
-  "cooldown" | "aborted" | "deadline" | "invalid-request";
+  "cooldown" | "aborted" | "deadline" | "invalid-request" | "too-large";
 
 export interface CountTokensResult {
   outcome: CountTokensOutcome;
@@ -72,6 +91,21 @@ export interface CountTokensResult {
   tokens?: number;
   ms: number;
   status?: number;
+  /** Body bytes the attempt was for (diagnostics). */
+  bytes?: number;
+  /** Allowance the attempt had (diagnostics). */
+  timeoutMs?: number;
+}
+
+/** The counting allowance for a body of `bytes` (see COUNT_TOKENS_TIMEOUT_MS). */
+export function countDeadlineMs(bytes: number): number {
+  const extra = Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes / COUNT_UPLOAD_BYTES_PER_MS) : 0;
+  return Math.min(COUNT_DEADLINE_MAX_MS, COUNT_TOKENS_TIMEOUT_MS + extra);
+}
+
+/** Whether Anthropic rejects a body of `bytes` as too large (413), unseen. */
+export function exceedsRequestLimit(bytes: number): boolean {
+  return bytes > ANTHROPIC_MAX_REQUEST_BYTES;
 }
 
 /** Whether a sample's tokens-per-byte ratio can describe a request body. */
@@ -130,7 +164,10 @@ export interface CountTokensSessionOptions {
   headers: Record<string, string>;
   requestUrl: string | undefined;
   signal?: AbortSignal;
+  /** A fixed allowance for the whole request instead of one scaled by size. */
   timeoutMs?: number;
+  /** Allowance for a body of `bytes`; defaults to countDeadlineMs. */
+  deadlineMs?: (bytes: number) => number;
   /** Called once per attempt; log only outcome and ms, never tokens or headers. */
   onAttempt?: (result: CountTokensResult) => void;
 }
@@ -140,7 +177,12 @@ export interface CountTokensSession {
   peek(body: Buffer): CountTokensResult | undefined;
 }
 
-/** Exact results belong to this request and body, never a shared sample slot. */
+/**
+ * Exact results belong to this request and body, never a shared sample slot.
+ * All counts of one request share one allowance: the largest body's
+ * (countDeadlineMs), spent only while a count is in flight, so time between
+ * counts (a compression before the replacement is counted) is not charged.
+ */
 export function createCountTokensSession(
   options: CountTokensSessionOptions,
   cooldowns = new CountTokensCooldowns(),
@@ -148,26 +190,25 @@ export function createCountTokensSession(
   const pending = new Map<string, Promise<CountTokensResult>>();
   const completed = new Map<string, CountTokensResult>();
   const account = countAccountKey(options);
-  let deadline: number | undefined;
+  const clock = new CountingClock();
+  let allowance = 0;
   return {
     peek: (body) => completed.get(bodyHash(body)),
     count: (body) => {
       const key = bodyHash(body);
       const existing = pending.get(key);
       if (existing) return existing;
-      deadline ??= Date.now() + (options.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS);
-      const remaining = deadline - Date.now();
+      const tooLarge = exceedsRequestLimit(body.length);
+      if (!tooLarge) allowance = Math.max(allowance, requestAllowance(options, body.length));
+      const remaining = allowance - clock.spent();
       const skipped: CountTokensOutcome | undefined = options.signal?.aborted ? "aborted"
-        : cooldowns.active(account) ? "cooldown" : remaining <= 0 ? "deadline" : undefined;
+        : tooLarge ? "too-large" : cooldowns.active(account) ? "cooldown"
+          : remaining <= 0 ? "deadline" : undefined;
       const attempt = skipped
-        ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped })
-        : countUpstreamTokens({ ...options, body, timeoutMs: remaining }).then((result) => {
-          cooldowns.record(account, result);
-          if (result.outcome !== "invalid-request" && result.outcome !== "deadline") {
-            try { options.onAttempt?.(result); } catch { /* diagnostics cannot break forwarding */ }
-          }
-          return result;
-        });
+        ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped, bytes: body.length })
+        : clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs: remaining }))
+          .then((result) => recordAttempt(options, cooldowns, account, result));
+      if (skipped === "too-large") attempt.then((result) => notifyAttempt(options, result));
       const saved = attempt.then((result) => { completed.set(key, result); return result; });
       pending.set(key, saved);
       return saved;
@@ -180,11 +221,14 @@ export function countUpstreamTokens(
   args: CountTokensSessionOptions & { body: Buffer },
 ): Promise<CountTokensResult> {
   const started = Date.now();
+  const timeoutMs = args.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS;
   const payload = countTokensBody(args.body);
   if (!payload || args.signal?.aborted) return Promise.resolve({
     ms: 0, outcome: args.signal?.aborted ? "aborted" : "invalid-request",
   });
-  const remaining = (args.timeoutMs ?? COUNT_TOKENS_TIMEOUT_MS) - (Date.now() - started);
+  const bytes = payload.length;
+  if (exceedsRequestLimit(bytes)) return Promise.resolve({ ms: 0, outcome: "too-large", bytes });
+  const remaining = timeoutMs - (Date.now() - started);
   if (remaining <= 0) return Promise.resolve({ ms: Date.now() - started, outcome: "deadline" });
   return new Promise((resolve) => {
     let done = false;
@@ -195,7 +239,7 @@ export function countUpstreamTokens(
       done = true;
       clearTimeout(timer);
       args.signal?.removeEventListener("abort", abort);
-      resolve({ ...result, ms: Date.now() - started });
+      resolve({ ...result, ms: Date.now() - started, bytes, timeoutMs: remaining });
       request?.destroy();
     };
     const abort = () => finish({ outcome: "aborted" });
@@ -312,4 +356,42 @@ function cooldownDuration(retryAfter: string | undefined, now: number): number {
   const duration = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - now;
   return Number.isFinite(duration)
     ? Math.max(1000, Math.min(COUNT_COOLDOWN_MS, duration)) : COUNT_COOLDOWN_MS;
+}
+
+function requestAllowance(options: CountTokensSessionOptions, bytes: number): number {
+  return options.timeoutMs ?? (options.deadlineMs ?? countDeadlineMs)(bytes);
+}
+
+function recordAttempt(
+  options: CountTokensSessionOptions, cooldowns: CountTokensCooldowns, account: string,
+  result: CountTokensResult,
+): CountTokensResult {
+  cooldowns.record(account, result);
+  if (result.outcome !== "invalid-request" && result.outcome !== "deadline") {
+    notifyAttempt(options, result);
+  }
+  return result;
+}
+
+function notifyAttempt(options: CountTokensSessionOptions, result: CountTokensResult): void {
+  try { options.onAttempt?.(result); } catch { /* diagnostics cannot break forwarding */ }
+}
+
+/** Wall time with at least one count in flight: what a request's allowance is spent on. */
+class CountingClock {
+  private inFlight = 0;
+  private since = 0;
+  private total = 0;
+
+  spent(): number {
+    return this.total + (this.inFlight > 0 ? Date.now() - this.since : 0);
+  }
+
+  /** Starts the clock before `start` runs: preparing the count body is counting time too. */
+  track<T>(start: () => Promise<T>): Promise<T> {
+    if (this.inFlight++ === 0) this.since = Date.now();
+    return start().finally(() => {
+      if (--this.inFlight === 0) this.total += Date.now() - this.since;
+    });
+  }
 }
