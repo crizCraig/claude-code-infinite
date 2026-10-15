@@ -286,8 +286,10 @@ test("a stale lock is taken over: too old, or its holder has exited", () => {
   const { lockFile } = filesIn();
   const now = Date.now();
   const write = (data) => fs.writeFileSync(lockFile, JSON.stringify(data));
+  write({ token: "live-20m", startedAt: now - 20 * 60_000, pid: process.pid });
+  assert.equal(acquireUpdateLock(lockFile, now), null, "a live installer is never reclaimed by age alone");
   write({ token: "old", startedAt: now - UPDATE_LOCK_STALE_MS - 1, pid: process.pid });
-  assert.ok(acquireUpdateLock(lockFile, now), "older than the stale timeout");
+  assert.ok(acquireUpdateLock(lockFile, now), "older than any runner can live: a reused pid");
 
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
   write({ token: "dead", startedAt: now - 60_000, pid: dead });
@@ -494,7 +496,11 @@ if (args[0] === "root") {
   process.stdout.write(process.env.FAKE_NPM_ROOT + "\\n");
   process.exit(0);
 }
-if (args[0] === "install") {
+if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
+  fs.writeFileSync(process.env.FAKE_NPM_HANG, String(process.pid));
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+} else if (args[0] === "install") {
   const code = Number(process.env.FAKE_NPM_EXIT || 0);
   if (code === 0) {
     const spec = args.find((a) => a.startsWith("claude-code-infinite@"));
@@ -504,11 +510,15 @@ if (args[0] === "install") {
   }
   process.stderr.write("fake npm install\\n");
   process.exit(code);
+} else {
+  process.exit(2);
 }
-process.exit(2);
 `;
 
-function runRunner({ global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot }) {
+function runRunner({
+  global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot, hang = false,
+  timeoutMs = 30_000, killGraceMs, pipeGraceMs,
+}) {
   const dir = tmpdir("ccc-au-run-");
   const npm = path.join(dir, "npm");
   fs.writeFileSync(npm, FAKE_NPM, { mode: 0o755 });
@@ -519,8 +529,9 @@ function runRunner({ global: g, version = "1.0.21", npmRoot, exit = 0, reportedR
   fs.writeFileSync(log, "");
   const config = {
     npm, packageName: PKG, version, packageDir: g.packageDir, npmRoot: npmRoot ?? g.npmRoot,
-    prefix: g.prefix, ...files, token: "t1", timeoutMs: 30_000,
+    prefix: g.prefix, ...files, token: "t1", timeoutMs, killGraceMs, pipeGraceMs,
   };
+  const pidFile = path.join(dir, "npm.pid");
   const result = spawnSync(process.execPath, ["-e", RUNNER_SOURCE, JSON.stringify(config)], {
     env: {
       ...process.env,
@@ -528,13 +539,14 @@ function runRunner({ global: g, version = "1.0.21", npmRoot, exit = 0, reportedR
       FAKE_NPM_LOG: log,
       FAKE_NPM_ROOT: reportedRoot ?? g.npmRoot,
       FAKE_NPM_EXIT: String(exit),
+      ...(hang ? { FAKE_NPM_HANG: pidFile } : {}),
     },
     encoding: "utf8",
     timeout: 30_000,
   });
-  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.status === 0 || result.status === 1, result.stderr);
   const calls = fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  return { files, calls, state: readUpdateState(files.stateFile), lockLeft: fs.existsSync(files.lockFile) };
+  return { files, calls, state: readUpdateState(files.stateFile), lockLeft: fs.existsSync(files.lockFile), pidFile };
 }
 
 test("runner: installs exactly that version into this prefix, records ok, frees the lock", () => {
@@ -581,4 +593,60 @@ test("runner: re-validates the version and never calls npm for a hostile one", (
   assert.equal(state.last, undefined, "a hostile version is not even recorded as an attempt");
   assert.deepEqual(calls, []);
   assert.equal(lockLeft, false);
+});
+
+test("reclaiming serializes on a reclaim file; an orphaned one is cleared, not reclaimed through", () => {
+  const { lockFile } = filesIn();
+  const now = Date.now();
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  const staleLock = JSON.stringify({ token: "dead", startedAt: now - 60_000, pid: dead });
+  fs.writeFileSync(lockFile, staleLock);
+  // Another session is reclaiming right now: stay out.
+  fs.writeFileSync(`${lockFile}.reclaim`, JSON.stringify({ token: "r", startedAt: now, pid: process.pid }));
+  assert.equal(acquireUpdateLock(lockFile, now), null);
+  assert.equal(fs.readFileSync(lockFile, "utf8"), staleLock, "the lock was not touched");
+  // Its holder crashed inside that window: the next try clears it and still yields...
+  fs.writeFileSync(`${lockFile}.reclaim`, JSON.stringify({ token: "r", startedAt: now - 60_000, pid: dead }));
+  assert.equal(acquireUpdateLock(lockFile, now), null);
+  assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
+  // ...and the one after reclaims the stale lock, leaving no reclaim file.
+  const token = acquireUpdateLock(lockFile, now);
+  assert.ok(token);
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, "utf8")).token, token);
+  assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
+});
+
+test("the plan is rechecked under the lock: racing sessions cannot bypass backoff or downgrade", () => {
+  const g = makeGlobal();
+  const files = filesIn();
+  // Three sessions planned against an empty state before any attempt.
+  const decisions = [plan({ global: g }), plan({ global: g }), plan({ global: g })];
+  const { spawnImpl, calls } = mockSpawn({ throws: new Error("boom") });
+  const results = decisions.map((decision) => startAutoUpdateInstall({ decision, files, spawnImpl }));
+  assert.deepEqual(results, ["spawn-failed", "skipped", "skipped"]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(readUpdateState(files.stateFile).attempts, { "1.0.21": 1 });
+  assert.equal(fs.existsSync(files.lockFile), false, "a skip frees the lock");
+
+  // Someone installed 1.0.22 after this session planned 1.0.21.
+  const newer = makeGlobal();
+  const planned = plan({ global: newer });
+  fs.writeFileSync(path.join(newer.packageDir, "package.json"), JSON.stringify({ name: PKG, version: "1.0.22" }));
+  const second = mockSpawn();
+  assert.equal(startAutoUpdateInstall({ decision: planned, files: filesIn(), spawnImpl: second.spawnImpl }), "skipped");
+  assert.equal(second.calls.length, 0);
+});
+
+test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", () => {
+  const g = makeGlobal();
+  const started = Date.now();
+  const { state, lockLeft, pidFile } = runRunner({
+    global: g, hang: true, timeoutMs: 300, killGraceMs: 300, pipeGraceMs: 300,
+  });
+  assert.ok(Date.now() - started < 20_000, "bounded");
+  assert.equal(state.last.status, "failed");
+  assert.match(state.last.error, /npm install timed out/);
+  assert.equal(lockLeft, false);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
 });

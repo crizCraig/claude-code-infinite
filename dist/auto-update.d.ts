@@ -30,9 +30,13 @@ export declare const UPDATE_LOCK_FILE = "update.lock";
 export declare const UPDATE_LOG_FILE = "auto-update.log";
 export declare const AUTO_UPDATE_BACKOFF_MS: number;
 export declare const MAX_ATTEMPTS_PER_VERSION = 2;
-/** Longer than the runner's install timeout, so a live install is never stolen. */
-export declare const UPDATE_LOCK_STALE_MS: number;
 export declare const INSTALL_TIMEOUT_MS: number;
+/**
+ * A lock is stale when its holder has exited, or when it is older than this.
+ * The runner exits by its hard deadline (install timeout plus kill grace, see
+ * auto-update-runner.ts), so a holder still "alive" past this is a reused pid.
+ */
+export declare const UPDATE_LOCK_STALE_MS: number;
 /** Wait after launch so the install never competes with Claude Code starting. */
 export declare const AUTO_UPDATE_DELAY_MS = 5000;
 /** This package's own directory (dist/..), as Node resolved it. */
@@ -118,7 +122,9 @@ export interface StartInstallOptions {
     /** The npm to run; default the one beside this Node, else `npm` on PATH. */
     npmPath?: string;
 }
-export type StartInstallResult = "started" | "locked" | "not-planned" | "spawn-failed";
+export type StartInstallResult = "started" | "locked" | "not-planned" | "spawn-failed"
+/** Rechecked under the lock: backed off, tried enough, or already installed. */
+ | "skipped";
 /** False when any opt-out is set: ccc's, Claude Code's, or the update check's. */
 export declare function autoUpdateEnabled(env: NodeJS.ProcessEnv, config: AutoUpdateConfig): boolean;
 /** A release version safe to hand to npm, or null. */
@@ -164,9 +170,9 @@ export declare function readUpdateState(file: string): UpdateState;
 /** Best effort and atomic: a failed write only loses bookkeeping. */
 export declare function writeUpdateState(file: string, state: UpdateState): void;
 /**
- * Create the lock exclusively, stealing it once when stale (too old, or its
- * holder has exited). Returns the owner token, or null when another session
- * holds it.
+ * Create the lock exclusively, reclaiming it once when stale (its holder has
+ * exited, or it is impossibly old). Returns the owner token, or null when
+ * another session holds it or is reclaiming it.
  */
 export declare function acquireUpdateLock(lockFile: string, now: number): string | null;
 /** Remove the lock only when this token still owns it. */

@@ -12,6 +12,11 @@
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
+ *
+ * Bounded: npm runs in its own process group and a timeout sends the group
+ * SIGTERM, then SIGKILL; a hard deadline (and SIGTERM/SIGINT/SIGHUP to the
+ * runner) records a failure, frees the lock and exits, so the lock's stale
+ * age (auto-update.ts UPDATE_LOCK_STALE_MS) is never reached by a live runner.
  */
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
@@ -26,6 +31,9 @@ export interface RunnerConfig {
     logFile: string;
     token: string;
     timeoutMs: number;
+    /** Test-only: SIGTERM→SIGKILL and SIGKILL→give-up waits (default 10 s, 5 s). */
+    killGraceMs?: number;
+    pipeGraceMs?: number;
 }
 export declare const RUNNER_SOURCE: string;
 //# sourceMappingURL=auto-update-runner.d.ts.map

@@ -12,6 +12,11 @@
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
+ *
+ * Bounded: npm runs in its own process group and a timeout sends the group
+ * SIGTERM, then SIGKILL; a hard deadline (and SIGTERM/SIGINT/SIGHUP to the
+ * runner) records a failure, frees the lock and exits, so the lock's stale
+ * age (auto-update.ts UPDATE_LOCK_STALE_MS) is never reached by a live runner.
  */
 export const RUNNER_SOURCE = String.raw `"use strict";
 const { spawn } = require("node:child_process");
@@ -22,7 +27,24 @@ const path = require("node:path");
 const VERSION_RE = /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/;
 const ROOT_TIMEOUT_MS = 60000;
 const cfg = JSON.parse(process.argv[1]);
+const KILL_GRACE_MS = cfg.killGraceMs || 10000;
+const PIPE_GRACE_MS = cfg.pipeGraceMs || 5000;
 let logFd = null;
+let current = null;
+let done = false;
+
+// Hard deadline: whatever npm does, this process records a result, frees the
+// lock and exits, so a live holder never outlasts the lock's stale age.
+const DEADLINE_MS = ROOT_TIMEOUT_MS + cfg.timeoutMs + 2 * (KILL_GRACE_MS + PIPE_GRACE_MS) + 30000;
+setTimeout(() => abort("runner deadline passed"), DEADLINE_MS);
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(signal, () => abort("runner stopped by " + signal));
+}
+
+function abort(reason) {
+  if (current) killGroup(current, "SIGKILL");
+  finishRun("failed", reason);
+}
 
 function note(line) {
   try {
@@ -30,25 +52,40 @@ function note(line) {
   } catch {}
 }
 
+// npm runs in its own process group, so a timeout reaches everything it
+// started: SIGTERM, then SIGKILL, then give up waiting on its pipes.
 function run(command, args, timeoutMs, capture) {
   return new Promise((resolve) => {
     let out = "";
     let timedOut = false;
+    let settled = false;
     let child;
+    const timers = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      current = null;
+      timers.forEach(clearTimeout);
+      resolve(Object.assign({ timedOut, out }, result));
+    };
     try {
       child = spawn(command, args, {
         cwd: os.homedir(),
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
     } catch (err) {
       resolve({ code: null, error: String(err), out: "" });
       return;
     }
-    const timer = setTimeout(() => {
+    current = child;
+    timers.push(setTimeout(() => {
       timedOut = true;
-      try { child.kill("SIGTERM"); } catch {}
-    }, timeoutMs);
+      killGroup(child, "SIGTERM");
+      timers.push(setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS));
+      timers.push(setTimeout(() => finish({ code: null, signal: "SIGKILL" }), KILL_GRACE_MS + PIPE_GRACE_MS));
+    }, timeoutMs));
     const logChunk = (chunk) => {
       try { if (logFd !== null) fs.writeSync(logFd, chunk); } catch {}
     };
@@ -57,15 +94,21 @@ function run(command, args, timeoutMs, capture) {
       logChunk(chunk);
     });
     child.stderr.on("data", logChunk);
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ code: null, error: String(err), out });
+    child.on("error", (err) => finish({ code: null, error: String(err) }));
+    // A descendant holding the pipes open must not keep us waiting for close.
+    child.on("exit", (code, signal) => {
+      timers.push(setTimeout(() => finish({ code, signal }), PIPE_GRACE_MS));
     });
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal, timedOut, out });
-    });
+    child.on("close", (code, signal) => finish({ code, signal }));
   });
+}
+
+function killGroup(child, signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try { child.kill(signal); } catch {}
+  }
 }
 
 function realpath(p) {
@@ -121,19 +164,24 @@ function releaseLock() {
   } catch {}
 }
 
+function finishRun(status, error) {
+  if (done) return;
+  done = true;
+  note(status === "ok" ? "installed " + cfg.version : "failed: " + error);
+  record(status, error);
+  releaseLock();
+  try { if (logFd !== null) fs.closeSync(logFd); } catch {}
+  process.exit(status === "ok" ? 0 : 1);
+}
+
 (async () => {
   try { logFd = fs.openSync(cfg.logFile, "w", 0o600); } catch {}
   note("installing " + cfg.packageName + "@" + cfg.version + " into " + cfg.prefix);
   try {
     await install();
-    note("installed " + cfg.version);
-    record("ok");
+    finishRun("ok");
   } catch (err) {
-    note("failed: " + (err && err.message ? err.message : String(err)));
-    record("failed", err && err.message ? err.message : String(err));
-  } finally {
-    releaseLock();
-    try { if (logFd !== null) fs.closeSync(logFd); } catch {}
+    finishRun("failed", err && err.message ? err.message : String(err));
   }
 })();
 `;

@@ -35,9 +35,13 @@ export const UPDATE_LOCK_FILE = "update.lock";
 export const UPDATE_LOG_FILE = "auto-update.log";
 export const AUTO_UPDATE_BACKOFF_MS = 24 * 60 * 60 * 1000;
 export const MAX_ATTEMPTS_PER_VERSION = 2;
-/** Longer than the runner's install timeout, so a live install is never stolen. */
-export const UPDATE_LOCK_STALE_MS = 15 * 60 * 1000;
 export const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * A lock is stale when its holder has exited, or when it is older than this.
+ * The runner exits by its hard deadline (install timeout plus kill grace, see
+ * auto-update-runner.ts), so a holder still "alive" past this is a reused pid.
+ */
+export const UPDATE_LOCK_STALE_MS = 60 * 60 * 1000;
 /** A lock whose holder is gone is stale after this grace (pid reuse is rare). */
 const DEAD_HOLDER_GRACE_MS = 30 * 1000;
 /** Wait after launch so the install never competes with Claude Code starting. */
@@ -116,6 +120,12 @@ export function startAutoUpdateInstall(opts) {
     if (token === null)
         return "locked";
     const packageDir = decision.method.packageDir;
+    // The plan was made before the launch delay; other sessions may have tried,
+    // failed or installed since. Only the lock holder's view is authoritative.
+    if (installBlockedNow(opts.files.stateFile, packageDir, version, now) !== null) {
+        releaseUpdateLock(opts.files.lockFile, token);
+        return "skipped";
+    }
     recordAttemptStart(opts.files.stateFile, version, packageDir, now);
     const config = runnerConfig(opts, decision.method, version, token);
     try {
@@ -210,9 +220,9 @@ export function writeUpdateState(file, state) {
     }
 }
 /**
- * Create the lock exclusively, stealing it once when stale (too old, or its
- * holder has exited). Returns the owner token, or null when another session
- * holds it.
+ * Create the lock exclusively, reclaiming it once when stale (its holder has
+ * exited, or it is impossibly old). Returns the owner token, or null when
+ * another session holds it or is reclaiming it.
  */
 export function acquireUpdateLock(lockFile, now) {
     const token = randomUUID();
@@ -221,9 +231,7 @@ export function acquireUpdateLock(lockFile, now) {
     const held = readLock(lockFile);
     if (held === null ? !unreadableLockIsStale(lockFile, now) : !lockIsStale(held, now))
         return null;
-    if (!stealLock(lockFile, held))
-        return null;
-    return createLock(lockFile, token, now) ? token : null;
+    return reclaimStaleLock(lockFile, held, token, now) ? token : null;
 }
 /** Remove the lock only when this token still owns it. */
 export function releaseUpdateLock(lockFile, token) {
@@ -302,6 +310,13 @@ function attemptBlocked(state, version, now) {
         return "backing off for a day after a failed install";
     }
     return null;
+}
+/** attemptBlocked plus "the package is already at or past this version". */
+function installBlockedNow(stateFile, packageDir, version, now) {
+    const installed = readInstalledVersion(packageDir);
+    if (installed !== null && !newerThan(version, installed))
+        return `${installed} is installed`;
+    return attemptBlocked(readUpdateState(stateFile), version, now);
 }
 function recordAttemptStart(file, version, packageDir, now) {
     const state = readUpdateState(file);
@@ -428,35 +443,45 @@ function unreadableLockIsStale(lockFile, now) {
         return now - fs.statSync(lockFile).mtimeMs > DEAD_HOLDER_GRACE_MS;
     }
     catch {
-        return true; // gone: nothing to steal, so the retry below simply creates it
+        return false; // gone: another session just released or reclaimed it
     }
 }
 /**
- * Move the stale lock aside atomically, so of two sessions stealing at once
- * only one wins; if what was moved is not the stale lock read (someone else
- * stole it and created theirs), put it back and give up.
+ * Replace a stale lock with ours. Reclaimers serialize on a second, briefly
+ * held exclusive file, and under it the lock is removed only while it is still
+ * the stale one read. Ordinary acquisition only ever creates a missing lock,
+ * so whoever creates it after the removal (us or another session) is its one
+ * owner: nothing here moves or deletes a live owner's lock.
  */
-function stealLock(lockFile, stale) {
-    const aside = `${lockFile}.stale.${process.pid}.${randomUUID()}`;
+function reclaimStaleLock(lockFile, stale, token, now) {
+    const mutex = `${lockFile}.reclaim`;
+    if (!createLock(mutex, token, now)) {
+        clearOrphanedMutex(mutex, now);
+        return false;
+    }
     try {
-        fs.renameSync(lockFile, aside);
+        const current = readLock(lockFile);
+        if (current?.token !== stale?.token)
+            return false;
+        if (stale === null && !unreadableLockIsStale(lockFile, now))
+            return false;
+        fs.rmSync(lockFile, { force: true });
+        return createLock(lockFile, token, now);
     }
-    catch {
-        return false;
+    finally {
+        releaseUpdateLock(mutex, token);
     }
-    const moved = readLock(aside);
-    if (moved?.token !== stale?.token) {
-        try {
-            fs.linkSync(aside, lockFile);
-        }
-        catch {
-            // The new owner's lock is lost; its runner still releases by token.
-        }
-        fs.rmSync(aside, { force: true });
-        return false;
-    }
-    fs.rmSync(aside, { force: true });
-    return true;
+}
+/**
+ * The reclaim file is held for microseconds; one left behind (its holder
+ * crashed in between) is removed once its holder is gone, so a later launch
+ * can reclaim. This call never reclaims in the same breath.
+ */
+function clearOrphanedMutex(mutex, now) {
+    const held = readLock(mutex);
+    const orphaned = held === null ? unreadableLockIsStale(mutex, now) : lockIsStale(held, now);
+    if (orphaned && readLock(mutex)?.token === held?.token)
+        fs.rmSync(mutex, { force: true });
 }
 function processAlive(pid) {
     try {
