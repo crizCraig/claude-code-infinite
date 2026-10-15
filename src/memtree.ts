@@ -110,6 +110,14 @@ export interface CompressRequestMeta {
    */
   clientInputTokens?: number;
   /**
+   * Server `client_input_tokens_exact`: `clientInputTokens` is a Count Tokens
+   * result for this very body, not a projection from an older usage sample.
+   * Only then may the server loosen its chars-per-token sizing. Not part of the
+   * cache key: an exact and a projected hint for the same messages both yield a
+   * safe answer for them.
+   */
+  clientInputTokensExact?: boolean;
+  /**
    * Each assistant message's response usage (output, thinking, input), keyed
    * by its position in the messages sent. Archived by the server for the
    * MemTree page; never hashed, never part of the compression cache key.
@@ -1106,6 +1114,7 @@ export class MemtreeClient {
       compressionTargetTokens: meta?.compressionTargetTokens,
       compressionThresholdTokens: meta?.compressionThresholdTokens,
       clientInputTokens: meta?.clientInputTokens,
+      clientInputTokensExact: meta?.clientInputTokensExact,
       messageUsage: meta?.messageUsage,
       messageTimes: meta?.messageTimes,
       sessionId: meta?.sessionId,
@@ -1477,6 +1486,7 @@ export class MemtreeClient {
       compressionTargetTokens?: number;
       compressionThresholdTokens?: number;
       clientInputTokens?: number;
+      clientInputTokensExact?: boolean;
       messageUsage?: MessageUsage;
       messageTimes?: MessageTimes;
       sessionId?: string;
@@ -1515,6 +1525,7 @@ export class MemtreeClient {
       }
       if (opts.clientInputTokens !== undefined) {
         body.client_input_tokens = opts.clientInputTokens;
+        if (opts.clientInputTokensExact) body.client_input_tokens_exact = true;
       }
       // Compress calls only: the server adds the thinking tokens (stripped
       // from `messages` above) to its budget, since a passthrough forwards

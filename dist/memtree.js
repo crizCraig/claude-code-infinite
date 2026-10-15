@@ -870,6 +870,7 @@ export class MemtreeClient {
             compressionTargetTokens: meta?.compressionTargetTokens,
             compressionThresholdTokens: meta?.compressionThresholdTokens,
             clientInputTokens: meta?.clientInputTokens,
+            clientInputTokensExact: meta?.clientInputTokensExact,
             messageUsage: meta?.messageUsage,
             messageTimes: meta?.messageTimes,
             sessionId: meta?.sessionId,
@@ -1225,6 +1226,8 @@ export class MemtreeClient {
             }
             if (opts.clientInputTokens !== undefined) {
                 body.client_input_tokens = opts.clientInputTokens;
+                if (opts.clientInputTokensExact)
+                    body.client_input_tokens_exact = true;
             }
             // Compress calls only: the server adds the thinking tokens (stripped
             // from `messages` above) to its budget, since a passthrough forwards

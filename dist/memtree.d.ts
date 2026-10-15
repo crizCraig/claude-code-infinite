@@ -79,6 +79,14 @@ export interface CompressRequestMeta {
      */
     clientInputTokens?: number;
     /**
+     * Server `client_input_tokens_exact`: `clientInputTokens` is a Count Tokens
+     * result for this very body, not a projection from an older usage sample.
+     * Only then may the server loosen its chars-per-token sizing. Not part of the
+     * cache key: an exact and a projected hint for the same messages both yield a
+     * safe answer for them.
+     */
+    clientInputTokensExact?: boolean;
+    /**
      * Each assistant message's response usage (output, thinking, input), keyed
      * by its position in the messages sent. Archived by the server for the
      * MemTree page; never hashed, never part of the compression cache key.

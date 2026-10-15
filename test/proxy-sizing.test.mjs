@@ -208,6 +208,7 @@ for (const lane of ['main', 'agent', 'away', 'sessionless']) {
       assert.equal(await h.post(0, options), 200);
       assert.equal(h.compressions.length, 1);
       assert.equal(h.compressions[0].client_input_tokens, 151_000);
+      assert.equal(h.compressions[0].client_input_tokens_exact, true, 'an exact count says so');
     } finally { h.close(); }
   });
 }
@@ -492,3 +493,18 @@ for (const lane of ['main', 'tool']) {
     } finally { h.close(); }
   });
 }
+
+test('client_input_tokens_exact is omitted for a size projected from a usage sample', async () => {
+  // Counting off: a 0.3 tokens/byte sample projects the 400 kB followup at
+  // ~120k, over the 100k budget, so ccc sends that projection as a hint, but
+  // it is not a count of these bytes and must not loosen the server's sizing.
+  const h = await harness({ enabled: false, budget: 100_000,
+    usage: (_body, bytes) => Math.floor(bytes * 0.3) });
+  try {
+    assert.equal(await h.post(200_000), 200);
+    await h.post(400_000);
+    const call = h.compressions.at(-1);
+    assert.ok(call.client_input_tokens > 100_000, `${call.client_input_tokens}`);
+    assert.equal(call.client_input_tokens_exact, undefined);
+  } finally { h.close(); }
+});

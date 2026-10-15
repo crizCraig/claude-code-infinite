@@ -1848,11 +1848,14 @@ async function handleMessages(
             [...state.toolRecoveryAttemptedLanes.values()].every((attempt) => attempt.inFlight))) {
           // A concurrent request of this lane is already compressing.
           rec.routeRecovery = { outcome: "in-flight" };
-        } else if (prior?.awaitingIndex && !plan.overWindow) {
+        } else if (prior?.awaitingIndex && (!plan.overWindow || plan.uncountedOverWindowOnly)) {
           // The last attempt found no tree for this conversation, so a
           // compress call could only pass everything through again. Forward
           // now; the page check lets the next tool turn try once it exists.
+          // Over the window only by its uncounted bound, delivery may still
+          // count it; if it refuses, that is an index wait, not a strike.
           rec.routeRecovery = { outcome: "awaiting-index" };
+          if (plan.uncountedOverWindowOnly) rec.indexBehind = true;
           checkAwaitedIndex(opts, prior, state.shutdownSignal);
         } else if (
           prior?.retryAtTokens !== undefined &&
@@ -3386,8 +3389,8 @@ function calibratedSizeExceedsWindow(
 ): boolean {
   // A planning estimate, so the full max_tokens (the floor needs an exact count).
   const outputTokens = bodyOutputReservation(body, false);
-  return record.sizeSource === "reported" &&
-    (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit;
+  return record.uncountedOverWindow === true || (record.sizeSource === "reported" &&
+    (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit);
 }
 
 function calibratedSizeExceedsLimits(
@@ -3690,6 +3693,7 @@ function planEdgeCompaction(args: {
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = routed.raw.length;
     compaction.sizeSource = size.source;
+    noteUncountedBound(compaction, args.sizing, prefixCandidate, body, modelContextLimit);
     const overWindow = routedBodyExceedsContext(body, routed.raw, modelContextLimit) ||
       calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
     const fallback = overWindow ? undefined : { prefix, routed };
@@ -3705,10 +3709,12 @@ function planEdgeCompaction(args: {
   }
 
   if (state.compactNow.has(sessionId)) return forced("manual");
-  const size = args.sizing.plan(args.sizing.register(forwardBody, "original"));
+  const originalCandidate = args.sizing.register(forwardBody, "original");
+  const size = args.sizing.plan(originalCandidate);
   compaction.estimatedTokens = size.tokens;
   compaction.estimatedBytes = forwardBody.length;
   compaction.sizeSource = size.source;
+  noteUncountedBound(compaction, args.sizing, originalCandidate, body, modelContextLimit);
   if (calibratedSizeExceedsLimits(compaction, body, modelContextLimit)) {
     return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
   }
@@ -3756,6 +3762,9 @@ type ToolPlan =
       budgetTokens: number;
       /** The request would not fit the model's window as sent. */
       overWindow: boolean;
+      /** Over the window only by its uncounted conservative bound
+       * (CompactionRecord.uncountedOverWindow), not by any estimate. */
+      uncountedOverWindowOnly?: true;
       fallback?: ToolRide;
       replaces?: StablePrefix | null;
     };
@@ -3838,8 +3847,11 @@ function planToolCompaction(args: {
   compaction.estimatedTokens = size.tokens;
   compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
   compaction.sizeSource = size.source;
+  noteUncountedBound(compaction, args.sizing, candidate, body, modelContextLimit);
   overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
     output: bodyOutputReservation(body, args.sizing.isExact(candidate)) });
+  const uncountedOnly = !overWindow && compaction.uncountedOverWindow === true;
+  overWindow ||= uncountedOnly;
   if (!args.canCompress) {
     if (overWindow) return { kind: "pass", original: true };
     return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3856,6 +3868,7 @@ function planToolCompaction(args: {
     estimateTokens: size.tokens,
     budgetTokens: budget.tokens,
     overWindow,
+    ...(uncountedOnly ? { uncountedOverWindowOnly: true as const } : {}),
     ...(ride && !overWindow ? { fallback: ride } : {}),
     ...(stableLane ? { replaces: current ?? null } : {}),
   };
@@ -3903,6 +3916,21 @@ function memoryRoutedToolBody(
   if (!capCacheBreakpoints(routed, route.compressedMessages.length, { preserveSystem: true })) return null;
   if (!validCacheTtlOrder(routed)) return null;
   return Buffer.from(JSON.stringify(routed), "utf-8");
+}
+
+/**
+ * Mark a planned candidate that has no exact count and no calibration ("bytes")
+ * whose per-model conservative bound plus max_tokens exceeds the window:
+ * delivery would refuse it uncounted, so it is over the window for planning.
+ */
+function noteUncountedBound(
+  record: CompactionRecord, sizing: RequestSizing, candidate: RequestCandidate,
+  body: Record<string, any>, modelContextLimit: number,
+): void {
+  if (sizing.isExact(candidate) || sizing.plan(candidate).source !== "bytes") return;
+  if (candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
+    record.uncountedOverWindow = true;
+  }
 }
 
 /** Size the assembled input (including system/tools) and reserve output room. */
@@ -4332,7 +4360,9 @@ async function runBlockingCompression(args: {
     // whatever the fallback gate would refuse to send uncompressed; a bytes/4
     // guess is not sent, as it would force needless compression.
     ...(args.inputCandidate && args.sizing.clientInputTokens(args.inputCandidate) !== undefined
-      ? { clientInputTokens: args.sizing.clientInputTokens(args.inputCandidate) }
+      ? { clientInputTokens: args.sizing.clientInputTokens(args.inputCandidate),
+        // Only an exact count of these bytes may loosen the server's sizing.
+        clientInputTokensExact: args.sizing.isExact(args.inputCandidate) }
       : {}),
     ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),

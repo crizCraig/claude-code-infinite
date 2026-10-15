@@ -23,10 +23,6 @@ export const CLAUDE_LEGACY_BYTES_PER_TOKEN = 2.4;
 export const OTHER_BYTES_PER_TOKEN = 2.8;
 /** Anthropic's largest per-image cost (Claude 4.7+: 2576 px, 4,784 tokens). */
 export const MAX_IMAGE_TOKENS = 4_784;
-/** A Messages API base64 image source as JSON.stringify writes it. Other key
- * orders, and documents (PDF pages cost more than one image), stay text: an
- * over-estimate, never an under-estimate. */
-const BASE64_IMAGE_RE = /"media_type":"image\/[a-z0-9.+-]+","data":"([A-Za-z0-9+/]+={0,2})"/g;
 const CLAUDE_VERSION_RE = /claude-(?:opus|sonnet|haiku|fable|instant)?-?(\d{1,2})(?:[-.](\d{1,2}))?(?![0-9])/;
 /** The conservative bytes per token of `model`'s tokenizer family. */
 export function bytesPerTokenForModel(model) {
@@ -48,20 +44,47 @@ export function conservativeTokensFromBytes(bytes, model) {
     return Math.ceil(bytes / bytesPerTokenForModel(model));
 }
 /** Tokens a request body may cost on `model`: its text at the family ratio,
- * each base64 image payload at one image's maximum. */
+ * each image block (base64 or URL, at any depth) at one image's maximum.
+ * A body that does not parse is all text, an over-estimate. */
 export function conservativeBodyTokens(body, model) {
     const { imageBytes, imageTokens } = imagePayloads(body);
     return conservativeTokensFromBytes(body.length - imageBytes, model) + imageTokens;
 }
 function imagePayloads(body) {
-    let imageBytes = 0;
-    let imageTokens = 0;
-    // Base64 is ASCII, so its character count is its byte count.
-    const text = body.toString("latin1");
-    for (const match of text.matchAll(BASE64_IMAGE_RE)) {
-        imageBytes += match[1].length;
-        imageTokens += MAX_IMAGE_TOKENS;
+    const totals = { imageBytes: 0, imageTokens: 0 };
+    // Most bodies carry no image: skip the parse.
+    if (!body.includes('"image"'))
+        return totals;
+    let parsed;
+    try {
+        parsed = JSON.parse(body.toString("utf-8"));
     }
-    return { imageBytes, imageTokens };
+    catch {
+        return totals;
+    }
+    walkImages(parsed, totals);
+    return totals;
+}
+/** Visit every `{type: "image", source}` block, whatever its key order. */
+function walkImages(value, totals) {
+    if (Array.isArray(value)) {
+        for (const item of value)
+            walkImages(item, totals);
+        return;
+    }
+    if (!value || typeof value !== "object")
+        return;
+    const block = value;
+    const source = block.source;
+    if (block.type === "image" && source && typeof source === "object") {
+        totals.imageTokens += MAX_IMAGE_TOKENS;
+        // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
+        if (source.type === "base64" && typeof source.data === "string") {
+            totals.imageBytes += source.data.length;
+        }
+        return;
+    }
+    for (const child of Object.values(block))
+        walkImages(child, totals);
 }
 //# sourceMappingURL=token-estimate.js.map

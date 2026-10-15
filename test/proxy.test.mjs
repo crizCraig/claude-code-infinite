@@ -10023,7 +10023,12 @@ for (const reportsBudget of [true, false]) {
 }
 
 test("a bytes-only window alarm does not force below the calibrated budget and window", async () => {
-  const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 10 } });
+  // Count Tokens is on (it answers bytes/10 here): uncounted and uncalibrated,
+  // these 600-900 kB bodies are over the 200k window by their conservative
+  // byte bound (token-estimate.ts), which now forces compression by itself.
+  // Counted, only the measured size decides, and bytes/4 still never forces.
+  const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 10 },
+    proxyOpts: { countTokens: true } });
   try {
     await h.post([userText("q"), assistantText("a"), userText("calibration ".repeat(50_000))]);
     const conv = [userText("q"), assistantText("a"), userText("x".repeat(900_000))];
@@ -10067,11 +10072,12 @@ for (const reportUsage of [false, true]) {
 
 
 for (const reportUsage of [true, false]) {
-  test(`human output reservation ${reportUsage ? "forces with calibrated usage" : "does not force from bytes alone"}`, async () => {
+  test(`human output reservation ${reportUsage ? "forces with calibrated usage" : "is forced by the uncounted conservative bound, not bytes/4"}`, async () => {
     // The 600 kB warm-up is over the 200k window by its conservative byte
-    // bound (token-estimate.ts), so where it must be delivered to calibrate
-    // usage it is counted (bytes/4) first; the next turn is still sized from
-    // the reported usage.
+    // bound (token-estimate.ts: 316k). With usage it must be delivered to
+    // calibrate, so it is counted (bytes/4) first and the next turn is sized
+    // from the reported usage. Uncounted and uncalibrated, that bound alone
+    // forces compression (bytes/4, 150k, used not to: it fit the window).
     const h = await edgeHarness({ budget: 160_000, upstreamOptions: { reportUsage },
       proxyOpts: { countTokens: reportUsage } });
     try {
@@ -10081,6 +10087,15 @@ for (const reportUsage of [true, false]) {
       conv.at(-1).content[0].text = "x".repeat(padding);
       const warm = await h.post(conv);
       assert.equal(warm.requestBytes, 600_268);
+      if (!reportUsage) {
+        assert.equal(warm.compaction.sizeSource, "bytes");
+        assert.equal(warm.compaction.estimatedTokens, 150_067);
+        assert.equal(warm.compaction.uncountedOverWindow, true);
+        assert.equal(warm.turnType, "followup-compressed");
+        assert.equal(h.compressCalls().length, 1);
+        assert.equal(h.compressCalls()[0].compression_threshold_tokens, undefined, "forced");
+        return;
+      }
       assert.equal(warm.turnType, "followup-noop");
       if (reportUsage) assert.equal(warm.usage.input_tokens + warm.usage.cache_read_input_tokens, 150_067);
       // The larger output reservation adds three bytes. Keep total request
@@ -10837,3 +10852,136 @@ for (const ending of ["Stop", "exit"]) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Uncounted conservative bound drives compression (token-estimate.ts)
+// ---------------------------------------------------------------------------
+
+/** POST a tool turn; returns status, retry-after and the parsed body. */
+async function postTurn(port, messages, model = "claude-x") {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...SESSION },
+    body: JSON.stringify({ model, max_tokens: 64, messages }),
+  });
+  return { status: res.status, retryAfter: res.headers.get("retry-after"), body: await res.json() };
+}
+
+const opusToolTurn = (bytes) => [
+  { role: "user", content: "task" },
+  { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x".repeat(bytes) }] },
+];
+
+test("an uncounted 2 MB Opus 5.5 tool turn under budget by bytes/4 is compressed, not refused", async () => {
+  // bytes/4 puts it at ~500k (under the 800k budget), so planning used to
+  // pass it through and delivery to forward it; its conservative bound
+  // (2 MB / 1.9 = 1.05M) is over the 1M window, so it compresses up front.
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(200, recoveredMemory());
+  const records = [];
+  const proxy = await startProxy({ budgetTokensOverride: 800_000,
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin, reqlog: { log: (r) => records.push(structuredClone(r)) } });
+  try {
+    const answer = await postTurn(proxy.port, opusToolTurn(2_000_000), "claude-opus-5-5");
+    assert.equal(answer.status, 200);
+    const rec = messageRecords(records).at(-1);
+    assert.equal(rec.compaction.sizeSource, "bytes");
+    assert.ok(rec.compaction.estimatedTokens < 800_000, `${rec.compaction.estimatedTokens}`);
+    assert.equal(rec.compaction.uncountedOverWindow, true);
+    assert.equal(rec.routeRecovery.outcome, "compressed");
+    const calls = memtreeSrv.calls.filter((c) => !c.index_only);
+    assert.equal(calls.length, 1, "compressed once, through the normal path");
+    assert.equal(calls[0].compression_threshold_tokens, undefined, "the bound forces");
+    const sent = upstream.seen.filter((c) => !c.isCount);
+    assert.equal(sent.length, 1);
+    assert.match(JSON.stringify(sent[0].body.messages), /recovered memory/);
+    assert.ok(sent[0].raw.length < 100_000, "the replacement went out, not the 2 MB original");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("an uncounted over-bound Opus 5.5 tool turn whose compression fails is refused with the hint", async () => {
+  const upstream = await recordingUpstream();
+  const memtreeSrv = await mockMemtree(500, { error: "boom" });
+  const proxy = await startProxy({ budgetTokensOverride: 800_000,
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin });
+  try {
+    const statuses = [];
+    let last;
+    for (let i = 0; i < 3; i++) {
+      last = await postTurn(proxy.port, opusToolTurn(2_000_000), "claude-opus-5-5");
+      statuses.push(last.status);
+    }
+    assert.deepEqual(statuses, [503, 503, 400]);
+    assert.match(last.body.error.message, /memtree-compact/);
+    assert.equal(upstream.seen.filter((c) => !c.isCount).length, 0, "never forwarded uncounted");
+    assert.equal(memtreeSrv.calls.filter((c) => !c.index_only).length, 1,
+      "the failure's cooldown holds: no compress per retry");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("while the tree builds, an uncounted over-bound original waits for the index at no compress cost", async () => {
+  // Over the window only by its uncounted bound (524 kB / 1.9 on a 200k
+  // window), the original still takes the awaiting-index hold: no blocking
+  // compress per tool turn, and its refusal is an index wait (503, retry in
+  // 30 s) rather than a strike that ends in a 400.
+  const upstream = await recordingUpstream();
+  const calls = [];
+  const memtreeSrv = await listen((req, res) => {
+    if (req.method === "GET") {
+      res.writeHead(202, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ status: "building" }));
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      calls.push(parsed);
+      const body = parsed.index_only
+        ? { messages: [], index_only: true, usage: {} }
+        : { messages: parsed.messages, compressed: false, usage: { prompt_tokens_details: { cached_tokens: 0 } } };
+      res.writeHead(200, { "content-type": "application/json", ...(parsed.index_only ? {} : pageHeaders(PAGE_URL_1)) });
+      res.end(JSON.stringify(body));
+    });
+  });
+  const records = [];
+  const proxy = await startRecoveryProxy({
+    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+  });
+  const blockingCalls = () => calls.filter((c) => !c.index_only).length;
+  try {
+    let loop = largeToolTurn();
+    await postTurn(proxy.port, loop);
+    assert.equal(messageRecords(records).at(-1).routeRecovery.awaitingIndex, true);
+    assert.equal(blockingCalls(), 1);
+    for (const id of ["t2", "t3", "t4", "t5"]) {
+      loop = extendToolLoop(loop, id);
+      const answer = await postTurn(proxy.port, loop);
+      const rec = messageRecords(records).at(-1);
+      assert.equal(rec.compaction.uncountedOverWindow, true);
+      assert.equal(rec.routeRecovery.outcome, "awaiting-index", id);
+      assert.equal(answer.status, 503, id);
+      assert.equal(answer.retryAfter, "30", id);
+      assert.match(answer.body.error.message, /still indexing/, id);
+    }
+    assert.equal(blockingCalls(), 1, "no compress call while the tree is building");
+    assert.equal(upstream.seen.filter((c) => !c.isCount).length, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.server.closeAllConnections();
+    memtreeSrv.close();
+  }
+});

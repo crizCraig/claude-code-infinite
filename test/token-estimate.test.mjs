@@ -58,13 +58,32 @@ test('each base64 image payload counts as one maximum-cost image, not as text', 
       2 * MAX_IMAGE_TOKENS);
 });
 
-test('other key orders, documents and escaped text stay text (an over-estimate)', () => {
+test('images are found by structure: any key order, URL sources, nested in tool results', () => {
   const data = 'A'.repeat(100_000);
+  const model = 'claude-opus-5-5';
   const reordered = bodyOf([image(data, 'reordered')]);
+  assert.equal(conservativeBodyTokens(reordered, model),
+    conservativeTokensFromBytes(reordered.length - data.length, model) + MAX_IMAGE_TOKENS);
+  // Codex round 1: a valid 535-byte 2576x1456 PNG costs 4,784 tokens in any key order.
+  const tiny = 'B'.repeat(535);
+  const eight = bodyOf(Array.from({ length: 8 }, () => image(tiny, 'reordered')));
+  assert.ok(conservativeBodyTokens(eight, model) >= 8 * MAX_IMAGE_TOKENS);
+  const url = bodyOf([{ type: 'image', source: { type: 'url', url: 'https://x/y.png' } }]);
+  assert.equal(conservativeBodyTokens(url, model),
+    conservativeTokensFromBytes(url.length, model) + MAX_IMAGE_TOKENS);
+  const nested = bodyOf([{ type: 'tool_result', tool_use_id: 't', content: [image(data)] }]);
+  assert.equal(conservativeBodyTokens(nested, model),
+    conservativeTokensFromBytes(nested.length - data.length, model) + MAX_IMAGE_TOKENS);
+});
+
+test('documents and text that only quotes an image stay text (an over-estimate)', () => {
+  const data = 'A'.repeat(100_000);
   const pdf = bodyOf([{ type: 'document',
     source: { type: 'base64', media_type: 'application/pdf', data } }]);
-  const quoted = bodyOf([{ type: 'text', text: `"media_type":"image/png","data":"${data}"` }]);
-  for (const body of [reordered, pdf, quoted]) {
+  const quoted = bodyOf([{ type: 'text',
+    text: `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"${data}"}}` }]);
+  const broken = Buffer.from(`{"type":"image" ${data}`);
+  for (const body of [pdf, quoted, broken]) {
     assert.equal(conservativeBodyTokens(body, 'claude-opus-5-5'),
       conservativeTokensFromBytes(body.length, 'claude-opus-5-5'));
   }
