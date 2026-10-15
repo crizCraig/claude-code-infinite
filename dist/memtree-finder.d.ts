@@ -36,6 +36,14 @@ export interface FinderSession {
         ref?: string;
         links?: FinderTreeLinks;
     } | null;
+    /** How it ended, from the newest stored record (polychat memtree_session_endings.py). */
+    ending?: FinderSessionEnding | null;
+}
+export interface FinderSessionEnding {
+    at?: string | null;
+    last_user?: string | null;
+    actions?: string[];
+    last_assistant?: string | null;
 }
 export interface FinderHit {
     id: string;
@@ -96,4 +104,7 @@ export declare function formatPath(path: {
     id: number;
     summary: string;
 }[], ref?: string): string;
+/** `2026-09-29T01:40:57.018000+00:00` → `2026-09-29 01:40 UTC`. */
+/** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
+export declare function endingLines(ending: FinderSessionEnding | null | undefined): string[];
 //# sourceMappingURL=memtree-finder.d.ts.map

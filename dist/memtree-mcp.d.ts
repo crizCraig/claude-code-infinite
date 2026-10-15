@@ -78,6 +78,7 @@ export declare const MEMTREE_TOOLS: ({
             start?: undefined;
             end?: undefined;
             tail?: undefined;
+            full?: undefined;
             q?: undefined;
         };
         required: string[];
@@ -114,6 +115,7 @@ export declare const MEMTREE_TOOLS: ({
             start?: undefined;
             end?: undefined;
             tail?: undefined;
+            full?: undefined;
             q?: undefined;
         };
         required?: undefined;
@@ -148,6 +150,10 @@ export declare const MEMTREE_TOOLS: ({
                 description: string;
             };
             tail: {
+                type: string;
+                description: string;
+            };
+            full: {
                 type: string;
                 description: string;
             };
@@ -205,6 +211,7 @@ export declare const MEMTREE_TOOLS: ({
             start?: undefined;
             end?: undefined;
             tail?: undefined;
+            full?: undefined;
         };
         required?: undefined;
     };
@@ -223,8 +230,8 @@ export interface TreeSource {
     currentId?(validatePage?: boolean): Promise<string>;
     /** Term search, formatted; optional so a plain index can stand in (tests). */
     search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
-    /** The un-indexed messages after the tree, read fresh from the server. */
-    tail?(tree: string | undefined, start?: number, end?: number): Promise<string>;
+    /** The un-indexed messages after the tree, read fresh from the server; `full`: tool calls whole. */
+    tail?(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
 }
 /**
  * Resolves, fetches and caches the current page, and other sessions' pages
@@ -255,7 +262,7 @@ export declare class CurrentTree implements TreeSource {
      * The server's un-indexed tail after the tree (`/messages`), never cached:
      * it grows with the conversation. With no range, the newest messages.
      */
-    tail(tree: string | undefined, start?: number, end?: number): Promise<string>;
+    tail(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
     private loadCurrent;
     private requireSessionId;
     /** The proxy's current page for the calling session; fails closed on any other session. */

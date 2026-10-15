@@ -100,6 +100,7 @@ export function formatSessions(body, args) {
             out.push(`    project: ${project}`);
         if (s.snippet)
             out.push(`    first message: ${oneLine(s.snippet, SNIPPET_CHARS)}`);
+        out.push(...endingLines(s.ending));
         const tree = s.latest_tree;
         if (tree?.request_id) {
             const ref = tree.ref ?? tree.request_id;
@@ -216,6 +217,23 @@ function projectLabel(project) {
     return [where || project.dir, at].filter(Boolean).join(" · ") || undefined;
 }
 /** `2026-09-29T01:40:57.018000+00:00` → `2026-09-29 01:40 UTC`. */
+/** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
+export function endingLines(ending) {
+    if (!ending)
+        return [];
+    const when = shortTime(ending.at);
+    const lines = [];
+    const head = `    ended${when ? ` ${when}` : ""}:`;
+    if (ending.last_user)
+        lines.push(`${head} last asked: ${oneLine(ending.last_user, SNIPPET_CHARS)}`);
+    const after = [
+        ending.actions?.length ? `tools ${ending.actions.join(", ")}` : undefined,
+        ending.last_assistant ? `last reply: ${oneLine(ending.last_assistant, SNIPPET_CHARS)}` : undefined,
+    ].filter(Boolean);
+    if (after.length)
+        lines.push(`${lines.length ? "      then" : head} ${after.join("; ")}`);
+    return lines;
+}
 function shortTime(value) {
     if (!value)
         return undefined;

@@ -35,7 +35,7 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
-import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
+import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, serverTailHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
 /**
@@ -93,8 +93,9 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
     "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
     "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
-    "yet, and search does not see them; read_lines {\"tail\": true} reads them verbatim (with tree for another " +
-    "session's page).";
+    "yet. A text search of one tree also matches them (listed after the tree's hits), list shows how each session " +
+    "ended, and read_lines {\"tail\": true} reads them (with tree for another session's page; large tool calls are " +
+    "shortened, \"full\": true reads them whole).";
 const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
 /**
  * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
@@ -111,7 +112,8 @@ export const MEMTREE_TOOLS = [
             "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
             "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
-            "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range.",
+            "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
+            "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail).",
         inputSchema: {
             type: "object",
             properties: {
@@ -144,8 +146,9 @@ export const MEMTREE_TOOLS = [
         name: "read_lines",
         description: "Read exact transcript lines: a leaf's node address (its whole range), or block and 1-based inclusive start/end lines. " +
             `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped. ` +
-            "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there, " +
-            "and search does not see it): the newest ones, or start/end message positions; add tree for another session's page.",
+            "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
+            "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
+            "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole.",
         inputSchema: {
             type: "object",
             properties: {
@@ -155,13 +158,15 @@ export const MEMTREE_TOOLS = [
                 end: { type: "number", description: "Last line, inclusive." },
                 tree: { type: "string", description: `With block/start/end or tail: ${TREE_DESC} Omit for this session.` },
                 tail: { type: "boolean", description: "Read the un-indexed messages after the tree instead of lines; start/end are then message positions." },
+                full: { type: "boolean", description: "With tail: every message whole, large tool calls and results included." },
             },
         },
     },
     {
         name: "list",
         description: "List the user's own MemTree sessions (this one and others), most recently active first: title (the tree's root summary), " +
-            "first message, times, project (directory, git repo, branch, commit), models, request count and the latest tree's reference. " +
+            "first message, how it ended (last user message, the tools after it and the last reply, with the time), times, " +
+            "project (directory, git repo, branch, commit), models, request count and the latest tree's reference. " +
             "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <ref>, \"id\": 0} or search {\"tree\": <ref>, ...}.",
         inputSchema: {
             type: "object",
@@ -287,8 +292,9 @@ export class CurrentTree {
                 const session = answer.body.session_id;
                 if (!other && session !== undefined)
                     this.checkSession(session, this.requireSessionId());
-                if (other || session !== undefined)
-                    return formatSearchHits(parsed.hits, query, parsed.terms, other);
+                if (other || session !== undefined) {
+                    return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body));
+                }
                 // Older servers omit identity: search only the session-validated page.
             }
             if (answer.status === 202) {
@@ -305,7 +311,7 @@ export class CurrentTree {
      * The server's un-indexed tail after the tree (`/messages`), never cached:
      * it grows with the conversation. With no range, the newest messages.
      */
-    async tail(tree, start, end) {
+    async tail(tree, start, end, full) {
         const other = checkTreeId(tree);
         const id = other ?? (await this.currentId());
         const params = new URLSearchParams();
@@ -313,6 +319,8 @@ export class CurrentTree {
             params.set("start", String(start));
         if (end !== undefined)
             params.set("end", String(end));
+        if (full)
+            params.set("full", "true");
         const query = params.toString() ? `?${params}` : "";
         const base = proxyBase(this.deps);
         const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/messages${query}`);
@@ -617,7 +625,10 @@ async function readLinesTool(args, tree) {
         if ([start, end].some((v) => v !== undefined && !Number.isInteger(v))) {
             throw new ToolInputError("read_lines: with tail, start and end are message positions (integers)");
         }
-        return tree.tail(treeArgument(args.tree), start, end);
+        if (args.full !== undefined && typeof args.full !== "boolean") {
+            throw new ToolInputError("read_lines: full must be true or false");
+        }
+        return tree.tail(treeArgument(args.tree), start, end, args.full === true);
     }
     if (args.node === undefined || args.node === null || args.node === "") {
         const target = treeArgument(args.tree);

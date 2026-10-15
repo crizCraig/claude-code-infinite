@@ -817,3 +817,68 @@ test("an MCP server started after a mid-session update says so on failed calls",
   const without = await handleMcpMessage(call, failing);
   assert.equal(without.result.content[0].text, "HTTP 404 not found");
 });
+
+test("read_lines tail: shortened tool calls are marked and full: true reads them whole", async () => {
+  const { formatTail } = await import("../dist/memtree-tools.js");
+  const urls = [];
+  const fetch = async (url) => {
+    const u = new URL(url);
+    urls.push(u.pathname + u.search);
+    if (u.pathname === "/memtree/current") return Response.json({ session_id: "session-1", id: "aaa111" });
+    return Response.json({
+      session_id: "session-1", tail_start: 10, tail_end: 11, start: 10, end: 11,
+      messages: [{ i: 10, k: "user", x: "publish" },
+        { i: 11, k: "tool_call", x: "[tool call · Artifact]\n… [52 lines / 2,210 chars omitted; full=true returns it whole]", shortened: true }],
+    });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9/", sessionId: "session-1", fetch });
+  const call = async (args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "read_lines", arguments: args } }, tree))
+      .result.content[0].text;
+  const text = await call({ tail: true });
+  assert.match(text, /\[11\] tool_call · shortened\n\[tool call · Artifact\]/);
+  assert.match(text, /1 large tool call\/result shortened; read_lines \{"tail": true, "start": 11, "end": 11, "full": true\} reads one whole/);
+  assert.equal(urls.at(-1), "/memtree/aaa111/messages");
+  await call({ tail: true, start: 11, end: 11, full: true });
+  assert.equal(urls.at(-1), "/memtree/aaa111/messages?start=11&end=11&full=true");
+  assert.match(await call({ tail: true, full: "yes" }), /full must be true or false/);
+  const plain = formatTail({ tail_start: 1, tail_end: 1, messages: [{ i: 1, k: "user", x: "hi" }] });
+  assert.doesNotMatch(plain, /shortened/);
+  const readLines = MEMTREE_TOOLS.find((t) => t.name === "read_lines");
+  assert.equal(readLines.inputSchema.properties.full.type, "boolean");
+  assert.match(readLines.description, /full: true/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /"full": true/);
+});
+
+test("tree search lists matching newest messages no tree covers yet", async () => {
+  const { serverTailHits, formatSearchHits } = await import("../dist/memtree-tools.js");
+  const body = { terms: ["pr"], hits: [{ id: 5, leaf: true, summary: "s" }],
+    tail_hits: [{ i: 2051, k: "assistant", at: "2026-10-06T01:00:00Z", matched_terms: ["pr"],
+      snippets: [{ line: 1, text: "PR #42 opened" }] }, { bad: true }] };
+  const tailHits = serverTailHits(body);
+  assert.equal(tailHits.length, 1);
+  const local = serverSearchHits(body);
+  const text = formatSearchHits(local.hits, "pr", local.terms, "r1-v1-own", tailHits);
+  assert.match(text, /Also in the newest messages, which no tree covers yet \(1\):/);
+  assert.match(text, /\[message 2051 · assistant · 2026-10-06T01:00:00Z · matched pr\]\n  L1: PR #42 opened/);
+  assert.match(text, /read_lines \{"tree": "r1-v1-own", "tail": true, "start": <message>, "end": <message>\}/);
+  const onlyTail = formatSearchHits([], "pr", ["pr"], undefined, tailHits);
+  assert.match(onlyTail, /^No node of the tree matches "pr"/);
+  assert.match(onlyTail, /message 2051/);
+  assert.deepEqual(serverTailHits({ hits: [] }), []);
+  const search = MEMTREE_TOOLS.find((t) => t.name === "search");
+  assert.match(search.description, /newest messages no tree covers yet/);
+});
+
+test("list shows how each session ended", () => {
+  const text = formatSessions({ sessions: [
+    { id: "s1", ending: { at: "2026-10-15T20:21:47.431Z", last_user: "ship it",
+      actions: ["Bash", "gh"], last_assistant: "PR #42 is open" } },
+    { id: "s2", ending: { actions: ["Read"] } },
+    { id: "s3", ending: null },
+  ] }, {});
+  assert.match(text, /ended 2026-10-15 20:21 UTC: last asked: ship it\n      then tools Bash, gh; last reply: PR #42 is open/);
+  assert.match(text, /\n    ended: tools Read/);
+  const list = MEMTREE_TOOLS.find((t) => t.name === "list");
+  assert.match(list.description, /how it ended/);
+});

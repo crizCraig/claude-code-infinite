@@ -51,6 +51,15 @@ export interface FinderSession {
   request_count?: number;
   tokens?: { prompt?: number; completion?: number; conversation?: number | null };
   latest_tree?: { request_id: string; ref?: string; links?: FinderTreeLinks } | null;
+  /** How it ended, from the newest stored record (polychat memtree_session_endings.py). */
+  ending?: FinderSessionEnding | null;
+}
+
+export interface FinderSessionEnding {
+  at?: string | null;
+  last_user?: string | null;
+  actions?: string[];
+  last_assistant?: string | null;
 }
 
 export interface FinderHit {
@@ -163,6 +172,7 @@ export function formatSessions(body: FinderSessionsResponse, args: Record<string
     const project = projectLabel(s.project);
     if (project) out.push(`    project: ${project}`);
     if (s.snippet) out.push(`    first message: ${oneLine(s.snippet, SNIPPET_CHARS)}`);
+    out.push(...endingLines(s.ending));
     const tree = s.latest_tree;
     if (tree?.request_id) {
       const ref = tree.ref ?? tree.request_id;
@@ -283,6 +293,21 @@ function projectLabel(project: FinderProject | null | undefined): string | undef
 }
 
 /** `2026-09-29T01:40:57.018000+00:00` → `2026-09-29 01:40 UTC`. */
+/** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
+export function endingLines(ending: FinderSessionEnding | null | undefined): string[] {
+  if (!ending) return [];
+  const when = shortTime(ending.at);
+  const lines: string[] = [];
+  const head = `    ended${when ? ` ${when}` : ""}:`;
+  if (ending.last_user) lines.push(`${head} last asked: ${oneLine(ending.last_user, SNIPPET_CHARS)}`);
+  const after = [
+    ending.actions?.length ? `tools ${ending.actions.join(", ")}` : undefined,
+    ending.last_assistant ? `last reply: ${oneLine(ending.last_assistant, SNIPPET_CHARS)}` : undefined,
+  ].filter(Boolean);
+  if (after.length) lines.push(`${lines.length ? "      then" : head} ${after.join("; ")}`);
+  return lines;
+}
+
 function shortTime(value: string | null | undefined): string | undefined {
   if (!value) return undefined;
   const date = new Date(value);

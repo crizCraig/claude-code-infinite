@@ -316,9 +316,14 @@ export function formatSearchHits(
   hits: SearchHit[],
   query: string,
   terms: string[],
-  tree?: string
+  tree?: string,
+  tailHits: TailHit[] = []
 ): string {
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
+  if (!hits.length && tailHits.length) {
+    return [`No node of the tree matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}).`,
+      ...formatTailHits(tailHits, tree)].join("\n");
+  }
   if (!hits.length) {
     return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
   }
@@ -347,6 +352,7 @@ export function formatSearchHits(
       ? `Summaries are lossy; read_lines {"tree": ${JSON.stringify(tree)}, block, start, end} returns the exact transcript lines, read_node {"tree": ${JSON.stringify(tree)}, id} a node's children and path from the root.`
       : "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root."
   );
+  out.push(...formatTailHits(tailHits, tree));
   return out.join("\n");
 }
 
@@ -456,6 +462,53 @@ interface TailMessage {
   at?: string;
   /** `in_newer_tree` or `not_indexed` (servers from 2026-10-06). */
   state?: string;
+  /** A large tool call or result cut to its first and last lines (`full` reads it whole). */
+  shortened?: boolean;
+}
+
+/** A tail message matching a tree search (`tail_hits`, polychat memtree_tail_search.py). */
+export interface TailHit {
+  i: number;
+  k?: string;
+  at?: string;
+  state?: string;
+  matched_terms: string[];
+  snippets: { line: number; text: string }[];
+}
+
+/** `tail_hits` of the server's tree search; [] when absent or malformed. */
+export function serverTailHits(body: unknown): TailHit[] {
+  const raw = (body as { tail_hits?: unknown } | undefined)?.tail_hits;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((h): h is Record<string, unknown> => !!h && Number.isInteger((h as { i?: unknown }).i))
+    .map((h) => ({
+      i: h.i as number,
+      k: typeof h.k === "string" ? h.k : undefined,
+      at: typeof h.at === "string" ? h.at : undefined,
+      state: typeof h.state === "string" ? h.state : undefined,
+      matched_terms: Array.isArray(h.matched_terms) ? h.matched_terms.map(String) : [],
+      snippets: Array.isArray(h.snippets)
+        ? (h.snippets as { line?: unknown; text?: unknown }[])
+            .filter((s) => Number.isInteger(s?.line) && typeof s?.text === "string")
+            .map((s) => ({ line: s.line as number, text: s.text as string }))
+        : [],
+    }));
+}
+
+/** Tail hits under a search's tree hits: newest messages no tree covers yet. */
+export function formatTailHits(hits: TailHit[], tree?: string): string[] {
+  if (!hits.length) return [];
+  const out = ["", `Also in the newest messages, which no tree covers yet (${hits.length}):`];
+  for (const hit of hits) {
+    const head = [`message ${hit.i}`, hit.k, hit.at, `matched ${hit.matched_terms.join(", ")}`]
+      .filter(Boolean)
+      .join(" · ");
+    out.push("", `[${head}]`);
+    for (const s of hit.snippets) out.push(`  L${s.line}: ${s.text}`);
+  }
+  out.push("", `read_lines {${treeArg(tree)}"tail": true, "start": <message>, "end": <message>} reads one whole.`);
+  return out;
 }
 
 /**
@@ -483,9 +536,18 @@ export function formatTail(body: unknown, tree?: string): string {
   ];
   for (const m of messages) {
     const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
-    out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}`, m.x ?? "");
+    const cut = m.shortened ? " · shortened" : "";
+    out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}${cut}`, m.x ?? "");
   }
   const notes: string[] = [];
+  const shortened = messages.filter((m) => m.shortened);
+  if (shortened.length) {
+    const example = shortened[shortened.length - 1].i;
+    notes.push(
+      `${shortened.length} large tool call${shortened.length === 1 ? "" : "s"}/result${shortened.length === 1 ? "" : "s"} shortened; ` +
+        `read_lines {${treeArg(tree)}"tail": true, "start": ${example}, "end": ${example}, "full": true} reads one whole`
+    );
+  }
   if (typeof page.tail_start === "number" && first > page.tail_start) {
     notes.push(`earlier: read_lines {${treeArg(tree)}"tail": true, "end": ${first - 1}}`);
   }
