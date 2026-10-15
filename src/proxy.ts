@@ -126,6 +126,8 @@ import type { NewestTreeLookup } from "./memtree-newest.js";
 import {
   describeClaudeCodeRequest,
   inspectMonitorTranscript,
+  knownSideRequestKind,
+  transcriptWarning,
   isClaudeCodeSideRequest,
   memtreeClientMeta,
   sessionTag,
@@ -1526,13 +1528,10 @@ async function handleMessages(
     try {
       rec.transcript = inspectMonitorTranscript(body);
       sideRequest = rec.transcript.ok;
-      if (!rec.transcript.ok) {
-        console.error(
-          `[ccc proxy] possible side request, transcript format not recognised ` +
-            `(${rec.transcript.reason}${rec.transcript.badLine ? ` at line ${rec.transcript.badLine}` : ""}); ` +
-            `handled as an ordinary request. Claude Code may have changed the monitor format.`
-        );
-      }
+      const knownKind = knownSideRequestKind(clientInfo);
+      if (knownKind) rec.transcript.knownKind = knownKind;
+      const warning = transcriptWarning(rec.transcript);
+      if (warning) console.error(warning);
     } catch {
       // never let the format check affect the request
     }

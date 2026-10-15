@@ -71,6 +71,34 @@ test("monitor transcript shape is recognised, and every deviation is named", () 
   assert.equal(inspectMonitorTranscript(wrap("")).reason, "empty");
 });
 
+test("only a malformed <transcript> block warns; a request with no transcript is silent", async () => {
+  const { transcriptWarning } = await import("../dist/cc-request.js");
+  const base = { ok: false, lines: 0, userLines: 0, toolLines: 0, metaLines: 0 };
+  assert.equal(transcriptWarning({ ...base, ok: true, lines: 2 }), undefined);
+  assert.equal(transcriptWarning({ ...base, reason: "no-transcript" }), undefined);
+  for (const reason of ["unclosed", "empty"]) {
+    assert.match(transcriptWarning({ ...base, reason }), new RegExp(`\\(${reason}\\)`));
+  }
+  assert.match(transcriptWarning({ ...base, reason: "bad-line", badLine: 3 }), /\(bad-line at line 3\)/);
+});
+
+test("benign no-transcript side requests are classified: session title and WebFetch summary", async () => {
+  const { knownSideRequestKind } = await import("../dist/cc-request.js");
+  const header = "x-anthropic-billing-header: cc_version=2.1.300.abc; cc_entrypoint=cli; cch=1;";
+  const info = (system, user) => describeClaudeCodeRequest({
+    system: [{ type: "text", text: header }, { type: "text", text: system }],
+    messages: [{ role: "user", content: user }],
+  });
+  assert.equal(knownSideRequestKind(info(
+    "You are Claude Code, Anthropic's official CLI for Claude. You are naming a coding session for a list.",
+    "<session> fix the build </session>")), "session-title");
+  assert.equal(knownSideRequestKind(info(
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    "Web page content: --- # Docs")), "webfetch-summary");
+  assert.equal(knownSideRequestKind(info("You are a security monitor for autonomous AI coding agents.", "x")), undefined);
+  assert.equal(knownSideRequestKind(describeClaudeCodeRequest({ messages: [] })), undefined);
+});
+
 test("header-without-origin requests log the last user message opening, count and a session tag", async () => {
   const { sessionTag } = await import("../dist/cc-request.js");
   const info = describeClaudeCodeRequest({
