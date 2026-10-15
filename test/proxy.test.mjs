@@ -2099,6 +2099,46 @@ test("server compressed:false is passthrough even when usage looks compressed", 
   }
 });
 
+test("a flatten that kept images is forwarded with the breakpoint on its last block", async () => {
+  let forwarded;
+  const upstream = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      forwarded = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(UPSTREAM_BODY)),
+      });
+      res.end(UPSTREAM_BODY);
+    });
+  });
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } };
+  const content = [{ type: "text", text: "memory + recent turns " + "x".repeat(3_000) }, image];
+  const memtreeSrv = await mockMemtree(200, {
+    messages: [{ role: "user", content: "memory + recent turns" }],
+    flattened_messages: [{ role: "user", content }],
+    compressed: true,
+    usage: { prompt_tokens: 200_000, completion_tokens: 1_000, prompt_tokens_details: { cached_tokens: 0 } },
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two");
+    const json = await postMessages(proxy.port, followupTurn("turn two"));
+    assert.equal(json.content.at(-1).text, "upstream answer");
+    const compressCall = memtreeSrv.calls.find((call) => call.flatten === true);
+    assert.equal(compressCall?.flatten_images, true, "compress calls ask for image blocks");
+    assert.deepEqual(forwarded.messages, [{ role: "user", content: [
+      content[0], { ...image, cache_control: { type: "ephemeral" } },
+    ] }]);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("server compressed:true is trusted over a zero cached_tokens", async () => {
   let forwarded;
   const upstream = await listen((req, res) => {

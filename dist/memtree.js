@@ -65,10 +65,48 @@ export function serverFlattenedMessages(result) {
     const only = flattened[0];
     if (!only || typeof only !== "object" || only.role !== "user")
         return null;
-    if (typeof only.content !== "string" || only.content.length === 0) {
-        return null;
+    if (typeof only.content === "string") {
+        return only.content.length === 0 ? null : [{ role: "user", content: only.content }];
     }
-    return [{ role: "user", content: only.content }];
+    if (!isImageFlattenContent(only.content))
+        return null;
+    return [{ role: "user", content: only.content.map((block) => ({ ...block })) }];
+}
+/**
+ * A flatten that kept images (requested with `flatten_images`): text and image
+ * blocks only, every text non-blank, at least one image. A list without an
+ * image is not something the server sends, so it is rejected like any other
+ * malformed flatten.
+ */
+function isImageFlattenContent(content) {
+    if (!Array.isArray(content) || content.length === 0)
+        return false;
+    let images = 0;
+    for (const block of content) {
+        if (!block || typeof block !== "object")
+            return false;
+        const b = block;
+        if (b.type === "text") {
+            if (typeof b.text !== "string" || b.text.trim().length === 0)
+                return false;
+        }
+        else if (b.type === "image" && isImageSource(b.source)) {
+            images += 1;
+        }
+        else {
+            return false;
+        }
+    }
+    return images > 0;
+}
+function isImageSource(source) {
+    if (!source || typeof source !== "object")
+        return false;
+    const s = source;
+    if (s.type === "base64") {
+        return typeof s.media_type === "string" && typeof s.data === "string" && s.data.length > 0;
+    }
+    return s.type === "url" && typeof s.url === "string" && s.url.length > 0;
 }
 function usageRecord(result) {
     return result.usage && typeof result.usage === "object"
@@ -1232,6 +1270,10 @@ export class MemtreeClient {
             // and never re-derives it. Pre-flatten servers ignore the field and
             // omit `flattened_messages`, which degrades to passthrough upstream.
             body.flatten = true;
+            // This client forwards a flattened message whose content is a list of
+            // text and image blocks, so the server keeps the newest images as images
+            // (within its image allowance) instead of naming them in placeholders.
+            body.flatten_images = true;
         }
         let payload;
         if (opts.serializedMessages !== undefined) {
