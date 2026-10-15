@@ -50,6 +50,18 @@ jobs:
             exit 1
           fi
 
+      # `./publish.sh --local` publishes from a maintainer's machine before it
+      # pushes the tag; tests still run, but there is nothing left to stage.
+      - name: Skip staging if this version is already published
+        id: published
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Compare the output: some npm versions exit 0 with no output for a missing version.
+          if [ "$(npm view "claude-code-infinite@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice::claude-code-infinite@$VERSION is already published (publish.sh --local); not staging."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - run: npm ci
 
       - name: Test (NO_COLOR)
@@ -77,11 +89,13 @@ jobs:
       # credential. Provenance is automatic for a public repo under trusted
       # publishing; --provenance just makes that explicit.
       - name: Stage on npm
+        if: steps.published.outputs.skip != 'true'
         run: |
           set -o pipefail
           npm stage publish --provenance 2>&1 | tee stage.log
 
       - name: Summary (approval needed)
+        if: steps.published.outputs.skip != 'true'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "::notice::claude-code-infinite@$VERSION is staged. Approve it at https://www.npmjs.com/package/claude-code-infinite (Staged Packages tab)."

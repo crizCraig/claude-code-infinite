@@ -277,7 +277,8 @@ maintainer before it goes live:
 The trusted publisher on npmjs.com is bound to the workflow file name `publish.yml` with no
 GitHub environment, and allows only staged publishing; renaming the workflow breaks it.
 `./publish.sh --local` is the fallback: it publishes directly from your machine with npm web
-auth, as before.
+auth, then pushes the commit and tag; the workflow still tests that tag but skips staging,
+since the version is already published.
 
 ## Troubleshooting
 

@@ -44,15 +44,23 @@ echo "Bumping version ($VERSION_TYPE)..."
 npm version "$VERSION_TYPE"
 VERSION=$(node -p "require('./package.json').version")
 
-echo "Pushing to git..."
-git push && git push --tags
-
 if [[ "$LOCAL" == true ]]; then
+    # Publish before pushing the tag: the tag push runs the workflow, which sees
+    # this version already on npm and skips staging instead of racing us for it.
     echo "Publishing to npm from this machine..."
-    npm publish --auth-type=web
+    if ! npm publish --auth-type=web; then
+        echo "Error: npm publish failed. v$VERSION is committed and tagged locally but not"
+        echo "pushed; retry with: npm publish --auth-type=web && git push && git push --tags"
+        exit 1
+    fi
+    echo "Pushing to git..."
+    git push && git push --tags
     echo "Done! Published v$VERSION"
     exit 0
 fi
+
+echo "Pushing to git..."
+git push && git push --tags
 
 APPROVE_URL="https://www.npmjs.com/package/claude-code-infinite"
 echo "Pushed v$VERSION. It is staged by CI after tests pass; approve it at"
