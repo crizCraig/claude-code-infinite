@@ -448,7 +448,7 @@ export declare class MemtreeClient {
     /**
      * Every transmitted field that can change the server's answer, except the
      * size hint (clientInputTokens) and the abort budget: the complete key adds
-     * the hint's verdict, and the in-flight join key compares hints itself. The
+     * the hint's value, and the in-flight join key compares hints itself. The
      * hint's provenance is included: only an exact count may loosen the
      * server's sizing, so exact and projected hints never share an answer.
      */

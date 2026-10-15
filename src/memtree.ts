@@ -886,20 +886,6 @@ function transmittedTools(tools: unknown[] | undefined): unknown[] | undefined {
   return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 
-/**
- * With a known comparison budget, only crossing it changes the server's
- * verdict, so same-side retries share a key. Before the server reports its
- * budget, callers can omit both target and threshold: preserve the full hint
- * then, since any differing value may cross the unknown model-policy budget.
- * In particular, a newly counted retry must not reuse an unhinted passthrough.
- */
-function clientOverThreshold(meta: CompressRequestMeta | undefined): true | number | null {
-  const budget = meta?.compressionThresholdTokens ?? meta?.compressionTargetTokens;
-  if (meta?.clientInputTokens === undefined) return null;
-  if (budget === undefined) return meta.clientInputTokens;
-  return meta.clientInputTokens > budget ? true : null;
-}
-
 /** A compress in flight and the size hint it sent (clientInputTokens). */
 interface InFlightCompress {
   promise: Promise<CompressResult | null>;
@@ -1388,7 +1374,9 @@ export class MemtreeClient {
     return createHash("sha256")
       .update(JSON.stringify([
         ...this.requestIdentity(hash, modelContextLimit, meta),
-        clientOverThreshold(meta),
+        // The numeric hint itself: the server calibrates its chars-per-token
+        // from it, so even same-side hints can change its verdict.
+        meta?.clientInputTokens ?? null,
       ]))
       .digest("hex");
   }
@@ -1396,7 +1384,7 @@ export class MemtreeClient {
   /**
    * Every transmitted field that can change the server's answer, except the
    * size hint (clientInputTokens) and the abort budget: the complete key adds
-   * the hint's verdict, and the in-flight join key compares hints itself. The
+   * the hint's value, and the in-flight join key compares hints itself. The
    * hint's provenance is included: only an exact count may loosen the
    * server's sizing, so exact and projected hints never share an answer.
    */

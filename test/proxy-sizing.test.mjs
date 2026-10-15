@@ -11,6 +11,8 @@ async function listen(handler) {
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
 }
 
+const HANG = Symbol('hang');
+
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
   compressBudgetMs, longCompressBudgetMs } = {}) {
@@ -23,8 +25,10 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       if (req.url.includes('/count_tokens')) {
         counts.push(body);
         if (timeout) return;
-        res.writeHead(countStatus, { 'content-type': 'application/json' });
+        // `count` may answer HANG: that one call never answers (a timeout).
         const result = count(body, counts.length);
+        if (result === HANG) return;
+        res.writeHead(countStatus, { 'content-type': 'application/json' });
         res.end(typeof result === 'string' ? result : JSON.stringify(result));
       } else {
         forwards.push(body);
@@ -558,3 +562,42 @@ test('an uncounted over-bound Opus 5.5 tool turn compresses on the long budget',
     assert.match(JSON.stringify(h.forwards[0].messages), /memory m/);
   } finally { h.close(); }
 });
+
+// Codex round 3: the judged candidate itself is counted at planning, whether
+// it is a sampled ride or the original behind a stored route that fails to
+// match; if that count fails, its bound sends it to compression, not refusal.
+function compressedHistory() {
+  return [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'x'.repeat(3_400_000) }];
+}
+const bigToolStep = (id) => [
+  { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: {} }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'y'.repeat(2_000_000) }] }];
+
+for (const stale of [false, true]) {
+  test(`a sampled over-bound ${stale ? 'original behind a stale route' : 'ride'} whose count times out compresses`, async () => {
+    // The first count (the 3.4 MB human turn) answers bytes/4 (~850k): over
+    // the 800k budget, so it compresses and installs a route. Later counts hang.
+    const h = await harness({ budget: 800_000, usage: (_body, bytes) => Math.floor(bytes / 4),
+      count: (body, n) => n === 1 ? { input_tokens: Math.floor(JSON.stringify(body).length / 4) } : HANG,
+      compress: () => compressedReply(4_000, 800_000) });
+    try {
+      const history = compressedHistory();
+      assert.equal(await h.post(0, { agent: '', model: 'claude-opus-5-5', messages: history }), 200);
+      assert.equal(h.compressions.length, 1);
+      // Stale: an edited, short history the stored route cannot validate; its
+      // ~2 MB original is projected at ~500k from the lane's 0.25 sample.
+      const next = stale
+        ? [{ role: 'user', content: 'first, edited' }, { role: 'assistant', content: 'answer' },
+          { role: 'user', content: 'go' }, ...bigToolStep('t1')]
+        : [...history, ...bigToolStep('t1')];
+      const status = await h.post(0, { agent: '', model: 'claude-opus-5-5', messages: next });
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.ok(rec.compaction.estimatedTokens < 800_000, 'planned under budget by its sample');
+      assert.equal(rec.compaction.uncountedOverWindow, true, JSON.stringify(rec.compaction));
+      assert.equal(h.compressions.length, 2, 'compressed through the normal path, not refused');
+      assert.equal(status, 200);
+      assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+    } finally { h.close(); }
+  });
+}

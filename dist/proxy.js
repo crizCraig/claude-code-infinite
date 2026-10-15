@@ -973,7 +973,6 @@ async function handleMessages(req, res, opts, upstream, state) {
     const rides = state.memoryRoutes.has(requestRouteKey) ||
         (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
     if (!rides) {
-        await requestSizing.countIfOverBound(forwardCandidate, sizingLimits());
         const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
         if (measured.source === "exact") {
             sizeSlot.set({ tokens: measured.tokens, forwardedBytes: forwardCandidate.body.length });
@@ -1171,7 +1170,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             // prefix, else whole) with no compress call; at it, compress once to
             // the target (planToolCompaction). A "replay" is a client retry of the
             // request that installed the route, forwarded verbatim.
-            const plan = planToolCompaction({
+            const plan = await planToolCompaction({
                 opts,
                 state,
                 body,
@@ -1355,7 +1354,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Stable-prefix (edge) compaction: the main thread's human turns only. The
     // recap rides the main route above; subagents keep per-turn compression.
     const edge = isMainRequest && sessionId !== undefined
-        ? planEdgeCompaction({
+        ? await planEdgeCompaction({
             sizing: requestSizing,
             opts,
             state,
@@ -2597,7 +2596,7 @@ function boundedSet(map, key, value, limit = STABLE_PREFIX_MAX_SESSIONS) {
  *
  * Fills rec.compaction with the budget, estimate and reason.
  */
-function planEdgeCompaction(args) {
+async function planEdgeCompaction(args) {
     const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } = args;
     const mode = compactionMode(opts, state, sessionId);
     const budget = resolveBudget(opts, state, body.model, modelContextLimit);
@@ -2649,6 +2648,7 @@ function planEdgeCompaction(args) {
         }
         const prefixCandidate = args.sizing.register(routed.raw, "ride", prefix.lastSize);
         candidateSizeOwners.set(prefixCandidate, prefix);
+        await countIfOverBound(args.sizing, prefixCandidate, body, modelContextLimit);
         const size = args.sizing.plan(prefixCandidate);
         compaction.estimatedTokens = size.tokens;
         compaction.estimatedBytes = routed.raw.length;
@@ -2670,6 +2670,7 @@ function planEdgeCompaction(args) {
     if (state.compactNow.has(sessionId))
         return forced("manual");
     const originalCandidate = args.sizing.register(forwardBody, "original");
+    await countIfOverBound(args.sizing, originalCandidate, body, modelContextLimit);
     const size = args.sizing.plan(originalCandidate);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = forwardBody.length;
@@ -2705,7 +2706,7 @@ function planEdgeCompaction(args) {
  *
  * Fills rec.compaction.
  */
-function planToolCompaction(args) {
+async function planToolCompaction(args) {
     const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } = args;
     const mode = compactionMode(opts, state, sessionId);
     const budget = resolveBudget(opts, state, body.model, modelContextLimit);
@@ -2747,6 +2748,7 @@ function planToolCompaction(args) {
     const candidate = args.sizing.register(ride?.raw ?? forwardBody, ride ? "ride" : "original", sample);
     if (ride)
         candidateSizeOwners.set(candidate, ride.sizeHolder);
+    await countIfOverBound(args.sizing, candidate, body, modelContextLimit);
     const size = args.sizing.plan(candidate);
     compaction.estimatedTokens = size.tokens;
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
@@ -2819,16 +2821,22 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     return Buffer.from(JSON.stringify(routed), "utf-8");
 }
 /**
- * Mark a planned candidate with no exact count whose per-model conservative
- * bound plus max_tokens exceeds the window, when it is uncalibrated ("bytes")
- * or cannot be counted any more (counting off, or its count failed): delivery
- * would refuse it uncounted, so it is over the window for planning. A sampled
- * estimate that can still be counted is left to delivery's count.
+ * Count the candidate a planner is about to judge (ride or original, sampled
+ * or not) when only a count could admit it: no exact count, and its per-model
+ * conservative bound plus max_tokens exceeds the window. Delivery reuses the
+ * result.
+ */
+async function countIfOverBound(sizing, candidate, body, modelContextLimit) {
+    await sizing.countIfOverBound(candidate, { budget: modelContextLimit, context: modelContextLimit, output: bodyOutputReservation(body, false) });
+}
+/**
+ * Mark a planned candidate still without an exact count (counting off, or its
+ * planning count failed: countIfOverBound ran first) whose conservative bound
+ * plus max_tokens exceeds the window: delivery would refuse it uncounted, so
+ * it is over the window for planning and takes the normal gated compression.
  */
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
     if (sizing.isExact(candidate))
-        return;
-    if (sizing.plan(candidate).source !== "bytes" && sizing.canCount(candidate))
         return;
     if (candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
         record.uncountedOverWindow = true;
