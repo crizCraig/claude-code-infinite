@@ -196,13 +196,14 @@ test("MemtreeClient: an in-flight compress is shared by a retry that forces no m
 
 test("a calibrated overflow keeps the short budget when delivery could still send it by bytes",
   async () => {
-    // Counting off and a 0.5 tokens/byte sample: 600 KB is ~300k calibrated
+    // Counting off and a 0.6 tokens/byte sample: 350 KB is ~210k calibrated
     // tokens, over the 200k window, but delivery would still send it whole on
-    // its bytes/4 estimate (150k), so a timeout is not a refusal.
-    const h = await harness({ countTokens: false, tokensPerByte: 0.5 });
+    // its conservative byte bound (350 KB / 1.9 = 184k, token-estimate.ts), so
+    // a timeout is not a refusal.
+    const h = await harness({ countTokens: false, tokensPerByte: 0.6 });
     try {
       assert.equal((await h.post([user("q " + "s".repeat(100_000))])).status, 200);
-      const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 600_000))]);
+      const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 350_000))]);
       assert.equal(result.status, 200);
       assert.ok(result.ms < SLOW_MS, `short budget (took ${result.ms} ms)`);
       const rec = h.lastRecord();

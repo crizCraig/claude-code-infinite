@@ -17,7 +17,9 @@ function flatText(message) {
 const SMALL_MEMORY = "retained smaller-window memory ".repeat(1_000);
 const FOLLOWUP = [
   { role: "user", content: "Inspect the repository." },
-  { role: "assistant", content: "original history details ".repeat(90_000) },
+  // 1.8 MB: inside 1M by the conservative byte bound (token-estimate.ts,
+  // 1.8 MB / 1.9 = 947k), so the uncounted wide-window fallback may forward it.
+  { role: "assistant", content: "original history details ".repeat(72_000) },
   { role: "user", content: "Continue the investigation." },
 ];
 
@@ -282,10 +284,10 @@ async function windowFixture({ compress, status, nativeOneMillionContext, holdFi
   const memtree = new MemtreeClient({ baseUrl: backend.origin, apiKey: "offline-test" });
   const proxy = await startProxy({
     memtree, upstreamOrigin: upstream.origin, nativeOneMillionContext,
-    // Tool turns compress only at the budget. FOLLOWUP's ~560k tokens are
-    // under the default 800k, so a 500k budget keeps a tool turn on the wide
+    // Tool turns compress only at the budget. FOLLOWUP's ~450k tokens are
+    // under the default 800k, so a 400k budget keeps a tool turn on the wide
     // window compacting (and installing a route) as these tests need.
-    budgetTokensOverride: 500_000,
+    budgetTokensOverride: 400_000,
     reqlog: { log: (record) => records.push(structuredClone(record)) },
   });
   async function request(messages, extra = {}, headers = {}, expectedStatus = 200) {

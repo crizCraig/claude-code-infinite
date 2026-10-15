@@ -61,7 +61,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     reqlog: { log: record => records.push(structuredClone(record)) },
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
-    session = 's', messages: suppliedMessages } = {}) {
+    session = 's', messages: suppliedMessages, model = 'claude-x' } = {}) {
     const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
@@ -69,7 +69,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       method: 'POST', headers: { 'content-type': 'application/json',
         'x-claude-code-session-id': session, 'x-claude-code-agent-id': agent,
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model: 'claude-x', max_tokens: 64, messages }),
+      body: JSON.stringify({ model, max_tokens: 64, messages }),
     });
     await response.text();
     return response.status;
@@ -90,7 +90,10 @@ for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {
     try {
       assert.equal(await h.post(10_000), 200);
       const start = Date.now();
-      assert.equal(await h.post(469_550), 200);
+      // 300 kB fits the 200k window by its conservative bound (bytes/1.9,
+      // token-estimate.ts) while the stale 0.9 tokens/byte sample says 270k.
+      // (469,550 bytes, the size this test used under bytes/4, no longer does.)
+      assert.equal(await h.post(300_000), 200);
       assert.ok(Date.now() - start < 4_000, 'one total 3s Count deadline');
       assert.equal(h.forwards.length, 2);
       assert.ok(h.counts.length <= 1, 'failed count not immediately retried');
@@ -103,7 +106,10 @@ test('soft budget attempts compression, no-ready-tree 413 forwards original with
   const h = await harness({ budget: 100_000, enabled: false,
     compress: () => ({ status: 413, body: { detail: 'Memory indexing in background' } }) });
   try {
-    assert.equal(await h.post(500_000), 200);
+    // Over the 100k budget by bytes/4 (the uncalibrated planning estimate),
+    // inside the 200k window by the conservative bound: 450 kB is 188k on
+    // Haiku 4.5's tokenizer (2.4 bytes/token); the 4.7+ bound (1.9) is 237k.
+    assert.equal(await h.post(450_000, { model: 'claude-haiku-4-5' }), 200);
     assert.equal(h.compressions.length, 1);
     assert.equal(h.forwards.length, 1);
     assert.ok(h.records.find(r => r.kind === 'messages').overBudgetForward);
@@ -127,8 +133,13 @@ test('exact low-ratio count stays authoritative for an image-sized request', asy
 test('concurrent lane sample cannot replace this request exact over-window count', async () => {
   let release, reached;
   const waiting = new Promise(resolve => { reached = resolve; });
-  const h = await harness({ count: () => ({ input_tokens: 210_000 }), usage: () => 90_000,
-    compress: async () => { reached(); await new Promise(resolve => { release = resolve; }); } });
+  // The concurrent 900 kB request is over its conservative byte bound
+  // (token-estimate.ts), so it is counted too (90k: fits) rather than sent on
+  // the large request's learned ratio.
+  const h = await harness({ count: body => ({
+    input_tokens: JSON.stringify(body).length > 950_000 ? 210_000 : 90_000 }),
+  usage: () => 90_000,
+  compress: async () => { reached(); await new Promise(resolve => { release = resolve; }); } });
   try {
     const large = h.post(1_000_000);
     await waiting;
@@ -136,12 +147,16 @@ test('concurrent lane sample cannot replace this request exact over-window count
     release();
     assert.equal(await large, 503);
     assert.equal(h.forwards.length, 1);
-    assert.equal(h.counts.length, 1);
+    assert.equal(h.counts.length, 2, 'one count per request; the large one is not recounted');
   } finally { release?.(); h.close(); }
 });
 
 test('2026-10-05 20:04 UTC pid84669: 469801-byte subagent formerly 5778216 tokens forwards', async () => {
-  const h = await harness({ budget: 800_000, enabled: false,
+  // The real request counted 117,450 tokens. Its conservative byte bound
+  // (247k on a 200k window) no longer admits it uncounted, so Count Tokens
+  // runs and admits it; the skewed 12 tokens/byte helper sample still cannot
+  // refuse it.
+  const h = await harness({ budget: 800_000, count: () => ({ input_tokens: 117_450 }),
     usage: (_body, bytes) => bytes < 2_000 ? 12_040 : 117_450 });
   try {
     await h.post(728);

@@ -65,15 +65,17 @@ async function harness(usage) {
 }
 
 const firstUser = (bytes) => [{ role: "user", content: "q " + "s".repeat(bytes) }];
-const opusToolTurn = () => [{ role: "user", content: "task" },
+const opusToolTurn = (bytes = 2_150_000) => [{ role: "user", content: "task" },
   { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] },
   { role: "user", content: [{ type: "tool_result", tool_use_id: "t",
-    content: "x".repeat(2_150_000) }] }];
+    content: "x".repeat(bytes) }] }];
 
-/** The 2.15 MB Opus tool turn goes out with no budget compaction. */
+/** A 1.8 MB Opus tool turn goes out with no budget compaction. Counting is off
+ * here, so delivery relies on the conservative byte bound (token-estimate.ts:
+ * 1.8 MB / 1.9 = 947k, inside 1M); the incident's 2.15 MB (1.13M) is not. */
 async function assertOpusTurnForwarded(h) {
   const before = h.forwards;
-  assert.equal(await h.post(OPUS, opusToolTurn(), { headers: ONE_M }), 200);
+  assert.equal(await h.post(OPUS, opusToolTurn(1_800_000), { headers: ONE_M }), 200);
   const rec = h.lastRecord();
   assert.equal(rec.compaction?.reason, undefined, "no reason=budget");
   assert.ok(rec.compaction.estimatedTokens < 800_000,

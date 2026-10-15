@@ -5606,15 +5606,26 @@ test("a fully indexed empty memory forwards real history instead of amnesia", as
 const RECOVERY_BUDGET = 20_000;
 const startRecoveryProxy = (opts) => startProxy({ budgetTokensOverride: RECOVERY_BUDGET, ...opts });
 
-/** Recording upstream that answers both /messages and /count_tokens. */
-function recordingUpstream() {
+/** Recording upstream that answers both /messages and /count_tokens.
+ * With `sizedCounts`, Count Tokens answers bytes/4 (like usage) and its calls
+ * go to `counts` instead of `seen`: for tests whose large original is
+ * forwarded whole, which now needs an exact count (its conservative byte
+ * bound, token-estimate.ts, is over the window). */
+function recordingUpstream({ sizedCounts = false } = {}) {
   const seen = [];
+  const counts = [];
   return listen((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const isCount = req.url.startsWith("/v1/messages/count_tokens");
       const raw = Buffer.concat(chunks);
+      if (isCount && sizedCounts) {
+        counts.push(raw.length);
+        const body = JSON.stringify({ input_tokens: Math.floor(raw.length / 4) });
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(body);
+      }
       seen.push({
         raw: raw.toString("utf-8"),
         isCount,
@@ -5634,7 +5645,7 @@ function recordingUpstream() {
       });
       res.end(body);
     });
-  }).then((srv) => ({ ...srv, seen }));
+  }).then((srv) => ({ ...srv, seen, counts }));
 }
 
 /**
@@ -5791,10 +5802,11 @@ test("a large route-miss tool turn recovers via blocking compress and self-heals
 });
 
 test("soft-budget recovery failure forwards the original and retains background indexing", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const memtreeSrv = await mockMemtree(500, { error: "boom" });
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5819,13 +5831,14 @@ test("soft-budget recovery failure forwards the original and retains background 
 });
 
 test("a MemTree no-op or unusable answer never becomes a recovered route", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   // No cached_tokens: an index-warming no-op echo.
   const memtreeSrv = await mockMemtree(200, (reqBody) => ({
     messages: reqBody.messages,
   }));
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -5981,10 +5994,11 @@ test("a no-op that finds no tree stops the tool loop's compress calls until the 
 });
 
 test("disabled recovery records the suppressed miss and never compresses", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6835,7 +6849,7 @@ test("an in-flight recovery holds the lane; a fitting concurrent miss forwards w
   // the lane in flight BEFORE its compress settles, so a miss racing it
   // forwards verbatim ("in-flight") instead of stacking a second blocking
   // wait — and the in-flight attempt still installs.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const held = deferred();
   let aCompressArrived = false;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -6859,6 +6873,7 @@ test("an in-flight recovery holds the lane; a fitting concurrent miss forwards w
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6942,7 +6957,7 @@ test("a hook arriving during recovery cannot invalidate the API request decision
 // --- ralph-review cycle 1: branches the original suite never exercised ---
 
 test("an amnesiac compressed answer is never installed as a route", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   // Indexed (cached_tokens present, so didMemtreeCompress is true) but the
   // conversation is gone. This is the dangerous case: every usage-based
   // measure calls it a perfect compression, and installing it as a route
@@ -6953,6 +6968,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -6976,7 +6992,7 @@ test("an amnesiac compressed answer is never installed as a route", async () => 
 });
 
 test("an oversized compression with no byte gain forwards the original within its native window", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   // Usable and genuinely indexed, but bigger than what it replaces.
   const memtreeSrv = await mockMemtree(200, {
     messages: [{ role: "user", content: "bloated memory " + "m".repeat(700_000) }],
@@ -6984,6 +7000,7 @@ test("an oversized compression with no byte gain forwards the original within it
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -7042,10 +7059,11 @@ test("an upstream failure on the recovered leg installs no route", async () => {
 });
 
 test("a failed recovery puts the fuse on cooldown instead of stalling every tool turn", async () => {
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const memtreeSrv = await mockMemtree(500, { error: "down" });
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -8671,10 +8689,11 @@ test("a route bookkeeping throw labels activation-error and backs the lane off",
   // lane budget — a deterministic bookkeeping throw would otherwise fund one
   // blocking recompress per tool turn — while still releasing the lane's
   // reservation so the next miss classifies cleanly instead of erroring.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const memtreeSrv = await mockMemtree(200, recoveredMemory());
   const records = [];
   const proxy = await startRecoveryProxy({
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -9085,9 +9104,13 @@ test("a skewed size sample cannot refuse a 469,801-byte subagent request (2026-1
   // (parent id only, another model) nor the subagent itself may teach the
   // subagent that ratio. MemTree is no help here (noop), so before the fix
   // the inflated estimate hit the fallback refusal.
+  // Count Tokens is on: uncounted, this body's conservative byte bound
+  // (token-estimate.ts: 469,801 / 1.9 = 247k) is over the 200k window, so it
+  // goes out on its exact count (bytes/4 here), never on the skewed sample.
   const h = await edgeHarness({
     budget: 800_000,
     memtree: { noop: true },
+    proxyOpts: { countTokens: true },
     upstreamOptions: { usageTokens: (_body, bytes) => (bytes < 2_000 ? 12_040 : undefined) },
   });
   try {
@@ -9126,12 +9149,14 @@ test("a failed count is reused and native-window fallback ignores a stale learne
     const agent = { "x-claude-code-agent-id": "a3" };
     await h.post(sizedAgentTurn(10_000), agent);
     const forwarded = h.upstream.bodies.length;
-    const rec = await h.post(sizedAgentTurn(469_801), agent);
-    assert.ok(rec.compaction.estimatedTokens > 400_000, "the stale estimate is over budget");
+    // 300 kB: its conservative byte bound (158k, token-estimate.ts) fits the
+    // 200k window; the 469,801 bytes this test used under bytes/4 do not.
+    const rec = await h.post(sizedAgentTurn(300_000), agent);
+    assert.ok(rec.compaction.estimatedTokens > 200_000, "the stale estimate is over budget");
     assert.equal(h.upstream.countCalls.length, 1, "failed count is reused");
     assert.equal(rec.countTokens[0].statusClass, "server-error");
     assert.equal(rec.overBudgetForward.reason, "bytes-fallback-fits-window");
-    assert.equal(rec.forwardedBytes, 469_801, "sent whole on the exact count");
+    assert.equal(rec.forwardedBytes, 300_000, "sent whole on the conservative byte bound");
     assert.equal(h.upstream.bodies.length, forwarded + 1);
   } finally {
     h.close();
@@ -9814,7 +9839,7 @@ test("over-budget compression exceptions return retryable errors and back off", 
 
 test("first-tree waiting expires hung probes and endless 202s, and aborts probes on shutdown", async () => {
   for (const mode of ["hung", "building", "shutdown"]) {
-    const upstream = await recordingUpstream();
+    const upstream = await recordingUpstream({ sizedCounts: true });
     const records = [];
     let gets = 0, closed = 0, calls = 0, ready = false;
     const memtreeSrv = await listen((req, res) => {
@@ -9836,6 +9861,7 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
       });
     });
     const proxy = await startRecoveryProxy({
+      countTokens: true,
       memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
       upstreamOrigin: upstream.origin,
       awaitedIndexProbeTimeoutMs: mode === "shutdown" ? 10_000 : 25,
@@ -10042,7 +10068,12 @@ for (const reportUsage of [false, true]) {
 
 for (const reportUsage of [true, false]) {
   test(`human output reservation ${reportUsage ? "forces with calibrated usage" : "does not force from bytes alone"}`, async () => {
-    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { reportUsage } });
+    // The 600 kB warm-up is over the 200k window by its conservative byte
+    // bound (token-estimate.ts), so where it must be delivered to calibrate
+    // usage it is counted (bytes/4) first; the next turn is still sized from
+    // the reported usage.
+    const h = await edgeHarness({ budget: 160_000, upstreamOptions: { reportUsage },
+      proxyOpts: { countTokens: reportUsage } });
     try {
       const conv = [userText("q"), assistantText("a"), userText("")];
       const shape = { model: "claude-x", max_tokens: 64, system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv };
@@ -10070,15 +10101,23 @@ for (const reportUsage of [true, false]) {
   });
 }
 
+/** A non-Claude model (2.8 bytes per token, token-estimate.ts): the ~295 kB
+ * prefix plus 64k output then fits the 200k window by the conservative byte
+ * bound, while the dense learned ratio (0.5 tokens/byte) says it does not, so
+ * these tests still show a learned ratio cannot veto the uncounted fallback.
+ * On Claude 4.7+ (1.9) the same prefix is over its bound and is not forwarded
+ * uncounted (see token-estimate.test.mjs). */
+const OTHER_MODEL = "other-model-x";
+
 for (const mode of ["compress", "failure", "uncalibrated"]) {
   test(`human prefix output reservation: ${mode}`, async () => {
     const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
     try {
       const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
-      await h.post(conv);
+      await h.post(conv, {}, { model: OTHER_MODEL });
       await h.command("/memtree-compact");
       conv.push(assistantText("a"), userText("compact"));
-      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      assert.equal((await h.post(conv, {}, { model: OTHER_MODEL })).turnType, "followup-compressed");
       const calls = h.compressCalls().length;
       const upstreamCount = h.upstream.bodies.length;
       if (mode === "failure") {
@@ -10086,7 +10125,7 @@ for (const mode of ["compress", "failure", "uncalibrated"]) {
         h.memtreeSrv.close();
       }
       conv.push(assistantText("a"), userText("y".repeat(290_000)));
-      const rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      const rec = await h.post(conv, {}, { max_tokens: 64_000, model: OTHER_MODEL });
       assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "transport estimate fits");
       if (mode === "uncalibrated") {
         assert.equal(rec.compaction.sizeSource, "bytes");
@@ -10119,10 +10158,10 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
     const h = await edgeHarness({ budget: 160_000, upstreamOptions: { bytesPerToken: 2, reportUsage: mode !== "uncalibrated" } });
     try {
       const conv = [userText("q"), assistantText("a"), userText("x".repeat(350_000))];
-      await h.post(conv);
+      await h.post(conv, {}, { model: OTHER_MODEL });
       await h.command("/memtree-compact");
       conv.push(assistantText("a"), userText("compact"));
-      assert.equal((await h.post(conv)).turnType, "followup-compressed");
+      assert.equal((await h.post(conv, {}, { model: OTHER_MODEL })).turnType, "followup-compressed");
       const calls = h.compressCalls().length;
       const upstreamCount = h.upstream.bodies.length;
       if (mode === "failure" || mode === "backoff") {
@@ -10130,7 +10169,7 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
         h.memtreeSrv.close();
       }
       toolStep(conv, "dense", 290_000);
-      let rec = await h.post(conv, {}, { max_tokens: 64_000 });
+      let rec = await h.post(conv, {}, { max_tokens: 64_000, model: OTHER_MODEL });
       assert.ok(rec.compaction.estimatedBytes / 4 + 64_000 < 200_000, "bytes estimate fits");
       if (mode === "uncalibrated") {
         assert.equal(rec.compaction.sizeSource, "bytes");
@@ -10152,7 +10191,7 @@ for (const mode of ["compress", "failure", "backoff", "uncalibrated"]) {
           assert.match(JSON.stringify(h.upstream.bodies.at(-1).messages), /memory/);
           if (mode === "backoff") {
             toolStep(conv, "next", 10);
-            const original = JSON.stringify({ model: "claude-x", max_tokens: 64_000,
+            const original = JSON.stringify({ model: OTHER_MODEL, max_tokens: 64_000,
               system: [{ type: "text", text: "sys", cache_control: EPH }], messages: conv }, null, 2);
             const count = messageRecords(h.records).length;
             const res = await fetch(`http://127.0.0.1:${h.proxy.port}/v1/messages`, {

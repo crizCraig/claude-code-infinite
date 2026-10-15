@@ -953,7 +953,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms });
         },
     }, state.countTokensCooldowns);
-    const requestSizing = new RequestSizing(countSession, opts.countTokens === true);
+    const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined);
     if (carriesServerTools(body))
         serverToolRecords.add(rec);
     const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey, body.model);

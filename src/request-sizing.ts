@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { plausibleSample, shouldCountTokens,
   type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
+import { conservativeBodyTokens } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
 
 /** Output room kept free on models that accept input + max_tokens over the
@@ -37,13 +38,18 @@ export interface RequestCandidate {
   readonly kind: CandidateKind;
   readonly sample?: Readonly<SizeSample>;
   readonly estimate: Readonly<PlannedSize>;
+  /** Per-model conservative bound (token-estimate.ts): what delivery may rely
+   * on without an exact count. */
+  readonly conservativeTokens: number;
 }
 
 export class RequestSizing {
   private readonly candidates = new Map<string, RequestCandidate>();
   private readonly excludedFallbacks = new Set<RequestCandidate>();
 
-  constructor(private readonly counts: CountTokensSession, private readonly enabled: boolean) {}
+  /** `model` is the request's model: it picks the tokenizer family's ratio. */
+  constructor(private readonly counts: CountTokensSession, private readonly enabled: boolean,
+    private readonly model?: string) {}
 
   /** The first registration fixes both bytes and learned sample for this request. */
   register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate {
@@ -52,7 +58,8 @@ export class RequestSizing {
     if (existing) return existing;
     const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
     const candidate = Object.freeze({ key, body: Buffer.from(body), kind, sample: snapshot,
-      estimate: Object.freeze(estimateRequestTokens(snapshot, body.length)) });
+      estimate: Object.freeze(estimateRequestTokens(snapshot, body.length)),
+      conservativeTokens: conservativeBodyTokens(body, this.model) });
     this.candidates.set(key, candidate);
     return candidate;
   }
@@ -83,17 +90,22 @@ export class RequestSizing {
     phase: "plan" | "delivery" = "delivery"): Promise<CandidateMeasurement> {
     let count = this.counts.peek(candidate.body);
     const estimate = candidate.estimate.tokens;
+    // Delivery counts whenever an estimate is all that says the body fits: the
+    // learned estimate, or the conservative bound, does not fit on its own.
     const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
-      (phase === "delivery" && !fitsNative(estimate, estimateLimits(limits)));
+      (phase === "delivery" && !(fitsNative(estimate, estimateLimits(limits)) &&
+        fitsNative(candidate.conservativeTokens, estimateLimits(limits))));
     if (!count && this.enabled && needed) count = await this.counts.count(candidate.body);
     if (count?.tokens !== undefined) return {
       tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,
     };
     // A learned ratio can request compression, but cannot veto a body whose
-    // plain estimate fits when counting is unavailable or disabled.
+    // conservative per-model bound fits when counting is unavailable or
+    // disabled; nor can it admit one whose bound does not (2026-10-15: bytes/4
+    // admitted a body Anthropic counted at 1.34M tokens on a 1M window).
     const bytes = phase === "delivery" &&
       (!this.enabled || count !== undefined || candidate.estimate.source === "bytes");
-    return { tokens: bytes ? Math.ceil(candidate.body.length / 4) : estimate,
+    return { tokens: bytes ? candidate.conservativeTokens : estimate,
       source: bytes ? "bytes" : candidate.estimate.source,
       estimatedTokens: estimate, count };
   }

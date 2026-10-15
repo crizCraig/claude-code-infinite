@@ -31,13 +31,18 @@ export interface RequestCandidate {
     readonly kind: CandidateKind;
     readonly sample?: Readonly<SizeSample>;
     readonly estimate: Readonly<PlannedSize>;
+    /** Per-model conservative bound (token-estimate.ts): what delivery may rely
+     * on without an exact count. */
+    readonly conservativeTokens: number;
 }
 export declare class RequestSizing {
     private readonly counts;
     private readonly enabled;
+    private readonly model?;
     private readonly candidates;
     private readonly excludedFallbacks;
-    constructor(counts: CountTokensSession, enabled: boolean);
+    /** `model` is the request's model: it picks the tokenizer family's ratio. */
+    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined);
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */

@@ -45,18 +45,27 @@ test('low-ratio exact count is one authoritative result for plan, hint and deliv
 });
 
 for (const enabled of [true, false]) {
-  test(`failed or disabled count uses final byte fallback (${enabled})`, async () => {
+  test(`failed or disabled count uses final conservative byte fallback (${enabled})`, async () => {
+    // No model: 2.8 bytes per token (token-estimate.ts). 500 bytes -> 179 tokens,
+    // which fits 200 with 10 output; 600 bytes -> 215 does not, although
+    // bytes/4 (150) used to admit it.
     const counts = fakeCounts();
     const sizing = new RequestSizing(counts, enabled);
-    const candidate = sizing.register(Buffer.from('x'.repeat(600)), 'original',
+    const candidate = sizing.register(Buffer.from('x'.repeat(500)), 'original',
       { tokens: 360, forwardedBytes: 400 });
     await sizing.measure(candidate, limits, 'plan');
     assert.ok(sizing.plan(candidate).tokens > 200, 'advisory estimate still requests compression');
     const selected = await sizing.select(candidate, limits);
     assert.equal(selected.candidate, candidate);
-    assert.equal(selected.measurement.tokens, 150);
+    assert.equal(selected.measurement.tokens, 179);
     assert.equal(selected.measurement.source, 'bytes');
     assert.equal(counts.calls.length, enabled ? 1 : 0);
+
+    const alone = new RequestSizing(fakeCounts(), enabled);
+    const loose = alone.register(Buffer.from('y'.repeat(600)), 'original',
+      { tokens: 360, forwardedBytes: 400 });
+    assert.equal(await alone.select(loose, limits), undefined,
+      'a body that fits only by bytes/4 is not delivered on an estimate');
   });
 }
 
