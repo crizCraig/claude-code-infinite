@@ -168,6 +168,38 @@ export interface TranscriptShape {
   /** For a bad line: its 1-based index inside the block and its opening. */
   badLine?: number;
   sample?: string;
+  /** A recognised benign side request that has no transcript at all. */
+  knownKind?: KnownSideRequestKind;
+}
+
+/**
+ * Side requests other than the monitor that share its header shape (no turn
+ * origin, no tools) and carry no `<transcript>` at all. Seen in the request
+ * log on haiku: the session-title request and WebFetch page summarisation.
+ */
+export type KnownSideRequestKind = "session-title" | "webfetch-summary";
+
+export function knownSideRequestKind(info: ClaudeCodeRequestInfo): KnownSideRequestKind | undefined {
+  if (info.systemHead?.includes("You are naming a coding session")) return "session-title";
+  if (info.lastUserHead?.startsWith("Web page content:")) return "webfetch-summary";
+  return undefined;
+}
+
+/**
+ * The console warning for a suspected side request whose transcript did not
+ * match. Only a `<transcript>` block that exists but is malformed warns: that
+ * is a real format change. No transcript at all is an ordinary request (a
+ * title, a WebFetch summary, an older main request) and stays in the request
+ * log only, since console output lands in Claude Code's input box.
+ */
+export function transcriptWarning(shape: TranscriptShape): string | undefined {
+  if (shape.ok || shape.reason === undefined || shape.reason === "no-transcript") return undefined;
+  const at = shape.badLine ? ` at line ${shape.badLine}` : "";
+  return (
+    `[ccc proxy] possible side request, transcript format not recognised ` +
+    `(${shape.reason}${at}); handled as an ordinary request. ` +
+    `Claude Code may have changed the monitor format.`
+  );
 }
 
 const TRANSCRIPT_OPEN = "<transcript>";

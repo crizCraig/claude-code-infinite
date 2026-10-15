@@ -3421,15 +3421,37 @@ test("a security-monitor side request skips MemTree and leaves the main tool loo
     assert.equal(memtreeSrv.calls.length, callsBefore, "no compress and no background index");
 
     // Monitor-shaped header but no recognisable transcript (e.g. an older
-    // Claude Code main request): ordinary handling, and the reason is logged.
-    const odd = JSON.stringify({ ...JSON.parse(monitor), messages: [{ role: "user", content: "first" }, { role: "assistant", content: "a" }, { role: "user", content: "no transcript here" }] });
-    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: odd });
-    await waitFor(() => msgRecs().length === 3);
-    assert.notEqual(msgRecs()[2].turnType, "side-request");
-    assert.equal(msgRecs()[2].transcript.reason, "no-transcript");
+    // Claude Code main request, a session title, a WebFetch summary):
+    // ordinary handling, the reason is logged, and nothing reaches the
+    // console (it would land in Claude Code's input box).
+    const consoleLines = [];
+    const realError = console.error;
+    const realLog = console.log;
+    console.error = (...a) => consoleLines.push(a.join(" "));
+    console.log = (...a) => consoleLines.push(a.join(" "));
+    try {
+      const odd = JSON.stringify({ ...JSON.parse(monitor), messages: [{ role: "user", content: "first" }, { role: "assistant", content: "a" }, { role: "user", content: "no transcript here" }] });
+      await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: odd });
+      await waitFor(() => msgRecs().length === 3);
+      assert.notEqual(msgRecs()[2].turnType, "side-request");
+      assert.equal(msgRecs()[2].transcript.reason, "no-transcript");
+      assert.deepEqual(consoleLines, [], "no-transcript prints nothing");
+
+      // A <transcript> block that does not parse is a real format change: warn.
+      const broken = JSON.stringify({ ...JSON.parse(monitor), messages: [{ role: "user", content: '<transcript>\n{"a":1,"b":2}\n</transcript>' }] });
+      await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: broken });
+      await waitFor(() => msgRecs().length === 4);
+      assert.equal(msgRecs()[3].transcript.reason, "bad-line");
+      assert.notEqual(msgRecs()[3].turnType, "side-request");
+      assert.equal(consoleLines.length, 1);
+      assert.match(consoleLines[0], /transcript format not recognised \(bad-line at line 2\)/);
+    } finally {
+      console.error = realError;
+      console.log = realLog;
+    }
     await armMainTurn(proxy, "turn two", "prompt-2");
     await postMessages(proxy.port, followupTurn("turn two"), headers);
-    await waitFor(() => msgRecs().length === 4);
+    await waitFor(() => msgRecs().length === 5);
 
     // The main thread's next tool turn still rides its compressed route.
     const toolLoop = [
@@ -3438,8 +3460,8 @@ test("a security-monitor side request skips MemTree and leaves the main tool loo
       { role: "user", content: [{ type: "tool_result", tool_use_id: "t9", content: "ok" }] },
     ];
     await postMessages(proxy.port, toolLoop, headers);
-    await waitFor(() => msgRecs().length === 5);
-    assert.equal(msgRecs()[4].turnType, "tool-memory");
+    await waitFor(() => msgRecs().length === 6);
+    assert.equal(msgRecs()[5].turnType, "tool-memory");
   } finally {
     proxy.close();
     upstream.close();

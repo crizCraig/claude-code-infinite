@@ -58,7 +58,7 @@ import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -901,11 +901,12 @@ async function handleMessages(req, res, opts, upstream, state) {
         try {
             rec.transcript = inspectMonitorTranscript(body);
             sideRequest = rec.transcript.ok;
-            if (!rec.transcript.ok) {
-                console.error(`[ccc proxy] possible side request, transcript format not recognised ` +
-                    `(${rec.transcript.reason}${rec.transcript.badLine ? ` at line ${rec.transcript.badLine}` : ""}); ` +
-                    `handled as an ordinary request. Claude Code may have changed the monitor format.`);
-            }
+            const knownKind = knownSideRequestKind(clientInfo);
+            if (knownKind)
+                rec.transcript.knownKind = knownKind;
+            const warning = transcriptWarning(rec.transcript);
+            if (warning)
+                console.error(warning);
         }
         catch {
             // never let the format check affect the request
