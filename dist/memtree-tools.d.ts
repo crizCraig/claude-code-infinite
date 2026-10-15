@@ -94,9 +94,25 @@ export declare function serverSearchHits(body: unknown): {
     hits: SearchHit[];
     terms: string[];
 } | undefined;
-export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string): string;
+export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string, tailHits?: TailHit[]): string;
 export declare function formatNode(index: MemtreeIndex, id: number, tree?: string): string;
 export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number, tree?: string): string;
+/** A tail message matching a tree search (`tail_hits`, polychat memtree_tail_search.py). */
+export interface TailHit {
+    i: number;
+    k?: string;
+    at?: string;
+    state?: string;
+    matched_terms: string[];
+    snippets: {
+        line: number;
+        text: string;
+    }[];
+}
+/** `tail_hits` of the server's tree search; [] when absent or malformed. */
+export declare function serverTailHits(body: unknown): TailHit[];
+/** Tail hits under a search's tree hits: newest messages no tree covers yet. */
+export declare function formatTailHits(hits: TailHit[], tree?: string): string[];
 /**
  * read_lines {"tail": true}: the messages after the tree that no tree covers
  * yet, verbatim, by position in the conversation's newest record.

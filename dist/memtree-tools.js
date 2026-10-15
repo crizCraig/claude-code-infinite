@@ -252,9 +252,13 @@ export function serverSearchHits(body) {
     }
     return { hits, terms: json.terms.map(String) };
 }
-export function formatSearchHits(hits, query, terms, tree) {
+export function formatSearchHits(hits, query, terms, tree, tailHits = []) {
     if (!terms.length)
         throw new ToolInputError("search: the query has no searchable terms");
+    if (!hits.length && tailHits.length) {
+        return [`No node of the tree matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}).`,
+            ...formatTailHits(tailHits, tree)].join("\n");
+    }
     if (!hits.length) {
         return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
     }
@@ -282,6 +286,7 @@ export function formatSearchHits(hits, query, terms, tree) {
     out.push("", tree
         ? `Summaries are lossy; read_lines {"tree": ${JSON.stringify(tree)}, block, start, end} returns the exact transcript lines, read_node {"tree": ${JSON.stringify(tree)}, id} a node's children and path from the root.`
         : "Summaries are lossy; read_lines {block, start, end} returns the exact transcript lines, read_node {id} a node's children and path from the root.");
+    out.push(...formatTailHits(tailHits, tree));
     return out.join("\n");
 }
 export function formatNode(index, id, tree) {
@@ -370,6 +375,42 @@ export function formatLines(index, block, start, end, tree) {
     const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;
     return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
 }
+/** `tail_hits` of the server's tree search; [] when absent or malformed. */
+export function serverTailHits(body) {
+    const raw = body?.tail_hits;
+    if (!Array.isArray(raw))
+        return [];
+    return raw
+        .filter((h) => !!h && Number.isInteger(h.i))
+        .map((h) => ({
+        i: h.i,
+        k: typeof h.k === "string" ? h.k : undefined,
+        at: typeof h.at === "string" ? h.at : undefined,
+        state: typeof h.state === "string" ? h.state : undefined,
+        matched_terms: Array.isArray(h.matched_terms) ? h.matched_terms.map(String) : [],
+        snippets: Array.isArray(h.snippets)
+            ? h.snippets
+                .filter((s) => Number.isInteger(s?.line) && typeof s?.text === "string")
+                .map((s) => ({ line: s.line, text: s.text }))
+            : [],
+    }));
+}
+/** Tail hits under a search's tree hits: newest messages no tree covers yet. */
+export function formatTailHits(hits, tree) {
+    if (!hits.length)
+        return [];
+    const out = ["", `Also in the newest messages, which no tree covers yet (${hits.length}):`];
+    for (const hit of hits) {
+        const head = [`message ${hit.i}`, hit.k, hit.at, `matched ${hit.matched_terms.join(", ")}`]
+            .filter(Boolean)
+            .join(" · ");
+        out.push("", `[${head}]`);
+        for (const s of hit.snippets)
+            out.push(`  L${s.line}: ${s.text}`);
+    }
+    out.push("", `read_lines {${treeArg(tree)}"tail": true, "start": <message>, "end": <message>} reads one whole.`);
+    return out;
+}
 /**
  * read_lines {"tail": true}: the messages after the tree that no tree covers
  * yet, verbatim, by position in the conversation's newest record.
@@ -392,9 +433,16 @@ export function formatTail(body, tree) {
     ];
     for (const m of messages) {
         const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
-        out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}`, m.x ?? "");
+        const cut = m.shortened ? " · shortened" : "";
+        out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}${cut}`, m.x ?? "");
     }
     const notes = [];
+    const shortened = messages.filter((m) => m.shortened);
+    if (shortened.length) {
+        const example = shortened[shortened.length - 1].i;
+        notes.push(`${shortened.length} large tool call${shortened.length === 1 ? "" : "s"}/result${shortened.length === 1 ? "" : "s"} shortened; ` +
+            `read_lines {${treeArg(tree)}"tail": true, "start": ${example}, "end": ${example}, "full": true} reads one whole`);
+    }
     if (typeof page.tail_start === "number" && first > page.tail_start) {
         notes.push(`earlier: read_lines {${treeArg(tree)}"tail": true, "end": ${first - 1}}`);
     }
