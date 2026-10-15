@@ -268,12 +268,17 @@ If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notic
 
 ## Upgrading
 
-`ccc` checks npm at startup (bounded to two seconds, silent if offline) and, when a
-newer release exists, shows one line under the MemTree banner inside Claude Code with
-the upgrade command. Upgrading is never automatic:
+`ccc` checks npm at startup (bounded to 1.5 seconds, silent if offline, and cached for a
+day in `~/.claude-code-infinite/update-check.json`) and, when a newer release exists,
+shows one line under the MemTree banner inside Claude Code, e.g.
+`• ccc 1.0.20 is available (you have 1.0.14) · npm i -g claude-code-infinite@latest`.
+Prereleases are never offered, and print (`-p`) or non-TTY runs skip the check. Upgrading
+is never automatic:
 
 ```bash
-npm install -g claude-code-infinite
+npm i -g claude-code-infinite@latest
 ```
 
-Set `CCC_SKIP_UPDATE_CHECK=1` to disable the check (air-gapped or CI runs).
+Set `CCC_NO_UPDATE_CHECK=1` (or the older `CCC_SKIP_UPDATE_CHECK=1`), or add
+`"updateCheck": false` to `~/.claude-code-infinite/config.json`, to disable the check
+(air-gapped or CI runs).

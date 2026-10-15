@@ -15,6 +15,7 @@
 
 import spawn from "cross-spawn";
 import { exec } from "node:child_process";
+import * as path from "node:path";
 import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
@@ -40,7 +41,7 @@ import {
   type PaymentStatus,
   hyperlink,
 } from "./payment-gate.js";
-import { checkForUpdate } from "./update-check.js";
+import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import {
   compactTargetFromEnv,
   isPrintInvocation,
@@ -73,6 +74,8 @@ import {
   setLocalPolychatApiKey,
   getStagingPolychatApiKey,
   setStagingPolychatApiKey,
+  getConfigDir,
+  loadConfig,
 } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 
@@ -309,14 +312,21 @@ async function main() {
   // Check the key's payment status before claude takes over the terminal.
   // Bounded (2s) and null on error — startup never fails or hangs on polychat
   // availability. The npm update check runs concurrently under the same
-  // bound; its result goes into the SessionStart banner below, since the TUI
-  // covers this terminal within a second. Both resolve rather than reject, so
-  // Promise.all cannot throw.
+  // bound (1.5s, and usually answered from a day-long cache); its result goes
+  // into the SessionStart banner below, since the TUI covers this terminal
+  // within a second. Print/non-TTY runs have no banner, so they skip it. Both
+  // resolve rather than reject, so Promise.all cannot throw.
   // The project (directory, git repo, branch, commit) goes with every MemTree
   // call so sessions can be found by project; read once, never fails.
   const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
     fetchPaymentStatus(memtreeBaseUrl, polychatApiKey),
-    checkForUpdate({ currentVersion: CLIENT_VERSION }),
+    interactiveUi
+      ? checkForUpdate({
+          currentVersion: CLIENT_VERSION,
+          config: loadConfig(),
+          cacheFile: path.join(getConfigDir(), UPDATE_CHECK_CACHE_FILE),
+        })
+      : Promise.resolve(null),
     readProjectMeta(process.cwd()),
   ]);
   if (paymentStatus?.paid === false) {
