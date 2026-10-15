@@ -13,7 +13,7 @@ async function listen(handler) {
 
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
-  compressBudgetMs } = {}) {
+  compressBudgetMs, longCompressBudgetMs } = {}) {
   const counts = [], forwards = [], compressions = [], records = [];
   const upstream = await listen((req, res) => {
     let raw = '';
@@ -51,6 +51,9 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret' });
   if (compressBudgetMs !== undefined) {
     Object.defineProperty(memtree, 'compressBudgetMs', { get: () => compressBudgetMs });
+  }
+  if (longCompressBudgetMs !== undefined) {
+    Object.defineProperty(memtree, 'longCompressBudgetMs', { get: () => longCompressBudgetMs });
   }
   const proxy = await startProxy({
     memtree,
@@ -228,8 +231,16 @@ for (const lane of ['tool', 'main']) {
             { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'next', content: 'next' }] }];
         assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }), 200);
         assert.equal(h.compressions.length, 2, 'exactly one extra recovery for this turn');
-        assert.equal(h.compressions[1].client_input_tokens, lateTokens);
-        assert.match(JSON.stringify(h.compressions[1].messages), /memory m/);
+        // Recovery restarts from the ORIGINAL conversation (what the index
+        // holds), never from the ride's memory prefix, at a tighter target.
+        const recovered = JSON.stringify(h.compressions[1].messages);
+        assert.doesNotMatch(recovered, /memory m/, 'never compresses a compressed body');
+        assert.match(recovered, /x{1000}/);
+        assert.match(recovered, /next/);
+        assert.ok(h.compressions[1].compression_target_tokens <
+          h.compressions[0].compression_target_tokens, 'tighter target than the ride');
+        assert.ok(h.compressions[1].client_input_tokens === undefined ||
+          h.compressions[1].client_input_tokens >= lateTokens);
         assert.ok(JSON.stringify(h.forwards[1]).length < 20_000);
         const rec = h.records.filter(r => r.kind === 'messages').at(-1);
         assert.equal(rec.lateCountRecovery.outcome, 'compressed');
@@ -410,7 +421,9 @@ for (const lane of ['main', 'tool']) {
       assert.equal(await h.post(0, { agent: '', messages: original }), 200);
       assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }), 200);
       assert.equal(h.compressions.length, 2, 'exactly one bounded late recovery');
-      assert.equal(h.compressions[1].client_input_tokens, 210_000, 'hint belongs to the counted ride');
+      assert.ok(h.compressions[1].client_input_tokens >= 300_000,
+        'hint describes the original conversation that is compressed, not the ride');
+      assert.doesNotMatch(JSON.stringify(h.compressions[1].messages), /memory m/);
       assert.equal(h.counts.length, 4, 'the larger replacement receives its own exact count');
       assert.deepEqual(h.forwards[1].messages, h.counts[3].messages);
       assert.ok(JSON.stringify(h.forwards[1]).length > JSON.stringify(h.forwards[0]).length);
@@ -419,6 +432,48 @@ for (const lane of ['main', 'tool']) {
       const rec = h.records.filter(r => r.kind === 'messages').at(-1);
       assert.equal(rec.lateCountRecovery.outcome, 'compressed');
       assert.equal(rec.overBudgetForward.reason, 'exact-count-fits-window');
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ['main', 'tool']) {
+  test(`${lane} compress timeout never forwards an original counted over the window`, async () => {
+    const h = await harness({ budget: 100_000, compressBudgetMs: 100, longCompressBudgetMs: 200,
+      count: () => ({ input_tokens: 300_000 }), compress: () => new Promise(() => {}) });
+    try {
+      const options = lane === 'tool' ? {} : { agent: '', messages: [
+        { role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'x'.repeat(1_200_000) }] };
+      assert.equal(await h.post(1_200_000, options), 503);
+      assert.equal(h.forwards.length, 0, 'a timeout is not a licence to send everything');
+      assert.equal(h.compressions.length, 1);
+    } finally { h.close(); }
+  });
+}
+
+for (const lane of ['main', 'tool']) {
+  test(`late ${lane} recovery timeout with nothing fitting refuses instead of forwarding`, async () => {
+    let rideCounts = 0;
+    const h = await harness({ budget: 100_000, usage: () => undefined, compressBudgetMs: 100,
+      longCompressBudgetMs: 200,
+      count: body => ({ input_tokens: JSON.stringify(body.messages).includes('x'.repeat(1000))
+        ? 300_000 : ++rideCounts === 1 ? 50_000 : 210_000 }),
+      compress: () => h.compressions.length === 1 ? compressedReply(200_000)
+        : new Promise(() => {}) });
+    const original = [{ role: 'user', content: 'first' },
+      { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(1_200_000) }];
+    const suffix = lane === 'main'
+      ? [{ role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }]
+      : [{ role: 'assistant', content: [{ type: 'tool_use', id: 'next', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'next', content: 'next' }] }];
+    try {
+      assert.equal(await h.post(0, { agent: '', messages: original }), 200);
+      assert.equal(await h.post(0, { agent: '', messages: [...original, ...suffix] }), 503);
+      assert.equal(h.forwards.length, 1, 'neither the over-window ride nor original is sent');
+      assert.equal(h.compressions.length, 2);
+      assert.doesNotMatch(JSON.stringify(h.compressions[1].messages), /memory m/);
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.equal(rec.lateCountRecovery.outcome, 'refused');
     } finally { h.close(); }
   });
 }
