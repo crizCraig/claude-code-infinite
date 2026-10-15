@@ -54,6 +54,7 @@ import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, ind
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
+import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
@@ -265,6 +266,7 @@ export function startProxy(opts) {
     const state = {
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
+        usageUrl: opts.memtree.usageDashboardUrl,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
         mainPromptGeneration: 0,
@@ -1885,10 +1887,12 @@ function sessionCommandReply(state, sessionId, prompt) {
         return [
             "• /memtree-view · show this session's MemTree page link",
             `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
-        ].join("\n");
+            usageLines(state),
+        ].filter((line) => line !== undefined).join("\n");
     }
-    if (isMemtreeViewCommand(prompt))
-        return memtreeViewLine(state, sessionId);
+    if (isMemtreeViewCommand(prompt)) {
+        return joinNoticeLines(memtreeViewLine(state, sessionId), usageLines(state)) ?? "";
+    }
     const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
     if (args === undefined)
         return undefined;
@@ -1931,7 +1935,8 @@ export const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main sessi
  */
 function subagentCommandReply(state, sessionId, prompt) {
     if (isMemtreeViewCommand(prompt)) {
-        return `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
+        const view = `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
+        return joinNoticeLines(view, usageLines(state)) ?? view;
     }
     if (sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND) !== undefined) {
         return `${TRAILER_LABEL} ${SUBAGENT_COMPACT_REPLY}`;
@@ -1963,6 +1968,15 @@ function memtreeViewLine(state, sessionId) {
     return page?.compressed && page.url !== link.link
         ? `${lines}\n${urlLine(viewUrl(page.url), "memory from ")}`
         : lines;
+}
+/**
+ * The usage dashboard link that `/memtree` and `/memtree-view` end with,
+ * formatted like the MemTree link; undefined when the environment has none.
+ */
+function usageLines(state) {
+    return state.usageUrl === undefined
+        ? undefined
+        : linkLines(USAGE_LABEL, viewUrl(state.usageUrl), USAGE_SIGN_IN_NOTE);
 }
 /** A `/memtree-view` URL: an explicit OSC 8 link where the terminal has them. */
 function viewUrl(url) {

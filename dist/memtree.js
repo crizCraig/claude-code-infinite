@@ -19,6 +19,7 @@
 import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
+import { usageDashboardUrl } from "./usage-link.js";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
 // Sent on every MemTree call so the server can detect/warn stale clients
@@ -744,6 +745,10 @@ export class MemtreeClient {
      */
     get paymentRequiredDetail() {
         return this.unpaidDetail;
+    }
+    /** polychat's usage dashboard for this client's environment (its base URL). */
+    get usageDashboardUrl() {
+        return usageDashboardUrl(this.baseUrl);
     }
     /**
      * The blocking-compress abort budget. Exposed so the proxy's request log

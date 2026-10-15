@@ -22,6 +22,7 @@ import { prepareFinalMessages, readFinalReply, type FinalReplyReader } from "./f
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
+import { usageDashboardUrl } from "./usage-link.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -946,6 +947,11 @@ export class MemtreeClient {
    */
   get paymentRequiredDetail(): string | null {
     return this.unpaidDetail;
+  }
+
+  /** polychat's usage dashboard for this client's environment (its base URL). */
+  get usageDashboardUrl(): string | undefined {
+    return usageDashboardUrl(this.baseUrl);
   }
 
   /**

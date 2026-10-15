@@ -116,6 +116,7 @@ import {
   type SessionStartHookInput,
   type SuccessLink,
 } from "./hooks.js";
+import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -359,6 +360,8 @@ interface ProxyState {
   paymentNotice: PaymentNoticeThrottle;
   /** The MemTree client's last 402 detail, or null while the key is paid. */
   unpaidDetail: () => string | null;
+  /** polychat's usage dashboard for the MemTree environment, if known. */
+  usageUrl: string | undefined;
   notices: NoticeDeliveryQueue;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
@@ -803,6 +806,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const state: ProxyState = {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
+    usageUrl: opts.memtree.usageDashboardUrl,
     notices: new NoticeDeliveryQueue(),
     mainNoticePending: false,
     mainPromptGeneration: 0,
@@ -2698,9 +2702,12 @@ function sessionCommandReply(
     return [
       "• /memtree-view · show this session's MemTree page link",
       `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
-    ].join("\n");
+      usageLines(state),
+    ].filter((line): line is string => line !== undefined).join("\n");
   }
-  if (isMemtreeViewCommand(prompt)) return memtreeViewLine(state, sessionId);
+  if (isMemtreeViewCommand(prompt)) {
+    return joinNoticeLines(memtreeViewLine(state, sessionId), usageLines(state)) ?? "";
+  }
   const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
   if (args === undefined) return undefined;
   const keep =
@@ -2746,7 +2753,8 @@ function subagentCommandReply(
   prompt: string
 ): string | undefined {
   if (isMemtreeViewCommand(prompt)) {
-    return `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
+    const view = `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
+    return joinNoticeLines(view, usageLines(state)) ?? view;
   }
   if (sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND) !== undefined) {
     return `${TRAILER_LABEL} ${SUBAGENT_COMPACT_REPLY}`;
@@ -2780,6 +2788,16 @@ function memtreeViewLine(state: ProxyState, sessionId: string): string {
   return page?.compressed && page.url !== link.link
     ? `${lines}\n${urlLine(viewUrl(page.url), "memory from ")}`
     : lines;
+}
+
+/**
+ * The usage dashboard link that `/memtree` and `/memtree-view` end with,
+ * formatted like the MemTree link; undefined when the environment has none.
+ */
+function usageLines(state: ProxyState): string | undefined {
+  return state.usageUrl === undefined
+    ? undefined
+    : linkLines(USAGE_LABEL, viewUrl(state.usageUrl), USAGE_SIGN_IN_NOTE);
 }
 
 /** A `/memtree-view` URL: an explicit OSC 8 link where the terminal has them. */
