@@ -28,6 +28,18 @@ export const ERRNOS = [
   "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN",
   "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID", "other",
 ] as const;
+export const SIGNALS = [
+  "SIGINT", "SIGTERM", "SIGKILL", "SIGHUP", "SIGQUIT", "SIGABRT", "SIGSEGV", "SIGBUS",
+  "SIGPIPE", "SIGUSR1", "SIGUSR2", "SIGTSTP", "SIGILL", "SIGFPE", "SIGTRAP", "SIGSYS",
+  "SIGXCPU", "SIGXFSZ", "SIGALRM", "other",
+] as const;
+
+/** A signal name from the fixed list, else "other"; undefined when there is none. */
+export function signalName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return (SIGNALS as readonly string[]).includes(value) ? value : "other";
+}
+
 export const ERROR_NAMES = [
   "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "AbortError",
   "TimeoutError", "SystemError", "other",
@@ -169,7 +181,7 @@ export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
   paused_notice: { trigger: oneOf(["turn", "resume"]) },
   update_hint: { latest: VERSION },
   auto_update: { result: oneOf(["started", "locked", "not-planned", "spawn-failed", "skipped"]) },
-  claude_exit: { code: integer(-1000, 1000), signal: matching(/^SIG[A-Z0-9]{2,8}$/, 12) },
+  claude_exit: { code: integer(-1000, 1000), signal: oneOf(SIGNALS) },
   claude_missing: {},
   error: { code: oneOf(ERROR_CODES), errno: oneOf(ERRNOS),
            error_name: oneOf(ERROR_NAMES) },

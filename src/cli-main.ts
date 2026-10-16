@@ -80,6 +80,7 @@ import {
 } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
+import { signalName } from "./diagnostics-schema.js";
 import { PACKAGE_DIR, detectInstallMethod } from "./auto-update.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -609,7 +610,9 @@ async function main() {
   });
 
   child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
-    if (code !== 0) diagnostics.record("claude_exit", { code: code ?? undefined, signal: signal ?? undefined });
+    if (code !== 0) {
+      diagnostics.record("claude_exit", { code: code ?? undefined, signal: signalName(signal) });
+    }
     void shutdown(exitCodeForChild(code, signal));
   });
 }

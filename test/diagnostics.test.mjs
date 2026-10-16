@@ -15,7 +15,7 @@ import {
   recordError,
   terminalName,
 } from "../dist/diagnostics.js";
-import { CONTEXT_FIELDS, EVENT_FIELDS, threePartVersion } from "../dist/diagnostics-schema.js";
+import { CONTEXT_FIELDS, EVENT_FIELDS, signalName, threePartVersion } from "../dist/diagnostics-schema.js";
 
 const KEY = "sk-polychat-user-key-0123456789abcdef";
 
@@ -161,12 +161,18 @@ test("errors travel as fixed-vocabulary codes only", async () => {
   recordError(diagnostics, "spawn_failed", known);
   recordError(diagnostics, "spawn_failed", custom);
   diagnostics.record("error", { code: "spawn_failed", errno: "PRIVATE_PROJECT", error_name: "CustomerSecretError" });
+  diagnostics.record("claude_exit", { code: 1, signal: "SIGSECRET" });
+  diagnostics.record("claude_exit", { code: 1, signal: signalName("SIGSECRET") });
+  diagnostics.record("claude_exit", { signal: signalName("SIGTERM") });
   await diagnostics.flush(1000);
   const events = sent[0].body.events.map(({ t, ...e }) => e);
   assert.deepEqual(events, [
     { code: "spawn_failed", errno: "ENOENT", error_name: "Error", name: "error" },
     { code: "spawn_failed", errno: "other", error_name: "other", name: "error" },
     { code: "spawn_failed", name: "error" },
+    { code: 1, name: "claude_exit" },
+    { code: 1, signal: "other", name: "claude_exit" },
+    { signal: "SIGTERM", name: "claude_exit" },
   ]);
 });
 
