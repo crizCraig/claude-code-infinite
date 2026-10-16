@@ -19,6 +19,10 @@ follows it down to the original messages.
 * **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
 * **Replaces `/compact` without losing the thread.** MemTree beats `/compact` by 20 points in our
   long-context benchmark ([details](#long-session-benchmark))
+* **Nothing is compressed early.** Claude sees every message word for word, just as in plain
+  Claude Code, until a session reaches about 800k tokens (80% of the 1M context window on
+  current models). Only then does MemTree step in, in place of Claude Code's auto-compact, which
+  loses detail
 * **Unlimited-length sessions**, with relevant past information recalled automatically
 * **A local proxy, so no slowdown.** Requests go straight from your machine to Anthropic and
   MemTree indexes in the background; only the occasional compression step, when a session
