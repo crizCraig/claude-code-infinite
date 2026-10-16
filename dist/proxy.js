@@ -2740,7 +2740,6 @@ async function planToolCompaction(args) {
     const stableLane = args.isMainRequest && sessionId !== undefined;
     const current = stableLane ? state.stablePrefixes.get(sessionId) : undefined;
     let ride = args.ride;
-    let overWindow = false;
     if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
         const routed = prefixRoutedBody(body, messages, current);
         if (routed) {
@@ -2750,11 +2749,6 @@ async function planToolCompaction(args) {
             // kept as a fallback.
             ride = { raw: routed.raw, turnType: "tool-prefix", sizeHolder: current };
         }
-    }
-    if (!ride) {
-        const original = args.sizing.register(forwardBody, "original");
-        overWindow ||= args.sizing.plan(original).tokens +
-            bodyOutputReservation(body, args.sizing.isExact(original)) > modelContextLimit;
     }
     const sample = ride
         ? ride.sizeHolder.lastSize
@@ -2770,7 +2764,9 @@ async function planToolCompaction(args) {
     compaction.estimatedBytes = (ride?.raw ?? forwardBody).length;
     compaction.sizeSource = size.source;
     noteUncountedBound(compaction, args.sizing, candidate, body, modelContextLimit);
-    overWindow ||= !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
+    // Judged after any planning count, so a fitting exact count is not
+    // overridden by the estimate it replaced.
+    let overWindow = !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
         output: bodyOutputReservation(body, args.sizing.isExact(candidate)) });
     const uncountedOnly = !overWindow && compaction.uncountedOverWindow === true;
     overWindow ||= uncountedOnly;

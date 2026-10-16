@@ -705,3 +705,31 @@ test('a human turn counted under the window with the output floor is not forced 
     assert.equal(h.compressions.at(-1).compression_threshold_tokens, 160_000);
   } finally { h.close(); }
 });
+
+test('a tool turn off its route, counted under the window with the output floor, passes without compression', async () => {
+  let compressions = 0;
+  const h = await harness({ budget: 160_000, usage: () => undefined,
+    count: body => {
+      const chars = JSON.stringify(body).length;
+      return { input_tokens: JSON.stringify(body.messages).includes('memory m') ? 5_000
+        : chars > 650_000 ? 300_000 : 145_000 };
+    },
+    compress: () => ++compressions === 1 ? compressedReply(4_000, 160_000) : undefined });
+  const options = { agent: '', model: 'claude-sonnet-4-5', maxTokens: 64_000 };
+  const toolTurn = (task, chars) => [{ role: 'user', content: task },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'x'.repeat(chars) }] }];
+  try {
+    assert.equal(await h.post(0, { ...options, messages: toolTurn('task', 700_000) }), 200);
+    assert.equal(h.compressions.length, 1);
+    // An edited first message: the route and prefix miss, so the original is
+    // planned without the early count rides skip. bytes/4 (~156k) + 64k
+    // max_tokens is over the 200k window; its count, 145k + the 16k output
+    // floor, fits, and 145k is under the 160k budget: forwarded whole.
+    assert.equal(await h.post(0, { ...options, messages: toolTurn('edited task', 625_000) }), 200);
+    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+    assert.equal(rec.compaction.estimatedTokens, 145_000);
+    assert.equal(h.compressions.length, 1, 'no compress call');
+    assert.match(JSON.stringify(h.forwards.at(-1).messages), /edited task/);
+  } finally { h.close(); }
+});
