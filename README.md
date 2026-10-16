@@ -24,6 +24,11 @@ follows it down to the original messages.
   MemTree indexes in the background; only the occasional compression step, when a session
   outgrows the context budget, waits on MemTree
 
+The magic starts past the context limit. Keep one session going for days and it learns how you
+work: your priorities, the nuances of your projects, your company and your environment. Where
+`/compact` would wipe that detail, MemTree keeps it, so the thread becomes an expert in you. Let it
+orchestrate dozens of subagents on your behalf.
+
 > [!IMPORTANT]
 > Requires a Claude Pro or Max subscription.
 
