@@ -138,3 +138,17 @@ test('a body over the 64 MiB request limit is known not to fit natively: no coun
   assert.equal(fitsMeasured(measured, big), false);
   assert.equal(await sizing.select(huge, big), undefined);
 });
+
+test('an uncalibrated byte estimate never exceeds the image-aware bound', () => {
+  const sizing = new RequestSizing(fakeCounts(), true, 'claude-opus-5-5');
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(1_000_000) } };
+  const body = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }, image] }] }));
+  // A dropped sample (4,000 tokens for ~1 MB is below the plausible ratio).
+  const candidate = sizing.register(body, 'ride', { tokens: 4_000, forwardedBytes: body.length });
+  assert.equal(candidate.sample, undefined);
+  assert.ok(candidate.conservativeTokens < 5_000);
+  assert.deepEqual(sizing.plan(candidate), { tokens: candidate.conservativeTokens, source: 'bytes' });
+  // Text: bytes/4 is below the bound, so it stays the estimate.
+  const text = sizing.register(Buffer.from('x'.repeat(4_000)), 'original');
+  assert.deepEqual(sizing.plan(text), { tokens: 1_000, source: 'bytes' });
+});

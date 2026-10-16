@@ -627,12 +627,16 @@ function imageFlattenReply(imageChars, budget = 100_000) {
     model_budget_tokens: budget, usage: { prompt_tokens: 300_000, completion_tokens: 50_000 } } };
 }
 
-for (const turn of ['human', 'tool']) {
-  test(`a ${turn} turn rides a prefix that kept images by its sized tokens, not its base64 bytes`, async () => {
+// 'calibrated': the prefix's reported usage is a plausible sample (0.05 tokens
+// per byte). 'uncalibrated': 4,000 tokens for ~1 MB is below the plausible
+// ratio, so the sample is dropped and only the image-aware bound sizes it.
+for (const [turn, sample] of [['human', 'calibrated'], ['tool', 'calibrated'],
+  ['human', 'uncalibrated'], ['tool', 'uncalibrated']]) {
+  test(`a ${turn} turn rides a prefix that kept images by its sized tokens, not its base64 bytes (${sample})`, async () => {
     let compressions = 0;
     const hasMemory = body => JSON.stringify(body.messages).includes('memory m');
     const h = await harness({ budget: 100_000,
-      usage: body => hasMemory(body) ? 50_000 : 10_000,
+      usage: body => hasMemory(body) ? (sample === 'calibrated' ? 50_000 : 4_000) : 10_000,
       count: body => ({ input_tokens: hasMemory(body) ? 60_000 : 300_000 }),
       compress: () => ++compressions === 1 ? imageFlattenReply(1_000_000) : undefined });
     const original = [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },

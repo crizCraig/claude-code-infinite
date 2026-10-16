@@ -28,9 +28,10 @@ export class RequestSizing {
         if (existing)
             return existing;
         const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
+        const conservativeTokens = conservativeBodyTokens(body, this.model);
         const candidate = Object.freeze({ key, body: Buffer.from(body), kind, sample: snapshot,
-            estimate: Object.freeze(estimateRequestTokens(snapshot, body.length)),
-            conservativeTokens: conservativeBodyTokens(body, this.model) });
+            estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length), conservativeTokens)),
+            conservativeTokens });
         this.candidates.set(key, candidate);
         return candidate;
     }
@@ -145,6 +146,17 @@ export function estimateLimits(limits) {
 export function fitsNative(input, limits) {
     return [input, limits.output, limits.context].every(value => Number.isFinite(value) && value >= 0) &&
         input + limits.output <= limits.context;
+}
+/**
+ * An uncalibrated bytes/4 estimate reads base64 images as text (a 1 MB image
+ * is ~250k "tokens" but costs at most MAX_IMAGE_TOKENS), so it is capped at
+ * the conservative bound, which is an upper bound. Text-only bodies are
+ * unchanged: their bytes/4 is below the bound. A calibrated estimate is kept.
+ */
+function capByteEstimate(estimate, conservativeTokens) {
+    if (estimate.source !== "bytes" || estimate.tokens <= conservativeTokens)
+        return estimate;
+    return { tokens: conservativeTokens, source: "bytes" };
 }
 /** One shared estimator for planner telemetry and request-local snapshots. */
 export function estimateRequestTokens(sample, bytes) {
