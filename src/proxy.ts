@@ -568,13 +568,24 @@ interface StablePrefixInstall {
 
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share
- * of the model's context window (900k of Opus 5.5's 1M, matching the server's
- * budget for ccc on 1M-window models). Plain Claude Code 2.1.302 auto-compacts
- * a 1M window at 967k, so MemTree compresses no earlier than ~70k before it
- * would; ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool
- * turn that jumps past the budget reaches the proxy and is compressed here.
+ * of the model's context window. 0.8 by default; NEAR_WINDOW_FALLBACK_RATIO
+ * (900k of 1M) for the 1M-window models the server budgets at 900k for ccc
+ * (NEAR_WINDOW_MODEL_RE). Plain Claude Code 2.1.302 auto-compacts a 1M window
+ * at 967k, so MemTree compresses no earlier than ~70k before it would; ccc
+ * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * jumps past the budget reaches the proxy and is compressed here.
  */
-export const FALLBACK_BUDGET_WINDOW_RATIO = 0.9;
+export const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
+export const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
+/** Opus 5.5, Opus 5, Opus 4.8 and Fable 5 / 5.1 (polychat LARGE_CONTEXT_MODELS). */
+const NEAR_WINDOW_MODEL_RE = /claude-(?:opus-(?:4-8|5-5|5)|fable-5(?:-1)?)(?![0-9])/i;
+const ONE_MILLION_TOKENS = 1_000_000;
+
+/** The fallback share of the window for `model` (see FALLBACK_BUDGET_WINDOW_RATIO). */
+export function fallbackBudgetRatio(model: unknown, modelContextLimit: number): number {
+  return typeof model === "string" && modelContextLimit >= ONE_MILLION_TOKENS &&
+    NEAR_WINDOW_MODEL_RE.test(model) ? NEAR_WINDOW_FALLBACK_RATIO : FALLBACK_BUDGET_WINDOW_RATIO;
+}
 /**
  * An explicit target is capped at this share of the budget: a compaction to
  * the budget itself would be over budget again on the next turn and
@@ -3323,7 +3334,7 @@ function serverBudgetKey(model: unknown, modelContextLimit: number): string {
 /**
  * The session's whole-request budget: CCC_BUDGET_TOKENS when set (tests),
  * else the model budget the server last reported for this model and window,
- * else the window times FALLBACK_BUDGET_WINDOW_RATIO (servers that predate
+ * else the window times fallbackBudgetRatio (servers that predate
  * `model_budget_tokens`, and the first request before any response).
  */
 function resolveBudget(
@@ -3338,7 +3349,7 @@ function resolveBudget(
   const reported = state.serverBudgets.get(serverBudgetKey(model, modelContextLimit));
   if (reported !== undefined) return { tokens: reported, source: "server" };
   return {
-    tokens: Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO),
+    tokens: Math.floor(modelContextLimit * fallbackBudgetRatio(model, modelContextLimit)),
     source: "window-ratio",
   };
 }

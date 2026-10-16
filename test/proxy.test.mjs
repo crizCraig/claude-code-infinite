@@ -3239,7 +3239,7 @@ test("/memtree-compact compacts the session's next message to its target (defaul
   const lastCall = () => memtreeSrv.calls.filter((c) => !c.index_only).at(-1);
   const lastTarget = () => lastCall().compression_target_tokens;
   // claude-x has a 200k window; this server reports no model budget, so the
-  // budget is the window-ratio fallback: 180k, half of it 90k.
+  // budget is the window-ratio fallback: 160k, half of it 80k.
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), headers);
@@ -3250,7 +3250,7 @@ test("/memtree-compact compacts the session's next message to its target (defaul
     assert.match(on.body.reason, /compacting: your next message .* about half the budget/);
     await armMainTurn(proxy, "turn three", "prompt-2");
     await postMessages(proxy.port, followupTurn("turn three"), headers);
-    assert.equal(lastTarget(), 90_000);
+    assert.equal(lastTarget(), 80_000);
     assert.equal(lastCall().compression_threshold_tokens, undefined, "manual: forced, no threshold");
 
     assert.match((await command("/memtree-compact 120k")).body.reason, /about 120k tokens/);
@@ -9488,7 +9488,7 @@ test("edge compaction budget: context window x ratio until the server reports it
     const conv = [userText("q1"), assistantText("a1"), userText("q2")];
     const first = await h.post(conv);
     assert.equal(first.compaction.budgetSource, "window-ratio");
-    assert.equal(first.compaction.budgetTokens, 180_000, "claude-x: 200k window x 0.9");
+    assert.equal(first.compaction.budgetTokens, 160_000, "claude-x: 200k window x 0.8");
     conv.push(assistantText("a2"), userText("q3"));
     const second = await h.post(conv);
     assert.equal(second.compaction.budgetSource, "server");
@@ -10072,7 +10072,7 @@ test("model churn evicts old server budgets and safely falls back to the context
     for (let n = 1; n <= 20; n++) await postModel(`claude-review-${n}`);
     const evicted = await postModel("claude-review-0");
     assert.equal(evicted.compaction.budgetSource, "window-ratio", "old model budget is evicted after churn");
-    assert.equal(evicted.compaction.budgetTokens, 180_000);
+    assert.equal(evicted.compaction.budgetTokens, 160_000);
     assert.equal((await postModel("claude-review-0")).compaction.budgetSource, "server", "a fresh report repopulates the evicted entry");
   } finally { await proxy.close(); upstream.close(); memtreeSrv.close(); }
 });

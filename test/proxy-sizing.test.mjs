@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { startProxy } from '../dist/proxy.js';
+import { startProxy, fallbackBudgetRatio } from '../dist/proxy.js';
 import { MemtreeClient } from '../dist/memtree.js';
 import { AWAY_SUMMARY_PROMPT_PREFIX } from '../dist/turns.js';
 
@@ -770,7 +770,7 @@ test('a compressed result whose usage is unusable is judged by its exact count b
   assert.equal(exceeds(body, rec, raw, 200_000, 190_000), true);
 });
 
-// The 900k budget on a 1M window (FALLBACK_BUDGET_WINDOW_RATIO until the server
+// The 900k budget on a 1M window (fallbackBudgetRatio until the server
 // reports one): a main-thread tool loop passes through just under it, and the
 // tool round that jumps past the window is compressed mid-turn, never sent whole.
 const OPUS_1M = { oneMillion: true, model: 'claude-opus-5-5', maxTokens: 128_000, agent: '' };
@@ -831,3 +831,15 @@ for (const outcome of ['compressed', 'failed']) {
     } finally { h.close(); }
   });
 }
+
+test('the 0.9 fallback is only for the 1M-window models the server budgets at 900k', () => {
+  for (const model of ['claude-opus-5-5', 'claude-opus-5-5[1m]', 'claude-opus-5',
+    'claude-opus-4-8', 'claude-fable-5', 'claude-fable-5-1', 'claude-opus-5-5-20261001']) {
+    assert.equal(fallbackBudgetRatio(model, 1_000_000), 0.9, model);
+    assert.equal(fallbackBudgetRatio(model, 200_000), 0.8, `${model} on a 200k window`);
+  }
+  for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-sonnet-4-6',
+    'claude-haiku-4-5', 'claude-opus-4-6', 'claude-x', undefined]) {
+    assert.equal(fallbackBudgetRatio(model, 1_000_000), 0.8, String(model));
+  }
+});

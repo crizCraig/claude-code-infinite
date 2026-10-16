@@ -206,13 +206,17 @@ export interface RunningProxy {
 }
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share
- * of the model's context window (900k of Opus 5.5's 1M, matching the server's
- * budget for ccc on 1M-window models). Plain Claude Code 2.1.302 auto-compacts
- * a 1M window at 967k, so MemTree compresses no earlier than ~70k before it
- * would; ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool
- * turn that jumps past the budget reaches the proxy and is compressed here.
+ * of the model's context window. 0.8 by default; NEAR_WINDOW_FALLBACK_RATIO
+ * (900k of 1M) for the 1M-window models the server budgets at 900k for ccc
+ * (NEAR_WINDOW_MODEL_RE). Plain Claude Code 2.1.302 auto-compacts a 1M window
+ * at 967k, so MemTree compresses no earlier than ~70k before it would; ccc
+ * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * jumps past the budget reaches the proxy and is compressed here.
  */
-export declare const FALLBACK_BUDGET_WINDOW_RATIO = 0.9;
+export declare const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
+export declare const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
+/** The fallback share of the window for `model` (see FALLBACK_BUDGET_WINDOW_RATIO). */
+export declare function fallbackBudgetRatio(model: unknown, modelContextLimit: number): number;
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
