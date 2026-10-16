@@ -2869,17 +2869,17 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
     }
 }
 /**
- * Whether a forwarded compressed body still overflows the window: its reported
- * input tokens (Anthropic's own count, so the output floor applies, as for an
- * exact count) when usage came back, else its conservative image-aware bound
- * (token-estimate.ts) with full max_tokens, never bytes/4, which reads base64
- * images as text.
+ * Whether a forwarded compressed body still overflows the window: its exact
+ * count (`exactTokens`, made for delivery), else its reported input tokens,
+ * both Anthropic's own count, so the output floor applies; else its
+ * conservative image-aware bound (token-estimate.ts) with full max_tokens,
+ * never bytes/4, which reads base64 images as text.
  */
-function compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit) {
-    const reported = reportedBodyTokens(rec);
-    const tokens = reported ??
+function compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit, exactTokens) {
+    const counted = exactTokens ?? reportedBodyTokens(rec);
+    const tokens = counted ??
         conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
-    return tokens + bodyOutputReservation(body, reported !== undefined) > modelContextLimit;
+    return tokens + bodyOutputReservation(body, counted !== undefined) > modelContextLimit;
 }
 /** Output room a native-fit check reserves: the model's floor for an exact
  * count, else (an estimate) the full max_tokens. */
@@ -3668,7 +3668,9 @@ async function recoverToolRouteMiss(args) {
     // Nothing to ride next turn, or a result that still does not fit the
     // window (the next turn would reject it and compress again): wait for
     // growth before the lane tries again.
-    if (!sizeHolder || compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit)) {
+    const exactTokens = args.sizing.exactTokensFor(compressedRaw);
+    if (!sizeHolder ||
+        compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit, exactTokens)) {
         backOff();
     }
     // A reservation that lost its race (stale) or never reached

@@ -152,3 +152,13 @@ test('an uncalibrated byte estimate never exceeds the image-aware bound', () => 
   const text = sizing.register(Buffer.from('x'.repeat(4_000)), 'original');
   assert.deepEqual(sizing.plan(text), { tokens: 1_000, source: 'bytes' });
 });
+
+test('exactTokensFor reads a completed count for the bytes and never counts', async () => {
+  const counts = fakeCounts(new Map([['body', 150]]));
+  const sizing = new RequestSizing(counts, true);
+  assert.equal(sizing.exactTokensFor(Buffer.from('body')), undefined);
+  assert.equal(counts.calls.length, 0);
+  await sizing.countIfOverBound(sizing.register(Buffer.from('body'), 'replacement'),
+    { budget: 1, context: 1, output: 0 });
+  assert.equal(sizing.exactTokensFor(Buffer.from('body')), 150);
+});

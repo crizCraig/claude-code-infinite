@@ -62,6 +62,8 @@ export declare class RequestSizing {
      * count and its conservative bound does not fit. Delivery reuses the result. */
     countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void>;
     /** Whether this body's size is an exact Count Tokens result. */
+    /** An exact count already made for these bytes, if any; never counts. */
+    exactTokensFor(body: Buffer): number | undefined;
     isExact(candidate: RequestCandidate): boolean;
     clientInputTokens(candidate: RequestCandidate): number | undefined;
     /** Count only when a size decision needs it; all views reuse the same result. */

@@ -756,3 +756,15 @@ test('a compressed image result with a low tokens-per-byte usage is judged by th
   // Anthropic's count of this body: + the 16k floor it fits 200k.
   assert.equal(exceeds(body, { usage: { input_tokens: 150_000 } }, raw, 200_000), false);
 });
+
+test('a compressed result whose usage is unusable is judged by its exact count before backing off', async () => {
+  const { __testCompressedResultExceedsWindow: exceeds } = await import('../dist/proxy.js');
+  const body = { model: 'claude-sonnet-4-5', max_tokens: 64_000 };
+  const raw = Buffer.from('m'.repeat(400_000));
+  // Usage that includes a server tool does not describe the body alone.
+  const rec = { usage: { input_tokens: 150_000, server_tool_use: { web_search_requests: 1 } } };
+  assert.equal(exceeds(body, rec, raw, 200_000), true, 'bound + full max_tokens');
+  // The delivery count of these bytes, 150k + the 16k floor, fits 200k.
+  assert.equal(exceeds(body, rec, raw, 200_000, 150_000), false);
+  assert.equal(exceeds(body, rec, raw, 200_000, 190_000), true);
+});

@@ -105,6 +105,11 @@ export class RequestSizing {
   }
 
   /** Whether this body's size is an exact Count Tokens result. */
+  /** An exact count already made for these bytes, if any; never counts. */
+  exactTokensFor(body: Buffer): number | undefined {
+    return this.counts.peek(body)?.tokens;
+  }
+
   isExact(candidate: RequestCandidate): boolean {
     return this.counts.peek(candidate.body)?.tokens !== undefined;
   }
