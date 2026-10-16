@@ -3986,8 +3986,10 @@ function noteUncountedBound(
 
 /**
  * Whether a forwarded compressed body still overflows the window: its reported
- * input tokens when usage came back, else its conservative image-aware bound
- * (token-estimate.ts), never bytes/4, which reads base64 images as text.
+ * input tokens (Anthropic's own count, so the output floor applies, as for an
+ * exact count) when usage came back, else its conservative image-aware bound
+ * (token-estimate.ts) with full max_tokens, never bytes/4, which reads base64
+ * images as text.
  */
 function compressedResultExceedsWindow(
   body: Record<string, any>,
@@ -3995,9 +3997,10 @@ function compressedResultExceedsWindow(
   compressedRaw: Buffer,
   modelContextLimit: number
 ): boolean {
-  const tokens = reportedSample(rec, compressedRaw.length)?.tokens ??
+  const reported = reportedSample(rec, compressedRaw.length)?.tokens;
+  const tokens = reported ??
     conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
-  return tokens + bodyOutputReservation(body, false) > modelContextLimit;
+  return tokens + bodyOutputReservation(body, reported !== undefined) > modelContextLimit;
 }
 
 /** Output room a native-fit check reserves: the model's floor for an exact
@@ -6009,6 +6012,7 @@ function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
 /** Test seam. */
 export const __testCapCacheBreakpoints = capCacheBreakpoints;
 export const __testEstimateRequestTokens = estimateRequestTokens;
+export const __testCompressedResultExceedsWindow = compressedResultExceedsWindow;
 
 /** Reads message times from the session's transcript, when there is one. */
 function transcriptTimesFor(

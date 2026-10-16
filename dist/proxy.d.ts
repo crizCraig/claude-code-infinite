@@ -47,7 +47,7 @@ import type { StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
-import { type RequestLogSink } from "./reqlog.js";
+import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
     /**
@@ -218,7 +218,17 @@ export declare const SUBAGENT_VIEW_NOTE = "(main session's page; subagent pages 
 export declare const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main session only.";
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
+/**
+ * Whether a forwarded compressed body still overflows the window: its reported
+ * input tokens (Anthropic's own count, so the output floor applies, as for an
+ * exact count) when usage came back, else its conservative image-aware bound
+ * (token-estimate.ts) with full max_tokens, never bytes/4, which reads base64
+ * images as text.
+ */
+declare function compressedResultExceedsWindow(body: Record<string, any>, rec: MessagesRecord, compressedRaw: Buffer, modelContextLimit: number): boolean;
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
+export declare const __testCompressedResultExceedsWindow: typeof compressedResultExceedsWindow;
+export {};
 //# sourceMappingURL=proxy.d.ts.map

@@ -733,3 +733,15 @@ test('a tool turn off its route, counted under the window with the output floor,
     assert.match(JSON.stringify(h.forwards.at(-1).messages), /edited task/);
   } finally { h.close(); }
 });
+
+test('a compressed result with reported usage is judged with the output floor before backing off', async () => {
+  const { __testCompressedResultExceedsWindow: exceeds } = await import('../dist/proxy.js');
+  const body = { model: 'claude-sonnet-4-5', max_tokens: 64_000 };
+  const raw = Buffer.from('m'.repeat(400_000));
+  // 150k reported + the 16k floor fits 200k (+ 64k max_tokens would not): no backoff.
+  assert.equal(exceeds(body, { usage: { input_tokens: 150_000 } }, raw, 200_000), false);
+  assert.equal(exceeds(body, { usage: { input_tokens: 190_000 } }, raw, 200_000), true);
+  // No usage: the conservative bound (400k / 2.4 = 167k) with full max_tokens.
+  assert.equal(exceeds(body, {}, raw, 200_000), true);
+  assert.equal(exceeds({ ...body, max_tokens: 16_000 }, {}, raw, 200_000), false);
+});

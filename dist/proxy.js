@@ -2862,13 +2862,16 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
 }
 /**
  * Whether a forwarded compressed body still overflows the window: its reported
- * input tokens when usage came back, else its conservative image-aware bound
- * (token-estimate.ts), never bytes/4, which reads base64 images as text.
+ * input tokens (Anthropic's own count, so the output floor applies, as for an
+ * exact count) when usage came back, else its conservative image-aware bound
+ * (token-estimate.ts) with full max_tokens, never bytes/4, which reads base64
+ * images as text.
  */
 function compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit) {
-    const tokens = reportedSample(rec, compressedRaw.length)?.tokens ??
+    const reported = reportedSample(rec, compressedRaw.length)?.tokens;
+    const tokens = reported ??
         conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
-    return tokens + bodyOutputReservation(body, false) > modelContextLimit;
+    return tokens + bodyOutputReservation(body, reported !== undefined) > modelContextLimit;
 }
 /** Output room a native-fit check reserves: the model's floor for an exact
  * count, else (an estimate) the full max_tokens. */
@@ -4598,6 +4601,7 @@ function readAll(stream) {
 /** Test seam. */
 export const __testCapCacheBreakpoints = capCacheBreakpoints;
 export const __testEstimateRequestTokens = estimateRequestTokens;
+export const __testCompressedResultExceedsWindow = compressedResultExceedsWindow;
 /** Reads message times from the session's transcript, when there is one. */
 function transcriptTimesFor(opts, sessionId, agentId) {
     const source = opts.transcriptUsage;
