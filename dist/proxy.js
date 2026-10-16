@@ -2671,7 +2671,11 @@ async function planEdgeCompaction(args) {
         // Request-local sizing (an exact count, a calibrated sample, or the
         // image-aware bound), not bytes: a flatten that kept images is mostly
         // base64 that costs a fixed amount per image.
-        const overWindow = calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+        const overWindow = args.sizing.isExact(prefixCandidate)
+            // An exact count reserves the model's output floor, as delivery does.
+            ? !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
+                output: bodyOutputReservation(body, true) })
+            : calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
         const fallback = overWindow ? undefined : { prefix, routed };
         if (state.compactNow.has(sessionId))
             return forced("manual", fallback);

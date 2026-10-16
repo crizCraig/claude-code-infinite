@@ -65,7 +65,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     reqlog: { log: record => records.push(structuredClone(record)) },
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
-    session = 's', messages: suppliedMessages, model = 'claude-x' } = {}) {
+    session = 's', messages: suppliedMessages, model = 'claude-x', maxTokens = 64 } = {}) {
     const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
@@ -73,7 +73,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       method: 'POST', headers: { 'content-type': 'application/json',
         'x-claude-code-session-id': session, 'x-claude-code-agent-id': agent,
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model, max_tokens: 64, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
     });
     await response.text();
     return response.status;
@@ -663,3 +663,26 @@ for (const [turn, sample] of [['human', 'calibrated'], ['tool', 'calibrated'],
     } finally { h.close(); }
   });
 }
+
+test('a human turn rides an exactly counted prefix that fits with the output floor, not full max_tokens', async () => {
+  let compressions = 0;
+  const hasMemory = body => JSON.stringify(body.messages).includes('memory m');
+  // No usage: the prefix has no sample, so its size is the exact count.
+  const h = await harness({ budget: 160_000, usage: () => undefined,
+    count: body => ({ input_tokens: hasMemory(body) ? 150_000 : 300_000 }),
+    compress: () => ++compressions === 1 ? compressedReply(400_000, 160_000) : undefined });
+  const options = { agent: '', model: 'claude-sonnet-4-5', maxTokens: 64_000 };
+  const original = [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'x'.repeat(600_000) }];
+  try {
+    assert.equal(await h.post(0, { ...options, messages: original }), 200);
+    assert.equal(h.compressions.length, 1);
+    const next = [...original, { role: 'assistant', content: 'next answer' },
+      { role: 'user', content: 'next question' }];
+    assert.equal(await h.post(0, { ...options, messages: next }), 200);
+    // 150k counted + 64k max_tokens exceeds the 200k window; + the output floor does not.
+    assert.equal(h.compressions.length, 1, 'the counted prefix rides');
+    assert.equal(h.records.filter(r => r.kind === 'messages').at(-1).turnType, 'followup-prefix');
+    assert.match(JSON.stringify(h.forwards.at(-1).messages), /next question/);
+  } finally { h.close(); }
+});
