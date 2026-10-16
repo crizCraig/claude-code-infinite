@@ -48,7 +48,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       const custom = !body.index_only && compress ? await compress(body) : undefined;
       res.writeHead(custom?.status ?? 200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(custom?.body ?? { messages: body.messages, compressed: false,
-        index_only: body.index_only, model_budget_tokens: budget,
+        index_only: body.index_only, model_budget_tokens: budget ?? undefined,
         usage: { prompt_tokens: 100, completion_tokens: 100 } }));
     });
   });
@@ -61,7 +61,8 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
   }
   const proxy = await startProxy({
     memtree,
-    upstreamOrigin: upstream.origin, budgetTokensOverride: budget, countTokens: enabled,
+    // budget null: no CCC_BUDGET_TOKENS, the proxy's own window-ratio fallback.
+    upstreamOrigin: upstream.origin, budgetTokensOverride: budget ?? undefined, countTokens: enabled,
     reqlog: { log: record => records.push(structuredClone(record)) },
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
@@ -768,3 +769,65 @@ test('a compressed result whose usage is unusable is judged by its exact count b
   assert.equal(exceeds(body, rec, raw, 200_000, 150_000), false);
   assert.equal(exceeds(body, rec, raw, 200_000, 190_000), true);
 });
+
+// The 900k budget on a 1M window (FALLBACK_BUDGET_WINDOW_RATIO until the server
+// reports one): a main-thread tool loop passes through just under it, and the
+// tool round that jumps past the window is compressed mid-turn, never sent whole.
+const OPUS_1M = { oneMillion: true, model: 'claude-opus-5-5', maxTokens: 128_000, agent: '' };
+const toolRound = (id, chars) => [
+  { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: {} }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'y'.repeat(chars) }] }];
+const nearWindowTurn = () => [{ role: 'user', content: 'task' }, ...toolRound('t1', 3_520_000)];
+const quarterToken = body => ({ input_tokens: Math.floor(JSON.stringify(body).length / 4) });
+
+for (const outcome of ['compressed', 'failed']) {
+  test(`900k budget: a tool round jumping from 880k past the 1M window is compressed mid-turn (${outcome})`, async () => {
+    let failing = outcome === 'failed';
+    const h = await harness({ budget: null, count: quarterToken,
+      usage: (_body, bytes) => Math.floor(bytes / 4),
+      compress: () => failing ? { status: 503, body: { detail: 'MemTree down' } }
+        : compressedReply(40_000, 900_000) });
+    try {
+      const first = nearWindowTurn();
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: first }), 200);
+      assert.equal(h.compressions.length, 0, '880k is under the 900k budget');
+      const passed = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.equal(passed.compaction.budgetTokens, 900_000);
+      assert.equal(passed.compaction.budgetSource, 'window-ratio');
+      assert.ok(passed.compaction.estimatedTokens > 870_000 &&
+        passed.compaction.estimatedTokens < 900_000, `${passed.compaction.estimatedTokens}`);
+
+      // A 150k-token tool result: about 1.03M, past the window.
+      const jumped = [...first, ...toolRound('t2', 600_000)];
+      const status = await h.post(0, { ...OPUS_1M, messages: jumped });
+      assert.equal(h.compressions.length, 1, 'one blocking compression in the tool loop');
+      assert.equal(h.compressions[0].compression_target_tokens, 450_000, 'half the budget');
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      assert.equal(rec.compaction.reason, 'budget');
+      assert.ok(rec.compaction.estimatedTokens > 1_000_000, `${rec.compaction.estimatedTokens}`);
+      assert.ok(h.forwards.slice(1).every(f => JSON.stringify(f).length < 1_000_000),
+        'the over-window history never reaches Anthropic');
+      if (outcome === 'compressed') {
+        assert.equal(status, 200);
+        assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+        return;
+      }
+      // MemTree is down: ccc's bounded refusal (503s Claude Code retries, then
+      // 400), the over-window history never sent; Claude Code itself no longer
+      // refuses it first (claude-env.ts). After the outage cooldown the same
+      // request compresses and goes out.
+      assert.equal(status, 503);
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: jumped }), 503);
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: jumped }), 400);
+      assert.equal(h.forwards.length, 1);
+      failing = false;
+      const realNow = Date.now;
+      Date.now = () => realNow() + 61_000;
+      try {
+        assert.equal(await h.post(0, { ...OPUS_1M, messages: jumped }), 200);
+      } finally { Date.now = realNow; }
+      assert.equal(h.forwards.length, 2);
+      assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+    } finally { h.close(); }
+  });
+}

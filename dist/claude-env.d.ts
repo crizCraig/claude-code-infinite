@@ -17,9 +17,22 @@
  * DISABLE_AUTO_COMPACT. Suppress that ccc-inappropriate recommendation with an
  * effectively unreachable finite threshold; manual `/compact` remains available.
  *
+ * With auto-compaction off, Claude Code still refuses a request itself once
+ * its own estimate (last reported usage plus the new messages) reaches the
+ * window minus 23k (977k on a 1M window; 2.1.302, measured) and never sends
+ * it: "Prompt is too long", and every later message is refused the same way.
+ * MemTree compresses at a budget near the window (900k), so one large tool
+ * round could otherwise strand a session there before ccc sees the request.
+ * CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE lifts that refusal: the request reaches
+ * the proxy, which compresses it mid-turn or, failing that, refuses it with
+ * its own bounded retry/400. A value the user already exported is kept.
+ *
  * `CCC_AUTO_COMPACT=1` is an escape hatch: remove ccc's override and let the
- * user's native Claude Code setting decide whether auto-compaction is enabled.
+ * user's native Claude Code setting decide whether auto-compaction is enabled
+ * (Claude Code's own limits then apply unchanged).
  */
+/** Claude Code's local refusal limit under ccc: effectively never reached. */
+export declare const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
 export declare function claudeChildEnv(parentEnv: NodeJS.ProcessEnv, anthropicBaseUrl: string): NodeJS.ProcessEnv;
 /**
  * Keep the proxy's MemTree budget in lockstep with Claude Code's own context

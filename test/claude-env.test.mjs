@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   claudeChildEnv,
   claudeNativeOneMillionContextEnabled,
+  UNREACHABLE_BLOCKING_LIMIT,
 } from "../dist/claude-env.js";
 
 test("ccc disables Claude Code auto-compaction without mutating the parent env", () => {
@@ -93,4 +94,20 @@ test("the documented Claude Code switch still disables native 1M context", () =>
       `value=${JSON.stringify(value)}`
     );
   }
+});
+
+test("ccc lifts Claude Code's local refusal near the window so MemTree can compress", () => {
+  const child = claudeChildEnv({}, "http://127.0.0.1:1234");
+  assert.equal(child.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, UNREACHABLE_BLOCKING_LIMIT);
+  assert.ok(Number(UNREACHABLE_BLOCKING_LIMIT) > 1_000_000, "above every context window");
+
+  // A value the user exported is theirs; an empty one is treated as unset.
+  const own = claudeChildEnv({ CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "500000" }, "http://x");
+  assert.equal(own.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, "500000");
+  const empty = claudeChildEnv({ CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "" }, "http://x");
+  assert.equal(empty.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, UNREACHABLE_BLOCKING_LIMIT);
+
+  // CCC_AUTO_COMPACT=1 hands compaction back to Claude Code with its own limits.
+  const native = claudeChildEnv({ CCC_AUTO_COMPACT: "1" }, "http://x");
+  assert.equal(native.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, undefined);
 });

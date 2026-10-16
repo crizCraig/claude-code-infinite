@@ -29,6 +29,13 @@ import {
 } from "./turns.js";
 
 export const CLIENT_NAME = "cc-infinite";
+/**
+ * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Claude Code's local refusal near the window (claude-env.ts) and compresses
+ * mid-turn, so the server may give it the 900k budget on 1M-window models
+ * (older ccc keeps 800k).
+ */
+export const CLIENT_FEATURES = "near-window-budget";
 // Sent on every MemTree call so the server can detect/warn stale clients
 // (plan: "API versioning").
 export const CLIENT_VERSION: string = createRequire(import.meta.url)(
@@ -1602,6 +1609,7 @@ export class MemtreeClient {
           "content-type": "application/json",
           "x-client": CLIENT_NAME,
           "x-client-version": CLIENT_VERSION,
+          "x-client-features": CLIENT_FEATURES,
           ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
           ...(opts.clientMeta && Object.keys(opts.clientMeta).length
             ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
