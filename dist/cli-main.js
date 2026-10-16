@@ -36,6 +36,8 @@ import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
+import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
+import { PACKAGE_DIR, detectInstallMethod } from "./auto-update.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -49,6 +51,8 @@ const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 // the key to paid, and how often it re-asks the status probe meanwhile.
 const SUBSCRIBE_WAIT_MS = 180_000;
 const SUBSCRIBE_POLL_MS = 3_000;
+/** This launch's diagnostics, for the top-level error handler. */
+let activeDiagnostics = null;
 function openUrl(url) {
     const platform = process.platform;
     const command = platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
@@ -85,7 +89,7 @@ async function promptForApiKey(mode) {
  * mean "unknown" (null): the caller stays quiet. Bounded by a short timeout
  * and never throws, so startup is never gated on polychat availability.
  */
-async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000) {
+async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000, diagnostics) {
     try {
         const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
             headers: {
@@ -95,11 +99,23 @@ async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000) {
             },
             signal: AbortSignal.timeout(timeoutMs),
         });
-        if (!res.ok)
+        if (!res.ok) {
+            diagnostics?.record("key_status", {
+                result: res.status === 401 ? "invalid" : res.status === 402 ? "payment_required" : "unknown",
+                status: res.status,
+            });
             return null;
-        return parsePaymentStatus(await res.json());
+        }
+        const status = parsePaymentStatus(await res.json());
+        diagnostics?.record("key_status", {
+            result: status?.paid === false ? "payment_required" : status ? "ok" : "unknown",
+            status: res.status,
+        });
+        return status;
     }
-    catch {
+    catch (err) {
+        if (diagnostics)
+            recordError(diagnostics, "status_probe_failed", err);
         return null;
     }
 }
@@ -110,13 +126,16 @@ async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000) {
  * the webhook to flip the key to paid), use claude without MemTree (launch
  * uncompressed, the in-session notice still fires), or quit.
  */
-async function runPaymentGate(status, recheck) {
+async function runPaymentGate(status, recheck, diagnostics) {
     let current = status;
     for (;;) {
         console.warn(`\x1b[1;33m${formatPaymentNotice(current, { hyperlinks: true })}\x1b[0m\n`);
         const choice = parsePaymentChoice(await askLine(PAYMENT_GATE_PROMPT));
-        if (choice === "quit")
+        diagnostics.record("payment_gate", { choice });
+        if (choice === "quit") {
+            await diagnostics.flush();
             process.exit(0);
+        }
         if (choice === "continue") {
             console.log("\nStarting claude without MemTree.\n");
             return;
@@ -124,6 +143,7 @@ async function runPaymentGate(status, recheck) {
         openUrl(current.url ?? FALLBACK_SUBSCRIBE_URL);
         console.log("\nOpened the subscribe page. Waiting for payment to complete…");
         const paid = await waitUntilPaid(recheck, SUBSCRIBE_WAIT_MS, SUBSCRIBE_POLL_MS);
+        diagnostics.record("payment_gate", { choice: paid ? "paid" : "still_unpaid" });
         if (paid) {
             console.log("\x1b[1;32m✓ MemTree is on — thank you.\x1b[0m\n");
             return;
@@ -195,16 +215,28 @@ async function main() {
     else if (mode === "staging") {
         console.log("\x1b[1;35m🚧 STAGING MODE\x1b[0m\n");
     }
+    const memtreeBaseUrl = mode === "local" ? LOCAL_BASE_URL :
+        mode === "staging" ? STAGING_BASE_URL :
+            POLYCHAT_BASE_URL;
     // Get or prompt for the MemTree API key (separate keys per environment)
     let polychatApiKey = mode === "local" ? getLocalPolychatApiKey() :
         mode === "staging" ? getStagingPolychatApiKey() :
             getPolychatApiKey();
+    // Client diagnostics (diagnostics.ts): versions, OS and errors, never content.
+    // Started before the key prompt so a signup that stalls there is visible too.
+    const diagnostics = startDiagnostics(mode, memtreeBaseUrl, polychatApiKey);
     if (!polychatApiKey) {
+        diagnostics.record("sign_in_prompt");
+        // The user may quit at the prompt: send what is known now.
+        diagnostics.flushNow();
         polychatApiKey = await promptForApiKey(mode);
         if (!polychatApiKey) {
             console.error("A MemTree API key is required.");
+            await diagnostics.flush();
             process.exit(1);
         }
+        diagnostics.record("key_saved");
+        diagnostics.setApiKey(polychatApiKey);
         if (mode === "local") {
             setLocalPolychatApiKey(polychatApiKey);
         }
@@ -216,9 +248,6 @@ async function main() {
         }
         console.log("API key saved.\n");
     }
-    const memtreeBaseUrl = mode === "local" ? LOCAL_BASE_URL :
-        mode === "staging" ? STAGING_BASE_URL :
-            POLYCHAT_BASE_URL;
     // Interactive UI only: print/non-TTY invocations are programmatic
     // interfaces whose output must stay byte-for-byte vanilla, and they get no
     // notice plugin to deliver a banner anyway.
@@ -236,7 +265,7 @@ async function main() {
     // call so sessions can be found by project; read once, never fails.
     const config = loadConfig();
     const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
-        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey),
+        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey, undefined, diagnostics),
         interactiveUi
             ? checkForUpdate({
                 currentVersion: CLIENT_VERSION,
@@ -248,7 +277,7 @@ async function main() {
     ]);
     if (paymentStatus?.paid === false) {
         if (interactiveUi) {
-            await runPaymentGate(paymentStatus, () => fetchPaymentStatus(memtreeBaseUrl, polychatApiKey));
+            await runPaymentGate(paymentStatus, () => fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), diagnostics);
         }
         else {
             console.warn(`\x1b[1;33m${formatPaymentNotice(paymentStatus)}\x1b[0m`);
@@ -269,10 +298,17 @@ async function main() {
         : null;
     if (isDebugMode && autoUpdate)
         console.log(`[DEBUG] ${autoUpdate.debugLine}`);
+    diagnostics.setContext({ interactive: interactiveUi });
+    if (autoUpdate?.bannerUpdate) {
+        diagnostics.record("update_hint", { latest: autoUpdate.bannerUpdate.latest });
+    }
     // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
     const reqlog = new RequestLogger();
+    // The proxy and MemTree client log through this tee: unchanged lines in the
+    // request log, plus a few allowlisted numbers for diagnostics.
+    const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics);
     // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
     // interactive sessions unless CCC_MEMTREE_MCP=0; print/non-TTY runs have it
     // only when their own --mcp-config names it. Either way MemTree is told
@@ -285,7 +321,7 @@ async function main() {
         baseUrl: memtreeBaseUrl,
         apiKey: polychatApiKey,
         debug: isDebugMode,
-        reqlog,
+        reqlog: observedLog,
         // Mutable below: a failed config write withdraws it before any call.
         memtreeTools: memtreeToolsConfigured ? MEMTREE_TOOLS_HEADER_VALUE : undefined,
     });
@@ -295,7 +331,8 @@ async function main() {
     const proxy = await startProxy({
         memtree,
         debug: isDebugMode,
-        reqlog,
+        reqlog: observedLog,
+        diagnostics,
         nativeOneMillionContext,
         // Kill switch for tool-turn COMPACTION only: CCC_TOOL_ROUTE_RECOVERY=0
         // makes tool turns pure passthrough — no size check, no compress call;
@@ -416,7 +453,7 @@ async function main() {
         // would never fire), inside the same bounded background drain.
         memtree.flushFinalIndexes();
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-        await reqlog.flush(SHUTDOWN_LOG_FLUSH_MS);
+        await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
         process.exit(code);
     };
     const handleShutdownSignal = createSignalShutdownHandler({
@@ -441,24 +478,61 @@ async function main() {
     process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
     // The background install starts once Claude Code is up; it outlives this
     // process if the session ends first.
-    autoUpdate?.scheduleInstall();
+    autoUpdate?.scheduleInstall(undefined, (result) => {
+        diagnostics.record("auto_update", { result });
+        diagnostics.flushNow();
+    });
     child.on("error", (err) => {
         if (err.code === "ENOENT") {
+            diagnostics.record("claude_missing");
             console.error("Could not find 'claude' command. Make sure Claude Code is installed.");
         }
         else {
+            recordError(diagnostics, "spawn_failed", err);
             console.error("Failed to start claude:", err.message);
         }
         void shutdown(1);
     });
     child.on("exit", (code, signal) => {
+        if (code !== 0)
+            diagnostics.record("claude_exit", { code: code ?? undefined, signal: signal ?? undefined });
         void shutdown(exitCodeForChild(code, signal));
     });
 }
-main().catch((err) => {
+main().catch(async (err) => {
     console.error(err);
+    if (activeDiagnostics) {
+        recordError(activeDiagnostics, "startup_failed", err);
+        await activeDiagnostics.flush();
+    }
     process.exit(1);
 });
+/**
+ * This launch's diagnostics: environment context, install method, the first
+ * run of this install, and a periodic background flush. Off under any opt-out.
+ */
+function startDiagnostics(mode, baseUrl, apiKey) {
+    const diagnostics = new Diagnostics({
+        baseUrl, configDir: getConfigDir(), clientName: CLIENT_NAME, clientVersion: CLIENT_VERSION,
+        config: loadConfig(), apiKey,
+    });
+    activeDiagnostics = diagnostics;
+    if (!diagnostics.enabled)
+        return diagnostics;
+    try {
+        const method = detectInstallMethod({
+            packageDir: PACKAGE_DIR, env: process.env, uid: process.getuid?.(),
+        });
+        diagnostics.setContext({ mode, install_method: method.kind });
+    }
+    catch {
+        diagnostics.setContext({ mode });
+    }
+    if (diagnostics.firstRun)
+        diagnostics.record("first_run");
+    diagnostics.start();
+    return diagnostics;
+}
 /** `CCC_COMPACT_TARGET` ("500k", "20000", "off"): see cli-args.ts. */
 /**
  * A resumed session whose last response was recorded past Claude Code's limit

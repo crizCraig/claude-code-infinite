@@ -141,6 +141,28 @@ Claude Code ──▶ localhost proxy (ccc)
 - Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
 
+### Diagnostics
+
+`ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
+
+- versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
+  architecture, terminal type and locale;
+- lifecycle events (first run, sign-in prompt shown, key accepted or rejected, session start,
+  the MemTree-paused notice shown, update hint or background update result);
+- errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
+  compression timeout).
+
+Never sent: your prompts or any conversation content, file paths, project or repository names,
+hostnames, usernames, environment values, keys or tokens, or error message text. Each event is
+checked against a fixed allowlist on your machine before it is queued, and again by the server.
+They are tied to your MemTree key when you have one, otherwise to a random install id in
+`~/.claude-code-infinite/install_id`. Sending is batched in the background and never slows a
+request; a failed send is dropped.
+
+Turn diagnostics off with any of: `CCC_NO_DIAGNOSTICS=1`, `"diagnostics": false` in
+`~/.claude-code-infinite/config.json`, `DO_NOT_TRACK=1`, or Claude Code's own
+`DISABLE_TELEMETRY=1` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`.
+
 ### Inline notices
 
 In interactive sessions, `ccc` reports these MemTree states as display-only lines in Claude Code:

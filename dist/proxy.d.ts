@@ -47,6 +47,7 @@ import type { StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
+import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -177,6 +178,11 @@ export interface ProxyOptions {
      * provider decides how often it has something to say.
      */
     sessionStartNotice?: () => string | undefined;
+    /**
+     * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
+     * and refusals, as allowlisted enums and numbers. Never content.
+     */
+    diagnostics?: DiagnosticsRecorder;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */

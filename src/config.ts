@@ -10,6 +10,8 @@ export interface Config {
   updateCheck?: boolean;
   /** false keeps the update hint but never installs in the background (auto-update.ts). */
   autoUpdate?: boolean;
+  /** false turns off client diagnostics (diagnostics.ts). */
+  diagnostics?: boolean;
 }
 
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");

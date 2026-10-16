@@ -269,6 +269,7 @@ export function startProxy(opts) {
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
+        diagnostics: opts.diagnostics,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
         mainPromptGeneration: 0,
@@ -617,6 +618,17 @@ export function memtreePageId(pageUrl) {
         return undefined;
     }
 }
+const SESSION_START_SOURCES = new Set(["startup", "resume", "clear", "compact"]);
+/** A main-agent SessionStart, for diagnostics; never fails the hook. */
+function recordSessionStart(state, source) {
+    try {
+        const known = source !== undefined && SESSION_START_SOURCES.has(source);
+        state.diagnostics?.record("session_start", { source: known ? source : "other" });
+    }
+    catch {
+        // Diagnostics are best effort.
+    }
+}
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(req, res, state, reqlog, 
 /** A main-lane turn ended: the session may be over (its final index). */
@@ -655,6 +667,8 @@ onMainStop) {
         return;
     }
     if (parsed.hook_event_name === "SessionStart") {
+        if (parsed.agent_id === undefined)
+            recordSessionStart(state, parsed.source);
         // A resume waits briefly for the newest tree; a fresh session has none to wait for.
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
@@ -1648,7 +1662,10 @@ async function handleMessages(req, res, opts, upstream, state) {
         const paymentDetail = opts.memtree.paymentRequiredDetail;
         const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
         if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
-            state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link), () => state.paymentNotice.markShown(), noticePromptId);
+            state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link), () => {
+                state.paymentNotice.markShown();
+                state.diagnostics?.record("paused_notice", { trigger: "turn" });
+            }, noticePromptId);
         }
         else if (mayQueueNotice && paymentDetail === null) {
             state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
@@ -1882,6 +1899,7 @@ function resumePaymentNotice(state, input) {
     if (detail === null)
         return undefined;
     state.paymentNotice.markShown();
+    state.diagnostics?.record("paused_notice", { trigger: "resume" });
     return state.notices.warningText(paymentNoticeText(detail));
 }
 /** The caller's extra SessionStart line; a throwing provider shows nothing. */
@@ -3863,6 +3881,10 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const failure = args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
+    args.state.diagnostics?.record("refusal", {
+        status: failure.status, attempt: failure.attempt,
+        input_ktokens: Math.round(inputTokens / 1000), budget_ktokens: Math.round(budgetTokens / 1000),
+    });
     console.error("[ccc proxy] request exceeds native context window; recovery failed", {
         lane: args.routeKey, attempt: failure.attempt, status: failure.status,
         inputTokens, outputTokens: args.body.max_tokens ?? 0,
