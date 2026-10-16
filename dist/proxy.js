@@ -2460,8 +2460,9 @@ function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
 }
 /** Calibrated input must leave room for the requested output as well. */
 function calibratedSizeExceedsWindow(record, body, modelContextLimit) {
-    // A planning estimate, so the full max_tokens (the floor needs an exact count).
-    const outputTokens = bodyOutputReservation(body, false);
+    // An exact count reserves the model's output floor, as delivery does; an
+    // estimate reserves the full max_tokens.
+    const outputTokens = bodyOutputReservation(body, exactSizedRecords.has(record));
     return record.uncountedOverWindow === true || (record.sizeSource === "reported" &&
         (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit);
 }
@@ -2671,11 +2672,7 @@ async function planEdgeCompaction(args) {
         // Request-local sizing (an exact count, a calibrated sample, or the
         // image-aware bound), not bytes: a flatten that kept images is mostly
         // base64 that costs a fixed amount per image.
-        const overWindow = args.sizing.isExact(prefixCandidate)
-            // An exact count reserves the model's output floor, as delivery does.
-            ? !fitsNative(size.tokens, { budget: budget.tokens, context: modelContextLimit,
-                output: bodyOutputReservation(body, true) })
-            : calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
+        const overWindow = calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
         const fallback = overWindow ? undefined : { prefix, routed };
         if (state.compactNow.has(sessionId))
             return forced("manual", fallback);
@@ -2848,15 +2845,20 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
 async function countIfOverBound(sizing, candidate, body, modelContextLimit) {
     await sizing.countIfOverBound(candidate, { budget: modelContextLimit, context: modelContextLimit, output: bodyOutputReservation(body, false) });
 }
+/** Compaction records whose estimatedTokens is an exact count (noteUncountedBound). */
+const exactSizedRecords = new WeakSet();
 /**
- * Mark a planned candidate still without an exact count (counting off, or its
+ * Note an exactly counted candidate (exactSizedRecords), or mark a planned
+ * candidate still without an exact count (counting off, or its
  * planning count failed: countIfOverBound ran first) whose conservative bound
  * plus max_tokens exceeds the window: delivery would refuse it uncounted, so
  * it is over the window for planning and takes the normal gated compression.
  */
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
-    if (sizing.isExact(candidate))
+    if (sizing.isExact(candidate)) {
+        exactSizedRecords.add(record);
         return;
+    }
     if (sizing.exceedsRequestLimit(candidate) ||
         candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
         record.uncountedOverWindow = true;

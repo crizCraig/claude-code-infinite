@@ -686,3 +686,22 @@ test('a human turn rides an exactly counted prefix that fits with the output flo
     assert.match(JSON.stringify(h.forwards.at(-1).messages), /next question/);
   } finally { h.close(); }
 });
+
+test('a human turn counted under the window with the output floor is not forced to the target', async () => {
+  const h = await harness({ budget: 160_000, usage: (_body, bytes) => Math.floor(bytes * 0.2),
+    count: body => ({ input_tokens: JSON.stringify(body).length > 500_000 ? 145_000 : 80_000 }) });
+  const options = { agent: '', model: 'claude-sonnet-4-5', maxTokens: 64_000 };
+  const turn = chars => [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'x'.repeat(chars) }];
+  try {
+    assert.equal(await h.post(0, { ...options, messages: turn(400_000) }), 200);
+    await h.post(0, { ...options, messages: turn(625_000) });
+    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+    // Counted 145k + the 16k output floor fits the 200k window (+ 64k max_tokens
+    // would not), and 145k is under the 160k budget: the server decides.
+    assert.equal(rec.compaction.sizeSource, 'reported');
+    assert.equal(rec.compaction.estimatedTokens, 145_000);
+    assert.equal(rec.compaction.reason, undefined, 'not forced');
+    assert.equal(h.compressions.at(-1).compression_threshold_tokens, 160_000);
+  } finally { h.close(); }
+});
