@@ -26,6 +26,8 @@ import {
   DIAGNOSTICS_SCHEMA,
   TERMINALS,
   TURN_TYPES,
+  errnoName,
+  errorClassName,
   sanitizeContext,
   sanitizeEvent,
   threePartVersion,
@@ -285,8 +287,8 @@ export function recordError(
   const e = err as { code?: unknown; name?: unknown } | null;
   diagnostics.record("error", {
     code,
-    errno: typeof e?.code === "string" ? e.code : undefined,
-    error_name: typeof e?.name === "string" ? e.name : undefined,
+    errno: errnoName(e?.code),
+    error_name: errorClassName(e?.name),
   });
 }
 

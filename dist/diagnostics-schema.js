@@ -12,8 +12,34 @@ export const DIAGNOSTICS_SCHEMA = 1;
 const DROP = Symbol("drop");
 /** Three parts only: a fourth (Claude Code's build suffix) would let an IPv4 address through. */
 const VERSION_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}(?:-(?:alpha|beta|rc|next|canary)(?:\.\d{1,4})?)?$/;
-/** Node errno codes (EACCES, CERT_HAS_EXPIRED): letters only, so no key or token passes. */
-const ERRNO_RE = /^(?:E[A-Z]{2,15}|(?:[A-Z]{2,12}_){1,6}[A-Z]{2,12})$/;
+/**
+ * Error codes and class names are fixed vocabularies; anything else is sent as "other"
+ * (errnoName / errorClassName). A shape check would let a project or customer name through.
+ */
+export const ERRNOS = [
+    "EACCES", "EPERM", "ENOENT", "ENOTDIR", "EISDIR", "EEXIST", "ENOSPC", "EROFS", "EMFILE",
+    "EBUSY", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "ENOTFOUND",
+    "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "EADDRINUSE", "ERR_INVALID_URL",
+    "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "UND_ERR_HEADERS_TIMEOUT", "CERT_HAS_EXPIRED",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN",
+    "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID", "other",
+];
+export const ERROR_NAMES = [
+    "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "AbortError",
+    "TimeoutError", "SystemError", "other",
+];
+/** A Node errno code from the fixed list, else "other"; undefined when there is none. */
+export function errnoName(value) {
+    if (typeof value !== "string")
+        return undefined;
+    return ERRNOS.includes(value) ? value : "other";
+}
+/** An error class name from the fixed list, else "other"; undefined when there is none. */
+export function errorClassName(value) {
+    if (typeof value !== "string")
+        return undefined;
+    return ERROR_NAMES.includes(value) ? value : "other";
+}
 export const ERROR_CODES = [
     "startup_failed", "spawn_failed", "proxy_start_failed", "config_write_failed",
     "status_probe_failed", "update_check_failed", "plugin_failed", "mcp_config_failed",
@@ -35,9 +61,10 @@ export const TURN_TYPES = [
 ];
 /** The event, rebuilt from allowed fields only; null when its name is not allowed. */
 export function sanitizeEvent(name, fields, t) {
-    const allowed = EVENT_FIELDS[name];
-    if (!allowed)
+    if (typeof name !== "string" || !Object.prototype.hasOwnProperty.call(EVENT_FIELDS, name)) {
         return null;
+    }
+    const allowed = EVENT_FIELDS[name];
     return { ...sanitizeFields(fields, allowed), name, t: Math.floor(t) };
 }
 export function sanitizeContext(fields) {
@@ -118,7 +145,7 @@ export const EVENT_FIELDS = {
     auto_update: { result: oneOf(["started", "locked", "not-planned", "spawn-failed", "skipped"]) },
     claude_exit: { code: integer(-1000, 1000), signal: matching(/^SIG[A-Z0-9]{2,8}$/, 12) },
     claude_missing: {},
-    error: { code: oneOf(ERROR_CODES), errno: matching(ERRNO_RE),
-        error_name: matching(/^[A-Z][A-Za-z]{0,30}Error$/) },
+    error: { code: oneOf(ERROR_CODES), errno: oneOf(ERRNOS),
+        error_name: oneOf(ERROR_NAMES) },
 };
 //# sourceMappingURL=diagnostics-schema.js.map

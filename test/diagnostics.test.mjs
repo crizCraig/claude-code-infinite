@@ -109,6 +109,8 @@ test("the queue is capped and a failed or hanging send never throws or blocks", 
 test("unknown events and fields are dropped before queueing", async () => {
   const { diagnostics, sent } = make();
   diagnostics.record("prompt_submitted", { text: "hello" });
+  diagnostics.record("constructor", {});
+  diagnostics.record("__proto__", {});
   diagnostics.record("key_status", { result: "invalid", status: 401, key: KEY, extra: 1 });
   diagnostics.record("upstream_error", { status: "401", turn_type: "made-up", request_kb: 12.4 });
   await diagnostics.flush(1000);
@@ -150,6 +152,22 @@ test("a throwing inner log or observer never breaks the tee's caller", () => {
   const { diagnostics } = make();
   const sink = new DiagnosticsRequestSink(undefined, diagnostics);
   sink.log({ kind: "messages", turnType: "tool", requestBytes: 1, get client() { throw new Error("x"); } });
+});
+
+test("errors travel as fixed-vocabulary codes only", async () => {
+  const { diagnostics, sent } = make();
+  const known = Object.assign(new Error("open '/Users/zelda/secret.txt'"), { code: "ENOENT" });
+  const custom = Object.assign(new Error("x"), { code: "PRIVATE_PROJECT", name: "CustomerSecretError" });
+  recordError(diagnostics, "spawn_failed", known);
+  recordError(diagnostics, "spawn_failed", custom);
+  diagnostics.record("error", { code: "spawn_failed", errno: "PRIVATE_PROJECT", error_name: "CustomerSecretError" });
+  await diagnostics.flush(1000);
+  const events = sent[0].body.events.map(({ t, ...e }) => e);
+  assert.deepEqual(events, [
+    { code: "spawn_failed", errno: "ENOENT", error_name: "Error", name: "error" },
+    { code: "spawn_failed", errno: "other", error_name: "other", name: "error" },
+    { code: "spawn_failed", name: "error" },
+  ]);
 });
 
 test("environment context maps every value onto an allowed shape", () => {

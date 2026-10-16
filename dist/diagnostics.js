@@ -21,7 +21,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
-import { DIAGNOSTICS_SCHEMA, TERMINALS, TURN_TYPES, sanitizeContext, sanitizeEvent, threePartVersion, } from "./diagnostics-schema.js";
+import { DIAGNOSTICS_SCHEMA, TERMINALS, TURN_TYPES, errnoName, errorClassName, sanitizeContext, sanitizeEvent, threePartVersion, } from "./diagnostics-schema.js";
 export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export const INSTALL_ID_FILE = "install_id";
 export const FLUSH_INTERVAL_MS = 30_000;
@@ -249,8 +249,8 @@ export function recordError(diagnostics, code, err) {
     const e = err;
     diagnostics.record("error", {
         code,
-        errno: typeof e?.code === "string" ? e.code : undefined,
-        error_name: typeof e?.name === "string" ? e.name : undefined,
+        errno: errnoName(e?.code),
+        error_name: errorClassName(e?.name),
     });
 }
 /** The install id, created (0600) on first use; null when it cannot be read or written. */
