@@ -36,6 +36,7 @@ import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-
 import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
+import { exitResumeHint } from "./resume-hint.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -452,6 +453,15 @@ async function main() {
         void shutdown(1);
     });
     child.on("exit", (code, signal) => {
+        // Under Claude Code's own "claude --resume <id>", which would skip MemTree.
+        const hint = exitResumeHint({
+            interactive: interactiveUi,
+            sessionId: proxy.mainSessionId(),
+            mode,
+            color: terminalSupportsColor(),
+        });
+        if (hint)
+            process.stdout.write(hint);
         void shutdown(exitCodeForChild(code, signal));
     });
 }

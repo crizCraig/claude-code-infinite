@@ -79,6 +79,7 @@ import {
   loadConfig,
 } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
+import { exitResumeHint } from "./resume-hint.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
@@ -562,6 +563,14 @@ async function main() {
   });
 
   child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    // Under Claude Code's own "claude --resume <id>", which would skip MemTree.
+    const hint = exitResumeHint({
+      interactive: interactiveUi,
+      sessionId: proxy.mainSessionId(),
+      mode,
+      color: terminalSupportsColor(),
+    });
+    if (hint) process.stdout.write(hint);
     void shutdown(exitCodeForChild(code, signal));
   });
 }

@@ -135,6 +135,7 @@ import {
 } from "./cc-request.js";
 import type { MessageTimes, TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
+import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import {
   approxTokensFromBytes,
@@ -336,6 +337,12 @@ export interface RunningProxy {
    * finalizers are awaited; false reports that forced cancellation was needed.
    */
   drain: (timeoutMs?: number) => Promise<boolean>;
+  /**
+   * The main session a user could resume now (`ccc --resume <id>`): the last
+   * one resumed or forked, or that sent a main-lane turn. Undefined until
+   * then, and again after /clear until its first turn.
+   */
+  mainSessionId: () => string | undefined;
 }
 
 interface Upstream {
@@ -374,6 +381,8 @@ interface ProxyState {
   /** ProxyOptions.sessionStartNotice. */
   sessionStartNotice?: () => string | undefined;
   notices: NoticeDeliveryQueue;
+  /** RunningProxy.mainSessionId. */
+  resumableMainSession?: string;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
   mainPromptId?: string;
@@ -940,6 +949,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
           void beginClose();
         },
         drain,
+        mainSessionId: () => state.resumableMainSession,
       });
     });
   });
@@ -1225,6 +1235,23 @@ export function memtreePageId(pageUrl: string): string | undefined {
   }
 }
 
+/**
+ * A resumed or forked session can be resumed again at once; a fresh or
+ * cleared one has nothing to resume until its first turn. Compaction keeps
+ * the same session.
+ */
+function noteMainSessionStart(
+  state: ProxyState,
+  source: string | undefined,
+  sessionId: string
+): void {
+  if (source === "resume" || source === "fork") {
+    state.resumableMainSession = isResumableSessionId(sessionId) ? sessionId : undefined;
+  } else if (source === "startup" || source === "clear") {
+    state.resumableMainSession = undefined;
+  }
+}
+
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(
   req: http.IncomingMessage,
@@ -1269,6 +1296,7 @@ async function handleNoticeHook(
   }
 
   if (parsed.hook_event_name === "SessionStart") {
+    if (parsed.agent_id === undefined) noteMainSessionStart(state, parsed.source, parsed.session_id);
     // A resume waits briefly for the newest tree; a fresh session has none to wait for.
     if (parsed.agent_id === undefined && parsed.source === "resume") {
       await state.newestTrees?.settle(parsed.session_id);
@@ -1704,6 +1732,7 @@ async function handleMessages(
   // reply the session ends with (scheduleFinalIndex, on Stop).
   const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
   if (mainSessionId !== undefined) {
+    if (isResumableSessionId(mainSessionId)) state.resumableMainSession = mainSessionId;
     opts.memtree.noteMainConversation(mainSessionId, {
       messages: msgsForMemtree,
       modelContextLimit,

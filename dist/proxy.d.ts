@@ -203,6 +203,12 @@ export interface RunningProxy {
      * finalizers are awaited; false reports that forced cancellation was needed.
      */
     drain: (timeoutMs?: number) => Promise<boolean>;
+    /**
+     * The main session a user could resume now (`ccc --resume <id>`): the last
+     * one resumed or forked, or that sent a main-lane turn. Undefined until
+     * then, and again after /clear until its first turn.
+     */
+    mainSessionId: () => string | undefined;
 }
 /**
  * Budget fallback until the server reports `model_budget_tokens`: this share

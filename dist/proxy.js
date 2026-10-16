@@ -59,6 +59,7 @@ import { hyperlink } from "./payment-gate.js";
 import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
@@ -387,6 +388,7 @@ export function startProxy(opts) {
                     void beginClose();
                 },
                 drain,
+                mainSessionId: () => state.resumableMainSession,
             });
         });
     });
@@ -617,6 +619,19 @@ export function memtreePageId(pageUrl) {
         return undefined;
     }
 }
+/**
+ * A resumed or forked session can be resumed again at once; a fresh or
+ * cleared one has nothing to resume until its first turn. Compaction keeps
+ * the same session.
+ */
+function noteMainSessionStart(state, source, sessionId) {
+    if (source === "resume" || source === "fork") {
+        state.resumableMainSession = isResumableSessionId(sessionId) ? sessionId : undefined;
+    }
+    else if (source === "startup" || source === "clear") {
+        state.resumableMainSession = undefined;
+    }
+}
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(req, res, state, reqlog, 
 /** A main-lane turn ended: the session may be over (its final index). */
@@ -655,6 +670,8 @@ onMainStop) {
         return;
     }
     if (parsed.hook_event_name === "SessionStart") {
+        if (parsed.agent_id === undefined)
+            noteMainSessionStart(state, parsed.source, parsed.session_id);
         // A resume waits briefly for the newest tree; a fresh session has none to wait for.
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
@@ -1055,6 +1072,8 @@ async function handleMessages(req, res, opts, upstream, state) {
     // reply the session ends with (scheduleFinalIndex, on Stop).
     const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
     if (mainSessionId !== undefined) {
+        if (isResumableSessionId(mainSessionId))
+            state.resumableMainSession = mainSessionId;
         opts.memtree.noteMainConversation(mainSessionId, {
             messages: msgsForMemtree,
             modelContextLimit,
