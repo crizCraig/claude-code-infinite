@@ -305,6 +305,7 @@ export function startProxy(opts) {
         laneSizes: new Map(),
     };
     installMemtreeLink(state, state.memtreeLinkPlacement);
+    state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
     const server = http.createServer((req, res) => {
         const accepted = { req, res };
         acceptedRequests.add(accepted);

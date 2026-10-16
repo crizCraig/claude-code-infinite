@@ -2797,7 +2797,7 @@ test("a page without a served index (older server, index-only ack) is never link
   }
 });
 
-const trailerNew = (link) => `• MemTree\n  ${link} ↗`;
+const trailerNew = (link) => `• MemTree · this session's memory map\n  ${link} ↗`;
 const trailerSame = (link) => `• MemTree\n  ${link} ↗`;
 
 for (const color of [false, true]) {
@@ -2823,7 +2823,7 @@ test(`placement 'message': the link trails every finished message, marked when t
       linkText(rendered),
       `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerNew(PAGE_URL_1)}`
     );
-    assert.ok(rendered.endsWith(`${color ? "\x1b[39m" : "• MemTree"}\n  ${PAGE_URL_1} ↗`),
+    assert.ok(rendered.endsWith(`${color ? "\x1b[22m" : "memory map"}\n  ${PAGE_URL_1} ↗`),
       "URL is bare on its own line, after the reset when colored");
     if (!color) assert.equal(rendered, stripAnsi(rendered), "NO_COLOR suppresses all ANSI styling");
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
@@ -2897,7 +2897,7 @@ test("a turn MemTree passed through whole names the unused index next to its lin
     const first = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
     assert.equal(
       linkText(first.body.hookSpecificOutput.displayContent),
-      `upstream answer\n\n• MemTree · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_1} ↗`
+      `upstream answer\n\n• MemTree · this session's memory map · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_1} ↗`
     );
     assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
 
@@ -2906,7 +2906,7 @@ test("a turn MemTree passed through whole names the unused index next to its lin
     const second = await postHook(proxy, displayHook({ prompt_id: "prompt-2", final: true }));
     assert.equal(
       linkText(second.body.hookSpecificOutput.displayContent),
-      `${COMPRESSED_NOTICE}\nupstream answer\n\n• MemTree\n  ${PAGE_URL_2} ↗`
+      `${COMPRESSED_NOTICE}\nupstream answer\n\n${trailerSame(PAGE_URL_2)}`
     );
   } finally {
     proxy.close();
@@ -2914,6 +2914,50 @@ test("a turn MemTree passed through whole names the unused index next to its lin
     memtreeSrv.close();
   }
 });
+
+for (const color of [false, true]) {
+test(`a short session's first tree is announced once on Stop, first ever with a how-to (${color ? "color" : "NO_COLOR"})`, async (t) => {
+  setNoticeColorMode(t, color);
+  const upstream = await mockUpstream();
+  const stamps = [pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_2, "index-b")];
+  // The session fits the budget: every turn goes out whole.
+  const memtreeSrv = await mockMemtree(200, { ...compressedOnce, compressed: false }, (_b, call) => stamps[call]);
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const shown = [];
+  const firstTreeIntro = { isFirstEver: () => shown.length === 0, markShown: (id) => shown.push(id) };
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, firstTreeIntro });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    assert.equal((await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }))).status, 204);
+    const stop = (await postHook(proxy, stopHook("prompt-1"))).body.systemMessage;
+    assert.equal(
+      stripAnsi(stop),
+      `🌿 First MemTree ready · a searchable map of this session so far\n  ${PAGE_URL_1} ↗\n` +
+        "  Open it, or paste the link to any agent to give it this session's context"
+    );
+    if (color) assert.match(stop, /^\x1b\[1m\x1b\[32m🌿 First MemTree ready/, "bold green, unlike the routine link");
+    else assert.equal(stop, stripAnsi(stop));
+    assert.deepEqual(shown, ["session-1"]);
+
+    // Same tree next turn: nothing at all.
+    await armMainTurn(proxy, "turn three", "prompt-2");
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
+
+    // A newer tree: the routine, labelled link.
+    await armMainTurn(proxy, "turn four", "prompt-3");
+    await postSessionMessages(proxy.port, followupTurn("turn four"));
+    const routine = (await postHook(proxy, stopHook("prompt-3"))).body.systemMessage;
+    assert.equal(stripAnsi(routine), `• MemTree · this session's memory map · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2} ↗`);
+    assert.deepEqual(shown, ["session-1"]);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
 
 test("a resumed session shows its link at SessionStart, from memory or from disk", async () => {
   const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
@@ -2943,14 +2987,14 @@ test("a resumed session shows its link at SessionStart, from memory or from disk
 
     // Same process (in-app /resume): from memory.
     const again = await postHook(first, resume);
-    assert.equal(stripAnsi(again.body.systemMessage), `• MemTree\n  ${PAGE_URL_1} ↗`);
+    assert.equal(stripAnsi(again.body.systemMessage), trailerNew(PAGE_URL_1));
 
     // New process: from disk. Compaction and subagents get nothing.
     assert.equal((await postHook(second, { ...resume, source: "compact" })).status, 204);
     assert.equal((await postHook(second, { ...resume, agent_id: "a1" })).status, 204);
     assert.equal((await postHook(second, { ...resume, session_id: "other" })).status, 204);
     const fromDisk = await postHook(second, resume);
-    assert.equal(stripAnsi(fromDisk.body.systemMessage), `• MemTree\n  ${PAGE_URL_1} ↗`);
+    assert.equal(stripAnsi(fromDisk.body.systemMessage), trailerNew(PAGE_URL_1));
     // Shown at resume, so the end of the next turn does not repeat it.
     await armMainTurn(second, "turn three", "prompt-2");
     assert.equal((await postHook(second, displayHook({ prompt_id: "prompt-2", final: true }))).status, 204);
@@ -3029,7 +3073,7 @@ test("the resume relay script forwards SessionStart stdin to the proxy and print
     assert.equal(hit.code, 0);
     assert.equal(
       stripAnsi(JSON.parse(hit.out).systemMessage),
-      `• MemTree · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2} ↗`
+      `• MemTree · this session's memory map · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2} ↗`
     );
     assert.deepEqual(
       await run({ hook_event_name: "SessionStart", session_id: "nope", source: "resume" }),
@@ -10720,7 +10764,7 @@ test("a resumed session links its newest tree, while MCP resumes from the stored
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store, newestTrees: lookup });
   try {
     const resumed = await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" });
-    assert.equal(stripAnsi(resumed.body.systemMessage), `• MemTree\n  ${NEWEST_URL} ↗`);
+    assert.equal(stripAnsi(resumed.body.systemMessage), trailerNew(NEWEST_URL));
     assert.equal(await getCurrentId(proxy, "session-1"), "ea18af90658b");
   } finally {
     proxy.close();

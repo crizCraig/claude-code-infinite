@@ -12,6 +12,17 @@ export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 export declare const TRAILER_LABEL = "\u2022 MemTree \u00B7";
 /** Label on a line that carries a MemTree page link. */
 export declare const LINK_LABEL = "\u2022 MemTree";
+/** What the link is, said next to the label when a tree is news. */
+export declare const LINK_DESCRIPTION = "this session's memory map";
+/**
+ * The one-time notice for a session's first tree: set apart from the routine
+ * link (leaf, bold) and saying in one line why it is worth opening. Kept short
+ * enough to fit 80 columns after Claude Code's "Stop says: " label.
+ */
+export declare const FIRST_TREE_TITLE = "\uD83C\uDF3F First MemTree ready";
+export declare const FIRST_TREE_VALUE = "a searchable map of this session so far";
+/** Added under the first tree a user ever sees: what to do with it. */
+export declare const FIRST_EVER_HINT = "Open it, or paste the link to any agent to give it this session's context";
 /**
  * Closes every URL line. Terminal linkifiers run a bare URL into whatever is
  * drawn right after it when the row joins the next one: a URL that ended a
@@ -72,6 +83,15 @@ export interface SuccessLink {
      * passed through whole.
      */
     note?: string;
+}
+/**
+ * Introduces the first tree of each session (see FIRST_TREE_TITLE). Answers
+ * whether this is the user's first tree ever, and hears when the intro was
+ * shown. Failures never break a hook.
+ */
+export interface FirstTreeIntro {
+    isFirstEver(sessionId: string | undefined): boolean;
+    markShown(sessionId: string | undefined): void;
 }
 /**
  * Where the trailer (`• MemTree · <link>`) is shown: under every finished
@@ -154,6 +174,7 @@ export declare class NoticeDeliveryQueue {
     private readonly delivered;
     private trailer;
     private trailerPlacement;
+    private firstTreeIntro;
     /** Key of the last trailer shown; a different key is announced as new. */
     constructor(ttlMs?: number, now?: () => number, color?: boolean);
     /** Replace stale delivery state when a new main human prompt is submitted. */
@@ -180,6 +201,11 @@ export declare class NoticeDeliveryQueue {
      * link is always at the bottom of the screen.
      */
     setTrailer(resolve: LinkResolver | null, placement?: TrailerPlacement): void;
+    /**
+     * Announce the first link a session shows with the one-time first-tree
+     * notice instead of the routine trailer. Off (null) by default.
+     */
+    setFirstTreeIntro(intro: FirstTreeIntro | null): void;
     queuePrefix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
     queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
     /**
@@ -216,6 +242,15 @@ export declare class NoticeDeliveryQueue {
      * marks the key as seen. Resolver failures never break a hook.
      */
     private renderTrailer;
+    /** A link that is news: green label, then what it is (dim). */
+    private newLinkLabel;
+    /**
+     * The session's first tree: bold leaf title, the value in one line, the
+     * URL below; for the user's first tree ever, one dim line on what to do.
+     */
+    private firstTreeNotice;
+    /** Call the first-tree intro; a throwing one never breaks a hook. */
+    private askIntro;
     /** The link notice with its note dim. */
     private linkNotice;
     private styleDim;

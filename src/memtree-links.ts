@@ -33,6 +33,11 @@ export class MemtreeLinkStore {
     return isStoredLink(entry) ? entry : undefined;
   }
 
+  /** Whether any session other than `sessionId` has a stored page. */
+  hasOtherSession(sessionId: string | undefined): boolean {
+    return Object.entries(this.readAll()).some(([id, v]) => id !== sessionId && isStoredLink(v));
+  }
+
   put(sessionId: string, link: Omit<StoredMemtreeLink, "updatedAt">): void {
     try {
       const all = this.readAll();

@@ -10,6 +10,8 @@ export declare class MemtreeLinkStore {
     private readonly maxSessions;
     constructor(filePath?: string, maxSessions?: number);
     get(sessionId: string): StoredMemtreeLink | undefined;
+    /** Whether any session other than `sessionId` has a stored page. */
+    hasOtherSession(sessionId: string | undefined): boolean;
     put(sessionId: string, link: Omit<StoredMemtreeLink, "updatedAt">): void;
     private readAll;
 }
