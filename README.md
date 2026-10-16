@@ -85,6 +85,8 @@ tokens; `/compact`'s exclude the one-time `/compact` step. This is one task fami
 * [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
 * **A Claude Pro or Max subscription**
 
+<sub>Also works with an Anthropic API key, but that's far costlier than Pro or Max.</sub>
+
 ## Setup
 
 1. Install (Node ≥ 20.3; no git needed)
