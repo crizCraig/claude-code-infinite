@@ -215,6 +215,22 @@ export interface MessagesRecord {
     lateCountRecovery?: {
         outcome: "compressed" | "forwarded" | "refused";
     };
+    /**
+     * Why ccc refused to forward this request (route-fallback.ts): the request
+     * did not fit the native window after recovery. Logged here, never printed:
+     * Claude Code's TUI shows the proxy's stderr inside the conversation.
+     */
+    refusal?: {
+        lane: string;
+        attempt: number;
+        status: number;
+        inputTokens: number;
+        outputTokens: number;
+        outputReservation: number;
+        indexBehind: boolean;
+        budgetTokens: number;
+        modelContextLimit: number;
+    };
     /** Searchable flag explaining a forward above the advisory compression budget. */
     overBudgetForward?: {
         reason: "exact-count-fits-window" | "estimate-fits-window" | "bytes-fallback-fits-window";
