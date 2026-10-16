@@ -2534,15 +2534,23 @@ function usedServerTools(rec) {
  * is dropped and the previous sample kept.
  */
 function reportedSample(rec, bytes) {
-    if (changedDeliveryRecords.has(rec))
-        return undefined;
-    if (serverToolRecords.has(rec) || usedServerTools(rec))
-        return undefined;
-    const tokens = reportedInputTokens(rec);
+    const tokens = reportedBodyTokens(rec);
     if (tokens === undefined)
         return undefined;
     const sample = { tokens, forwardedBytes: bytes };
     return plausibleSample(sample) ? sample : undefined;
+}
+/**
+ * Anthropic's input tokens for the body this request forwarded, when its usage
+ * describes that body (not a changed delivery, no server tools). Not filtered
+ * by plausibility: a body that is mostly images is truly cheap per byte.
+ */
+function reportedBodyTokens(rec) {
+    if (changedDeliveryRecords.has(rec))
+        return undefined;
+    if (serverToolRecords.has(rec) || usedServerTools(rec))
+        return undefined;
+    return reportedInputTokens(rec);
 }
 /**
  * Key of a non-main request's size sample (ProxyState.laneSizes): its lane,
@@ -2868,7 +2876,7 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
  * images as text.
  */
 function compressedResultExceedsWindow(body, rec, compressedRaw, modelContextLimit) {
-    const reported = reportedSample(rec, compressedRaw.length)?.tokens;
+    const reported = reportedBodyTokens(rec);
     const tokens = reported ??
         conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
     return tokens + bodyOutputReservation(body, reported !== undefined) > modelContextLimit;

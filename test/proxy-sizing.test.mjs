@@ -745,3 +745,14 @@ test('a compressed result with reported usage is judged with the output floor be
   assert.equal(exceeds(body, {}, raw, 200_000), true);
   assert.equal(exceeds({ ...body, max_tokens: 16_000 }, {}, raw, 200_000), false);
 });
+
+test('a compressed image result with a low tokens-per-byte usage is judged by that usage', async () => {
+  const { __testCompressedResultExceedsWindow: exceeds } = await import('../dist/proxy.js');
+  const body = { model: 'claude-sonnet-4-5', max_tokens: 64_000 };
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(2_500_000) } };
+  const raw = Buffer.from(JSON.stringify({ messages: [{ role: 'user',
+    content: [{ type: 'text', text: 'm'.repeat(300_000) }, image, image, image, image] }] }));
+  // 150k for ~10 MB is below the plausible sample ratio, but it is still
+  // Anthropic's count of this body: + the 16k floor it fits 200k.
+  assert.equal(exceeds(body, { usage: { input_tokens: 150_000 } }, raw, 200_000), false);
+});

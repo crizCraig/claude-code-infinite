@@ -3525,12 +3525,21 @@ function usedServerTools(rec: MessagesRecord): boolean {
  * is dropped and the previous sample kept.
  */
 function reportedSample(rec: MessagesRecord, bytes: number): SizeSample | undefined {
-  if (changedDeliveryRecords.has(rec)) return undefined;
-  if (serverToolRecords.has(rec) || usedServerTools(rec)) return undefined;
-  const tokens = reportedInputTokens(rec);
+  const tokens = reportedBodyTokens(rec);
   if (tokens === undefined) return undefined;
   const sample = { tokens, forwardedBytes: bytes };
   return plausibleSample(sample) ? sample : undefined;
+}
+
+/**
+ * Anthropic's input tokens for the body this request forwarded, when its usage
+ * describes that body (not a changed delivery, no server tools). Not filtered
+ * by plausibility: a body that is mostly images is truly cheap per byte.
+ */
+function reportedBodyTokens(rec: MessagesRecord): number | undefined {
+  if (changedDeliveryRecords.has(rec)) return undefined;
+  if (serverToolRecords.has(rec) || usedServerTools(rec)) return undefined;
+  return reportedInputTokens(rec);
 }
 
 /**
@@ -3997,7 +4006,7 @@ function compressedResultExceedsWindow(
   compressedRaw: Buffer,
   modelContextLimit: number
 ): boolean {
-  const reported = reportedSample(rec, compressedRaw.length)?.tokens;
+  const reported = reportedBodyTokens(rec);
   const tokens = reported ??
     conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
   return tokens + bodyOutputReservation(body, reported !== undefined) > modelContextLimit;
