@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { execSync } from "node:child_process";
 import os from "node:os";
@@ -439,7 +440,12 @@ test("startup banner rides a SessionStart command hook emitting systemMessage JS
       "SessionStart accepts only command/mcp_tool hooks, never http"
     );
     // Every shell Claude Code might use must yield byte-identical valid JSON.
-    for (const shell of ["/bin/sh", "/bin/bash", "/bin/zsh"]) {
+    // /bin/sh always exists; bash and zsh are checked where installed (Linux
+    // CI images ship without zsh).
+    const shells = ["/bin/sh", "/bin/bash", "/bin/zsh"].filter(
+      (shell) => shell === "/bin/sh" || fs.existsSync(shell)
+    );
+    for (const shell of shells) {
       const stdout = execSync(hook.command, { shell, encoding: "utf-8" });
       assert.deepEqual(
         JSON.parse(stdout),

@@ -6025,8 +6025,27 @@ test("a no-op that finds no tree stops the tool loop's compress calls until the 
     });
   });
   const records = [];
+  // The proxy checks the page in the background, triggered by a tool turn.
+  // Track those checks so the test flips readiness only once none is in
+  // flight: a check t3 started that lands after the flip would otherwise
+  // answer 200 and clear the wait before t4 (seen on slower Linux CI).
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const pageChecks = new Set();
+  const fetchMemTree = memtree.fetchMemTree.bind(memtree);
+  memtree.fetchMemTree = (...args) => {
+    const check = fetchMemTree(...args);
+    const settled = check.then(() => {}, () => {});
+    pageChecks.add(settled);
+    settled.then(() => pageChecks.delete(settled));
+    return check;
+  };
+  const pageChecksSettled = async () => {
+    while (pageChecks.size > 0) await Promise.all([...pageChecks]);
+    // Let the proxy's own then/finally on the check run.
+    await new Promise((r) => setImmediate(r));
+  };
   const proxy = await startRecoveryProxy({
-    memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
+    memtree,
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
   });
@@ -6046,13 +6065,15 @@ test("a no-op that finds no tree stops the tool loop's compress calls until the 
     }
     assert.equal(blockingCalls(), 1, "no compress call while the tree is building");
     await waitFor(() => pageGets >= 1);
+    await pageChecksSettled();
+    const getsBeforeReady = pageGets;
 
     pageReady = true;
     loop = extendToolLoop(loop, "t4");
     await postMessages(proxy.port, loop, SESSION);
     assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
-    await waitFor(() => pageGets >= 2);
-    await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => pageGets > getsBeforeReady);
+    await pageChecksSettled();
 
     loop = extendToolLoop(loop, "t5");
     await postMessages(proxy.port, loop, SESSION);
@@ -8492,6 +8513,8 @@ test("a compress timeout arms the cooldown", async () => {
       baseUrl: memtreeSrv.origin,
       apiKey: "k",
       compressTimeoutMs: 100,
+      // An over-window turn with no prefix to ride takes the long budget.
+      longCompressTimeoutMs: 100,
     }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
