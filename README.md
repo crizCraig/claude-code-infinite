@@ -107,6 +107,31 @@ The tool supports multiple environments (this selects the MemTree compression AP
 
 Each environment maintains its own separate API key.
 
+## Commands
+
+Type these inside a `ccc` session (the `ccc:` prefix is optional). `ccc` answers them
+locally, so they cost no model turn.
+
+| Command | What it does |
+| --- | --- |
+| `/ccc:memtree` | Lists the MemTree commands and links your usage dashboard. |
+| `/ccc:memtree-view` | Shows the link to this session's MemTree page. |
+| `/ccc:memtree-compact [tokens]` | Compacts the session on your next message (to half the budget, or a target such as `400k`) and keeps the compressed history. |
+| `/ccc:memtree-compact off` | Goes back to sending the conversation whole. |
+
+Environment variables, set when launching `ccc`:
+
+| Variable | What it does |
+| --- | --- |
+| `CCC_COMPACT_TARGET=500k` | Compaction target for every session (useful for headless `-p` runs); `off` starts every session with compaction off. |
+| `CCC_MEMTREE_LINK` | Where the MemTree link appears: `turn` (default, end of a turn with a new page), `message` (under every reply), `stop` (end of every turn), `success` (only after an optimized turn), or `off`. |
+| `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction setting ([details](#claude-code-auto-compaction)). |
+| `CCC_NO_UPDATE_CHECK=1` | Turns off the update check, and with it automatic updates ([details](#upgrading)). |
+| `CCC_DISABLE_AUTOUPDATE=1` | Keeps the update notice but never installs ([details](#automatic-updates)). |
+
+Links are clickable in terminals that support OSC 8 hyperlinks (iTerm2, Ghostty, WezTerm,
+kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
+
 ## Claude Code auto-compaction
 
 `ccc` disables Claude Code's automatic conversation compaction for the Claude process it launches. MemTree manages the context sent to the model, so letting Claude Code independently summarize the full local transcript can compact a conversation MemTree already reduced. Manual `/compact` remains available.
