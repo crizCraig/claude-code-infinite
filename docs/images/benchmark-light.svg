@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="196" viewBox="0 0 600 196" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="Judged score out of 100: Claude Code Infinite 69, full context 69, /compact 49">
+<text x="0" y="22" font-size="16" font-weight="600" fill="#0b0b0b">Long-session benchmark: judged score (0–100)</text>
+<text x="0" y="42" font-size="12" fill="#52514e">Blind-graded, mean of 3 rounds, 775k-token Claude Code session, Claude Opus 5.5</text>
+<line x1="190" y1="60" x2="190" y2="174" stroke="#d6d5d0" stroke-width="1"/>
+<line x1="550" y1="60" x2="550" y2="174" stroke="#d6d5d0" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="550" y="190" font-size="11" text-anchor="middle" fill="#52514e">100</text>
+<text x="180" y="86.0" font-size="14" text-anchor="end" font-weight="600" fill="#0b0b0b">Claude Code Infinite</text>
+<path d="M190,68H434.4Q438.4,68 438.4,72V90Q438.4,94 434.4,94H190Z" fill="#2a78d6"/>
+<text x="446.4" y="86.0" font-size="14" font-weight="600" fill="#0b0b0b">69</text>
+<text x="180" y="124.0" font-size="14" text-anchor="end" font-weight="400" fill="#0b0b0b">Full context</text>
+<path d="M190,106H434.4Q438.4,106 438.4,110V128Q438.4,132 434.4,132H190Z" fill="#8d8c86"/>
+<text x="446.4" y="124.0" font-size="14" font-weight="600" fill="#0b0b0b">69</text>
+<text x="180" y="162.0" font-size="14" text-anchor="end" font-weight="400" fill="#0b0b0b">/compact</text>
+<path d="M190,144H362.4Q366.4,144 366.4,148V166Q366.4,170 362.4,170H190Z" fill="#8d8c86"/>
+<text x="374.4" y="162.0" font-size="14" font-weight="600" fill="#0b0b0b">49</text>
+</svg>
