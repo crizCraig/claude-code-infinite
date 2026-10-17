@@ -90,7 +90,7 @@ fi
 # One atomic push, so the tag never exists on GitHub without its commit on main.
 echo "Pushing main and v$VERSION..."
 if ! git push --atomic origin main "v$VERSION"; then
-    echo "Error: v$VERSION is on npm but the push failed. Rebase is not possible (the tag"
+    echo "Error: v$VERSION is on npm but the push failed. Fix the remote state (the tag names"
     echo "this commit, so do not rebase it), then: $PUSH_HELP"
     exit 1
 fi
