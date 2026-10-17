@@ -22,6 +22,7 @@ export interface SessionLink {
     session_id: string;
     url: string;
     tree: string;
+    /** The session's last activity (the listing has no tree time; the tree may trail it). */
     updated_at: string | null;
 }
 type Lookup = {
@@ -29,6 +30,7 @@ type Lookup = {
     link: SessionLink;
 } | {
     kind: "none";
+    reason: "no-session" | "no-tree";
 } | {
     kind: "error";
     message: string;

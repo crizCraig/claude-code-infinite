@@ -18,7 +18,8 @@ import { SESSION_ID, validatedTreeUrl } from "./memtree-newest.js";
 /** The whole lookup, every page included, gives up after this long. */
 export const LINK_TIMEOUT_MS = 5_000;
 export const LINK_EXIT = { ok: 0, error: 1, usage: 2, noTree: 3 };
-const SESSIONS_LIMIT = 10;
+/** The server's maximum page, so a busy match rarely needs a second request. */
+const SESSIONS_LIMIT = 100;
 const MAX_PAGES = 10;
 const ERROR_PREVIEW_CHARS = 300;
 export const LINK_USAGE = "usage: ccc [staging|local] link <session-id> [--json]\n" +
@@ -42,7 +43,7 @@ export async function runLinkCommand(argv, deps) {
         return LINK_EXIT.error;
     }
     if (result.kind === "none") {
-        deps.stderr(`ccc link: session ${parsed.sessionId} has no MemTree yet\n`);
+        deps.stderr(`ccc link: ${noneMessage(parsed.sessionId, result.reason)}\n`);
         return LINK_EXIT.noTree;
     }
     deps.stdout(`${parsed.json ? JSON.stringify(result.link) : result.link.url}\n`);
@@ -62,7 +63,18 @@ export function parseLinkArgs(argv) {
 }
 /** Pages through the owner's sessions matching the id, under one deadline. */
 export async function findSessionLink(sessionId, deps) {
-    const signal = AbortSignal.timeout(deps.timeoutMs ?? LINK_TIMEOUT_MS);
+    // A referenced timer, not AbortSignal.timeout (unreferenced): the deadline
+    // must fire even when nothing else keeps the event loop alive.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? LINK_TIMEOUT_MS);
+    try {
+        return await lookupPages(sessionId, deps, controller.signal);
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+async function lookupPages(sessionId, deps, signal) {
     const query = new URLSearchParams({ q: sessionId, limit: String(SESSIONS_LIMIT) });
     const seen = new Set();
     try {
@@ -70,12 +82,13 @@ export async function findSessionLink(sessionId, deps) {
             const body = await fetchSessionsPage(deps, query, signal);
             if (typeof body === "string")
                 return { kind: "error", message: body };
-            const item = body.sessions.find((s) => s?.session_id === sessionId);
+            const item = body.sessions.find((s) => sameSession(s?.session_id, sessionId));
             if (item)
-                return linkFromItem(item, sessionId);
+                return linkFromItem(item);
             const cursor = body.next_cursor;
-            if (cursor === null || cursor === undefined || cursor === "")
-                return { kind: "none" };
+            if (cursor === null || cursor === undefined || cursor === "") {
+                return { kind: "none", reason: "no-session" };
+            }
             if (typeof cursor !== "string" || seen.has(cursor)) {
                 return { kind: "error", message: "unexpected sessions listing from the server" };
             }
@@ -93,6 +106,7 @@ async function fetchSessionsPage(deps, query, signal) {
     const base = deps.baseUrl.replace(/\/$/, "");
     const res = await deps.fetch(`${base}/v1/memtree/sessions?${query}`, {
         signal,
+        redirect: "error", // the bearer header never follows a redirect
         headers: {
             authorization: `Bearer ${deps.apiKey}`,
             accept: "application/json",
@@ -113,22 +127,34 @@ async function fetchSessionsPage(deps, query, signal) {
     }
     return "unexpected sessions listing from the server";
 }
-function linkFromItem(item, sessionId) {
+function linkFromItem(item) {
     const tree = item.latest_tree;
-    const raw = typeof tree?.links?.url === "string" ? tree.links.url : undefined;
+    if (!tree)
+        return { kind: "none", reason: "no-tree" };
+    const raw = typeof tree.links?.url === "string" ? tree.links.url : undefined;
     const url = raw ? validatedTreeUrl(raw) : undefined;
-    if (!tree || !url)
-        return { kind: "none" };
+    if (!url)
+        return { kind: "error", message: "the server sent no usable tree URL" };
     const ref = typeof tree.ref === "string" && tree.ref ? tree.ref : tree.request_id;
     return {
         kind: "found",
         link: {
-            session_id: sessionId,
+            session_id: String(item.session_id),
             url,
             tree: typeof ref === "string" ? ref : "",
             updated_at: typeof item.last_at === "string" ? item.last_at : null,
         },
     };
+}
+/** Session ids are matched as the server's `q` does: ignoring case. */
+function sameSession(candidate, sessionId) {
+    return typeof candidate === "string" && candidate.toLowerCase() === sessionId.toLowerCase();
+}
+function noneMessage(sessionId, reason) {
+    return reason === "no-tree"
+        ? `session ${sessionId} has no MemTree yet`
+        : `no session ${sessionId} on this key yet (check the id; a new session appears ` +
+            "once its first request reaches MemTree)";
 }
 function networkMessage(err, signal) {
     if (signal.aborted)

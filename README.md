@@ -126,7 +126,7 @@ From a shell or script (no session needed):
 
 | Command | What it does |
 | --- | --- |
-| `ccc link <session-id>` | Prints the session's newest MemTree page URL on stdout, one line and nothing else. `--json` prints `{session_id, url, tree, updated_at}` instead. Exit status 0 printed, 1 no saved key or the server could not be reached (5 s timeout), 2 bad invocation, 3 the session has no MemTree yet. Only your own sessions (those of your saved key) are found. `ccc staging link` / `ccc local link` use that environment's key. |
+| `ccc link <session-id>` | Prints the session's newest MemTree page URL on stdout, one line and nothing else. `--json` prints `{session_id, url, tree, updated_at}` instead (`updated_at` is the session's last activity). Exit status 0 printed, 1 no saved key or the server could not be reached (5 s timeout), 2 bad invocation, 3 the session has no MemTree yet (or no session with that id on your key; stderr says which). Only your own sessions (those of your saved key) are found. `ccc staging link` / `ccc local link` use that environment's key. |
 | `ccc fetch <memtree-url>` | Prints one of your MemTree pages as JSON, using your saved key. |
 
 Environment variables, set when launching `ccc`:

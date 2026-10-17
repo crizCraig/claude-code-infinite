@@ -91,7 +91,8 @@ url=$(ccc link "$sid") && echo "Agent memory: $url"
 ```
 
 `ccc link <session-id>` prints the session's newest MemTree page URL on stdout, one line and
-nothing else; `--json` prints `{session_id, url, tree, updated_at}`. It uses your saved key, so
+nothing else; `--json` prints `{session_id, url, tree, updated_at}` (`updated_at` is the
+session's last activity, which the tree can trail). It uses your saved key, so
 it finds only your own sessions, and gives up after 5 seconds. Exit status:
 
 | Status | Meaning |
@@ -99,7 +100,7 @@ it finds only your own sessions, and gives up after 5 seconds. Exit status:
 | 0 | The URL was printed. |
 | 1 | No saved key, or the MemTree server could not be reached or refused. |
 | 2 | Bad invocation (no or malformed session id). |
-| 3 | The session has no tree yet (it needs roughly 10k tokens of conversation). |
+| 3 | The session has no tree yet (it needs roughly 10k tokens of conversation), or your key has no session with that id; stderr says which. |
 
 The link can trail by one call: a `-p` run's newest tree is built as it exits, so right after a
 call `ccc link` may still show the tree from the call before (it catches up within a minute or

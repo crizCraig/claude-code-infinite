@@ -21,7 +21,7 @@ function session(sessionId, tree = { request_id: "r1", ref: "r1@v3", links: { ur
 function fakeFetch(pages) {
   const calls = [];
   const fn = async (url, init) => {
-    calls.push({ url: String(url), headers: init.headers });
+    calls.push({ url: String(url), headers: init.headers, redirect: init.redirect });
     const page = pages[calls.length - 1];
     if (page instanceof Error) throw page;
     const { status = 200, body } = page;
@@ -51,6 +51,13 @@ test("prints exactly the newest tree's URL, asking the owner-only sessions listi
   assert.equal(url.origin + url.pathname, "https://api.polychat.co/v1/memtree/sessions");
   assert.equal(url.searchParams.get("q"), SID);
   assert.equal(r.calls[0].headers.authorization, "Bearer k-123");
+  assert.equal(r.calls[0].redirect, "error");
+});
+
+test("the id matches ignoring case, as the server's q does", async () => {
+  const r = await run([SID.toUpperCase(), "--json"], [{ body: { sessions: [session(SID)] } }]);
+  assert.equal(r.code, 0);
+  assert.equal(JSON.parse(r.stdout).session_id, SID);
 });
 
 test("--json prints session_id, url, tree and updated_at", async () => {
@@ -81,6 +88,7 @@ test("no tree yet: exit 3, message on stderr, nothing on stdout", async () => {
   const unknown = await run([SID], [{ body: { sessions: [], next_cursor: null } }]);
   assert.equal(unknown.code, 3);
   assert.equal(unknown.stdout, "");
+  assert.match(unknown.stderr, /no session .* on this key yet/);
 });
 
 test("no saved key: exit 1 with a hint, no request made", async () => {
@@ -98,6 +106,7 @@ test("network error, server refusal and malformed body: exit 1, nothing on stdou
     { status: 401, body: "{\"detail\":\"bad key\"}" },
     { status: 500, body: "boom" },
     { body: "not json" },
+    { body: { sessions: [session(SID, { request_id: "r", links: { url: "javascript:x" } })] } },
   ]) {
     const r = await run([SID], [page]);
     assert.equal(r.code, 1, JSON.stringify(page));
