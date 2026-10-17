@@ -21,6 +21,13 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
+/**
+ * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Claude Code's local refusal near the window (claude-env.ts) and compresses
+ * mid-turn, so the server may give it the 900k budget on 1M-window models
+ * (older ccc keeps 800k).
+ */
+export declare const CLIENT_FEATURES = "near-window-budget";
 export declare const CLIENT_VERSION: string;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the

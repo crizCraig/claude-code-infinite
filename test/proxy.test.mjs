@@ -4338,6 +4338,9 @@ test("x-memtree-tools rides compress calls only when the memtree MCP tools are c
   try {
     const on = await run("search,read_node,read_lines");
     assert.ok(on.filter((c) => !c.indexOnly).every((c) => c.tools === "search,read_node,read_lines"));
+    // Every call declares the near-window budget (the server's 900k for ccc).
+    const features = memtreeSrv.callHeaders.map((h) => h["x-client-features"]);
+    assert.ok(features.length >= 2 && features.every((f) => f === "near-window-budget"), String(features));
     assert.ok(on.filter((c) => c.indexOnly).every((c) => c.tools === undefined), "index-only calls return no memory");
     const off = await run(undefined);
     assert.ok(off.length >= 2);

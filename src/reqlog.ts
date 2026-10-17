@@ -391,7 +391,7 @@ export interface CompactionRecord {
   /**
    * Where the budget came from: CCC_BUDGET_TOKENS ("override"), the
    * server's `model_budget_tokens` ("server"), or the model's context window
-   * times FALLBACK_BUDGET_WINDOW_RATIO until the server reports one.
+   * times fallbackBudgetRatio (proxy.ts) until the server reports one.
    */
   budgetSource: "override" | "server" | "window-ratio";
   /** What a compaction on this turn aims at (budget/2, or the explicit N). */
