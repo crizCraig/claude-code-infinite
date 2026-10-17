@@ -3007,6 +3007,52 @@ test("a resumed session shows its link at SessionStart, from memory or from disk
   }
 });
 
+test("the proxy knows the main session to resume: a resume or a main turn, not a subagent", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const start = (source, extra = {}) =>
+    postHook(proxy, { hook_event_name: "SessionStart", source, ...extra });
+  try {
+    assert.equal(proxy.mainSessionId(), undefined, "nothing before the session starts");
+    await start("startup", { session_id: "fresh" });
+    assert.equal(proxy.mainSessionId(), undefined, "a fresh session has nothing to resume yet");
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postMessages(proxy.port, followupTurn("turn two"), {
+      "x-claude-code-session-id": "session-1",
+    });
+    assert.equal(proxy.mainSessionId(), "session-1", "a main turn makes it resumable");
+
+    // A subagent's turn or start, and compaction, leave the main session alone.
+    await postMessages(proxy.port, followupTurn("agent work"), {
+      "x-claude-code-session-id": "agent-session",
+      "x-claude-code-agent-id": "agent-1",
+    });
+    await start("resume", { session_id: "sub", agent_id: "a1" });
+    await start("compact", { session_id: "session-1" });
+    assert.equal(proxy.mainSessionId(), "session-1");
+
+    // In-app /resume of another session: resumable before any new turn.
+    await start("resume", { session_id: "session-2" });
+    assert.equal(proxy.mainSessionId(), "session-2");
+    await start("fork", { session_id: "session-3" });
+    assert.equal(proxy.mainSessionId(), "session-3");
+    // /clear starts an empty session: nothing to resume until it has a turn.
+    await start("clear", { session_id: "session-4" });
+    assert.equal(proxy.mainSessionId(), undefined);
+
+    // An id that is unsafe to print is never offered.
+    await start("resume", { session_id: "bad\u001b]0;x\u0007" });
+    assert.equal(proxy.mainSessionId(), undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("SessionStart carries the auto-update line for main sessions, not compaction or subagents", async () => {
   const upstream = await mockUpstream();
   const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:9", apiKey: "k" });
