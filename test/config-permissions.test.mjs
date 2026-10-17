@@ -13,14 +13,16 @@ const dir = join(home, ".claude-code-infinite");
 const file = join(dir, "config.json");
 const mode = (path) => statSync(path).mode & 0o777;
 
-test("saved keys are readable only by their owner", { skip: process.platform === "win32" }, () => {
+test("saved keys are readable only by their owner", {
+  skip: process.platform === "win32" && "Windows has no POSIX mode bits",
+}, () => {
   setPolychatApiKey("sk-secret");
   assert.equal(mode(dir), 0o700);
   assert.equal(mode(file), 0o600);
 });
 
 test("an existing world-readable config is tightened when read", {
-  skip: process.platform === "win32",
+  skip: process.platform === "win32" && "Windows has no POSIX mode bits",
 }, () => {
   mkdirSync(dir, { recursive: true });
   writeFileSync(file, JSON.stringify({ polychatApiKey: "sk-old" }));
