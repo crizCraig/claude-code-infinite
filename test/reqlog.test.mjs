@@ -190,8 +190,11 @@ test("proxied /v1/messages requests each append a JSONL record", async () => {
       );
     });
 
-    const [toolRec, followupRec] = records.filter((r) => r.kind === "messages");
-    assert.equal(toolRec.turnType, "tool");
+    // Appends are fire-and-forget, so the two records may land in either order.
+    const messageRecs = records.filter((r) => r.kind === "messages");
+    const toolRec = messageRecs.find((r) => r.turnType === "tool");
+    const followupRec = messageRecs.find((r) => r.turnType !== "tool");
+    assert.ok(toolRec, JSON.stringify(messageRecs.map((r) => r.turnType)));
     assert.equal(toolRec.model, "claude-x");
     assert.equal(toolRec.stream, false);
     assert.equal(toolRec.upstreamStatus, 200);
