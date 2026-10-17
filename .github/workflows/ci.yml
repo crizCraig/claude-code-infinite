@@ -25,14 +25,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # 24: what publish.yml releases with. 20.3.0: package.json engines minimum.
-        node: ["24", "20.3.0"]
-        # Windows is not an officially supported platform and Node 20 is past its
-        # end of life: Windows runs on the release Node only. (Node 20.3 there
-        # misses a socket close in the first-tree probe test and then hangs.)
-        exclude:
-          - os: windows-latest
-            node: "20.3.0"
+        # 24: what publish.yml releases with. 20: the engines minimum's major
+        # (package.json ">=20.3"), at its latest release. Exact 20.3.0 is not
+        # used: its test runner intermittently never exits after
+        # test/reqlog.test.mjs passes (not reproducible on 20.20).
+        node: ["24", "20"]
     steps:
       # Keep LF on Windows so the committed dist/ compares byte for byte with a
       # fresh build (.gitattributes also pins eol=lf).
