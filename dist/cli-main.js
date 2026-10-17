@@ -50,7 +50,7 @@ const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc"
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
-/** The exit resume hint's stdout write, which a Windows console completes later. */
+/** Shutdown's wait for the child's exit and the resume hint's (asynchronous) write. */
 const SHUTDOWN_OUTPUT_FLUSH_MS = 1_000;
 // Payment gate: how long "subscribe now" waits for the Stripe webhook to flip
 // the key to paid, and how often it re-asks the status probe meanwhile.
@@ -446,9 +446,11 @@ async function main() {
         stdio: "inherit",
     });
     let shuttingDown = false;
-    // The exit resume hint's write; set by the child's exit even when a signal
-    // already started shutdown, and awaited (bounded) just before exiting.
-    let exitOutput;
+    // Settles once the child has exited and the resume hint (if any) is written,
+    // or the child failed to start. Awaited (bounded) just before exiting, so a
+    // signal whose cleanup finishes first still lets the hint print.
+    let markChildDone = () => { };
+    const childDone = new Promise((resolve) => { markChildDone = resolve; });
     const shutdown = async (code) => {
         if (shuttingDown)
             return;
@@ -465,8 +467,7 @@ async function main() {
         memtree.flushFinalIndexes();
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
         await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
-        if (exitOutput)
-            await settleWithin(exitOutput, SHUTDOWN_OUTPUT_FLUSH_MS);
+        await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
         process.exit(code);
     };
     const handleShutdownSignal = createSignalShutdownHandler({
@@ -504,6 +505,7 @@ async function main() {
             recordError(diagnostics, "spawn_failed", err);
             console.error("Failed to start claude:", err.message);
         }
+        markChildDone();
         void shutdown(1);
     });
     child.on("exit", (code, signal) => {
@@ -518,8 +520,7 @@ async function main() {
             color: terminalSupportsColor(),
         });
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
-        if (hint)
-            exitOutput = writeStdout(hint);
+        void (hint ? writeStdout(hint) : Promise.resolve()).then(markChildDone);
         void shutdown(exitCodeForChild(code, signal));
     });
 }
