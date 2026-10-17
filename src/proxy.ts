@@ -136,6 +136,7 @@ import {
 import type { MessageTimes, TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
+import type { DiagnosticsRecorder } from "./diagnostics.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -309,6 +310,11 @@ export interface ProxyOptions {
    * provider decides how often it has something to say.
    */
   sessionStartNotice?: () => string | undefined;
+  /**
+   * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
+   * and refusals, as allowlisted enums and numbers. Never content.
+   */
+  diagnostics?: DiagnosticsRecorder;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
@@ -373,6 +379,8 @@ interface ProxyState {
   usageUrl: string | undefined;
   /** ProxyOptions.sessionStartNotice. */
   sessionStartNotice?: () => string | undefined;
+  /** ProxyOptions.diagnostics. */
+  diagnostics?: DiagnosticsRecorder;
   notices: NoticeDeliveryQueue;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
@@ -833,6 +841,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
+    diagnostics: opts.diagnostics,
     notices: new NoticeDeliveryQueue(),
     mainNoticePending: false,
     mainPromptGeneration: 0,
@@ -1239,6 +1248,18 @@ export function memtreePageId(pageUrl: string): string | undefined {
   }
 }
 
+const SESSION_START_SOURCES = new Set(["startup", "resume", "clear", "compact"]);
+
+/** A main-agent SessionStart, for diagnostics; never fails the hook. */
+function recordSessionStart(state: ProxyState, source: string | undefined): void {
+  try {
+    const known = source !== undefined && SESSION_START_SOURCES.has(source);
+    state.diagnostics?.record("session_start", { source: known ? source : "other" });
+  } catch {
+    // Diagnostics are best effort.
+  }
+}
+
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(
   req: http.IncomingMessage,
@@ -1283,6 +1304,7 @@ async function handleNoticeHook(
   }
 
   if (parsed.hook_event_name === "SessionStart") {
+    if (parsed.agent_id === undefined) recordSessionStart(state, parsed.source);
     // A resume waits briefly for the newest tree; a fresh session has none to wait for.
     if (parsed.agent_id === undefined && parsed.source === "resume") {
       await state.newestTrees?.settle(parsed.session_id);
@@ -2397,7 +2419,10 @@ async function handleMessages(
     if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
       state.notices.queueSuffix(
         paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link),
-        () => state.paymentNotice.markShown(),
+        () => {
+          state.paymentNotice.markShown();
+          state.diagnostics?.record("paused_notice", { trigger: "turn" });
+        },
         noticePromptId
       );
     } else if (mayQueueNotice && paymentDetail === null) {
@@ -2711,6 +2736,7 @@ function resumePaymentNotice(
   const detail = state.unpaidDetail();
   if (detail === null) return undefined;
   state.paymentNotice.markShown();
+  state.diagnostics?.record("paused_notice", { trigger: "resume" });
   return state.notices.warningText(paymentNoticeText(detail));
 }
 
@@ -5257,6 +5283,10 @@ function refuseWholeRequest(
     { awaitingIndex: args.rec.indexBehind === true });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
+  args.state.diagnostics?.record("refusal", {
+    status: failure.status, attempt: failure.attempt,
+    input_ktokens: Math.round(inputTokens / 1000), budget_ktokens: Math.round(budgetTokens / 1000),
+  });
   // To requests.jsonl, never the console: Claude Code's TUI shows stderr inline.
   args.rec.refusal = {
     lane: args.routeKey, attempt: failure.attempt, status: failure.status,

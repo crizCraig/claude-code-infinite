@@ -1,0 +1,355 @@
+/**
+ * Client diagnostics: why a session stalls, without ever sending its content
+ * (polychat plans/2026-10-16_PLAN_ccc_client_diagnostics.md).
+ *
+ * What is sent: ccc / Claude Code / Node versions, install method, OS and arch,
+ * terminal type, locale, and lifecycle and error events made of enums, status
+ * codes, sizes and timings (diagnostics-schema.ts is the allowlist; polychat
+ * enforces it again). Never prompts, paths, hostnames, usernames, env values,
+ * keys or error message text.
+ *
+ * Hard constraints, like reqlog.ts: never throw and never block. Events go into
+ * a capped in-memory queue; batches are POSTed fire-and-forget (every
+ * FLUSH_INTERVAL_MS, after the sign-in prompt, and at shutdown under a short
+ * bound); a failed POST drops its batch.
+ *
+ * Off with CCC_NO_DIAGNOSTICS=1, `"diagnostics": false` in the config,
+ * DO_NOT_TRACK=1, or Claude Code's DISABLE_TELEMETRY /
+ * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
+ */
+
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
+import { join } from "node:path";
+import {
+  DIAGNOSTICS_SCHEMA,
+  TERMINALS,
+  TURN_TYPES,
+  errnoName,
+  errorClassName,
+  sanitizeContext,
+  sanitizeEvent,
+  threePartVersion,
+  type DiagnosticsErrorCode,
+  type DiagnosticsEvent,
+  type DiagnosticsFields,
+} from "./diagnostics-schema.js";
+import type { RequestLogSink, RequestRecord } from "./reqlog.js";
+
+export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
+export const INSTALL_ID_FILE = "install_id";
+export const FLUSH_INTERVAL_MS = 30_000;
+export const MAX_QUEUE = 200;
+export const BATCH_SIZE = 50;
+export const SEND_TIMEOUT_MS = 3_000;
+export const SHUTDOWN_FLUSH_MS = 1_000;
+/** Repeats of one error kind (event + status) reported per process. */
+export const MAX_REPEATS = 5;
+const OPT_OUT_ENV = [
+  "CCC_NO_DIAGNOSTICS", "DO_NOT_TRACK", "DISABLE_TELEMETRY",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** What the proxy and the launcher need: record an event, never fail. */
+export interface DiagnosticsRecorder {
+  record(name: string, fields?: Record<string, unknown>): void;
+}
+
+export interface DiagnosticsOptions {
+  baseUrl: string;
+  configDir: string;
+  clientName: string;
+  clientVersion: string;
+  env?: NodeJS.ProcessEnv;
+  config?: { diagnostics?: boolean };
+  apiKey?: string;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+  flushIntervalMs?: number;
+  maxQueue?: number;
+}
+
+/** False when any opt-out is set. */
+export function diagnosticsEnabled(env: NodeJS.ProcessEnv, config: { diagnostics?: boolean }):
+    boolean {
+  if (config.diagnostics === false) return false;
+  return !OPT_OUT_ENV.some((name) => envFlagSet(env[name]));
+}
+
+export class Diagnostics implements DiagnosticsRecorder {
+  readonly enabled: boolean;
+  /** True when this launch created the install id (the machine's first run). */
+  readonly firstRun: boolean;
+  /** Events dropped because the queue was full. */
+  dropped = 0;
+  private readonly installId: string | null;
+  private readonly queue: DiagnosticsEvent[] = [];
+  private readonly inFlight = new Set<Promise<void>>();
+  private readonly repeats = new Map<string, number>();
+  private context: DiagnosticsFields = {};
+  private apiKey: string | undefined;
+  private timer: NodeJS.Timeout | undefined;
+
+  constructor(private readonly opts: DiagnosticsOptions) {
+    const env = opts.env ?? process.env;
+    let enabled = diagnosticsEnabled(env, opts.config ?? {});
+    const install = enabled ? readOrCreateInstallId(opts.configDir) : null;
+    if (install === null) enabled = false;
+    this.enabled = enabled;
+    this.installId = install?.id ?? null;
+    this.firstRun = install?.created === true;
+    this.apiKey = opts.apiKey;
+    if (enabled) this.context = sanitizeContext(environmentContext(env, opts.clientVersion));
+  }
+
+  setApiKey(apiKey: string | undefined): void {
+    this.apiKey = apiKey;
+  }
+
+  /** Add context fields (allowlisted; later values win). */
+  setContext(fields: Record<string, unknown>): void {
+    if (!this.enabled) return;
+    try {
+      this.context = { ...this.context, ...sanitizeContext(fields) };
+    } catch {
+      // Never break the caller.
+    }
+  }
+
+  record(name: string, fields: Record<string, unknown> = {}): void {
+    if (!this.enabled) return;
+    try {
+      const event = sanitizeEvent(name, fields, this.now());
+      if (event === null) return;
+      if (this.queue.length >= (this.opts.maxQueue ?? MAX_QUEUE)) {
+        this.dropped++;
+        return;
+      }
+      this.queue.push(event);
+    } catch {
+      // Never break the caller.
+    }
+  }
+
+  /** Like record, but at most MAX_REPEATS times per `key` in this process. */
+  recordLimited(key: string, name: string, fields: Record<string, unknown> = {}): void {
+    const seen = this.repeats.get(key) ?? 0;
+    if (seen >= MAX_REPEATS) return;
+    this.repeats.set(key, seen + 1);
+    this.record(name, fields);
+  }
+
+  /** Flush every FLUSH_INTERVAL_MS without keeping the process alive. */
+  start(): void {
+    if (!this.enabled || this.timer) return;
+    this.timer = setInterval(() => this.flushNow(), this.opts.flushIntervalMs ?? FLUSH_INTERVAL_MS);
+    this.timer.unref();
+  }
+
+  /** Send what is queued now; fire-and-forget. */
+  flushNow(): void {
+    if (!this.enabled) return;
+    while (this.queue.length > 0) {
+      this.track(this.send(this.queue.splice(0, BATCH_SIZE)));
+    }
+  }
+
+  /** Shutdown: send what is queued and wait for in-flight sends, at most `timeoutMs`. */
+  async flush(timeoutMs = SHUTDOWN_FLUSH_MS): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    this.flushNow();
+    if (this.inFlight.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled([...this.inFlight]),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /** The exact JSON body a batch of these events is sent as (tests read it). */
+  batchBody(events: DiagnosticsEvent[]): string {
+    return JSON.stringify({
+      schema: DIAGNOSTICS_SCHEMA, install_id: this.installId, context: this.context, events,
+    });
+  }
+
+  private async send(events: DiagnosticsEvent[]): Promise<void> {
+    try {
+      const doFetch = this.opts.fetchImpl ?? fetch;
+      await doFetch(`${this.opts.baseUrl.replace(/\/$/, "")}${DIAGNOSTICS_PATH}`, {
+        method: "POST",
+        headers: this.headers(),
+        body: this.batchBody(events),
+        signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      });
+    } catch {
+      // Dropped: diagnostics never retry or surface errors.
+    }
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      "content-type": "application/json",
+      "x-client": this.opts.clientName,
+      "x-client-version": this.opts.clientVersion,
+      ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
+    };
+  }
+
+  private track(sending: Promise<void>): void {
+    this.inFlight.add(sending);
+    void sending.finally(() => this.inFlight.delete(sending));
+  }
+
+  private now(): number {
+    return (this.opts.now ?? Date.now)();
+  }
+}
+
+/**
+ * Tee for the request log: every record still goes to `inner` unchanged, and a
+ * few named numeric/enum fields of some records become diagnostics events.
+ * Records are never copied: they can hold content (client.systemHead, URLs).
+ */
+export class DiagnosticsRequestSink implements RequestLogSink {
+  private firstRequest = false;
+  private firstTurn = false;
+
+  constructor(
+    private readonly inner: RequestLogSink | undefined,
+    private readonly diagnostics: Diagnostics
+  ) {}
+
+  log(record: RequestRecord): void {
+    this.inner?.log(record);
+    try {
+      this.observe(record);
+    } catch {
+      // Diagnostics never break the request log.
+    }
+  }
+
+  private observe(record: RequestRecord): void {
+    if (record.kind === "messages") this.observeMessages(record);
+    else if (record.kind === "memtree") this.observeMemtree(record);
+  }
+
+  private observeMessages(rec: Extract<RequestRecord, { kind: "messages" }>): void {
+    if (rec.turnType === "foreign") return;
+    const ccVersion = threePartVersion(rec.client?.ccVersion);
+    if (ccVersion) this.diagnostics.setContext({ cc_version: ccVersion });
+    const fields = {
+      status: rec.upstreamStatus, turn_type: turnType(rec.turnType), ttfb_ms: rec.ttfbMs,
+      total_ms: rec.totalMs, request_kb: kb(rec.requestBytes),
+    };
+    if (!this.firstRequest) {
+      this.firstRequest = true;
+      this.diagnostics.record("first_request", fields);
+    }
+    if (!this.firstTurn && rec.client?.turnOrigin === "human") {
+      this.firstTurn = true;
+      this.diagnostics.record("first_turn", fields);
+    }
+    this.observeMessageErrors(rec, fields);
+  }
+
+  private observeMessageErrors(
+    rec: Extract<RequestRecord, { kind: "messages" }>, fields: Record<string, unknown>
+  ): void {
+    const status = rec.upstreamStatus;
+    if (typeof status === "number" && status >= 400) {
+      this.diagnostics.recordLimited(`upstream:${status}`, "upstream_error", fields);
+    }
+    if (rec.compress?.timedOut) {
+      this.diagnostics.recordLimited("compress_timeout", "compress_timeout",
+        { ms: rec.compress.ms, request_kb: kb(rec.requestBytes) });
+    }
+  }
+
+  private observeMemtree(rec: Extract<RequestRecord, { kind: "memtree" }>): void {
+    if (rec.ok) return;
+    this.diagnostics.recordLimited(`memtree:${rec.status ?? "none"}`, "memtree_error", {
+      status: rec.status, index_only: rec.indexOnly, ms: rec.ms, request_kb: kb(rec.requestBytes),
+    });
+  }
+}
+
+/** Record a launcher error by code only: Node's errno and class name, never its message. */
+export function recordError(
+  diagnostics: DiagnosticsRecorder, code: DiagnosticsErrorCode, err: unknown
+): void {
+  const e = err as { code?: unknown; name?: unknown } | null;
+  diagnostics.record("error", {
+    code,
+    errno: errnoName(e?.code),
+    error_name: errorClassName(e?.name),
+  });
+}
+
+/** The install id, created (0600) on first use; null when it cannot be read or written. */
+export function readOrCreateInstallId(configDir: string): { id: string; created: boolean } | null {
+  const file = join(configDir, INSTALL_ID_FILE);
+  try {
+    const existing = readFileSync(file, "utf-8").trim();
+    if (UUID_RE.test(existing)) return { id: existing, created: false };
+  } catch {
+    // Missing: create it below.
+  }
+  try {
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const id = randomUUID();
+    writeFileSync(file, `${id}\n`, { mode: 0o600 });
+    chmodSync(file, 0o600);
+    return { id, created: true };
+  } catch {
+    return null;
+  }
+}
+
+/** Environment context; every value is mapped onto an allowlisted shape. */
+export function environmentContext(env: NodeJS.ProcessEnv, cccVersion: string): Record<string, unknown> {
+  return {
+    ccc_version: threePartVersion(cccVersion),
+    node: threePartVersion(process.versions.node),
+    os: process.platform,
+    os_release: /^\d{1,4}(?:\.\d{1,6}){0,2}/.exec(os.release())?.[0],
+    arch: process.arch,
+    terminal: terminalName(env),
+    locale: localeName(),
+    wsl: process.platform === "linux" && (env.WSL_DISTRO_NAME !== undefined || env.WSL_INTEROP !== undefined),
+  };
+}
+
+export function terminalName(env: NodeJS.ProcessEnv): string {
+  const raw = env.TERM_PROGRAM;
+  if (!raw) return env.WT_SESSION ? "Windows_Terminal" : "none";
+  const known = (TERMINALS as readonly string[]).find((t) => t.toLowerCase() === raw.toLowerCase());
+  return known ?? "other";
+}
+
+export function localeName(): string {
+  try {
+    const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+    return /^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?$/.test(locale) ? locale : "other";
+  } catch {
+    return "other";
+  }
+}
+
+function turnType(value: string): string {
+  return (TURN_TYPES as readonly string[]).includes(value) ? value : "other";
+}
+
+function kb(bytes: number | undefined): number | undefined {
+  return typeof bytes === "number" ? Math.round(bytes / 1024) : undefined;
+}
+
+function envFlagSet(value: string | undefined): boolean {
+  return value !== undefined && /^(1|true|yes|on)$/i.test(value.trim());
+}

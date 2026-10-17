@@ -187,6 +187,28 @@ Claude Code ──▶ localhost proxy (ccc)
 - Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
 
+### Diagnostics
+
+`ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
+
+- versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
+  architecture, terminal type and locale;
+- lifecycle events (first run, sign-in prompt shown, key accepted or rejected, session start,
+  the MemTree-paused notice shown, update hint or background update result);
+- errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
+  compression timeout).
+
+Never sent: your prompts or any conversation content, file paths, project or repository names,
+hostnames, usernames, environment values, keys or tokens, or error message text. Each event is
+checked against a fixed allowlist on your machine before it is queued, and again by the server.
+They are tied to your MemTree key when you have one, otherwise to a random install id in
+`~/.claude-code-infinite/install_id`. Sending is batched in the background and never slows a
+request; a failed send is dropped.
+
+Turn diagnostics off with any of: `CCC_NO_DIAGNOSTICS=1`, `"diagnostics": false` in
+`~/.claude-code-infinite/config.json`, `DO_NOT_TRACK=1`, or Claude Code's own
+`DISABLE_TELEMETRY=1` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`.
+
 ### Memory tools
 
 Interactive `ccc` sessions also get a small MCP server, `memtree`, with four read-only tools (see [Search across sessions](#search-across-sessions)): `mcp__memtree__search` (`query`; optional `tree`, `"current"` for this session or omitted for all of your sessions; `mode` `text` (default, free) or `vector` (meaning, first page charged); `project`, `since`, `until`, `cursor`, `limit` (default 10, at most 50)), `mcp__memtree__read_node` (`node`, an address `<tree>#<id>` from search, or `id` with optional `tree`: summary, path from the root, children, leaf line range), `mcp__memtree__read_lines` (a leaf's `node`, or `block`, `start`, `end` with optional `tree`: exact transcript lines, at most 400 lines / 40k characters per call) (with `tail: true` instead, the newest messages after the tree that are not indexed yet) and `mcp__memtree__list` (your sessions, most recently active first; `since`, `until`, `project`, `q`, `cursor`, `limit`). Other sessions' trees are named explicitly by reference and authorized by your MemTree key. This session's tree (`tree: "current"`, or no `tree` on `read_node`/`read_lines`) is the one the current request was served from: the server asks the `ccc` proxy for `GET $ANTHROPIC_BASE_URL/memtree/current?session=<id>` (only that session's compression source page, or its stored source page on resume; `current.json?session=<id>` returns the page itself). Completed pages are cached. If the proxy temporarily serves an older prefix while a newer tree is indexing, the tools reuse that prefix during a 45-second cooldown, then check the page again. `ccc` registers it with `--mcp-config=<temp file>`, which keeps working under `--strict-mcp-config`, and pre-allows the four read-only tools; `CCC_MEMTREE_MCP=0` turns it off. The MCP process requires `CLAUDE_CODE_SESSION_ID` and checks that both the pointer and page belong to it. If Claude Code retains an MCP process with an old session ID after `/clear` or a session switch, reconnect the MCP server with the current session ID; it cannot infer a new identity from another session using the proxy. Print (`-p`) and non-TTY runs get it only when their own `--mcp-config` names a server `memtree` run by `ccc memtree-mcp` (add `--allowedTools mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines,mcp__memtree__list`). Whenever the tools are configured, compress calls carry `x-memtree-tools: search,read_node,read_lines,list` so MemTree tells the model how to use them.
