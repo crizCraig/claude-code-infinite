@@ -118,11 +118,8 @@ function openUrl(url: string): void {
     : exec(`${command} "${url}"`);
 }
 
-async function promptForApiKey(mode: Mode): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+async function promptForApiKey(mode: Mode, output: NodeJS.WritableStream): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output });
 
   const url =
     mode === "local"
@@ -336,9 +333,12 @@ async function main() {
     diagnostics.record("sign_in_prompt");
     // The user may quit at the prompt: send what is known now.
     diagnostics.flushNow();
-    polychatApiKey = await promptForApiKey(mode);
+    // Only a terminal can answer; a print run's stdout stays Claude's.
+    polychatApiKey = process.stdin.isTTY === true
+      ? await promptForApiKey(mode, interactiveUi ? process.stdout : process.stderr)
+      : undefined;
     if (!polychatApiKey) {
-      console.error("A MemTree API key is required.");
+      console.error("A MemTree API key is required: run `ccc` in a terminal once to save one.");
       await diagnostics.flush();
       process.exit(1);
     }

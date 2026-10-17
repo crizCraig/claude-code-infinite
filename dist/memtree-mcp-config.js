@@ -23,9 +23,9 @@
  *   The server writes only to its own stdio pipe, so `-p` output (text, json,
  *   stream-json) is unchanged apart from what the model does with the tools.
  * - The caller's choices win (planMemtreeMcp): `CCC_MEMTREE_MCP=0` turns it
- *   off; a caller's own `--mcp-config` server named `memtree` is kept and ccc
- *   adds and pre-allows nothing (if it runs `ccc memtree-mcp` the header is
- *   still sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
+ *   off; a caller's own `--mcp-config` server named `memtree` (or a config
+ *   ccc cannot read, which might define one) is kept and ccc adds and
+ *   pre-allows nothing (if it runs `ccc memtree-mcp` the header is still sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
  *   or a `*` pattern) are neither pre-allowed nor named in the header, and
  *   with all four disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
@@ -84,7 +84,7 @@ export function planMemtreeMcp(args, env, cwd = process.cwd()) {
     const callerServer = memtreeServerInArgs(args, cwd);
     if (callerServer === "ccc")
         return { register: false, tools };
-    if (callerServer === "other" || !memtreeMcpEnabledByEnv(env) || tools.length === 0) {
+    if (callerServer !== "none" || !memtreeMcpEnabledByEnv(env) || tools.length === 0) {
         return { register: false, tools: [] };
     }
     return { register: true, tools };
@@ -117,26 +117,22 @@ export function mcpConfigArgs(args) {
     return optionValues(args, ["--mcp-config"]);
 }
 /**
- * Whether Claude's argv already configures ccc's `memtree` server: a server
- * named `memtree` whose command line runs `memtree-mcp` (`ccc memtree-mcp` or
- * dist/memtree-mcp.js). Unreadable or malformed configs count as no.
- */
-export function argsConfigureMemtreeMcp(args, cwd = process.cwd()) {
-    return memtreeServerInArgs(args, cwd) === "ccc";
-}
-/**
- * The server named `memtree` in the argv's `--mcp-config` values: "ccc" when
- * one runs `memtree-mcp`, "other" when only someone else's is named, "none".
+ * The server named `memtree` in the argv's `--mcp-config` values, judged by
+ * the last value that defines one (Claude Code keeps the last definition of
+ * a name): "ccc" when it runs `memtree-mcp` (`ccc memtree-mcp`, `ccc staging
+ * memtree-mcp`, or dist/memtree-mcp.js), "other" for someone else's, and
+ * "unknown" when a value ccc cannot read or parse comes after it (it may
+ * define one), "none" otherwise. Only `--mcp-config` can override ccc's
+ * server: it beats a project `.mcp.json` server of the same name (checked on
+ * Claude Code 2.1.302), and plugin servers get `plugin_…` names.
  */
 export function memtreeServerInArgs(args, cwd = process.cwd()) {
     let found = "none";
     for (const value of mcpConfigArgs(args)) {
         const server = memtreeServerIn(value, cwd);
-        if (server === undefined)
+        if (server === null)
             continue;
-        if (isCccMemtreeServer(server))
-            return "ccc";
-        found = "other";
+        found = server === undefined ? "unknown" : isCccMemtreeServer(server) ? "ccc" : "other";
     }
     return found;
 }
@@ -159,7 +155,10 @@ function optionValues(args, names) {
     }
     return values;
 }
-/** The `memtree` entry of one `--mcp-config` value (file or inline JSON), if any. */
+/**
+ * The `memtree` entry of one `--mcp-config` value (file or inline JSON):
+ * null when it defines none, undefined when it cannot be read or parsed.
+ */
 function memtreeServerIn(value, cwd) {
     let parsed;
     try {
@@ -172,13 +171,14 @@ function memtreeServerIn(value, cwd) {
         return undefined;
     }
     const server = parsed?.mcpServers?.[MEMTREE_MCP_SERVER_NAME];
+    if (server === undefined)
+        return null;
     return server && typeof server === "object" ? server : undefined;
 }
+/** A command line whose program or an argument is `memtree-mcp` or a memtree-mcp.js path. */
 function isCccMemtreeServer(server) {
-    const commandLine = [server.command, ...(Array.isArray(server.args) ? server.args : [])]
-        .filter((part) => typeof part === "string")
-        .join(" ");
-    return /memtree-mcp/.test(commandLine);
+    const parts = [server.command, ...(Array.isArray(server.args) ? server.args : [])];
+    return parts.some((part) => typeof part === "string" && /^memtree-mcp(\.js)?$/.test(path.basename(part)));
 }
 function memtreeToolName(tool) {
     return `mcp__${MEMTREE_MCP_SERVER_NAME}__${tool}`;

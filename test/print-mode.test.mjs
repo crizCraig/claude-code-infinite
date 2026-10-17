@@ -49,7 +49,7 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome() {
+function fakeClaudeHome({ key = "test-key" } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   const bin = path.join(home, "bin");
   fs.mkdirSync(bin);
@@ -71,13 +71,13 @@ function fakeClaudeHome() {
   const configDir = path.join(home, ".claude-code-infinite");
   fs.mkdirSync(configDir, { mode: 0o700 });
   fs.writeFileSync(path.join(configDir, "config.json"),
-    JSON.stringify({ localPolychatApiKey: "test-key", diagnostics: false, updateCheck: false }),
+    JSON.stringify({ localPolychatApiKey: key, diagnostics: false, updateCheck: false }),
     { mode: 0o600 });
   return { home, bin };
 }
 
-function runCcc(args, extraEnv = {}) {
-  const { home, bin } = fakeClaudeHome();
+function runCcc(args, extraEnv = {}, home_ = {}) {
+  const { home, bin } = fakeClaudeHome(home_);
   const env = {
     ...process.env, HOME: home, USERPROFILE: home, CCC_NO_DIAGNOSTICS: "1",
     PATH: `${bin}${path.delimiter}${process.env.PATH}`,
@@ -121,4 +121,12 @@ test("ccc -p with CCC_MEMTREE_MCP=0: Claude's argv is untouched", { timeout: 30_
   const { code, stdout, stderr } = await runCcc(["-p", "hi"], { CCC_MEMTREE_MCP: "0" });
   assert.equal(code, 0, stderr);
   assert.deepEqual(JSON.parse(stdout.trim()).args, ["-p", "hi"]);
+});
+
+test("ccc -p with no saved key and no terminal: fails on stderr, never prompts on stdout", { timeout: 30_000 }, async () => {
+  const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, { key: null });
+  assert.equal(code, 1);
+  assert.equal(stdout, "");
+  assert.match(stderr, /MemTree API key is required/);
+  assert.match(stderr, /run `ccc` in a terminal/);
 });

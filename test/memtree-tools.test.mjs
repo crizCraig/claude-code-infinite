@@ -26,7 +26,7 @@ import {
 import { formatSessions, formatSearchResults, searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
 import { readProjectMeta, repoNameFromRemote } from "../dist/project-meta.js";
 import {
-  argsConfigureMemtreeMcp,
+  memtreeServerInArgs,
   mcpConfigArgs,
   MEMTREE_ALLOWED_TOOLS,
   MEMTREE_TOOLS_HEADER_VALUE,
@@ -584,12 +584,12 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
   try {
     const probe = path.join(dir, "probe.json");
     fs.writeFileSync(probe, JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["memtree-mcp"] } } }));
-    assert.equal(argsConfigureMemtreeMcp(["-p", "q", "--mcp-config", "probe.json"], dir), true);
-    assert.equal(argsConfigureMemtreeMcp([`--mcp-config=${JSON.stringify(config)}`]), true);
+    assert.equal(memtreeServerInArgs(["-p", "q", "--mcp-config", "probe.json"], dir), "ccc");
+    assert.equal(memtreeServerInArgs([`--mcp-config=${JSON.stringify(config)}`]), "ccc");
     fs.writeFileSync(probe, JSON.stringify({ mcpServers: { memtree: { command: "other-server" } } }));
-    assert.equal(argsConfigureMemtreeMcp(["--mcp-config", probe]), false, "someone else's memtree server");
-    assert.equal(argsConfigureMemtreeMcp(["--mcp-config", path.join(dir, "missing.json")]), false);
-    assert.equal(argsConfigureMemtreeMcp(["-p", "q"]), false);
+    assert.equal(memtreeServerInArgs(["--mcp-config", probe]), "other", "someone else's memtree server");
+    assert.equal(memtreeServerInArgs(["--mcp-config", path.join(dir, "missing.json")]), "unknown");
+    assert.equal(memtreeServerInArgs(["-p", "q"]), "none");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

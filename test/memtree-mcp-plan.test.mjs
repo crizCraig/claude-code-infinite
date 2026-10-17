@@ -9,6 +9,7 @@ import path from "node:path";
 import {
   MEMTREE_ALLOWED_TOOLS,
   disallowedMemtreeTools,
+  memtreeServerInArgs,
   planMemtreeMcp,
   withMemtreeMcpArgs,
 } from "../dist/memtree-mcp-config.js";
@@ -103,4 +104,29 @@ test("pre-allow adds only the memtree tools ccc registers; the caller's lists st
   const allowed = withMemtreeMcpArgs(["q"], "/tmp/m.json")[1].slice("--allowedTools=".length).split(",");
   assert.deepEqual(allowed, MEMTREE_ALLOWED_TOOLS);
   assert.ok(allowed.every((tool) => /^mcp__memtree__(search|read_node|read_lines|list)$/.test(tool)));
+});
+
+test("a --mcp-config ccc cannot read might define memtree: fail closed (no server, no pre-allow)", () => {
+  withConfigDir((dir) => {
+    for (const value of [path.join(dir, "missing.json"), "{not json", path.join(dir, "bad.json")]) {
+      fs.writeFileSync(path.join(dir, "bad.json"), "\ufeff{]");
+      assert.deepEqual(planMemtreeMcp(["-p", `--mcp-config=${value}`], {}), { register: false, tools: [] }, value);
+    }
+    // Readable configs without a memtree server leave ccc's in place.
+    fs.writeFileSync(path.join(dir, "empty.json"), JSON.stringify({ mcpServers: {} }));
+    assert.deepEqual(planMemtreeMcp(["-p", "--mcp-config", path.join(dir, "empty.json")], {}),
+      { register: true, tools: ALL });
+  });
+});
+
+test("the last memtree definition wins, as in Claude Code; only ccc's own server counts as ccc's", () => {
+  const ccc = JSON.stringify({ mcpServers: { memtree: { command: "ccc", args: ["staging", "memtree-mcp"] } } });
+  const script = JSON.stringify({ mcpServers: { memtree: { command: "node", args: ["/x/dist/memtree-mcp.js"] } } });
+  const foreign = JSON.stringify({ mcpServers: { memtree: { command: "npx", args: ["some-memtree-mcp"] } } });
+  assert.equal(memtreeServerInArgs([`--mcp-config=${ccc}`]), "ccc");
+  assert.equal(memtreeServerInArgs([`--mcp-config=${script}`]), "ccc");
+  assert.equal(memtreeServerInArgs([`--mcp-config=${foreign}`]), "other");
+  assert.equal(memtreeServerInArgs([`--mcp-config=${ccc}`, `--mcp-config=${foreign}`]), "other");
+  assert.equal(memtreeServerInArgs([`--mcp-config=${foreign}`, `--mcp-config=${ccc}`]), "ccc");
+  assert.equal(memtreeServerInArgs(["-p", "q"]), "none");
 });
