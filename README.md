@@ -225,6 +225,8 @@ ccc -p --resume <session-id> --output-format json "…"
 
 Start the session with `ccc -p --session-id <uuid> "…"` (or take `session_id` from the first JSON result). Never run two `ccc` processes on one session at the same time: both would append to the same transcript. Headless runs have the [memory tools](#memory-tools) with no extra flags (`CCC_MEMTREE_MCP=0` turns them off; they can read all of the sessions your MemTree key owns, so give each user of a shared agent platform their own key). Stdout carries only Claude Code's output, so `--output-format json` and `stream-json` parse as with `claude`; `ccc`'s own lines (banner, mode, request log path) go to stderr. `--mcp-config` takes several values, so pass your own as `--mcp-config=<file>` or put the prompt before it; otherwise it swallows a prompt that follows it.
 
+The full guide for agent platforms (setup, output parsing, memory tools, tree links, older versions) is [docs/headless.md](docs/headless.md).
+
 ## How it works
 
 <table><tr><td>

@@ -1,0 +1,129 @@
+# Running agents on Claude Code Infinite (`ccc -p`)
+
+For agent platforms and scripts that drive Claude Code headlessly (`claude -p`) and want
+long-term memory: each agent keeps one conversation that can run past the context limit
+without losing what it learned.
+
+This guide is for ccc 1.0.23 and later. See [Older versions](#older-versions) for 1.0.22.
+
+## 1. One-time setup (per person or machine)
+
+1. You need a **Claude Pro or Max subscription** (Claude Code logs in with it).
+2. Sign up at https://polychat.co and create a MemTree key. Use your own account and don't
+   share keys: every session on a key lands in that key's memory and search results.
+3. Install and run once in a terminal, so ccc stores your key and Claude Code logs in:
+   ```bash
+   npm install -g claude-code-infinite
+   ccc            # paste your MemTree key when asked; log in to Claude if prompted; then /exit
+   ```
+   After this, headless runs work unattended. A headless run with no saved key exits with
+   status 1 and says so on stderr; it never waits for input. ccc keeps itself updated
+   automatically in interactive sessions.
+
+## 2. The core pattern: one session per agent
+
+Start a session, keep its id, and resume it on every call. The conversation (and its memory)
+grows across calls. Once it nears the model's context limit, MemTree compresses it instead of
+Claude Code's `/compact`, so details aren't wiped.
+
+```bash
+# First call: start the agent's session and capture its id
+sid=$(printf '%s' "You are the inventory agent for ... (instructions)" \
+      | ccc -p --output-format json | jq -r .session_id)
+
+# Every later call: resume the same session
+printf '%s' "Restock report for today: ..." \
+  | ccc -p --resume "$sid" --output-format json | jq -r .result
+```
+
+You can also choose the id yourself: `ccc -p --session-id <uuid> "…"` for the first call, then
+`ccc -p --resume <uuid> "…"`.
+
+Rules of thumb:
+- **One session per long-lived agent.** Store the `session_id` with the agent.
+- **Never run two processes on the same session at once.** Both would append to the same
+  transcript. Queue each agent's calls.
+- **Resume by id, not with `--continue`.** With `--continue`, Claude Code starts MCP servers
+  before it switches to the continued session, so the memory tools can't open that session's own
+  tree (`list` and searches across sessions still work).
+- **Prefer a few long-lived agents over many one-shot calls.** A session gets its first memory
+  tree once it has roughly 10k tokens of conversation; tiny one-off calls never get one.
+- **Pipe the prompt on stdin**, or put it before any `--mcp-config`. Claude Code's
+  `--mcp-config` takes several values and swallows a prompt placed after it; pass your own as
+  `--mcp-config=<file>`.
+- Use any Claude Code flags as usual (`--model`, `--allowedTools`, `--append-system-prompt`, ...).
+
+**Output:** stdout carries only Claude Code's output, so `--output-format json` and
+`stream-json` parse exactly as with `claude`. ccc's own lines (its banner, the environment and
+the request log path) go to stderr.
+
+## 3. Searching memory across sessions
+
+Every ccc session, headless or interactive, gets MemTree's four read-only tools with no extra
+flags: `mcp__memtree__search` (text or meaning, in this session's tree or across all your
+sessions), `mcp__memtree__list`, `mcp__memtree__read_node` and `mcp__memtree__read_lines`. An
+agent can look up what it or any other agent on the same key decided, tried or ruled out. ccc
+pre-allows these four tools, so a `-p` run can call them without a permission prompt.
+
+Your own flags win:
+- `CCC_MEMTREE_MCP=0` turns the tools off.
+- `--disallowedTools mcp__memtree` (or a single tool, or `mcp__memtree__*`) removes them;
+  ccc neither pre-allows nor advertises a disallowed tool.
+- Your `--allowedTools` list is kept: ccc adds only the four memtree tools to it.
+- If your own `--mcp-config` defines a server named `memtree`, ccc adds nothing and yours is
+  used. You don't need one, but if you write one, run ccc's server with
+  `{"mcpServers": {"memtree": {"command": "ccc", "args": ["memtree-mcp"]}}}` and pre-allow
+  the tools yourself with `--allowedTools`.
+
+The tools can read every session your MemTree key owns. If your platform runs agents for
+different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.
+
+## 4. Seeing an agent's memory
+
+Every session's memory is a tree you can open in the browser, search, share, or paste into any
+agent as context. Your sessions and trees are listed at https://app.polychat.co/usage.
+
+A headless run doesn't print its tree link (stdout stays Claude Code's). To show an agent's
+tree on your platform:
+- open the session from https://app.polychat.co/usage, or
+- ask the agent: `mcp__memtree__list` returns each session with its latest tree link.
+
+A session's newest tree is built in the background after a call ends, so it can trail the last
+call by a minute or two.
+
+## 5. Useful settings
+
+| Setting | Effect |
+| --- | --- |
+| `CCC_COMPACT_TARGET=500k` | Compress to this size when a session reaches the budget (default: half the budget). |
+| `CCC_MEMTREE_MCP=0` | Turn off the MemTree tools. |
+| `CCC_NO_UPDATE_CHECK=1` / `CCC_DISABLE_AUTOUPDATE=1` | Turn off update checks / automatic installs (e.g. to pin a version in CI). |
+| `CCC_NO_DIAGNOSTICS=1` | Turn off anonymous client diagnostics (versions, OS, error codes; never content). |
+
+## 6. Costs and terms
+
+- Claude Code usage comes out of your Claude subscription, as with plain Claude Code.
+- MemTree is billed per use on your polychat account (see https://app.polychat.co/usage).
+- Running your **own** agents on your own subscription is normal Claude Code headless use. If
+  your platform runs agents **for other people**, check Anthropic's terms for your case: they may
+  require an API key instead.
+
+## 7. Troubleshooting
+
+- `--resume requires a valid session ID`: the id was empty or mistyped; parse it from the JSON
+  as above.
+- `A MemTree API key is required`: no key is saved for this user; run `ccc` once in a terminal.
+- A call that hangs ~2 minutes then fails on a huge session: MemTree has no index for it yet
+  (e.g. a session moved between machines or accounts). It indexes in the background; retry later.
+- Logs: `~/.claude-code-infinite/logs/requests.jsonl` (one line per request, no content).
+
+## Older versions
+
+ccc 1.0.22 and earlier differ in three ways:
+- **Banner on stdout.** ccc prints a short banner before the JSON, so take the last line that
+  starts with `{`: `ccc -p --output-format json … | grep '^{' | tail -1 | jq -r .result`.
+- **No memory tools in `-p` runs.** The README's manual recipe (`--mcp-config` naming
+  `ccc memtree-mcp`) works only without an environment word: `ccc staging memtree-mcp` starts a
+  Claude session instead of the server and times out. Upgrade to get the tools by default.
+- **No saved key.** A headless run prints the key prompt to stdout and exits with status 0;
+  check for a `session_id` in the output.

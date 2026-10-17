@@ -25,7 +25,8 @@
  * - The caller's choices win (planMemtreeMcp): `CCC_MEMTREE_MCP=0` turns it
  *   off; a caller's own `--mcp-config` server named `memtree` (or a config
  *   ccc cannot read, which might define one) is kept and ccc adds and
- *   pre-allows nothing (if it runs `ccc memtree-mcp` the header is still sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
+ *   pre-allows nothing (if it runs `ccc memtree-mcp` the header is still
+ *   sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
  *   or a `*` pattern) are neither pre-allowed nor named in the header, and
  *   with all four disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
