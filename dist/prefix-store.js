@@ -160,6 +160,9 @@ function writeAtomically(dir, file, text) {
 function readPrivateFile(file, maxBytes) {
     let fd;
     try {
+        // Windows has no O_NOFOLLOW: refuse a symlink by lstat first (best effort).
+        if (NO_FOLLOW === 0 && fs.lstatSync(file).isSymbolicLink())
+            return undefined;
         fd = fs.openSync(file, fs.constants.O_RDONLY | NO_FOLLOW);
     }
     catch {

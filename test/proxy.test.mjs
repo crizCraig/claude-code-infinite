@@ -10131,10 +10131,12 @@ test("capture files and new or reused directories are private and exclude auth h
       const proxy = await startProxy({ memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "memtree-secret" }), upstreamOrigin: upstream.origin, captureDir: dir, reqlog: { log: r => records.push(structuredClone(r)) } });
       try {
         await postMessages(proxy.port, [{ role: "user", content: "hello" }], { ...SESSION, authorization: "Bearer anthropic-secret", "x-api-key": "api-secret" });
-        assert.equal(fs.statSync(dir).mode & 0o777, 0o700, `${mode} capture directory is private`);
+        // Windows has no POSIX mode bits (chmod sets only read-only).
+        const posix = process.platform !== "win32";
+        if (posix) assert.equal(fs.statSync(dir).mode & 0o777, 0o700, `${mode} capture directory is private`);
         const files = fs.readdirSync(dir);
         assert.equal(files.length, 1);
-        assert.equal(fs.statSync(path.join(dir, files[0])).mode & 0o777, 0o600);
+        if (posix) assert.equal(fs.statSync(path.join(dir, files[0])).mode & 0o777, 0o600);
         const contents = fs.readFileSync(path.join(dir, files[0]), "utf8");
         assert.deepEqual(JSON.parse(contents).messages, [{ role: "user", content: "hello" }]);
         assert.doesNotMatch(contents + JSON.stringify(records), /anthropic-secret|api-secret|memtree-secret/);

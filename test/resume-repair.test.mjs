@@ -213,7 +213,7 @@ test("concurrent writers, changed snapshots and backup collisions skip without t
       if (mode === "version") fs.appendFileSync(f.file, JSON.stringify(response("new", "claude-future", usage(2_000_000))) + "\n");
       if (mode === "unknown-last") fs.appendFileSync(f.file, '{"type":"assistant","message":{"id":"new"}}\n');
       if (mode === "backup") fs.openSync = (name, flags, ...rest) => {
-        if (String(name).startsWith(f.options.backupDir)) {
+        if (collision === undefined && String(name).startsWith(f.options.backupDir)) {
           collision = name;
           // realOpen, not fs.writeFileSync: Node 20's writeFileSync calls the
           // patched fs.openSync and would recurse.
