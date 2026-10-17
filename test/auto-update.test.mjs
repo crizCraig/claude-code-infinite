@@ -499,7 +499,10 @@ test("setup: an install hides the hint; a skip shows it; a landed install shows 
   assert.equal(s.bannerUpdate, null);
   assert.equal(s.bannerInstalled, null);
   assert.match(s.debugLine, /install method npm-global .*installing 1\.0\.21 in the background/);
-  const result = await new Promise((resolve) => s.scheduleInstall(0, resolve));
+  // The install timer is unref'd; hold the loop open or Node 20 may exit first.
+  const keepAlive = setInterval(() => {}, 1000);
+  const result = await new Promise((resolve) => s.scheduleInstall(0, resolve))
+    .finally(() => clearInterval(keepAlive));
   assert.equal(result, "started");
   assert.equal(calls.length, 1);
 

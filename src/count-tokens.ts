@@ -28,6 +28,12 @@ import { approxTokensFromBytes } from "./reqlog.js";
  * count is slow: a fast count returns as soon as it is done.
  */
 export const COUNT_TOKENS_TIMEOUT_MS = 3_000;
+/**
+ * Less deadline than this left is none: no count completes that fast, and a
+ * timer can fire a millisecond before Date.now() says it is due (Node 20), so
+ * a timed-out attempt would otherwise leave a sliver for a pointless second one.
+ */
+const MIN_COUNT_ATTEMPT_MS = 5;
 /** Upload rate the allowance still covers, in bytes per ms (1 MB/s). */
 export const COUNT_UPLOAD_BYTES_PER_MS = 1_000;
 /** Most a request waits on counting, however large its bodies. */
@@ -203,7 +209,7 @@ export function createCountTokensSession(
       const remaining = allowance - clock.spent();
       const skipped: CountTokensOutcome | undefined = options.signal?.aborted ? "aborted"
         : tooLarge ? "too-large" : cooldowns.active(account) ? "cooldown"
-          : remaining <= 0 ? "deadline" : undefined;
+          : remaining < MIN_COUNT_ATTEMPT_MS ? "deadline" : undefined;
       const attempt = skipped
         ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped, bytes: body.length })
         : clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs: remaining }))

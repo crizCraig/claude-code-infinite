@@ -215,7 +215,10 @@ test("concurrent writers, changed snapshots and backup collisions skip without t
       if (mode === "backup") fs.openSync = (name, flags, ...rest) => {
         if (String(name).startsWith(f.options.backupDir)) {
           collision = name;
-          fs.writeFileSync(name, "existing backup");
+          // realOpen, not fs.writeFileSync: Node 20's writeFileSync calls the
+          // patched fs.openSync and would recurse.
+          const fd = realOpen(name, "w");
+          try { fs.writeSync(fd, "existing backup"); } finally { fs.closeSync(fd); }
           assert.equal(flags, "wx", "backup creation must be exclusive");
         }
         return realOpen(name, flags, ...rest);
