@@ -13,6 +13,30 @@ export function isPrintInvocation(args: string[]): boolean {
   return false;
 }
 
+/** ccc's own subcommands, which start no Claude session. */
+const SUBCOMMANDS = ["fetch", "memtree-mcp", "link"] as const;
+const ENVIRONMENT_WORDS = ["local", "staging"];
+
+export type CccEnvironment = "production" | "staging" | "local";
+
+/** The environment a leading `local`/`staging` word selects (else production). */
+export function environmentOf(args: readonly string[]): CccEnvironment {
+  return args[0] === "local" ? "local" : args[0] === "staging" ? "staging" : "production";
+}
+
+/**
+ * A ccc subcommand and its arguments: the first word, or the word after
+ * `local`/`staging` (`ccc staging memtree-mcp` is the same server as
+ * `ccc memtree-mcp`; the environment is the proxy's, from its base URL).
+ */
+export function subcommandArgs(
+  args: readonly string[]
+): { name: (typeof SUBCOMMANDS)[number]; args: string[] } | undefined {
+  const start = ENVIRONMENT_WORDS.includes(args[0] ?? "") ? 1 : 0;
+  const name = SUBCOMMANDS.find((command) => command === args[start]);
+  return name ? { name, args: args.slice(start + 1) } : undefined;
+}
+
 /**
  * Consume ccc's own flags only before the conventional `--` separator. Values
  * after it are literal Claude arguments/prompts, even when they look like ccc

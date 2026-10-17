@@ -27,6 +27,7 @@ export declare const NEWEST_TREE_UNSUPPORTED_MS: number;
 export declare const NEWEST_TREE_WAIT_MS = 2500;
 /** A lookup that has not answered by then is dropped; the next peek retries. */
 export declare const NEWEST_TREE_FETCH_TIMEOUT_MS = 10000;
+export declare const SESSION_ID: RegExp;
 export interface NewestTree {
     /** The server-selected page, including its pinned namespace and source. */
     url: string;

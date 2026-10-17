@@ -28,11 +28,13 @@ import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, hyperlink, } from "./payment-gate.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
-import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, } from "./cli-args.js";
+import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, subcommandArgs, } from "./cli-args.js";
+import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
+import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
-import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
+import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, exitCodeForChild, settleWithin, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
@@ -65,11 +67,8 @@ function openUrl(url) {
         ? exec(`${command} "${url}"`, { shell: "cmd.exe" })
         : exec(`${command} "${url}"`);
 }
-async function promptForApiKey(mode) {
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-    });
+async function promptForApiKey(mode, output) {
+    const rl = readline.createInterface({ input: process.stdin, output });
     const url = mode === "local"
         ? "http://local.polychat.co:5173/memtree-api"
         : POLYCHAT_AUTH_URL;
@@ -189,6 +188,19 @@ function installedClaudeSupportsMessageDisplay() {
         return false;
     }
 }
+/** `ccc link` in this environment: its server, its saved key, real stdio. */
+function linkDeps(mode) {
+    return {
+        fetch: globalThis.fetch,
+        baseUrl: mode === "local" ? LOCAL_BASE_URL : mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
+        apiKey: mode === "local" ? getLocalPolychatApiKey() :
+            mode === "staging" ? getStagingPolychatApiKey() :
+                getPolychatApiKey(),
+        command: mode === "production" ? "ccc" : `ccc ${mode}`,
+        stdout: (text) => process.stdout.write(text),
+        stderr: (text) => process.stderr.write(text),
+    };
+}
 async function main() {
     const parsedArgs = parseWrapperArgs(process.argv.slice(2));
     const isDebugMode = parsedArgs.debug;
@@ -196,20 +208,35 @@ async function main() {
     // `ccc fetch <memtree-url>`: read one of the user's MemTree pages with the
     // stored key and print it. No proxy, no Claude — an agent's escape hatch
     // when it is not running inside a ccc session.
-    if (filteredArgs[0] === "fetch") {
-        process.exit(await runMemtreeFetchCommand(filteredArgs.slice(1)));
-    }
     // `ccc memtree-mcp`: the `memtree` MCP server over stdio (memtree-mcp.ts),
     // for an --mcp-config a caller writes (e.g. the memory recall probe). It
     // reads the tree through the ccc proxy in its inherited ANTHROPIC_BASE_URL.
-    if (filteredArgs[0] === "memtree-mcp") {
+    // Both also follow `local`/`staging`, whose proxy the base URL already is.
+    const subcommand = subcommandArgs(filteredArgs);
+    if (subcommand?.name === "fetch") {
+        process.exit(await runMemtreeFetchCommand(subcommand.args));
+    }
+    if (subcommand?.name === "memtree-mcp") {
         runMemtreeMcpServer();
         return;
     }
-    const mode = filteredArgs[0] === "local" ? "local" :
-        filteredArgs[0] === "staging" ? "staging" :
-            "production";
+    const mode = environmentOf(filteredArgs);
+    // `ccc [staging|local] link <session-id>`: the session's newest MemTree page.
+    if (subcommand?.name === "link") {
+        // exitCode, not exit(): a piped stdout (async on macOS) gets its line out first.
+        process.exitCode = await runLinkCommand(subcommand.args, linkDeps(mode));
+        return;
+    }
     const claudeArgs = mode !== "production" ? filteredArgs.slice(1) : filteredArgs;
+    // Interactive UI only: print/non-TTY invocations are programmatic
+    // interfaces whose output must stay byte-for-byte vanilla, and they get no
+    // notice plugin to deliver a banner anyway. Their stdout is Claude's alone:
+    // ccc's own lines (banner, mode, request log, debug) go to stderr.
+    const interactiveUi = !isPrintInvocation(claudeArgs) &&
+        process.stdin.isTTY === true &&
+        process.stdout.isTTY === true;
+    if (!interactiveUi)
+        routeConsoleToStderr();
     printBanner();
     if (isDebugMode) {
         console.log("\x1b[1;36m🔍 DEBUG MODE\x1b[0m\n");
@@ -234,9 +261,12 @@ async function main() {
         diagnostics.record("sign_in_prompt");
         // The user may quit at the prompt: send what is known now.
         diagnostics.flushNow();
-        polychatApiKey = await promptForApiKey(mode);
+        // Only a terminal can answer; a print run's stdout stays Claude's.
+        polychatApiKey = process.stdin.isTTY === true
+            ? await promptForApiKey(mode, interactiveUi ? process.stdout : process.stderr)
+            : undefined;
         if (!polychatApiKey) {
-            console.error("A MemTree API key is required.");
+            console.error("A MemTree API key is required: run `ccc` in a terminal once to save one.");
             await diagnostics.flush();
             process.exit(1);
         }
@@ -253,12 +283,6 @@ async function main() {
         }
         console.log("API key saved.\n");
     }
-    // Interactive UI only: print/non-TTY invocations are programmatic
-    // interfaces whose output must stay byte-for-byte vanilla, and they get no
-    // notice plugin to deliver a banner anyway.
-    const interactiveUi = !isPrintInvocation(claudeArgs) &&
-        process.stdin.isTTY === true &&
-        process.stdout.isTTY === true;
     // Check the key's payment status before claude takes over the terminal.
     // Bounded (2s) and null on error — startup never fails or hangs on polychat
     // availability. The npm update check runs concurrently under the same
@@ -315,11 +339,11 @@ async function main() {
     // request log, plus a few allowlisted numbers for diagnostics.
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics);
     // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
-    // interactive sessions unless CCC_MEMTREE_MCP=0; print/non-TTY runs have it
-    // only when their own --mcp-config names it. Either way MemTree is told
-    // (x-memtree-tools) only when the session really has the tools.
-    const autoMemtreeMcp = interactiveUi && memtreeMcpEnabledByEnv(process.env);
-    const memtreeToolsConfigured = autoMemtreeMcp || argsConfigureMemtreeMcp(claudeArgs);
+    // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
+    // the caller's own --mcp-config names a `memtree` server, or its
+    // --disallowedTools covers all four tools. MemTree is told
+    // (x-memtree-tools) only which tools the session really has.
+    const memtreeMcpPlan = planMemtreeMcp(claudeArgs, process.env);
     // Start the local proxy. Claude Code's OAuth token flows through it straight
     // to api.anthropic.com and never reaches polychat.co.
     const memtree = new MemtreeClient({
@@ -328,7 +352,7 @@ async function main() {
         debug: isDebugMode,
         reqlog: observedLog,
         // Mutable below: a failed config write withdraws it before any call.
-        memtreeTools: memtreeToolsConfigured ? MEMTREE_TOOLS_HEADER_VALUE : undefined,
+        memtreeTools: memtreeMcpPlan.tools.length ? memtreeMcpPlan.tools.join(",") : undefined,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
@@ -424,16 +448,15 @@ async function main() {
         }
     }
     let memtreeMcpConfig = null;
-    if (autoMemtreeMcp) {
+    if (memtreeMcpPlan.register) {
         try {
             memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`);
-            childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path);
+            childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path, memtreeMcpPlan.tools);
         }
         catch (err) {
             // Optional like the notice plugin; without it MemTree must not name
-            // tools the session lacks.
-            if (!argsConfigureMemtreeMcp(claudeArgs))
-                memtree.setMemtreeTools(undefined);
+            // tools the session lacks (ccc registers only when the caller has none).
+            memtree.setMemtreeTools(undefined);
             if (isDebugMode) {
                 console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
             }

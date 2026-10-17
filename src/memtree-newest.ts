@@ -33,7 +33,7 @@ const SESSIONS_LIMIT = 10;
 const MAX_SESSIONS = 200;
 const MAX_PENDING = 8;
 const MAX_PAGES = 32;
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+export const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 export interface NewestTree {
   /** The server-selected page, including its pinned namespace and source. */
