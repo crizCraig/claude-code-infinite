@@ -443,10 +443,12 @@ test("startup banner rides a SessionStart command hook emitting systemMessage JS
     );
     // Every shell Claude Code might use must yield byte-identical valid JSON.
     // /bin/sh always exists; bash and zsh are checked where installed (Linux
-    // CI images ship without zsh).
-    const shells = ["/bin/sh", "/bin/bash", "/bin/zsh"].filter(
-      (shell) => shell === "/bin/sh" || fs.existsSync(shell)
-    );
+    // CI images ship without zsh). Windows runs hook commands in Git Bash.
+    const shells = process.platform === "win32"
+      ? ["bash"]
+      : ["/bin/sh", "/bin/bash", "/bin/zsh"].filter(
+        (shell) => shell === "/bin/sh" || fs.existsSync(shell)
+      );
     for (const shell of shells) {
       const stdout = execSync(hook.command, { shell, encoding: "utf-8" });
       assert.deepEqual(
@@ -642,6 +644,34 @@ for (const color of [true, false]) {
     assert.ok(output.split("\n").length <= 3, "title, URL, hint");
     assert.ok(!color || output === unlink(output));
     if (!color) assert.ok(!output.includes("\x1b"), "NO_COLOR has no ANSI");
+  });
+
+  test(`a first tree that arrives with a compression is introduced under the success line (${mode})`, () => {
+    // "success" placement has no trailer: the success line is its only link.
+    for (const placement of ["turn", "success"]) {
+      const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+      const intro = introDouble(true);
+      queue.setFirstTreeIntro(intro);
+      const resolve = () => ({ key: "tree-1", link: "https://x/m/1" });
+      queue.setLink(resolve);
+      if (placement === "turn") queue.setTrailer(resolve, placement);
+      queue.queuePrefix("✓ MemTree · conversation optimized");
+      const hint = dim("Open it, or paste the link to any agent to give it this session's context");
+      assert.equal(
+        queue.claim(stop()).systemMessage,
+        `${green("✓ MemTree · conversation optimized")}\n${firstTree("https://x/m/1")}\n  ${hint}`,
+        placement
+      );
+      assert.deepEqual(intro.shown, ["session-1"], placement);
+      // Later success lines carry the plain link; the intro is once per session.
+      queue.queuePrefix("✓ MemTree · conversation optimized");
+      assert.equal(
+        queue.claim(stop()).systemMessage,
+        `${green("✓ MemTree · conversation optimized")}\n  https://x/m/1 ↗`,
+        placement
+      );
+      assert.deepEqual(intro.shown, ["session-1"], placement);
+    }
   });
 
   test(`a resumed session that already showed its link gets no first-tree notice (${mode})`, () => {

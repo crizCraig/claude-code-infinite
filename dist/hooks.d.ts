@@ -231,6 +231,8 @@ export declare class NoticeDeliveryQueue {
      * does not repeat the same link.
      */
     private renderSuccess;
+    /** No link has been shown for this session yet, and the first-tree intro is on. */
+    private isFirstLink;
     /** The session's current link, shown or not. Resolver failures never break a hook. */
     private currentLink;
     /** The link if its key changed since last shown, without marking it. Resolver failures never break a hook. */

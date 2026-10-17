@@ -521,11 +521,23 @@ export class NoticeDeliveryQueue {
     const text = resolveNoticeText(prefix);
     const link = this.currentLink(sessionId);
     if (link === undefined) return this.styleSuccess(text);
-    this.deliveryFor(sessionId).link = link.key;
-    this.deliveryFor(sessionId).successPage = noticePageIdentity(link.link);
-    this.deliveryFor(sessionId).trailer = link.key;
-    this.deliveryFor(sessionId).trailerUrl = link.link;
-    return `${this.styleSuccess(text)}\n${urlLine(link.link)}`;
+    // The session's first link may arrive with a compression: introduce it here,
+    // since marking it delivered below keeps the trailer from ever doing so.
+    const first = this.isFirstLink(sessionId);
+    const delivered = this.deliveryFor(sessionId);
+    delivered.link = link.key;
+    delivered.successPage = noticePageIdentity(link.link);
+    delivered.trailer = link.key;
+    delivered.trailerUrl = link.link;
+    const below = first ? this.firstTreeNotice(link.link, sessionId) : urlLine(link.link);
+    return `${this.styleSuccess(text)}\n${below}`;
+  }
+
+  /** No link has been shown for this session yet, and the first-tree intro is on. */
+  private isFirstLink(sessionId: string | undefined): boolean {
+    const delivered = this.deliveryFor(sessionId);
+    return this.firstTreeIntro !== null && delivered.trailer === undefined &&
+      delivered.link === undefined && delivered.trailerUrl === undefined;
   }
 
   /** The session's current link, shown or not. Resolver failures never break a hook. */
@@ -571,8 +583,7 @@ export class NoticeDeliveryQueue {
     const isNew = link.key !== delivered.trailer && link.link !== delivered.trailerUrl;
     // "turn": one line per user turn, and only when the index changed.
     if (this.trailerPlacement === "turn" && !isNew) return undefined;
-    const first = this.firstTreeIntro !== null && delivered.trailer === undefined &&
-      delivered.link === undefined && delivered.trailerUrl === undefined;
+    const first = this.isFirstLink(sessionId);
     delivered.trailer = link.key;
     delivered.trailerUrl = link.link;
     if (first) return this.firstTreeNotice(link.link, sessionId);
