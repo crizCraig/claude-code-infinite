@@ -308,27 +308,35 @@ For `ccc --resume <id>`, an automatic, best-effort repair can unblock a transcri
 
 ## Releasing
 
-Releases are staged by GitHub Actions through npm Trusted Publishing (OIDC), so no npm
-token, passkey or browser is needed to build and upload them, and each one is approved by a
-maintainer before it goes live:
+Releases are published by GitHub Actions through npm Trusted Publishing (OIDC): no npm
+token, passkey or staging step. Each one waits for a maintainer's approval.
 
-1. On a clean `main`, run `./publish.sh` (or `./publish.sh minor` / `major`). It builds,
-   checks that `dist/` is committed, runs `npm version`, and pushes the commit and the
-   `vX.Y.Z` tag.
-2. The tag push runs [`.github/workflows/publish.yml`](.github/workflows/publish.yml): `npm ci`,
-   the test suite with `NO_COLOR=1` and with `FORCE_COLOR=1`, a check that the rebuilt
-   `dist/` matches the commit and that the tag equals `package.json`'s version, then
-   `npm stage publish --provenance`.
-3. Approve the staged version (2FA) on
-   [npmjs.com](https://www.npmjs.com/package/claude-code-infinite) under the **Staged
-   Packages** tab, or with `npm stage list claude-code-infinite` and
-   `npm stage approve <stage-id>`. Until then it is not installable.
+1. [release-please](https://github.com/googleapis/release-please) keeps a **Release x.y.z**
+   pull request open on `main` ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+   It bumps `package.json`, `package-lock.json` and `.release-please-manifest.json` and adds
+   a `CHANGELOG.md` entry, and it updates itself on every push to `main`.
+2. Merge it when you want to release. release-please then tags `vX.Y.Z`, creates the GitHub
+   release and starts [`.github/workflows/publish.yml`](.github/workflows/publish.yml) on the
+   tag. That runs the full CI matrix (`ci.yml`), checks that the tag equals `package.json`'s
+   version and that the committed `dist/` matches a fresh build.
+3. Approve the `npm` environment (one tap in the GitHub mobile app, or **Review deployments**
+   on the run). The job then runs `npm publish --provenance --access public`.
 
-The trusted publisher on npmjs.com is bound to the workflow file name `publish.yml` with no
-GitHub environment, and allows only staged publishing; renaming the workflow breaks it.
-`./publish.sh --local` is the fallback: it publishes directly from your machine with npm web
-auth, then pushes the commit and tag; the workflow still tests that tag but skips staging,
-since the version is already published.
+Commits: release-please only opens the PR, and only lists a commit in the changelog, for
+conventional prefixes: `feat:`, `fix:`, `perf:`, `refactor:`, `revert:` or `deps:` (a scope
+is fine, e.g. `fix(exit): ...`). Other subjects such as `Exit: ...` or `README: ...` are
+allowed and ship in the release, but are not listed. Every release is a patch bump. For a
+minor or major release, or to release with no listed commit, push an empty commit:
+
+```bash
+git commit --allow-empty -m "chore: release 1.1.0" -m "Release-As: 1.1.0"
+```
+
+The trusted publisher on npmjs.com is bound to the workflow file `publish.yml` and the GitHub
+environment `npm`; renaming either breaks publishing. `./publish.sh --local [patch|minor|major]`
+is the emergency path: it publishes directly from your machine with npm web auth, then pushes
+the tag, the GitHub release and the commit (including the release-please manifest).
+publish.yml still tests that tag but skips publishing, since the version is already on npm.
 
 ## Troubleshooting
 

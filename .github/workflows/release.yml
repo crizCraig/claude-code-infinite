@@ -1,0 +1,56 @@
+# Keeps a "Release x.y.z" pull request open on main (release-please), and when that PR
+# is merged, tags vX.Y.Z, creates the GitHub release and starts publish.yml on the tag.
+#
+# Why publish.yml is dispatched rather than called (workflow_call): npm's trusted
+# publisher checks the *calling* (top-level) workflow's file name, and it is bound to
+# publish.yml. A tag created with GITHUB_TOKEN starts no push workflow, but a
+# workflow_dispatch sent with GITHUB_TOKEN does start a run.
+name: Release PR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # release branch, tag and GitHub release
+      pull-requests: write # open and update the release PR
+      issues: write # PR labels (autorelease: pending / tagged)
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Config: release-please-config.json and .release-please-manifest.json.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+
+  start-publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # workflow_dispatch of publish.yml
+    steps:
+      - name: Start publish.yml on the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected release tag: $TAG"
+            exit 1
+          fi
+          gh workflow run publish.yml --ref "$TAG"
+          echo "::notice::Started publish.yml for $TAG. Approve the npm environment when CI passes."

@@ -1,10 +1,14 @@
 #!/bin/bash
-# Release: bump the version, push the commit and tag. The tag push triggers
-# .github/workflows/publish.yml, which tests and stages the version on npm via
-# Trusted Publishing (OIDC); a maintainer then approves it on npmjs.com (2FA).
-# Usage: ./publish.sh [patch|minor|major] [--local]
-#   --local  fallback: publish directly from this machine (npm web auth), as before.
+# Releases go through the "Release x.y.z" pull request that release-please keeps open
+# on GitHub: merging it tags vX.Y.Z, and .github/workflows/publish.yml publishes to npm
+# after CI passes and a maintainer approves the `npm` environment. See README "Releasing".
+#
+# Usage: ./publish.sh --local [patch|minor|major]
+#   --local  emergency path: bump, tag and publish directly from this machine (npm web
+#            auth), then push the tag, the GitHub release and the commit.
 set -e
+
+REPO_URL="https://github.com/crizCraig/claude-code-infinite"
 
 # Ensure we're in the project directory
 cd "$(dirname "$0")"
@@ -14,11 +18,21 @@ VERSION_TYPE="patch"
 for arg in "$@"; do
     case "$arg" in
         --local) LOCAL=true ;;
-        *) VERSION_TYPE="$arg" ;;
+        patch|minor|major) VERSION_TYPE="$arg" ;;
+        *) echo "Error: unknown argument '$arg'."; exit 1 ;;
     esac
 done
 
-# Publish from main only: npm version commits and tags the *current* branch.
+if [[ "$LOCAL" != true ]]; then
+    echo "Releases now go through the Release PR, not this script:"
+    echo "  1. Merge the open \"Release x.y.z\" pull request: $REPO_URL/pulls"
+    echo "  2. Approve the 'npm' environment when publish.yml asks (GitHub app or"
+    echo "     $REPO_URL/actions/workflows/publish.yml)."
+    echo "Emergency only: ./publish.sh --local [patch|minor|major] publishes from this machine."
+    exit 1
+fi
+
+# Publish from main only: the release commit and tag go on the *current* branch.
 if [[ "$(git branch --show-current)" != "main" ]]; then
     echo "Error: publish.sh must run on main (currently on '$(git branch --show-current)')."
     exit 1
@@ -41,34 +55,36 @@ if ! git diff-index --quiet HEAD -- dist; then
 fi
 
 echo "Bumping version ($VERSION_TYPE)..."
-npm version "$VERSION_TYPE"
+npm version "$VERSION_TYPE" --no-git-tag-version > /dev/null
 VERSION=$(node -p "require('./package.json').version")
+# Keep release-please's manifest in step, or its next Release PR repeats this version.
+node -e '
+  const fs = require("fs");
+  const f = ".release-please-manifest.json";
+  const m = JSON.parse(fs.readFileSync(f, "utf8"));
+  m["."] = process.argv[1];
+  fs.writeFileSync(f, JSON.stringify(m, null, 2) + "\n");
+' "$VERSION"
+git add package.json package-lock.json .release-please-manifest.json
+git commit -m "Release $VERSION"
+git tag -a "v$VERSION" -m "v$VERSION"
 
-if [[ "$LOCAL" == true ]]; then
-    # Publish before pushing the tag: the tag push runs the workflow, which sees
-    # this version already on npm and skips staging instead of racing us for it.
-    echo "Publishing to npm from this machine..."
-    if ! npm publish --auth-type=web; then
-        echo "Error: npm publish failed. v$VERSION is committed and tagged locally but not"
-        echo "pushed; retry with: npm publish --auth-type=web && git push && git push --tags"
-        exit 1
-    fi
-    echo "Pushing to git..."
-    git push && git push --tags
-    echo "Done! Published v$VERSION"
-    exit 0
+# Publish before pushing the tag: the tag push runs publish.yml, which sees this
+# version already on npm and only tests it instead of racing us for it.
+echo "Publishing to npm from this machine..."
+if ! npm publish --auth-type=web; then
+    echo "Error: npm publish failed. v$VERSION is committed and tagged locally but not"
+    echo "pushed. Retry npm publish --auth-type=web, then push by hand:"
+    echo "  git push origin v$VERSION"
+    echo "  gh release create v$VERSION --verify-tag --generate-notes && git push"
+    exit 1
 fi
 
-echo "Pushing to git..."
-git push && git push --tags
-
-APPROVE_URL="https://www.npmjs.com/package/claude-code-infinite"
-echo "Pushed v$VERSION. It is staged by CI after tests pass; approve it at"
-echo "  $APPROVE_URL (Staged Packages tab), or: npm stage approve <stage-id>"
-sleep 5
-RUN_URL=$(gh run list --workflow publish.yml -L1 --json url --jq '.[0].url' 2>/dev/null || true)
-if [[ -n "$RUN_URL" ]]; then
-    echo "Actions run: $RUN_URL"
-else
-    echo "Actions runs: https://github.com/crizCraig/claude-code-infinite/actions/workflows/publish.yml"
-fi
+# The GitHub release tells release-please where this release starts; create it
+# before pushing main so the Release PR run on that push already sees it.
+echo "Pushing the tag, the GitHub release and main..."
+git push origin "v$VERSION"
+gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION" \
+    || echo "Warning: create the GitHub release by hand: gh release create v$VERSION --verify-tag"
+git push
+echo "Done! Published v$VERSION"

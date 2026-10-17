@@ -1,53 +1,44 @@
-# Stages each release on npm via Trusted Publishing (OIDC): no npm token, passkey
-# or browser in CI. The trusted publisher on npmjs.com is bound to this exact file
-# name (publish.yml) with no GitHub environment, so do not rename this file or add
-# `environment:`. It allows only `npm stage publish`, so a maintainer must approve
-# the staged version on npmjs.com (with 2FA) before it is installable.
-name: Stage npm release
+# Publishes a release tag to npm via Trusted Publishing (OIDC): no npm token, passkey
+# or staging. The trusted publisher on npmjs.com is bound to this file name
+# (publish.yml) and the GitHub environment `npm`, so do not rename this file or the
+# environment. The `npm` environment requires a maintainer's approval (one tap in the
+# GitHub app) and only accepts v* tags.
+#
+# Started by release.yml (workflow_dispatch on the tag it just created) or by pushing
+# a vX.Y.Z tag (publish.sh --local, which publishes first, so this run only tests it).
+name: Publish to npm
 
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write # OIDC token for npm trusted publishing (and provenance)
+permissions: {}
 
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # The full cross-platform CI (ci.yml) must pass before anything is staged.
-  ci:
-    uses: ./.github/workflows/ci.yml
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
-
-  publish:
-    needs: ci
-    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.published.outputs.skip }}
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-
-      # Trusted publishing needs npm >= 11.5.1; `npm stage publish` needs >= 11.15.0.
-      - name: Update npm
+      - name: Require a release tag
         run: |
-          npm install -g npm@latest
-          NPM_VERSION="$(npm --version)"
-          echo "npm $NPM_VERSION"
-          node -e '
-            const [a, b] = process.argv[1].split(".").map(Number);
-            if (a < 11 || (a === 11 && b < 15)) {
-              console.error("npm >= 11.15.0 required for npm stage publish");
-              process.exit(1);
-            }' "$NPM_VERSION"
+          if ! [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Run this on a vX.Y.Z tag, not $GITHUB_REF"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify tag matches package.json version
         run: |
@@ -57,30 +48,55 @@ jobs:
             exit 1
           fi
 
-      # `./publish.sh --local` publishes from a maintainer's machine before it
-      # pushes the tag; tests still run, but there is nothing left to stage.
-      - name: Skip staging if this version is already published
+      # `./publish.sh --local` publishes from a maintainer's machine before it pushes
+      # the tag; CI still tests the tag, but there is nothing to publish (or approve).
+      - name: Skip publishing if this version is already on npm
         id: published
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           # Compare the output: some npm versions exit 0 with no output for a missing version.
           if [ "$(npm view "claude-code-infinite@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
-            echo "::notice::claude-code-infinite@$VERSION is already published (publish.sh --local); not staging."
+            echo "::notice::claude-code-infinite@$VERSION is already on npm; not publishing."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - run: npm ci
+  # The full cross-platform CI (ci.yml) must pass before anything is published.
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
-      - name: Test (NO_COLOR)
-        run: npm test
-        env:
-          NO_COLOR: "1"
+  publish:
+    needs: [check, ci]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/claude-code-infinite
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Test (colour)
-        run: npm test
-        env:
-          FORCE_COLOR: "1"
-          TERM: xterm-256color
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1. Pinned so a new npm release cannot
+      # run in a job that holds the OIDC token.
+      - name: Install npm 11.21.0
+        run: |
+          npm install -g --ignore-scripts npm@11.21.0
+          echo "npm $(npm --version)"
+
+      # No install scripts: this job can mint the publish credential.
+      - run: npm ci --ignore-scripts
 
       - name: Verify committed dist matches source
         run: |
@@ -88,35 +104,21 @@ jobs:
           if [ -n "$(git status --porcelain dist)" ]; then
             echo "::error::dist/ is out of date with src/. Run npm run build and commit dist."
             git status --porcelain dist
-            git diff --stat dist
             exit 1
           fi
 
       # No NODE_AUTH_TOKEN: npm exchanges the GitHub OIDC token for a short-lived
-      # credential. Provenance is automatic for a public repo under trusted
-      # publishing; --provenance just makes that explicit.
-      - name: Stage on npm
-        if: steps.published.outputs.skip != 'true'
-        run: |
-          set -o pipefail
-          npm stage publish --provenance 2>&1 | tee stage.log
+      # credential. Provenance is automatic under trusted publishing for a public
+      # repo; --provenance makes that explicit.
+      - name: Publish
+        run: npm publish --provenance --access public
 
-      - name: Summary (approval needed)
-        if: steps.published.outputs.skip != 'true'
+      - name: Summary
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "::notice::claude-code-infinite@$VERSION is staged. Approve it at https://www.npmjs.com/package/claude-code-infinite (Staged Packages tab)."
+          echo "::notice::Published claude-code-infinite@$VERSION"
           {
-            echo "## claude-code-infinite@$VERSION is staged, not yet published"
+            echo "## Published claude-code-infinite@$VERSION"
             echo
-            echo "Approve it (2FA) before it is installable:"
-            echo
-            echo "- Web: https://www.npmjs.com/package/claude-code-infinite"
-            echo "  (Staged Packages tab, then Approve)"
-            echo "- CLI: \`npm stage list claude-code-infinite\`, then"
-            echo "  \`npm stage approve <stage-id>\`"
-            echo
-            echo '```'
-            tail -n 5 stage.log
-            echo '```'
+            echo "https://www.npmjs.com/package/claude-code-infinite/v/$VERSION"
           } >> "$GITHUB_STEP_SUMMARY"
