@@ -309,7 +309,10 @@ For `ccc --resume <id>`, an automatic, best-effort repair can unblock a transcri
 ## Releasing
 
 Releases are published by GitHub Actions through npm Trusted Publishing (OIDC): no npm
-token, passkey or staging step. Each one waits for a maintainer's approval.
+token, passkey or staging step. Each one waits for approval of the `npm` GitHub environment
+(reviewer: crizCraig). That approval is a GitHub permission: anything holding a maintainer's
+GitHub token with `repo` scope (including an agent using `gh`) can grant it, so keep such
+tokens out of untrusted sessions.
 
 1. [release-please](https://github.com/googleapis/release-please) keeps a **Release x.y.z**
    pull request open on `main` ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
@@ -317,8 +320,9 @@ token, passkey or staging step. Each one waits for a maintainer's approval.
    a `CHANGELOG.md` entry, and it updates itself on every push to `main`.
 2. Merge it when you want to release. release-please then tags `vX.Y.Z`, creates the GitHub
    release and starts [`.github/workflows/publish.yml`](.github/workflows/publish.yml) on the
-   tag. That runs the full CI matrix (`ci.yml`), checks that the tag equals `package.json`'s
-   version and that the committed `dist/` matches a fresh build.
+   tag. That checks that the tagged commit is on `main` and that the tag equals
+   `package.json`'s version, runs the full CI matrix (`ci.yml`), and checks that the committed
+   `dist/` matches a fresh build.
 3. Approve the `npm` environment (one tap in the GitHub mobile app, or **Review deployments**
    on the run). The job then runs `npm publish --provenance --access public`.
 
@@ -334,8 +338,9 @@ git commit --allow-empty -m "chore: release 1.1.0" -m "Release-As: 1.1.0"
 
 The trusted publisher on npmjs.com is bound to the workflow file `publish.yml` and the GitHub
 environment `npm`; renaming either breaks publishing. `./publish.sh --local [patch|minor|major]`
-is the emergency path: it publishes directly from your machine with npm web auth, then pushes
-the tag, the GitHub release and the commit (including the release-please manifest).
+is the emergency path: from a `main` that matches `origin/main`, it publishes directly from
+your machine with npm web auth, then pushes the release commit (including the release-please
+manifest) and the tag in one atomic push, and creates the GitHub release.
 publish.yml still tests that tag but skips publishing, since the version is already on npm.
 
 ## Troubleshooting

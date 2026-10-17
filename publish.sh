@@ -5,8 +5,8 @@
 #
 # Usage: ./publish.sh --local [patch|minor|major]
 #   --local  emergency path: bump, tag and publish directly from this machine (npm web
-#            auth), then push the tag, the GitHub release and the commit.
-set -e
+#            auth), then push the commit and tag (atomically) and create the GitHub release.
+set -euo pipefail
 
 REPO_URL="https://github.com/crizCraig/claude-code-infinite"
 
@@ -46,6 +46,14 @@ if ! git diff-index --quiet HEAD --; then
     exit 1
 fi
 
+# Release only what is on origin/main: publish.yml rejects a tag whose commit is not on
+# main, and a stale main would make the final push fail after npm already has the version.
+git fetch -q origin main
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+    echo "Error: local main differs from origin/main. Pull (or push) first."
+    exit 1
+fi
+
 echo "Building..."
 npm run build
 git update-index -q --refresh
@@ -71,20 +79,25 @@ git tag -a "v$VERSION" -m "v$VERSION"
 
 # Publish before pushing the tag: the tag push runs publish.yml, which sees this
 # version already on npm and only tests it instead of racing us for it.
+PUSH_HELP="git push --atomic origin main v$VERSION && gh release create v$VERSION --verify-tag --generate-notes"
 echo "Publishing to npm from this machine..."
 if ! npm publish --auth-type=web; then
     echo "Error: npm publish failed. v$VERSION is committed and tagged locally but not"
-    echo "pushed. Retry npm publish --auth-type=web, then push by hand:"
-    echo "  git push origin v$VERSION"
-    echo "  gh release create v$VERSION --verify-tag --generate-notes && git push"
+    echo "pushed. Retry npm publish --auth-type=web, then: $PUSH_HELP"
     exit 1
 fi
 
-# The GitHub release tells release-please where this release starts; create it
-# before pushing main so the Release PR run on that push already sees it.
-echo "Pushing the tag, the GitHub release and main..."
-git push origin "v$VERSION"
-gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION" \
-    || echo "Warning: create the GitHub release by hand: gh release create v$VERSION --verify-tag"
-git push
+# One atomic push, so the tag never exists on GitHub without its commit on main.
+echo "Pushing main and v$VERSION..."
+if ! git push --atomic origin main "v$VERSION"; then
+    echo "Error: v$VERSION is on npm but the push failed. Rebase is not possible (the tag"
+    echo "this commit, so do not rebase it), then: $PUSH_HELP"
+    exit 1
+fi
+# The GitHub release tells release-please where this release starts.
+if ! gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION"; then
+    echo "Error: create the GitHub release by hand, or release-please's next PR will"
+    echo "repeat this release's commits: gh release create v$VERSION --verify-tag --generate-notes"
+    exit 1
+fi
 echo "Done! Published v$VERSION"
