@@ -582,8 +582,9 @@ async function main() {
     // would never fire), inside the same bounded background drain.
     memtree.flushFinalIndexes();
     await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-    await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+    // Before the final flushes, so a late child exit's diagnostics event is sent.
     await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
+    await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
     process.exit(code);
   };
 
