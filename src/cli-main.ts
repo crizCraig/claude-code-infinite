@@ -49,10 +49,12 @@ import {
   isPrintInvocation,
   parseWrapperArgs,
   memtreeLinkPlacementFromEnv,
+  environmentOf,
   subcommandArgs,
 } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
+import { type LinkDeps, runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
 import {
@@ -264,6 +266,21 @@ function installedClaudeSupportsMessageDisplay(): boolean {
   }
 }
 
+/** `ccc link` in this environment: its server, its saved key, real stdio. */
+function linkDeps(mode: Mode): LinkDeps {
+  return {
+    fetch: globalThis.fetch,
+    baseUrl: mode === "local" ? LOCAL_BASE_URL : mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
+    apiKey:
+      mode === "local" ? getLocalPolychatApiKey() :
+      mode === "staging" ? getStagingPolychatApiKey() :
+      getPolychatApiKey(),
+    command: mode === "production" ? "ccc" : `ccc ${mode}`,
+    stdout: (text) => process.stdout.write(text),
+    stderr: (text) => process.stderr.write(text),
+  };
+}
+
 async function main() {
   const parsedArgs = parseWrapperArgs(process.argv.slice(2));
   const isDebugMode = parsedArgs.debug;
@@ -285,10 +302,13 @@ async function main() {
     return;
   }
 
-  const mode: Mode =
-    filteredArgs[0] === "local" ? "local" :
-    filteredArgs[0] === "staging" ? "staging" :
-    "production";
+  const mode: Mode = environmentOf(filteredArgs);
+  // `ccc [staging|local] link <session-id>`: the session's newest MemTree page.
+  if (subcommand?.name === "link") {
+    // exitCode, not exit(): a piped stdout (async on macOS) gets its line out first.
+    process.exitCode = await runLinkCommand(subcommand.args, linkDeps(mode));
+    return;
+  }
 
   const claudeArgs = mode !== "production" ? filteredArgs.slice(1) : filteredArgs;
 

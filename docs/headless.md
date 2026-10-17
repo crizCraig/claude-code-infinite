@@ -83,13 +83,29 @@ different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.
 Every session's memory is a tree you can open in the browser, search, share, or paste into any
 agent as context. Your sessions and trees are listed at https://app.polychat.co/usage.
 
-A headless run doesn't print its tree link (stdout stays Claude Code's). To show an agent's
-tree on your platform:
+A headless run doesn't print its tree link (stdout stays Claude Code's). After a run, call
+`ccc link` to show the agent's memory:
+
+```bash
+url=$(ccc link "$sid") && echo "Agent memory: $url"
+```
+
+`ccc link <session-id>` prints the session's newest MemTree page URL on stdout, one line and
+nothing else; `--json` prints `{session_id, url, tree, updated_at}`. It uses your saved key, so
+it finds only your own sessions, and gives up after 5 seconds. Exit status:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | The URL was printed. |
+| 1 | No saved key, or the MemTree server could not be reached or refused. |
+| 2 | Bad invocation (no or malformed session id). |
+| 3 | The session has no tree yet (it needs roughly 10k tokens of conversation). |
+
+The link can trail by one call: a `-p` run's newest tree is built as it exits, so right after a
+call `ccc link` may still show the tree from the call before (it catches up within a minute or
+two). Other ways to see a tree:
 - open the session from https://app.polychat.co/usage, or
 - ask the agent: `mcp__memtree__list` returns each session with its latest tree link.
-
-A session's newest tree is built in the background after a call ends, so it can trail the last
-call by a minute or two.
 
 ## 5. Useful settings
 
@@ -119,11 +135,12 @@ call by a minute or two.
 
 ## Older versions
 
-ccc 1.0.22 and earlier differ in three ways:
+ccc 1.0.22 and earlier differ in four ways:
 - **Banner on stdout.** ccc prints a short banner before the JSON, so take the last line that
   starts with `{`: `ccc -p --output-format json … | grep '^{' | tail -1 | jq -r .result`.
 - **No memory tools in `-p` runs.** The README's manual recipe (`--mcp-config` naming
   `ccc memtree-mcp`) works only without an environment word: `ccc staging memtree-mcp` starts a
   Claude session instead of the server and times out. Upgrade to get the tools by default.
+- **No `ccc link`.** Use https://app.polychat.co/usage or `mcp__memtree__list` for tree links.
 - **No saved key.** A headless run prints the key prompt to stdout and exits with status 0;
   check for a `session_id` in the output.

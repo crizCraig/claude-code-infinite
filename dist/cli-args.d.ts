@@ -6,7 +6,10 @@ export interface WrapperArgs {
 /** Whether Claude's own print mode was requested before its `--` separator. */
 export declare function isPrintInvocation(args: string[]): boolean;
 /** ccc's own subcommands, which start no Claude session. */
-declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp"];
+declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp", "link"];
+export type CccEnvironment = "production" | "staging" | "local";
+/** The environment a leading `local`/`staging` word selects (else production). */
+export declare function environmentOf(args: readonly string[]): CccEnvironment;
 /**
  * A ccc subcommand and its arguments: the first word, or the word after
  * `local`/`staging` (`ccc staging memtree-mcp` is the same server as

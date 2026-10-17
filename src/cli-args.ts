@@ -14,8 +14,15 @@ export function isPrintInvocation(args: string[]): boolean {
 }
 
 /** ccc's own subcommands, which start no Claude session. */
-const SUBCOMMANDS = ["fetch", "memtree-mcp"] as const;
+const SUBCOMMANDS = ["fetch", "memtree-mcp", "link"] as const;
 const ENVIRONMENT_WORDS = ["local", "staging"];
+
+export type CccEnvironment = "production" | "staging" | "local";
+
+/** The environment a leading `local`/`staging` word selects (else production). */
+export function environmentOf(args: readonly string[]): CccEnvironment {
+  return args[0] === "local" ? "local" : args[0] === "staging" ? "staging" : "production";
+}
 
 /**
  * A ccc subcommand and its arguments: the first word, or the word after

@@ -28,9 +28,10 @@ import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, hyperlink, } from "./payment-gate.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
-import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, subcommandArgs, } from "./cli-args.js";
+import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, subcommandArgs, } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
+import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
@@ -187,6 +188,19 @@ function installedClaudeSupportsMessageDisplay() {
         return false;
     }
 }
+/** `ccc link` in this environment: its server, its saved key, real stdio. */
+function linkDeps(mode) {
+    return {
+        fetch: globalThis.fetch,
+        baseUrl: mode === "local" ? LOCAL_BASE_URL : mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
+        apiKey: mode === "local" ? getLocalPolychatApiKey() :
+            mode === "staging" ? getStagingPolychatApiKey() :
+                getPolychatApiKey(),
+        command: mode === "production" ? "ccc" : `ccc ${mode}`,
+        stdout: (text) => process.stdout.write(text),
+        stderr: (text) => process.stderr.write(text),
+    };
+}
 async function main() {
     const parsedArgs = parseWrapperArgs(process.argv.slice(2));
     const isDebugMode = parsedArgs.debug;
@@ -206,9 +220,13 @@ async function main() {
         runMemtreeMcpServer();
         return;
     }
-    const mode = filteredArgs[0] === "local" ? "local" :
-        filteredArgs[0] === "staging" ? "staging" :
-            "production";
+    const mode = environmentOf(filteredArgs);
+    // `ccc [staging|local] link <session-id>`: the session's newest MemTree page.
+    if (subcommand?.name === "link") {
+        // exitCode, not exit(): a piped stdout (async on macOS) gets its line out first.
+        process.exitCode = await runLinkCommand(subcommand.args, linkDeps(mode));
+        return;
+    }
     const claudeArgs = mode !== "production" ? filteredArgs.slice(1) : filteredArgs;
     // Interactive UI only: print/non-TTY invocations are programmatic
     // interfaces whose output must stay byte-for-byte vanilla, and they get no

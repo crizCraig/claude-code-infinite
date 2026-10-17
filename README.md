@@ -122,6 +122,13 @@ locally, so they cost no model turn.
 | `/ccc:memtree-compact [tokens]` | Compacts the session on your next message (to half the budget, or a target such as `400k`) and keeps the compressed history. |
 | `/ccc:memtree-compact off` | Goes back to sending the conversation whole. |
 
+From a shell or script (no session needed):
+
+| Command | What it does |
+| --- | --- |
+| `ccc link <session-id>` | Prints the session's newest MemTree page URL on stdout, one line and nothing else. `--json` prints `{session_id, url, tree, updated_at}` instead. Exit status 0 printed, 1 no saved key or the server could not be reached (5 s timeout), 2 bad invocation, 3 the session has no MemTree yet. Only your own sessions (those of your saved key) are found. `ccc staging link` / `ccc local link` use that environment's key. |
+| `ccc fetch <memtree-url>` | Prints one of your MemTree pages as JSON, using your saved key. |
+
 Environment variables, set when launching `ccc`:
 
 | Variable | What it does |
@@ -224,6 +231,8 @@ ccc -p --resume <session-id> --output-format json "…"
 ```
 
 Start the session with `ccc -p --session-id <uuid> "…"` (or take `session_id` from the first JSON result). Never run two `ccc` processes on one session at the same time: both would append to the same transcript. Headless runs have the [memory tools](#memory-tools) with no extra flags (`CCC_MEMTREE_MCP=0` turns them off; they can read all of the sessions your MemTree key owns, so give each user of a shared agent platform their own key). Stdout carries only Claude Code's output, so `--output-format json` and `stream-json` parse as with `claude`; `ccc`'s own lines (banner, mode, request log path) go to stderr. `--mcp-config` takes several values, so pass your own as `--mcp-config=<file>` or put the prompt before it; otherwise it swallows a prompt that follows it.
+
+To show an agent's memory after a run, `ccc link "$sid"` prints the session's newest MemTree page URL (exit 3 when it has no tree yet). It can trail the run by one call: a `-p` run's newest tree is built as it exits.
 
 The full guide for agent platforms (setup, output parsing, memory tools, tree links, older versions) is [docs/headless.md](docs/headless.md).
 
