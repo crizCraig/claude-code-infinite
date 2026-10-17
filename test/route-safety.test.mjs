@@ -60,6 +60,28 @@ test("failed oversized rebuilding retries twice then terminates, never forwardin
   } finally { h.close(); }
 });
 
+test("a refusal records its details in the request log and prints nothing to the TUI", async () => {
+  // Incident 2026-10-16: the "recovery failed" object was printed with console.error,
+  // which Claude Code's TUI shows inside the conversation. Only debug output may
+  // reach the console; the details belong in requests.jsonl.
+  const h = await waitingHarness(60_000);
+  h.memtree.compress = async () => unfitResult(false);
+  const printed = [];
+  const real = { error: console.error, warn: console.warn, log: console.log };
+  for (const name of Object.keys(real)) console[name] = (...a) => printed.push(a.join(" "));
+  try {
+    const response = await request(h.proxy, body("x".repeat(900_000)));
+    assert.equal(response.status, 503);
+  } finally { Object.assign(console, real); h.close(); }
+  assert.deepEqual(printed, [], "nothing printed outside debug");
+  const decision = h.records.filter(r => r.kind === "messages").at(-1);
+  assert.equal(decision.refusal.attempt, 1);
+  assert.equal(decision.refusal.status, 503);
+  assert.equal(decision.refusal.indexBehind, false);
+  assert.equal(typeof decision.refusal.budgetTokens, "number");
+  assert.equal(typeof decision.refusal.modelContextLimit, "number");
+});
+
 test("fallback ignores the soft budget but reserves output against the native window", async () => {
   const h = await harness();
   try {

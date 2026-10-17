@@ -3863,12 +3863,13 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const failure = args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
-    console.error("[ccc proxy] request exceeds native context window; recovery failed", {
+    // To requests.jsonl, never the console: Claude Code's TUI shows stderr inline.
+    args.rec.refusal = {
         lane: args.routeKey, attempt: failure.attempt, status: failure.status,
         inputTokens, outputTokens: args.body.max_tokens ?? 0,
         outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
         budgetTokens, modelContextLimit: args.modelContextLimit,
-    });
+    };
     if (args.res.headersSent || args.res.destroyed)
         return false;
     args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
