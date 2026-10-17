@@ -4,6 +4,8 @@ import {
   createSignalShutdownHandler,
   exitCodeForChild,
   exitCodeForSignal,
+  settleWithin,
+  writeStdout,
 } from "../dist/cli-lifecycle.js";
 
 test("signals use conventional shell exit statuses", () => {
@@ -40,4 +42,28 @@ test("signal shutdown drains once and makes the second signal a force escape", (
     ["forward", "SIGTERM"],
     ["force-exit", 143],
   ]);
+});
+
+test("writeStdout resolves only once the stream has taken the text, and on a throwing stream", async () => {
+  let finish;
+  const written = [];
+  const slow = { write(text, done) { written.push(text); finish = done; return false; } };
+  let settled = false;
+  const pending = writeStdout("hint\n", slow).then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(written, ["hint\n"]);
+  assert.equal(settled, false, "still waiting on the asynchronous write");
+  finish();
+  await pending;
+  assert.equal(settled, true);
+  await writeStdout("x", { write() { throw new Error("EPIPE"); } });
+});
+
+test("settleWithin waits for the promise but never past its bound", async () => {
+  let started = Date.now();
+  await settleWithin(new Promise(() => {}), 30);
+  assert.ok(Date.now() - started >= 25, "bounded wait");
+  started = Date.now();
+  await settleWithin(Promise.reject(new Error("x")), 5_000);
+  assert.ok(Date.now() - started < 1_000, "a rejection settles at once");
 });

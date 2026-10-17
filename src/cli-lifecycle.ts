@@ -40,3 +40,28 @@ export function createSignalShutdownHandler(
     else actions.forceExit(code);
   };
 }
+
+/** Resolves once `text` is handed to the OS (or the write fails); never rejects. */
+export function writeStdout(
+  text: string,
+  stream: Pick<NodeJS.WriteStream, "write"> = process.stdout
+): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      stream.write(text, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** Waits for `pending` at most `ms`; a bound for cleanup that must not hang exit. */
+export function settleWithin(pending: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    pending.then(
+      () => { clearTimeout(timer); resolve(); },
+      () => { clearTimeout(timer); resolve(); }
+    );
+  });
+}

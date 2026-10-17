@@ -34,7 +34,7 @@ import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
 import { argsConfigureMemtreeMcp, MEMTREE_TOOLS_HEADER_VALUE, memtreeMcpEnabledByEnv, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
-import { createSignalShutdownHandler, exitCodeForChild, } from "./cli-lifecycle.js";
+import { createSignalShutdownHandler, exitCodeForChild, settleWithin, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
@@ -50,6 +50,8 @@ const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc"
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
+/** The exit resume hint's stdout write, which a Windows console completes later. */
+const SHUTDOWN_OUTPUT_FLUSH_MS = 1_000;
 // Payment gate: how long "subscribe now" waits for the Stripe webhook to flip
 // the key to paid, and how often it re-asks the status probe meanwhile.
 const SUBSCRIBE_WAIT_MS = 180_000;
@@ -444,7 +446,7 @@ async function main() {
         stdio: "inherit",
     });
     let shuttingDown = false;
-    const shutdown = async (code) => {
+    const shutdown = async (code, output) => {
         if (shuttingDown)
             return;
         shuttingDown = true;
@@ -459,7 +461,11 @@ async function main() {
         // would never fire), inside the same bounded background drain.
         memtree.flushFinalIndexes();
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-        await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+        await Promise.all([
+            reqlog.flush(SHUTDOWN_LOG_FLUSH_MS),
+            diagnostics.flush(),
+            output && settleWithin(output, SHUTDOWN_OUTPUT_FLUSH_MS),
+        ]);
         process.exit(code);
     };
     const handleShutdownSignal = createSignalShutdownHandler({
@@ -510,9 +516,9 @@ async function main() {
             mode,
             color: terminalSupportsColor(),
         });
-        if (hint)
-            process.stdout.write(hint);
-        void shutdown(exitCodeForChild(code, signal));
+        // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
+        const output = hint ? writeStdout(hint) : undefined;
+        void shutdown(exitCodeForChild(code, signal), output);
     });
 }
 main().catch(async (err) => {

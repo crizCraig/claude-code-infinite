@@ -27,4 +27,22 @@ export function createSignalShutdownHandler(actions) {
             actions.forceExit(code);
     };
 }
+/** Resolves once `text` is handed to the OS (or the write fails); never rejects. */
+export function writeStdout(text, stream = process.stdout) {
+    return new Promise((resolve) => {
+        try {
+            stream.write(text, () => resolve());
+        }
+        catch {
+            resolve();
+        }
+    });
+}
+/** Waits for `pending` at most `ms`; a bound for cleanup that must not hang exit. */
+export function settleWithin(pending, ms) {
+    return new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        pending.then(() => { clearTimeout(timer); resolve(); }, () => { clearTimeout(timer); resolve(); });
+    });
+}
 //# sourceMappingURL=cli-lifecycle.js.map

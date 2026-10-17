@@ -14,4 +14,8 @@ export interface SignalShutdownActions {
  * Dependencies are injected so this policy can be tested without process.exit.
  */
 export declare function createSignalShutdownHandler(actions: SignalShutdownActions): (signal: ShutdownSignal) => void;
+/** Resolves once `text` is handed to the OS (or the write fails); never rejects. */
+export declare function writeStdout(text: string, stream?: Pick<NodeJS.WriteStream, "write">): Promise<void>;
+/** Waits for `pending` at most `ms`; a bound for cleanup that must not hang exit. */
+export declare function settleWithin(pending: Promise<unknown>, ms: number): Promise<void>;
 //# sourceMappingURL=cli-lifecycle.d.ts.map

@@ -68,6 +68,8 @@ import {
 import {
   createSignalShutdownHandler,
   exitCodeForChild,
+  settleWithin,
+  writeStdout,
 } from "./cli-lifecycle.js";
 import {
   getPolychatApiKey,
@@ -94,6 +96,8 @@ const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc"
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
+/** The exit resume hint's stdout write, which a Windows console completes later. */
+const SHUTDOWN_OUTPUT_FLUSH_MS = 1_000;
 // Payment gate: how long "subscribe now" waits for the Stripe webhook to flip
 // the key to paid, and how often it re-asks the status probe meanwhile.
 const SUBSCRIBE_WAIT_MS = 180_000;
@@ -559,7 +563,7 @@ async function main() {
   });
 
   let shuttingDown = false;
-  const shutdown = async (code: number): Promise<void> => {
+  const shutdown = async (code: number, output?: Promise<void>): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     noticePlugin?.close();
@@ -573,7 +577,11 @@ async function main() {
     // would never fire), inside the same bounded background drain.
     memtree.flushFinalIndexes();
     await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-    await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+    await Promise.all([
+      reqlog.flush(SHUTDOWN_LOG_FLUSH_MS),
+      diagnostics.flush(),
+      output && settleWithin(output, SHUTDOWN_OUTPUT_FLUSH_MS),
+    ]);
     process.exit(code);
   };
 
@@ -625,8 +633,9 @@ async function main() {
       mode,
       color: terminalSupportsColor(),
     });
-    if (hint) process.stdout.write(hint);
-    void shutdown(exitCodeForChild(code, signal));
+    // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
+    const output = hint ? writeStdout(hint) : undefined;
+    void shutdown(exitCodeForChild(code, signal), output);
   });
 }
 
