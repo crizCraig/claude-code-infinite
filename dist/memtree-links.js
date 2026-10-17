@@ -24,6 +24,10 @@ export class MemtreeLinkStore {
         const entry = this.readAll()[sessionId];
         return isStoredLink(entry) ? entry : undefined;
     }
+    /** Whether any session other than `sessionId` has a stored page. */
+    hasOtherSession(sessionId) {
+        return Object.entries(this.readAll()).some(([id, v]) => id !== sessionId && isStoredLink(v));
+    }
     put(sessionId, link) {
         try {
             const all = this.readAll();

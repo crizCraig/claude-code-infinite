@@ -15,6 +15,17 @@ export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 export const TRAILER_LABEL = "• MemTree ·";
 /** Label on a line that carries a MemTree page link. */
 export const LINK_LABEL = "• MemTree";
+/** What the link is, said next to the label when a tree is news. */
+export const LINK_DESCRIPTION = "this session's memory map";
+/**
+ * The one-time notice for a session's first tree: set apart from the routine
+ * link (leaf, bold) and saying in one line why it is worth opening. Kept short
+ * enough to fit 80 columns after Claude Code's "Stop says: " label.
+ */
+export const FIRST_TREE_TITLE = "🌿 First MemTree ready";
+export const FIRST_TREE_VALUE = "a searchable map of this session so far";
+/** Added under the first tree a user ever sees: what to do with it. */
+export const FIRST_EVER_HINT = "Open it, or paste the link to any agent to give it this session's context";
 /**
  * Closes every URL line. Terminal linkifiers run a bare URL into whatever is
  * drawn right after it when the row joins the next one: a URL that ended a
@@ -42,6 +53,7 @@ const ANSI_GREEN = "\x1b[32m";
 const ANSI_YELLOW = "\x1b[33m";
 const ANSI_DEFAULT_FOREGROUND = "\x1b[39m";
 const ANSI_DIM = "\x1b[2m";
+const ANSI_BOLD = "\x1b[1m";
 const ANSI_NORMAL_INTENSITY = "\x1b[22m";
 const STARTUP_NOTICE_FILE = "startup-notice.json";
 const RESUME_RELAY_FILE = "resume-link.mjs";
@@ -156,6 +168,7 @@ export class NoticeDeliveryQueue {
     delivered = new Map();
     trailer = null;
     trailerPlacement = "message";
+    firstTreeIntro = null;
     /** Key of the last trailer shown; a different key is announced as new. */
     constructor(ttlMs = DEFAULT_NOTICE_TTL_MS, now = Date.now, color = terminalSupportsColor()) {
         this.ttlMs = ttlMs;
@@ -184,7 +197,7 @@ export class NoticeDeliveryQueue {
         this.deliveryFor(sessionId).trailer = link.key;
         this.deliveryFor(sessionId).trailerUrl = link.link;
         this.deliveryFor(sessionId).link = link.key;
-        return this.linkNotice(this.styleSuccess(LINK_LABEL), link);
+        return this.linkNotice(this.newLinkLabel(), link);
     }
     /** Whether the next success line would carry a link not shown before. */
     linkPending(sessionId) {
@@ -199,6 +212,13 @@ export class NoticeDeliveryQueue {
     setTrailer(resolve, placement = "message") {
         this.trailer = resolve;
         this.trailerPlacement = placement;
+    }
+    /**
+     * Announce the first link a session shows with the one-time first-tree
+     * notice instead of the routine trailer. Off (null) by default.
+     */
+    setFirstTreeIntro(intro) {
+        this.firstTreeIntro = intro;
     }
     queuePrefix(text, onDelivered, promptId) {
         this.pending = {
@@ -395,10 +415,40 @@ export class NoticeDeliveryQueue {
         // "turn": one line per user turn, and only when the index changed.
         if (this.trailerPlacement === "turn" && !isNew)
             return undefined;
-        this.deliveryFor(sessionId).trailer = link.key;
-        this.deliveryFor(sessionId).trailerUrl = link.link;
-        const label = isNew ? this.styleSuccess(LINK_LABEL) : this.styleDim(LINK_LABEL);
+        const first = this.firstTreeIntro !== null && delivered.trailer === undefined &&
+            delivered.link === undefined && delivered.trailerUrl === undefined;
+        delivered.trailer = link.key;
+        delivered.trailerUrl = link.link;
+        if (first)
+            return this.firstTreeNotice(link.link, sessionId);
+        const label = isNew ? this.newLinkLabel() : this.styleDim(LINK_LABEL);
         return this.linkNotice(label, link);
+    }
+    /** A link that is news: green label, then what it is (dim). */
+    newLinkLabel() {
+        return `${this.styleSuccess(LINK_LABEL)} · ${this.styleDim(LINK_DESCRIPTION)}`;
+    }
+    /**
+     * The session's first tree: bold leaf title, the value in one line, the
+     * URL below; for the user's first tree ever, one dim line on what to do.
+     */
+    firstTreeNotice(url, sessionId) {
+        const title = this.color
+            ? `${ANSI_BOLD}${this.styleSuccess(FIRST_TREE_TITLE)}${ANSI_NORMAL_INTENSITY}`
+            : FIRST_TREE_TITLE;
+        const notice = linkLines(title, url, FIRST_TREE_VALUE);
+        const firstEver = this.askIntro((intro) => intro.isFirstEver(sessionId)) === true;
+        this.askIntro((intro) => intro.markShown(sessionId));
+        return firstEver ? `${notice}\n  ${this.styleDim(FIRST_EVER_HINT)}` : notice;
+    }
+    /** Call the first-tree intro; a throwing one never breaks a hook. */
+    askIntro(call) {
+        try {
+            return this.firstTreeIntro ? call(this.firstTreeIntro) : undefined;
+        }
+        catch {
+            return undefined;
+        }
     }
     /** The link notice with its note dim. */
     linkNotice(label, link) {

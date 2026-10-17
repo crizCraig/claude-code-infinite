@@ -17,6 +17,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
+import { FirstTreeMarker } from "./first-tree.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
@@ -328,6 +329,7 @@ async function main() {
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
+    const memtreeLinkStore = new MemtreeLinkStore();
     const transcriptUsage = new ClaudeTranscriptUsage();
     const proxy = await startProxy({
         memtree,
@@ -359,7 +361,9 @@ async function main() {
         // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
         // link is shown while the placement is being tried out; see ProxyOptions.
         memtreeLinkPlacement,
-        memtreeLinkStore: new MemtreeLinkStore(),
+        memtreeLinkStore,
+        // A session's first tree gets a one-time notice saying what it is.
+        firstTreeIntro: new FirstTreeMarker(memtreeLinkStore),
         // Each session's adopted compressed prefix, so a resumed session's first
         // turn rides it instead of blocking on a fresh compress.
         stablePrefixStore: new StablePrefixStore(),

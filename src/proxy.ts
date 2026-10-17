@@ -113,6 +113,7 @@ import {
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
+  type FirstTreeIntro,
   type SessionStartHookInput,
   type SuccessLink,
 } from "./hooks.js";
@@ -279,6 +280,12 @@ export interface ProxyOptions {
    * the CLI passes the default store under ~/.claude-code-infinite.
    */
   memtreeLinkStore?: MemtreeLinkStore;
+  /**
+   * Announces each session's first tree with a one-time notice (and, for the
+   * user's first tree ever, what to do with it) instead of the routine link.
+   * Omitted means no intro (tests); the CLI passes the on-disk FirstTreeMarker.
+   */
+  firstTreeIntro?: FirstTreeIntro;
   /**
    * Where each session's adopted compressed prefix is persisted so a resumed
    * session's first turn can ride it (prefix-store.ts). Omitted means no
@@ -878,6 +885,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     laneSizes: new Map(),
   };
   installMemtreeLink(state, state.memtreeLinkPlacement);
+  state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
   const server = http.createServer((req, res) => {
     const accepted = { req, res };
     acceptedRequests.add(accepted);

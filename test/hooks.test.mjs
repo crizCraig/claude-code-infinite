@@ -179,7 +179,7 @@ test("trailer follows every finished message, is green once per key, falls back 
     hookSpecificOutput: {
       hookEventName: "MessageDisplay",
       displayContent:
-        "done\n\n\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/aaaaaaaaaaaa ↗",
+        "done\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2mthis session's memory map\x1b[22m\n  https://app.polychat.co/m/aaaaaaaaaaaa ↗",
     },
   });
   // Stop after a message carried it: nothing more this turn.
@@ -195,7 +195,7 @@ test("trailer follows every finished message, is green once per key, falls back 
   // A turn that renders no message: Stop carries the trailer, once.
   link = { key: "index-b", link: "https://app.polychat.co/m/bbbbbbbbbbbb" };
   assert.deepEqual(queue.claim(stop()), {
-    systemMessage: "\x1b[32m• MemTree\x1b[39m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
+    systemMessage: "\x1b[32m• MemTree\x1b[39m · \x1b[2mthis session's memory map\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
   });
   assert.deepEqual(queue.claim(stop()), {
     systemMessage: "\x1b[2m• MemTree\x1b[22m\n  https://app.polychat.co/m/bbbbbbbbbbbb ↗",
@@ -230,7 +230,7 @@ test("trailer note follows the bare link, dim", () => {
   queue.setTrailer(() => link, "message");
   assert.equal(
     queue.claim(display({ final: true, delta: "a" })).hookSpecificOutput.displayContent,
-    "a\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1 ↗"
+    "a\n\n\x1b[32m• MemTree\x1b[39m · \x1b[2mthis session's memory map\x1b[22m · \x1b[2m/memtree-compact to compact session\x1b[22m\n  https://x/m/1 ↗"
   );
   assert.equal(
     queue.claim(display({ final: true, delta: "b" })).hookSpecificOutput.displayContent,
@@ -248,7 +248,9 @@ test("trailer placement 'stop' shows it once per turn on Stop only", () => {
   const queue = new NoticeDeliveryQueue(undefined, undefined, false);
   queue.setTrailer(() => ({ key: "k", link: "https://x/m/1" }), "stop");
   assert.equal(queue.claim(display({ final: true })), null);
-  assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1 ↗" });
+  assert.deepEqual(queue.claim(stop()), {
+    systemMessage: "• MemTree · this session's memory map\n  https://x/m/1 ↗",
+  });
   assert.deepEqual(queue.claim(stop()), { systemMessage: "• MemTree\n  https://x/m/1 ↗" });
   queue.queueSuffix("⚠ warn");
   assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1 ↗" });
@@ -585,3 +587,109 @@ for (const color of [false, true]) {
     assert.equal(urlLeftOpen(`• MemTree\n  ${url}\n`), true, "the bug: a bare URL ends the output");
   });
 }
+
+/** A first-tree intro double: `firstEver` for the next answer, `shown` counts. */
+const introDouble = (firstEver = false) => {
+  const intro = { firstEver, shown: [], asked: 0 };
+  intro.isFirstEver = () => (intro.asked++, intro.firstEver);
+  intro.markShown = (id) => intro.shown.push(id);
+  return intro;
+};
+
+for (const color of [true, false]) {
+  const mode = color ? "color" : "NO_COLOR";
+  const bold = (s) => (color ? `\x1b[1m\x1b[32m${s}\x1b[39m\x1b[22m` : s);
+  const green = (s) => (color ? `\x1b[32m${s}\x1b[39m` : s);
+  const dim = (s) => (color ? `\x1b[2m${s}\x1b[22m` : s);
+  const firstTree = (url) =>
+    `${bold("🌿 First MemTree ready")} · a searchable map of this session so far\n  ${url} ↗`;
+  const routine = (url) => `${green("• MemTree")} · ${dim("this session's memory map")}\n  ${url} ↗`;
+
+  test(`a session's first tree gets a one-time notice on Stop, then the routine link (${mode})`, () => {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    const intro = introDouble(false);
+    queue.setFirstTreeIntro(intro);
+    let link = { key: "tree-1", link: "https://x/m/1", note: "/memtree-compact to compact session" };
+    queue.setTrailer(() => link, "turn");
+
+    assert.deepEqual(queue.claim(stop()), { systemMessage: firstTree("https://x/m/1") });
+    assert.deepEqual(intro.shown, ["session-1"]);
+    // Unchanged tree: nothing on later turns.
+    assert.equal(queue.claim(stop()), null);
+    // A newer tree: the routine link, labelled, with its note.
+    link = { key: "tree-2", link: "https://x/m/2", note: "/memtree-compact to compact session" };
+    assert.equal(
+      queue.claim(stop()).systemMessage,
+      `${green("• MemTree")} · ${dim("this session's memory map")} · ` +
+        `${dim("/memtree-compact to compact session")}\n  https://x/m/2 ↗`
+    );
+    link = { key: "tree-3", link: "https://x/m/3" };
+    assert.equal(queue.claim(stop()).systemMessage, routine("https://x/m/3"));
+    assert.deepEqual(intro.shown, ["session-1"], "the intro is once per session");
+
+    // Another session gets its own first-tree notice.
+    assert.equal(queue.claim(stop({ session_id: "session-2" })).systemMessage, firstTree("https://x/m/3"));
+  });
+
+  test(`the user's first tree ever adds one line on what to do with it (${mode})`, () => {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    const intro = introDouble(true);
+    queue.setFirstTreeIntro(intro);
+    queue.setTrailer(() => ({ key: "tree-1", link: "https://x/m/1" }), "turn");
+    const hint = dim("Open it, or paste the link to any agent to give it this session's context");
+    const output = queue.claim(stop()).systemMessage;
+    assert.equal(output, `${firstTree("https://x/m/1")}\n  ${hint}`);
+    assert.ok(output.split("\n").length <= 3, "title, URL, hint");
+    assert.ok(!color || output === unlink(output));
+    if (!color) assert.ok(!output.includes("\x1b"), "NO_COLOR has no ANSI");
+  });
+
+  test(`a resumed session that already showed its link gets no first-tree notice (${mode})`, () => {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    const intro = introDouble(true);
+    queue.setFirstTreeIntro(intro);
+    const resumed = queue.resumeLine({ key: "tree-1", link: "https://x/m/1" }, "session-1");
+    assert.equal(resumed, routine("https://x/m/1"));
+    let link = { key: "tree-1", link: "https://x/m/1" };
+    queue.setTrailer(() => link, "turn");
+    assert.equal(queue.claim(stop()), null);
+    link = { key: "tree-2", link: "https://x/m/2" };
+    assert.equal(queue.claim(stop()).systemMessage, routine("https://x/m/2"));
+    assert.deepEqual(intro.shown, []);
+    assert.equal(intro.asked, 0);
+  });
+
+  test(`the first-tree notice also rides a finished message, never stderr (${mode})`, () => {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, color);
+    queue.setFirstTreeIntro(introDouble(false));
+    queue.setTrailer(() => ({ key: "tree-1", link: "https://x/m/1" }), "message");
+    assert.equal(
+      queue.claim(display({ final: true, delta: "done" })).hookSpecificOutput.displayContent,
+      `done\n\n${firstTree("https://x/m/1")}`
+    );
+    assert.equal(
+      queue.claim(display({ final: true, delta: "again" })).hookSpecificOutput.displayContent,
+      `again\n\n${dim("• MemTree")}\n  https://x/m/1 ↗`,
+      "an unchanged link under later messages stays short and dim"
+    );
+  });
+}
+
+test("a throwing first-tree intro still shows the notice, without the first-ever line", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+  queue.setFirstTreeIntro({
+    isFirstEver() { throw new Error("boom"); },
+    markShown() { throw new Error("boom"); },
+  });
+  queue.setTrailer(() => ({ key: "tree-1", link: "https://x/m/1" }), "turn");
+  assert.equal(
+    queue.claim(stop()).systemMessage,
+    "🌿 First MemTree ready · a searchable map of this session so far\n  https://x/m/1 ↗"
+  );
+});
+
+test("without an intro installed the first link is the routine one", () => {
+  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+  queue.setTrailer(() => ({ key: "tree-1", link: "https://x/m/1" }), "turn");
+  assert.equal(queue.claim(stop()).systemMessage, "• MemTree · this session's memory map\n  https://x/m/1 ↗");
+});
