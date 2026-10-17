@@ -446,7 +446,10 @@ async function main() {
         stdio: "inherit",
     });
     let shuttingDown = false;
-    const shutdown = async (code, output) => {
+    // The exit resume hint's write; set by the child's exit even when a signal
+    // already started shutdown, and awaited (bounded) just before exiting.
+    let exitOutput;
+    const shutdown = async (code) => {
         if (shuttingDown)
             return;
         shuttingDown = true;
@@ -461,11 +464,9 @@ async function main() {
         // would never fire), inside the same bounded background drain.
         memtree.flushFinalIndexes();
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
-        await Promise.all([
-            reqlog.flush(SHUTDOWN_LOG_FLUSH_MS),
-            diagnostics.flush(),
-            output && settleWithin(output, SHUTDOWN_OUTPUT_FLUSH_MS),
-        ]);
+        await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+        if (exitOutput)
+            await settleWithin(exitOutput, SHUTDOWN_OUTPUT_FLUSH_MS);
         process.exit(code);
     };
     const handleShutdownSignal = createSignalShutdownHandler({
@@ -517,8 +518,9 @@ async function main() {
             color: terminalSupportsColor(),
         });
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
-        const output = hint ? writeStdout(hint) : undefined;
-        void shutdown(exitCodeForChild(code, signal), output);
+        if (hint)
+            exitOutput = writeStdout(hint);
+        void shutdown(exitCodeForChild(code, signal));
     });
 }
 main().catch(async (err) => {
