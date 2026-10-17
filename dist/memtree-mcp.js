@@ -9,7 +9,7 @@
  *
  * A minimal JSON-RPC 2.0 server over stdio (newline-delimited messages, the
  * MCP stdio transport); no SDK dependency. Started by Claude Code from the
- * `--mcp-config` ccc passes (interactive sessions) or one the caller passes
+ * `--mcp-config` ccc passes (every session, `-p` included) or one the caller passes
  * (`ccc memtree-mcp`, e.g. the memory recall probe).
  *
  * Which tree: the loopback proxy of the ccc that launched this Claude Code

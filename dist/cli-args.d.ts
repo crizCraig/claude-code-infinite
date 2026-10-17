@@ -5,6 +5,17 @@ export interface WrapperArgs {
 }
 /** Whether Claude's own print mode was requested before its `--` separator. */
 export declare function isPrintInvocation(args: string[]): boolean;
+/** ccc's own subcommands, which start no Claude session. */
+declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp"];
+/**
+ * A ccc subcommand and its arguments: the first word, or the word after
+ * `local`/`staging` (`ccc staging memtree-mcp` is the same server as
+ * `ccc memtree-mcp`; the environment is the proxy's, from its base URL).
+ */
+export declare function subcommandArgs(args: readonly string[]): {
+    name: (typeof SUBCOMMANDS)[number];
+    args: string[];
+} | undefined;
 /**
  * Consume ccc's own flags only before the conventional `--` separator. Values
  * after it are literal Claude arguments/prompts, even when they look like ccc
@@ -29,4 +40,5 @@ export declare function compactTargetFromEnv(raw: string | undefined, parseToken
     value: number | null | undefined;
     warning?: string;
 };
+export {};
 //# sourceMappingURL=cli-args.d.ts.map
