@@ -27,6 +27,11 @@ import { UPGRADE_COMMAND } from "../dist/update-check.js";
 const PKG = "claude-code-infinite";
 const UPDATE = { latest: "1.0.21", current: "1.0.20" };
 const isRoot = process.getuid?.() === 0;
+// Auto-update never runs on Windows (detectInstallMethod refuses win32). The
+// runner it would start relies on POSIX process groups (kill(-pgid)) and a
+// shebang script standing in for npm, neither of which exists there.
+const POSIX_RUNNER = process.platform === "win32" &&
+  "auto-update is off on Windows; the runner needs POSIX process groups and a shebang fake npm";
 
 function tmpdir(label = "ccc-au-") {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), label)));
@@ -152,7 +157,10 @@ test("pnpm, yarn, bun and volta global installs are skipped", () => {
   assert.equal(detect(dir, { env: { VOLTA_HOME: voltaHome } }).kind, "volta");
 });
 
-test("a prefix that needs sudo is skipped, never escalated", { skip: isRoot && "root can write anything" }, () => {
+test("a prefix that needs sudo is skipped, never escalated", {
+  skip: (isRoot && "root can write anything") ||
+    (process.platform === "win32" && "chmod 0o555 does not deny writes on Windows"),
+}, () => {
   for (const which of ["npmRoot", "bin", "packageDir"]) {
     const g = makeGlobal();
     const dir = which === "bin" ? path.join(g.prefix, "bin") : g[which];
@@ -327,12 +335,15 @@ test("an entry is stale only when every process it names is gone, however old", 
   assert.equal(tryWith({ token: "young", startedAt: now, pid: dead }), true, "no grace needed: it names its processes");
   // The launcher exited, the runner it handed over to has not run a line yet.
   assert.equal(tryWith({ token: "handed", startedAt: now - 60_000, pid: dead, runner: process.pid }), false);
-  // The runner died but npm's group lives on: still held.
-  const npmGroup = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
-  try {
-    assert.equal(tryWith({ token: "grp", startedAt: now - 60_000, pid: dead, group: npmGroup.pid }), false);
-  } finally {
-    process.kill(-npmGroup.pid, "SIGKILL");
+  // The runner died but npm's group lives on: still held. Process groups are
+  // POSIX only (and auto-update never runs on Windows).
+  if (process.platform !== "win32") {
+    const npmGroup = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    try {
+      assert.equal(tryWith({ token: "grp", startedAt: now - 60_000, pid: dead, group: npmGroup.pid }), false);
+    } finally {
+      process.kill(-npmGroup.pid, "SIGKILL");
+    }
   }
   // Stale entries are cleared by the next owner.
   for (const n of lockEntries(lockDir)) fs.rmSync(path.join(lockDir, n));
@@ -635,7 +646,7 @@ async function runRunner({
   };
 }
 
-test("runner: installs exactly that version into this prefix, records ok, frees the lock", async () => {
+test("runner: installs exactly that version into this prefix, records ok, frees the lock", { skip: POSIX_RUNNER }, async () => {
   const g = makeGlobal();
   const { calls, state, lockLeft, files } = await runRunner({ global: g });
   assert.deepEqual(calls[0], ["root", "--global"]);
@@ -648,14 +659,14 @@ test("runner: installs exactly that version into this prefix, records ok, frees 
   assert.match(fs.readFileSync(files.logFile, "utf8"), /fake npm install[\s\S]*installed 1\.0\.21/);
 });
 
-test("runner: npm failure is recorded and frees the lock", async () => {
+test("runner: npm failure is recorded and frees the lock", { skip: POSIX_RUNNER }, async () => {
   const { state, lockLeft } = await runRunner({ global: makeGlobal(), exit: 1 });
   assert.equal(state.last.status, "failed");
   assert.match(state.last.error, /npm install exited with 1/);
   assert.equal(lockLeft, false);
 });
 
-test("runner: a different npm root or a linked entry installs nothing", async () => {
+test("runner: a different npm root or a linked entry installs nothing", { skip: POSIX_RUNNER }, async () => {
   const g = makeGlobal();
   const elsewhere = makeGlobal();
   const wrong = await runRunner({ global: g, reportedRoot: elsewhere.npmRoot });
@@ -702,7 +713,7 @@ test("the plan is rechecked under the lock: racing sessions cannot bypass backof
   assert.equal(second.calls.length, 0);
 });
 
-test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", async () => {
+test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", { skip: POSIX_RUNNER }, async () => {
   const g = makeGlobal();
   const started = Date.now();
   const { state, lockLeft, pidFile } = await runRunner({
@@ -716,7 +727,7 @@ test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the l
   assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
 });
 
-test("runner: a descendant npm leaves behind is reaped before the lock is freed", async () => {
+test("runner: a descendant npm leaves behind is reaped before the lock is freed", { skip: POSIX_RUNNER }, async () => {
   const g = makeGlobal();
   const { state, lockLeft, pidFile } = await runRunner({
     global: g, descendant: true, killGraceMs: 300, pipeGraceMs: 300,
@@ -750,7 +761,7 @@ test("runner: without the launcher's handoff it installs nothing", async () => {
   assert.equal(never.lockLeft, false);
 });
 
-test("runner: stopped while reaping npm root, it starts no further npm command", async () => {
+test("runner: stopped while reaping npm root, it starts no further npm command", { skip: POSIX_RUNNER }, async () => {
   const { calls, state, lockLeft } = await runRunner({
     global: makeGlobal(), abortDuringRoot: true, killGraceMs: 300, pipeGraceMs: 300,
   });
@@ -781,7 +792,7 @@ test("a handoff landing while an entry is judged stale keeps it: the acquirer ba
   assert.equal(fs.existsSync(file), false);
 });
 
-test("runner: while npm runs its lock entry already protects it (spawning or group)", async () => {
+test("runner: while npm runs its lock entry already protects it (spawning or group)", { skip: POSIX_RUNNER }, async () => {
   const { state, snapshotFile } = await runRunner({ global: makeGlobal(), snapshot: true });
   assert.equal(state.last.status, "ok");
   const during = JSON.parse(fs.readFileSync(snapshotFile, "utf8"));

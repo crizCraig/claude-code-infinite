@@ -3108,7 +3108,8 @@ test("the resume relay script forwards SessionStart stdin to the proxy and print
     // would block the very event loop that has to answer the relay.
     const run = (input) =>
       new Promise((resolve, reject) => {
-        const child = spawn("/bin/sh", ["-c", command]);
+        // Claude Code runs hook commands in Git Bash on Windows.
+        const child = spawn(process.platform === "win32" ? "bash" : "/bin/sh", ["-c", command]);
         let out = "";
         child.stdout.on("data", (c) => (out += c));
         child.on("error", reject);

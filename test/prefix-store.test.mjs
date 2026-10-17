@@ -127,7 +127,8 @@ test("a restarted proxy rides the persisted prefix on its first turn, byte for b
     ridden = before.raw.at(-1);
     const files = await waitForFile(dir);
     assert.equal(files.length, 1);
-    assert.equal(fs.statSync(files[0]).mode & 0o777, 0o600);
+    // Windows has no POSIX mode bits (chmod sets only read-only).
+    if (process.platform !== "win32") assert.equal(fs.statSync(files[0]).mode & 0o777, 0o600);
   } finally { before.close(); }
 
   const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort: before.memoryPort });
@@ -371,7 +372,7 @@ test("the store repairs its directory mode and cleans stale temporary files", ()
   fs.utimesSync(stale, old, old);
   const store = new StablePrefixStore(dir);
   store.save("s", OWNER, PREFIX("p"), undefined);
-  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  if (process.platform !== "win32") assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
   assert.equal(fs.existsSync(stale), false, "stale temporary file removed");
   assert.deepEqual(fs.readdirSync(dir).filter((f) => !f.endsWith(".json")), []);
 });
