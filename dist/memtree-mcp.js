@@ -75,8 +75,10 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "MemTree indexes the whole conversation as it goes: a tree of summaries from a one-line overview at the root down to " +
     "leaves, each pointing at the exact transcript lines it summarizes. Indexing runs in the background and trails the " +
     "newest messages slightly.\n\n" +
-    "Until the conversation reaches its size budget you see every message verbatim, and these tools are only a way to " +
-    "find things in a long history. Once it reaches the budget, the earlier conversation is replaced by a single memory " +
+    "Until the conversation reaches its size budget you see every message verbatim. The tools reach beyond this " +
+    "conversation: when the user refers to earlier work from another session (\"like last time\", \"the " +
+    "fix from yesterday\"), search without tree, or list recent sessions, before asking or re-deriving it.\n\n" +
+    "Once the conversation reaches the budget, the earlier conversation is replaced by a single memory " +
     "message: that tree, expanded where it looked relevant to the latest request and collapsed elsewhere. The user's own " +
     "messages shown there, and everything after the memory message, stay word for word; the rest of the earlier " +
     "conversation survives only as summaries, which drop exact values, instructions, reasoning and dead ends. The detail " +
@@ -86,7 +88,7 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
     "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
     "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
-    "sessions (use that when the user refers to earlier work that is not in this session), and list shows those " +
+    "sessions, and list shows those " +
     "sessions by time and project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
     "meaning: its first page is charged even when the query embedding is cached; cursor continuation is free, " +
     "including when the embedding must be regenerated. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
@@ -107,8 +109,9 @@ export const MEMTREE_TOOL_META = { "anthropic/alwaysLoad": true };
 export const MEMTREE_TOOLS = [
     {
         name: "search",
-        description: "Search MemTree for exact details or for meaning: one tree (tree, \"current\" for this session) or, without tree, " +
-            "all of the user's sessions. Use it before re-deriving or guessing something from earlier work. " +
+        description: "Find what this conversation doesn't show: exact details from earlier in this session that the memory only " +
+            "summarizes, or earlier work from the user's other sessions. Search one tree (tree, \"current\" for this session) " +
+            "or, without tree, all of the user's sessions. Use it before re-deriving or guessing something from earlier work. " +
             "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
             "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +

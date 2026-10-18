@@ -748,6 +748,21 @@ test("finder query strings: filters pass through, mode defaults to text, tree sc
   assert.throws(() => sessionsQuery({ since: 5 }), /since must be a string/);
 });
 
+test("MCP instructions and search lead with when to use them, before any compression", () => {
+  const budget = MEMTREE_MCP_INSTRUCTIONS.indexOf("Once the conversation reaches the budget");
+  assert.ok(budget > 0);
+  const before = MEMTREE_MCP_INSTRUCTIONS.slice(0, budget);
+  assert.match(before, /another session/, "cross-session use is named before compression is");
+  assert.match(before, /search without tree, or list/);
+  assert.doesNotMatch(before, /only a way to find things/, "no longer framed as optional");
+  const search = MEMTREE_TOOLS.find((t) => t.name === "search");
+  assert.match(search.description, /^Find what this conversation doesn't show: /);
+  assert.match(search.description.split(". ")[0], /only summarizes.*other sessions/);
+  // Constant overhead: instructions + search description, measured 2026-10-18.
+  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_150,
+    MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
+});
+
 test("MCP instructions mention the cross-session tools and stay constant", () => {
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /\blist\b/);
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /"tree": "current"/);
