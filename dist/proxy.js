@@ -134,9 +134,9 @@ function checkAwaitedIndex(opts, attempt, shutdownSignal) {
     // Bound both the individual body read and repeated 202 responses. A page
     // that never completes must eventually return the lane to growth backoff.
     const timeoutMs = Math.max(1, Math.min(opts.awaitedIndexProbeTimeoutMs ?? 5_000, waiting.deadline - Date.now()));
-    const signal = AbortSignal.any([shutdownSignal, AbortSignal.timeout(timeoutMs)]);
+    const probe = abortOnTimeoutOrShutdown(timeoutMs, shutdownSignal);
     opts.memtree
-        .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`, "application/json", signal)
+        .fetchMemTree(`/usage/memtree/${waiting.pageId}.json`, "application/json", probe.signal)
         .then((page) => {
         if (page.status === 202 && Date.now() < waiting.deadline)
             return;
@@ -151,8 +151,31 @@ function checkAwaitedIndex(opts, attempt, shutdownSignal) {
             attempt.awaitingIndex = undefined;
     })
         .finally(() => {
+        probe.dispose();
         waiting.checking = false;
     });
+}
+/**
+ * A signal that aborts after `timeoutMs` or when `shutdownSignal` aborts.
+ * Not AbortSignal.any([shutdown, AbortSignal.timeout(ms)]): on Node 20 the
+ * composite holds its sources weakly, so a GC can collect the timeout signal
+ * and its abort never fires, leaving a hung probe open for good. Here the
+ * timer and the shutdown listener hold the controller until dispose().
+ */
+function abortOnTimeoutOrShutdown(timeoutMs, shutdownSignal) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    // Unreferenced like AbortSignal.timeout: a probe never holds the process open.
+    const timer = setTimeout(abort, timeoutMs);
+    timer.unref();
+    shutdownSignal.addEventListener("abort", abort, { once: true });
+    return {
+        signal: controller.signal,
+        dispose: () => {
+            clearTimeout(timer);
+            shutdownSignal.removeEventListener("abort", abort);
+        },
+    };
 }
 /**
  * Record lag evidence from `result` (indexLagEvidence): a refusal of this

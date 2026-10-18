@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import v8 from "node:v8";
+import vm from "node:vm";
 import {
   constants as zlibConstants,
   createGzip,
@@ -287,6 +289,38 @@ async function waitFor(cond, timeoutMs = 3000) {
     if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
     await new Promise((r) => setTimeout(r, 20));
   }
+}
+
+/**
+ * Run a full GC now. Timers and abort signals that only something weakly
+ * held keeps alive are collected here, so a test that needs one to fire
+ * fails every time instead of only when a GC happens to land in its window.
+ */
+function forceGc() {
+  v8.setFlagsFromString("--expose-gc");
+  vm.runInNewContext("gc")();
+}
+
+/**
+ * Resolves once a response of the proxy on `port` closes before finishing:
+ * the proxy's own res 'close' listener has then run, so it knows the client
+ * left. Arm it before the client request starts. Awaiting the event itself,
+ * rather than sleeping, is what keeps client-close races deterministic.
+ */
+function proxyResponseAborted(port) {
+  const proto = http.ServerResponse.prototype;
+  const emit = proto.emit;
+  return new Promise((resolve) => {
+    proto.emit = function (event, ...args) {
+      const result = emit.call(this, event, ...args);
+      if (event === "close" && !this.writableFinished &&
+          this.req?.headers.host === `127.0.0.1:${port}`) {
+        proto.emit = emit;
+        resolve();
+      }
+      return result;
+    };
+  });
 }
 
 function deferred() {
@@ -6461,6 +6495,7 @@ test("a closed newer subagent followup hands its lane decision back", async () =
     const older = postMessages(proxy.port, olderMessages, agent);
     await waitFor(() => arrived.AAA);
 
+    const proxySawClose = proxyResponseAborted(proxy.port);
     const newerClientGone = new Promise((resolve, reject) => {
       const clientReq = http.request({
         host: "127.0.0.1",
@@ -6494,8 +6529,8 @@ test("a closed newer subagent followup hands its lane decision back", async () =
     // 'close' listener. If the gate resolves before that, compression settles
     // with the client still apparently live and the followup logs a normal
     // record — "followup-client-closed" then never arrives, which was this
-    // test's historic ~1-in-5 flake. Let the close propagate first.
-    await new Promise((r) => setTimeout(r, 150));
+    // test's historic ~1-in-5 flake. Wait until the proxy has seen it.
+    await proxySawClose;
     gates.BBB.resolve();
     await within(
       waitFor(() =>
@@ -6592,6 +6627,7 @@ test("an agent followup keeps its reservation through delayed activation", async
     const candidate = postMessages(proxy.port, candidateMessages, agent);
     await waitFor(() => arrived.BBB);
 
+    const proxySawClose = proxyResponseAborted(proxy.port);
     const abandonedClientGone = new Promise((resolve, reject) => {
       abandonedRequest = http.request({
         host: "127.0.0.1",
@@ -6627,10 +6663,10 @@ test("an agent followup keeps its reservation through delayed activation", async
     await abandonedClientGone;
     // Same race as the deflaked lane-handback test: destroy() resolves the
     // client-LOCAL error immediately, but the proxy observes the close only
-    // at its res 'close' listener. Let the teardown propagate before letting
+    // at its res 'close' listener. Wait for that listener to run before letting
     // compression settle, or CCC forwards as live and the asserted
     // "followup-client-closed" record never arrives.
-    await new Promise((r) => setTimeout(r, 150));
+    await proxySawClose;
     gates.CCC.resolve();
     await within(
       waitFor(() =>
@@ -7495,6 +7531,7 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
   const conversation = largeToolTurn();
   try {
     // Send a large tool turn, then kill the client mid-compress.
+    const proxySawClose = proxyResponseAborted(proxy.port);
     const clientGone = new Promise((resolve) => {
       const clientReq = http.request({
         host: "127.0.0.1",
@@ -7510,10 +7547,10 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
       waitFor(() => compressArrived).then(() => clientReq.destroy());
     });
     await clientGone;
-    // Let the socket teardown reach the proxy's res 'close' listener before
+    // Wait for the socket teardown to reach the proxy's res 'close' listener before
     // compression settles (same race as the deflaked lane-handback test);
     // otherwise the outcome is "failed" instead of "client-closed".
-    await new Promise((r) => setTimeout(r, 150));
+    await proxySawClose;
     held.resolve();
     await within(
       waitFor(() =>
@@ -8680,6 +8717,7 @@ test("a client closed during the blocking compress refunds the lane budget", asy
   const conversation = largeToolTurn();
   try {
     // Send the large miss, then kill the client while the compress is held.
+    const proxySawClose = proxyResponseAborted(proxy.port);
     const clientGone = new Promise((resolve) => {
       const clientReq = http.request({
         host: "127.0.0.1",
@@ -8695,11 +8733,11 @@ test("a client closed during the blocking compress refunds the lane budget", asy
       waitFor(() => compressArrived).then(() => clientReq.destroy());
     });
     await clientGone;
-    // Let the close propagate to the proxy's res 'close' listener before the
+    // Wait for the close to reach the proxy's res 'close' listener before the
     // compress settles (same race as the deflaked lane-handback test);
     // otherwise recovery forwards as live, logs "compressed", and the refund
     // assertions below fail.
-    await new Promise((r) => setTimeout(r, 150));
+    await proxySawClose;
     gate.resolve();
     await within(
       waitFor(() =>
@@ -10067,12 +10105,17 @@ test("first-tree waiting expires hung probes and endless 202s, and aborts probes
       await postMessages(proxy.port, loop, SESSION);
       assert.equal(messageRecords(records).at(-1).routeRecovery.outcome, "awaiting-index");
       await waitFor(() => gets === 1);
+      // Collect anything only weakly held (Node 20's AbortSignal.any keeps its
+      // sources weakly), so a probe abort that depends on luck fails every run.
+      forceGc();
       if (mode === "shutdown") {
         await proxy.close();
-        await waitFor(() => closed === 1, 500);
+        await waitFor(() => closed === 1);
       } else {
-        if (mode === "hung") await waitFor(() => closed === 1, 500);
-        else await waitFor(() => Date.now() >= waitStarted + 150, 500);
+        // Await the probe's abort (its socket closing) or the wait deadline
+        // itself, not a fixed sleep: the probe times out after 25 ms.
+        if (mode === "hung") await waitFor(() => closed === 1);
+        else await waitFor(() => Date.now() >= waitStarted + 150);
         ready = true;
         loop = extendToolLoop(loop, "t3");
         loop.at(-1).content[0].content = "growth".repeat(10_000);
@@ -10447,7 +10490,8 @@ test("concurrent session pages and late completions are ordered within each sess
   });
   const get = (session) => fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${session}`);
   const waitFor = async (session, count) => {
-    for (let n = 0; n < 500 && (pending.get(session)?.length ?? 0) < count; n++) {
+    const deadline = Date.now() + 3000;
+    while ((pending.get(session)?.length ?? 0) < count && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
     assert.equal(pending.get(session)?.length, count);
@@ -11034,9 +11078,7 @@ for (const ending of ["Stop", "exit"]) {
       await postSessionMessages(proxy.port, [{ role: "user", content: "short question" }]);
       if (ending === "Stop") {
         await postHook(proxy, stopHook("prompt-main"));
-        for (let n = 0; n < 100 && !server.calls.some(c => c.final_index); n++) {
-          await new Promise(r => setTimeout(r, 5));
-        }
+        await waitFor(() => server.calls.some(c => c.final_index));
       } else memtree.flushFinalIndexes();
       await memtree.drainBackground(2000);
       const finals = server.calls.filter(c => c.final_index);
