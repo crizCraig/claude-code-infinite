@@ -92,7 +92,8 @@ function groupAlive(pgid) {
 function signalGroup(pgid, signal) {
   if (IS_WINDOWS) {
     try {
-      require("node:child_process").spawnSync("taskkill", ["/PID", String(pgid), "/T", "/F"], {
+      const taskkill = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+      require("node:child_process").spawnSync(taskkill, ["/PID", String(pgid), "/T", "/F"], {
         stdio: "ignore", windowsHide: true, timeout: 10000,
       });
     } catch {}

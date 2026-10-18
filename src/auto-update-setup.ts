@@ -11,7 +11,6 @@ import {
   AutoUpdateNotices,
   PACKAGE_DIR,
   detectInstallMethod,
-  isLinkedInstall,
   manualUpdateCommand,
   liveLockSince,
   planAutoUpdate,
@@ -44,6 +43,8 @@ export interface AutoUpdateSetupOptions {
   scriptPath?: string;
   /** This process (Windows: the runner waits for it to exit). */
   pid?: number;
+  /** Test-only: the Node (and so npm) the runner uses. */
+  execPath?: string;
 }
 
 export interface AutoUpdateSetup {
@@ -106,7 +107,7 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
     started = true;
     const spawnImpl = opts.spawnImpl ?? (spawn as unknown as SpawnLike);
     const result = startAutoUpdateInstall({
-      decision, files, spawnImpl, env, now, platform,
+      decision, files, spawnImpl, env, now, platform, execPath: opts.execPath,
       ...(windows ? { waitForPid: opts.pid ?? process.pid } : {}),
     });
     onResult?.(result);
@@ -156,7 +157,7 @@ function debugLine(method: InstallMethod | null, decision: AutoUpdateDecision): 
   const what =
     decision.action === "install" ? `installing ${decision.version} in the background`
     : decision.action === "installed" ? `${decision.version} already installed, restart to use it`
-    : isLinkedInstall(method?.kind ?? "unknown") ? "skipped: linked install"
+    : decision.code === "linked-install" ? "skipped: linked install"
     : `not installing: ${decision.reason}`;
   return `Auto-update: ${how}; ${what}`;
 }

@@ -5,7 +5,7 @@
  * startup path; on Windows only as ccc exits, see auto-update.ts).
  */
 import { spawn } from "node:child_process";
-import { AUTO_UPDATE_DELAY_MS, AutoUpdateNotices, PACKAGE_DIR, detectInstallMethod, isLinkedInstall, manualUpdateCommand, liveLockSince, planAutoUpdate, readInstalledVersion, readUpdateState, startAutoUpdateInstall, updateFiles, } from "./auto-update.js";
+import { AUTO_UPDATE_DELAY_MS, AutoUpdateNotices, PACKAGE_DIR, detectInstallMethod, manualUpdateCommand, liveLockSince, planAutoUpdate, readInstalledVersion, readUpdateState, startAutoUpdateInstall, updateFiles, } from "./auto-update.js";
 import { updateInstalledNoticeText, updateNoticeText } from "./notices.js";
 import { UPGRADE_COMMAND } from "./update-check.js";
 /** The banner's ending for a Windows update that installs as ccc exits. */
@@ -43,7 +43,7 @@ export function setupAutoUpdate(opts) {
         started = true;
         const spawnImpl = opts.spawnImpl ?? spawn;
         const result = startAutoUpdateInstall({
-            decision, files, spawnImpl, env, now, platform,
+            decision, files, spawnImpl, env, now, platform, execPath: opts.execPath,
             ...(windows ? { waitForPid: opts.pid ?? process.pid } : {}),
         });
         onResult?.(result);
@@ -89,7 +89,7 @@ function debugLine(method, decision) {
     const how = method ? `install method ${method.kind} (${method.detail})` : "no update to install";
     const what = decision.action === "install" ? `installing ${decision.version} in the background`
         : decision.action === "installed" ? `${decision.version} already installed, restart to use it`
-            : isLinkedInstall(method?.kind ?? "unknown") ? "skipped: linked install"
+            : decision.code === "linked-install" ? "skipped: linked install"
                 : `not installing: ${decision.reason}`;
     return `Auto-update: ${how}; ${what}`;
 }

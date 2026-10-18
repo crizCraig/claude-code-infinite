@@ -151,6 +151,11 @@ export interface DetectInstallOptions {
    * the package directory.
    */
   scriptPath?: string;
+  /**
+   * Windows: test writability by creating a file (default true). Diagnostics
+   * pass false, so a launch with no update writes nothing into the package.
+   */
+  probeWrites?: boolean;
   platform?: NodeJS.Platform;
   /** process.getuid(); undefined where there is none. */
   uid?: number;
@@ -235,9 +240,10 @@ export function detectInstallMethod(opts: DetectInstallOptions): InstallMethod {
   // pnpm (and others) also reach the package through a symlinked entry: theirs, not a link.
   const link = opts.scriptPath ? linkedPackageEntry(opts.scriptPath) : null;
   if (link && !otherPackageManager(real, env)) {
-    return method("npm-link", real, `${link} is a symlink (npm link)`);
+    const git = fs.existsSync(path.join(real, ".git"));
+    return method(git ? "git-checkout" : "npm-link", real, `${link} is a symlink (npm link)`);
   }
-  return classifyPackageDir(real, env, platform);
+  return classifyPackageDir(real, env, platform, opts.probeWrites !== false);
 }
 
 /** True for the installs whose files are the user's own checkout. */
@@ -253,9 +259,10 @@ export function isLinkedInstall(kind: InstallMethodKind): boolean {
 export function manualUpdateCommand(kind: InstallMethodKind): string {
   const spec = `${PACKAGE_NAME}@latest`;
   switch (kind) {
-    case "npm-link":
     case "git-checkout":
       return "linked install: git pull && npm run build in your checkout";
+    case "npm-link":
+      return "linked install: update and rebuild the folder it links to";
     case "pnpm": return `pnpm add -g ${spec}`;
     case "yarn": return `yarn global add ${spec}`;
     case "bun": return `bun add -g ${spec}`;
@@ -323,7 +330,8 @@ export function startAutoUpdateInstall(opts: StartInstallOptions): StartInstallR
         env: runnerEnv(opts.env ?? process.env, opts.execPath, opts.platform),
       }
     );
-    child.on("error", (err) => spawnFailed(opts.files, token, version, packageDir, err));
+    // A late error: this launch already reported "started", so the next one reports the failure.
+    child.on("error", (err) => spawnFailed(opts.files, token, version, packageDir, err, false));
     child.unref();
     // The handoff the runner waits for: without it the runner never installs.
     if (child.pid !== undefined) setLockRunner(opts.files.lockDir, token, child.pid);
@@ -397,7 +405,10 @@ export function takeUnreportedOutcome(
   const state = readUpdateState(stateFile);
   const last = state.last;
   if (!last || last.status === "running" || last.reported) return null;
-  writeUpdateState(stateFile, { ...state, last: { ...last, reported: true } });
+  // Re-read just before writing: an attempt started meanwhile is left as it is.
+  const again = readUpdateState(stateFile);
+  if (again.last?.at !== last.at || again.last.status !== last.status) return null;
+  writeUpdateState(stateFile, { ...again, last: { ...again.last, reported: true } });
   return last.status;
 }
 
@@ -447,7 +458,8 @@ export function writeUpdateState(file: string, state: UpdateState): void {
 function classifyPackageDir(
   real: string,
   env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform
+  platform: NodeJS.Platform,
+  probeWrites: boolean
 ): InstallMethod {
   if (fs.existsSync(path.join(real, ".git"))) {
     return method("git-checkout", real, "package directory is a git checkout");
@@ -468,19 +480,23 @@ function classifyPackageDir(
   }
   const prefix = windows ? path.dirname(parent) : path.dirname(path.dirname(parent));
   const bin = windows ? prefix : path.join(prefix, "bin");
-  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), bin], windows);
+  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), bin],
+    windows && probeWrites);
   if (unwritable) return method("not-writable", real, `${unwritable} is not writable without sudo`);
   return { kind: "npm-global", packageDir: real, detail: `npm prefix ${prefix}`, npmRoot: parent, prefix };
 }
 
 function otherPackageManager(real: string, env: NodeJS.ProcessEnv): InstallMethodKind | null {
-  const p = real.split(path.sep).join("/");
+  // Case-insensitive, with Windows' folders too (%LOCALAPPDATA%\Yarn\Data\global, \Volta\).
+  const p = real.split(path.sep).join("/").toLowerCase();
   if (p.includes("/_npx/")) return "npx";
   if (/\/\.?pnpm\//.test(p) || p.includes("/.pnpm-global/")) return "pnpm";
-  if (/\/\.yarn\//.test(p) || /\/yarn\/global\//.test(p) || p.includes("/.config/yarn/")) return "yarn";
+  if (/\/\.yarn\//.test(p) || /\/yarn\/(data\/)?global\//.test(p) || p.includes("/.config/yarn/")) {
+    return "yarn";
+  }
   if (p.includes("/.bun/")) return "bun";
   const volta = env.VOLTA_HOME && realpathOrNull(env.VOLTA_HOME);
-  if (p.includes("/.volta/") || (volta && isInside(real, volta))) return "volta";
+  if (/\/\.?volta\//.test(p) || (volta && isInside(real, volta))) return "volta";
   return null;
 }
 
@@ -593,12 +609,15 @@ function spawnFailed(
   token: string,
   version: string,
   packageDir: string,
-  err: unknown
+  err: unknown,
+  /** The launch reports it itself (auto_update spawn-failed): not again on the next one. */
+  reported = true
 ): void {
   const state = readUpdateState(files.stateFile);
   const error = `could not start the installer: ${String(err).slice(0, 200)}`;
-  // The launch reports this itself (auto_update spawn-failed): not again on the next one.
-  state.last = { version, status: "failed", at: Date.now(), packageDir, error, reported: true };
+  state.last = {
+    version, status: "failed", at: Date.now(), packageDir, error, ...(reported ? { reported } : {}),
+  };
   writeUpdateState(files.stateFile, state);
   releaseUpdateLock(files.lockDir, token);
 }

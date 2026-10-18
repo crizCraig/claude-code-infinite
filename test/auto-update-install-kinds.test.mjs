@@ -273,7 +273,9 @@ test("Windows: without npm-cli.js nothing runs; the attempt is a recorded failur
 test("Windows: setup installs only on exit, once, waiting for this ccc's pid", () => {
   const g = makeWindowsGlobal();
   const { spawnImpl, calls } = mockSpawn();
-  const s = setup(g.packageDir, { platform: "win32", uid: undefined, spawnImpl, pid: 999 });
+  const s = setup(g.packageDir, {
+    platform: "win32", uid: undefined, spawnImpl, pid: 999, execPath: g.execPath,
+  });
   assert.equal(s.decision.action, "install", s.debugLine);
   assert.deepEqual(s.bannerUpdate, { ...UPDATE, command: "installs when you exit ccc" },
     "nothing installs during the session: the banner says when it will");
@@ -283,13 +285,11 @@ test("Windows: setup installs only on exit, once, waiting for this ccc's pid", (
   const results = [];
   s.installOnExit((r) => results.push(r));
   s.installOnExit((r) => results.push(r));
-  assert.equal(calls.length <= 1, true);
-  if (results[0] === "started") {
-    assert.equal(JSON.parse(calls[0].args[2]).waitForPid, 999);
-  } else {
-    // No npm-cli.js beside the test's Node (setup uses process.execPath): a recorded failure.
-    assert.deepEqual(results, ["spawn-failed"]);
-  }
+  assert.deepEqual(results, ["started"]);
+  assert.equal(calls.length, 1);
+  const config = JSON.parse(calls[0].args[2]);
+  assert.equal(config.waitForPid, 999);
+  assert.deepEqual(config.npmArgs, [g.cli]);
   assert.equal(results.length, 1, "only once");
 });
 
@@ -314,4 +314,18 @@ test("diagnostics allow every skip reason and result auto-update reports", async
   assert.deepEqual(sanitizeEvent("auto_update", { result: "skipped", reason: "linked-install" }, 1),
     { result: "skipped", reason: "linked-install", name: "auto_update", t: 1 });
   assert.equal(sanitizeEvent("auto_update", { reason: "/Users/ada/src" }, 1).reason, undefined);
+});
+
+test("yarn and Volta on Windows are recognised (their folders, any case)", () => {
+  const yarn = makePackage(path.join(tmpdir(), "AppData", "Local", "Yarn", "Data", "global",
+    "node_modules", PKG));
+  assert.equal(detectInstallMethod({ packageDir: yarn, platform: "win32" }).kind, "yarn");
+  const volta = makePackage(path.join(tmpdir(), "AppData", "Local", "Volta", "tools", "image",
+    "packages", PKG, "node_modules", PKG));
+  assert.equal(detectInstallMethod({ packageDir: volta, platform: "win32" }).kind, "volta");
+});
+
+test("a link to a folder without git is told to rebuild that folder, not to git pull", () => {
+  assert.match(manualUpdateCommand("npm-link"), /update and rebuild the folder it links to/);
+  assert.match(manualUpdateCommand("git-checkout"), /git pull && npm run build/);
 });

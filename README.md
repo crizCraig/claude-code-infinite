@@ -458,8 +458,9 @@ In every other case it only shows the update line, with the command that fits th
 **Windows.** The install starts as `ccc` exits rather than during the session: the
 background installer waits for that `ccc` to be gone before npm runs, so npm does not
 rewrite files under the session that started it. The banner says so (`• ccc X is
-available … · installs when you exit ccc`), and the next `ccc` you start runs the new
-version. Closing the terminal window counts as exiting. By hand:
+available … · installs when you exit ccc`). A `ccc` started while it installs says
+"Finishing a ccc update…" and waits for it (a few seconds, at most 30), then runs the new
+version. Closing the terminal window usually counts as exiting too. By hand:
 `npm i -g claude-code-infinite@latest`.
 
 `ccc --debug` prints which install method was detected and what it decided.

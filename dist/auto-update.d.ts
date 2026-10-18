@@ -101,6 +101,11 @@ export interface DetectInstallOptions {
      * the package directory.
      */
     scriptPath?: string;
+    /**
+     * Windows: test writability by creating a file (default true). Diagnostics
+     * pass false, so a launch with no update writes nothing into the package.
+     */
+    probeWrites?: boolean;
     platform?: NodeJS.Platform;
     /** process.getuid(); undefined where there is none. */
     uid?: number;

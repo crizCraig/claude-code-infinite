@@ -22,6 +22,8 @@ export interface AutoUpdateSetupOptions {
     scriptPath?: string;
     /** This process (Windows: the runner waits for it to exit). */
     pid?: number;
+    /** Test-only: the Node (and so npm) the runner uses. */
+    execPath?: string;
 }
 export interface AutoUpdateSetup {
     decision: AutoUpdateDecision;

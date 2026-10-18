@@ -13,6 +13,7 @@
  */
 import spawn from "cross-spawn";
 import { exec } from "node:child_process";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
@@ -265,10 +266,12 @@ async function main() {
     // Before the key prompt: someone without Claude Code learns that first.
     const claude = locateClaude();
     if (diagnostics.enabled) {
+        // One read each of Claude Code's config files (~/.claude.json can be large).
+        const readFile = memoizedTextReader();
         diagnostics.setContext({
             claude_found: claude?.source,
-            claude_auth: claudeAuthFromConfig(),
-            claude_plan: claudePlanFromConfig(),
+            claude_auth: claudeAuthFromConfig({ readFile }),
+            claude_plan: claudePlanFromConfig({ readFile }),
         });
     }
     if (!claude) {
@@ -578,7 +581,12 @@ async function main() {
             mode,
             color: terminalSupportsColor(),
         });
-        const credit = creditTooLow ? `${creditNoticeText(terminalSupportsColor())}\n` : "";
+        // Print/non-TTY stdout is Claude's alone: the notice goes to stderr there.
+        if (creditTooLow && !interactiveUi)
+            console.error(creditNoticeText(false));
+        const credit = creditTooLow && interactiveUi
+            ? `${creditNoticeText(terminalSupportsColor())}\n`
+            : "";
         const exitText = `${credit}${hint ?? ""}`;
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
         void (exitText ? writeStdout(exitText) : Promise.resolve()).then(markChildDone);
@@ -608,7 +616,7 @@ function startDiagnostics(mode, baseUrl, apiKey) {
     try {
         const method = detectInstallMethod({
             packageDir: PACKAGE_DIR, env: process.env, uid: process.getuid?.(),
-            scriptPath: process.argv[1],
+            scriptPath: process.argv[1], probeWrites: false,
         });
         diagnostics.setContext({ mode, install_method: method.kind });
     }
@@ -620,16 +628,34 @@ function startDiagnostics(mode, baseUrl, apiKey) {
     diagnostics.start();
     return diagnostics;
 }
+/** A file reader that reads each path once (null when unreadable). */
+function memoizedTextReader() {
+    const cache = new Map();
+    return (file) => {
+        if (!cache.has(file)) {
+            let text = null;
+            try {
+                text = readFileSync(file, "utf8");
+            }
+            catch {
+                // Missing or unreadable: no answer from it.
+            }
+            cache.set(file, text);
+        }
+        return cache.get(file);
+    };
+}
 /**
  * auto_update events: a skip with its reason, an install that landed, and
  * (once) the result of the last background install, which its detached
  * runner cannot send itself.
  */
 function recordAutoUpdateDecision(diagnostics, autoUpdate) {
-    if (autoUpdate?.bannerUpdate) {
+    const decision = autoUpdate?.decision;
+    // Windows' "installs when you exit" banner is an install, not a hint.
+    if (autoUpdate?.bannerUpdate && decision?.action === "skip") {
         diagnostics.record("update_hint", { latest: autoUpdate.bannerUpdate.latest });
     }
-    const decision = autoUpdate?.decision;
     if (decision?.action === "skip" && decision.code !== "no-update") {
         diagnostics.record("auto_update", { result: "skipped", reason: decision.code });
     }
