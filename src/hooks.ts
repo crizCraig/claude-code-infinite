@@ -29,6 +29,25 @@ export const FIRST_TREE_VALUE = "a searchable map of this session so far";
 /** Added under the first tree a user ever sees: what to do with it. */
 export const FIRST_EVER_HINT =
   "Open it, or paste the link to any agent to give it this session's context";
+/** Under the first tree a user ever sees: the server's report of what the agent did. */
+export const FIRST_EVER_REPORT_LABEL = "What your agent did so far:";
+
+/**
+ * The report page of a MemTree page link (`/m/<id>` or `/usage/memtree/<id>`,
+ * plus `/report`), or undefined for any other URL, which is then not offered.
+ */
+export function memtreeReportUrl(pageUrl: string): string | undefined {
+  try {
+    const url = new URL(pageUrl);
+    if (!/^\/(m|usage\/memtree)\/[A-Za-z0-9_-]+$/.test(url.pathname)) return undefined;
+    url.pathname = `${url.pathname}/report`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Closes every URL line. Terminal linkifiers run a bare URL into whatever is
@@ -611,7 +630,8 @@ export class NoticeDeliveryQueue {
 
   /**
    * The session's first tree: bold leaf title, the value in one line, the
-   * URL below; for the user's first tree ever, one dim line on what to do.
+   * URL below; for the user's first tree ever, one dim line on what to do and the
+   * page's "what your agent did" report (memtreeReportUrl) on its own URL line.
    */
   private firstTreeNotice(url: string, sessionId: string | undefined): string {
     const title = this.color
@@ -620,7 +640,10 @@ export class NoticeDeliveryQueue {
     const notice = linkLines(title, url, FIRST_TREE_VALUE);
     const firstEver = this.askIntro((intro) => intro.isFirstEver(sessionId)) === true;
     this.askIntro((intro) => intro.markShown(sessionId));
-    return firstEver ? `${notice}\n  ${this.styleDim(FIRST_EVER_HINT)}` : notice;
+    if (!firstEver) return notice;
+    const hint = `${notice}\n  ${this.styleDim(FIRST_EVER_HINT)}`;
+    const report = memtreeReportUrl(url);
+    return report ? `${hint}\n  ${this.styleDim(FIRST_EVER_REPORT_LABEL)}\n${urlLine(report)}` : hint;
   }
 
   /** Call the first-tree intro; a throwing one never breaks a hook. */
