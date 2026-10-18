@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.26](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.25...v1.0.26) (2026-10-18)
+
+
+### Features
+
+* MemTree tools say when to use them before any compression ([f795c7a](https://github.com/crizCraig/claude-code-infinite/commit/f795c7a1c02f45ae1876359f7ac0b77cbdbda276))
+
+
+### Bug Fixes
+
+* find and launch Claude Code however it is installed on Windows; safe auto-update there; never over a linked install ([6b0127d](https://github.com/crizCraig/claude-code-infinite/commit/6b0127da7f2cbd0032fd37854b124f6503b45cd2))
+* review fixes for Windows updates, pnpm links and sign-in diagnostics ([9d86b5b](https://github.com/crizCraig/claude-code-infinite/commit/9d86b5b32584d5c46f7fcac6b41c7c4f1ade2da0))
+* second review round: wait for a Windows update on relaunch, keep print stdout clean ([ca03bc5](https://github.com/crizCraig/claude-code-infinite/commit/ca03bc57d95878f5715f86c55a3ca18c8cbbb117))
+* third review round: start the Windows update first in shutdown, find claude.cmd for resume repair ([d11e257](https://github.com/crizCraig/claude-code-infinite/commit/d11e25783b5a1961abf8d96060ab0892d2ee9ce1))
+
 ## [1.0.25](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.24...v1.0.25) (2026-10-18)
 
 
