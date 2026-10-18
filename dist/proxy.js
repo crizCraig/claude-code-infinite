@@ -304,6 +304,7 @@ export function startProxy(opts) {
     const state = {
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
+        pausedDetail: () => opts.memtree.pausedDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
         diagnostics: opts.diagnostics,
@@ -1719,7 +1720,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
         if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
             // A paused refusal of this very request withdraws it (refuseWholeRequest).
-            pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link), () => {
+            pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget: reachedBudget(rec.compaction) }), () => {
                 state.paymentNotice.markShown();
                 state.diagnostics?.record("paused_notice", { trigger: "turn" });
             }, noticePromptId));
@@ -3944,11 +3945,9 @@ async function wholeRequestRefused(sizing, candidate, limits) {
 }
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(args, inputTokens, budgetTokens) {
-    const unpaid = args.state.unpaidDetail();
+    const unpaid = args.state.pausedDetail();
     const failure = unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
         : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true });
-    if (unpaid !== null)
-        notePausedRefusal(args.state, args.rec, args.routeKey);
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     args.state.diagnostics?.record("refusal", {
@@ -3962,10 +3961,14 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
         budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
     };
+    if (unpaid !== null)
+        cancelPausedNotice(args.state, args.rec);
     if (args.res.headersSent || args.res.destroyed)
         return false;
     args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
     args.res.end(JSON.stringify(failure.body));
+    if (unpaid !== null)
+        notePausedRefusal(args.state, args.rec, args.routeKey);
     return false;
 }
 /**
@@ -3974,14 +3977,27 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
  * queued notice is withdrawn rather than shown a second time after it.
  */
 function notePausedRefusal(state, rec, lane) {
-    state.notices.cancel(pausedNotices.get(rec));
-    pausedNotices.delete(rec);
-    state.paymentNotice.markShown();
+    // A subagent's refusal goes to its parent model, not to the user's screen.
+    if (rec.routeLane !== "agent")
+        state.paymentNotice.markShown();
     // A tool turn in the outage cooldown or its lane's growth backoff refuses on
     // the last 402 without asking. End both so the next request asks MemTree
-    // again (a 402 answers fast) and paying takes effect with no restart.
+    // again (a 402 answers fast) and paying takes effect with no restart. A
+    // concurrent attempt still compressing (no backoff yet) keeps its slot.
     state.toolRecoveryCooldownUntil = 0;
-    state.toolRecoveryAttemptedLanes.delete(lane);
+    const attempt = state.toolRecoveryAttemptedLanes.get(lane);
+    if (attempt && (!attempt.inFlight || attempt.retryAtTokens !== undefined)) {
+        state.toolRecoveryAttemptedLanes.delete(lane);
+    }
+}
+/** Withdraw the paused notice this request queued: its refusal says the same. */
+function cancelPausedNotice(state, rec) {
+    state.notices.cancel(pausedNotices.get(rec));
+    pausedNotices.delete(rec);
+}
+/** Whether this turn's own size estimate reached its whole-request budget. */
+function reachedBudget(compaction) {
+    return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
 }
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap();

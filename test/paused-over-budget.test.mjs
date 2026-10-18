@@ -9,7 +9,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
-import { PAYMENT_PAUSED_HEADLINE, pausedRefusalMessage } from "../dist/payment-notice.js";
+import { PAYMENT_CONTINUES_LINE, PAYMENT_OVER_BUDGET_LINE, PAYMENT_PAUSED_HEADLINE,
+  pausedRefusalMessage } from "../dist/payment-notice.js";
 
 const MODEL = "claude-opus-4-7[1m]";
 const MAX_TOKENS = 128_000;
@@ -37,7 +38,7 @@ async function serve(handler) {
 
 /** Upstream counts and answers; MemTree answers 402 until `h.paid`, then compresses. */
 async function harness(extra = {}) {
-  const h = { paid: false, delivered: [], compressCalls: 0 };
+  const h = { paid: false, down: false, delivered: [], compressCalls: 0 };
   const upstream = await serve((req, res, raw) => {
     res.setHeader("content-type", "application/json");
     if (req.url.includes("/count_tokens")) {
@@ -52,6 +53,10 @@ async function harness(extra = {}) {
     if (req.method === "GET") { res.statusCode = 202; return res.end("{}"); }
     const indexOnly = raw && JSON.parse(raw).index_only;
     if (!indexOnly) h.compressCalls += 1;
+    if (h.down) {
+      res.statusCode = 503;
+      return res.end(JSON.stringify({ detail: "down" }));
+    }
     if (!h.paid) {
       res.statusCode = 402;
       return res.end(JSON.stringify({ detail: PAYMENT_DETAIL }));
@@ -107,7 +112,7 @@ test("the paused refusal names the pause, the subscribe link and /clear, not mem
   assert.equal(text,
     "MemTree is paused (usage limit reached), so this long conversation can't be compressed " +
     `to fit the model's context window. Subscribe to resume: ${SUBSCRIBE_URL} · ` +
-    "or start fresh with /clear (your history stays in your MemTree).");
+    "or start fresh with /clear (MemTree keeps what it indexed before the pause).");
   assert.ok(!text.includes("memtree-compact"));
   assert.ok(!text.includes("\n"), "one line");
   // No checkout link in the detail: the pricing page.
@@ -180,8 +185,12 @@ test("a fitting paused turn still gets the throttled paused notice", async () =>
     assert.equal((await post(h, humanTurn(977_000))).status, 200);
     const shown = await display(h, "p1");
     assert.ok(shown.body.hookSpecificOutput.displayContent.includes(PAYMENT_PAUSED_HEADLINE));
-    assert.ok(shown.body.hookSpecificOutput.displayContent.includes(SUBSCRIBE_URL));
-    assert.ok(!shown.body.hookSpecificOutput.displayContent.includes("memtree-compact"));
+    const text = shown.body.hookSpecificOutput.displayContent;
+    assert.ok(text.includes(SUBSCRIBE_URL));
+    assert.ok(!text.includes("memtree-compact"));
+    // Over the budget it is nearing the window: Claude Code's own /compact still works.
+    assert.ok(text.includes(PAYMENT_OVER_BUDGET_LINE), text);
+    assert.ok(!text.includes(PAYMENT_CONTINUES_LINE), text);
   } finally { h.close(); }
 });
 
@@ -206,5 +215,32 @@ test("while paused, /ccc:memtree and /ccc:memtree-compact do not offer compactio
     h.paid = true;
     assert.equal((await post(h, humanTurn(977_000))).status, 200); // paid again
     assert.match((await submit(h, "/ccc:memtree")).body.reason, /memtree-compact/);
+  } finally { h.close(); }
+});
+
+test("an outage after a 402 gets the usual bounded retries, not the paused refusal", async () => {
+  const h = await harness();
+  try {
+    assert.equal((await post(h, humanTurn(988_000))).status, 400); // paused
+    h.down = true; // MemTree's latest answer is no longer a 402
+    const response = await post(h, humanTurn(988_000));
+    assert.equal(response.status, 503);
+    assert.ok(!errorMessage(response).includes("paused"));
+  } finally { h.close(); }
+});
+
+test("a subagent's paused refusal does not use up the user's paused notice", async () => {
+  const h = await harness();
+  try {
+    const raw = JSON.stringify({ model: MODEL, max_tokens: MAX_TOKENS, messages: toolTurn(988_000) });
+    const response = await fetch(`http://127.0.0.1:${h.proxy.port}/v1/messages`, {
+      method: "POST", body: raw, headers: { "content-type": "application/json",
+        "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": "agent-1" } });
+    assert.equal(response.status, 400);
+    assert.match(JSON.parse(await response.text()).error.message, /MemTree is paused/);
+    await submit(h, "next", "p1");
+    assert.equal((await post(h, humanTurn(977_000))).status, 200);
+    const shown = await display(h, "p1");
+    assert.ok(shown.body.hookSpecificOutput.displayContent.includes(PAYMENT_PAUSED_HEADLINE));
   } finally { h.close(); }
 });

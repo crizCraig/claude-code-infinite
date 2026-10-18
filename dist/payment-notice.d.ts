@@ -22,6 +22,12 @@ export declare const PAYMENT_NOTICE_INTERVAL_MS: number;
 export declare const PAYMENT_PAUSED_HEADLINE = "\u26A0 MemTree compression is paused: usage limit reached. Subscribe to turn it back on:";
 export declare const PAYMENT_CONTINUES_LINE = "Your session continues uncompressed.";
 export declare const PAYMENT_PAGE_LABEL = "Your MemTree so far:";
+/**
+ * A paused turn that MemTree would have compressed: the session nears the
+ * model's window, past which only compression could send it. Claude Code's
+ * own /compact needs no MemTree but must run while the conversation still fits.
+ */
+export declare const PAYMENT_OVER_BUDGET_LINE: string;
 /** What a paused key means, in the refusal and the command replies. */
 export declare const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
 /**
@@ -36,7 +42,9 @@ export declare function pausedCompactionText(url: string): string;
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.
  */
-export declare function paymentNoticeText(detail: string, memtreeUrl?: string): string;
+export declare function paymentNoticeText(detail: string, memtreeUrl?: string, options?: {
+    overBudget?: boolean;
+}): string;
 /**
  * The checkout link in a 402 detail (the server's payment prompt carries a
  * `/payment?user_id=…&user_email=…` link), tagged `source=ccc` like the

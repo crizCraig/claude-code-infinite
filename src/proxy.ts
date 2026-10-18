@@ -391,6 +391,8 @@ interface ProxyState {
   paymentNotice: PaymentNoticeThrottle;
   /** The MemTree client's last 402 detail, or null while the key is paid. */
   unpaidDetail: () => string | null;
+  /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
+  pausedDetail: () => string | null;
   /** polychat's usage dashboard for the MemTree environment, if known. */
   usageUrl: string | undefined;
   /** ProxyOptions.sessionStartNotice. */
@@ -884,6 +886,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const state: ProxyState = {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
+    pausedDetail: () => opts.memtree.pausedDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
     diagnostics: opts.diagnostics,
@@ -2487,7 +2490,8 @@ async function handleMessages(
     if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
       // A paused refusal of this very request withdraws it (refuseWholeRequest).
       pausedNotices.set(rec, state.notices.queueSuffix(
-        paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link),
+        paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link,
+          { overBudget: reachedBudget(rec.compaction) }),
         () => {
           state.paymentNotice.markShown();
           state.diagnostics?.record("paused_notice", { trigger: "turn" });
@@ -5356,11 +5360,10 @@ function refuseWholeRequest(
   inputTokens: number,
   budgetTokens: number
 ): false {
-  const unpaid = args.state.unpaidDetail();
+  const unpaid = args.state.pausedDetail();
   const failure = unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
     : args.state.fallbackFailures.fail(args.routeKey,
       { awaitingIndex: args.rec.indexBehind === true });
-  if (unpaid !== null) notePausedRefusal(args.state, args.rec, args.routeKey);
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   args.state.diagnostics?.record("refusal", {
@@ -5374,9 +5377,11 @@ function refuseWholeRequest(
     outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
     budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
   };
+  if (unpaid !== null) cancelPausedNotice(args.state, args.rec);
   if (args.res.headersSent || args.res.destroyed) return false;
   args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
   args.res.end(JSON.stringify(failure.body));
+  if (unpaid !== null) notePausedRefusal(args.state, args.rec, args.routeKey);
   return false;
 }
 
@@ -5386,14 +5391,28 @@ function refuseWholeRequest(
  * queued notice is withdrawn rather than shown a second time after it.
  */
 function notePausedRefusal(state: ProxyState, rec: MessagesRecord, lane: string): void {
-  state.notices.cancel(pausedNotices.get(rec));
-  pausedNotices.delete(rec);
-  state.paymentNotice.markShown();
+  // A subagent's refusal goes to its parent model, not to the user's screen.
+  if (rec.routeLane !== "agent") state.paymentNotice.markShown();
   // A tool turn in the outage cooldown or its lane's growth backoff refuses on
   // the last 402 without asking. End both so the next request asks MemTree
-  // again (a 402 answers fast) and paying takes effect with no restart.
+  // again (a 402 answers fast) and paying takes effect with no restart. A
+  // concurrent attempt still compressing (no backoff yet) keeps its slot.
   state.toolRecoveryCooldownUntil = 0;
-  state.toolRecoveryAttemptedLanes.delete(lane);
+  const attempt = state.toolRecoveryAttemptedLanes.get(lane);
+  if (attempt && (!attempt.inFlight || attempt.retryAtTokens !== undefined)) {
+    state.toolRecoveryAttemptedLanes.delete(lane);
+  }
+}
+
+/** Withdraw the paused notice this request queued: its refusal says the same. */
+function cancelPausedNotice(state: ProxyState, rec: MessagesRecord): void {
+  state.notices.cancel(pausedNotices.get(rec));
+  pausedNotices.delete(rec);
+}
+
+/** Whether this turn's own size estimate reached its whole-request budget. */
+function reachedBudget(compaction: CompactionRecord | undefined): boolean {
+  return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
 }
 
 /** The paused notice a degraded request queued, until it is refused or settles. */

@@ -33,6 +33,14 @@ export const PAYMENT_PAUSED_HEADLINE =
 export const PAYMENT_CONTINUES_LINE =
   "Your session continues uncompressed.";
 export const PAYMENT_PAGE_LABEL = "Your MemTree so far:";
+/**
+ * A paused turn that MemTree would have compressed: the session nears the
+ * model's window, past which only compression could send it. Claude Code's
+ * own /compact needs no MemTree but must run while the conversation still fits.
+ */
+export const PAYMENT_OVER_BUDGET_LINE =
+  "Your session continues uncompressed, but it is nearing the model's context window: " +
+  "run /compact (Claude Code's own) or /clear before it stops fitting.";
 /** What a paused key means, in the refusal and the command replies. */
 export const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
 
@@ -44,7 +52,7 @@ export const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
 export function pausedRefusalMessage(detail: string): string {
   return `${MEMTREE_PAUSED}, so this long conversation can't be compressed to fit the ` +
     `model's context window. Subscribe to resume: ${subscribeUrlFromDetail(detail)} · ` +
-    "or start fresh with /clear (your history stays in your MemTree).";
+    "or start fresh with /clear (MemTree keeps what it indexed before the pause).";
 }
 
 /** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
@@ -56,10 +64,12 @@ export function pausedCompactionText(url: string): string {
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.
  */
-export function paymentNoticeText(detail: string, memtreeUrl?: string): string {
+export function paymentNoticeText(
+  detail: string, memtreeUrl?: string, options: { overBudget?: boolean } = {}
+): string {
   const lines = [PAYMENT_PAUSED_HEADLINE, `  ${subscribeUrlFromDetail(detail)}`];
   const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "");
-  lines.push(PAYMENT_CONTINUES_LINE);
+  lines.push(options.overBudget ? PAYMENT_OVER_BUDGET_LINE : PAYMENT_CONTINUES_LINE);
   if (account) lines.push(account);
   if (memtreeUrl) lines.push(PAYMENT_PAGE_LABEL, `  ${memtreeUrl}`);
   return lines.join("\n");

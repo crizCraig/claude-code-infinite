@@ -324,6 +324,8 @@ export declare class MemtreeClient {
     private finalDrainDeadline;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     private unpaidDetail;
+    /** Whether the latest call that got an answer, or timed out, got a 402. */
+    private lastAnswerUnpaid;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
     /**
@@ -332,6 +334,13 @@ export declare class MemtreeClient {
      * background-indexing calls; cleared by any subsequent success.
      */
     get paymentRequiredDetail(): string | null;
+    /**
+     * The 402 detail while the server's latest answer (or timeout) was that 402,
+     * else null. A later outage keeps paymentRequiredDetail for the notice, but
+     * then says nothing current about payment, so a final "paused" refusal
+     * relies on this instead.
+     */
+    get pausedDetail(): string | null;
     /** polychat's usage dashboard for this client's environment (its base URL). */
     get usageDashboardUrl(): string | undefined;
     /**

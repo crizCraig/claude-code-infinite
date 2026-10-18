@@ -970,6 +970,8 @@ export class MemtreeClient {
   private finalDrainDeadline: number | undefined;
   /** FastAPI `detail` text from the most recent 402, or null while paid. */
   private unpaidDetail: string | null = null;
+  /** Whether the latest call that got an answer, or timed out, got a 402. */
+  private lastAnswerUnpaid = false;
   /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
 
@@ -980,6 +982,16 @@ export class MemtreeClient {
    */
   get paymentRequiredDetail(): string | null {
     return this.unpaidDetail;
+  }
+
+  /**
+   * The 402 detail while the server's latest answer (or timeout) was that 402,
+   * else null. A later outage keeps paymentRequiredDetail for the notice, but
+   * then says nothing current about payment, so a final "paused" refusal
+   * relies on this instead.
+   */
+  get pausedDetail(): string | null {
+    return this.lastAnswerUnpaid ? this.unpaidDetail : null;
   }
 
   /** polychat's usage dashboard for this client's environment (its base URL). */
@@ -1688,6 +1700,8 @@ export class MemtreeClient {
     } finally {
       clearTimeout(timeout);
       opts.signal?.removeEventListener("abort", abort);
+      // A call the caller aborted says nothing about the server.
+      if (status !== undefined || !opts.signal?.aborted) this.lastAnswerUnpaid = status === 402;
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).
       this.reqlog?.log({
