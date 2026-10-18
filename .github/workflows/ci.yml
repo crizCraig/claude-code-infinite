@@ -69,3 +69,11 @@ jobs:
         env:
           FORCE_COLOR: "1"
           TERM: xterm-256color
+
+      # A real auto-update (npm registry): a published ccc in a throwaway global
+      # prefix updates itself through the detached runner, on every OS.
+      - name: Auto-update end to end (real npm)
+        if: matrix.node == '24'
+        run: node --test test/auto-update-e2e.test.mjs
+        env:
+          CCC_E2E_NPM: "1"

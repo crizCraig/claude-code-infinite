@@ -27,6 +27,8 @@ export interface UpdateAvailable {
     latest: string;
     /** The running client's version. */
     current: string;
+    /** How to update this install by hand, when not UPGRADE_COMMAND (auto-update.ts). */
+    command?: string;
 }
 /** The config.json fields this check reads. */
 export interface UpdateCheckConfig {

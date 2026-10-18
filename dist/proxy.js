@@ -61,6 +61,7 @@ import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
+import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -884,6 +885,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         kind: "messages",
         turnType: "unparseable",
         requestBytes: rawBody.length,
+        claudeAuth: claudeAuthFromHeaders(req.headers),
     };
     const logged = async (forward) => {
         try {
@@ -1015,6 +1017,8 @@ async function handleMessages(req, res, opts, upstream, state) {
     // strips the `[1m]` model suffix on the wire). Current native-1M models send
     // neither, so contextLimitForModel also needs the launcher's native setting.
     const modelContextLimit = contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false);
+    if (isMainRequest)
+        rec.contextWindow = modelContextLimit;
     // Before anything reads the size sample: replace an unknown or stale
     // estimate with an exact count where it would decide the outcome.
     const requestSessionKey = requestSessionId(req);
@@ -4437,6 +4441,9 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                     observed = decodeForObservation(Buffer.concat(observedChunks), contentEncoding);
                     if (rec && observed && !isSse) {
                         mergeUsageFromJsonBody(observed, rec);
+                        if ((upstreamRes.statusCode ?? 0) >= 400) {
+                            rec.upstreamError = upstreamErrorCode(observed);
+                        }
                     }
                 }
                 if (isSse) {

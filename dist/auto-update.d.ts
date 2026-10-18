@@ -4,12 +4,20 @@
  * Code does ("✔ Update installed · Restart to update").
  *
  * Only when self-updating is safe: a plain global npm install whose package
- * directory is physically inside `<prefix>/lib/node_modules` and writable by
- * this user (no sudo, ever). npm-linked and git checkouts, npx and local
- * installs, pnpm/yarn/bun/volta globals, root/sudo runs and Windows get the
- * hint line only. The install runs in a detached runner (auto-update-runner.ts)
- * that loads no file from the package, so it survives this ccc exiting and
- * npm replacing the package under it.
+ * directory is physically inside `<prefix>/lib/node_modules` (on Windows
+ * `<prefix>\node_modules`) and writable by this user (no sudo, ever).
+ * npm-linked and git checkouts (detected through the bin link too, so an
+ * `npm link` is never replaced), npx and local installs, pnpm/yarn/bun/volta
+ * globals and root/sudo runs get the hint line only, with the command that
+ * fits how they were installed. The install runs in a detached runner
+ * (auto-update-runner.ts) that loads no file from the package, so it survives
+ * this ccc exiting and npm replacing the package under it.
+ *
+ * Windows: the runner starts only as ccc exits and waits for this process to
+ * be gone before npm runs, so npm never replaces the `ccc.cmd` shim that the
+ * session's cmd.exe still has open. npm is run as `node npm-cli.js` (no
+ * shell: Node refuses to spawn a .cmd without one), and the runner kills
+ * npm's process tree with taskkill instead of a POSIX process group.
  *
  * One install at a time across sessions (a lock file with a stale timeout).
  * Every attempt is recorded in update-state.json: a failure backs off for a
@@ -60,12 +68,17 @@ export interface UpdateAttempt {
     at: number;
     packageDir: string;
     error?: string;
+    /** A launch has sent this result to diagnostics (takeUnreportedOutcome). */
+    reported?: boolean;
 }
 export interface UpdateState {
     /** Install attempts per version (newest few kept). */
     attempts: Record<string, number>;
     last?: UpdateAttempt;
 }
+/** Why a launch with an update available did not install it, for diagnostics. */
+export declare const SKIP_CODES: readonly ["disabled", "not-release", "linked-install", "install-method", "backoff", "max-attempts", "lock-held"];
+export type SkipCode = (typeof SKIP_CODES)[number] | "no-update";
 export type AutoUpdateDecision = {
     action: "install";
     version: string;
@@ -76,9 +89,16 @@ export type AutoUpdateDecision = {
 } | {
     action: "skip";
     reason: string;
+    code: SkipCode;
 };
 export interface DetectInstallOptions {
     packageDir: string;
+    /**
+     * The script as started (process.argv[1]), before symlinks are resolved:
+     * through it an `npm link` shows even though Node reports the checkout as
+     * the package directory.
+     */
+    scriptPath?: string;
     platform?: NodeJS.Platform;
     /** process.getuid(); undefined where there is none. */
     uid?: number;
@@ -105,6 +125,7 @@ export type SpawnLike = (command: string, args: string[], options: {
     detached: boolean;
     stdio: "ignore";
     env: NodeJS.ProcessEnv;
+    windowsHide: boolean;
 }) => {
     pid?: number;
     unref(): void;
@@ -119,6 +140,11 @@ export interface StartInstallOptions {
     execPath?: string;
     /** The npm to run; default the one beside this Node, else `npm` on PATH. */
     npmPath?: string;
+    /** Arguments before npm's own (Windows: npm-cli.js, run by this Node). */
+    npmArgs?: string[];
+    platform?: NodeJS.Platform;
+    /** Windows: the ccc whose exit the runner waits for before installing. */
+    waitForPid?: number;
 }
 export type StartInstallResult = "started" | "locked" | "not-planned" | "spawn-failed"
 /** Rechecked under the lock: backed off, tried enough, or already installed. */
@@ -132,6 +158,14 @@ export declare function strictReleaseVersion(version: unknown): string | null;
  * runner re-checks the root against `npm root -g` before installing.
  */
 export declare function detectInstallMethod(opts: DetectInstallOptions): InstallMethod;
+/** True for the installs whose files are the user's own checkout. */
+export declare function isLinkedInstall(kind: InstallMethodKind): boolean;
+/**
+ * How to update this install by hand: never `npm i -g` over a linked checkout
+ * (that replaces the link with the published package), and each package
+ * manager's own command for its globals.
+ */
+export declare function manualUpdateCommand(kind: InstallMethodKind): string;
 /** Decide what this launch does about an available update. */
 export declare function planAutoUpdate(opts: PlanOptions): AutoUpdateDecision;
 /**
@@ -161,10 +195,22 @@ export declare class AutoUpdateNotices {
     sessionStartLine(): string | undefined;
     private pendingLine;
 }
+/**
+ * The result of the last background install, once: "ok" or "failed" the
+ * first time a launch sees it finished, then null (marked reported in the
+ * state file). For diagnostics, which the detached runner cannot send.
+ */
+export declare function takeUnreportedOutcome(stateFile: string): "ok" | "failed" | null;
 /** The version in `<packageDir>/package.json`, or null. */
 export declare function readInstalledVersion(packageDir: string): string | null;
 export declare function updateFiles(configDir: string): UpdateFiles;
 export declare function readUpdateState(file: string): UpdateState;
 /** Best effort and atomic: a failed write only loses bookkeeping. */
 export declare function writeUpdateState(file: string, state: UpdateState): void;
+/**
+ * The `node_modules/claude-code-infinite` entry the script was started
+ * through, when that entry is a symlink or junction (an `npm link`). The bin
+ * itself may be a symlink (POSIX `<prefix>/bin/ccc`): one hop is followed.
+ */
+export declare function linkedPackageEntry(scriptPath: string): string | null;
 //# sourceMappingURL=auto-update.d.ts.map

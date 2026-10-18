@@ -41,7 +41,9 @@ import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalP
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
 import { signalName } from "./diagnostics-schema.js";
-import { PACKAGE_DIR, detectInstallMethod } from "./auto-update.js";
+import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
+import { claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
+import { claudeAuthFromConfig, claudePlanFromConfig, creditNoticeText } from "./claude-auth.js";
 import { exitResumeHint } from "./resume-hint.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
@@ -179,9 +181,9 @@ function printBanner() {
     console.log(`\n\x1b[38;5;209m∞\x1b[0m \x1b[1;38;5;209mClaude Code Infinite\x1b[0m \x1b[38;5;209m∞\x1b[0m \x1b[38;5;48mfrom \x1b]8;;https://MemTree.dev\x1b\\MemTree\x1b]8;;\x1b\\\x1b[0m\n`);
 }
 /** Unknown/old versions get the longstanding Stop fallback only. */
-function installedClaudeSupportsMessageDisplay() {
+function installedClaudeSupportsMessageDisplay(command) {
     try {
-        const result = spawn.sync("claude", ["--version"], { encoding: "utf-8" });
+        const result = spawn.sync(command, ["--version"], { encoding: "utf-8" });
         return supportsMessageDisplay(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
     }
     catch {
@@ -238,6 +240,9 @@ async function main() {
     if (!interactiveUi)
         routeConsoleToStderr();
     printBanner();
+    const cwdTip = interactiveUi ? cwdHintText(process.cwd()) : null;
+    if (cwdTip)
+        console.log(`\x1b[2m${cwdTip}\x1b[0m\n`);
     if (isDebugMode) {
         console.log("\x1b[1;36m🔍 DEBUG MODE\x1b[0m\n");
     }
@@ -257,6 +262,23 @@ async function main() {
     // Client diagnostics (diagnostics.ts): versions, OS and errors, never content.
     // Started before the key prompt so a signup that stalls there is visible too.
     const diagnostics = startDiagnostics(mode, memtreeBaseUrl, polychatApiKey);
+    // Before the key prompt: someone without Claude Code learns that first.
+    const claude = locateClaude();
+    if (diagnostics.enabled) {
+        diagnostics.setContext({
+            claude_found: claude?.source,
+            claude_auth: claudeAuthFromConfig(),
+            claude_plan: claudePlanFromConfig(),
+        });
+    }
+    if (!claude) {
+        diagnostics.record("claude_missing");
+        console.error(claudeMissingText());
+        await diagnostics.flush();
+        process.exit(1);
+    }
+    if (isDebugMode)
+        console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
     if (!polychatApiKey) {
         diagnostics.record("sign_in_prompt");
         // The user may quit at the prompt: send what is known now.
@@ -323,21 +345,24 @@ async function main() {
             config,
             configDir: getConfigDir(),
             color: terminalSupportsColor(),
+            scriptPath: process.argv[1],
         })
         : null;
     if (isDebugMode && autoUpdate)
         console.log(`[DEBUG] ${autoUpdate.debugLine}`);
     diagnostics.setContext({ interactive: interactiveUi });
-    if (autoUpdate?.bannerUpdate) {
-        diagnostics.record("update_hint", { latest: autoUpdate.bannerUpdate.latest });
-    }
+    recordAutoUpdateDecision(diagnostics, autoUpdate);
     // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
     const reqlog = new RequestLogger();
     // The proxy and MemTree client log through this tee: unchanged lines in the
     // request log, plus a few allowlisted numbers for diagnostics.
-    const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics);
+    // Anthropic refusing an API key for no credit gets one line as ccc exits.
+    let creditTooLow = false;
+    const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, () => {
+        creditTooLow = true;
+    });
     // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
     // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
     // the caller's own --mcp-config names a `memtree` server, or its
@@ -429,7 +454,7 @@ async function main() {
     if (interactiveUi) {
         try {
             noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
-                messageDisplay: installedClaudeSupportsMessageDisplay(),
+                messageDisplay: installedClaudeSupportsMessageDisplay(claude.command),
                 startupMessage: startupNoticeText(terminalSupportsColor(), autoUpdate?.bannerUpdate ?? null, autoUpdate?.bannerInstalled ?? null),
                 // Also carries the unpaid-key notice on resume, so it is on even
                 // when MemTree links are off (the proxy then answers links-free).
@@ -464,8 +489,8 @@ async function main() {
     }
     // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
     // native login and sends its own OAuth bearer to the local base URL.
-    const child = spawn("claude", childArgs, {
-        env: claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`),
+    const child = spawn(claude.command, childArgs, {
+        env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`), claude),
         stdio: "inherit",
     });
     let shuttingDown = false;
@@ -491,6 +516,8 @@ async function main() {
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
         // Before the final flushes, so a late child exit's diagnostics event is sent.
         await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
+        // Windows installs only now: the runner waits for this process to exit.
+        autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
         await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
         process.exit(code);
     };
@@ -523,7 +550,7 @@ async function main() {
     child.on("error", (err) => {
         if (err.code === "ENOENT") {
             diagnostics.record("claude_missing");
-            console.error("Could not find 'claude' command. Make sure Claude Code is installed.");
+            console.error(claudeMissingText());
         }
         else {
             recordError(diagnostics, "spawn_failed", err);
@@ -543,8 +570,10 @@ async function main() {
             mode,
             color: terminalSupportsColor(),
         });
+        const credit = creditTooLow ? `${creditNoticeText(terminalSupportsColor())}\n` : "";
+        const exitText = `${credit}${hint ?? ""}`;
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
-        void (hint ? writeStdout(hint) : Promise.resolve()).then(markChildDone);
+        void (exitText ? writeStdout(exitText) : Promise.resolve()).then(markChildDone);
         void shutdown(exitCodeForChild(code, signal));
     });
 }
@@ -571,6 +600,7 @@ function startDiagnostics(mode, baseUrl, apiKey) {
     try {
         const method = detectInstallMethod({
             packageDir: PACKAGE_DIR, env: process.env, uid: process.getuid?.(),
+            scriptPath: process.argv[1],
         });
         diagnostics.setContext({ mode, install_method: method.kind });
     }
@@ -581,6 +611,28 @@ function startDiagnostics(mode, baseUrl, apiKey) {
         diagnostics.record("first_run");
     diagnostics.start();
     return diagnostics;
+}
+/**
+ * auto_update events: a skip with its reason, an install that landed, and
+ * (once) the result of the last background install, which its detached
+ * runner cannot send itself.
+ */
+function recordAutoUpdateDecision(diagnostics, autoUpdate) {
+    if (autoUpdate?.bannerUpdate) {
+        diagnostics.record("update_hint", { latest: autoUpdate.bannerUpdate.latest });
+    }
+    const decision = autoUpdate?.decision;
+    if (decision?.action === "skip" && decision.code !== "no-update") {
+        diagnostics.record("auto_update", { result: "skipped", reason: decision.code });
+    }
+    else if (decision?.action === "installed") {
+        diagnostics.record("auto_update", { result: "installed" });
+    }
+    if (!autoUpdate || !diagnostics.enabled)
+        return;
+    const outcome = takeUnreportedOutcome(updateFiles(getConfigDir()).stateFile);
+    if (outcome)
+        diagnostics.record("auto_update", { result: outcome });
 }
 /** `CCC_COMPACT_TARGET` ("500k", "20000", "off"): see cli-args.ts. */
 /**

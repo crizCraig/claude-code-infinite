@@ -93,9 +93,13 @@ export declare class Diagnostics implements DiagnosticsRecorder {
 export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly inner;
     private readonly diagnostics;
+    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
+    private readonly onCreditBalanceTooLow?;
     private firstRequest;
     private firstTurn;
-    constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics);
+    constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
+    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
+    onCreditBalanceTooLow?: (() => void) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;

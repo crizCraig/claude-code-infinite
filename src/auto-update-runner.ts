@@ -19,6 +19,12 @@
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
+ * Windows (waitForPid): the runner first waits for the ccc that started it to
+ * exit, so npm never rewrites a `ccc.cmd` that a running cmd.exe has open; npm
+ * runs as `node npm-cli.js` (npmArgs), and its "group" is npm's own pid,
+ * stopped with `taskkill /T /F` (its whole process tree) instead of signals
+ * to a POSIX process group.
+ *
  * Bounded: each npm command runs in its own process group, recorded in the
  * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,
  * then SIGKILL, until no member is left, so a descendant that outlives npm
@@ -32,6 +38,12 @@
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
   npm: string;
+  /** Arguments before npm's own: Windows runs `node npm-cli.js`. */
+  npmArgs?: string[];
+  /** Windows: wait for this pid (the launching ccc) to exit before installing. */
+  waitForPid?: number;
+  /** Test-only: how long to wait for waitForPid (default 60 s). */
+  waitForPidMs?: number;
   packageName: string;
   version: string;
   packageDir: string;
@@ -58,7 +70,9 @@ const path = require("node:path");
 
 const VERSION_RE = /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/;
 const ROOT_TIMEOUT_MS = 60000;
+const IS_WINDOWS = process.platform === "win32";
 const cfg = JSON.parse(process.argv[1]);
+const WAIT_FOR_PID_MS = cfg.waitForPidMs || 60000;
 const KILL_GRACE_MS = cfg.killGraceMs || 10000;
 const PIPE_GRACE_MS = cfg.pipeGraceMs || 5000;
 const ENTRY = path.join(cfg.lockDir, cfg.token + ".json");
@@ -71,7 +85,8 @@ let stopping = null;
 
 // Hard deadline: whatever npm does, this process kills its group, records a
 // result and exits, so a live holder never outlasts the lock's stale age.
-const DEADLINE_MS = ROOT_TIMEOUT_MS + cfg.timeoutMs + 2 * (2 * KILL_GRACE_MS + 2 * PIPE_GRACE_MS) + 30000;
+const DEADLINE_MS = ROOT_TIMEOUT_MS + cfg.timeoutMs + 2 * (2 * KILL_GRACE_MS + 2 * PIPE_GRACE_MS) +
+  (cfg.waitForPid ? WAIT_FOR_PID_MS : 0) + 30000;
 setTimeout(() => abort("runner deadline passed"), DEADLINE_MS);
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => abort("runner stopped by " + signal));
@@ -87,17 +102,48 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function groupAlive(pgid) {
+function pidAlive(pid) {
   try {
-    process.kill(-pgid, 0);
+    process.kill(pid, 0);
     return true;
   } catch (err) {
     return err.code === "EPERM";
   }
 }
 
+// Windows has no process groups: the "group" is npm's pid and its tree.
+function groupAlive(pgid) {
+  return pidAlive(IS_WINDOWS ? pgid : -pgid);
+}
+
 function signalGroup(pgid, signal) {
+  if (IS_WINDOWS) {
+    try {
+      require("node:child_process").spawnSync("taskkill", ["/PID", String(pgid), "/T", "/F"], {
+        stdio: "ignore", windowsHide: true, timeout: 10000,
+      });
+    } catch {}
+    return;
+  }
   try { process.kill(-pgid, signal); } catch {}
+}
+
+async function awaitLauncherExit() {
+  if (!cfg.waitForPid) return true;
+  const until = Date.now() + WAIT_FOR_PID_MS;
+  while (pidAlive(cfg.waitForPid)) {
+    if (Date.now() >= until || stopping) return false;
+    await sleep(100);
+  }
+  return true;
+}
+
+function npmArgs(args) {
+  return (cfg.npmArgs || []).concat(args);
+}
+
+function samePath(a, b) {
+  return a !== null && b !== null && (IS_WINDOWS ? a.toLowerCase() === b.toLowerCase() : a === b);
 }
 
 async function goneWithin(pgid, ms) {
@@ -190,6 +236,7 @@ function run(command, args, timeoutMs, capture) {
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
+        windowsHide: true,
       });
     } catch (err) {
       recordGroup(null, false);
@@ -247,20 +294,21 @@ function describe(result, what) {
 
 async function install() {
   if (!VERSION_RE.test(cfg.version)) throw new Error("refusing version " + JSON.stringify(cfg.version));
-  const rootRun = await runReaped(cfg.npm, ["root", "--global"], ROOT_TIMEOUT_MS, true);
+  if (!(await awaitLauncherExit())) throw new Error(stopping || "ccc did not exit");
+  const rootRun = await runReaped(cfg.npm, npmArgs(["root", "--global"]), ROOT_TIMEOUT_MS, true);
   const rootFailure = describe(rootRun, "npm root -g");
   if (rootFailure) throw new Error(rootFailure);
   const npmRoot = realpath(rootRun.out.trim());
-  if (npmRoot === null || npmRoot !== realpath(cfg.npmRoot)) {
+  if (npmRoot === null || !samePath(npmRoot, realpath(cfg.npmRoot))) {
     throw new Error("npm root -g is " + rootRun.out.trim() + ", not " + cfg.npmRoot + ": wrong prefix");
   }
   const entry = path.join(npmRoot, cfg.packageName);
   if (fs.lstatSync(entry).isSymbolicLink()) throw new Error(entry + " is a symlink (npm link)");
-  if (realpath(entry) !== realpath(cfg.packageDir)) throw new Error(entry + " is not this ccc");
+  if (!samePath(realpath(entry), realpath(cfg.packageDir))) throw new Error(entry + " is not this ccc");
   const spec = cfg.packageName + "@" + cfg.version;
   const args = ["install", "--global", "--prefix=" + cfg.prefix, spec, "--no-fund", "--no-audit"];
   note("npm " + args.join(" "));
-  const failure = describe(await runReaped(cfg.npm, args, cfg.timeoutMs, false), "npm install");
+  const failure = describe(await runReaped(cfg.npm, npmArgs(args), cfg.timeoutMs, false), "npm install");
   if (failure) throw new Error(failure);
   const pkg = JSON.parse(fs.readFileSync(path.join(cfg.packageDir, "package.json"), "utf8"));
   if (pkg.version !== cfg.version) throw new Error("installed version is " + pkg.version);

@@ -18,6 +18,7 @@
  * the response format lets us extract it cheaply, lands under `usage`.
  */
 import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
+import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 /** Rough bytes→tokens estimate (bytes/4). Label the result approximate. */
 export declare function approxTokensFromBytes(bytes: number): number;
 export declare function defaultLogPath(): string;
@@ -336,6 +337,12 @@ export interface MessagesRecord {
          | "client-aborted";
     };
     upstreamStatus?: number;
+    /** How Claude Code signed this request in (its auth header's shape; never the value). */
+    claudeAuth?: ClaudeAuthType;
+    /** Main-agent requests: the context window ccc inferred for the model, in tokens. */
+    contextWindow?: number;
+    /** A known Anthropic error in the response body, by code (claude-auth.ts). */
+    upstreamError?: UpstreamErrorCode;
     /** The downstream client aborted before the response finished. */
     clientAborted?: true;
     /** Forward start → first response byte from Anthropic. */

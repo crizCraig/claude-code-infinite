@@ -1,0 +1,203 @@
+// Finding Claude Code however it was installed (claude-locate.ts), plus a real
+// launch of the shapes Windows installs leave behind: npm's claude.cmd shim on
+// PATH and the native installer's claude.exe in %USERPROFILE%\.local\bin.
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import crossSpawn from "cross-spawn";
+import {
+  CLAUDE_SOURCES,
+  claudeMissingText,
+  cwdHintText,
+  expandWindowsVars,
+  locateClaude,
+  parseRegQueryPath,
+  withClaudeOnPath,
+} from "../dist/claude-locate.js";
+import { CLAUDE_SOURCES as SCHEMA_SOURCES } from "../dist/diagnostics-schema.js";
+
+const isWindows = process.platform === "win32";
+const W = path.win32;
+
+/** A fake filesystem: the set of runnable files (Windows paths compare case-insensitively). */
+function fakeFs(files, platform) {
+  const set = new Set(files.map((f) => (platform === "win32" ? f.toLowerCase() : f)));
+  return (file) => set.has(platform === "win32" ? file.toLowerCase() : file);
+}
+
+const WIN_ENV = {
+  Path: "C:\\Windows\\system32;C:\\Program Files\\nodejs",
+  PATHEXT: ".COM;.EXE;.BAT;.CMD",
+  USERPROFILE: "C:\\Users\\ada",
+  APPDATA: "C:\\Users\\ada\\AppData\\Roaming",
+  LOCALAPPDATA: "C:\\Users\\ada\\AppData\\Local",
+};
+
+function locateWin(files, extra = {}) {
+  return locateClaude({
+    platform: "win32", env: WIN_ENV, homedir: "C:\\Users\\ada",
+    isExecutable: fakeFs(files, "win32"), registryPath: () => [], listDir: () => [], ...extra,
+  });
+}
+
+test("on PATH: spawned by name, as before (claude.cmd or claude.exe both count)", () => {
+  const shim = "C:\\Program Files\\nodejs\\claude.cmd";
+  assert.deepEqual(locateWin([shim]), { command: "claude", source: "path" });
+  assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "claude", source: "path" });
+  // An extensionless `claude` (npm's script for Git Bash) is not something cmd can run.
+  assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
+});
+
+test("Windows: the native installer's claude.exe off PATH is found and its folder added", () => {
+  const exe = "C:\\Users\\ada\\.local\\bin\\claude.exe";
+  const found = locateWin([exe]);
+  assert.deepEqual(found, { command: exe, source: "native", dir: "C:\\Users\\ada\\.local\\bin" });
+  const env = withClaudeOnPath(WIN_ENV, found, "win32");
+  assert.equal(env.Path, `C:\\Users\\ada\\.local\\bin;${WIN_ENV.Path}`);
+  assert.equal(env.PATH, undefined, "Windows' own Path key, not a second one");
+});
+
+test("Windows: npm's global claude.cmd and winget's link are found off PATH", () => {
+  const npmShim = "C:\\Users\\ada\\AppData\\Roaming\\npm\\claude.cmd";
+  assert.equal(locateWin([npmShim]).source, "npm");
+  assert.equal(locateWin([npmShim]).command, npmShim);
+  const link = "C:\\Users\\ada\\AppData\\Local\\Microsoft\\WinGet\\Links\\claude.exe";
+  assert.equal(locateWin([link]).source, "winget");
+  const pkgDir = "C:\\Users\\ada\\AppData\\Local\\Microsoft\\WinGet\\Packages";
+  const pkg = `${pkgDir}\\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe`;
+  const found = locateWin([`${pkg}\\claude.exe`], {
+    listDir: (dir) => (dir === pkgDir ? ["Other.App_x", W.basename(pkg)] : []),
+  });
+  assert.equal(found.source, "winget");
+  assert.equal(found.command, `${pkg}\\claude.exe`);
+});
+
+test("Windows: installed since this terminal opened: the registry PATH has it", () => {
+  const custom = "D:\\tools\\claude\\claude.exe";
+  const found = locateWin([custom], {
+    registryPath: () => ["%USERPROFILE%\\.local\\bin;D:\\tools\\claude", "C:\\Windows"],
+  });
+  assert.deepEqual(found, { command: custom, source: "registry-path", dir: "D:\\tools\\claude" });
+});
+
+test("reg query output and %VAR% expansion", () => {
+  const out = "\r\nHKEY_CURRENT_USER\\Environment\r\n    Path    REG_EXPAND_SZ    " +
+    "%USERPROFILE%\\.local\\bin;C:\\x\r\n\r\n";
+  assert.equal(parseRegQueryPath(out), "%USERPROFILE%\\.local\\bin;C:\\x");
+  assert.equal(parseRegQueryPath("    Path    REG_SZ    C:\\y"), "C:\\y");
+  assert.equal(parseRegQueryPath("ERROR: The system was unable to find"), null);
+  assert.equal(expandWindowsVars("%userprofile%\\a;%NOPE%\\b", WIN_ENV), "C:\\Users\\ada\\a;%NOPE%\\b");
+});
+
+test("macOS/Linux: the native installer, the legacy local install and Homebrew off PATH", () => {
+  const base = { platform: "linux", env: { PATH: "/usr/bin" }, homedir: "/home/ada" };
+  const at = (file) => locateClaude({ ...base, isExecutable: fakeFs([file], "linux") });
+  assert.deepEqual(at("/home/ada/.local/bin/claude"),
+    { command: "/home/ada/.local/bin/claude", source: "native", dir: "/home/ada/.local/bin" });
+  assert.equal(at("/home/ada/.claude/local/claude").source, "legacy-local");
+  assert.equal(at("/opt/homebrew/bin/claude").source, "homebrew");
+  assert.deepEqual(at("/usr/bin/claude"), { command: "claude", source: "path" });
+  assert.equal(at("/nowhere/claude"), null);
+});
+
+test("not installed: the official install command for the OS, and the sign-in step", () => {
+  const win = claudeMissingText("win32");
+  assert.match(win, /irm https:\/\/claude\.ai\/install\.ps1 \| iex/);
+  assert.match(win, /then run `claude` once to sign in/);
+  assert.match(claudeMissingText("darwin"), /curl -fsSL https:\/\/claude\.ai\/install\.sh \| bash/);
+});
+
+test("cwd tip: System32 and the home folder get one line; a project folder gets none", () => {
+  const opts = { platform: "win32", env: { SystemRoot: "C:\\WINDOWS" }, homedir: "C:\\Users\\ada" };
+  assert.match(cwdHintText("C:\\Windows\\System32", opts), /running in C:\\Windows\\System32\. Run it from your project folder/);
+  assert.match(cwdHintText("c:\\windows\\system32\\", opts), /project folder/);
+  assert.match(cwdHintText("C:\\Users\\ada", opts), /running in your home folder/);
+  assert.equal(cwdHintText("C:\\Users\\ada\\code\\app", opts), null);
+  const mac = { platform: "darwin", env: {}, homedir: "/Users/ada" };
+  assert.match(cwdHintText("/Users/ada/", mac), /home folder/);
+  assert.equal(cwdHintText("/Users/ada/src/app", mac), null);
+  assert.equal(cwdHintText("C:\\Windows\\System32", mac), null);
+  for (const line of [cwdHintText("C:\\Users\\ada", opts)]) assert.doesNotMatch(line, /\n/);
+});
+
+test("the diagnostics schema allows exactly the sources locate reports", () => {
+  assert.deepEqual([...SCHEMA_SOURCES], [...CLAUDE_SOURCES]);
+});
+
+// ---------------------------------------------------------------------------
+// Real launches (Windows): what cross-spawn runs for each install shape
+// ---------------------------------------------------------------------------
+
+function tmpdir() {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ccc-claude-")));
+}
+
+/** Run what locate found the way ccc does, with args that cmd.exe would mangle unescaped. */
+function launch(location, env, outFile) {
+  const args = ["--plugin-dir", "C:\\a dir\\x", "say \"hi\" & echo pwned", "100%"];
+  const result = crossSpawn.sync(location.command, args, {
+    env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: outFile }, encoding: "utf8",
+  });
+  assert.equal(result.status, 0, `${result.stderr}`);
+  return { args, got: JSON.parse(fs.readFileSync(outFile, "utf8")) };
+}
+
+const RECORD_ARGS =
+  "require('fs').writeFileSync(process.env.CLAUDE_OUT, JSON.stringify(process.argv.slice(2)))";
+
+test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
+  skip: !isWindows && "Windows only",
+}, () => {
+  const dir = tmpdir();
+  const npmDir = path.join(dir, "npm");
+  fs.mkdirSync(npmDir);
+  const js = path.join(dir, "fake-claude.js");
+  fs.writeFileSync(js, `${RECORD_ARGS};\n`);
+  // The shape of npm's cmd-shim for a bin.
+  fs.writeFileSync(path.join(npmDir, "claude.cmd"),
+    `@ECHO off\r\n"${process.execPath}" "${js}" %*\r\n`);
+  const env = { ...process.env, Path: `${npmDir};${process.env.Path ?? process.env.PATH}` };
+  delete env.PATH;
+  const location = locateClaude({ env, registryPath: () => [] });
+  assert.deepEqual(location, { command: "claude", source: "path" });
+  const { args, got } = launch(location, env, path.join(dir, "out.json"));
+  assert.deepEqual(got, args);
+});
+
+test("Windows: the native claude.exe in %USERPROFILE%\\.local\\bin, not on PATH, launches", {
+  skip: !isWindows && "Windows only",
+}, () => {
+  const profile = tmpdir();
+  const bin = path.join(profile, ".local", "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  // A real executable named claude.exe: node.exe under that name, given its script with -e.
+  const exe = path.join(bin, "claude.exe");
+  try { fs.linkSync(process.execPath, exe); } catch { fs.copyFileSync(process.execPath, exe); }
+  const env = {
+    ...process.env, USERPROFILE: profile, APPDATA: path.join(profile, "Roaming"),
+    LOCALAPPDATA: path.join(profile, "Local"),
+  };
+  const location = locateClaude({ env, homedir: profile, registryPath: () => [] });
+  assert.equal(location?.source, "native", JSON.stringify(location));
+  assert.equal(location.command.toLowerCase(), exe.toLowerCase());
+  const out = path.join(profile, "out.json");
+  const record = RECORD_ARGS.replace("slice(2)", "slice(1)"); // `node -e`: no script path
+  const result = crossSpawn.sync(location.command, ["-e", record, "--", "a b", "c&d"], {
+    env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: out }, encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")), ["a b", "c&d"]);
+});
+
+test("Windows: with no claude anywhere, locate says so (ccc then prints the install command)", {
+  skip: !isWindows && "Windows only",
+}, () => {
+  const profile = tmpdir();
+  const env = {
+    Path: "C:\\Windows\\System32", PATHEXT: ".COM;.EXE;.BAT;.CMD", USERPROFILE: profile,
+    APPDATA: path.join(profile, "R"), LOCALAPPDATA: path.join(profile, "L"),
+  };
+  assert.equal(locateClaude({ env, homedir: profile, registryPath: () => [] }), null);
+});

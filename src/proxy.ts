@@ -141,6 +141,7 @@ import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
+import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -1564,6 +1565,7 @@ async function handleMessages(
     kind: "messages",
     turnType: "unparseable",
     requestBytes: rawBody.length,
+    claudeAuth: claudeAuthFromHeaders(req.headers),
   };
   const logged = async (forward: Promise<unknown>): Promise<void> => {
     try {
@@ -1701,6 +1703,7 @@ async function handleMessages(
     headerText(req.headers, "anthropic-beta"),
     opts.nativeOneMillionContext !== false
   );
+  if (isMainRequest) rec.contextWindow = modelContextLimit;
   // Before anything reads the size sample: replace an unknown or stale
   // estimate with an exact count where it would decide the outcome.
   const requestSessionKey = requestSessionId(req);
@@ -5887,6 +5890,9 @@ function forwardAccepted(
             );
             if (rec && observed && !isSse) {
               mergeUsageFromJsonBody(observed, rec);
+              if ((upstreamRes.statusCode ?? 0) >= 400) {
+                rec.upstreamError = upstreamErrorCode(observed);
+              }
             }
           }
           if (isSse) {

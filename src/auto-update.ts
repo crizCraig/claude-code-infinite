@@ -4,12 +4,20 @@
  * Code does ("✔ Update installed · Restart to update").
  *
  * Only when self-updating is safe: a plain global npm install whose package
- * directory is physically inside `<prefix>/lib/node_modules` and writable by
- * this user (no sudo, ever). npm-linked and git checkouts, npx and local
- * installs, pnpm/yarn/bun/volta globals, root/sudo runs and Windows get the
- * hint line only. The install runs in a detached runner (auto-update-runner.ts)
- * that loads no file from the package, so it survives this ccc exiting and
- * npm replacing the package under it.
+ * directory is physically inside `<prefix>/lib/node_modules` (on Windows
+ * `<prefix>\node_modules`) and writable by this user (no sudo, ever).
+ * npm-linked and git checkouts (detected through the bin link too, so an
+ * `npm link` is never replaced), npx and local installs, pnpm/yarn/bun/volta
+ * globals and root/sudo runs get the hint line only, with the command that
+ * fits how they were installed. The install runs in a detached runner
+ * (auto-update-runner.ts) that loads no file from the package, so it survives
+ * this ccc exiting and npm replacing the package under it.
+ *
+ * Windows: the runner starts only as ccc exits and waits for this process to
+ * be gone before npm runs, so npm never replaces the `ccc.cmd` shim that the
+ * session's cmd.exe still has open. npm is run as `node npm-cli.js` (no
+ * shell: Node refuses to spawn a .cmd without one), and the runner kills
+ * npm's process tree with taskkill instead of a POSIX process group.
  *
  * One install at a time across sessions (a lock file with a stale timeout).
  * Every attempt is recorded in update-state.json: a failure backs off for a
@@ -111,6 +119,8 @@ export interface UpdateAttempt {
   at: number;
   packageDir: string;
   error?: string;
+  /** A launch has sent this result to diagnostics (takeUnreportedOutcome). */
+  reported?: boolean;
 }
 
 export interface UpdateState {
@@ -119,13 +129,26 @@ export interface UpdateState {
   last?: UpdateAttempt;
 }
 
+/** Why a launch with an update available did not install it, for diagnostics. */
+export const SKIP_CODES = [
+  "disabled", "not-release", "linked-install", "install-method", "backoff", "max-attempts",
+  "lock-held",
+] as const;
+export type SkipCode = (typeof SKIP_CODES)[number] | "no-update";
+
 export type AutoUpdateDecision =
   | { action: "install"; version: string; method: InstallMethod }
   | { action: "installed"; version: string }
-  | { action: "skip"; reason: string };
+  | { action: "skip"; reason: string; code: SkipCode };
 
 export interface DetectInstallOptions {
   packageDir: string;
+  /**
+   * The script as started (process.argv[1]), before symlinks are resolved:
+   * through it an `npm link` shows even though Node reports the checkout as
+   * the package directory.
+   */
+  scriptPath?: string;
   platform?: NodeJS.Platform;
   /** process.getuid(); undefined where there is none. */
   uid?: number;
@@ -154,7 +177,7 @@ export interface UpdateFiles {
 export type SpawnLike = (
   command: string,
   args: string[],
-  options: { detached: boolean; stdio: "ignore"; env: NodeJS.ProcessEnv }
+  options: { detached: boolean; stdio: "ignore"; env: NodeJS.ProcessEnv; windowsHide: boolean }
 ) => { pid?: number; unref(): void; on(event: "error", cb: (err: Error) => void): unknown };
 
 export interface StartInstallOptions {
@@ -166,6 +189,11 @@ export interface StartInstallOptions {
   execPath?: string;
   /** The npm to run; default the one beside this Node, else `npm` on PATH. */
   npmPath?: string;
+  /** Arguments before npm's own (Windows: npm-cli.js, run by this Node). */
+  npmArgs?: string[];
+  platform?: NodeJS.Platform;
+  /** Windows: the ccc whose exit the runner waits for before installing. */
+  waitForPid?: number;
 }
 
 export type StartInstallResult =
@@ -196,35 +224,61 @@ export function strictReleaseVersion(version: unknown): string | null {
 export function detectInstallMethod(opts: DetectInstallOptions): InstallMethod {
   const env = opts.env ?? {};
   const raw = opts.packageDir;
-  if ((opts.platform ?? process.platform) === "win32") {
-    return method("unsupported-platform", raw, "Windows: npm cannot safely replace a running ccc");
-  }
-  if (opts.uid === 0 || env.SUDO_UID !== undefined) {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32" && (opts.uid === 0 || env.SUDO_UID !== undefined)) {
     return method("root", raw, "running as root or under sudo");
   }
   const real = realpathOrNull(raw);
   if (real === null) return method("unknown", raw, "package directory not found");
-  return classifyPackageDir(real, env);
+  const link = opts.scriptPath ? linkedPackageEntry(opts.scriptPath) : null;
+  if (link) return method("npm-link", real, `${link} is a symlink (npm link)`);
+  return classifyPackageDir(real, env, platform);
+}
+
+/** True for the installs whose files are the user's own checkout. */
+export function isLinkedInstall(kind: InstallMethodKind): boolean {
+  return kind === "npm-link" || kind === "git-checkout";
+}
+
+/**
+ * How to update this install by hand: never `npm i -g` over a linked checkout
+ * (that replaces the link with the published package), and each package
+ * manager's own command for its globals.
+ */
+export function manualUpdateCommand(kind: InstallMethodKind): string {
+  const spec = `${PACKAGE_NAME}@latest`;
+  switch (kind) {
+    case "npm-link":
+    case "git-checkout":
+      return "linked install: git pull && npm run build in your checkout";
+    case "pnpm": return `pnpm add -g ${spec}`;
+    case "yarn": return `yarn global add ${spec}`;
+    case "bun": return `bun add -g ${spec}`;
+    case "volta": return `volta install ${spec}`;
+    case "npx": return `npx ${spec}`;
+    default: return `npm i -g ${spec}`;
+  }
 }
 
 /** Decide what this launch does about an available update. */
 export function planAutoUpdate(opts: PlanOptions): AutoUpdateDecision {
-  if (!opts.update) return { action: "skip", reason: "no update available" };
-  if (!autoUpdateEnabled(opts.env, opts.config)) return { action: "skip", reason: "disabled" };
+  if (!opts.update) return skip("no update available", "no-update");
+  if (!autoUpdateEnabled(opts.env, opts.config)) return skip("disabled", "disabled");
   const version = strictReleaseVersion(opts.update.latest);
-  if (version === null) return { action: "skip", reason: "version is not a plain release" };
+  if (version === null) return skip("version is not a plain release", "not-release");
+  if (isLinkedInstall(opts.method.kind)) return skip("linked install", "linked-install");
   if (opts.method.kind !== "npm-global") {
-    return { action: "skip", reason: `install method ${opts.method.kind}` };
+    return skip(`install method ${opts.method.kind}`, "install-method");
   }
   if (opts.installedVersion === version && newerThan(version, opts.update.current)) {
     return { action: "installed", version };
   }
   const blocked = attemptBlocked(opts.state, version, opts.now);
-  if (blocked) return { action: "skip", reason: blocked };
+  if (blocked) return skip(blocked, blocked.startsWith("already tried") ? "max-attempts" : "backoff");
   const heldSince = opts.lockHeldSince ?? null;
   if (heldSince !== null && opts.now - heldSince > UPDATE_LOCK_STALE_MS) {
     // A live entry this old is a stuck installer or a reused pid: say so with the hint.
-    return { action: "skip", reason: "the install lock has been held for over an hour" };
+    return skip("the install lock has been held for over an hour", "lock-held");
   }
   return { action: "install", version, method: opts.method };
 }
@@ -248,13 +302,21 @@ export function startAutoUpdateInstall(opts: StartInstallOptions): StartInstallR
     releaseUpdateLock(opts.files.lockDir, token);
     return "skipped";
   }
+  const npm = npmCommand(opts);
+  if (npm === null) {
+    spawnFailed(opts.files, token, version, packageDir, "npm-cli.js not found");
+    return "spawn-failed";
+  }
   recordAttemptStart(opts.files.stateFile, version, packageDir, now);
-  const config = runnerConfig(opts, decision.method, version, token);
+  const config = runnerConfig(opts, decision.method, version, token, npm);
   try {
     const child = opts.spawnImpl(
       opts.execPath ?? process.execPath,
       ["-e", RUNNER_SOURCE, JSON.stringify(config)],
-      { detached: true, stdio: "ignore", env: runnerEnv(opts.env ?? process.env, opts.execPath) }
+      {
+        detached: true, stdio: "ignore", windowsHide: true,
+        env: runnerEnv(opts.env ?? process.env, opts.execPath, opts.platform),
+      }
     );
     child.on("error", (err) => spawnFailed(opts.files, token, version, packageDir, err));
     child.unref();
@@ -315,6 +377,19 @@ export class AutoUpdateNotices {
   }
 }
 
+/**
+ * The result of the last background install, once: "ok" or "failed" the
+ * first time a launch sees it finished, then null (marked reported in the
+ * state file). For diagnostics, which the detached runner cannot send.
+ */
+export function takeUnreportedOutcome(stateFile: string): "ok" | "failed" | null {
+  const state = readUpdateState(stateFile);
+  const last = state.last;
+  if (!last || last.status === "running" || last.reported) return null;
+  writeUpdateState(stateFile, { ...state, last: { ...last, reported: true } });
+  return last.status;
+}
+
 /** The version in `<packageDir>/package.json`, or null. */
 export function readInstalledVersion(packageDir: string): string | null {
   try {
@@ -358,7 +433,11 @@ export function writeUpdateState(file: string, state: UpdateState): void {
 // Install-method detection
 // ---------------------------------------------------------------------------
 
-function classifyPackageDir(real: string, env: NodeJS.ProcessEnv): InstallMethod {
+function classifyPackageDir(
+  real: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform
+): InstallMethod {
   if (fs.existsSync(path.join(real, ".git"))) {
     return method("git-checkout", real, "package directory is a git checkout");
   }
@@ -368,11 +447,17 @@ function classifyPackageDir(real: string, env: NodeJS.ProcessEnv): InstallMethod
   if (path.basename(parent) !== "node_modules" || path.basename(real) !== PACKAGE_NAME) {
     return method("npm-link", real, "package directory is outside node_modules (linked checkout)");
   }
-  if (path.basename(path.dirname(parent)) !== "lib") {
+  // Windows keeps globals in <prefix>\node_modules with the shims in <prefix>.
+  const windows = platform === "win32";
+  if (!windows && path.basename(path.dirname(parent)) !== "lib") {
     return method("local", real, "not a global npm prefix (<prefix>/lib/node_modules)");
   }
-  const prefix = path.dirname(path.dirname(parent));
-  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), path.join(prefix, "bin")]);
+  if (windows && !isWindowsGlobalPrefix(path.dirname(parent))) {
+    return method("local", real, "not a global npm prefix (<prefix>\\node_modules with ccc.cmd)");
+  }
+  const prefix = windows ? path.dirname(parent) : path.dirname(path.dirname(parent));
+  const bin = windows ? prefix : path.join(prefix, "bin");
+  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), bin]);
   if (unwritable) return method("not-writable", real, `${unwritable} is not writable without sudo`);
   return { kind: "npm-global", packageDir: real, detail: `npm prefix ${prefix}`, npmRoot: parent, prefix };
 }
@@ -385,6 +470,38 @@ function otherPackageManager(real: string, env: NodeJS.ProcessEnv): InstallMetho
   if (p.includes("/.bun/")) return "bun";
   const volta = env.VOLTA_HOME && realpathOrNull(env.VOLTA_HOME);
   if (p.includes("/.volta/") || (volta && isInside(real, volta))) return "volta";
+  return null;
+}
+
+/** A Windows npm prefix has the package's shim beside its node_modules. */
+function isWindowsGlobalPrefix(prefix: string): boolean {
+  return fs.existsSync(path.join(prefix, "ccc.cmd")) || fs.existsSync(path.join(prefix, "ccc.ps1"));
+}
+
+/**
+ * The `node_modules/claude-code-infinite` entry the script was started
+ * through, when that entry is a symlink or junction (an `npm link`). The bin
+ * itself may be a symlink (POSIX `<prefix>/bin/ccc`): one hop is followed.
+ */
+export function linkedPackageEntry(scriptPath: string): string | null {
+  let script = path.resolve(scriptPath);
+  try {
+    if (fs.lstatSync(script).isSymbolicLink()) {
+      script = path.resolve(path.dirname(script), fs.readlinkSync(script));
+    }
+  } catch {
+    return null;
+  }
+  for (let dir = path.dirname(script); dir !== path.dirname(dir); dir = path.dirname(dir)) {
+    if (path.basename(dir) !== PACKAGE_NAME || path.basename(path.dirname(dir)) !== "node_modules") {
+      continue;
+    }
+    try {
+      return fs.lstatSync(dir).isSymbolicLink() ? dir : null;
+    } catch {
+      return null;
+    }
+  }
   return null;
 }
 
@@ -401,6 +518,10 @@ function firstUnwritable(dirs: string[]): string | null {
 
 function method(kind: InstallMethodKind, packageDir: string, detail: string): InstallMethod {
   return { kind, packageDir, detail };
+}
+
+function skip(reason: string, code: SkipCode): AutoUpdateDecision {
+  return { action: "skip", reason, code };
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +607,10 @@ function cleanAttempt(value: any): UpdateAttempt | undefined {
     return undefined;
   }
   const error = typeof value.error === "string" ? value.error.slice(0, 300) : undefined;
-  return { version, status, at: value.at, packageDir: value.packageDir, ...(error ? { error } : {}) };
+  return {
+    version, status, at: value.at, packageDir: value.packageDir, ...(error ? { error } : {}),
+    ...(value.reported === true ? { reported: true } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -497,10 +621,12 @@ function runnerConfig(
   opts: StartInstallOptions,
   m: InstallMethod,
   version: string,
-  token: string
+  token: string,
+  npm: { npm: string; npmArgs?: string[] }
 ): RunnerConfig {
   return {
-    npm: opts.npmPath ?? defaultNpmPath(opts.execPath ?? process.execPath),
+    ...npm,
+    ...(opts.waitForPid !== undefined ? { waitForPid: opts.waitForPid } : {}),
     packageName: PACKAGE_NAME,
     version,
     packageDir: m.packageDir,
@@ -514,18 +640,48 @@ function runnerConfig(
   };
 }
 
-/** The npm installed with this Node, so it targets the same prefix; else PATH's. */
-function defaultNpmPath(execPath: string): string {
-  const beside = path.join(path.dirname(execPath), "npm");
-  return fs.existsSync(beside) ? beside : "npm";
+/**
+ * How the runner starts npm. POSIX: the npm beside this Node (so it targets
+ * the same prefix), else PATH's. Windows: this Node running npm-cli.js, found
+ * beside this Node or beside an npm.cmd on PATH; null when there is none.
+ */
+function npmCommand(opts: StartInstallOptions): { npm: string; npmArgs?: string[] } | null {
+  const execPath = opts.execPath ?? process.execPath;
+  if (opts.npmPath) return { npm: opts.npmPath, ...(opts.npmArgs ? { npmArgs: opts.npmArgs } : {}) };
+  if ((opts.platform ?? process.platform) !== "win32") {
+    const beside = path.join(path.dirname(execPath), "npm");
+    return { npm: fs.existsSync(beside) ? beside : "npm" };
+  }
+  const cli = windowsNpmCli(execPath, opts.env ?? process.env);
+  return cli ? { npm: execPath, npmArgs: [cli] } : null;
+}
+
+function windowsNpmCli(execPath: string, env: NodeJS.ProcessEnv): string | null {
+  const cliIn = (dir: string) => path.join(dir, "node_modules", "npm", "bin", "npm-cli.js");
+  const pathValue = Object.entries(env).find(([k]) => k.toUpperCase() === "PATH")?.[1] ?? "";
+  const dirs = [path.dirname(execPath), ...pathValue.split(";").filter(Boolean)];
+  for (const dir of dirs) {
+    if (dir !== path.dirname(execPath) && !fs.existsSync(path.join(dir, "npm.cmd"))) continue;
+    if (fs.existsSync(cliIn(dir))) return cliIn(dir);
+  }
+  return null;
 }
 
 /** npm's `#!/usr/bin/env node` must find this same Node first. */
-function runnerEnv(env: NodeJS.ProcessEnv, execPath = process.execPath): NodeJS.ProcessEnv {
+function runnerEnv(
+  env: NodeJS.ProcessEnv,
+  execPath = process.execPath,
+  platform: NodeJS.Platform = process.platform
+): NodeJS.ProcessEnv {
   const bin = path.dirname(execPath);
+  // Windows env names are case-insensitive; a copy keeps whichever spelling it had.
+  const key = platform === "win32"
+    ? Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "Path"
+    : "PATH";
+  const delimiter = platform === "win32" ? ";" : ":";
   return {
     ...env,
-    PATH: env.PATH ? `${bin}${path.delimiter}${env.PATH}` : bin,
+    [key]: env[key] ? `${bin}${delimiter}${env[key]}` : bin,
     npm_config_update_notifier: "false",
   };
 }

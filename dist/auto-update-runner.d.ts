@@ -19,6 +19,12 @@
  * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
+ * Windows (waitForPid): the runner first waits for the ccc that started it to
+ * exit, so npm never rewrites a `ccc.cmd` that a running cmd.exe has open; npm
+ * runs as `node npm-cli.js` (npmArgs), and its "group" is npm's own pid,
+ * stopped with `taskkill /T /F` (its whole process tree) instead of signals
+ * to a POSIX process group.
+ *
  * Bounded: each npm command runs in its own process group, recorded in the
  * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,
  * then SIGKILL, until no member is left, so a descendant that outlives npm
@@ -31,6 +37,12 @@
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
     npm: string;
+    /** Arguments before npm's own: Windows runs `node npm-cli.js`. */
+    npmArgs?: string[];
+    /** Windows: wait for this pid (the launching ccc) to exit before installing. */
+    waitForPid?: number;
+    /** Test-only: how long to wait for waitForPid (default 60 s). */
+    waitForPidMs?: number;
     packageName: string;
     version: string;
     packageDir: string;

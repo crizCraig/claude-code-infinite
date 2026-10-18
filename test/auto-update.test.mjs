@@ -27,11 +27,12 @@ import { UPGRADE_COMMAND } from "../dist/update-check.js";
 const PKG = "claude-code-infinite";
 const UPDATE = { latest: "1.0.21", current: "1.0.20" };
 const isRoot = process.getuid?.() === 0;
-// Auto-update never runs on Windows (detectInstallMethod refuses win32). The
-// runner it would start relies on POSIX process groups (kill(-pgid)) and a
-// shebang script standing in for npm, neither of which exists there.
-const POSIX_RUNNER = process.platform === "win32" &&
-  "auto-update is off on Windows; the runner needs POSIX process groups and a shebang fake npm";
+const isWindows = process.platform === "win32";
+// Windows has no process groups: the runner stops npm's tree with taskkill,
+// which cannot reach a descendant that outlived npm or deliver a SIGTERM a
+// test process could catch. Those two tests are POSIX-only.
+const POSIX_GROUPS = isWindows &&
+  "Windows has no process groups: npm's tree is stopped with taskkill /T /F";
 
 function tmpdir(label = "ccc-au-") {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), label)));
@@ -175,12 +176,35 @@ test("a prefix that needs sudo is skipped, never escalated", {
   }
 });
 
-test("root, sudo and Windows are skipped", () => {
+test("root and sudo are skipped", () => {
   const g = makeGlobal();
   assert.equal(detect(g.packageDir, { uid: 0 }).kind, "root");
   assert.equal(detect(g.packageDir, { env: { SUDO_UID: "501" } }).kind, "root");
-  assert.equal(detect(g.packageDir, { platform: "win32" }).kind, "unsupported-platform");
   assert.equal(detect(path.join(g.root, "missing")).kind, "unknown");
+});
+
+/** Windows' layout: `<prefix>\node_modules\claude-code-infinite`, shims in `<prefix>`. */
+function makeWindowsGlobal(root = tmpdir(), version = "1.0.20") {
+  const prefix = path.join(root, "npm");
+  const npmRoot = path.join(prefix, "node_modules");
+  const packageDir = makePackage(path.join(npmRoot, PKG), version);
+  fs.writeFileSync(path.join(prefix, "ccc.cmd"), "@ECHO off\r\n");
+  return { root, prefix, npmRoot, packageDir };
+}
+
+test("Windows: a global npm install in its own layout self-updates; anything else does not", () => {
+  const g = makeWindowsGlobal();
+  const m = detect(g.packageDir, { platform: "win32", uid: undefined });
+  assert.equal(m.kind, "npm-global", m.detail);
+  assert.equal(m.prefix, g.prefix);
+  assert.equal(m.npmRoot, g.npmRoot);
+  // POSIX's layout seen as Windows: no ccc.cmd beside node_modules, so not a prefix.
+  assert.equal(detect(makeGlobal().packageDir, { platform: "win32" }).kind, "local");
+  // A project's node_modules has no shims beside it either.
+  const project = makePackage(path.join(tmpdir(), "app", "node_modules", PKG));
+  assert.equal(detect(project, { platform: "win32" }).kind, "local");
+  // sudo does not exist there; SUDO_UID from some shell does not matter.
+  assert.equal(detect(g.packageDir, { platform: "win32", env: { SUDO_UID: "1" } }).kind, "npm-global");
 });
 
 // ---------------------------------------------------------------------------
@@ -198,12 +222,12 @@ test("opt-outs: CCC_DISABLE_AUTOUPDATE, DISABLE_AUTOUPDATER, autoUpdate:false, a
     { CCC_SKIP_UPDATE_CHECK: "1" },
   ]) {
     assert.equal(autoUpdateEnabled(env, {}), false, JSON.stringify(env));
-    assert.deepEqual(plan({ env }), { action: "skip", reason: "disabled" });
+    assert.deepEqual(plan({ env }), { action: "skip", reason: "disabled", code: "disabled" });
   }
   assert.equal(autoUpdateEnabled({ DISABLE_AUTOUPDATER: "0" }, {}), true);
   for (const config of [{ autoUpdate: false }, { updateCheck: false }]) {
     assert.equal(autoUpdateEnabled({}, config), false);
-    assert.deepEqual(plan({ config }), { action: "skip", reason: "disabled" });
+    assert.deepEqual(plan({ config }), { action: "skip", reason: "disabled", code: "disabled" });
   }
 });
 
@@ -264,7 +288,7 @@ test("linked installs plan no install, and a forged plan never spawns", () => {
   fs.symlinkSync(checkout, g.packageDir);
   const method = detect(g.packageDir);
   const decision = plan({ method });
-  assert.deepEqual(decision, { action: "skip", reason: "install method git-checkout" });
+  assert.deepEqual(decision, { action: "skip", reason: "linked install", code: "linked-install" });
   const { spawnImpl, calls } = mockSpawn();
   const files = filesIn();
   assert.equal(startAutoUpdateInstall({ decision, files, spawnImpl }), "not-planned");
@@ -522,7 +546,7 @@ test("setup: an install hides the hint; a skip shows it; a landed install shows 
 
   const npx = makePackage(path.join(tmpdir(), "_npx", "a", "node_modules", PKG));
   const skipped = setup(npx, { spawnImpl });
-  assert.deepEqual(skipped.bannerUpdate, UPDATE);
+  assert.deepEqual(skipped.bannerUpdate, { ...UPDATE, command: `npx ${PKG}@latest` });
   assert.match(skipped.debugLine, /install method npx/);
   skipped.scheduleInstall(0);
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -601,10 +625,13 @@ async function runRunner({
   global: g, version = "1.0.21", npmRoot, exit = 0, reportedRoot, hang = false,
   timeoutMs = 30_000, killGraceMs, pipeGraceMs, descendant = false,
   handoff = "ok", handoffMs, abortDuringRoot = false, snapshot = false,
+  viaNode = isWindows, waitForPid, waitForPidMs,
 }) {
   const dir = tmpdir("ccc-au-run-");
-  const npm = path.join(dir, "npm");
-  fs.writeFileSync(npm, FAKE_NPM, { mode: 0o755 });
+  // Windows runs npm as `node npm-cli.js` (no shebangs there); POSIX as a script.
+  const npmFile = path.join(dir, viaNode ? "npm-cli.js" : "npm");
+  fs.writeFileSync(npmFile, FAKE_NPM, { mode: 0o755 });
+  const npm = viaNode ? process.execPath : npmFile;
   const files = updateFiles(path.join(dir, "cfg"));
   const entry = { token: "t1", startedAt: Date.now(), pid: process.pid };
   if (handoff !== "lost") writeEntry(files.lockDir, entry);
@@ -613,6 +640,7 @@ async function runRunner({
   const config = {
     npm, packageName: PKG, version, packageDir: g.packageDir, npmRoot: npmRoot ?? g.npmRoot,
     prefix: g.prefix, ...files, token: "t1", timeoutMs, killGraceMs, pipeGraceMs, handoffMs,
+    ...(viaNode ? { npmArgs: [npmFile] } : {}), waitForPid, waitForPidMs,
   };
   const pidFile = path.join(dir, "npm.pid");
   const child = spawn(process.execPath, ["-e", RUNNER_SOURCE, JSON.stringify(config)], {
@@ -646,7 +674,7 @@ async function runRunner({
   };
 }
 
-test("runner: installs exactly that version into this prefix, records ok, frees the lock", { skip: POSIX_RUNNER }, async () => {
+test("runner: installs exactly that version into this prefix, records ok, frees the lock", async () => {
   const g = makeGlobal();
   const { calls, state, lockLeft, files } = await runRunner({ global: g });
   assert.deepEqual(calls[0], ["root", "--global"]);
@@ -659,14 +687,14 @@ test("runner: installs exactly that version into this prefix, records ok, frees 
   assert.match(fs.readFileSync(files.logFile, "utf8"), /fake npm install[\s\S]*installed 1\.0\.21/);
 });
 
-test("runner: npm failure is recorded and frees the lock", { skip: POSIX_RUNNER }, async () => {
+test("runner: npm failure is recorded and frees the lock", async () => {
   const { state, lockLeft } = await runRunner({ global: makeGlobal(), exit: 1 });
   assert.equal(state.last.status, "failed");
   assert.match(state.last.error, /npm install exited with 1/);
   assert.equal(lockLeft, false);
 });
 
-test("runner: a different npm root or a linked entry installs nothing", { skip: POSIX_RUNNER }, async () => {
+test("runner: a different npm root or a linked entry installs nothing", async () => {
   const g = makeGlobal();
   const elsewhere = makeGlobal();
   const wrong = await runRunner({ global: g, reportedRoot: elsewhere.npmRoot });
@@ -713,7 +741,7 @@ test("the plan is rechecked under the lock: racing sessions cannot bypass backof
   assert.equal(second.calls.length, 0);
 });
 
-test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", { skip: POSIX_RUNNER }, async () => {
+test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", async () => {
   const g = makeGlobal();
   const started = Date.now();
   const { state, lockLeft, pidFile } = await runRunner({
@@ -727,7 +755,7 @@ test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the l
   assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
 });
 
-test("runner: a descendant npm leaves behind is reaped before the lock is freed", { skip: POSIX_RUNNER }, async () => {
+test("runner: a descendant npm leaves behind is reaped before the lock is freed", { skip: POSIX_GROUPS }, async () => {
   const g = makeGlobal();
   const { state, lockLeft, pidFile } = await runRunner({
     global: g, descendant: true, killGraceMs: 300, pipeGraceMs: 300,
@@ -761,7 +789,7 @@ test("runner: without the launcher's handoff it installs nothing", async () => {
   assert.equal(never.lockLeft, false);
 });
 
-test("runner: stopped while reaping npm root, it starts no further npm command", { skip: POSIX_RUNNER }, async () => {
+test("runner: stopped while reaping npm root, it starts no further npm command", { skip: POSIX_GROUPS }, async () => {
   const { calls, state, lockLeft } = await runRunner({
     global: makeGlobal(), abortDuringRoot: true, killGraceMs: 300, pipeGraceMs: 300,
   });
@@ -792,7 +820,7 @@ test("a handoff landing while an entry is judged stale keeps it: the acquirer ba
   assert.equal(fs.existsSync(file), false);
 });
 
-test("runner: while npm runs its lock entry already protects it (spawning or group)", { skip: POSIX_RUNNER }, async () => {
+test("runner: while npm runs its lock entry already protects it (spawning or group)", async () => {
   const { state, snapshotFile } = await runRunner({ global: makeGlobal(), snapshot: true });
   assert.equal(state.last.status, "ok");
   const during = JSON.parse(fs.readFileSync(snapshotFile, "utf8"));
@@ -810,4 +838,37 @@ test("a runner that died while starting npm leaves the lock held (fail closed), 
   assert.equal(liveLockSince(lockDir, now), now - 60_000);
   const later = now + 2 * UPDATE_LOCK_STALE_MS;
   assert.match(plan({ now: later, lockHeldSince: liveLockSince(lockDir, later) }).reason, /held for over an hour/);
+});
+
+test("runner: npm run as `node npm-cli.js` (Windows' way) installs the same", async () => {
+  const g = makeGlobal();
+  const { calls, state } = await runRunner({ global: g, viaNode: true });
+  assert.deepEqual(calls.map((c) => c[0]), ["root", "install"]);
+  assert.equal(state.last.status, "ok", state.last.error);
+});
+
+test("runner: with waitForPid it runs no npm until that process has exited", async () => {
+  const g = makeGlobal();
+  // Stands in for the exiting ccc: alive for a moment after the runner starts.
+  const ccc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 1500)"], { stdio: "ignore" });
+  const exited = new Promise((resolve) => ccc.on("exit", () => resolve(Date.now())));
+  const { calls, state } = await runRunner({ global: g, waitForPid: ccc.pid });
+  const exitedAt = await exited;
+  assert.equal(state.last.status, "ok", state.last.error);
+  assert.ok(state.last.at >= exitedAt, "installed only after the launcher was gone");
+  assert.deepEqual(calls.map((c) => c[0]), ["root", "install"]);
+});
+
+test("runner: a launcher that never exits gets no install, a recorded failure, a free lock", async () => {
+  const ccc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  try {
+    const { calls, state, lockLeft } = await runRunner({
+      global: makeGlobal(), waitForPid: ccc.pid, waitForPidMs: 300,
+    });
+    assert.deepEqual(calls, []);
+    assert.match(state.last.error, /ccc did not exit/);
+    assert.equal(lockLeft, false);
+  } finally {
+    ccc.kill();
+  }
 });

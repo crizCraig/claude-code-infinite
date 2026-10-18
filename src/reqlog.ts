@@ -22,6 +22,7 @@ import { appendFile, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getConfigDir } from "./config.js";
 import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
+import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
 const APPROX_CHARS_PER_TOKEN = 4;
@@ -361,6 +362,12 @@ export interface MessagesRecord {
       | "client-aborted";
   };
   upstreamStatus?: number;
+  /** How Claude Code signed this request in (its auth header's shape; never the value). */
+  claudeAuth?: ClaudeAuthType;
+  /** Main-agent requests: the context window ccc inferred for the model, in tokens. */
+  contextWindow?: number;
+  /** A known Anthropic error in the response body, by code (claude-auth.ts). */
+  upstreamError?: UpstreamErrorCode;
   /** The downstream client aborted before the response finished. */
   clientAborted?: true;
   /** Forward start → first response byte from Anthropic. */

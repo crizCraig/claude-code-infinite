@@ -22,6 +22,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { DIAGNOSTICS_SCHEMA, TERMINALS, TURN_TYPES, errnoName, errorClassName, sanitizeContext, sanitizeEvent, threePartVersion, } from "./diagnostics-schema.js";
+import { CREDIT_BALANCE_TOO_LOW } from "./claude-auth.js";
 export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export const INSTALL_ID_FILE = "install_id";
 export const FLUSH_INTERVAL_MS = 30_000;
@@ -186,11 +187,15 @@ export class Diagnostics {
 export class DiagnosticsRequestSink {
     inner;
     diagnostics;
+    onCreditBalanceTooLow;
     firstRequest = false;
     firstTurn = false;
-    constructor(inner, diagnostics) {
+    constructor(inner, diagnostics, 
+    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
+    onCreditBalanceTooLow) {
         this.inner = inner;
         this.diagnostics = diagnostics;
+        this.onCreditBalanceTooLow = onCreditBalanceTooLow;
     }
     log(record) {
         this.inner?.log(record);
@@ -213,6 +218,12 @@ export class DiagnosticsRequestSink {
         const ccVersion = threePartVersion(rec.client?.ccVersion);
         if (ccVersion)
             this.diagnostics.setContext({ cc_version: ccVersion });
+        // The request's own auth header beats the startup guess from config.
+        if (rec.claudeAuth)
+            this.diagnostics.setContext({ claude_auth: rec.claudeAuth });
+        if (rec.contextWindow) {
+            this.diagnostics.setContext({ context_window_k: Math.round(rec.contextWindow / 1000) });
+        }
         const fields = {
             status: rec.upstreamStatus, turn_type: turnType(rec.turnType), ttfb_ms: rec.ttfbMs,
             total_ms: rec.totalMs, request_kb: kb(rec.requestBytes),
@@ -231,6 +242,10 @@ export class DiagnosticsRequestSink {
         const status = rec.upstreamStatus;
         if (typeof status === "number" && status >= 400) {
             this.diagnostics.recordLimited(`upstream:${status}`, "upstream_error", fields);
+        }
+        if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
+            this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
+            this.onCreditBalanceTooLow?.();
         }
         if (rec.compress?.timedOut) {
             this.diagnostics.recordLimited("compress_timeout", "compress_timeout", { ms: rec.compress.ms, request_kb: kb(rec.requestBytes) });

@@ -116,11 +116,12 @@ export function updateInstalledNoticeText(version: string, color: boolean): stri
 export function updateNoticeText(update: UpdateAvailable, color: boolean): string {
   const latest = sanitizeNoticeDetail(update.latest, 40);
   const current = sanitizeNoticeDetail(update.current, 40);
-  const plain = `• ccc ${latest} is available (you have ${current}) · ${UPGRADE_COMMAND}`;
+  const command = sanitizeNoticeDetail(update.command ?? UPGRADE_COMMAND, 80);
+  const plain = `• ccc ${latest} is available (you have ${current}) · ${command}`;
   if (!color) return plain;
   return (
     `\x1b[33m• ccc ${latest} is available\x1b[39m ` +
-    `\x1b[2m(you have ${current})\x1b[22m · \x1b[1m${UPGRADE_COMMAND}\x1b[22m`
+    `\x1b[2m(you have ${current})\x1b[22m · \x1b[1m${command}\x1b[22m`
   );
 }
 

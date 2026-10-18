@@ -158,8 +158,10 @@ function entryIsStale(entry, now) {
         return false;
     if (runner !== undefined && processAlive(runner))
         return false;
-    if (group !== undefined && processAlive(-group))
+    // Windows has no process groups: the runner records npm's own pid there.
+    if (group !== undefined && processAlive(process.platform === "win32" ? group : -group)) {
         return false;
+    }
     // Its runner died while starting npm: npm may be running unrecorded.
     return entry.data.spawning !== true;
 }

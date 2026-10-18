@@ -54,10 +54,30 @@ export function errorClassName(value) {
 export const ERROR_CODES = [
     "startup_failed", "spawn_failed", "proxy_start_failed", "config_write_failed",
     "status_probe_failed", "update_check_failed", "plugin_failed", "mcp_config_failed",
+    "credit_balance_too_low",
 ];
 export const INSTALL_METHODS = [
     "npm-global", "npm-link", "git-checkout", "npx", "local", "pnpm", "yarn", "bun", "volta",
     "not-writable", "root", "unsupported-platform", "unknown",
+];
+/** claude-auth.ts and claude-locate.ts (kept here so the schema has no imports). */
+export const CLAUDE_AUTH_TYPES = [
+    "subscription", "api_key", "bedrock", "vertex", "foundry", "unknown",
+];
+export const CLAUDE_PLANS = [
+    "free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown",
+];
+export const CLAUDE_SOURCES = [
+    "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local",
+];
+/** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
+export const AUTO_UPDATE_RESULTS = [
+    "started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed",
+];
+/** auto-update.ts SKIP_CODES. */
+export const AUTO_UPDATE_REASONS = [
+    "disabled", "not-release", "linked-install", "install-method", "backoff", "max-attempts",
+    "lock-held",
 ];
 export const TERMINALS = [
     "Apple_Terminal", "iTerm.app", "vscode", "WezTerm", "ghostty", "WarpTerminal", "tmux",
@@ -134,6 +154,11 @@ export const CONTEXT_FIELDS = {
     wsl: bool,
     interactive: bool,
     mode: oneOf(["production", "staging", "local"]),
+    claude_auth: oneOf(CLAUDE_AUTH_TYPES),
+    claude_plan: oneOf(CLAUDE_PLANS),
+    claude_found: oneOf(CLAUDE_SOURCES),
+    /** The main model's context window ccc inferred, in thousands of tokens. */
+    context_window_k: integer(0, 100_000),
 };
 export const EVENT_FIELDS = {
     first_run: {},
@@ -153,7 +178,7 @@ export const EVENT_FIELDS = {
     refusal: { status: STATUS, input_ktokens: KB, budget_ktokens: KB, attempt: integer(0, 1000) },
     paused_notice: { trigger: oneOf(["turn", "resume"]) },
     update_hint: { latest: VERSION },
-    auto_update: { result: oneOf(["started", "locked", "not-planned", "spawn-failed", "skipped"]) },
+    auto_update: { result: oneOf(AUTO_UPDATE_RESULTS), reason: oneOf(AUTO_UPDATE_REASONS) },
     claude_exit: { code: integer(-1000, 1000), signal: oneOf(SIGNALS) },
     claude_missing: {},
     error: { code: oneOf(ERROR_CODES), errno: oneOf(ERRNOS),

@@ -22,9 +22,17 @@ export declare const ERROR_NAMES: readonly ["Error", "TypeError", "RangeError", 
 export declare function errnoName(value: unknown): string | undefined;
 /** An error class name from the fixed list, else "other"; undefined when there is none. */
 export declare function errorClassName(value: unknown): string | undefined;
-export declare const ERROR_CODES: readonly ["startup_failed", "spawn_failed", "proxy_start_failed", "config_write_failed", "status_probe_failed", "update_check_failed", "plugin_failed", "mcp_config_failed"];
+export declare const ERROR_CODES: readonly ["startup_failed", "spawn_failed", "proxy_start_failed", "config_write_failed", "status_probe_failed", "update_check_failed", "plugin_failed", "mcp_config_failed", "credit_balance_too_low"];
 export type DiagnosticsErrorCode = (typeof ERROR_CODES)[number];
 export declare const INSTALL_METHODS: readonly ["npm-global", "npm-link", "git-checkout", "npx", "local", "pnpm", "yarn", "bun", "volta", "not-writable", "root", "unsupported-platform", "unknown"];
+/** claude-auth.ts and claude-locate.ts (kept here so the schema has no imports). */
+export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "unknown"];
+export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown"];
+export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
+/** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
+export declare const AUTO_UPDATE_RESULTS: readonly ["started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed"];
+/** auto-update.ts SKIP_CODES. */
+export declare const AUTO_UPDATE_REASONS: readonly ["disabled", "not-release", "linked-install", "install-method", "backoff", "max-attempts", "lock-held"];
 export declare const TERMINALS: readonly ["Apple_Terminal", "iTerm.app", "vscode", "WezTerm", "ghostty", "WarpTerminal", "tmux", "Hyper", "Tabby", "alacritty", "kitty", "cursor", "zed", "JetBrains-JediTerm", "rio", "Windows_Terminal", "mintty", "konsole", "gnome-terminal", "none", "other"];
 export declare const TURN_TYPES: readonly ["first-user", "tool", "tool-memory", "tool-prefix", "tool-recompressed", "followup-compressed", "followup-prefix", "followup-noop", "followup-empty-memory", "followup-no-flatten", "followup-degraded", "fork-memory", "side-request", "foreign", "followup-client-closed", "unparseable", "other"];
 export type DiagnosticsFields = Record<string, string | number | boolean>;

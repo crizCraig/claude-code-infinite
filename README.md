@@ -202,6 +202,10 @@ Claude Code ──▶ localhost proxy (ccc)
 
 - versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
   architecture, terminal type and locale;
+- how Claude Code is signed in, as a type only (Claude.ai subscription, API key, Bedrock,
+  Vertex), the plan's tier name when Claude Code records one (Pro, Max, Team), the main
+  model's context window ccc uses (200k or 1M), and where Claude Code was found (on PATH,
+  its installer's folder, npm, winget);
 - lifecycle events (first run, sign-in prompt shown, key accepted or rejected, session start,
   the MemTree-paused notice shown, update hint or background update result);
 - errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
@@ -371,6 +375,23 @@ publish.yml still tests that tag but skips publishing, since the version is alre
 
 `ccc` never touches your Anthropic credentials — Claude Code manages its own login exactly as it does without `ccc`. If you see auth errors, fix them the vanilla way: run `/login` inside Claude Code (or `claude` directly) and re-authenticate.
 
+### "Claude Code isn't installed"
+
+`ccc` runs Claude Code, so it has to be installed and signed in first. `ccc` finds it on
+PATH and, failing that, where its installers put it (`%USERPROFILE%\.local\bin`,
+`%APPDATA%\npm`, winget's folder and your saved user PATH on Windows; `~/.local/bin`,
+`~/.claude/local` and Homebrew elsewhere), so a terminal opened before the install works
+too. If it is not there, install it with the official command (Windows PowerShell:
+`irm https://claude.ai/install.ps1 | iex`; macOS/Linux:
+`curl -fsSL https://claude.ai/install.sh | bash`), run `claude` once to sign in, then run
+`ccc` again, from your project folder.
+
+### "This API key has no credit"
+
+`ccc` isn't free Claude: it runs your own Claude Code with your own Anthropic login. When
+Anthropic refuses an API key for having no credit, `ccc` says so as it exits. Sign in with
+a Claude Pro or Max plan (`claude`, then `/login`) or add credit to the key.
+
 ### MemTree degraded / passthrough mode
 
 If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the compression API is unreachable or your MemTree key is invalid/expired. Your session keeps working uncompressed. Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
@@ -423,14 +444,22 @@ at once; after an hour `ccc` shows the update line instead, and deleting
 
 **When it doesn't.** `ccc` updates itself only when it is a plain global npm install
 (`npm i -g`) whose files are in `npm root -g` and writable by you. It never uses `sudo`.
-In every other case it only shows the update line:
+In every other case it only shows the update line, with the command that fits the install:
 
-- `npm link`ed or git checkouts (a development copy is never touched),
+- `npm link`ed or git checkouts: a development copy is never touched, and the line says to
+  `git pull && npm run build` in the checkout (`npm i -g` would replace the link with the
+  published package),
 - `npx` and project-local installs,
-- pnpm, yarn, bun and Volta global installs (update with your tool's own command),
+- pnpm, yarn, bun and Volta global installs (the line gives your tool's own command),
 - a global prefix that needs `sudo` to write, or `ccc` running as root,
-- Windows,
 - print (`-p`) and non-TTY runs, which never install anything.
+
+**Windows.** The install starts as `ccc` exits rather than during the session: the
+background installer waits for that `ccc` to be gone before npm runs, so npm never
+rewrites the `ccc.cmd` that the session's terminal is still running. The next `ccc` you
+start runs the new version. Quitting by closing the terminal window skips that
+session's install; the next session that exits normally does it. By hand:
+`npm i -g claude-code-infinite@latest`.
 
 `ccc --debug` prints which install method was detected and what it decided.
 

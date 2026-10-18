@@ -2,7 +2,7 @@
  * Launch-time glue for auto-update.ts: decide what this interactive launch
  * does about an available update, what the SessionStart banner says now, and
  * when the background install starts (after Claude Code is up, never on the
- * startup path).
+ * startup path; on Windows only as ccc exits, see auto-update.ts).
  */
 
 import { spawn } from "node:child_process";
@@ -11,6 +11,8 @@ import {
   AutoUpdateNotices,
   PACKAGE_DIR,
   detectInstallMethod,
+  isLinkedInstall,
+  manualUpdateCommand,
   liveLockSince,
   planAutoUpdate,
   readInstalledVersion,
@@ -24,7 +26,7 @@ import {
   type StartInstallResult,
 } from "./auto-update.js";
 import { updateInstalledNoticeText, updateNoticeText } from "./notices.js";
-import type { UpdateAvailable } from "./update-check.js";
+import { UPGRADE_COMMAND, type UpdateAvailable } from "./update-check.js";
 
 export interface AutoUpdateSetupOptions {
   update: UpdateAvailable | null;
@@ -38,6 +40,10 @@ export interface AutoUpdateSetupOptions {
   spawnImpl?: SpawnLike;
   platform?: NodeJS.Platform;
   uid?: number;
+  /** process.argv[1], to see an `npm link` through the bin (detectInstallMethod). */
+  scriptPath?: string;
+  /** This process (Windows: the runner waits for it to exit). */
+  pid?: number;
 }
 
 export interface AutoUpdateSetup {
@@ -50,8 +56,16 @@ export interface AutoUpdateSetup {
   bannerInstalled: string | null;
   /** The SessionStart line for later hooks in this process (proxy option). */
   notices: AutoUpdateNotices;
-  /** Start the planned install after `delayMs`; a no-op unless planned. */
+  /**
+   * Start the planned install after `delayMs`; a no-op unless planned, and on
+   * Windows, where it starts in installOnExit instead.
+   */
   scheduleInstall(delayMs?: number, onResult?: (result: StartInstallResult) => void): void;
+  /**
+   * Windows: start the planned install now, as ccc exits; the runner waits for
+   * this process to be gone. A no-op elsewhere or unless planned.
+   */
+  installOnExit(onResult?: (result: StartInstallResult) => void): void;
   /** One line naming the install method and the decision, for --debug. */
   debugLine: string;
 }
@@ -73,30 +87,44 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
         installedVersion: readInstalledVersion(method.packageDir),
         lockHeldSince: liveLockSince(files.lockDir, now()),
       })
-    : ({ action: "skip", reason: "no update available" } as const);
+    : ({ action: "skip", reason: "no update available", code: "no-update" } as const);
+  const platform = opts.platform ?? process.platform;
+  const windows = platform === "win32";
+  const command = method ? manualUpdateCommand(method.kind) : undefined;
+  const withCommand = (update: UpdateAvailable): UpdateAvailable =>
+    command && command !== UPGRADE_COMMAND ? { ...update, command } : update;
+  let started = false;
+  const start = (onResult?: (result: StartInstallResult) => void) => {
+    if (decision.action !== "install" || started) return;
+    started = true;
+    const spawnImpl = opts.spawnImpl ?? (spawn as unknown as SpawnLike);
+    const result = startAutoUpdateInstall({
+      decision, files, spawnImpl, env, now, platform,
+      ...(windows ? { waitForPid: opts.pid ?? process.pid } : {}),
+    });
+    onResult?.(result);
+  };
   const notices = new AutoUpdateNotices({
     currentVersion: opts.currentVersion,
     packageDir: method?.packageDir ?? packageDir,
     stateFile: files.stateFile,
     startedAt: now(),
     installedText: (version) => updateInstalledNoticeText(version, opts.color),
-    hintText: (update) => updateNoticeText(update, opts.color),
+    hintText: (update) => updateNoticeText(withCommand(update), opts.color),
   });
   if (decision.action === "installed") notices.markShown();
   return {
     decision,
     method,
-    bannerUpdate: decision.action === "skip" ? opts.update : null,
+    bannerUpdate: decision.action === "skip" && opts.update ? withCommand(opts.update) : null,
     bannerInstalled: decision.action === "installed" ? decision.version : null,
     notices,
     scheduleInstall(delayMs = AUTO_UPDATE_DELAY_MS, onResult) {
-      if (decision.action !== "install") return;
-      const spawnImpl = opts.spawnImpl ?? (spawn as unknown as SpawnLike);
-      const timer = setTimeout(() => {
-        const result = startAutoUpdateInstall({ decision, files, spawnImpl, env, now });
-        onResult?.(result);
-      }, delayMs);
-      timer.unref();
+      if (decision.action !== "install" || windows) return;
+      setTimeout(() => start(onResult), delayMs).unref();
+    },
+    installOnExit(onResult) {
+      if (windows) start(onResult);
     },
     debugLine: debugLine(method, decision),
   };
@@ -112,6 +140,7 @@ function detectMethod(
     env,
     platform: opts.platform,
     uid: opts.uid ?? process.getuid?.(),
+    scriptPath: opts.scriptPath,
   });
 }
 
@@ -120,6 +149,7 @@ function debugLine(method: InstallMethod | null, decision: AutoUpdateDecision): 
   const what =
     decision.action === "install" ? `installing ${decision.version} in the background`
     : decision.action === "installed" ? `${decision.version} already installed, restart to use it`
+    : isLinkedInstall(method?.kind ?? "unknown") ? "skipped: linked install"
     : `not installing: ${decision.reason}`;
   return `Auto-update: ${how}; ${what}`;
 }
