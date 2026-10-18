@@ -41,7 +41,8 @@
 
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures } from "./route-fallback.js";
+import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures, pausedRefusal }
+  from "./route-fallback.js";
 import {
   createCountTokensSession,
   CountTokensCooldowns,
@@ -119,7 +120,8 @@ import {
 } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
-import { PaymentNoticeThrottle, paymentNoticeText } from "./payment-notice.js";
+import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText,
+  subscribeUrlFromDetail } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
 import type { PersistedEntry, StablePrefixStore } from "./prefix-store.js";
@@ -2483,14 +2485,15 @@ async function handleMessages(
     const mayQueueNotice =
       displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
     if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
-      state.notices.queueSuffix(
+      // A paused refusal of this very request withdraws it (refuseWholeRequest).
+      pausedNotices.set(rec, state.notices.queueSuffix(
         paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link),
         () => {
           state.paymentNotice.markShown();
           state.diagnostics?.record("paused_notice", { trigger: "turn" });
         },
         noticePromptId
-      );
+      ));
     } else if (mayQueueNotice && paymentDetail === null) {
       state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
     }
@@ -2832,10 +2835,15 @@ function sessionCommandReply(
   sessionId: string,
   prompt: string
 ): string | undefined {
+  const unpaid = state.unpaidDetail();
+  // Paused, compaction needs the MemTree it cannot reach: say how to resume instead.
+  const paused = unpaid === null ? undefined
+    : pausedCompactionText(viewUrl(subscribeUrlFromDetail(unpaid)));
   if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
     return [
       "• /memtree-view · show this session's MemTree page link",
-      `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
+      paused !== undefined ? `• ${paused}`
+        : `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
       usageLines(state),
     ].filter((line): line is string => line !== undefined).join("\n");
   }
@@ -2855,6 +2863,7 @@ function sessionCommandReply(
     state.storedPrefixLookups.set(sessionId, null);
     return `${TRAILER_LABEL} compaction off: the conversation is sent whole, and MemTree compresses only when it outgrows the model's budget.`;
   }
+  if (paused !== undefined) return `${TRAILER_LABEL} ${paused}`;
   if (args === "") {
     // Back to the automatic target (half the budget, or CCC_COMPACT_TARGET).
     // Under CCC_COMPACT_TARGET=off the default is off, so pin the automatic
@@ -2950,7 +2959,9 @@ function sessionLink(
   source: { url: string; index: string; compressed: boolean } | undefined
 ): SuccessLink | undefined {
   const newest = state.newestTrees?.peek(sessionId);
-  const note = source && !source.compressed ? { note: NOT_COMPRESSED_NOTE } : {};
+  // The note suggests /memtree-compact, which cannot run while MemTree is paused.
+  const note = source && !source.compressed && state.unpaidDetail() === null
+    ? { note: NOT_COMPRESSED_NOTE } : {};
   if (newest) return { key: newest.key, link: newest.url, ...note };
   return source ? { key: source.index, link: source.url, ...note } : undefined;
 }
@@ -5345,8 +5356,11 @@ function refuseWholeRequest(
   inputTokens: number,
   budgetTokens: number
 ): false {
-  const failure = args.state.fallbackFailures.fail(args.routeKey,
-    { awaitingIndex: args.rec.indexBehind === true });
+  const unpaid = args.state.unpaidDetail();
+  const failure = unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
+    : args.state.fallbackFailures.fail(args.routeKey,
+      { awaitingIndex: args.rec.indexBehind === true });
+  if (unpaid !== null) notePausedRefusal(args.state, args.rec, args.routeKey);
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   args.state.diagnostics?.record("refusal", {
@@ -5358,7 +5372,7 @@ function refuseWholeRequest(
     lane: args.routeKey, attempt: failure.attempt, status: failure.status,
     inputTokens, outputTokens: args.body.max_tokens ?? 0,
     outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
-    budgetTokens, modelContextLimit: args.modelContextLimit,
+    budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
   };
   if (args.res.headersSent || args.res.destroyed) return false;
   args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
@@ -5366,6 +5380,24 @@ function refuseWholeRequest(
   return false;
 }
 
+/**
+ * The refusal text already says MemTree is paused and how to resume, so it
+ * counts as the paused notice: the throttle restarts, and this request's
+ * queued notice is withdrawn rather than shown a second time after it.
+ */
+function notePausedRefusal(state: ProxyState, rec: MessagesRecord, lane: string): void {
+  state.notices.cancel(pausedNotices.get(rec));
+  pausedNotices.delete(rec);
+  state.paymentNotice.markShown();
+  // A tool turn in the outage cooldown or its lane's growth backoff refuses on
+  // the last 402 without asking. End both so the next request asks MemTree
+  // again (a 402 answers fast) and paying takes effect with no restart.
+  state.toolRecoveryCooldownUntil = 0;
+  state.toolRecoveryAttemptedLanes.delete(lane);
+}
+
+/** The paused notice a degraded request queued, until it is refused or settles. */
+const pausedNotices = new WeakMap<MessagesRecord, object>();
 const changedDeliveryRecords = new WeakSet<MessagesRecord>();
 const selectedCandidates = new WeakMap<MessagesRecord, RequestCandidate>();
 const candidateSizeOwners = new WeakMap<RequestCandidate, SizeHolder | SizeSlot>();

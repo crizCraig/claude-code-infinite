@@ -246,6 +246,8 @@ export interface MessagesRecord {
     lane: string; attempt: number; status: number;
     inputTokens: number; outputTokens: number; outputReservation: number;
     indexBehind: boolean; budgetTokens: number; modelContextLimit: number;
+    /** MemTree was paused (402): the refusal said so, outside the strike episode. */
+    paused?: true;
   };
   /** Searchable flag explaining a forward above the advisory compression budget. */
   overBudgetForward?: {

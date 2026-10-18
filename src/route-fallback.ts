@@ -139,6 +139,16 @@ const INDEX_WAIT_MESSAGE =
   "MemTree is still indexing this conversation, so it does not fit the model's context " +
   "window yet; retrying once indexing catches up.";
 
+/**
+ * The refusal while MemTree is paused (402): only compression could fit the
+ * request, and a retry cannot pay, so it is final at once and outside the
+ * strike episode (attempt 0). Paying lets the very next request compress.
+ */
+export function pausedRefusal(message: string): RouteFallbackError {
+  return { ...refusal(0), body: { type: "error",
+    error: { type: "invalid_request_error", message } } };
+}
+
 function retryError(attempt: number, retryAfter: string, message: string): RouteFallbackError {
   return {
     status: 503,

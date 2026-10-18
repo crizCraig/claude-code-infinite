@@ -194,7 +194,7 @@ Claude Code ──▶ localhost proxy (ccc)
 
 - Only message content is sent to MemTree for indexing/compression — never credentials.
 - Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
-- If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted.
+- If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted. While MemTree is paused (usage limit reached), a request that still fits the model's context window goes out unchanged, exactly as plain Claude Code would send it; one that no longer fits is refused at once with "MemTree is paused (usage limit reached), so this long conversation can't be compressed…", your subscribe link, and `/clear` to start fresh (`/memtree-compact` needs MemTree, so it is not offered then). After you subscribe, the next request compresses again with no restart.
 
 ### Diagnostics
 

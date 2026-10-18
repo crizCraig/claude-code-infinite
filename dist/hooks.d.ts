@@ -207,7 +207,10 @@ export declare class NoticeDeliveryQueue {
      */
     setFirstTreeIntro(intro: FirstTreeIntro | null): void;
     queuePrefix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
-    queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
+    /** Returns a handle that `cancel` takes to withdraw this notice undelivered. */
+    queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): object;
+    /** Withdraw a queued notice that is still pending; a newer one is kept. */
+    cancel(handle: object | undefined): void;
     /**
      * Claim eligible notice parts atomically for one hook invocation. Subagent
      * hooks share the plugin but must never consume the main turn's notice.

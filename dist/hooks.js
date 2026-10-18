@@ -227,12 +227,19 @@ export class NoticeDeliveryQueue {
             prefix: { text, onDelivered },
         };
     }
+    /** Returns a handle that `cancel` takes to withdraw this notice undelivered. */
     queueSuffix(text, onDelivered, promptId) {
         this.pending = {
             createdAt: this.now(),
             promptId,
             suffix: { text, onDelivered },
         };
+        return this.pending;
+    }
+    /** Withdraw a queued notice that is still pending; a newer one is kept. */
+    cancel(handle) {
+        if (handle !== undefined && this.pending === handle)
+            this.pending = null;
     }
     /**
      * Claim eligible notice parts atomically for one hook invocation. Subagent

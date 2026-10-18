@@ -64,4 +64,10 @@ export declare class RouteFallbackFailures {
      */
     private retire;
 }
+/**
+ * The refusal while MemTree is paused (402): only compression could fit the
+ * request, and a retry cannot pay, so it is final at once and outside the
+ * strike episode (attempt 0). Paying lets the very next request compress.
+ */
+export declare function pausedRefusal(message: string): RouteFallbackError;
 //# sourceMappingURL=route-fallback.d.ts.map

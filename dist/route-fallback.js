@@ -104,6 +104,15 @@ export class RouteFallbackFailures {
 const RETRY_MESSAGE = "MemTree could not produce a usable compressed request; retrying within a bounded limit.";
 const INDEX_WAIT_MESSAGE = "MemTree is still indexing this conversation, so it does not fit the model's context " +
     "window yet; retrying once indexing catches up.";
+/**
+ * The refusal while MemTree is paused (402): only compression could fit the
+ * request, and a retry cannot pay, so it is final at once and outside the
+ * strike episode (attempt 0). Paying lets the very next request compress.
+ */
+export function pausedRefusal(message) {
+    return { ...refusal(0), body: { type: "error",
+            error: { type: "invalid_request_error", message } } };
+}
 function retryError(attempt, retryAfter, message) {
     return {
         status: 503,

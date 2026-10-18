@@ -22,6 +22,16 @@ export declare const PAYMENT_NOTICE_INTERVAL_MS: number;
 export declare const PAYMENT_PAUSED_HEADLINE = "\u26A0 MemTree compression is paused: usage limit reached. Subscribe to turn it back on:";
 export declare const PAYMENT_CONTINUES_LINE = "Your session continues uncompressed.";
 export declare const PAYMENT_PAGE_LABEL = "Your MemTree so far:";
+/** What a paused key means, in the refusal and the command replies. */
+export declare const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
+/**
+ * The API error text Claude Code shows when a paused session no longer fits
+ * the model's window: only compression could fit it, so it says why, how to
+ * resume, and the one way on that needs no MemTree. One line, bare URL.
+ */
+export declare function pausedRefusalMessage(detail: string): string;
+/** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
+export declare function pausedCompactionText(url: string): string;
 /**
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.
