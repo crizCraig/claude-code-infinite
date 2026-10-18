@@ -62,6 +62,12 @@ async function harness(extra = {}) {
       return res.end(JSON.stringify({ detail: PAYMENT_DETAIL }));
     }
     if (indexOnly) return res.end(JSON.stringify({ messages: [] }));
+    if (h.passthrough) {
+      // Nothing compressed yet: the server hands the conversation back, with its page.
+      res.setHeader("x-polychat-memtree-url", "https://memtree.example/m/page-1");
+      res.setHeader("x-polychat-memtree-index", "index-1");
+      return res.end(JSON.stringify({ messages: JSON.parse(raw).messages }));
+    }
     const messages = [{ role: "user", content: "saved memory ".repeat(200) }];
     res.end(JSON.stringify({ compressed: true, messages, flattened_messages: messages,
       usage: { indexed_tokens: 990_000, raw_prompt_tokens: 995_000 } }));
@@ -242,5 +248,48 @@ test("a subagent's paused refusal does not use up the user's paused notice", asy
     assert.equal((await post(h, humanTurn(977_000))).status, 200);
     const shown = await display(h, "p1");
     assert.ok(shown.body.hookSpecificOutput.displayContent.includes(PAYMENT_PAUSED_HEADLINE));
+  } finally { h.close(); }
+});
+
+test("the near-window line shows once per session, even inside the throttle", async () => {
+  const h = await harness();
+  try {
+    // A forwarded turn's background index answers 402: paused.
+    assert.equal((await post(h, humanTurn(500_000))).status, 200);
+    for (let i = 0; i < 100 && h.memtree.paymentRequiredDetail === null; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.notEqual(h.memtree.paymentRequiredDetail, null);
+    // A resume shows the paused notice and starts the 30-minute throttle.
+    const resumed = await hook(h, { hook_event_name: "SessionStart", source: "resume" });
+    assert.ok(resumed.body.systemMessage.includes(PAYMENT_PAUSED_HEADLINE));
+    assert.ok(!resumed.body.systemMessage.includes(PAYMENT_OVER_BUDGET_LINE));
+    // A tool round crosses the budget while it still fits: say /compact works now.
+    await submit(h, "go", "p2");
+    assert.equal((await post(h, toolTurn(960_000))).status, 200);
+    const warned = await display(h, "p2");
+    assert.ok(warned.body.hookSpecificOutput.displayContent.includes(PAYMENT_OVER_BUDGET_LINE));
+    // Only once.
+    assert.equal((await post(h, toolTurn(970_000))).status, 200);
+    assert.equal((await display(h, "p2")).status, 204);
+  } finally { h.close(); }
+});
+
+test("while paused, /ccc:memtree-view drops the /memtree-compact note", async () => {
+  const h = await harness();
+  try {
+    h.paid = true;
+    h.passthrough = true;
+    await submit(h, "next", "p1");
+    assert.equal((await post(h, humanTurn(977_000))).status, 200);
+    const before = (await submit(h, "/ccc:memtree-view")).body.reason;
+    assert.match(before, /memtree-compact/, "offered while paid");
+    h.paid = false;
+    await submit(h, "again", "p2");
+    assert.equal((await post(h, humanTurn(978_000))).status, 200); // 402: paused
+    assert.notEqual(h.memtree.paymentRequiredDetail, null);
+    const view = (await submit(h, "/ccc:memtree-view")).body.reason;
+    assert.ok(view.includes("memtree.example"), view);
+    assert.ok(!view.includes("memtree-compact"), view);
   } finally { h.close(); }
 });

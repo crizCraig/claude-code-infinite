@@ -389,6 +389,11 @@ interface MemtreePage {
 interface ProxyState {
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
   paymentNotice: PaymentNoticeThrottle;
+  /**
+   * Sessions shown the paused notice's near-the-window line: once per session,
+   * past the throttle, since /compact only works while the conversation fits.
+   */
+  pausedNearWindowWarned: Set<string>;
   /** The MemTree client's last 402 detail, or null while the key is paid. */
   unpaidDetail: () => string | null;
   /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
@@ -885,6 +890,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const state: ProxyState = {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
+    pausedNearWindowWarned: new Set(),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
     pausedDetail: () => opts.memtree.pausedDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
@@ -2487,13 +2493,15 @@ async function handleMessages(
     const paymentDetail = opts.memtree.paymentRequiredDetail;
     const mayQueueNotice =
       displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
-    if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
+    const overBudget = reachedBudget(rec.compaction);
+    if (mayQueueNotice && paymentDetail !== null &&
+        (state.paymentNotice.due() || (overBudget && !nearWindowWarned(state, sessionId)))) {
       // A paused refusal of this very request withdraws it (refuseWholeRequest).
       pausedNotices.set(rec, state.notices.queueSuffix(
-        paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link,
-          { overBudget: reachedBudget(rec.compaction) }),
+        paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }),
         () => {
           state.paymentNotice.markShown();
+          if (overBudget && sessionId !== undefined) state.pausedNearWindowWarned.add(sessionId);
           state.diagnostics?.record("paused_notice", { trigger: "turn" });
         },
         noticePromptId
@@ -5333,6 +5341,7 @@ async function selectForwardCandidate(args: {
     args.rec.overBudgetForward = { reason: measurement.source === "exact"
       ? "exact-count-fits-window" : measurement.source === "bytes"
         ? "bytes-fallback-fits-window" : "estimate-fits-window" };
+    warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
   }
   return changed ? candidate.body : intended;
 }
@@ -5356,7 +5365,8 @@ async function wholeRequestRefused(
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(
   args: { state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
-    body: Record<string, any>; modelContextLimit: number; routeKey: string },
+    body: Record<string, any>; modelContextLimit: number; routeKey: string;
+    req: http.IncomingMessage },
   inputTokens: number,
   budgetTokens: number
 ): false {
@@ -5381,7 +5391,9 @@ function refuseWholeRequest(
   if (args.res.headersSent || args.res.destroyed) return false;
   args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
   args.res.end(JSON.stringify(failure.body));
-  if (unpaid !== null) notePausedRefusal(args.state, args.rec, args.routeKey);
+  if (unpaid !== null) {
+    notePausedRefusal(args.state, args.rec, args.routeKey, requestSessionId(args.req));
+  }
   return false;
 }
 
@@ -5390,9 +5402,15 @@ function refuseWholeRequest(
  * counts as the paused notice: the throttle restarts, and this request's
  * queued notice is withdrawn rather than shown a second time after it.
  */
-function notePausedRefusal(state: ProxyState, rec: MessagesRecord, lane: string): void {
-  // A subagent's refusal goes to its parent model, not to the user's screen.
-  if (rec.routeLane !== "agent") state.paymentNotice.markShown();
+function notePausedRefusal(
+  state: ProxyState, rec: MessagesRecord, lane: string, sessionId: string | undefined
+): void {
+  // A subagent's or hidden away-summary's refusal is not on the user's screen.
+  if (rec.routeLane === "main") {
+    state.paymentNotice.markShown();
+    // Past the window /compact no longer fits: no later near-window line.
+    if (sessionId !== undefined) state.pausedNearWindowWarned.add(sessionId);
+  }
   // A tool turn in the outage cooldown or its lane's growth backoff refuses on
   // the last 402 without asking. End both so the next request asks MemTree
   // again (a 402 answers fast) and paying takes effect with no restart. A
@@ -5408,6 +5426,28 @@ function notePausedRefusal(state: ProxyState, rec: MessagesRecord, lane: string)
 function cancelPausedNotice(state: ProxyState, rec: MessagesRecord): void {
   state.notices.cancel(pausedNotices.get(rec));
   pausedNotices.delete(rec);
+}
+
+/**
+ * A paused main-lane request over the budget, still fitting the window (often a
+ * tool round): once per session, say /compact still works now. A turn that
+ * already queued the paused notice carries the line itself.
+ */
+function warnPausedNearWindow(
+  state: ProxyState, rec: MessagesRecord, sessionId: string | undefined
+): void {
+  const detail = state.unpaidDetail();
+  if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
+      pausedNotices.has(rec) || nearWindowWarned(state, sessionId)) return;
+  state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
+    state.paymentNotice.markShown();
+    state.pausedNearWindowWarned.add(sessionId);
+    state.diagnostics?.record("paused_notice", { trigger: "turn" });
+  }, state.mainPromptId);
+}
+
+function nearWindowWarned(state: ProxyState, sessionId: string | undefined): boolean {
+  return sessionId !== undefined && state.pausedNearWindowWarned.has(sessionId);
 }
 
 /** Whether this turn's own size estimate reached its whole-request budget. */

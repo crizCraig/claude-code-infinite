@@ -1701,7 +1701,12 @@ export class MemtreeClient {
       clearTimeout(timeout);
       opts.signal?.removeEventListener("abort", abort);
       // A call the caller aborted says nothing about the server.
-      if (status !== undefined || !opts.signal?.aborted) this.lastAnswerUnpaid = status === 402;
+      // A background index call that failed otherwise (a timeout, a 413 on a big
+      // body) is no news about payment; a compress call's answer always is.
+      const news = status === 402 || ok || !opts.indexOnly;
+      if (news && (status !== undefined || !opts.signal?.aborted)) {
+        this.lastAnswerUnpaid = status === 402;
+      }
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).
       this.reqlog?.log({

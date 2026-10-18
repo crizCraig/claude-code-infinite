@@ -303,6 +303,7 @@ export function startProxy(opts) {
     const shutdownAbort = new AbortController();
     const state = {
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
+        pausedNearWindowWarned: new Set(),
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         pausedDetail: () => opts.memtree.pausedDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
@@ -1718,10 +1719,14 @@ async function handleMessages(req, res, opts, upstream, state) {
         capture(opts, "anthropic-request", forwardBody);
         const paymentDetail = opts.memtree.paymentRequiredDetail;
         const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
-        if (mayQueueNotice && paymentDetail !== null && state.paymentNotice.due()) {
+        const overBudget = reachedBudget(rec.compaction);
+        if (mayQueueNotice && paymentDetail !== null &&
+            (state.paymentNotice.due() || (overBudget && !nearWindowWarned(state, sessionId)))) {
             // A paused refusal of this very request withdraws it (refuseWholeRequest).
-            pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget: reachedBudget(rec.compaction) }), () => {
+            pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }), () => {
                 state.paymentNotice.markShown();
+                if (overBudget && sessionId !== undefined)
+                    state.pausedNearWindowWarned.add(sessionId);
                 state.diagnostics?.record("paused_notice", { trigger: "turn" });
             }, noticePromptId));
         }
@@ -3926,6 +3931,7 @@ async function selectForwardCandidate(args) {
         args.rec.overBudgetForward = { reason: measurement.source === "exact"
                 ? "exact-count-fits-window" : measurement.source === "bytes"
                 ? "bytes-fallback-fits-window" : "estimate-fits-window" };
+        warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
     }
     return changed ? candidate.body : intended;
 }
@@ -3967,8 +3973,9 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         return false;
     args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
     args.res.end(JSON.stringify(failure.body));
-    if (unpaid !== null)
-        notePausedRefusal(args.state, args.rec, args.routeKey);
+    if (unpaid !== null) {
+        notePausedRefusal(args.state, args.rec, args.routeKey, requestSessionId(args.req));
+    }
     return false;
 }
 /**
@@ -3976,10 +3983,14 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
  * counts as the paused notice: the throttle restarts, and this request's
  * queued notice is withdrawn rather than shown a second time after it.
  */
-function notePausedRefusal(state, rec, lane) {
-    // A subagent's refusal goes to its parent model, not to the user's screen.
-    if (rec.routeLane !== "agent")
+function notePausedRefusal(state, rec, lane, sessionId) {
+    // A subagent's or hidden away-summary's refusal is not on the user's screen.
+    if (rec.routeLane === "main") {
         state.paymentNotice.markShown();
+        // Past the window /compact no longer fits: no later near-window line.
+        if (sessionId !== undefined)
+            state.pausedNearWindowWarned.add(sessionId);
+    }
     // A tool turn in the outage cooldown or its lane's growth backoff refuses on
     // the last 402 without asking. End both so the next request asks MemTree
     // again (a 402 answers fast) and paying takes effect with no restart. A
@@ -3994,6 +4005,25 @@ function notePausedRefusal(state, rec, lane) {
 function cancelPausedNotice(state, rec) {
     state.notices.cancel(pausedNotices.get(rec));
     pausedNotices.delete(rec);
+}
+/**
+ * A paused main-lane request over the budget, still fitting the window (often a
+ * tool round): once per session, say /compact still works now. A turn that
+ * already queued the paused notice carries the line itself.
+ */
+function warnPausedNearWindow(state, rec, sessionId) {
+    const detail = state.unpaidDetail();
+    if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
+        pausedNotices.has(rec) || nearWindowWarned(state, sessionId))
+        return;
+    state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
+        state.paymentNotice.markShown();
+        state.pausedNearWindowWarned.add(sessionId);
+        state.diagnostics?.record("paused_notice", { trigger: "turn" });
+    }, state.mainPromptId);
+}
+function nearWindowWarned(state, sessionId) {
+    return sessionId !== undefined && state.pausedNearWindowWarned.has(sessionId);
 }
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction) {
