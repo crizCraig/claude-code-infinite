@@ -1722,13 +1722,17 @@ async function handleMessages(req, res, opts, upstream, state) {
         const overBudget = reachedBudget(rec.compaction);
         if (mayQueueNotice && paymentDetail !== null &&
             (state.paymentNotice.due() || (overBudget && !nearWindowWarned(state, sessionId)))) {
-            // A paused refusal of this very request withdraws it (refuseWholeRequest).
-            pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }), () => {
+            // A paused refusal of this very request withdraws it (refuseWholeRequest),
+            // and any later one withdraws its near-window line.
+            const handle = state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }), () => {
                 state.paymentNotice.markShown();
                 if (overBudget && sessionId !== undefined)
                     addNearWindowWarned(state, sessionId);
                 state.diagnostics?.record("paused_notice", { trigger: "turn" });
-            }, noticePromptId));
+            }, noticePromptId);
+            pausedNotices.set(rec, handle);
+            if (overBudget)
+                state.nearWindowNotice = handle;
         }
         else if (mayQueueNotice && paymentDetail === null) {
             state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
@@ -2209,6 +2213,9 @@ function noteMemtreeHealth(state, compression) {
     }
     if (compression.liveHealth === "success") {
         state.toolRecoveryCooldownUntil = 0;
+        // Paid again: a later pause (next month's limit) warns near the window afresh.
+        if (state.unpaidDetail() === null)
+            state.pausedNearWindowWarned.clear();
     }
 }
 /**
@@ -4021,7 +4028,7 @@ function warnPausedNearWindow(state, rec, sessionId) {
     // Never replace another queued notice (or this one again): a later request tries.
     if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
         pausedNotices.has(rec) || nearWindowWarned(state, sessionId) ||
-        state.notices.hasPending())
+        state.notices.hasPending(state.mainPromptId))
         return;
     state.nearWindowNotice = state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
         state.paymentNotice.markShown();

@@ -236,9 +236,10 @@ export class NoticeDeliveryQueue {
         };
         return this.pending;
     }
-    /** Whether any notice is queued and not yet delivered. */
-    hasPending() {
-        return this.freshPending() !== null;
+    /** Whether a notice for `promptId` (or for any prompt) is queued and undelivered. */
+    hasPending(promptId) {
+        const pending = this.freshPending();
+        return pending !== null && this.promptMatches(pending, promptId);
     }
     /** Withdraw a queued notice that is still pending; a newer one is kept. */
     cancel(handle) {
