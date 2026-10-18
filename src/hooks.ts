@@ -388,6 +388,11 @@ export class NoticeDeliveryQueue {
     return this.pending;
   }
 
+  /** Whether any notice is queued and not yet delivered. */
+  hasPending(): boolean {
+    return this.freshPending() !== null;
+  }
+
   /** Withdraw a queued notice that is still pending; a newer one is kept. */
   cancel(handle: object | undefined): void {
     if (handle !== undefined && this.pending === handle) this.pending = null;

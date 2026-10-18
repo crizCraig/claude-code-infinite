@@ -394,6 +394,8 @@ interface ProxyState {
    * past the throttle, since /compact only works while the conversation fits.
    */
   pausedNearWindowWarned: Set<string>;
+  /** The queued near-window line, so a refusal can withdraw it undelivered. */
+  nearWindowNotice?: object;
   /** The MemTree client's last 402 detail, or null while the key is paid. */
   unpaidDetail: () => string | null;
   /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
@@ -2501,7 +2503,7 @@ async function handleMessages(
         paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }),
         () => {
           state.paymentNotice.markShown();
-          if (overBudget && sessionId !== undefined) state.pausedNearWindowWarned.add(sessionId);
+          if (overBudget && sessionId !== undefined) addNearWindowWarned(state, sessionId);
           state.diagnostics?.record("paused_notice", { trigger: "turn" });
         },
         noticePromptId
@@ -5408,8 +5410,10 @@ function notePausedRefusal(
   // A subagent's or hidden away-summary's refusal is not on the user's screen.
   if (rec.routeLane === "main") {
     state.paymentNotice.markShown();
-    // Past the window /compact no longer fits: no later near-window line.
-    if (sessionId !== undefined) state.pausedNearWindowWarned.add(sessionId);
+    // Past the window /compact no longer fits: withdraw an undelivered
+    // near-window line and show none later.
+    state.notices.cancel(state.nearWindowNotice);
+    if (sessionId !== undefined) addNearWindowWarned(state, sessionId);
   }
   // A tool turn in the outage cooldown or its lane's growth backoff refuses on
   // the last 402 without asking. End both so the next request asks MemTree
@@ -5437,13 +5441,28 @@ function warnPausedNearWindow(
   state: ProxyState, rec: MessagesRecord, sessionId: string | undefined
 ): void {
   const detail = state.unpaidDetail();
+  // Paid again: a later pause (next month's limit) warns afresh.
+  if (detail === null) state.pausedNearWindowWarned.clear();
+  // Never replace another queued notice (or this one again): a later request tries.
   if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
-      pausedNotices.has(rec) || nearWindowWarned(state, sessionId)) return;
-  state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
+      pausedNotices.has(rec) || nearWindowWarned(state, sessionId) ||
+      state.notices.hasPending()) return;
+  state.nearWindowNotice = state.notices.queueSuffix(
+    paymentNoticeText(detail, undefined, { overBudget: true }), () => {
     state.paymentNotice.markShown();
-    state.pausedNearWindowWarned.add(sessionId);
+    addNearWindowWarned(state, sessionId);
     state.diagnostics?.record("paused_notice", { trigger: "turn" });
   }, state.mainPromptId);
+}
+
+/** Remember a warned session, keeping the set bounded (oldest first out). */
+function addNearWindowWarned(state: ProxyState, sessionId: string): void {
+  state.pausedNearWindowWarned.delete(sessionId);
+  state.pausedNearWindowWarned.add(sessionId);
+  if (state.pausedNearWindowWarned.size > MEMTREE_LINKS_MAX_SESSIONS) {
+    const oldest = state.pausedNearWindowWarned.values().next().value;
+    if (oldest !== undefined) state.pausedNearWindowWarned.delete(oldest);
+  }
 }
 
 function nearWindowWarned(state: ProxyState, sessionId: string | undefined): boolean {

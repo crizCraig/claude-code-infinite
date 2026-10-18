@@ -1726,7 +1726,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             pausedNotices.set(rec, state.notices.queueSuffix(paymentNoticeText(paymentDetail, recapLink(state, sessionId)?.link, { overBudget }), () => {
                 state.paymentNotice.markShown();
                 if (overBudget && sessionId !== undefined)
-                    state.pausedNearWindowWarned.add(sessionId);
+                    addNearWindowWarned(state, sessionId);
                 state.diagnostics?.record("paused_notice", { trigger: "turn" });
             }, noticePromptId));
         }
@@ -3987,9 +3987,11 @@ function notePausedRefusal(state, rec, lane, sessionId) {
     // A subagent's or hidden away-summary's refusal is not on the user's screen.
     if (rec.routeLane === "main") {
         state.paymentNotice.markShown();
-        // Past the window /compact no longer fits: no later near-window line.
+        // Past the window /compact no longer fits: withdraw an undelivered
+        // near-window line and show none later.
+        state.notices.cancel(state.nearWindowNotice);
         if (sessionId !== undefined)
-            state.pausedNearWindowWarned.add(sessionId);
+            addNearWindowWarned(state, sessionId);
     }
     // A tool turn in the outage cooldown or its lane's growth backoff refuses on
     // the last 402 without asking. End both so the next request asks MemTree
@@ -4013,14 +4015,29 @@ function cancelPausedNotice(state, rec) {
  */
 function warnPausedNearWindow(state, rec, sessionId) {
     const detail = state.unpaidDetail();
+    // Paid again: a later pause (next month's limit) warns afresh.
+    if (detail === null)
+        state.pausedNearWindowWarned.clear();
+    // Never replace another queued notice (or this one again): a later request tries.
     if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
-        pausedNotices.has(rec) || nearWindowWarned(state, sessionId))
+        pausedNotices.has(rec) || nearWindowWarned(state, sessionId) ||
+        state.notices.hasPending())
         return;
-    state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
+    state.nearWindowNotice = state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
         state.paymentNotice.markShown();
-        state.pausedNearWindowWarned.add(sessionId);
+        addNearWindowWarned(state, sessionId);
         state.diagnostics?.record("paused_notice", { trigger: "turn" });
     }, state.mainPromptId);
+}
+/** Remember a warned session, keeping the set bounded (oldest first out). */
+function addNearWindowWarned(state, sessionId) {
+    state.pausedNearWindowWarned.delete(sessionId);
+    state.pausedNearWindowWarned.add(sessionId);
+    if (state.pausedNearWindowWarned.size > MEMTREE_LINKS_MAX_SESSIONS) {
+        const oldest = state.pausedNearWindowWarned.values().next().value;
+        if (oldest !== undefined)
+            state.pausedNearWindowWarned.delete(oldest);
+    }
 }
 function nearWindowWarned(state, sessionId) {
     return sessionId !== undefined && state.pausedNearWindowWarned.has(sessionId);

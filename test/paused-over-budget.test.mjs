@@ -293,3 +293,14 @@ test("while paused, /ccc:memtree-view drops the /memtree-compact note", async ()
     assert.ok(!view.includes("memtree-compact"), view);
   } finally { h.close(); }
 });
+
+test("a refusal withdraws an undelivered near-window line", async () => {
+  const h = await harness();
+  try {
+    await submit(h, "go", "p1");
+    assert.equal((await post(h, toolTurn(960_000))).status, 200); // line queued, not shown
+    assert.equal((await post(h, toolTurn(990_000))).status, 400); // now past the window
+    const after = await stop(h, "p1");
+    assert.ok(after.status === 204 || !after.body.systemMessage.includes(PAYMENT_OVER_BUDGET_LINE));
+  } finally { h.close(); }
+});

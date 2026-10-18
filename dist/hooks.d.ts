@@ -209,6 +209,8 @@ export declare class NoticeDeliveryQueue {
     queuePrefix(text: NoticeText, onDelivered?: () => void, promptId?: string): void;
     /** Returns a handle that `cancel` takes to withdraw this notice undelivered. */
     queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): object;
+    /** Whether any notice is queued and not yet delivered. */
+    hasPending(): boolean;
     /** Withdraw a queued notice that is still pending; a newer one is kept. */
     cancel(handle: object | undefined): void;
     /**
