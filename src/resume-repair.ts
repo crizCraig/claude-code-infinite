@@ -5,7 +5,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import spawn from "cross-spawn";
 import { getConfigDir } from "./config.js";
 import { defaultProjectsDir, findTranscript } from "./transcript-usage.js";
 import { contextLimitForModel } from "./turns.js";
@@ -28,6 +28,8 @@ export interface ResumeRepairOptions {
   backupDir?: string;
   now?: Date;
   claudeVersion?: string;
+  /** What to run for `--version` when claudeVersion is not given (claude-locate.ts). */
+  claudeCommand?: string;
   /** Injectable process check; production refuses if any possible writer exists. */
   isQuiescent?: (file: string) => boolean;
 }
@@ -47,7 +49,7 @@ export function repairStrandedResume(
     const lines = original.toString("utf8").split("\n");
     if (!Buffer.from(lines.join("\n"), "utf8").equals(original)) return undefined;
     const plan = planUsageRepair(lines, options.nativeOneMillionContext,
-      options.claudeVersion ?? installedVersion(), resumeModelOverride(claudeArgs));
+      options.claudeVersion ?? installedVersion(options.claudeCommand), resumeModelOverride(claudeArgs));
     if (!plan) return undefined;
     for (const index of plan.lineIndexes) lines[index] = lowerUsage(lines[index], plan.loweredTokens);
     const backupPath = replaceQuiescentTranscript({
@@ -202,10 +204,12 @@ function lowerBuckets(usage: any, loweredTokens: number): void {
   }
 }
 
-function installedVersion(): string {
+/** cross-spawn, so npm's claude.cmd runs on Windows too. */
+function installedVersion(command = "claude"): string {
   try {
-    return execFileSync("claude", ["--version"], { encoding: "utf8", timeout: 1500,
-      stdio: ["ignore", "pipe", "ignore"] }).match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
+    const out = spawn.sync(command, ["--version"], { encoding: "utf8", timeout: 1500,
+      stdio: ["ignore", "pipe", "ignore"] }).stdout;
+    return String(out ?? "").match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
   } catch { return "unknown"; }
 }
 

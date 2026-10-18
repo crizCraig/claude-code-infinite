@@ -432,7 +432,7 @@ async function main() {
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
-    reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext);
+    reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
     // The first request after a resume must count the whole session's thinking.
     const resumedSession = resumeSessionId(claudeArgs);
     if (resumedSession !== undefined)
@@ -506,6 +506,9 @@ async function main() {
         if (shuttingDown)
             return;
         shuttingDown = true;
+        // Windows installs only now, first: the runner waits for this process to exit,
+        // so a second Ctrl+C or a crash during the drains below cannot skip it.
+        autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
         noticePlugin?.close();
         memtreeMcpConfig?.close();
         // Stop new proxy work and give active handlers a bounded chance to
@@ -519,8 +522,6 @@ async function main() {
         await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
         // Before the final flushes, so a late child exit's diagnostics event is sent.
         await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
-        // Windows installs only now: the runner waits for this process to exit.
-        autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
         await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
         process.exit(code);
     };
@@ -675,9 +676,9 @@ function recordAutoUpdateDecision(diagnostics, autoUpdate) {
  * would refuse every prompt; lower that record first (resume-repair.ts).
  * Never blocks the launch.
  */
-function reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext) {
+function reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claudeCommand) {
     try {
-        const repair = repairStrandedResume(claudeArgs, { nativeOneMillionContext });
+        const repair = repairStrandedResume(claudeArgs, { nativeOneMillionContext, claudeCommand });
         if (!repair)
             return;
         const k = (tokens) => `${Math.round(tokens / 1000)}k`;

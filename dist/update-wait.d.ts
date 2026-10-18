@@ -7,7 +7,7 @@
  * Node built-ins only, and loaded before cli-main.js: it must run while the
  * rest of the package may be mid-replacement (a failure to load it is ignored).
  */
-export declare const UPDATE_WAIT_MS = 30000;
+export declare const UPDATE_WAIT_MS = 120000;
 /** Entries older than this are not a just-started install (a stuck lock shows the hint instead). */
 export declare const FRESH_ENTRY_MS: number;
 export interface UpdateWaitOptions {

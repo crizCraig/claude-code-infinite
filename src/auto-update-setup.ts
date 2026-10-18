@@ -134,7 +134,7 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
     installOnExit(onResult) {
       if (windows) start(onResult);
     },
-    debugLine: debugLine(method, decision),
+    debugLine: debugLine(method, decision, windows),
   };
 }
 
@@ -152,10 +152,16 @@ function detectMethod(
   });
 }
 
-function debugLine(method: InstallMethod | null, decision: AutoUpdateDecision): string {
+function debugLine(
+  method: InstallMethod | null,
+  decision: AutoUpdateDecision,
+  windows: boolean
+): string {
   const how = method ? `install method ${method.kind} (${method.detail})` : "no update to install";
   const what =
-    decision.action === "install" ? `installing ${decision.version} in the background`
+    decision.action === "install"
+      ? (windows ? `installs ${decision.version} when ccc exits`
+        : `installing ${decision.version} in the background`)
     : decision.action === "installed" ? `${decision.version} already installed, restart to use it`
     : decision.code === "linked-install" ? "skipped: linked install"
     : `not installing: ${decision.reason}`;

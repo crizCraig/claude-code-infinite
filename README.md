@@ -448,8 +448,8 @@ at once; after an hour `ccc` shows the update line instead, and deleting
 In every other case it only shows the update line, with the command that fits the install:
 
 - `npm link`ed or git checkouts: a development copy is never touched, and the line says to
-  `git pull && npm run build` in the checkout (`npm i -g` would replace the link with the
-  published package),
+  `git pull && npm run build` in a git checkout, or to update and rebuild the linked folder
+  otherwise (`npm i -g` would replace the link with the published package),
 - `npx` and project-local installs,
 - pnpm, yarn, bun and Volta global installs (the line gives your tool's own command),
 - a global prefix that needs `sudo` to write, or `ccc` running as root,
@@ -459,7 +459,7 @@ In every other case it only shows the update line, with the command that fits th
 background installer waits for that `ccc` to be gone before npm runs, so npm does not
 rewrite files under the session that started it. The banner says so (`• ccc X is
 available … · installs when you exit ccc`). A `ccc` started while it installs says
-"Finishing a ccc update…" and waits for it (a few seconds, at most 30), then runs the new
+"Finishing a ccc update…" and waits for it (usually seconds, at most two minutes), then runs the new
 version. Closing the terminal window usually counts as exiting too. By hand:
 `npm i -g claude-code-infinite@latest`.
 

@@ -5,7 +5,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import spawn from "cross-spawn";
 import { getConfigDir } from "./config.js";
 import { defaultProjectsDir, findTranscript } from "./transcript-usage.js";
 import { contextLimitForModel } from "./turns.js";
@@ -29,7 +29,7 @@ export function repairStrandedResume(claudeArgs, options) {
         const lines = original.toString("utf8").split("\n");
         if (!Buffer.from(lines.join("\n"), "utf8").equals(original))
             return undefined;
-        const plan = planUsageRepair(lines, options.nativeOneMillionContext, options.claudeVersion ?? installedVersion(), resumeModelOverride(claudeArgs));
+        const plan = planUsageRepair(lines, options.nativeOneMillionContext, options.claudeVersion ?? installedVersion(options.claudeCommand), resumeModelOverride(claudeArgs));
         if (!plan)
             return undefined;
         for (const index of plan.lineIndexes)
@@ -183,10 +183,12 @@ function lowerBuckets(usage, loweredTokens) {
             usage.cache_creation[key] = 0;
     }
 }
-function installedVersion() {
+/** cross-spawn, so npm's claude.cmd runs on Windows too. */
+function installedVersion(command = "claude") {
     try {
-        return execFileSync("claude", ["--version"], { encoding: "utf8", timeout: 1500,
-            stdio: ["ignore", "pipe", "ignore"] }).match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
+        const out = spawn.sync(command, ["--version"], { encoding: "utf8", timeout: 1500,
+            stdio: ["ignore", "pipe", "ignore"] }).stdout;
+        return String(out ?? "").match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
     }
     catch {
         return "unknown";

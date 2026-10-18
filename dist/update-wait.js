@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-export const UPDATE_WAIT_MS = 30_000;
+export const UPDATE_WAIT_MS = 120_000;
 /** Entries older than this are not a just-started install (a stuck lock shows the hint instead). */
 export const FRESH_ENTRY_MS = 5 * 60_000;
 /** Resolves when no fresh live install holds the lock, or after waitMs. True if it waited. */

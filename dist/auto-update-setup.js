@@ -73,7 +73,7 @@ export function setupAutoUpdate(opts) {
             if (windows)
                 start(onResult);
         },
-        debugLine: debugLine(method, decision),
+        debugLine: debugLine(method, decision, windows),
     };
 }
 function detectMethod(opts, env, packageDir) {
@@ -85,9 +85,11 @@ function detectMethod(opts, env, packageDir) {
         scriptPath: opts.scriptPath,
     });
 }
-function debugLine(method, decision) {
+function debugLine(method, decision, windows) {
     const how = method ? `install method ${method.kind} (${method.detail})` : "no update to install";
-    const what = decision.action === "install" ? `installing ${decision.version} in the background`
+    const what = decision.action === "install"
+        ? (windows ? `installs ${decision.version} when ccc exits`
+            : `installing ${decision.version} in the background`)
         : decision.action === "installed" ? `${decision.version} already installed, restart to use it`
             : decision.code === "linked-install" ? "skipped: linked install"
                 : `not installing: ${decision.reason}`;

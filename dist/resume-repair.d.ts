@@ -13,6 +13,8 @@ export interface ResumeRepairOptions {
     backupDir?: string;
     now?: Date;
     claudeVersion?: string;
+    /** What to run for `--version` when claudeVersion is not given (claude-locate.ts). */
+    claudeCommand?: string;
     /** Injectable process check; production refuses if any possible writer exists. */
     isQuiescent?: (file: string) => boolean;
 }
