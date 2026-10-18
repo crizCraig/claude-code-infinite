@@ -20,10 +20,11 @@
  * says that version. Any failure is recorded with a short reason.
  *
  * Windows (waitForPid): the runner first waits for the ccc that started it to
- * exit, so npm never rewrites a `ccc.cmd` that a running cmd.exe has open; npm
+ * exit, so npm does not rewrite files under that session; npm
  * runs as `node npm-cli.js` (npmArgs), and its "group" is npm's own pid,
  * stopped with `taskkill /T /F` (its whole process tree) instead of signals
- * to a POSIX process group.
+ * to a POSIX process group. Unlike a POSIX group, a descendant that outlives
+ * npm is not tracked there (ccc and its dependency have no install scripts).
  *
  * Bounded: each npm command runs in its own process group, recorded in the
  * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,

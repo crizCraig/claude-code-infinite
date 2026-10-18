@@ -64,6 +64,9 @@ test("config: provider env flags, then API key env, then apiKeyHelper, then the 
   assert.equal(auth({}, { "/work/app/.claude/settings.local.json": helper }), "api_key");
   assert.equal(auth({}, { [`${HOME}/.claude.json`]: GLOBAL_CONFIG }), "subscription");
   assert.equal(auth({}, { [`${HOME}/.claude.json`]: '{"primaryApiKey": "sk-ant-api03-x"}' }), "api_key");
+  const consoleLogin = GLOBAL_CONFIG.replace('"numStartups":12', '"primaryApiKey":"sk-ant-api03-x","numStartups":12');
+  assert.equal(auth({}, { [`${HOME}/.claude.json`]: consoleLogin }), "api_key",
+    "a Console login records oauthAccount too: its key decides");
   assert.equal(auth({ CLAUDE_CONFIG_DIR: "/cfg" }, { "/cfg/.claude.json": GLOBAL_CONFIG }), "subscription");
   assert.equal(auth({}, { [`${HOME}/.claude.json`]: "not json {" }), "unknown");
   assert.equal(auth({}), "unknown");
@@ -129,6 +132,9 @@ test("the tee: auth type and window from requests, the credit error as a code, c
                 claudeAuth: "api_key", contextWindow: 200_000, upstreamError: CREDIT_BALANCE_TOO_LOW };
   sink.log(rec);
   sink.log(rec);
+  // A gateway bearer (unknown shape) does not overwrite a known type.
+  sink.log({ kind: "messages", turnType: "tool", requestBytes: 10, upstreamStatus: 200,
+             claudeAuth: "unknown" });
   await diagnostics.flush(1000);
   const body = sent[0];
   assert.equal(body.context.claude_auth, "api_key");

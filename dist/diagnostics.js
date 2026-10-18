@@ -219,8 +219,9 @@ export class DiagnosticsRequestSink {
         if (ccVersion)
             this.diagnostics.setContext({ cc_version: ccVersion });
         // The request's own auth header beats the startup guess from config.
-        if (rec.claudeAuth)
+        if (rec.claudeAuth && rec.claudeAuth !== "unknown") {
             this.diagnostics.setContext({ claude_auth: rec.claudeAuth });
+        }
         if (rec.contextWindow) {
             this.diagnostics.setContext({ context_window_k: Math.round(rec.contextWindow / 1000) });
         }

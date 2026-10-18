@@ -8,6 +8,8 @@ import { spawn } from "node:child_process";
 import { AUTO_UPDATE_DELAY_MS, AutoUpdateNotices, PACKAGE_DIR, detectInstallMethod, isLinkedInstall, manualUpdateCommand, liveLockSince, planAutoUpdate, readInstalledVersion, readUpdateState, startAutoUpdateInstall, updateFiles, } from "./auto-update.js";
 import { updateInstalledNoticeText, updateNoticeText } from "./notices.js";
 import { UPGRADE_COMMAND } from "./update-check.js";
+/** The banner's ending for a Windows update that installs as ccc exits. */
+export const WINDOWS_ON_EXIT_TEXT = "installs when you exit ccc";
 export function setupAutoUpdate(opts) {
     const env = opts.env ?? process.env;
     const packageDir = opts.packageDir ?? PACKAGE_DIR;
@@ -30,6 +32,10 @@ export function setupAutoUpdate(opts) {
     const windows = platform === "win32";
     const command = method ? manualUpdateCommand(method.kind) : undefined;
     const withCommand = (update) => command && command !== UPGRADE_COMMAND ? { ...update, command } : update;
+    // Windows installs as ccc exits: say so now, since nothing installs during the session.
+    const onExitBanner = windows && decision.action === "install" && opts.update
+        ? { ...opts.update, command: WINDOWS_ON_EXIT_TEXT }
+        : null;
     let started = false;
     const start = (onResult) => {
         if (decision.action !== "install" || started)
@@ -55,7 +61,7 @@ export function setupAutoUpdate(opts) {
     return {
         decision,
         method,
-        bannerUpdate: decision.action === "skip" && opts.update ? withCommand(opts.update) : null,
+        bannerUpdate: decision.action === "skip" && opts.update ? withCommand(opts.update) : onExitBanner,
         bannerInstalled: decision.action === "installed" ? decision.version : null,
         notices,
         scheduleInstall(delayMs = AUTO_UPDATE_DELAY_MS, onResult) {

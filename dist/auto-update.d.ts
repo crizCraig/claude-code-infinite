@@ -13,9 +13,11 @@
  * (auto-update-runner.ts) that loads no file from the package, so it survives
  * this ccc exiting and npm replacing the package under it.
  *
- * Windows: the runner starts only as ccc exits and waits for this process to
- * be gone before npm runs, so npm never replaces the `ccc.cmd` shim that the
- * session's cmd.exe still has open. npm is run as `node npm-cli.js` (no
+ * Windows: the runner starts only as ccc exits (also when the window is
+ * closed) and waits for this process to be gone before npm runs, so npm does
+ * not rewrite files under the session that started it (other running
+ * sessions are as on POSIX: they already loaded their code; the shim npm
+ * rewrites is identical between versions). npm is run as `node npm-cli.js` (no
  * shell: Node refuses to spawn a .cmd without one), and the runner kills
  * npm's process tree with taskkill instead of a POSIX process group.
  *
@@ -200,7 +202,7 @@ export declare class AutoUpdateNotices {
  * first time a launch sees it finished, then null (marked reported in the
  * state file). For diagnostics, which the detached runner cannot send.
  */
-export declare function takeUnreportedOutcome(stateFile: string): "ok" | "failed" | null;
+export declare function takeUnreportedOutcome(stateFile: string, lockDir?: string, now?: number): "ok" | "failed" | null;
 /** The version in `<packageDir>/package.json`, or null. */
 export declare function readInstalledVersion(packageDir: string): string | null;
 export declare function updateFiles(configDir: string): UpdateFiles;

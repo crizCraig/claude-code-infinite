@@ -13,9 +13,11 @@
  * (auto-update-runner.ts) that loads no file from the package, so it survives
  * this ccc exiting and npm replacing the package under it.
  *
- * Windows: the runner starts only as ccc exits and waits for this process to
- * be gone before npm runs, so npm never replaces the `ccc.cmd` shim that the
- * session's cmd.exe still has open. npm is run as `node npm-cli.js` (no
+ * Windows: the runner starts only as ccc exits (also when the window is
+ * closed) and waits for this process to be gone before npm runs, so npm does
+ * not rewrite files under the session that started it (other running
+ * sessions are as on POSIX: they already loaded their code; the shim npm
+ * rewrites is identical between versions). npm is run as `node npm-cli.js` (no
  * shell: Node refuses to spawn a .cmd without one), and the runner kills
  * npm's process tree with taskkill instead of a POSIX process group.
  *
@@ -230,8 +232,11 @@ export function detectInstallMethod(opts: DetectInstallOptions): InstallMethod {
   }
   const real = realpathOrNull(raw);
   if (real === null) return method("unknown", raw, "package directory not found");
+  // pnpm (and others) also reach the package through a symlinked entry: theirs, not a link.
   const link = opts.scriptPath ? linkedPackageEntry(opts.scriptPath) : null;
-  if (link) return method("npm-link", real, `${link} is a symlink (npm link)`);
+  if (link && !otherPackageManager(real, env)) {
+    return method("npm-link", real, `${link} is a symlink (npm link)`);
+  }
   return classifyPackageDir(real, env, platform);
 }
 
@@ -382,7 +387,13 @@ export class AutoUpdateNotices {
  * first time a launch sees it finished, then null (marked reported in the
  * state file). For diagnostics, which the detached runner cannot send.
  */
-export function takeUnreportedOutcome(stateFile: string): "ok" | "failed" | null {
+export function takeUnreportedOutcome(
+  stateFile: string,
+  lockDir?: string,
+  now: number = Date.now()
+): "ok" | "failed" | null {
+  // An installer holding the lock may write the state file: leave it alone until it is done.
+  if (lockDir !== undefined && liveLockSince(lockDir, now) !== null) return null;
   const state = readUpdateState(stateFile);
   const last = state.last;
   if (!last || last.status === "running" || last.reported) return null;
@@ -457,7 +468,7 @@ function classifyPackageDir(
   }
   const prefix = windows ? path.dirname(parent) : path.dirname(path.dirname(parent));
   const bin = windows ? prefix : path.join(prefix, "bin");
-  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), bin]);
+  const unwritable = firstUnwritable([parent, real, path.join(real, "dist"), bin], windows);
   if (unwritable) return method("not-writable", real, `${unwritable} is not writable without sudo`);
   return { kind: "npm-global", packageDir: real, detail: `npm prefix ${prefix}`, npmRoot: parent, prefix };
 }
@@ -505,10 +516,20 @@ export function linkedPackageEntry(scriptPath: string): string | null {
   return null;
 }
 
-function firstUnwritable(dirs: string[]): string | null {
+/**
+ * The first directory this user cannot write. On Windows access(W_OK) ignores
+ * ACLs (C:\Program Files passes), so a file is actually created and removed.
+ */
+function firstUnwritable(dirs: string[], windows = false): string | null {
   for (const dir of dirs) {
     try {
-      fs.accessSync(dir, fs.constants.W_OK);
+      if (windows) {
+        const probe = path.join(dir, `.ccc-write-probe-${process.pid}-${randomUUID()}`);
+        fs.writeFileSync(probe, "");
+        fs.rmSync(probe, { force: true });
+      } else {
+        fs.accessSync(dir, fs.constants.W_OK);
+      }
     } catch {
       return dir;
     }
@@ -576,7 +597,8 @@ function spawnFailed(
 ): void {
   const state = readUpdateState(files.stateFile);
   const error = `could not start the installer: ${String(err).slice(0, 200)}`;
-  state.last = { version, status: "failed", at: Date.now(), packageDir, error };
+  // The launch reports this itself (auto_update spawn-failed): not again on the next one.
+  state.last = { version, status: "failed", at: Date.now(), packageDir, error, reported: true };
   writeUpdateState(files.stateFile, state);
   releaseUpdateLock(files.lockDir, token);
 }
@@ -659,7 +681,10 @@ function npmCommand(opts: StartInstallOptions): { npm: string; npmArgs?: string[
 function windowsNpmCli(execPath: string, env: NodeJS.ProcessEnv): string | null {
   const cliIn = (dir: string) => path.join(dir, "node_modules", "npm", "bin", "npm-cli.js");
   const pathValue = Object.entries(env).find(([k]) => k.toUpperCase() === "PATH")?.[1] ?? "";
-  const dirs = [path.dirname(execPath), ...pathValue.split(";").filter(Boolean)];
+  const dirs = [
+    path.dirname(execPath),
+    ...pathValue.split(";").map((d) => d.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean),
+  ];
   for (const dir of dirs) {
     if (dir !== path.dirname(execPath) && !fs.existsSync(path.join(dir, "npm.cmd"))) continue;
     if (fs.existsSync(cliIn(dir))) return cliIn(dir);

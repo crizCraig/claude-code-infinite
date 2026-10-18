@@ -665,6 +665,14 @@ async function main() {
   });
   process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
   process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+  if (process.platform === "win32") {
+    // Closing the console window (SIGHUP) gives ccc a few seconds: start the
+    // update first, since the drains in shutdown may not finish in time.
+    process.on("SIGHUP", () => {
+      autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
+      handleShutdownSignal("SIGTERM");
+    });
+  }
 
   // The background install starts once Claude Code is up; it outlives this
   // process if the session ends first.
@@ -755,7 +763,8 @@ function recordAutoUpdateDecision(diagnostics: Diagnostics, autoUpdate: AutoUpda
     diagnostics.record("auto_update", { result: "installed" });
   }
   if (!autoUpdate || !diagnostics.enabled) return;
-  const outcome = takeUnreportedOutcome(updateFiles(getConfigDir()).stateFile);
+  const files = updateFiles(getConfigDir());
+  const outcome = takeUnreportedOutcome(files.stateFile, files.lockDir);
   if (outcome) diagnostics.record("auto_update", { result: outcome });
 }
 

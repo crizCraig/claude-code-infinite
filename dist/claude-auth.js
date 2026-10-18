@@ -126,10 +126,11 @@ function hasApiKeyHelper(text) {
 function authFromGlobalConfig(text) {
     if (text === null)
         return "unknown";
-    if (/"oauthAccount"\s*:\s*\{/.test(text))
-        return "subscription";
+    // A Console (API billing) login stores a key and may also record oauthAccount.
     if (/"primaryApiKey"\s*:\s*"[^"]/.test(text))
         return "api_key";
+    if (/"oauthAccount"\s*:\s*\{/.test(text))
+        return "subscription";
     return "unknown";
 }
 /** "claude_max" + "default_claude_max_20x" → "max_20x"; "pro" → "pro". */

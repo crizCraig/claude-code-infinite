@@ -57,9 +57,7 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
   if (onPath) return { command: "claude", source: "path" };
   const home = opts.homedir ?? os.homedir();
   for (const candidate of candidates(platform, env, home, opts)) {
-    const file = candidate.dirs.length
-      ? findOnPath("claude", candidate.dirs, platform, env, isExecutable)
-      : null;
+    const file = findOnPath("claude", candidate.dirs, platform, env, isExecutable);
     if (file) return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
   }
   return null;
@@ -89,7 +87,7 @@ export function claudeMissingText(platform: NodeJS.Platform = process.platform):
   return [
     "Claude Code isn't installed. ccc runs Claude Code, so install it first:",
     install,
-    "then run `claude` once to sign in, and run ccc again.",
+    "then open a new terminal, run `claude` once to sign in, and run ccc again.",
   ].join("\n");
 }
 
@@ -157,14 +155,18 @@ function windowsCandidates(
   const appData = envValue(env, "APPDATA") || w.join(profile, "AppData", "Roaming");
   const localAppData = envValue(env, "LOCALAPPDATA") || w.join(profile, "AppData", "Local");
   const winget = w.join(localAppData, "Microsoft", "WinGet");
-  const registry = (opts.registryPath ?? readRegistryPath)()
-    .flatMap((value) => splitPath(expandWindowsVars(value, env), "win32"));
+  // The installers' own folders first (cheap stats); the registry (two spawns) last.
   return [
-    { source: "registry-path", dirs: registry },
     { source: "native", dirs: [w.join(profile, ".local", "bin")] },
     { source: "npm", dirs: [w.join(appData, "npm")] },
     { source: "winget", dirs: [w.join(winget, "Links"), ...wingetPackageDirs(winget, opts)] },
+    { source: "registry-path", get dirs() { return registryDirs(env, opts); } },
   ];
+}
+
+function registryDirs(env: NodeJS.ProcessEnv, opts: LocateClaudeOptions): string[] {
+  return (opts.registryPath ?? (() => readRegistryPath(env)))()
+    .flatMap((value) => splitPath(expandWindowsVars(value, env), "win32"));
 }
 
 /** winget's own folders for Claude Code (Anthropic.ClaudeCode_<source hash>). */
@@ -230,7 +232,10 @@ export function parseRegQueryPath(output: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-function readRegistryPath(): string[] {
+function readRegistryPath(env: NodeJS.ProcessEnv): string[] {
+  // By full path: PATH is what may be broken here.
+  const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
+  const reg = path.win32.join(root, "System32", "reg.exe");
   const keys = [
     "HKCU\\Environment",
     "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
@@ -238,7 +243,7 @@ function readRegistryPath(): string[] {
   const out: string[] = [];
   for (const key of keys) {
     try {
-      const result = spawnSync("reg", ["query", key, "/v", "Path"], {
+      const result = spawnSync(reg, ["query", key, "/v", "Path"], {
         encoding: "utf8", timeout: 2000, windowsHide: true,
       });
       const value = result.status === 0 ? parseRegQueryPath(result.stdout ?? "") : null;

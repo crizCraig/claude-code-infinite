@@ -129,6 +129,19 @@ test("Windows: a junctioned package entry (npm link) is seen through the script 
   assert.equal(m.kind, "npm-link");
 });
 
+test("pnpm's symlinked package entry is pnpm, not an npm link", () => {
+  const root = tmpdir();
+  const store = makePackage(path.join(root, "pnpm", "global", "5", "node_modules", ".pnpm",
+    `${PKG}@1.0.22`, "node_modules", PKG));
+  const entry = path.join(root, "pnpm", "global", "5", "node_modules", PKG);
+  linkDir(store, entry);
+  const script = path.join(entry, "dist", "cli.js");
+  assert.equal(linkedPackageEntry(script), entry, "the entry is a symlink");
+  const m = detectInstallMethod({ packageDir: store, scriptPath: script, platform: "darwin", uid: 501 });
+  assert.equal(m.kind, "pnpm");
+  assert.equal(manualUpdateCommand(m.kind), `pnpm add -g ${PKG}@latest`);
+});
+
 test("a plain global install's script path is not a link", () => {
   const prefix = path.join(tmpdir(), "prefix");
   const entry = makePackage(path.join(prefix, "lib", "node_modules", PKG));
@@ -175,7 +188,14 @@ test("the last background install's result is reported once", () => {
   assert.equal(takeUnreportedOutcome(stateFile), null, "only once");
   assert.equal(readUpdateState(stateFile).attempts["1.0.24"], 1, "bookkeeping kept");
   writeUpdateState(stateFile, { attempts: {}, last: { ...last, status: "failed", error: "x" } });
-  assert.equal(takeUnreportedOutcome(stateFile), "failed");
+  // While an installer holds the lock it may be writing the state file: wait.
+  const { lockDir } = updateFiles(path.dirname(stateFile));
+  fs.mkdirSync(lockDir, { recursive: true });
+  const entry = path.join(lockDir, "live.json");
+  fs.writeFileSync(entry, JSON.stringify({ token: "live", startedAt: Date.now(), pid: process.pid }));
+  assert.equal(takeUnreportedOutcome(stateFile, lockDir), null, "lock held");
+  fs.rmSync(entry);
+  assert.equal(takeUnreportedOutcome(stateFile, lockDir), "failed");
   assert.equal(takeUnreportedOutcome(stateFile), null);
 });
 
@@ -246,6 +266,7 @@ test("Windows: without npm-cli.js nothing runs; the attempt is a recorded failur
   assert.equal(result, "spawn-failed");
   assert.equal(calls.length, 0);
   assert.equal(readUpdateState(files.stateFile).last.status, "failed");
+  assert.equal(takeUnreportedOutcome(files.stateFile), null, "this launch reported it already");
   assert.deepEqual(fs.readdirSync(files.lockDir).filter((n) => n.endsWith(".json")), []);
 });
 
@@ -254,7 +275,9 @@ test("Windows: setup installs only on exit, once, waiting for this ccc's pid", (
   const { spawnImpl, calls } = mockSpawn();
   const s = setup(g.packageDir, { platform: "win32", uid: undefined, spawnImpl, pid: 999 });
   assert.equal(s.decision.action, "install", s.debugLine);
-  assert.equal(s.bannerUpdate, null, "an install is coming: no hint");
+  assert.deepEqual(s.bannerUpdate, { ...UPDATE, command: "installs when you exit ccc" },
+    "nothing installs during the session: the banner says when it will");
+  assert.match(updateNoticeText(s.bannerUpdate, false), /1\.0\.24 is available .* installs when you exit ccc$/);
   s.scheduleInstall(0);
   assert.equal(calls.length, 0, "never while ccc runs");
   const results = [];

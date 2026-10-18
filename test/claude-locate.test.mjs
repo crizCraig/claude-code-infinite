@@ -82,6 +82,18 @@ test("Windows: installed since this terminal opened: the registry PATH has it", 
   assert.deepEqual(found, { command: custom, source: "registry-path", dir: "D:\\tools\\claude" });
 });
 
+test("Windows: the registry is read only when no installer folder has claude", () => {
+  let reads = 0;
+  const registryPath = () => { reads += 1; return ["D:\\tools"]; };
+  const exe = "C:\\Users\\ada\\.local\\bin\\claude.exe";
+  assert.equal(locateWin([exe, "D:\\tools\\claude.exe"], { registryPath }).source, "native");
+  assert.equal(reads, 0, "two reg.exe spawns saved");
+  assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude.cmd"], { registryPath }).source, "path");
+  assert.equal(reads, 0);
+  assert.equal(locateWin([], { registryPath }), null);
+  assert.equal(reads, 1);
+});
+
 test("reg query output and %VAR% expansion", () => {
   const out = "\r\nHKEY_CURRENT_USER\\Environment\r\n    Path    REG_EXPAND_SZ    " +
     "%USERPROFILE%\\.local\\bin;C:\\x\r\n\r\n";
@@ -105,7 +117,7 @@ test("macOS/Linux: the native installer, the legacy local install and Homebrew o
 test("not installed: the official install command for the OS, and the sign-in step", () => {
   const win = claudeMissingText("win32");
   assert.match(win, /irm https:\/\/claude\.ai\/install\.ps1 \| iex/);
-  assert.match(win, /then run `claude` once to sign in/);
+  assert.match(win, /open a new terminal, run `claude` once to sign in/);
   assert.match(claudeMissingText("darwin"), /curl -fsSL https:\/\/claude\.ai\/install\.sh \| bash/);
 });
 

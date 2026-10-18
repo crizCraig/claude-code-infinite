@@ -141,8 +141,9 @@ function hasApiKeyHelper(text: string | null): boolean {
  */
 function authFromGlobalConfig(text: string | null): ClaudeAuthType {
   if (text === null) return "unknown";
-  if (/"oauthAccount"\s*:\s*\{/.test(text)) return "subscription";
+  // A Console (API billing) login stores a key and may also record oauthAccount.
   if (/"primaryApiKey"\s*:\s*"[^"]/.test(text)) return "api_key";
+  if (/"oauthAccount"\s*:\s*\{/.test(text)) return "subscription";
   return "unknown";
 }
 

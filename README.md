@@ -203,7 +203,7 @@ Claude Code ──▶ localhost proxy (ccc)
 - versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
   architecture, terminal type and locale;
 - how Claude Code is signed in, as a type only (Claude.ai subscription, API key, Bedrock,
-  Vertex), the plan's tier name when Claude Code records one (Pro, Max, Team), the main
+  Vertex, Foundry), the plan's tier name when Claude Code records one (Pro, Max, Team), the main
   model's context window ccc uses (200k or 1M), and where Claude Code was found (on PATH,
   its installer's folder, npm, winget);
 - lifecycle events (first run, sign-in prompt shown, key accepted or rejected, session start,
@@ -383,7 +383,8 @@ PATH and, failing that, where its installers put it (`%USERPROFILE%\.local\bin`,
 `~/.claude/local` and Homebrew elsewhere), so a terminal opened before the install works
 too. If it is not there, install it with the official command (Windows PowerShell:
 `irm https://claude.ai/install.ps1 | iex`; macOS/Linux:
-`curl -fsSL https://claude.ai/install.sh | bash`), run `claude` once to sign in, then run
+`curl -fsSL https://claude.ai/install.sh | bash`), open a new terminal, run `claude` once
+to sign in, then run
 `ccc` again, from your project folder.
 
 ### "This API key has no credit"
@@ -455,10 +456,10 @@ In every other case it only shows the update line, with the command that fits th
 - print (`-p`) and non-TTY runs, which never install anything.
 
 **Windows.** The install starts as `ccc` exits rather than during the session: the
-background installer waits for that `ccc` to be gone before npm runs, so npm never
-rewrites the `ccc.cmd` that the session's terminal is still running. The next `ccc` you
-start runs the new version. Quitting by closing the terminal window skips that
-session's install; the next session that exits normally does it. By hand:
+background installer waits for that `ccc` to be gone before npm runs, so npm does not
+rewrite files under the session that started it. The banner says so (`• ccc X is
+available … · installs when you exit ccc`), and the next `ccc` you start runs the new
+version. Closing the terminal window counts as exiting. By hand:
 `npm i -g claude-code-infinite@latest`.
 
 `ccc --debug` prints which install method was detected and what it decided.

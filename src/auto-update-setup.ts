@@ -70,6 +70,9 @@ export interface AutoUpdateSetup {
   debugLine: string;
 }
 
+/** The banner's ending for a Windows update that installs as ccc exits. */
+export const WINDOWS_ON_EXIT_TEXT = "installs when you exit ccc";
+
 export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
   const env = opts.env ?? process.env;
   const packageDir = opts.packageDir ?? PACKAGE_DIR;
@@ -93,6 +96,10 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
   const command = method ? manualUpdateCommand(method.kind) : undefined;
   const withCommand = (update: UpdateAvailable): UpdateAvailable =>
     command && command !== UPGRADE_COMMAND ? { ...update, command } : update;
+  // Windows installs as ccc exits: say so now, since nothing installs during the session.
+  const onExitBanner = windows && decision.action === "install" && opts.update
+    ? { ...opts.update, command: WINDOWS_ON_EXIT_TEXT }
+    : null;
   let started = false;
   const start = (onResult?: (result: StartInstallResult) => void) => {
     if (decision.action !== "install" || started) return;
@@ -116,7 +123,7 @@ export function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup {
   return {
     decision,
     method,
-    bannerUpdate: decision.action === "skip" && opts.update ? withCommand(opts.update) : null,
+    bannerUpdate: decision.action === "skip" && opts.update ? withCommand(opts.update) : onExitBanner,
     bannerInstalled: decision.action === "installed" ? decision.version : null,
     notices,
     scheduleInstall(delayMs = AUTO_UPDATE_DELAY_MS, onResult) {

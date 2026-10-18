@@ -46,5 +46,7 @@ export interface AutoUpdateSetup {
     /** One line naming the install method and the decision, for --debug. */
     debugLine: string;
 }
+/** The banner's ending for a Windows update that installs as ccc exits. */
+export declare const WINDOWS_ON_EXIT_TEXT = "installs when you exit ccc";
 export declare function setupAutoUpdate(opts: AutoUpdateSetupOptions): AutoUpdateSetup;
 //# sourceMappingURL=auto-update-setup.d.ts.map
