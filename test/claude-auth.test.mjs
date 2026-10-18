@@ -39,8 +39,12 @@ const GLOBAL_CONFIG = JSON.stringify({
   },
 });
 
+/** Fake files by POSIX-style path; Windows' path.join output is compared with / too. */
 function files(map) {
-  return (file) => (Object.prototype.hasOwnProperty.call(map, file) ? map[file] : null);
+  return (file) => {
+    const key = file.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "");
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+  };
 }
 
 function auth(env, map = {}) {
