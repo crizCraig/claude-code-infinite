@@ -2,8 +2,15 @@
  * Environment for the Claude Code child process.
  *
  * MemTree replaces Claude Code's built-in automatic compaction, so ccc disables
- * only auto-compaction by default. Manual `/compact` remains available because
- * Claude Code controls it with a separate setting.
+ * automatic compaction (threshold and idle) by default. Manual `/compact`
+ * remains available because Claude Code controls it with a separate setting.
+ *
+ * DISABLE_AUTO_COMPACT also turns off idle compaction (2.1.286+: "Compacted
+ * while idle, before the prompt cache expired"), the remote-only sleep
+ * compactor and cold compaction: all check the same auto-compact switch first
+ * (idle and sleep skip with `compaction_off`; 2.1.303, read from the binary;
+ * the settings reference documents it under `idleCompaction`). No separate
+ * `idleCompaction` setting is needed, so ccc never passes --settings for it.
  *
  * Claude Code normally treats a custom ANTHROPIC_BASE_URL as a third-party
  * gateway. That suppresses native model capabilities it cannot verify through
@@ -28,8 +35,8 @@
  * its own bounded retry/400. A value the user already exported is kept.
  *
  * `CCC_AUTO_COMPACT=1` is an escape hatch: remove ccc's override and let the
- * user's native Claude Code setting decide whether auto-compaction is enabled
- * (Claude Code's own limits then apply unchanged).
+ * user's native Claude Code settings decide whether auto-compaction and idle
+ * compaction are enabled (Claude Code's own limits then apply unchanged).
  */
 /** Claude Code's local refusal limit under ccc: effectively never reached. */
 export const UNREACHABLE_BLOCKING_LIMIT = "1000000000";

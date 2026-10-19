@@ -136,7 +136,7 @@ Environment variables, set when launching `ccc`:
 | `CCC_COMPACT_TARGET=500k` | Compaction target for every session (useful for headless `-p` runs); `off` starts every session with compaction off. |
 | `CCC_MEMTREE_MCP=0` | Turns off the `memtree` MCP tools ([details](#memory-tools)), in interactive and headless (`-p`) runs. |
 | `CCC_MEMTREE_LINK` | Where the MemTree link appears: `turn` (default, end of a turn with a new page), `message` (under every reply), `stop` (end of every turn), `success` (only after an optimized turn), or `off`. |
-| `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction setting ([details](#claude-code-auto-compaction)). |
+| `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction and idle compaction settings ([details](#claude-code-auto-compaction)). |
 | `CCC_NO_UPDATE_CHECK=1` | Turns off the update check, and with it automatic updates ([details](#upgrading)). |
 | `CCC_DISABLE_AUTOUPDATE=1` | Keeps the update notice but never installs ([details](#automatic-updates)). |
 | `CCC_NO_DIAGNOSTICS=1` | Turns off diagnostics ([details](#diagnostics)). So do `DO_NOT_TRACK=1`, Claude Code's `DISABLE_TELEMETRY=1` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and `"diagnostics": false` in `~/.claude-code-infinite/config.json`. |
@@ -147,6 +147,12 @@ kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
 ## Claude Code auto-compaction
 
 `ccc` disables Claude Code's automatic conversation compaction for the Claude process it launches. MemTree manages the context sent to the model, so letting Claude Code independently summarize the full local transcript can compact a conversation MemTree already reduced. Manual `/compact` remains available.
+
+That includes idle compaction (Claude Code 2.1.286 and later), which summarizes a
+long conversation while you're away, just before the prompt cache expires
+("Compacted while idle, before the prompt cache expired"). The
+`DISABLE_AUTO_COMPACT=1` that `ccc` sets turns it off too, so you don't need
+`"idleCompaction": false` in your settings.
 
 Claude Code 2.1.219 also recommends “Resume from summary” for any old session
 above a fixed 100k-token threshold, even when the active model has a 1M window
@@ -168,7 +174,8 @@ On `ccc --resume <id>`, `ccc` backs the transcript up to
 recorded usage to half the window, so the next message is sent and MemTree
 compresses it.
 
-To restore Claude Code's native auto-compaction setting for one invocation, use:
+To restore Claude Code's native auto-compaction and idle compaction settings for one
+invocation, use:
 
 ```bash
 CCC_AUTO_COMPACT=1 ccc

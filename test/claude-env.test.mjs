@@ -28,6 +28,17 @@ test("ccc disables Claude Code auto-compaction without mutating the parent env",
   assert.equal(child.CCC_AUTO_COMPACT, undefined);
 });
 
+test("the child gets DISABLE_AUTO_COMPACT=1 by default (which also gates idle compaction)", () => {
+  // Claude Code's idle compaction (2.1.286+) skips with `compaction_off` when
+  // DISABLE_AUTO_COMPACT is set, so this env var is ccc's only switch for it.
+  // Claude Code treats an empty value as unset, so ccc must overwrite it.
+  for (const parent of [{}, { DISABLE_AUTO_COMPACT: "0" }, { DISABLE_AUTO_COMPACT: "" }]) {
+    const child = claudeChildEnv(parent, "http://127.0.0.1:1234");
+    assert.equal(child.DISABLE_AUTO_COMPACT, "1", JSON.stringify(parent));
+    assert.equal(child.DISABLE_COMPACT, undefined, "manual /compact remains available");
+  }
+});
+
 test("CCC_AUTO_COMPACT=1 restores Claude Code's native auto-compact setting", () => {
   const child = claudeChildEnv(
     {
