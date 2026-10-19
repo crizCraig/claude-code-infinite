@@ -2,6 +2,10 @@
   <img width="470" height="214" alt="cc-inf-wide-transparent" src="https://github.com/user-attachments/assets/1524e5dc-637f-4d25-9a15-f7f7b65c8182" />
 </p>
 
+<p align="center">
+  <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind: MemTree 69% at 39M tokens per run, full context 69% at 113M, /compact 49% at 17M" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
+</p>
+
 # Claude Code Infinite
 
 Memory for long-running agents. Claude Code Infinite indexes your Claude Code sessions with
@@ -31,13 +35,6 @@ orchestrate dozens of subagents on your behalf.
 
 > [!IMPORTANT]
 > Requires a Claude Pro or Max subscription.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-dark.svg">
-    <img width="600" alt="Long-session benchmark, judged score out of 100: Claude Code Infinite 69, full context 69, /compact 49" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-light.svg">
-  </picture>
-</p>
 
 ## Search across sessions
 
