@@ -2968,8 +2968,7 @@ test(`a short session's first tree is announced once on Stop, first ever with a 
     assert.equal(
       stripAnsi(stop),
       `🌿 First MemTree ready · a searchable map of this session so far\n  ${PAGE_URL_1} ↗\n` +
-        "  Open it, or paste the link to any agent to give it this session's context\n" +
-        `  What your agent did so far:\n  ${PAGE_URL_1}/report ↗`
+        "  Open it, or paste the link to any agent to give it this session's context"
     );
     if (color) assert.match(stop, /^\x1b\[1m\x1b\[32m🌿 First MemTree ready/, "bold green, unlike the routine link");
     else assert.equal(stop, stripAnsi(stop));

@@ -12,7 +12,6 @@ import {
   supportsMessageDisplay,
   terminalSupportsColor,
   withSessionNoticePluginArgs,
-  memtreeReportUrl,
 } from "../dist/hooks.js";
 
 const display = (overrides = {}) => ({
@@ -640,10 +639,9 @@ for (const color of [true, false]) {
     queue.setFirstTreeIntro(intro);
     queue.setTrailer(() => ({ key: "tree-1", link: "https://x/m/1" }), "turn");
     const hint = dim("Open it, or paste the link to any agent to give it this session's context");
-    const report = `  ${dim("What your agent did so far:")}\n  https://x/m/1/report ↗`;
     const output = queue.claim(stop()).systemMessage;
-    assert.equal(output, `${firstTree("https://x/m/1")}\n  ${hint}\n${report}`);
-    assert.ok(output.split("\n").length <= 5, "title, URL, hint, report label, report URL");
+    assert.equal(output, `${firstTree("https://x/m/1")}\n  ${hint}`);
+    assert.ok(output.split("\n").length <= 3, "title, URL, hint");
     assert.ok(!color || output === unlink(output));
     if (!color) assert.ok(!output.includes("\x1b"), "NO_COLOR has no ANSI");
   });
@@ -659,10 +657,9 @@ for (const color of [true, false]) {
       if (placement === "turn") queue.setTrailer(resolve, placement);
       queue.queuePrefix("✓ MemTree · conversation optimized");
       const hint = dim("Open it, or paste the link to any agent to give it this session's context");
-      const report = `  ${dim("What your agent did so far:")}\n  https://x/m/1/report ↗`;
       assert.equal(
         queue.claim(stop()).systemMessage,
-        `${green("✓ MemTree · conversation optimized")}\n${firstTree("https://x/m/1")}\n  ${hint}\n${report}`,
+        `${green("✓ MemTree · conversation optimized")}\n${firstTree("https://x/m/1")}\n  ${hint}`,
         placement
       );
       assert.deepEqual(intro.shown, ["session-1"], placement);
@@ -721,23 +718,17 @@ test("a throwing first-tree intro still shows the notice, without the first-ever
   );
 });
 
-test("the report link is offered only for a MemTree page URL", () => {
-  assert.equal(memtreeReportUrl("https://memtree.dev/m/abc123-s"), "https://memtree.dev/m/abc123-s/report");
-  assert.equal(
-    memtreeReportUrl("http://localhost:8000/usage/memtree/0b7c-v1-own?share=t#x"),
-    "http://localhost:8000/usage/memtree/0b7c-v1-own/report"
-  );
-  for (const bad of ["https://x/usage", "https://x/m/a/b", "not a url", "https://x/m/", "https://x/m/a%20b"]) {
-    assert.equal(memtreeReportUrl(bad), undefined, bad);
+// The server's /report page is behind its MEMTREE_REPORT_PAGE flag (default off),
+// so no ccc release may link it until the server advertises it.
+test("a first-ever MemTree page notice never links the report page", () => {
+  for (const link of ["https://memtree.dev/m/abc123-s", "https://x/usage/memtree/0b7c-v1-own"]) {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+    queue.setFirstTreeIntro({ isFirstEver: () => true, markShown() {} });
+    queue.setTrailer(() => ({ key: "tree-1", link }), "turn");
+    const output = queue.claim(stop()).systemMessage;
+    assert.ok(output.includes(link), output);
+    assert.ok(!output.includes("/report") && !output.includes("What your agent did"), output);
   }
-});
-
-test("a first-ever tree whose link is not a MemTree page gets no report line", () => {
-  const queue = new NoticeDeliveryQueue(undefined, undefined, false);
-  queue.setFirstTreeIntro({ isFirstEver: () => true, markShown() {} });
-  queue.setTrailer(() => ({ key: "tree-1", link: "https://x/other/1" }), "turn");
-  const output = queue.claim(stop()).systemMessage;
-  assert.ok(!output.includes("/report") && !output.includes("What your agent did"), output);
 });
 
 test("without an intro installed the first link is the routine one", () => {

@@ -23,13 +23,6 @@ export declare const FIRST_TREE_TITLE = "\uD83C\uDF3F First MemTree ready";
 export declare const FIRST_TREE_VALUE = "a searchable map of this session so far";
 /** Added under the first tree a user ever sees: what to do with it. */
 export declare const FIRST_EVER_HINT = "Open it, or paste the link to any agent to give it this session's context";
-/** Under the first tree a user ever sees: the server's report of what the agent did. */
-export declare const FIRST_EVER_REPORT_LABEL = "What your agent did so far:";
-/**
- * The report page of a MemTree page link (`/m/<id>` or `/usage/memtree/<id>`,
- * plus `/report`), or undefined for any other URL, which is then not offered.
- */
-export declare function memtreeReportUrl(pageUrl: string): string | undefined;
 /**
  * Closes every URL line. Terminal linkifiers run a bare URL into whatever is
  * drawn right after it when the row joins the next one: a URL that ended a
@@ -260,8 +253,7 @@ export declare class NoticeDeliveryQueue {
     private newLinkLabel;
     /**
      * The session's first tree: bold leaf title, the value in one line, the
-     * URL below; for the user's first tree ever, one dim line on what to do and the
-     * page's "what your agent did" report (memtreeReportUrl) on its own URL line.
+     * URL below; for the user's first tree ever, one dim line on what to do.
      */
     private firstTreeNotice;
     /** Call the first-tree intro; a throwing one never breaks a hook. */
