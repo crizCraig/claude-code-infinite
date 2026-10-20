@@ -37,8 +37,7 @@ work: your priorities, the nuances of your projects, your company and your envir
 orchestrate dozens of subagents on your behalf.
 
 > [!IMPORTANT]
-> Install [Claude Code in your terminal](#setup) and sign in with Claude Pro or Max
-> before running `ccc`. The Claude desktop app isn't enough.
+> Needs [Claude Code in your terminal](#setup), signed in with Claude Pro or Max.
 
 ## Search across sessions
 
@@ -84,36 +83,43 @@ tokens; `/compact`'s exclude the one-time `/compact` step. This is one task fami
 ## Requirements
 
 * **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
-  with Claude Pro or Max.** The Claude desktop app isn't enough: `ccc` needs the terminal
-  version.
+  with Claude Pro or Max** ([don't have it yet?](#setup))
 * [node.js 20.3 or newer](https://nodejs.org/en/download/)
 
 <sub>Also works with an Anthropic API key that has credit, but that's far costlier than Pro or Max.</sub>
 
 ## Setup
 
-1. **Install Claude Code first** and sign in with Claude Pro or Max. The Claude desktop app
-  isn't enough: `ccc` needs the terminal version.
-  ```powershell
-  # Windows PowerShell
-  irm https://claude.ai/install.ps1 | iex
-  ```
-  ```bash
-  # macOS / Linux
-  curl -fsSL https://claude.ai/install.sh | bash
-  ```
-  Open a new terminal and run `claude` once to sign in
-  ([help](#claude-code-isnt-installed)).
-2. Install Claude Code Infinite (Node ≥ 20.3; no git needed)
+1. Install Claude Code Infinite (Node ≥ 20.3; no git needed)
   ```bash
   npm install -g claude-code-infinite
   ```
-3. Run it from your project folder
+2. Run it from your project folder
   ```bash
   ccc
   ```
 
 This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
+
+Needs [Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in with
+Claude Pro or Max.
+
+<details>
+<summary>Don't have Claude Code yet?</summary>
+
+```powershell
+# Windows PowerShell
+irm https://claude.ai/install.ps1 | iex
+```
+```bash
+# macOS / Linux
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+Then open a new terminal and run `claude` once to sign in. The Claude desktop app isn't enough:
+`ccc` needs the `claude` command in your terminal ([help](#claude-code-isnt-installed)).
+
+</details>
 
 ## Environments
 
