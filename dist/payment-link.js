@@ -21,7 +21,7 @@ export const REASON_FREE_CREDIT_USED = "free_credit_used";
 export const REASON_PLAN_LIMIT = "plan_limit";
 // The link must be our short path on one of our hosts: a hostile or broken body
 // can't put an arbitrary URL (or terminal controls) on screen or into `open`.
-const SHORT_LINK_RE = new RegExp("^(?:https:\\/\\/(?:[a-z0-9-]+\\.)*(?:polychat\\.co|run\\.app)" +
+const SHORT_LINK_RE = new RegExp("^(?:https:\\/\\/(?:(?:[a-z0-9-]+\\.)*polychat\\.co|polychat-[a-z0-9-]+(?:\\.[a-z0-9-]+)?\\.run\\.app)" +
     "|http:\\/\\/(?:local\\.polychat\\.co|localhost|127\\.0\\.0\\.1)(?::\\d+)?)" +
     "\\/p\\/[A-Za-z0-9]{12,64}$");
 const PLAN_RE = /^[A-Za-z0-9 %.+-]{1,40}$/;

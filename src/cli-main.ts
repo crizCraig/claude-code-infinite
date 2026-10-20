@@ -43,6 +43,7 @@ import {
   FALLBACK_SUBSCRIBE_URL,
   MEMTREE_OFF_LINE,
   PRINT_PAUSED_LINE,
+  RESUMED_PAUSED_LINE,
   formatPaymentNotice,
   parsePaymentChoice,
   parsePaymentStatus,
@@ -234,7 +235,8 @@ async function runPaymentGate(
   status: PaymentStatus,
   recheck: () => Promise<PaymentStatus | null>,
   links: PaymentLinkCache,
-  diagnostics: Diagnostics
+  diagnostics: Diagnostics,
+  resumed: boolean
 ): Promise<boolean> {
   const color = terminalSupportsColor();
   for (;;) {
@@ -247,7 +249,7 @@ async function runPaymentGate(
       process.exit(0);
     }
     if (choice === "continue") {
-      console.log(`\n${MEMTREE_OFF_LINE}\n`);
+      console.log(`\n${resumed ? RESUMED_PAUSED_LINE : MEMTREE_OFF_LINE}\n`);
       return false;
     }
     // A link left on screen past its hour is replaced before it is opened.
@@ -492,10 +494,11 @@ async function main() {
   if (paymentStatus?.paid === false) {
     if (interactiveUi) {
       memtreeOff = !(await runPaymentGate(paymentStatus, () =>
-        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), paymentLinks, diagnostics
+        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), paymentLinks, diagnostics,
+        resumesSession(claudeArgs)
       ));
     } else {
-      console.error(PRINT_PAUSED_LINE);
+      console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
       memtreeOff = true;
     }
   }

@@ -35,6 +35,7 @@ export declare const PAUSED_LOSS_LINES: string;
 /** After [c]: the session runs as plain Claude Code; the next start checks again. */
 export declare const MEMTREE_OFF_LINE = "MemTree is off for this session. ccc checks again the next time you start it.";
 /** Print/non-TTY runs of an unpaid key: one stderr line, then plain Claude Code. */
+export declare const RESUMED_PAUSED_LINE = "MemTree is paused, so this resumed session runs uncompressed. ccc checks again next start.";
 export declare const PRINT_PAUSED_LINE: string;
 export type PaymentStatus = {
     paid: boolean;

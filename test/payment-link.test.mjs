@@ -33,6 +33,7 @@ test("a server body becomes a link; anything off-shape is no link", () => {
     { ...BODY, url: "https://evil.example/p/Ab3xY9qwertyuiop" },
     { ...BODY, url: "http://app.polychat.co/p/Ab3xY9qwertyuiop" },
     { ...BODY, url: "https://polychat.co.evil.example/p/Ab3xY9qwertyuiop" },
+    { ...BODY, url: "https://someone-else.run.app/p/Ab3xY9qwertyuiop" },
   ]) assert.equal(parsePaymentLink(bad), null, JSON.stringify(bad));
   assert.ok(parsePaymentLink({ ...BODY, url: "http://local.polychat.co:8000/p/Ab3xY9qwertyuiop" }));
   assert.ok(parsePaymentLink({ ...BODY,

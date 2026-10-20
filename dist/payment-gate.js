@@ -36,6 +36,7 @@ export const PAUSED_LOSS_LINES = "Without it, long sessions hit the context limi
 /** After [c]: the session runs as plain Claude Code; the next start checks again. */
 export const MEMTREE_OFF_LINE = "MemTree is off for this session. ccc checks again the next time you start it.";
 /** Print/non-TTY runs of an unpaid key: one stderr line, then plain Claude Code. */
+export const RESUMED_PAUSED_LINE = "MemTree is paused, so this resumed session runs uncompressed. ccc checks again next start.";
 export const PRINT_PAUSED_LINE = "ccc: MemTree is paused (payment required), so this run is plain Claude Code. " +
     "Run ccc in a terminal to subscribe.";
 const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
@@ -43,7 +44,8 @@ const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
 const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
 // "we recommend 🌱 Starter plan for $5/month" → plan name + price.
 const RECOMMENDED_PLAN_RE = /recommend\s+(?:\S+\s+)?([A-Za-z][\w ]*?plan)\s+for\s+(\$[\d.]+\/month)/i;
-const SAFE_URL_RE = /^https?:\/\/[^\s"'`$<>\\\u0000-\u001f\u007f-\u009f]+$/;
+// No quotes, `$`, backticks or bare `%` (cmd.exe expands %VAR% when Windows opens it).
+const SAFE_URL_RE = /^https?:\/\/(?:[^\s"'`$<>%\\\u0000-\u001f\u007f-\u009f]|%[0-9A-Fa-f]{2})+$/;
 // C0 controls, DEL, and C1 controls.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 /**

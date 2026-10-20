@@ -93,7 +93,8 @@ export function plainClaudeEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 export function resumesSession(args: readonly string[]): boolean {
   for (const arg of args) {
     if (arg === "--") return false;
-    if (["-r", "--resume", "-c", "--continue"].includes(arg) || arg.startsWith("--resume=")) {
+    if (["-r", "--resume", "-c", "--continue", "--from-pr"].includes(arg) ||
+        arg.startsWith("--resume=") || arg.startsWith("--from-pr=")) {
       return true;
     }
   }

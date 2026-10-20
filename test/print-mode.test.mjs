@@ -218,6 +218,7 @@ test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session
     assert.match(args[0], /^--mcp-config=/, "still through ccc");
     assert.deepEqual(args.slice(-4), ["-p", "--resume", id, "hi"]);
     assert.match(stderr, /Request log:/);
+    assert.match(stderr, /resumed session runs uncompressed/);
   } finally {
     server.close();
   }

@@ -32,7 +32,7 @@ test("inside another ccc session, the outer session's settings are dropped too",
 });
 
 test("resumes and continues are recognised", () => {
-  for (const args of [["-r"], ["--resume", "x"], ["--resume=x"], ["-c"], ["--continue", "-p", "q"]]) {
+  for (const args of [["-r"], ["--resume", "x"], ["--resume=x"], ["-c"], ["--continue", "-p", "q"], ["--from-pr", "7"]]) {
     assert.ok(resumesSession(args), args.join(" "));
   }
   for (const args of [[], ["-p", "hi"], ["--", "-c"]]) assert.ok(!resumesSession(args), args.join(" "));
