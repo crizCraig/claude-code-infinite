@@ -21,6 +21,8 @@ export declare const PROJECT_TREES_LIMIT = 5;
 export declare const PROJECT_TREES_WAIT_MS = 300;
 /** A request that has not answered by then is dropped. */
 export declare const PROJECT_TREES_FETCH_TIMEOUT_MS = 5000;
+/** A later session start reuses an answer this fresh instead of asking again. */
+export declare const PROJECT_TREES_FRESH_MS = 60000;
 /** Root summaries are cut to this many characters. */
 export declare const PROJECT_TREES_SUMMARY_CHARS = 150;
 export declare const PROJECT_TREES_HEADER: string;
@@ -40,10 +42,14 @@ export declare class ProjectTreesHint {
     private readonly fetchJson;
     private readonly project;
     private readonly waitMs;
+    private readonly now;
     private pending;
     private latest;
     private disabled;
-    constructor(fetchJson: ProjectTreesFetch, project: string, waitMs?: number);
+    private fetchedAt;
+    /** The server answered 404/405: it has no such endpoint; not asked again this run. */
+    private unsupported;
+    constructor(fetchJson: ProjectTreesFetch, project: string, waitMs?: number, now?: () => number);
     /** No more blocks: the session lost the tools they name (memtree MCP config failed). */
     disable(): void;
     /** Start a lookup unless one is on its way; never throws. */
@@ -56,10 +62,13 @@ export declare class ProjectTreesHint {
     contextFor(sessionId: string | undefined): Promise<string | undefined>;
     private lookup;
 }
-/** The project name the server matches: `owner/repo` when known, else the directory. */
+/**
+ * The project name the server matches: the `owner/repo` of the `origin`
+ * remote. A directory name alone ("app", "src") would also match unrelated
+ * directories and repos of that name, so without a remote there is no hint.
+ */
 export declare function projectIdentity(meta: {
     git_repo?: string;
-    project_dir?: string;
 } | undefined): string | undefined;
 /** The server's `trees`, keeping only well-formed entries. */
 export declare function parseProjectTrees(body: unknown): ProjectTree[] | undefined;
@@ -72,6 +81,5 @@ export declare function formatProjectTrees(trees: readonly ProjectTree[], curren
  */
 export declare function projectTreesHintFor(interactive: boolean, tools: readonly string[], meta: {
     git_repo?: string;
-    project_dir?: string;
 } | undefined, env: NodeJS.ProcessEnv, fetchJson: ProjectTreesFetch): ProjectTreesHint | undefined;
 //# sourceMappingURL=project-trees.d.ts.map

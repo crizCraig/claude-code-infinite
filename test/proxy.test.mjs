@@ -3142,14 +3142,14 @@ test("SessionStart adds earlier project trees as model context for main session 
       },
     });
     assert.equal(first.body.systemMessage, undefined, "nothing shown to the user");
-    for (const source of ["resume", "clear"]) {
+    for (const source of ["resume", "clear", "fork"]) {
       const hit = await postHook(proxy, { ...start, source });
       assert.equal(hit.body.hookSpecificOutput.additionalContext, "Earlier sessions (not session-1)");
     }
     assert.equal((await postHook(proxy, { ...start, source: "compact" })).status, 204);
     assert.equal((await postHook(proxy, { ...start, agent_id: "a1" })).status, 204);
     assert.equal((await postHook(proxy, { ...start, session_id: "none" })).status, 204);
-    assert.deepEqual(asked, ["session-1", "session-1", "session-1", "none"]);
+    assert.deepEqual(asked, ["session-1", "session-1", "session-1", "session-1", "none"]);
   } finally {
     proxy.close();
   }
@@ -3164,6 +3164,21 @@ test("SessionStart adds earlier project trees as model context for main session 
     assert.deepEqual(both.body, { systemMessage: "banner" }, "a failing hint leaves the banner alone");
   } finally {
     throwing.close();
+  }
+  const withBanner = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    projectTrees,
+    sessionStartNotice: () => "banner",
+  });
+  try {
+    const both = await postHook(withBanner, { hook_event_name: "SessionStart", source: "startup" });
+    assert.deepEqual(both.body, {
+      systemMessage: "banner",
+      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "Earlier sessions (not session-1)" },
+    });
+  } finally {
+    withBanner.close();
     upstream.close();
   }
 });

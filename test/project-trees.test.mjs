@@ -71,7 +71,7 @@ test("malformed answers and entries are dropped", () => {
 
 test("the project is owner/repo when known, else the directory", () => {
   assert.equal(projectIdentity({ git_repo: "o/r", project_dir: "d" }), "o/r");
-  assert.equal(projectIdentity({ project_dir: "d" }), "d");
+  assert.equal(projectIdentity({ project_dir: "d" }), undefined, "a bare directory name is too loose");
   assert.equal(projectIdentity({}), undefined);
   assert.equal(projectIdentity(undefined), undefined);
 });
@@ -84,6 +84,7 @@ test("the hint is on only for interactive sessions with search and read_node and
   assert.equal(projectTreesHintFor(false, all, meta, {}, fetch), undefined, "print runs");
   assert.equal(projectTreesHintFor(true, ["search", "list"], meta, {}, fetch), undefined);
   assert.equal(projectTreesHintFor(true, all, {}, {}, fetch), undefined, "no project");
+  assert.equal(projectTreesHintFor(true, all, { project_dir: "app" }, {}, fetch), undefined);
   assert.equal(projectTreesHintFor(true, all, meta, { CCC_PROJECT_TREES: "0" }, fetch), undefined);
 });
 
@@ -115,6 +116,28 @@ test("a slow, failed or old server adds nothing and never throws", async () => {
   release({ trees: [tree("late", 3)] });
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok((await hint.contextFor("s")).includes("late-req"), "a late answer serves the next start");
+});
+
+test("a fresh answer is reused; an old server is not asked again", async () => {
+  const clock = { t: 0 };
+  const asked = [];
+  const hint = new ProjectTreesHint(async (path) => {
+    asked.push(path);
+    return { status: 200, body: Buffer.from(JSON.stringify({ trees: [tree("a", 1)] })) };
+  }, "o/r", 300, () => clock.t);
+  hint.prefetch();
+  assert.ok(await hint.contextFor("x"));
+  assert.ok(await hint.contextFor("y"));
+  assert.equal(asked.length, 1, "within a minute: no second request");
+  clock.t = 61_000;
+  await hint.contextFor("z");
+  assert.equal(asked.length, 2, "then refreshed in the background");
+
+  const { hint: old, asked: oldAsked } = scripted(() => 404);
+  old.prefetch();
+  assert.equal(await old.contextFor("s"), undefined);
+  await old.contextFor("s");
+  assert.equal(oldAsked.length, 1, "a 404 is remembered for the run");
 });
 
 test("disable() stops the block (the session lost its memtree tools)", async () => {

@@ -727,12 +727,14 @@ onMainStop) {
             recordSessionStart(state, parsed.source);
             noteMainSessionStart(state, parsed.source, parsed.session_id);
         }
+        // Earlier trees in this project: asked now, so its wait overlaps the resume's.
+        const contextPromise = projectTreesContext(state.projectTrees, parsed);
         // A resume waits briefly for the newest tree; a fresh session has none to wait for.
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
         }
         const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed), extraSessionStartLine(state.sessionStartNotice, parsed));
-        const context = await projectTreesContext(state.projectTrees, parsed);
+        const context = await contextPromise;
         if (!line && !context) {
             res.writeHead(204);
             res.end();
