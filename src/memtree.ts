@@ -23,6 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
+import { keyPageUrl } from "./key-page.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -972,6 +973,8 @@ export class MemtreeClient {
   private unpaidDetail: string | null = null;
   /** Whether the latest call that got an answer, or timed out, got a 402. */
   private lastAnswerUnpaid = false;
+  /** Whether the latest call that got an answer, or timed out, got a 401/403. */
+  private lastAnswerKeyInvalid = false;
   /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
 
@@ -992,6 +995,19 @@ export class MemtreeClient {
    */
   get pausedDetail(): string | null {
     return this.lastAnswerUnpaid ? this.unpaidDetail : null;
+  }
+
+  /**
+   * Whether the server's latest answer (or timeout) refused the key itself:
+   * 401/403, i.e. a mistyped or revoked key. Cleared by any later answer.
+   */
+  get keyInvalid(): boolean {
+    return this.lastAnswerKeyInvalid;
+  }
+
+  /** Where to get a new key for this client's environment (its base URL). */
+  get keyPageUrl(): string {
+    return keyPageUrl(this.baseUrl);
   }
 
   /** polychat's usage dashboard for this client's environment (its base URL). */
@@ -1703,9 +1719,12 @@ export class MemtreeClient {
       // A call the caller aborted says nothing about the server.
       // A background index call that failed otherwise (a timeout, a 413 on a big
       // body) is no news about payment; a compress call's answer always is.
-      const news = status === 402 || ok || !opts.indexOnly;
+      // A refused key is news from any call, like a 402.
+      const keyRefused = status === 401 || status === 403;
+      const news = status === 402 || keyRefused || ok || !opts.indexOnly;
       if (news && (status !== undefined || !opts.signal?.aborted)) {
         this.lastAnswerUnpaid = status === 402;
+        this.lastAnswerKeyInvalid = keyRefused;
       }
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).

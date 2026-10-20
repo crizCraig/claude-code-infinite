@@ -39,10 +39,18 @@ import {
   PAYMENT_GATE_PROMPT,
   formatPaymentNotice,
   parsePaymentChoice,
-  parsePaymentStatus,
   type PaymentStatus,
   hyperlink,
 } from "./payment-gate.js";
+import {
+  KEY_PAGE_URL,
+  LOCAL_KEY_PAGE_URL,
+  fetchKeyStatus,
+  keyInvalidLine,
+  keyPageUrl,
+  runKeyGate,
+  type KeyCheck,
+} from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate, type AutoUpdateSetup } from "./auto-update-setup.js";
 import {
@@ -121,8 +129,6 @@ import { exitResumeHint } from "./resume-hint.js";
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
-// utm_source=ccc: signups from this link are attributed to ccc (polychat docs/signup_sources.md).
-const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
@@ -151,10 +157,7 @@ function openUrl(url: string): void {
 async function promptForApiKey(mode: Mode, output: NodeJS.WritableStream): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output });
 
-  const url =
-    mode === "local"
-      ? "http://local.polychat.co:5173/memtree-api"
-      : POLYCHAT_AUTH_URL;
+  const url = mode === "local" ? LOCAL_KEY_PAGE_URL : KEY_PAGE_URL;
 
   // The label is a clickable link (OSC 8) where the terminal supports it, and
   // the URL is printed too, for other terminals and for opening it elsewhere.
@@ -174,44 +177,52 @@ async function promptForApiKey(mode: Mode, output: NodeJS.WritableStream): Promi
 }
 
 /**
- * Startup payment check: GET /v1/context_memory/status, so an unpaid key is
- * handled BEFORE the first degraded turn. The endpoint may not be deployed
- * yet — 404/405/401/503, network errors, timeouts and unexpected bodies all
- * mean "unknown" (null): the caller stays quiet. Bounded by a short timeout
- * and never throws, so startup is never gated on polychat availability.
+ * The startup check said the key is invalid (401/403): interactive runs get
+ * the paste-a-new-key gate (q quits, c carries on without MemTree, like the
+ * payment gate); print/non-TTY runs get one line on stderr and carry on.
+ * Anything else passes through unchanged.
  */
-async function fetchPaymentStatus(
-  baseUrl: string,
-  apiKey: string,
-  timeoutMs = 2000,
-  diagnostics?: Diagnostics
-): Promise<PaymentStatus | null> {
-  try {
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "x-client": CLIENT_NAME,
-        "x-client-version": CLIENT_VERSION,
-      },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      diagnostics?.record("key_status", {
-        result: res.status === 401 ? "invalid" : res.status === 402 ? "payment_required" : "unknown",
-        status: res.status,
-      });
-      return null;
-    }
-    const status = parsePaymentStatus(await res.json());
-    diagnostics?.record("key_status", {
-      result: status?.paid === false ? "payment_required" : status ? "ok" : "unknown",
-      status: res.status,
-    });
-    return status;
-  } catch (err) {
-    if (diagnostics) recordError(diagnostics, "status_probe_failed", err);
-    return null;
+async function handleInvalidKey(
+  check: KeyCheck,
+  ctx: { mode: Mode; baseUrl: string; apiKey: string; interactive: boolean;
+    diagnostics: Diagnostics }
+): Promise<{ apiKey: string; check: KeyCheck }> {
+  if (check !== "invalid") return { apiKey: ctx.apiKey, check };
+  const url = keyPageUrl(ctx.baseUrl);
+  if (!ctx.interactive) {
+    // console.log is routed to stderr (uncoloured off a terminal) in these runs.
+    console.log(keyInvalidLine(url, ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`));
+    return { apiKey: ctx.apiKey, check };
   }
+  const color = terminalSupportsColor();
+  const result = await runKeyGate({
+    keyPageUrl: url,
+    ask: askLine,
+    open: openUrl,
+    warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
+    say: (text) => console.log(text),
+    check: (apiKey) => fetchKeyStatus(ctx.baseUrl, apiKey, { diagnostics: ctx.diagnostics }),
+    saveKey: (apiKey) => saveApiKey(ctx.mode, apiKey, ctx.diagnostics),
+  });
+  if (result.action === "quit") {
+    await ctx.diagnostics.flush();
+    process.exit(0);
+  }
+  return result.action === "rekeyed" ? result : { apiKey: ctx.apiKey, check };
+}
+
+/** Save `apiKey` as this environment's key; diagnostics now go by it. */
+function saveApiKey(mode: Mode, apiKey: string, diagnostics: Diagnostics): void {
+  diagnostics.record("key_saved");
+  diagnostics.setApiKey(apiKey);
+  if (mode === "local") setLocalPolychatApiKey(apiKey);
+  else if (mode === "staging") setStagingPolychatApiKey(apiKey);
+  else setPolychatApiKey(apiKey);
+}
+
+/** The payment status in a key check; null when the key is invalid or unknown. */
+function paymentOnly(check: KeyCheck): PaymentStatus | null {
+  return check === "invalid" ? null : check;
 }
 
 /**
@@ -436,19 +447,11 @@ async function main() {
       await diagnostics.flush();
       process.exit(1);
     }
-    diagnostics.record("key_saved");
-    diagnostics.setApiKey(polychatApiKey);
-    if (mode === "local") {
-      setLocalPolychatApiKey(polychatApiKey);
-    } else if (mode === "staging") {
-      setStagingPolychatApiKey(polychatApiKey);
-    } else {
-      setPolychatApiKey(polychatApiKey);
-    }
+    saveApiKey(mode, polychatApiKey, diagnostics);
     console.log("API key saved.\n");
   }
 
-  // Check the key's payment status before claude takes over the terminal.
+  // Check the key (valid? paid?) before claude takes over the terminal.
   // Bounded (2s) and null on error — startup never fails or hangs on polychat
   // availability. The npm update check runs concurrently under the same
   // bound (1.5s, and usually answered from a day-long cache); its result goes
@@ -458,8 +461,8 @@ async function main() {
   // The project (directory, git repo, branch, commit) goes with every MemTree
   // call so sessions can be found by project; read once, never fails.
   const config = loadConfig();
-  const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
-    fetchPaymentStatus(memtreeBaseUrl, polychatApiKey, undefined, diagnostics),
+  const [keyCheck, updateAvailable, projectMeta] = await Promise.all([
+    fetchKeyStatus(memtreeBaseUrl, polychatApiKey, { diagnostics }),
     interactiveUi
       ? checkForUpdate({
           currentVersion: CLIENT_VERSION,
@@ -469,10 +472,18 @@ async function main() {
       : Promise.resolve(null),
     readProjectMeta(process.cwd()),
   ]);
+  // A definite 401/403: the key is mistyped or revoked. Say so before claude
+  // starts; interactive runs may paste a new one, others carry on without MemTree.
+  const checked = await handleInvalidKey(keyCheck, {
+    mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey, interactive: interactiveUi, diagnostics,
+  });
+  polychatApiKey = checked.apiKey;
+  const paymentStatus = paymentOnly(checked.check);
   if (paymentStatus?.paid === false) {
+    const key = polychatApiKey;
     if (interactiveUi) {
-      await runPaymentGate(paymentStatus, () =>
-        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), diagnostics
+      await runPaymentGate(paymentStatus, async () => paymentOnly(
+        await fetchKeyStatus(memtreeBaseUrl, key)), diagnostics
       );
     } else {
       console.warn(`\x1b[1;33m${formatPaymentNotice(paymentStatus)}\x1b[0m`);
