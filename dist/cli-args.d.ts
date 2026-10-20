@@ -5,6 +5,11 @@ export interface WrapperArgs {
 }
 /** Whether Claude's own print mode was requested before its `--` separator. */
 export declare function isPrintInvocation(args: string[]): boolean;
+/**
+ * `ccc --version` / `ccc -v` (alone, or after `local`/`staging`): answered by ccc itself,
+ * with no MemTree key, proxy or session, so it works right after installing.
+ */
+export declare function isVersionRequest(args: readonly string[]): boolean;
 /** ccc's own subcommands, which start no Claude session. */
 declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp", "link"];
 export type CccEnvironment = "production" | "staging" | "local";

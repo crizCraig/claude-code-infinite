@@ -13,6 +13,16 @@ export function isPrintInvocation(args: string[]): boolean {
   return false;
 }
 
+/**
+ * `ccc --version` / `ccc -v` (alone, or after `local`/`staging`): answered by ccc itself,
+ * with no MemTree key, proxy or session, so it works right after installing.
+ */
+export function isVersionRequest(args: readonly string[]): boolean {
+  const start = ENVIRONMENT_WORDS.includes(args[0] ?? "") ? 1 : 0;
+  const rest = args.slice(start);
+  return rest.length === 1 && (rest[0] === "--version" || rest[0] === "-v");
+}
+
 /** ccc's own subcommands, which start no Claude session. */
 const SUBCOMMANDS = ["fetch", "memtree-mcp", "link"] as const;
 const ENVIRONMENT_WORDS = ["local", "staging"];
