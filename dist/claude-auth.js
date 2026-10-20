@@ -53,13 +53,16 @@ export function claudeAuthFromConfig(opts = {}) {
 /**
  * Whether a claude.ai login is on file, by key names only: `oauthAccount` in
  * `~/.claude.json` without a Console key, or `claudeAiOauth` in
- * `.credentials.json` (Linux and Windows). Unlike claudeAuthFromConfig it
- * ignores env keys, which Claude Code asks about before using.
+ * `.credentials.json` (Linux and Windows), or a `claude setup-token` token in
+ * the environment. Unlike claudeAuthFromConfig it ignores env API keys, which
+ * Claude Code asks about before using.
  */
 export function claudeSubscriptionLogin(opts = {}) {
     const env = opts.env ?? process.env;
     const read = opts.readFile ?? readTextOrNull;
     const home = opts.homedir ?? os.homedir();
+    if (nonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN))
+        return true;
     const dir = nonEmpty(env.CLAUDE_CONFIG_DIR) ? env.CLAUDE_CONFIG_DIR : null;
     const global = read(dir ? path.join(dir, ".claude.json") : path.join(home, ".claude.json"));
     if (authFromGlobalConfig(global) === "subscription")

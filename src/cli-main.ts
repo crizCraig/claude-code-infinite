@@ -108,6 +108,7 @@ import {
   creditNoticeText,
 } from "./claude-auth.js";
 import {
+  isInfoOnlyRun,
   printNoPlanWarning,
   readSeenClaudeAuth,
   writeSeenClaudeAuth,
@@ -484,8 +485,9 @@ async function main() {
   // request log, plus a few allowlisted numbers for diagnostics.
   // Anthropic refusing an API key for no credit gets one line as ccc exits.
   let creditTooLow = false;
-  const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, () => {
-    creditTooLow = true;
+  const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
+    // Its advice is for API keys; a subscription's refusal (extra usage spent) is not one.
+    if (auth !== "subscription") creditTooLow = true;
   }, (auth) => {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
@@ -564,7 +566,7 @@ async function main() {
   // One unobtrusive (dim) line so users can find the log during an incident.
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
   // On an API key or not signed in: one line before the first prompt (stderr).
-  if (printNoPlanWarning(claudeSignIn,
+  if (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn,
     process.stderr.isTTY === true && terminalSupportsColor())) {
     diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
   }

@@ -32,10 +32,16 @@ export function needsPlanWarning(input) {
         return false;
     if (PAID_PLANS.includes(plan))
         return false;
-    if (plan !== "free" && (auth === "subscription" || input.subscriptionLogin === true)) {
+    // Even a "free" plan on record: it may predate an upgrade.
+    if (auth === "subscription" || input.subscriptionLogin === true)
         return false;
-    }
     return seen !== "subscription";
+}
+const INFO_FLAGS = ["--version", "-v", "--help", "-h"];
+/** `claude --version`, `claude mcp --help` and the like: no session, so no line. */
+export function isInfoOnlyRun(args) {
+    const end = args.indexOf("--");
+    return (end === -1 ? args : args.slice(0, end)).some((a) => INFO_FLAGS.includes(a));
 }
 export function noPlanWarningText(color) {
     return color ? `\x1b[33m${NO_PLAN_TEXT}\x1b[39m` : NO_PLAN_TEXT;

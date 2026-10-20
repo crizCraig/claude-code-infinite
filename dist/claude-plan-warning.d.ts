@@ -33,6 +33,8 @@ export interface PlanWarningInput {
  * is never warned.
  */
 export declare function needsPlanWarning(input: PlanWarningInput): boolean;
+/** `claude --version`, `claude mcp --help` and the like: no session, so no line. */
+export declare function isInfoOnlyRun(args: readonly string[]): boolean;
 export declare function noPlanWarningText(color: boolean): string;
 /**
  * The line on stderr when it applies: stdout stays Claude Code's in print

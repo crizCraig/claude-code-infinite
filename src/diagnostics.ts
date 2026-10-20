@@ -225,8 +225,8 @@ export class DiagnosticsRequestSink implements RequestLogSink {
   constructor(
     private readonly inner: RequestLogSink | undefined,
     private readonly diagnostics: Diagnostics,
-    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
-    private readonly onCreditBalanceTooLow?: () => void,
+    /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
+    private readonly onCreditBalanceTooLow?: (auth: ClaudeAuthType | undefined) => void,
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?: (auth: ClaudeAuthType) => void
   ) {}
@@ -281,7 +281,7 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     }
     if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
       this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
-      this.onCreditBalanceTooLow?.();
+      this.onCreditBalanceTooLow?.(rec.claudeAuth === "unknown" ? undefined : rec.claudeAuth);
       // An API key's refusal; a subscription token's header (extra usage spent) stays one.
       if (rec.claudeAuth === undefined || rec.claudeAuth === "unknown") {
         this.onClaudeAuth?.("api_key");

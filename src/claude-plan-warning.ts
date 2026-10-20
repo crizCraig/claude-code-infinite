@@ -48,10 +48,17 @@ export function needsPlanWarning(input: PlanWarningInput): boolean {
   const { auth, plan, seen } = input;
   if (auth === "bedrock" || auth === "vertex" || auth === "foundry") return false;
   if (PAID_PLANS.includes(plan)) return false;
-  if (plan !== "free" && (auth === "subscription" || input.subscriptionLogin === true)) {
-    return false;
-  }
+  // Even a "free" plan on record: it may predate an upgrade.
+  if (auth === "subscription" || input.subscriptionLogin === true) return false;
   return seen !== "subscription";
+}
+
+const INFO_FLAGS = ["--version", "-v", "--help", "-h"];
+
+/** `claude --version`, `claude mcp --help` and the like: no session, so no line. */
+export function isInfoOnlyRun(args: readonly string[]): boolean {
+  const end = args.indexOf("--");
+  return (end === -1 ? args : args.slice(0, end)).some((a) => INFO_FLAGS.includes(a));
 }
 
 export function noPlanWarningText(color: boolean): string {

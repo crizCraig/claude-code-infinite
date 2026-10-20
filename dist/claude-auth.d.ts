@@ -32,8 +32,9 @@ export declare function claudeAuthFromConfig(opts?: ClaudeAuthOptions): ClaudeAu
 /**
  * Whether a claude.ai login is on file, by key names only: `oauthAccount` in
  * `~/.claude.json` without a Console key, or `claudeAiOauth` in
- * `.credentials.json` (Linux and Windows). Unlike claudeAuthFromConfig it
- * ignores env keys, which Claude Code asks about before using.
+ * `.credentials.json` (Linux and Windows), or a `claude setup-token` token in
+ * the environment. Unlike claudeAuthFromConfig it ignores env API keys, which
+ * Claude Code asks about before using.
  */
 export declare function claudeSubscriptionLogin(opts?: ClaudeAuthOptions): boolean;
 /**

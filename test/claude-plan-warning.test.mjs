@@ -40,7 +40,9 @@ test("warns on an API key or no sign-in, unless a paid plan is recorded", () => 
       assert.equal(needsPlanWarning({ auth, plan }), true, `${auth}/${plan}`);
     }
   }
-  assert.equal(needsPlanWarning({ auth: "subscription", plan: "free" }), true, "free has no Claude Code");
+  // A free plan on record with a login on file may be stale (upgraded since): not warned.
+  assert.equal(needsPlanWarning({ auth: "subscription", plan: "free" }), false);
+  assert.equal(needsPlanWarning({ auth: "unknown", plan: "free", subscriptionLogin: true }), false);
 });
 
 test("never fires for a subscription", () => {
@@ -68,7 +70,7 @@ test("a stale API-key sighting never outweighs a subscription on file", () => {
   assert.equal(needsPlanWarning({ auth: "subscription", plan: "unknown", seen: "api_key" }), false);
   // Nothing on file but the key: still warned.
   assert.equal(needsPlanWarning({ auth: "unknown", plan: "unknown", seen: "api_key" }), true);
-  assert.equal(needsPlanWarning({ auth: "subscription", plan: "free", seen: "api_key" }), true);
+  assert.equal(needsPlanWarning({ auth: "api_key", plan: "free", seen: "api_key" }), true);
 });
 
 test("cloud providers are not Claude plans and are not warned", () => {
@@ -99,6 +101,19 @@ test("a claude.ai login on file, by key names only", async () => {
   assert.equal(at({ "/home/ada/.claude/.credentials.json": '{"claudeAiOauth": {"accessToken": "t"}}' }),
     true);
   assert.equal(at({}), false);
+  // `claude setup-token`, even beside an exported API key.
+  assert.equal(claudeSubscriptionLogin({ env: { CLAUDE_CODE_OAUTH_TOKEN: "t", ANTHROPIC_API_KEY: "k" },
+    homedir: "/home/ada", readFile: () => null }), true);
+});
+
+test("info-only runs (--version, --help) get no line", async () => {
+  const { isInfoOnlyRun } = await import("../dist/claude-plan-warning.js");
+  for (const args of [["--version"], ["-v"], ["--help"], ["-h"], ["mcp", "--help"]]) {
+    assert.equal(isInfoOnlyRun(args), true, args.join(" "));
+  }
+  for (const args of [[], ["-p", "hi"], ["--resume"], ["-p", "--", "--help"]]) {
+    assert.equal(isInfoOnlyRun(args), false, args.join(" "));
+  }
 });
 
 test("the sign-in type Claude Code last used is kept as a type only", () => {
@@ -121,7 +136,9 @@ test("the tee reports each request's sign-in type, and a credit refusal as an AP
     config: {}, env: { CCC_DIAGNOSTICS: "0" },
   });
   const seen = [];
-  const sink = new DiagnosticsRequestSink(undefined, diagnostics, undefined, (a) => seen.push(a));
+  const credit = [];
+  const sink = new DiagnosticsRequestSink(undefined, diagnostics, (a) => credit.push(a ?? "none"),
+    (a) => seen.push(a));
   const rec = (extra) => ({ kind: "messages", turnType: "first-user", ...extra });
   sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 200 }));
   sink.log(rec({ claudeAuth: "unknown", upstreamStatus: 200 }));
@@ -131,6 +148,8 @@ test("the tee reports each request's sign-in type, and a credit refusal as an AP
   sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 400,
                  upstreamError: "credit_balance_too_low" }));
   assert.deepEqual(seen, ["subscription", "api_key", "api_key", "subscription"]);
+  // ccc's exit line is for API keys: the subscription's refusal is passed on as one.
+  assert.deepEqual(credit, ["api_key", "none", "subscription"]);
 });
 
 test("diagnostics: the warning is recorded by sign-in type only", () => {

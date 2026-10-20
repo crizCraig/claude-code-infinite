@@ -94,15 +94,15 @@ export declare class Diagnostics implements DiagnosticsRecorder {
 export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly inner;
     private readonly diagnostics;
-    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
+    /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
     private readonly onCreditBalanceTooLow?;
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?;
     private firstRequest;
     private firstTurn;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
-    /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
-    onCreditBalanceTooLow?: (() => void) | undefined, 
+    /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
+    onCreditBalanceTooLow?: ((auth: ClaudeAuthType | undefined) => void) | undefined, 
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined);
     log(record: RequestRecord): void;
