@@ -36,7 +36,7 @@ jobs:
   client:
     name: ccc on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +73,7 @@ jobs:
 
       - name: One real -p turn and its MemTree
         if: ${{ !cancelled() }}
-        timeout-minutes: 20
+        timeout-minutes: 25 # a 4 min turn, then up to 12 min for its tree
         run: node scripts/e2e/client-e2e.mjs turn
         env:
           MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
@@ -81,7 +81,7 @@ jobs:
 
       - name: MemTree after first use (scripted call)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
-        timeout-minutes: 15
+        timeout-minutes: 20 # up to 12 min for the tree
         run: node scripts/e2e/client-e2e.mjs memtree
         env:
           MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}

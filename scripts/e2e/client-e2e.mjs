@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   FAIL, PASS, PROD_BASE_URL, SKIP, E2E_EMAIL_MARKER, claudeMissingProblems, exitCode,
-  VERSION_WITHOUT_KEY_SINCE, installedVersion, journeyLines, noKeyProblems, versionAtLeast, versionProblems, parsePrintResult, redactUrl,
+  VERSION_WITHOUT_KEY_SINCE, installedVersion, isMemtreeUrl, redactText, journeyLines, noKeyProblems, versionAtLeast, versionProblems, parsePrintResult, redactUrl,
   requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "./lib.mjs";
 
@@ -33,7 +33,7 @@ const REQUEST_LOG = path.join(CONFIG_DIR, "logs", "requests.jsonl");
 const KEY = process.env.MEMTREE_E2E_KEY?.trim() || "";
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY?.trim() || "";
 const IS_WINDOWS = process.platform === "win32";
-const TREE_WAIT_MS = 10 * 60_000;
+const TREE_WAIT_MS = 12 * 60_000; // for the tree and its page together
 const TREE_POLL_MS = 20_000;
 const TURN_TIMEOUT_MS = 4 * 60_000;
 const CLIENT = "cc-infinite-e2e"; // labels the scripted call's usage row as e2e traffic
@@ -92,11 +92,12 @@ async function firstRun() {
     record("first-run", "key accepted by production", SKIP, "secret MEMTREE_E2E_KEY not set");
     return phaseDone("first-run");
   }
-  await check("first-run", "key accepted by production's status endpoint", keyStatus);
+  const verified = await check("first-run", "key accepted by production's status endpoint", keyStatus);
   await check("first-run", "a wrong key is refused (401)", async () => {
     const res = await statusRequest("sk-e2e-not-a-real-key");
     assert(res.status === 401, `HTTP ${res.status}`);
   });
+  if (!verified) return phaseDone("first-run");
   saveKey();
   await check("first-run", "ccc --version", () => {
     const run = spawnSync("ccc", ["--version"], { encoding: "utf8", input: "", shell: IS_WINDOWS, timeout: 60_000 });
@@ -113,6 +114,7 @@ async function turn() {
     record("model-turn", "one ccc -p turn", SKIP, `secret ${missing.join(", ")} not set`);
     return phaseDone("turn");
   }
+  if (!(await usableKey("model-turn"))) return phaseDone("turn");
   saveKey();
   const started = Date.now();
   let sessionId;
@@ -145,6 +147,7 @@ async function memtree() {
     record("memtree", "scripted MemTree call makes a tree", SKIP, "secret MEMTREE_E2E_KEY not set");
     return phaseDone("memtree");
   }
+  if (!(await usableKey("memtree"))) return phaseDone("memtree");
   saveKey();
   const sessionId = randomUUID();
   const ok = await check("memtree", "scripted index call accepted", async () => {
@@ -174,14 +177,16 @@ async function memtree() {
 
 /** `ccc link` finds the session's tree; its page opens for the owner and for no one else. */
 async function treeChecks(journey, sessionId) {
+  const deadline = Date.now() + TREE_WAIT_MS;
   let url;
   const found = await check(journey, "ccc link returns the session's tree", async () => {
     const started = Date.now();
     let last;
-    while (Date.now() - started < TREE_WAIT_MS) {
+    while (Date.now() < deadline) {
       last = runCcc(["link", sessionId], { timeout: 60_000 });
       if (last.status === 0) {
         url = last.stdout.trim();
+        assert(isMemtreeUrl(url), `ccc link printed a URL off ${PROD_BASE_URL}`);
         return `${redactUrl(url)} after ${Math.round((Date.now() - started) / 1000)} s`;
       }
       await sleep(TREE_POLL_MS);
@@ -190,19 +195,23 @@ async function treeChecks(journey, sessionId) {
   });
   if (!found) return;
   await check(journey, "tree page opens for its owner", async () => {
-    const started = Date.now();
     let res;
     do {
       res = await fetch(url, { headers: { authorization: `Bearer ${KEY}`, accept: "text/html" }, redirect: "manual" });
       if (res.status !== 202) break;
       await sleep(TREE_POLL_MS);
-    } while (Date.now() - started < TREE_WAIT_MS);
+    } while (Date.now() < deadline);
     assert(res.status === 200, `HTTP ${res.status}`);
   });
   await check(journey, "tree page refused without the key", async () => {
     const res = await fetch(url, { headers: { accept: "text/html" }, redirect: "manual" });
     assert(res.status === 404, `HTTP ${res.status}, expected the uniform 404`);
   });
+}
+
+/** Use the key only when production says it is a paid e2e-test account (never a real one). */
+async function usableKey(journey) {
+  return check(journey, "the key is the paid e2e-test account's", keyStatus);
 }
 
 async function keyStatus() {
@@ -262,9 +271,7 @@ function phaseDone(name) {
 }
 
 function mask(text) {
-  let out = text;
-  for (const secret of [KEY, ANTHROPIC_KEY]) if (secret) out = out.split(secret).join("***");
-  return out.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
+  return redactText(text, [KEY, ANTHROPIC_KEY]);
 }
 
 function assert(cond, message) {
