@@ -37,7 +37,8 @@ work: your priorities, the nuances of your projects, your company and your envir
 orchestrate dozens of subagents on your behalf.
 
 > [!IMPORTANT]
-> Requires a Claude Pro or Max subscription.
+> Install [Claude Code in your terminal](#setup) and sign in with Claude Pro or Max
+> before running `ccc`. The Claude desktop app isn't enough.
 
 ## Search across sessions
 
@@ -82,19 +83,32 @@ tokens; `/compact`'s exclude the one-time `/compact` step. This is one task fami
 
 ## Requirements
 
+* **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
+  with Claude Pro or Max.** The Claude desktop app isn't enough: `ccc` needs the terminal
+  version.
 * [node.js 20.3 or newer](https://nodejs.org/en/download/)
-* [Claude Code (the terminal version)](https://code.claude.com/docs/en/quickstart)
-* **A Claude Pro or Max subscription**
 
-<sub>Also works with an Anthropic API key, but that's far costlier than Pro or Max.</sub>
+<sub>Also works with an Anthropic API key that has credit, but that's far costlier than Pro or Max.</sub>
 
 ## Setup
 
-1. Install (Node ≥ 20.3; no git needed)
+1. **Install Claude Code first** and sign in with Claude Pro or Max. The Claude desktop app
+  isn't enough: `ccc` needs the terminal version.
+  ```powershell
+  # Windows PowerShell
+  irm https://claude.ai/install.ps1 | iex
+  ```
+  ```bash
+  # macOS / Linux
+  curl -fsSL https://claude.ai/install.sh | bash
+  ```
+  Open a new terminal and run `claude` once to sign in
+  ([help](#claude-code-isnt-installed)).
+2. Install Claude Code Infinite (Node ≥ 20.3; no git needed)
   ```bash
   npm install -g claude-code-infinite
   ```
-2. Run Claude Code Infinite with
+3. Run it from your project folder
   ```bash
   ccc
   ```

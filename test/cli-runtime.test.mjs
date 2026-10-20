@@ -22,7 +22,7 @@ test("runtime requirements agree in the package, lockfile and installation docs"
   assert.deepEqual(lock.packages[""].engines, pkg.engines);
   const docs = readFileSync(new URL("../README.md", import.meta.url), "utf8");
   assert.match(docs, /node\.js 20\.3 or newer/);
-  assert.match(docs, /Install \(Node ≥ 20\.3;/);
+  assert.match(docs, /Install Claude Code Infinite \(Node ≥ 20\.3;/);
 });
 
 for (const version of ["18.0.0", "18.20.0", "20.0.0", "20.2.0"]) {
