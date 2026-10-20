@@ -101,6 +101,30 @@ export function requestLogLines(jsonl, kind, sinceMs) {
   return lines;
 }
 
+/**
+ * Text safe for a public log: the given secrets, any `sk-` key, email, UUID, the payment
+ * link's user_id/user_email values and MemTree page ids are replaced.
+ */
+export function redactText(text, secrets = []) {
+  let out = String(text ?? "");
+  for (const secret of secrets) if (secret) out = out.split(secret).join("***");
+  return out
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***")
+    .replace(/(user_id|user_email)=[^&\s"']+/g, "$1=***")
+    .replace(/[^\s@"'<>(),;:]+@[^\s@"'<>(),;:]+\.[A-Za-z]{2,}/g, "***@***")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
+    .replace(/(\/(?:m|usage\/memtree)\/)[A-Za-z0-9_-]+/g, "$1…");
+}
+
+/** Whether a URL `ccc link` printed is on the MemTree server we sent the key to. */
+export function isMemtreeUrl(url, baseUrl = PROD_BASE_URL) {
+  try {
+    return new URL(url).origin === new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
 /** A MemTree page URL with its id hidden, for logs that are public. */
 export function redactUrl(url) {
   try {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   CLAUDE_MISSING_MESSAGE, FAIL, NO_KEY_MESSAGE, PASS, SKIP, claudeInstallCommand,
   claudeMissingProblems, exitCode, installedVersion, journeyLines, noKeyProblems,
-  parsePrintResult, redactUrl, versionAtLeast, versionProblems, requestLogLines, summaryMarkdown, uniqueFirstMessage,
+  isMemtreeUrl, parsePrintResult, redactText, redactUrl, versionAtLeast, versionProblems, requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "../scripts/e2e/lib.mjs";
 import { claudeDesktopOnlyText, claudeMissingText } from "../dist/claude-locate.js";
 
@@ -88,4 +88,21 @@ test("e2e: version comparisons and the --version expectation", () => {
   assert.deepEqual(versionProblems(good, "1.0.28"), []);
   const old = { status: 1, stdout: "", stderr: "A MemTree API key is required" };
   assert.equal(versionProblems(old, "1.0.28").length, 4);
+});
+
+test("e2e: public log text hides keys, emails, ids and payment link identities", () => {
+  const body = "Payment required for e2e-test-a@polychat.co: https://app.polychat.co/payment?" +
+    "user_id=0b3c8f1e-1111-2222-3333-444455556666&user_email=e2e-test-a@polychat.co&price_id=p " +
+    "key sk-abcdefghijkl and secret123 tree https://app.polychat.co/m/AbCd123";
+  const out = redactText(body, ["secret123"]);
+  for (const leak of ["e2e-test-a", "0b3c8f1e", "sk-abcdefghijkl", "secret123", "AbCd123"]) {
+    assert.ok(!out.includes(leak), `${leak} in ${out}`);
+  }
+  assert.ok(out.includes("user_id=***") && out.includes("price_id=p"));
+});
+
+test("e2e: the key is only sent to the MemTree server's own URLs", () => {
+  assert.ok(isMemtreeUrl("https://app.polychat.co/m/x"));
+  assert.ok(!isMemtreeUrl("https://evil.example/m/x"));
+  assert.ok(!isMemtreeUrl("not a url"));
 });
