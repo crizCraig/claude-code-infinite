@@ -12,6 +12,30 @@ export const CLAUDE_MISSING_MESSAGE = "Claude Code isn't installed. ccc runs Cla
 export const DESKTOP_ONLY_MESSAGE = "Found the Claude desktop app, but ccc needs Claude Code in the terminal";
 export const E2E_EMAIL_MARKER = "e2e-test";
 
+/** The first ccc whose `--version` answers without a key (fix/version-without-key). */
+export const VERSION_WITHOUT_KEY_SINCE = "1.0.28";
+
+/** Whether dotted version `v` is at least `min` (numeric parts only). */
+export function versionAtLeast(v, min) {
+  const a = String(v).split(".").map(Number);
+  const b = String(min).split(".").map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d) return d > 0;
+  }
+  return true;
+}
+
+/** Problems with `ccc --version` on a fresh install: ccc's version, then Claude Code's. */
+export function versionProblems(run, installed) {
+  const problems = [];
+  if (run.status !== 0) problems.push(`exit ${run.status}`);
+  if (run.stdout.split("\n")[0] !== `${installed} (Claude Code Infinite)`) problems.push("first line is not ccc's version");
+  if (!/\(Claude Code\)/.test(run.stdout)) problems.push("no Claude Code version");
+  if (/MemTree API key/.test(run.stdout + run.stderr)) problems.push("asked for a MemTree key");
+  return problems;
+}
+
 /** The command ccc tells someone without Claude Code to run, per OS (claude-locate.ts). */
 export function claudeInstallCommand(platform) {
   return platform === "win32"
