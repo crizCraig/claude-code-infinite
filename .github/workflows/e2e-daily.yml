@@ -1,0 +1,120 @@
+# Daily end-to-end checks of what a new user does: install ccc from npm, first run without
+# Claude Code and without a key, then (with the e2e secrets) a key against PRODUCTION, one
+# real `ccc -p` turn and a MemTree tree that `ccc link` finds. Linux, macOS and Windows.
+# Checks: scripts/e2e/client-e2e.mjs. The web, signup and payment checks run from the
+# polychat repo's e2e-daily workflow.
+#
+# Secrets (all optional; checks that need a missing one are SKIPPED, not failed):
+#   MEMTREE_E2E_KEY        MemTree key of the dedicated e2e-test account (never a real one;
+#                          the run fails if the key's email lacks "e2e-test")
+#   E2E_ANTHROPIC_API_KEY  low-limit Anthropic key for the one Haiku `-p` turn per OS
+#   E2E_RESEND_API_KEY, E2E_ALERT_TO, E2E_ALERT_FROM   extra failure email / SMS gateway
+#
+# Never runs on pull requests (this repo is public: forks must not reach the secrets), and
+# nothing it prints contains a key, an email or a tree id.
+name: E2E daily
+
+on:
+  schedule:
+    - cron: "17 13 * * *" # 06:17 Phoenix, quiet; before the 08:00 daily email
+  workflow_dispatch:
+  push: # TEMPORARY: lets the branch be tested before merge; removed before merging
+    branches: [ci/e2e-daily]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-daily
+  cancel-in-progress: false
+
+env:
+  CCC_NO_DIAGNOSTICS: "1" # keep test installs out of the client diagnostics panel
+  NO_COLOR: "1"
+
+jobs:
+  client:
+    name: ccc on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install ccc from npm (latest)
+        run: npm install -g claude-code-infinite@latest
+
+      - name: Install checks (before Claude Code)
+        run: node scripts/e2e/client-e2e.mjs install
+
+      - name: Install Claude Code (official installer)
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: curl -fsSL https://claude.ai/install.sh | bash
+
+      - name: Install Claude Code (official installer, PowerShell)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: irm https://claude.ai/install.ps1 | iex
+
+      - name: First run (no key, then the e2e key)
+        if: ${{ !cancelled() }}
+        run: node scripts/e2e/client-e2e.mjs first-run
+        env:
+          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+
+      - name: One real -p turn and its MemTree
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: node scripts/e2e/client-e2e.mjs turn
+        env:
+          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.E2E_ANTHROPIC_API_KEY }}
+
+      - name: MemTree after first use (scripted call)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        timeout-minutes: 15
+        run: node scripts/e2e/client-e2e.mjs memtree
+        env:
+          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: node scripts/e2e/client-e2e.mjs summary
+
+      - name: Upload results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ccc-e2e-${{ matrix.os }}
+          path: ${{ runner.temp }}/ccc-e2e-results.jsonl
+          retention-days: 14
+
+  alert:
+    needs: client
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Email (and SMS gateway) alert
+        run: node scripts/e2e/notify.mjs
+        env:
+          E2E_RESEND_API_KEY: ${{ secrets.E2E_RESEND_API_KEY }}
+          E2E_ALERT_TO: ${{ secrets.E2E_ALERT_TO }}
+          E2E_ALERT_FROM: ${{ secrets.E2E_ALERT_FROM }}
+          E2E_ALERT_SUBJECT: "ccc e2e daily FAILED"
+          E2E_ALERT_BODY: "A daily ccc install/first-run check failed. Status per OS and check in the run summary:"
