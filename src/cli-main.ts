@@ -33,16 +33,20 @@ import {
 } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
-import { startupNoticeText } from "./notices.js";
+import { memtreeOffNoticeText, startupNoticeText } from "./notices.js";
 import {
   FALLBACK_SUBSCRIBE_URL,
-  PAYMENT_GATE_PROMPT,
+  MEMTREE_OFF_LINE,
+  PRINT_PAUSED_LINE,
   formatPaymentNotice,
   parsePaymentChoice,
   parsePaymentStatus,
+  paymentGatePrompt,
   type PaymentStatus,
   hyperlink,
 } from "./payment-gate.js";
+import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
+import { runWithoutMemtree } from "./paused-session.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate, type AutoUpdateSetup } from "./auto-update-setup.js";
 import {
@@ -217,39 +221,40 @@ async function fetchPaymentStatus(
 /**
  * Interactive gate for an unpaid key. The TUI covers the terminal within a
  * second of launch, so a printed warning is never read; instead stop here
- * until the user picks: subscribe now (open the checkout link, then wait for
- * the webhook to flip the key to paid), use claude without MemTree (launch
- * uncompressed, the in-session notice still fires), or quit.
+ * until the user picks: subscribe now (open the short checkout link, then wait
+ * for the webhook to flip the key to paid), continue without MemTree (plain
+ * Claude Code for this session), or quit. Resolves true when MemTree is on.
  */
 async function runPaymentGate(
   status: PaymentStatus,
   recheck: () => Promise<PaymentStatus | null>,
+  links: PaymentLinkCache,
   diagnostics: Diagnostics
-): Promise<void> {
-  let current = status;
+): Promise<boolean> {
+  const color = terminalSupportsColor();
   for (;;) {
-    console.warn(
-      `\x1b[1;33m${formatPaymentNotice(current, { hyperlinks: true })}\x1b[0m\n`
-    );
-    const choice = parsePaymentChoice(await askLine(PAYMENT_GATE_PROMPT));
+    const link = await links.get();
+    console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
+    const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
     diagnostics.record("payment_gate", { choice });
     if (choice === "quit") {
       await diagnostics.flush();
       process.exit(0);
     }
     if (choice === "continue") {
-      console.log("\nStarting claude without MemTree.\n");
-      return;
+      console.log(`\n${MEMTREE_OFF_LINE}\n`);
+      return false;
     }
-    openUrl(current.url ?? FALLBACK_SUBSCRIBE_URL);
+    // A link left on screen past its hour is replaced before it is opened.
+    openUrl((await links.get())?.url ?? status.url ?? FALLBACK_SUBSCRIBE_URL);
     console.log("\nOpened the subscribe page. Waiting for payment to complete…");
     const paid = await waitUntilPaid(recheck, SUBSCRIBE_WAIT_MS, SUBSCRIBE_POLL_MS);
     diagnostics.record("payment_gate", { choice: paid ? "paid" : "still_unpaid" });
     if (paid) {
       console.log("\x1b[1;32m✓ MemTree is on — thank you.\x1b[0m\n");
-      return;
+      return true;
     }
-    console.warn("\nStill unpaid.\n");
+    console.warn("\nStill unpaid.");
   }
 }
 
@@ -469,13 +474,23 @@ async function main() {
       : Promise.resolve(null),
     readProjectMeta(process.cwd()),
   ]);
+  // The short checkout link (payment-link.ts): the gate's, and later the
+  // in-session paused notices' when the key runs out mid-session.
+  const paymentLinks = new PaymentLinkCache(() => fetchPaymentLink({
+    baseUrl: memtreeBaseUrl, apiKey: polychatApiKey,
+    headers: { "x-client": CLIENT_NAME, "x-client-version": CLIENT_VERSION },
+  }));
+  // Unpaid: [c] (or any print run) is plain Claude Code for this session, with
+  // no MemTree calls that would only answer 402 (paused-session.ts).
+  let memtreeOff = false;
   if (paymentStatus?.paid === false) {
     if (interactiveUi) {
-      await runPaymentGate(paymentStatus, () =>
-        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), diagnostics
-      );
+      memtreeOff = !(await runPaymentGate(paymentStatus, () =>
+        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), paymentLinks, diagnostics
+      ));
     } else {
-      console.warn(`\x1b[1;33m${formatPaymentNotice(paymentStatus)}\x1b[0m`);
+      console.error(PRINT_PAUSED_LINE);
+      memtreeOff = true;
     }
   }
   if (isDebugMode && updateAvailable) {
@@ -497,6 +512,13 @@ async function main() {
   if (isDebugMode && autoUpdate) console.log(`[DEBUG] ${autoUpdate.debugLine}`);
   diagnostics.setContext({ interactive: interactiveUi });
   recordAutoUpdateDecision(diagnostics, autoUpdate);
+  if (memtreeOff) {
+    const link = paymentLinks.current()?.url ?? paymentStatus?.url ?? FALLBACK_SUBSCRIBE_URL;
+    await runWithoutMemtree({
+      claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
+      banner: memtreeOffNoticeText(terminalSupportsColor(), link),
+    });
+  }
 
   // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
   // successful notice claims, so incidents can be reconstructed after the
@@ -530,6 +552,7 @@ async function main() {
     reqlog: observedLog,
     // Mutable below: a failed config write withdraws it before any call.
     memtreeTools: memtreeMcpPlan.tools.length ? memtreeMcpPlan.tools.join(",") : undefined,
+    paymentLinks,
   });
   const nativeOneMillionContext =
     claudeNativeOneMillionContextEnabled(process.env);

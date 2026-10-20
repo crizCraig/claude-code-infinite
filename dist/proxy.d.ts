@@ -240,6 +240,8 @@ export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
+/** How long a paused turn waits for the short checkout link before its notice (once). */
+export declare const PAYMENT_LINK_NOTICE_WAIT_MS = 1000;
 export declare const SUBAGENT_VIEW_NOTE = "(main session's page; subagent pages aren't linked yet)";
 export declare const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main session only.";
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */

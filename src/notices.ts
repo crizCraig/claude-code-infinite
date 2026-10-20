@@ -99,6 +99,18 @@ export function startupNoticeText(
 }
 
 /**
+ * SessionStart banner for a paused session that runs as plain Claude Code
+ * (paused-session.ts): MemTree is off for it, and how to turn it back on.
+ */
+export function memtreeOffNoticeText(color: boolean, subscribeUrl: string): string {
+  const url = sanitizeNoticeDetail(subscribeUrl, 400);
+  const how = `Subscribe, then restart ccc to turn it back on: ${url}`;
+  if (!color) return `\n\n·─╼ MemTree is off for this session ╾─·\n${how}`;
+  return "\n\n\x1b[2m·─╼\x1b[22m \x1b[33mMemTree is off for this session\x1b[39m " +
+    `\x1b[2m╾─·\x1b[22m\n${how}`;
+}
+
+/**
  * After a background install (auto-update.ts): the running session keeps its
  * version until ccc restarts. `✔ ccc 1.0.21 installed · restart ccc to use it`.
  */

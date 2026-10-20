@@ -631,25 +631,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
         hooks.MessageDisplay = [{ hooks: [hook] }];
     }
     if (opts.startupMessage) {
-        // SessionStart accepts only `command`/`mcp_tool` hooks — never `http` —
-        // so the banner is baked into a static file the command simply cats. It
-        // must NOT be `echo`'d: sh and zsh expand backslash escapes, turning the
-        // JSON's \n into a raw newline and silently corrupting the payload.
-        fs.writeFileSync(path.join(hooksDir, STARTUP_NOTICE_FILE), JSON.stringify({ systemMessage: opts.startupMessage }), { mode: 0o600 });
         hooks.SessionStart = [
             ...(hooks.SessionStart ?? []),
-            {
-                // A compaction continues the same conversation; only real session
-                // starts (fresh, --resume, /clear) re-show the banner.
-                matcher: "startup|resume|clear",
-                hooks: [
-                    {
-                        type: "command",
-                        command: `cat ${singleQuoteForShell(path.join(hooksDir, STARTUP_NOTICE_FILE))}`,
-                        timeout: 5,
-                    },
-                ],
-            },
+            startupBannerHook(hooksDir, opts.startupMessage),
         ];
     }
     if (opts.resumeLink) {
@@ -674,14 +658,7 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             },
         ];
     }
-    fs.writeFileSync(path.join(manifestDir, "plugin.json"), JSON.stringify({
-        // Claude Code lists plugin commands as `/<name>:<command>`, so this
-        // short name is what users see: `/ccc:memtree`, `/ccc:memtree-view`, …
-        name: SESSION_PLUGIN_NAME,
-        version: "1.0.0",
-        description: "Session-only display hooks for Claude Code Infinite",
-    }), { mode: 0o600 });
-    fs.writeFileSync(path.join(hooksDir, "hooks.json"), JSON.stringify({ description: "Display MemTree state", hooks }), { mode: 0o600 });
+    writePluginFiles(dir, hooks);
     let closed = false;
     return {
         dir,
@@ -692,6 +669,61 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             fs.rmSync(dir, { recursive: true, force: true });
         },
     };
+}
+/**
+ * A plugin with only the SessionStart banner, for a session that runs without the
+ * proxy (MemTree paused: plain Claude Code, see paused-session.ts). No http hooks,
+ * commands or relays: nothing in it needs ccc's local server.
+ */
+export function createStartupBannerPlugin(startupMessage, opts = {}) {
+    const dir = fs.mkdtempSync(path.join(opts.tempRoot ?? os.tmpdir(), "ccc-notice-plugin-"));
+    const hooksDir = path.join(dir, "hooks");
+    fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const hooks = { SessionStart: [startupBannerHook(hooksDir, startupMessage)] };
+    writePluginFiles(dir, hooks);
+    let closed = false;
+    return {
+        dir,
+        close() {
+            if (closed)
+                return;
+            closed = true;
+            fs.rmSync(dir, { recursive: true, force: true });
+        },
+    };
+}
+/**
+ * SessionStart accepts only `command`/`mcp_tool` hooks, never `http`, so the
+ * banner is baked into a static file the command simply cats. It must NOT be
+ * `echo`'d: sh and zsh expand backslash escapes, turning the JSON's \n into a
+ * raw newline and silently corrupting the payload.
+ */
+function startupBannerHook(hooksDir, message) {
+    fs.writeFileSync(path.join(hooksDir, STARTUP_NOTICE_FILE), JSON.stringify({ systemMessage: message }), { mode: 0o600 });
+    return {
+        // A compaction continues the same conversation; only real session
+        // starts (fresh, --resume, /clear) re-show the banner.
+        matcher: "startup|resume|clear",
+        hooks: [
+            {
+                type: "command",
+                command: `cat ${singleQuoteForShell(path.join(hooksDir, STARTUP_NOTICE_FILE))}`,
+                timeout: 5,
+            },
+        ],
+    };
+}
+/** The manifest and hooks.json every ccc session plugin has. */
+function writePluginFiles(dir, hooks) {
+    fs.writeFileSync(path.join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({
+        // Claude Code lists plugin commands as `/<name>:<command>`, so this
+        // short name is what users see: `/ccc:memtree`, `/ccc:memtree-view`, …
+        name: SESSION_PLUGIN_NAME,
+        version: "1.0.0",
+        description: "Session-only display hooks for Claude Code Infinite",
+    }), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "hooks", "hooks.json"), JSON.stringify({ description: "Display MemTree state", hooks }), { mode: 0o600 });
 }
 /**
  * POSIX single-quoting: everything inside is literal, and an embedded quote is

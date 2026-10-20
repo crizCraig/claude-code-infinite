@@ -291,6 +291,14 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
      */
     resumeLink?: boolean;
 }): SessionNoticePlugin;
+/**
+ * A plugin with only the SessionStart banner, for a session that runs without the
+ * proxy (MemTree paused: plain Claude Code, see paused-session.ts). No http hooks,
+ * commands or relays: nothing in it needs ccc's local server.
+ */
+export declare function createStartupBannerPlugin(startupMessage: string, opts?: {
+    tempRoot?: string;
+}): SessionNoticePlugin;
 /** Return true only for known Claude versions that support MessageDisplay. */
 export declare function supportsMessageDisplay(versionOutput: string): boolean;
 export {};

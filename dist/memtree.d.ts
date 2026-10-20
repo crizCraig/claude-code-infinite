@@ -19,6 +19,7 @@
 import { type FinalReplyReader } from "./final-index.js";
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
+import type { PaymentLinkCache } from "./payment-link.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 /**
@@ -53,6 +54,11 @@ export interface MemtreeOptions {
      * the `memtree` MCP server is configured for the session (memtree-mcp-config.ts).
      */
     memtreeTools?: string;
+    /**
+     * The short checkout link (payment-link.ts): fetched on the first 402 and put in
+     * place of the 402 detail's long `/payment?…` link in every paused notice.
+     */
+    paymentLinks?: PaymentLinkCache;
 }
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
@@ -322,6 +328,7 @@ export declare class MemtreeClient {
     private readonly finalIndexed;
     private readonly finalPreparing;
     private finalDrainDeadline;
+    private readonly paymentLinks;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     private unpaidDetail;
     /** Whether the latest call that got an answer, or timed out, got a 402. */
@@ -341,6 +348,12 @@ export declare class MemtreeClient {
      * relies on this instead.
      */
     get pausedDetail(): string | null;
+    /**
+     * Wait at most `ms` for a short checkout link already being fetched, so a
+     * notice about to be built from the 402 detail can show it. Never throws.
+     */
+    paymentLinkSettled(ms: number): Promise<void>;
+    private withShortLink;
     /** polychat's usage dashboard for this client's environment (its base URL). */
     get usageDashboardUrl(): string | undefined;
     /**
