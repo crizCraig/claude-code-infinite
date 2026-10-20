@@ -26,9 +26,10 @@ import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColo
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, updateNoticeText, } from "./notices.js";
-import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
+import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
+import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
@@ -52,8 +53,6 @@ import { exitResumeHint } from "./resume-hint.js";
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
-// utm_source=ccc: signups from this link are attributed to ccc (polychat docs/signup_sources.md).
-const POLYCHAT_AUTH_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
@@ -74,9 +73,7 @@ function openUrl(url) {
 }
 async function promptForApiKey(mode, output) {
     const rl = readline.createInterface({ input: process.stdin, output });
-    const url = mode === "local"
-        ? "http://local.polychat.co:5173/memtree-api"
-        : POLYCHAT_AUTH_URL;
+    const url = mode === "local" ? LOCAL_KEY_PAGE_URL : KEY_PAGE_URL;
     // The label is a clickable link (OSC 8) where the terminal supports it, and
     // the URL is printed too, for other terminals and for opening it elsewhere.
     console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
@@ -92,41 +89,48 @@ async function promptForApiKey(mode, output) {
     });
 }
 /**
- * Startup payment check: GET /v1/context_memory/status, so an unpaid key is
- * handled BEFORE the first degraded turn. The endpoint may not be deployed
- * yet — 404/405/401/503, network errors, timeouts and unexpected bodies all
- * mean "unknown" (null): the caller stays quiet. Bounded by a short timeout
- * and never throws, so startup is never gated on polychat availability.
+ * The startup check said the key is invalid (401/403): interactive runs get
+ * the paste-a-new-key gate (q quits, c carries on without MemTree, like the
+ * payment gate); print/non-TTY runs get one line on stderr and carry on.
+ * Anything else passes through unchanged.
  */
-async function fetchPaymentStatus(baseUrl, apiKey, timeoutMs = 2000, diagnostics) {
-    try {
-        const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
-            headers: {
-                authorization: `Bearer ${apiKey}`,
-                "x-client": CLIENT_NAME,
-                "x-client-version": CLIENT_VERSION,
-            },
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!res.ok) {
-            diagnostics?.record("key_status", {
-                result: res.status === 401 ? "invalid" : res.status === 402 ? "payment_required" : "unknown",
-                status: res.status,
-            });
-            return null;
-        }
-        const status = parsePaymentStatus(await res.json());
-        diagnostics?.record("key_status", {
-            result: status?.paid === false ? "payment_required" : status ? "ok" : "unknown",
-            status: res.status,
-        });
-        return status;
+async function handleInvalidKey(check, ctx) {
+    if (check === "invalid" && ctx.interactive)
+        ctx.diagnostics.flushNow(); // may quit at the gate
+    const color = terminalSupportsColor();
+    const result = await resolveInvalidKey(check, ctx.apiKey, {
+        interactive: ctx.interactive,
+        command: ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`,
+        keyPageUrl: keyPageUrl(ctx.baseUrl),
+        // console.log is routed to stderr (uncoloured off a terminal) in print/non-TTY runs.
+        stderrLine: (text) => console.log(text),
+        ask: askLine,
+        open: openUrl,
+        warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
+        say: (text) => console.log(text),
+        check: (apiKey) => fetchKeyStatus(ctx.baseUrl, apiKey, { diagnostics: ctx.diagnostics }),
+        saveKey: (apiKey) => saveApiKey(ctx.mode, apiKey, ctx.diagnostics),
+    });
+    if (result === "quit") {
+        await ctx.diagnostics.flush();
+        process.exit(0);
     }
-    catch (err) {
-        if (diagnostics)
-            recordError(diagnostics, "status_probe_failed", err);
-        return null;
-    }
+    return result;
+}
+/** Save `apiKey` as this environment's key; diagnostics now go by it. */
+function saveApiKey(mode, apiKey, diagnostics) {
+    diagnostics.record("key_saved");
+    diagnostics.setApiKey(apiKey);
+    if (mode === "local")
+        setLocalPolychatApiKey(apiKey);
+    else if (mode === "staging")
+        setStagingPolychatApiKey(apiKey);
+    else
+        setPolychatApiKey(apiKey);
+}
+/** The payment status in a key check; null when the key is invalid or unknown. */
+function paymentOnly(check) {
+    return check === "invalid" ? null : check;
 }
 /**
  * Interactive gate for an unpaid key. The TUI covers the terminal within a
@@ -323,20 +327,10 @@ async function main() {
             await diagnostics.flush();
             process.exit(1);
         }
-        diagnostics.record("key_saved");
-        diagnostics.setApiKey(polychatApiKey);
-        if (mode === "local") {
-            setLocalPolychatApiKey(polychatApiKey);
-        }
-        else if (mode === "staging") {
-            setStagingPolychatApiKey(polychatApiKey);
-        }
-        else {
-            setPolychatApiKey(polychatApiKey);
-        }
+        saveApiKey(mode, polychatApiKey, diagnostics);
         console.log("API key saved.\n");
     }
-    // Check the key's payment status before claude takes over the terminal.
+    // Check the key (valid? paid?) before claude takes over the terminal.
     // Bounded (2s) and null on error — startup never fails or hangs on polychat
     // availability. The npm update check runs concurrently under the same
     // bound (1.5s, and usually answered from a day-long cache); its result goes
@@ -346,8 +340,8 @@ async function main() {
     // The project (directory, git repo, branch, commit) goes with every MemTree
     // call so sessions can be found by project; read once, never fails.
     const config = loadConfig();
-    const [paymentStatus, updateAvailable, projectMeta] = await Promise.all([
-        fetchPaymentStatus(memtreeBaseUrl, polychatApiKey, undefined, diagnostics),
+    const [keyCheck, updateAvailable, projectMeta] = await Promise.all([
+        fetchKeyStatus(memtreeBaseUrl, polychatApiKey, { diagnostics }),
         interactiveUi
             ? checkForUpdate({
                 currentVersion: CLIENT_VERSION,
@@ -357,18 +351,27 @@ async function main() {
             : Promise.resolve(null),
         readProjectMeta(process.cwd()),
     ]);
+    // A definite 401/403: the key is mistyped or revoked. Say so before claude
+    // starts; interactive runs may paste a new one, others carry on without MemTree.
+    const checked = await handleInvalidKey(keyCheck, {
+        mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey, interactive: interactiveUi, diagnostics,
+    });
+    polychatApiKey = checked.apiKey;
+    const paymentStatus = paymentOnly(checked.check);
+    const linkKey = polychatApiKey;
     // The short checkout link (payment-link.ts): the gate's, and later the
     // in-session paused notices' when the key runs out mid-session.
     const paymentLinks = new PaymentLinkCache(() => fetchPaymentLink({
-        baseUrl: memtreeBaseUrl, apiKey: polychatApiKey,
+        baseUrl: memtreeBaseUrl, apiKey: linkKey,
         headers: { "x-client": CLIENT_NAME, "x-client-version": CLIENT_VERSION },
     }));
     // Unpaid: [c] (or any print run) is plain Claude Code for this session, with
     // no MemTree calls that would only answer 402 (paused-session.ts).
     let memtreeOff = false;
     if (paymentStatus?.paid === false) {
+        const key = polychatApiKey;
         if (interactiveUi) {
-            memtreeOff = !(await runPaymentGate(paymentStatus, () => fetchPaymentStatus(memtreeBaseUrl, polychatApiKey), paymentLinks, diagnostics, resumesSession(claudeArgs)));
+            memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs)));
         }
         else {
             console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);

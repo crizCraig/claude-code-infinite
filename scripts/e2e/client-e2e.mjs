@@ -167,8 +167,11 @@ async function memtree() {
       }),
       signal: AbortSignal.timeout(60_000),
     });
-    assert(res.status === 200, `HTTP ${res.status}: ${tail(await res.text())}`);
-    const body = await res.json();
+    // Read the body once: a template literal evaluates eagerly, so `await res.text()` inside the
+    // assert message consumed the body even on success and res.json() then threw.
+    const raw = await res.text();
+    assert(res.status === 200, `HTTP ${res.status}: ${tail(raw)}`);
+    const body = JSON.parse(raw);
     assert(body.index_only === true, "not answered as an index-only call");
   });
   if (ok) await treeChecks("memtree", sessionId);

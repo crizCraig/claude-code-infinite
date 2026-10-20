@@ -21,6 +21,7 @@ import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
+import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
 /**
@@ -770,6 +771,8 @@ export class MemtreeClient {
     unpaidDetail = null;
     /** Whether the latest call that got an answer, or timed out, got a 402. */
     lastAnswerUnpaid = false;
+    /** Whether the latest call that got an answer, or timed out, refused the key (key-page.ts). */
+    lastAnswerKeyInvalid = false;
     /** Complete compression request key → whether its latest failure arms fuse. */
     compressFailureArming = new Map();
     /**
@@ -800,6 +803,18 @@ export class MemtreeClient {
         if (detail === null)
             return null;
         return withShortPaymentUrl(detail, this.paymentLinks?.current()?.url);
+    }
+    /**
+     * Whether the server's latest answer (or timeout) refused the key itself:
+     * 401, or 403 with polychat's detail (key-page.ts): a mistyped or revoked
+     * key. Cleared by any later answer.
+     */
+    get keyInvalid() {
+        return this.lastAnswerKeyInvalid;
+    }
+    /** Where to get a new key for this client's environment (its base URL). */
+    get keyPageUrl() {
+        return keyPageUrl(this.baseUrl);
     }
     /** polychat's usage dashboard for this client's environment (its base URL). */
     get usageDashboardUrl() {
@@ -1320,6 +1335,7 @@ export class MemtreeClient {
         const started = Date.now();
         let status;
         let ok = false;
+        let keyRefused = false;
         let diagnostics = {};
         const controller = new AbortController();
         const abort = () => controller.abort();
@@ -1357,6 +1373,7 @@ export class MemtreeClient {
                     // Shared, cached and backed off: one request per hour at most while paused.
                     void this.paymentLinks?.get();
                 }
+                keyRefused = isKeyRejected(response.status, text);
                 // The status rides on the error so compress() can classify the
                 // failure for the fuse without parsing message text.
                 throw Object.assign(new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`), { status: response.status });
@@ -1407,9 +1424,11 @@ export class MemtreeClient {
             // A call the caller aborted says nothing about the server.
             // A background index call that failed otherwise (a timeout, a 413 on a big
             // body) is no news about payment; a compress call's answer always is.
-            const news = status === 402 || ok || !opts.indexOnly;
+            // A refused key is news from any call, like a 402.
+            const news = status === 402 || keyRefused || ok || !opts.indexOnly;
             if (news && (status !== undefined || !opts.signal?.aborted)) {
                 this.lastAnswerUnpaid = status === 402;
+                this.lastAnswerKeyInvalid = keyRefused;
             }
             // One JSONL line per MemTree call, success or failure; `status` stays
             // absent when the call never got a response (network error/timeout).

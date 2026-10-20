@@ -120,6 +120,7 @@ import {
 } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
+import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText,
   subscribeUrlFromDetail } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -390,6 +391,12 @@ interface MemtreePage {
 interface ProxyState {
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
   paymentNotice: PaymentNoticeThrottle;
+  /** Invalid-key (401/403) notice throttle, on the payment notice's interval. */
+  keyNotice: PaymentNoticeThrottle;
+  /** Whether MemTree's latest answer refused the key (MemtreeClient.keyInvalid). */
+  keyInvalid: () => boolean;
+  /** Where to get a new MemTree key (MemtreeClient.keyPageUrl). */
+  keyPageUrl: string;
   /**
    * Sessions shown the paused notice's near-the-window line: once per session,
    * past the throttle, since /compact only works while the conversation fits.
@@ -893,6 +900,9 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const state: ProxyState = {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
+    keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
+    keyInvalid: () => opts.memtree.keyInvalid,
+    keyPageUrl: opts.memtree.keyPageUrl,
     pausedNearWindowWarned: new Set(),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
     pausedDetail: () => opts.memtree.pausedDetail,
@@ -2506,7 +2516,15 @@ async function handleMessages(
     const mayQueueNotice =
       displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
     const overBudget = reachedBudget(rec.compaction);
-    if (mayQueueNotice && paymentDetail !== null &&
+    if (state.keyInvalid()) {
+      // A refused key (401/403) says why MemTree is off and how to fix it;
+      // throttled like the payment notice, and quiet in between.
+      if (mayQueueNotice && state.keyNotice.due()) {
+        // A refusal of this very request says the same and withdraws it.
+        pausedNotices.set(rec, state.notices.queueSuffix(keyInvalidNoticeText(state.keyPageUrl),
+          () => state.keyNotice.markShown(), noticePromptId));
+      }
+    } else if (mayQueueNotice && paymentDetail !== null &&
         (state.paymentNotice.due() || (overBudget && !nearWindowWarned(state, sessionId)))) {
       // A paused refusal of this very request withdraws it (refuseWholeRequest),
       // and any later one withdraws its near-window line.
@@ -4902,7 +4920,8 @@ async function recoverToolRouteMiss(args: {
     // or a shutting-down proxy gets no retry.
     if (
       !state.shutdownSignal.aborted &&
-      opts.memtree.paymentRequiredDetail === null
+      opts.memtree.paymentRequiredDetail === null &&
+      !opts.memtree.keyInvalid // a refused key refuses the index too
     ) {
       opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta, transcriptTimesFor(opts, requestSessionId(req), agentAttributionId(req)));
     }
@@ -5389,8 +5408,11 @@ function refuseWholeRequest(
   inputTokens: number,
   budgetTokens: number
 ): false {
-  const unpaid = args.state.pausedDetail();
-  const failure = unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
+  // A refused key or a paused one: a retry cannot fix either, so it is final at once.
+  const keyInvalid = args.state.keyInvalid();
+  const unpaid = keyInvalid ? null : args.state.pausedDetail();
+  const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
+    : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
     : args.state.fallbackFailures.fail(args.routeKey,
       { awaitingIndex: args.rec.indexBehind === true });
   args.rec.forwardedBytes = 0;
@@ -5405,14 +5427,17 @@ function refuseWholeRequest(
     inputTokens, outputTokens: args.body.max_tokens ?? 0,
     outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
     budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
+    ...(keyInvalid ? { keyInvalid: true } : {}),
   };
-  if (unpaid !== null) cancelPausedNotice(args.state, args.rec);
+  if (unpaid !== null || keyInvalid) cancelPausedNotice(args.state, args.rec);
   if (args.res.headersSent || args.res.destroyed) return false;
   args.res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
   args.res.end(JSON.stringify(failure.body));
   if (unpaid !== null) {
     notePausedRefusal(args.state, args.rec, args.routeKey, requestSessionId(args.req));
   }
+  // The refusal named the key: it counts as the key notice on the user's screen.
+  if (keyInvalid && args.rec.routeLane === "main") args.state.keyNotice.markShown();
   return false;
 }
 
@@ -5457,6 +5482,7 @@ function cancelPausedNotice(state: ProxyState, rec: MessagesRecord): void {
 function warnPausedNearWindow(
   state: ProxyState, rec: MessagesRecord, sessionId: string | undefined
 ): void {
+  if (state.keyInvalid()) return; // a refused key, not a pause: the key notice says why
   const detail = state.unpaidDetail();
   // Paid again: a later pause (next month's limit) warns afresh.
   if (detail === null) state.pausedNearWindowWarned.clear();
