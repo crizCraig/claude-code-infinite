@@ -69,7 +69,7 @@ test("malformed answers and entries are dropped", () => {
   assert.ok(formatProjectTrees(parsed, undefined).includes("line one line two"), "one line each");
 });
 
-test("the project is owner/repo when known, else the directory", () => {
+test("the project is the origin remote's owner/repo, never a bare directory", () => {
   assert.equal(projectIdentity({ git_repo: "o/r", project_dir: "d" }), "o/r");
   assert.equal(projectIdentity({ project_dir: "d" }), undefined, "a bare directory name is too loose");
   assert.equal(projectIdentity({}), undefined);
