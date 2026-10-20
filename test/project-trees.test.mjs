@@ -107,15 +107,21 @@ test("a slow, failed or old server adds nothing and never throws", async () => {
     hint.prefetch();
     assert.equal(await hint.contextFor("s"), undefined);
   }
-  let release;
-  const { hint } = scripted(() => new Promise((resolve) => { release = resolve; }), 20);
-  hint.prefetch();
-  const started = Date.now();
-  assert.equal(await hint.contextFor("s"), undefined, "does not wait past its bound");
-  assert.ok(Date.now() - started < 1_000);
-  release({ trees: [tree("late", 3)] });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.ok((await hint.contextFor("s")).includes("late-req"), "a late answer serves the next start");
+  // The hint's own timer is unref'd (it never holds ccc open); keep the loop alive here.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    let release;
+    const { hint } = scripted(() => new Promise((resolve) => { release = resolve; }), 20);
+    hint.prefetch();
+    const started = Date.now();
+    assert.equal(await hint.contextFor("s"), undefined, "does not wait past its bound");
+    assert.ok(Date.now() - started < 1_000);
+    release({ trees: [tree("late", 3)] });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok((await hint.contextFor("s")).includes("late-req"), "a late answer serves the next start");
+  } finally {
+    clearInterval(keepAlive);
+  }
 });
 
 test("a fresh answer is reused; an old server is not asked again", async () => {
