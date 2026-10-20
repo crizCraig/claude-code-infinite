@@ -23,6 +23,8 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
+import type { PaymentLinkCache } from "./payment-link.js";
+import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import {
   stripCcSystemReminders,
@@ -84,6 +86,11 @@ export interface MemtreeOptions {
    * the `memtree` MCP server is configured for the session (memtree-mcp-config.ts).
    */
   memtreeTools?: string;
+  /**
+   * The short checkout link (payment-link.ts): fetched on the first 402 and put in
+   * place of the 402 detail's long `/payment?…` link in every paused notice.
+   */
+  paymentLinks?: PaymentLinkCache;
 }
 
 /**
@@ -969,6 +976,7 @@ export class MemtreeClient {
   private readonly finalIndexed = new Map<string, string>();
   private readonly finalPreparing = new Map<string, AbortController>();
   private finalDrainDeadline: number | undefined;
+  private readonly paymentLinks: PaymentLinkCache | undefined;
   /** FastAPI `detail` text from the most recent 402, or null while paid. */
   private unpaidDetail: string | null = null;
   /** Whether the latest call that got an answer, or timed out, got a 402. */
@@ -984,7 +992,7 @@ export class MemtreeClient {
    * background-indexing calls; cleared by any subsequent success.
    */
   get paymentRequiredDetail(): string | null {
-    return this.unpaidDetail;
+    return this.withShortLink(this.unpaidDetail);
   }
 
   /**
@@ -994,7 +1002,20 @@ export class MemtreeClient {
    * relies on this instead.
    */
   get pausedDetail(): string | null {
-    return this.lastAnswerUnpaid ? this.unpaidDetail : null;
+    return this.lastAnswerUnpaid ? this.withShortLink(this.unpaidDetail) : null;
+  }
+
+  /**
+   * Wait at most `ms` for a short checkout link already being fetched, so a
+   * notice about to be built from the 402 detail can show it. Never throws.
+   */
+  paymentLinkSettled(ms: number): Promise<void> {
+    return this.paymentLinks?.settled(ms) ?? Promise.resolve();
+  }
+
+  private withShortLink(detail: string | null): string | null {
+    if (detail === null) return null;
+    return withShortPaymentUrl(detail, this.paymentLinks?.current()?.url);
   }
 
   /**
@@ -1087,6 +1108,7 @@ export class MemtreeClient {
     this.debug = opts.debug ?? false;
     this.reqlog = opts.reqlog;
     this.memtreeTools = opts.memtreeTools || undefined;
+    this.paymentLinks = opts.paymentLinks;
   }
 
   static hashMessages(messages: Message[]): string {
@@ -1658,6 +1680,8 @@ export class MemtreeClient {
         const text = await response.text().catch(() => "");
         if (response.status === 402) {
           this.unpaidDetail = extract402Detail(text);
+          // Shared, cached and backed off: one request per hour at most while paused.
+          void this.paymentLinks?.get();
         }
         keyRefused = isKeyRejected(response.status, text);
         // The status rides on the error so compress() can classify the

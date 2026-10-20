@@ -5,6 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -167,4 +168,58 @@ test("ccc -p: the sign-in Claude Code last sent through ccc decides when the con
   assert.doesNotMatch(max.stderr, /Pro or Max plan/, "a /login to Max since then wins");
   const key = await runCcc(["-p", "hi"], {}, { seenAuth: "api_key" });
   assert.match(key.stderr, NO_PLAN);
+});
+
+/** A fake MemTree server that says the key is unpaid, on a free port. */
+function fakeUnpaidServer(requests) {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      req.resume();
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/v1/context_memory/status") {
+        res.end(JSON.stringify({ paid: false, payment_message: "Please subscribe." }));
+      } else {
+        res.statusCode = 402;
+        res.end(JSON.stringify({ detail: "Payment required" }));
+      }
+    });
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+}
+
+const localBase = (server) => ({ CCC_LOCAL_BASE_URL: `http://127.0.0.1:${server.address().port}` });
+
+test("ccc -p with an unpaid key: one stderr line, then plain Claude Code with no MemTree calls", { timeout: 30_000 }, async () => {
+  const requests = [];
+  const server = await fakeUnpaidServer(requests);
+  try {
+    const { code, stdout, stderr } = await runCcc(["-p", "hi"], localBase(server));
+    assert.equal(code, 0, stderr);
+    // No memtree MCP server or plugin: Claude Code's own argv, exactly.
+    assert.deepEqual(JSON.parse(stdout.trim()).args, ["-p", "hi"]);
+    assert.equal(stderr.split("\n").filter((l) => /MemTree is paused/.test(l)).length, 1, stderr);
+    assert.match(stderr, /plain Claude Code/);
+    assert.doesNotMatch(stderr, /Request log:/, "no proxy was started");
+    assert.deepEqual(requests, ["GET /v1/context_memory/status"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session may be past the window)", { timeout: 30_000 }, async () => {
+  const requests = [];
+  const server = await fakeUnpaidServer(requests);
+  try {
+    const id = "6472823f-ca4f-4027-9b89-64a81c367dc3";
+    const { code, stdout, stderr } = await runCcc(["-p", "--resume", id, "hi"], localBase(server));
+    assert.equal(code, 0, stderr);
+    const { args } = JSON.parse(stdout.trim());
+    assert.match(args[0], /^--mcp-config=/, "still through ccc");
+    assert.deepEqual(args.slice(-4), ["-p", "--resume", id, "hi"]);
+    assert.match(stderr, /Request log:/);
+    assert.match(stderr, /resumed session runs uncompressed/);
+  } finally {
+    server.close();
+  }
 });

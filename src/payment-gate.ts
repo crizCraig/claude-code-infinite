@@ -2,27 +2,56 @@
  * Startup payment gate for interactive `ccc` sessions.
  *
  * GET /v1/context_memory/status says whether the MemTree key is paid up. When
- * it is not, the launcher used to print a warning and start claude anyway —
- * but the TUI covers the terminal within a second, so the warning was never
- * read. Instead, an unpaid interactive session now stops on a prompt:
+ * it is not, an interactive session stops on a short prompt before Claude Code
+ * takes the terminal (the TUI would cover a printed warning within a second):
  *
- *   [Enter] subscribe now   [c] use claude without MemTree   [q] quit
+ *   MemTree is paused: your free credit is used up.
+ *   Without it, long sessions hit the context limit and get compacted, losing information,
+ *   and your sessions aren't saved or searchable.
+ *   Starter is $5/month: https://app.polychat.co/p/Ab3xY9…
+ *   [Enter] subscribe ($5/mo)   [c] continue without MemTree   [q] quit:
+ *
+ * The plan, price, reason and short link come from POST /v1/payment/link
+ * (payment-link.ts); an older server without it gets the status probe's
+ * `/payment?…` link and the plan named in its prose.
  *
  * Everything that needs no terminal lives here so it can be unit-tested:
  * parsing the status body, formatting the notice, and mapping keystrokes to a
- * choice. The prompt loop itself is in cli.ts.
+ * choice. The prompt loop itself is in cli-main.ts.
  */
+
+import {
+  type PaymentLink,
+  REASON_FREE_CREDIT_USED,
+  REASON_PLAN_LIMIT,
+  formatUsd,
+} from "./payment-link.js";
 
 export const FALLBACK_SUBSCRIBE_URL = "https://polychat.co/pricing";
 
 /** Query flag on the checkout link so the server's success page says "go back to your terminal". */
 export const CHECKOUT_SOURCE_PARAM = "source=ccc";
 
-export const PAYMENT_GATE_HEADLINE =
-  "⚠ MemTree is off — payment required (compression + indexing disabled).";
-
-export const PAYMENT_GATE_PROMPT =
-  "[Enter] subscribe now   [c] use claude without MemTree   [q] quit: ";
+export const PAUSED_FREE_CREDIT_HEADLINE = "MemTree is paused: your free credit is used up.";
+export const PAUSED_PLAN_LIMIT_HEADLINE = "MemTree is paused: your plan's usage limit is reached.";
+export const PAUSED_HEADLINE = "MemTree is paused: payment required.";
+/**
+ * What a paused session runs without. With [c] ccc starts plain Claude Code
+ * (cli-main.ts), whose own auto-compaction summarizes a long session, and nothing
+ * reaches MemTree, so the session is not indexed, saved there, or searchable.
+ */
+export const PAUSED_LOSS_LINES =
+  "Without it, long sessions hit the context limit and get compacted, losing\n" +
+  "information, and your sessions aren't saved or searchable.";
+/** After [c]: the session runs as plain Claude Code; the next start checks again. */
+export const MEMTREE_OFF_LINE =
+  "MemTree is off for this session. ccc checks again the next time you start it.";
+/** Print/non-TTY runs of an unpaid key: one stderr line, then plain Claude Code. */
+export const RESUMED_PAUSED_LINE =
+  "MemTree is paused, so this resumed session runs uncompressed. ccc checks again next start.";
+export const PRINT_PAUSED_LINE =
+  "ccc: MemTree is paused (payment required), so this run is plain Claude Code. " +
+  "Run ccc in a terminal to subscribe.";
 
 export type PaymentStatus = {
   paid: boolean;
@@ -35,8 +64,12 @@ export type PaymentStatus = {
 export type PaymentChoice = "subscribe" | "continue" | "quit";
 
 const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
+/** The short checkout link (payment-link.ts) that ccc puts in place of the `/payment?…` one. */
+const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
 // "we recommend 🌱 Starter plan for $5/month" → plan name + price.
 const RECOMMENDED_PLAN_RE = /recommend\s+(?:\S+\s+)?([A-Za-z][\w ]*?plan)\s+for\s+(\$[\d.]+\/month)/i;
+// No quotes, `$`, backticks or bare `%` (cmd.exe expands %VAR% when Windows opens it).
+const SAFE_URL_RE = /^https?:\/\/(?:[^\s"'`$<>%\\\u0000-\u001f\u007f-\u009f]|%[0-9A-Fa-f]{2})+$/;
 // C0 controls, DEL, and C1 controls.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 
@@ -57,7 +90,9 @@ export function parsePaymentStatus(body: unknown): PaymentStatus | null {
     typeof record.payment_url === "string" && record.payment_url.trim()
       ? record.payment_url.trim()
       : null;
-  const url = explicitUrl ?? extractPaymentUrl(message);
+  const found = explicitUrl ?? extractPaymentUrl(message);
+  // Printed and handed to the browser opener: a plain http(s) URL only.
+  const url = found && SAFE_URL_RE.test(found) ? found : null;
   return {
     paid: record.paid,
     message,
@@ -65,35 +100,67 @@ export function parsePaymentStatus(body: unknown): PaymentStatus | null {
   };
 }
 
-/** Append `source=ccc` to a checkout link (idempotent). */
+/** Append `source=ccc` to a `/payment?…` link (idempotent); a short link already implies it. */
 export function withCheckoutSource(url: string): string {
-  if (url.includes(CHECKOUT_SOURCE_PARAM)) return url;
+  if (url.includes(CHECKOUT_SOURCE_PARAM) || SHORT_PAYMENT_URL_RE.test(url)) return url;
   return `${url}${url.includes("?") ? "&" : "?"}${CHECKOUT_SOURCE_PARAM}`;
 }
 
-/** First `/payment?…` link in a payment prompt, or null. */
+/** The short checkout link in a payment prompt, else its first `/payment?…` link, else null. */
 export function extractPaymentUrl(message: string | null): string | null {
   if (!message) return null;
-  const match = PAYMENT_URL_RE.exec(message);
+  const match = SHORT_PAYMENT_URL_RE.exec(message) ?? PAYMENT_URL_RE.exec(message);
   return match ? match[0] : null;
 }
 
 /**
- * Terminal text for an unpaid key: the headline and one line with the
- * recommended plan (when the server's prose names one) and the subscribe
- * link. The full server message is deliberately not echoed — it is several
- * paragraphs written for a chat window, and the prompt below is the point.
+ * A 402 detail with its `/payment?…` link replaced by the short one, so every
+ * in-session notice built from it shows the short link. Unchanged without either.
+ */
+export function withShortPaymentUrl(detail: string, shortUrl: string | null | undefined): string {
+  if (!shortUrl) return detail;
+  return detail.replace(new RegExp(PAYMENT_URL_RE.source, "g"), () => shortUrl);
+}
+
+/**
+ * The gate's text, at most four lines above the prompt: why MemTree is paused,
+ * what the session loses without it, and the plan, price and link. The full
+ * server message is deliberately not echoed: it is several paragraphs written
+ * for a chat window, and the prompt below is the point.
  */
 export function formatPaymentNotice(
   status: PaymentStatus,
-  options: { hyperlinks?: boolean } = {}
+  options: { hyperlinks?: boolean; color?: boolean; link?: PaymentLink | null } = {}
 ): string {
-  const plan = extractRecommendedPlan(status.message);
-  const url = status.url ?? FALLBACK_SUBSCRIBE_URL;
-  if (!options.hyperlinks) return `${PAYMENT_GATE_HEADLINE}\n  ${plan ? `${plan}: ` : ""}${url}`;
-  // Interactive terminals: the plan name is an OSC 8 link to checkout, and the
-  // URL is printed below it for terminals without hyperlinks (and to copy).
-  return `${PAYMENT_GATE_HEADLINE}\n  ${hyperlink(plan ?? "Subscribe", url)}\n  ${url}`;
+  const link = options.link ?? null;
+  const headline = pausedHeadline(link?.reason ?? null);
+  const url = link?.url ?? status.url ?? FALLBACK_SUBSCRIBE_URL;
+  const shownUrl = options.hyperlinks ? hyperlink(url, url) : url;
+  return [
+    options.color ? `\x1b[1;33m${headline}\x1b[0m` : headline,
+    PAUSED_LOSS_LINES,
+    `${offerLabel(status, link)}: ${shownUrl}`,
+  ].join("\n");
+}
+
+/** The prompt line, with the server's price when it gave one. */
+export function paymentGatePrompt(link: PaymentLink | null = null): string {
+  const verb = link?.reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe";
+  const price = link ? ` (${formatUsd(link.monthlyPriceUsd)}/mo)` : "";
+  return `[Enter] ${verb}${price}   [c] continue without MemTree   [q] quit: `;
+}
+
+/** The first line: why MemTree is paused, as far as the server said. */
+export function pausedHeadline(reason: string | null): string {
+  if (reason === REASON_FREE_CREDIT_USED) return PAUSED_FREE_CREDIT_HEADLINE;
+  if (reason === REASON_PLAN_LIMIT) return PAUSED_PLAN_LIMIT_HEADLINE;
+  return PAUSED_HEADLINE;
+}
+
+/** "Starter is $5/month", else the old server's "Starter plan, $5/month", else "Subscribe". */
+function offerLabel(status: PaymentStatus, link: PaymentLink | null): string {
+  if (link) return `${link.plan} is ${formatUsd(link.monthlyPriceUsd)}/month`;
+  return extractRecommendedPlan(status.message) ?? "Subscribe";
 }
 
 /** OSC 8 terminal hyperlink: `text` shown, `url` opened on click. */

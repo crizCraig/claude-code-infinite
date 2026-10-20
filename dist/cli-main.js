@@ -25,8 +25,10 @@ import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
-import { startupNoticeText } from "./notices.js";
-import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, hyperlink, } from "./payment-gate.js";
+import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, updateNoticeText, } from "./notices.js";
+import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
+import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
+import { resumesSession, runWithoutMemtree } from "./paused-session.js";
 import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
@@ -133,33 +135,35 @@ function paymentOnly(check) {
 /**
  * Interactive gate for an unpaid key. The TUI covers the terminal within a
  * second of launch, so a printed warning is never read; instead stop here
- * until the user picks: subscribe now (open the checkout link, then wait for
- * the webhook to flip the key to paid), use claude without MemTree (launch
- * uncompressed, the in-session notice still fires), or quit.
+ * until the user picks: subscribe now (open the short checkout link, then wait
+ * for the webhook to flip the key to paid), continue without MemTree (plain
+ * Claude Code for this session), or quit. Resolves true when MemTree is on.
  */
-async function runPaymentGate(status, recheck, diagnostics) {
-    let current = status;
+async function runPaymentGate(status, recheck, links, diagnostics, resumed) {
+    const color = terminalSupportsColor();
     for (;;) {
-        console.warn(`\x1b[1;33m${formatPaymentNotice(current, { hyperlinks: true })}\x1b[0m\n`);
-        const choice = parsePaymentChoice(await askLine(PAYMENT_GATE_PROMPT));
+        const link = await links.get();
+        console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
+        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
         diagnostics.record("payment_gate", { choice });
         if (choice === "quit") {
             await diagnostics.flush();
             process.exit(0);
         }
         if (choice === "continue") {
-            console.log("\nStarting claude without MemTree.\n");
-            return;
+            console.log(`\n${resumed ? RESUMED_PAUSED_LINE : MEMTREE_OFF_LINE}\n`);
+            return false;
         }
-        openUrl(current.url ?? FALLBACK_SUBSCRIBE_URL);
+        // A link left on screen past its hour is replaced before it is opened.
+        openUrl((await links.get())?.url ?? status.url ?? FALLBACK_SUBSCRIBE_URL);
         console.log("\nOpened the subscribe page. Waiting for payment to complete…");
         const paid = await waitUntilPaid(recheck, SUBSCRIBE_WAIT_MS, SUBSCRIBE_POLL_MS);
         diagnostics.record("payment_gate", { choice: paid ? "paid" : "still_unpaid" });
         if (paid) {
             console.log("\x1b[1;32m✓ MemTree is on — thank you.\x1b[0m\n");
-            return;
+            return true;
         }
-        console.warn("\nStill unpaid.\n");
+        console.warn("\nStill unpaid.");
     }
 }
 /** Poll the status probe until it reports paid, or give up after `totalMs`. */
@@ -274,7 +278,8 @@ async function main() {
     else if (mode === "staging") {
         console.log("\x1b[1;35m🚧 STAGING MODE\x1b[0m\n");
     }
-    const memtreeBaseUrl = mode === "local" ? LOCAL_BASE_URL :
+    // CCC_LOCAL_BASE_URL: local mode's server elsewhere than :8080 (tests use a free port).
+    const memtreeBaseUrl = mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
     // Get or prompt for the MemTree API key (separate keys per environment)
@@ -353,13 +358,24 @@ async function main() {
     });
     polychatApiKey = checked.apiKey;
     const paymentStatus = paymentOnly(checked.check);
+    const linkKey = polychatApiKey;
+    // The short checkout link (payment-link.ts): the gate's, and later the
+    // in-session paused notices' when the key runs out mid-session.
+    const paymentLinks = new PaymentLinkCache(() => fetchPaymentLink({
+        baseUrl: memtreeBaseUrl, apiKey: linkKey,
+        headers: { "x-client": CLIENT_NAME, "x-client-version": CLIENT_VERSION },
+    }));
+    // Unpaid: [c] (or any print run) is plain Claude Code for this session, with
+    // no MemTree calls that would only answer 402 (paused-session.ts).
+    let memtreeOff = false;
     if (paymentStatus?.paid === false) {
         const key = polychatApiKey;
         if (interactiveUi) {
-            await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), diagnostics);
+            memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs)));
         }
         else {
-            console.warn(`\x1b[1;33m${formatPaymentNotice(paymentStatus)}\x1b[0m`);
+            console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
+            memtreeOff = true;
         }
     }
     if (isDebugMode && updateAvailable) {
@@ -380,6 +396,14 @@ async function main() {
         console.log(`[DEBUG] ${autoUpdate.debugLine}`);
     diagnostics.setContext({ interactive: interactiveUi });
     recordAutoUpdateDecision(diagnostics, autoUpdate);
+    // A resumed session may be past the window under MemTree; plain Claude Code
+    // could not send or compact it, so it keeps ccc's paused handling (402 notices).
+    if (memtreeOff && !resumesSession(claudeArgs)) {
+        await runWithoutMemtree({
+            claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
+            banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate)),
+        });
+    }
     // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
     // successful notice claims, so incidents can be reconstructed after the
     // fact without --debug. Never blocks or throws.
@@ -412,6 +436,7 @@ async function main() {
         reqlog: observedLog,
         // Mutable below: a failed config write withdraws it before any call.
         memtreeTools: memtreeMcpPlan.tools.length ? memtreeMcpPlan.tools.join(",") : undefined,
+        paymentLinks,
     });
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
@@ -743,5 +768,12 @@ function budgetFromEnv(raw) {
         return undefined;
     }
     return budget;
+}
+/** The update line a paused session's banner carries (the normal banner's, see notices.ts). */
+function pausedUpdateLine(autoUpdate) {
+    const color = terminalSupportsColor();
+    if (autoUpdate?.bannerInstalled)
+        return updateInstalledNoticeText(autoUpdate.bannerInstalled, color);
+    return autoUpdate?.bannerUpdate ? updateNoticeText(autoUpdate.bannerUpdate, color) : null;
 }
 //# sourceMappingURL=cli-main.js.map
