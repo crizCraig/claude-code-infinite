@@ -111,10 +111,10 @@ test("info-only runs (--version, --help) get no line", async () => {
   for (const args of [["--version"], ["-v"], ["--help"], ["-h"], ["mcp", "--help"]]) {
     assert.equal(isInfoOnlyRun(args), true, args.join(" "));
   }
-  for (const sub of ["setup-token", "doctor", "update", "mcp", "config", "install", "plugin"]) {
+  for (const sub of ["setup-token", "doctor", "update", "upgrade", "mcp", "install", "plugins"]) {
     assert.equal(isInfoOnlyRun([sub, "x"]), true, sub);
   }
-  for (const args of [[], ["-p", "hi"], ["--resume"], ["-p", "--", "--help"], ["fix", "mcp"]]) {
+  for (const args of [[], ["-p", "hi"], ["--resume"], ["-p", "--", "--help"], ["fix", "mcp"], ["config", "the", "linter"]]) {
     assert.equal(isInfoOnlyRun(args), false, args.join(" "));
   }
 });

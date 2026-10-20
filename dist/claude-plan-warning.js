@@ -40,7 +40,7 @@ export function needsPlanWarning(input) {
 const INFO_FLAGS = ["--version", "-v", "--help", "-h"];
 /** Claude Code subcommands that start no session (`setup-token` makes a subscription token). */
 const NO_SESSION_COMMANDS = [
-    "setup-token", "doctor", "update", "mcp", "config", "install", "plugin",
+    "setup-token", "doctor", "update", "upgrade", "mcp", "install", "plugin", "plugins",
 ];
 /** `claude --version`, `claude doctor` and the like: no session, so no line. */
 export function isInfoOnlyRun(args) {
