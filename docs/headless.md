@@ -130,6 +130,8 @@ two). Other ways to see a tree:
 - `--resume requires a valid session ID`: the id was empty or mistyped; parse it from the JSON
   as above.
 - `A MemTree API key is required`: no key is saved for this user; run `ccc` once in a terminal.
+- `Your MemTree key isn't valid (revoked or mistyped)` (stderr): polychat refused the saved key.
+  The run carries on without MemTree; get a new key and run `ccc` in a terminal to paste it.
 - A call that hangs ~2 minutes then fails on a huge session: MemTree has no index for it yet
   (e.g. a session moved between machines or accounts). It indexes in the background; retry later.
 - Logs: `~/.claude-code-infinite/logs/requests.jsonl` (one line per request, no content).

@@ -4,7 +4,8 @@
 # Checks: scripts/e2e/client-e2e.mjs. The web, signup and payment checks run from the
 # polychat repo's e2e-daily workflow.
 #
-# Secrets (all optional; checks that need a missing one are SKIPPED, not failed):
+# Secrets live in the `e2e` environment (Settings > Environments), which only `main` can use,
+# so no other branch can read them. All optional (checks needing a missing one are SKIPPED):
 #   MEMTREE_E2E_KEY        MemTree key of the dedicated e2e-test account (never a real one;
 #                          the run fails if the key's email lacks "e2e-test")
 #   E2E_ANTHROPIC_API_KEY  low-limit Anthropic key for the one Haiku `-p` turn per OS
@@ -18,8 +19,6 @@ on:
   schedule:
     - cron: "17 13 * * *" # 06:17 Phoenix, quiet; before the 08:00 daily email
   workflow_dispatch:
-  push: # TEMPORARY: lets the branch be tested before merge; removed before merging
-    branches: [ci/e2e-daily]
 
 permissions:
   contents: read
@@ -36,6 +35,7 @@ jobs:
   client:
     name: ccc on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    environment: e2e # its secrets are readable from main only
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -101,6 +101,7 @@ jobs:
   alert:
     needs: client
     if: ${{ failure() }}
+    environment: e2e
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
