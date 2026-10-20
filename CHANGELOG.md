@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.27](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.26...v1.0.27) (2026-10-20)
+
+
+### Bug Fixes
+
+* a subscription on file always silences the no-plan line; skip Store app aliases ([7e8b7e6](https://github.com/crizCraig/claude-code-infinite/commit/7e8b7e65a6da5094a44539c02774e0ff4c6957bc))
+* credit advice only for API-key refusals; no no-plan line for non-session subcommands (review round 3) ([f8a991f](https://github.com/crizCraig/claude-code-infinite/commit/f8a991f811e8af2b238b2dfe3ff5820e8d0ebc1f))
+* first-ever MemTree notice no longer links the /report page ([787e7b8](https://github.com/crizCraig/claude-code-infinite/commit/787e7b8030a9356aea072f7add7561a73a7d1762))
+* no credit advice for a subscription's refusal; no line on --version/--help (review round 2) ([53f88f6](https://github.com/crizCraig/claude-code-infinite/commit/53f88f67b28f59a781e7d3b9f6aa22679e63862a))
+* no-plan line skip list follows Claude Code's subcommands (config is a prompt word now) ([ecf086f](https://github.com/crizCraig/claude-code-infinite/commit/ecf086fc40531721a699954922293bff752ab115))
+* warn before the first prompt when Claude Code has no Claude plan; spot the desktop app ([564bdee](https://github.com/crizCraig/claude-code-infinite/commit/564bdeef8f97e6f3e4cfd203cbc9734fe71c47e0))
+
 ## [1.0.26](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.25...v1.0.26) (2026-10-18)
 
 
