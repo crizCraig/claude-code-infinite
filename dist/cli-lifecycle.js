@@ -1,4 +1,5 @@
 import { constants as osConstants } from "node:os";
+import { signalName } from "./diagnostics-schema.js";
 /** Conventional shell status for a process terminated by a POSIX signal. */
 export function exitCodeForSignal(signal) {
     const signalNumber = osConstants.signals[signal];
@@ -9,6 +10,18 @@ export function exitCodeForChild(code, signal) {
     if (code !== null)
         return code;
     return signal === null ? 1 : exitCodeForSignal(signal);
+}
+/**
+ * Claude Code's exit for diagnostics: the status (clamped by the schema as
+ * `code`, unclamped as `code_raw`), its signal, and how long it ran.
+ */
+export function claudeExitFields(code, signal, startedAt, now = Date.now()) {
+    return {
+        code: code ?? undefined,
+        code_raw: code ?? undefined,
+        signal: signalName(signal),
+        uptime_ms: Math.max(0, now - startedAt),
+    };
 }
 /**
  * First signal forwards to the child and starts graceful shutdown; a second

@@ -67,3 +67,28 @@ test("settleWithin waits for the promise but never past its bound", async () => 
   await settleWithin(Promise.reject(new Error("x")), 5_000);
   assert.ok(Date.now() - started < 1_000, "a rejection settles at once");
 });
+
+// Claude Code's exit for diagnostics: the clamped code as before, plus the raw
+// value (Windows NTSTATUS codes such as 0xC0000005 arrive as 3221225477) and
+// how long Claude Code ran, so a crash at launch tells apart from a closed window.
+test("claude_exit fields: raw code and run time, sanitized by the schema", async () => {
+  const { claudeExitFields } = await import("../dist/cli-lifecycle.js");
+  const { sanitizeEvent } = await import("../dist/diagnostics-schema.js");
+  const ev = (fields) => sanitizeEvent("claude_exit", fields, 1);
+  assert.deepEqual(ev(claudeExitFields(3221225477, null, 1000, 1450)),
+    { code: 1000, code_raw: 3221225477, uptime_ms: 450, name: "claude_exit", t: 1 });
+  assert.deepEqual(ev(claudeExitFields(129, null, 0, 90_000)),
+    { code: 129, code_raw: 129, uptime_ms: 90_000, name: "claude_exit", t: 1 });
+  assert.deepEqual(ev(claudeExitFields(-1073741819, null, 5, 5)),
+    { code: -1000, code_raw: -1073741819, uptime_ms: 0, name: "claude_exit", t: 1 });
+  assert.deepEqual(ev(claudeExitFields(null, "SIGTERM", 0, 10)),
+    { signal: "SIGTERM", uptime_ms: 10, name: "claude_exit", t: 1 });
+  // Beyond a 32-bit status: clamped to its range, like every integer field.
+  assert.deepEqual(ev({ code_raw: 2 ** 40 }), { code_raw: 4294967295, name: "claude_exit", t: 1 });
+});
+
+test("console_closed: an event with no fields", async () => {
+  const { sanitizeEvent } = await import("../dist/diagnostics-schema.js");
+  assert.deepEqual(sanitizeEvent("console_closed", { path: "C:\\x" }, 2),
+    { name: "console_closed", t: 2 });
+});

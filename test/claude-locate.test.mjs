@@ -8,7 +8,10 @@ import os from "node:os";
 import path from "node:path";
 import crossSpawn from "cross-spawn";
 import {
+  CLAUDE_FOUND,
   CLAUDE_SOURCES,
+  claudeDesktopInstalled,
+  claudeDesktopOnlyText,
   claudeMissingText,
   cwdHintText,
   expandWindowsVars,
@@ -16,7 +19,7 @@ import {
   parseRegQueryPath,
   withClaudeOnPath,
 } from "../dist/claude-locate.js";
-import { CLAUDE_SOURCES as SCHEMA_SOURCES } from "../dist/diagnostics-schema.js";
+import { CLAUDE_FOUND as SCHEMA_FOUND, sanitizeContext } from "../dist/diagnostics-schema.js";
 
 const isWindows = process.platform === "win32";
 const W = path.win32;
@@ -134,8 +137,62 @@ test("cwd tip: System32 and the home folder get one line; a project folder gets 
   for (const line of [cwdHintText("C:\\Users\\ada", opts)]) assert.doesNotMatch(line, /\n/);
 });
 
-test("the diagnostics schema allows exactly the sources locate reports", () => {
-  assert.deepEqual([...SCHEMA_SOURCES], [...CLAUDE_SOURCES]);
+test("the diagnostics schema allows exactly the sources locate reports, plus desktop_only", () => {
+  assert.deepEqual([...CLAUDE_FOUND], [...CLAUDE_SOURCES, "desktop_only"]);
+  assert.deepEqual([...SCHEMA_FOUND], [...CLAUDE_FOUND]);
+  assert.deepEqual(sanitizeContext({ claude_found: "desktop_only" }), { claude_found: "desktop_only" });
+});
+
+// ---------------------------------------------------------------------------
+// The Claude desktop app: it is not the terminal CLI ccc runs
+// ---------------------------------------------------------------------------
+
+test("Windows: the desktop app's own claude.exe on PATH is not taken for the CLI", () => {
+  const squirrel = "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude";
+  const store = "C:\\Program Files\\WindowsApps\\Claude_1.2.3.0_x64__pzs8sxrjxfjjc\\app";
+  for (const dir of [squirrel, `${squirrel}\\app-1.2.3`, store]) {
+    const env = { ...WIN_ENV, Path: `${dir};${WIN_ENV.Path}` };
+    const locate = (files) => locateClaude({
+      platform: "win32", env, homedir: "C:\\Users\\ada", isExecutable: fakeFs(files, "win32"),
+      registryPath: () => [dir], listDir: () => [],
+    });
+    assert.equal(locate([`${dir}\\claude.exe`]), null, dir);
+    // The real CLI later on PATH: by its full path, since `claude` would start the desktop app.
+    const cli = "C:\\Program Files\\nodejs\\claude.cmd";
+    assert.deepEqual(locate([`${dir}\\claude.exe`, cli]),
+      { command: cli, source: "path", dir: "C:\\Program Files\\nodejs" });
+    const exe = "C:\\Users\\ada\\.local\\bin\\claude.exe";
+    assert.equal(locate([`${dir}\\claude.exe`, exe]).source, "native");
+  }
+});
+
+test("desktop app installed, no CLI: detected per OS, never from the CLI's own folders", () => {
+  const winOpts = (dirs) => ({
+    platform: "win32", env: WIN_ENV, homedir: "C:\\Users\\ada",
+    exists: fakeFs(dirs, "win32"),
+  });
+  const local = "C:\\Users\\ada\\AppData\\Local";
+  assert.equal(claudeDesktopInstalled(winOpts([`${local}\\AnthropicClaude`])), true);
+  assert.equal(claudeDesktopInstalled(winOpts([`${local}\\Packages\\Claude_pzs8sxrjxfjjc`])), true);
+  assert.equal(claudeDesktopInstalled(winOpts(["C:\\Users\\ada\\AppData\\Roaming\\Claude"])), true);
+  assert.equal(claudeDesktopInstalled(winOpts([
+    "C:\\Users\\ada\\.claude", "C:\\Users\\ada\\.local\\bin",
+  ])), false, "~/.claude is shared with the CLI");
+  const mac = (dirs) => ({ platform: "darwin", env: {}, homedir: "/Users/ada", exists: fakeFs(dirs, "darwin") });
+  assert.equal(claudeDesktopInstalled(mac(["/Applications/Claude.app"])), true);
+  assert.equal(claudeDesktopInstalled(mac(["/Users/ada/Applications/Claude.app"])), true);
+  assert.equal(claudeDesktopInstalled(mac(["/Users/ada/.claude"])), false);
+  assert.equal(claudeDesktopInstalled({ platform: "linux", env: {}, homedir: "/home/ada",
+    exists: () => true }), false);
+});
+
+test("desktop app only: one message naming the app and the terminal install", () => {
+  const win = claudeDesktopOnlyText("win32");
+  assert.match(win, /^Found the Claude desktop app, but ccc needs Claude Code in the terminal: /);
+  assert.match(win, /install it with `irm https:\/\/claude\.ai\/install\.ps1 \| iex`/);
+  assert.match(win, /run `claude` once to sign in/);
+  assert.match(claudeDesktopOnlyText("darwin"),
+    /`curl -fsSL https:\/\/claude\.ai\/install\.sh \| bash`/);
 });
 
 // ---------------------------------------------------------------------------
@@ -212,4 +269,24 @@ test("Windows: with no claude anywhere, locate says so (ccc then prints the inst
     APPDATA: path.join(profile, "R"), LOCALAPPDATA: path.join(profile, "L"),
   };
   assert.equal(locateClaude({ env, homedir: profile, registryPath: () => [] }), null);
+});
+
+test("Windows: only the desktop app's claude.exe (on PATH, real files): not launched, app detected", {
+  skip: !isWindows && "Windows only",
+}, () => {
+  const profile = tmpdir();
+  const local = path.join(profile, "Local");
+  const app = path.join(local, "AnthropicClaude");
+  fs.mkdirSync(app, { recursive: true });
+  try { fs.linkSync(process.execPath, path.join(app, "claude.exe")); }
+  catch { fs.copyFileSync(process.execPath, path.join(app, "claude.exe")); }
+  const env = {
+    Path: `${app};C:\\Windows\\System32`, PATHEXT: ".COM;.EXE;.BAT;.CMD", USERPROFILE: profile,
+    APPDATA: path.join(profile, "Roaming"), LOCALAPPDATA: local,
+  };
+  assert.equal(locateClaude({ env, homedir: profile, registryPath: () => [] }), null);
+  assert.equal(claudeDesktopInstalled({ env, homedir: profile }), true);
+  assert.equal(claudeDesktopInstalled({
+    env: { ...env, LOCALAPPDATA: path.join(profile, "none") }, homedir: profile,
+  }), false);
 });

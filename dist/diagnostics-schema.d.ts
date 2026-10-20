@@ -29,6 +29,8 @@ export declare const INSTALL_METHODS: readonly ["npm-global", "npm-link", "git-c
 export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "unknown"];
 export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown"];
 export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
+/** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
+export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
 /** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
 export declare const AUTO_UPDATE_RESULTS: readonly ["started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed"];
 /** auto-update.ts SKIP_CODES. */

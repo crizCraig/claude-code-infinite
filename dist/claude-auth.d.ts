@@ -40,7 +40,7 @@ export declare function claudePlanFromConfig(opts?: ClaudeAuthOptions): ClaudePl
 export declare function claudeAuthFromHeaders(headers: Record<string, string | string[] | undefined>): ClaudeAuthType | undefined;
 /** A known Anthropic error in a JSON error body, by code; undefined otherwise. */
 export declare function upstreamErrorCode(body: Buffer | string): UpstreamErrorCode | undefined;
-/** Printed once when Anthropic refused an API key for having no credit. */
+/** Printed once when Anthropic refused an API key for having no credit: the no-plan advice. */
 export declare function creditNoticeText(color: boolean): string;
 /** "claude_max" + "default_claude_max_20x" → "max_20x"; "pro" → "pro". */
 export declare function planFrom(type: string | undefined, rateTier: string | undefined): ClaudePlan;

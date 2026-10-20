@@ -36,7 +36,7 @@ import {
   type DiagnosticsFields,
 } from "./diagnostics-schema.js";
 import type { RequestLogSink, RequestRecord } from "./reqlog.js";
-import { CREDIT_BALANCE_TOO_LOW } from "./claude-auth.js";
+import { CREDIT_BALANCE_TOO_LOW, type ClaudeAuthType } from "./claude-auth.js";
 
 export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export const INSTALL_ID_FILE = "install_id";
@@ -226,7 +226,9 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     private readonly inner: RequestLogSink | undefined,
     private readonly diagnostics: Diagnostics,
     /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
-    private readonly onCreditBalanceTooLow?: () => void
+    private readonly onCreditBalanceTooLow?: () => void,
+    /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
+    private readonly onClaudeAuth?: (auth: ClaudeAuthType) => void
   ) {}
 
   log(record: RequestRecord): void {
@@ -250,6 +252,7 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     // The request's own auth header beats the startup guess from config.
     if (rec.claudeAuth && rec.claudeAuth !== "unknown") {
       this.diagnostics.setContext({ claude_auth: rec.claudeAuth });
+      this.onClaudeAuth?.(rec.claudeAuth);
     }
     if (rec.contextWindow) {
       this.diagnostics.setContext({ context_window_k: Math.round(rec.contextWindow / 1000) });
@@ -279,6 +282,8 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
       this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
       this.onCreditBalanceTooLow?.();
+      // Only an API key is refused for credit, whatever its header looked like.
+      if (rec.claudeAuth !== "api_key") this.onClaudeAuth?.("api_key");
     }
     if (rec.compress?.timedOut) {
       this.diagnostics.recordLimited("compress_timeout", "compress_timeout",

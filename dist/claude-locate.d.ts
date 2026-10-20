@@ -19,6 +19,9 @@
 /** Where Claude Code was found, for diagnostics (an enum, never a path). */
 export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
 export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
+/** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
+export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
+export type ClaudeFound = (typeof CLAUDE_FOUND)[number];
 export interface ClaudeLocation {
     /** What to spawn: `claude` when it is on PATH, else its absolute path. */
     command: string;
@@ -37,10 +40,26 @@ export interface LocateClaudeOptions {
     /** Directory entries (winget's package folders); [] when unreadable. */
     listDir?: (dir: string) => string[];
 }
+export interface DesktopAppOptions {
+    platform?: NodeJS.Platform;
+    env?: NodeJS.ProcessEnv;
+    homedir?: string;
+    /** True when the path exists (file or folder). */
+    exists?: (file: string) => boolean;
+}
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export declare function locateClaude(opts?: LocateClaudeOptions): ClaudeLocation | null;
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */
 export declare function withClaudeOnPath(env: NodeJS.ProcessEnv, location: ClaudeLocation, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
+/**
+ * Whether the Claude desktop app is installed (Windows, macOS). It runs Claude
+ * Code inside the app (its own copy, in the app's data folder, kept at the
+ * app's version), but puts no `claude` on the terminal's PATH, so ccc cannot
+ * use it. Only its own folders count, never `~/.claude`, which the CLI shares.
+ */
+export declare function claudeDesktopInstalled(opts?: DesktopAppOptions): boolean;
+/** Said instead of claudeMissingText when only the desktop app is installed. */
+export declare function claudeDesktopOnlyText(platform?: NodeJS.Platform): string;
 /**
  * Said once, instead of launching, when Claude Code is not installed: the
  * official install command for this OS and the sign-in step.

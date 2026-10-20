@@ -19,6 +19,7 @@
  */
 import { type DiagnosticsErrorCode, type DiagnosticsEvent } from "./diagnostics-schema.js";
 import type { RequestLogSink, RequestRecord } from "./reqlog.js";
+import { type ClaudeAuthType } from "./claude-auth.js";
 export declare const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export declare const INSTALL_ID_FILE = "install_id";
 export declare const FLUSH_INTERVAL_MS = 30000;
@@ -95,11 +96,15 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly diagnostics;
     /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
     private readonly onCreditBalanceTooLow?;
+    /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
+    private readonly onClaudeAuth?;
     private firstRequest;
     private firstTurn;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
     /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
-    onCreditBalanceTooLow?: (() => void) | undefined);
+    onCreditBalanceTooLow?: (() => void) | undefined, 
+    /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
+    onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;

@@ -49,8 +49,9 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "test-key" } = {}) {
+function fakeClaudeHome({ key = "test-key", claudeJson } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
+  if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
   fs.mkdirSync(bin);
   const script = path.join(bin, "claude.mjs");
@@ -84,6 +85,10 @@ function runCcc(args, extraEnv = {}, home_ = {}) {
   };
   delete env.ANTHROPIC_BASE_URL;
   delete env.CCC_MEMTREE_MCP;
+  // Claude Code's sign-in comes from this fake home only.
+  for (const name of ["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY"]) delete env[name];
   Object.assign(env, extraEnv);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -129,4 +134,24 @@ test("ccc -p with no saved key and no terminal: fails on stderr, never prompts o
   assert.equal(stdout, "");
   assert.match(stderr, /MemTree API key is required/);
   assert.match(stderr, /run `ccc` in a terminal/);
+});
+
+const NO_PLAN = /^ccc needs Claude Code signed in with a Claude Pro or Max plan \(run `claude`, then `\/login`\)\. With an API key you pay Anthropic per token, and a key with no credit won't work\.$/m;
+
+test("ccc -p not signed in to a plan: the no-plan line on stderr, stdout still Claude's alone", { timeout: 30_000 }, async () => {
+  const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, {
+    claudeJson: { primaryApiKey: "sk-ant-api03-x" },
+  });
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, NO_PLAN);
+  assert.equal(stdout.split("\n").filter(Boolean).length, 1);
+  assert.doesNotMatch(stdout, /Pro or Max/);
+});
+
+test("ccc -p on a Claude subscription: no no-plan line", { timeout: 30_000 }, async () => {
+  const { code, stderr } = await runCcc(["-p", "hi"], {}, {
+    claudeJson: { oauthAccount: { emailAddress: "a@b.c" }, organizationType: "claude_max" },
+  });
+  assert.equal(code, 0, stderr);
+  assert.doesNotMatch(stderr, /Pro or Max plan/);
 });

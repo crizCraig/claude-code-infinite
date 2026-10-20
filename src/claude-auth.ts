@@ -16,6 +16,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { noPlanWarningText } from "./claude-plan-warning.js";
 
 export const CLAUDE_AUTH_TYPES = [
   "subscription", "api_key", "bedrock", "vertex", "foundry", "unknown",
@@ -53,6 +54,8 @@ export function claudeAuthFromConfig(opts: ClaudeAuthOptions = {}): ClaudeAuthTy
   if (settingsFiles(configDir, opts.cwd ?? process.cwd()).some((f) => hasApiKeyHelper(read(f)))) {
     return "api_key";
   }
+  // `claude setup-token`'s long-lived subscription token; below the keys, as in Claude Code.
+  if (nonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN)) return "subscription";
   const globalConfig = nonEmpty(env.CLAUDE_CONFIG_DIR)
     ? path.join(env.CLAUDE_CONFIG_DIR!, ".claude.json")
     : path.join(home, ".claude.json");
@@ -105,12 +108,9 @@ export function upstreamErrorCode(body: Buffer | string): UpstreamErrorCode | un
     : undefined;
 }
 
-/** Printed once when Anthropic refused an API key for having no credit. */
+/** Printed once when Anthropic refused an API key for having no credit: the no-plan advice. */
 export function creditNoticeText(color: boolean): string {
-  const text =
-    "ccc isn't free Claude: it runs your own Claude Code, and this API key has no credit. " +
-    "Sign in with a Claude Pro or Max plan (run `claude`, then /login) or add credit to the key.";
-  return color ? `\x1b[33m${text}\x1b[39m` : text;
+  return noPlanWarningText(color);
 }
 
 // ---------------------------------------------------------------------------

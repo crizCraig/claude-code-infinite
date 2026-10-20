@@ -79,6 +79,8 @@ export const CLAUDE_PLANS = [
 export const CLAUDE_SOURCES = [
   "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local",
 ] as const;
+/** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
+export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"] as const;
 /** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
 export const AUTO_UPDATE_RESULTS = [
   "started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed",
@@ -183,7 +185,7 @@ export const CONTEXT_FIELDS: Record<string, Validator> = {
   mode: oneOf(["production", "staging", "local"]),
   claude_auth: oneOf(CLAUDE_AUTH_TYPES),
   claude_plan: oneOf(CLAUDE_PLANS),
-  claude_found: oneOf(CLAUDE_SOURCES),
+  claude_found: oneOf(CLAUDE_FOUND),
   /** The main model's context window ccc inferred, in thousands of tokens. */
   context_window_k: integer(0, 100_000),
 };
@@ -207,8 +209,17 @@ export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
   paused_notice: { trigger: oneOf(["turn", "resume"]) },
   update_hint: { latest: VERSION },
   auto_update: { result: oneOf(AUTO_UPDATE_RESULTS), reason: oneOf(AUTO_UPDATE_REASONS) },
-  claude_exit: { code: integer(-1000, 1000), signal: oneOf(SIGNALS) },
+  /**
+   * `code` stays clamped as before; `code_raw` is the status unclamped (Windows NTSTATUS
+   * values such as 0xC0000005 = 3221225477) and `uptime_ms` how long Claude Code ran.
+   */
+  claude_exit: { code: integer(-1000, 1000), signal: oneOf(SIGNALS),
+                 code_raw: integer(-2147483648, 4294967295), uptime_ms: MS },
   claude_missing: {},
+  /** Windows: ccc got SIGHUP, i.e. its console window was closed (Claude Code then exits 129). */
+  console_closed: {},
+  /** The "no Claude plan" line was shown (claude-plan-warning.ts), by sign-in type. */
+  no_plan_warning: { auth: oneOf(CLAUDE_AUTH_TYPES) },
   error: { code: oneOf(ERROR_CODES), errno: oneOf(ERRNOS),
            error_name: oneOf(ERROR_NAMES) },
 };

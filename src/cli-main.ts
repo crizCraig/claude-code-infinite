@@ -70,6 +70,7 @@ import {
 } from "./claude-env.js";
 import {
   createSignalShutdownHandler,
+  claudeExitFields,
   exitCodeForChild,
   settleWithin,
   writeStdout,
@@ -86,7 +87,6 @@ import {
 } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
-import { signalName } from "./diagnostics-schema.js";
 import {
   PACKAGE_DIR,
   detectInstallMethod,
@@ -94,12 +94,19 @@ import {
   updateFiles,
 } from "./auto-update.js";
 import {
+  claudeDesktopInstalled,
+  claudeDesktopOnlyText,
   claudeMissingText,
   cwdHintText,
   locateClaude,
   withClaudeOnPath,
 } from "./claude-locate.js";
 import { claudeAuthFromConfig, claudePlanFromConfig, creditNoticeText } from "./claude-auth.js";
+import {
+  printNoPlanWarning,
+  readSeenClaudeAuth,
+  writeSeenClaudeAuth,
+} from "./claude-plan-warning.js";
 import { exitResumeHint } from "./resume-hint.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -366,18 +373,23 @@ async function main() {
 
   // Before the key prompt: someone without Claude Code learns that first.
   const claude = locateClaude();
-  if (diagnostics.enabled) {
-    // One read each of Claude Code's config files (~/.claude.json can be large).
-    const readFile = memoizedTextReader();
-    diagnostics.setContext({
-      claude_found: claude?.source,
-      claude_auth: claudeAuthFromConfig({ readFile }),
-      claude_plan: claudePlanFromConfig({ readFile }),
-    });
-  }
+  // Only the desktop app (its Claude Code is not a terminal command) gets its own message.
+  const desktopOnly = !claude && claudeDesktopInstalled();
+  // One read each of Claude Code's config files (~/.claude.json can be large).
+  const readFile = memoizedTextReader();
+  const claudeSignIn = {
+    auth: claudeAuthFromConfig({ readFile }),
+    plan: claudePlanFromConfig({ readFile }),
+    seen: readSeenClaudeAuth(getConfigDir()),
+  };
+  diagnostics.setContext({
+    claude_found: desktopOnly ? "desktop_only" : claude?.source,
+    claude_auth: claudeSignIn.auth,
+    claude_plan: claudeSignIn.plan,
+  });
   if (!claude) {
     diagnostics.record("claude_missing");
-    console.error(claudeMissingText());
+    console.error(desktopOnly ? claudeDesktopOnlyText() : claudeMissingText());
     await diagnostics.flush();
     process.exit(1);
   }
@@ -468,6 +480,10 @@ async function main() {
   let creditTooLow = false;
   const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, () => {
     creditTooLow = true;
+  }, (auth) => {
+    // The next launch's no-plan line goes by what Claude Code really sent.
+    if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
+    claudeSignIn.seen = auth;
   });
 
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
@@ -541,6 +557,10 @@ async function main() {
 
   // One unobtrusive (dim) line so users can find the log during an incident.
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
+  // On an API key or not signed in: one line before the first prompt (stderr).
+  if (printNoPlanWarning(claudeSignIn, interactiveUi && terminalSupportsColor())) {
+    diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
+  }
   reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
   // The first request after a resume must count the whole session's thinking.
   const resumedSession = resumeSessionId(claudeArgs);
@@ -614,6 +634,7 @@ async function main() {
 
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
   // native login and sends its own OAuth bearer to the local base URL.
+  const claudeStartedAt = Date.now();
   const child = spawn(claude.command, childArgs, {
     env: withClaudeOnPath(
       claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`),
@@ -673,6 +694,7 @@ async function main() {
     // Closing the console window (SIGHUP) gives ccc a few seconds: start the
     // update first, since the drains in shutdown may not finish in time.
     process.on("SIGHUP", () => {
+      diagnostics.record("console_closed");
       autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
       handleShutdownSignal("SIGTERM");
     });
@@ -699,7 +721,7 @@ async function main() {
 
   child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
     if (code !== 0) {
-      diagnostics.record("claude_exit", { code: code ?? undefined, signal: signalName(signal) });
+      diagnostics.record("claude_exit", claudeExitFields(code, signal, claudeStartedAt));
     }
     // Under Claude Code's own "claude --resume <id>", which would skip MemTree.
     const hint = exitResumeHint({

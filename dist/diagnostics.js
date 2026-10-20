@@ -188,14 +188,18 @@ export class DiagnosticsRequestSink {
     inner;
     diagnostics;
     onCreditBalanceTooLow;
+    onClaudeAuth;
     firstRequest = false;
     firstTurn = false;
     constructor(inner, diagnostics, 
     /** Anthropic refused Claude Code's API key for having no credit (claude-auth.ts). */
-    onCreditBalanceTooLow) {
+    onCreditBalanceTooLow, 
+    /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
+    onClaudeAuth) {
         this.inner = inner;
         this.diagnostics = diagnostics;
         this.onCreditBalanceTooLow = onCreditBalanceTooLow;
+        this.onClaudeAuth = onClaudeAuth;
     }
     log(record) {
         this.inner?.log(record);
@@ -221,6 +225,7 @@ export class DiagnosticsRequestSink {
         // The request's own auth header beats the startup guess from config.
         if (rec.claudeAuth && rec.claudeAuth !== "unknown") {
             this.diagnostics.setContext({ claude_auth: rec.claudeAuth });
+            this.onClaudeAuth?.(rec.claudeAuth);
         }
         if (rec.contextWindow) {
             this.diagnostics.setContext({ context_window_k: Math.round(rec.contextWindow / 1000) });
@@ -247,6 +252,9 @@ export class DiagnosticsRequestSink {
         if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
             this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
             this.onCreditBalanceTooLow?.();
+            // Only an API key is refused for credit, whatever its header looked like.
+            if (rec.claudeAuth !== "api_key")
+                this.onClaudeAuth?.("api_key");
         }
         if (rec.compress?.timedOut) {
             this.diagnostics.recordLimited("compress_timeout", "compress_timeout", { ms: rec.compress.ms, request_kb: kb(rec.requestBytes) });

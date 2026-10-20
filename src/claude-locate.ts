@@ -27,6 +27,9 @@ export const CLAUDE_SOURCES = [
   "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local",
 ] as const;
 export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
+/** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
+export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"] as const;
+export type ClaudeFound = (typeof CLAUDE_FOUND)[number];
 
 export interface ClaudeLocation {
   /** What to spawn: `claude` when it is on PATH, else its absolute path. */
@@ -48,16 +51,26 @@ export interface LocateClaudeOptions {
   listDir?: (dir: string) => string[];
 }
 
+export interface DesktopAppOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homedir?: string;
+  /** True when the path exists (file or folder). */
+  exists?: (file: string) => boolean;
+}
+
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | null {
   const platform = opts.platform ?? process.platform;
   const env = opts.env ?? process.env;
   const isExecutable = opts.isExecutable ?? defaultIsExecutable(platform);
-  const onPath = findOnPath("claude", pathDirs(env, platform), platform, env, isExecutable);
-  if (onPath) return { command: "claude", source: "path" };
+  const onPath = locateOnPath(pathDirs(env, platform), platform, env, isExecutable);
+  if (onPath) return onPath;
   const home = opts.homedir ?? os.homedir();
   for (const candidate of candidates(platform, env, home, opts)) {
-    const file = findOnPath("claude", candidate.dirs, platform, env, isExecutable);
+    const file = candidate.dirs
+      .map((dir) => findOnPath("claude", [dir], platform, env, isExecutable))
+      .find((f): f is string => f !== null && !isDesktopAppExe(f, platform));
     if (file) return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
   }
   return null;
@@ -74,6 +87,29 @@ export function withClaudeOnPath(
   const current = env[key];
   const delimiter = platform === "win32" ? ";" : ":";
   return { ...env, [key]: current ? `${location.dir}${delimiter}${current}` : location.dir };
+}
+
+/**
+ * Whether the Claude desktop app is installed (Windows, macOS). It runs Claude
+ * Code inside the app (its own copy, in the app's data folder, kept at the
+ * app's version), but puts no `claude` on the terminal's PATH, so ccc cannot
+ * use it. Only its own folders count, never `~/.claude`, which the CLI shares.
+ */
+export function claudeDesktopInstalled(opts: DesktopAppOptions = {}): boolean {
+  const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
+  const home = opts.homedir ?? os.homedir();
+  const exists = opts.exists ?? fs.existsSync;
+  return desktopAppPaths(platform, env, home).some((p) => exists(p));
+}
+
+/** Said instead of claudeMissingText when only the desktop app is installed. */
+export function claudeDesktopOnlyText(platform: NodeJS.Platform = process.platform): string {
+  const install = platform === "win32"
+    ? "`irm https://claude.ai/install.ps1 | iex` (in PowerShell)"
+    : "`curl -fsSL https://claude.ai/install.sh | bash`";
+  return "Found the Claude desktop app, but ccc needs Claude Code in the terminal: " +
+    `install it with ${install}, then open a new terminal and run \`claude\` once to sign in.`;
 }
 
 /**
@@ -162,6 +198,60 @@ function windowsCandidates(
     { source: "winget", dirs: [w.join(winget, "Links"), ...wingetPackageDirs(winget, opts)] },
     { source: "registry-path", get dirs() { return registryDirs(env, opts); } },
   ];
+}
+
+/** The desktop app's install and data folders (Squirrel, Microsoft Store/MSIX, macOS). */
+function desktopAppPaths(platform: NodeJS.Platform, env: NodeJS.ProcessEnv, home: string): string[] {
+  if (platform === "darwin") {
+    return ["/Applications/Claude.app", path.posix.join(home, "Applications", "Claude.app")];
+  }
+  if (platform !== "win32") return [];
+  const w = path.win32;
+  const profile = envValue(env, "USERPROFILE") || home;
+  const appData = envValue(env, "APPDATA") || w.join(profile, "AppData", "Roaming");
+  const localAppData = envValue(env, "LOCALAPPDATA") || w.join(profile, "AppData", "Local");
+  return [
+    w.join(localAppData, "AnthropicClaude"),
+    w.join(localAppData, "Packages", DESKTOP_MSIX_FAMILY),
+    w.join(appData, "Claude"),
+  ];
+}
+
+/** The Microsoft Store / MSIX package family of the Claude desktop app. */
+const DESKTOP_MSIX_FAMILY = "Claude_pzs8sxrjxfjjc";
+
+/**
+ * The desktop app's own `claude.exe` (Squirrel: %LOCALAPPDATA%\AnthropicClaude
+ * and its app-<version> folders; MSIX: WindowsApps\Claude_<version>_<arch>__<id>).
+ * Launched as Claude Code it opens the app instead, so it is skipped.
+ */
+function isDesktopAppExe(file: string, platform: NodeJS.Platform): boolean {
+  if (platform !== "win32") return false;
+  const dir = path.win32.dirname(file).toLowerCase();
+  return /\\anthropicclaude(\\app-[^\\]+)?$/.test(dir) ||
+    /\\windowsapps\\claude_[^\\]*__pzs8sxrjxfjjc(\\app)?$/.test(dir);
+}
+
+/**
+ * `claude` on PATH, skipping the desktop app's exe. Spawned by name when it is
+ * the first `claude` on PATH (as before); by full path when the desktop app's
+ * comes first, since spawning by name would start the app.
+ */
+function locateOnPath(
+  dirs: string[],
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  isExecutable: (file: string) => boolean
+): ClaudeLocation | null {
+  let skipped = false;
+  for (const dir of dirs) {
+    const file = findOnPath("claude", [dir], platform, env, isExecutable);
+    if (!file) continue;
+    if (isDesktopAppExe(file, platform)) { skipped = true; continue; }
+    if (!skipped) return { command: "claude", source: "path" };
+    return { command: file, source: "path", dir: pathFor(platform).dirname(file) };
+  }
+  return null;
 }
 
 function registryDirs(env: NodeJS.ProcessEnv, opts: LocateClaudeOptions): string[] {

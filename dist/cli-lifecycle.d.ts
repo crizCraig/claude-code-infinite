@@ -3,6 +3,11 @@ export type ShutdownSignal = "SIGINT" | "SIGTERM";
 export declare function exitCodeForSignal(signal: NodeJS.Signals): number;
 /** Preserve a child's numeric status or translate its terminating signal. */
 export declare function exitCodeForChild(code: number | null, signal: NodeJS.Signals | null): number;
+/**
+ * Claude Code's exit for diagnostics: the status (clamped by the schema as
+ * `code`, unclamped as `code_raw`), its signal, and how long it ran.
+ */
+export declare function claudeExitFields(code: number | null, signal: NodeJS.Signals | null, startedAt: number, now?: number): Record<string, number | string | undefined>;
 export interface SignalShutdownActions {
     forward(signal: ShutdownSignal): void;
     shutdown(code: number): void;

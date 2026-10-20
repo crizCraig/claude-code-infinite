@@ -103,7 +103,7 @@ test("credit balance too low: recognised in Anthropic's error body, nothing else
   assert.equal(upstreamErrorCode(Buffer.from(body)), CREDIT_BALANCE_TOO_LOW);
   assert.equal(upstreamErrorCode('{"error":{"message":"prompt is too long"}}'), undefined);
   assert.equal(upstreamErrorCode("<html>"), undefined);
-  assert.match(creditNoticeText(false), /isn't free Claude.*Pro or Max.*add credit/);
+  assert.match(creditNoticeText(false), /Pro or Max plan.*\/login.*no credit won't work/);
   assert.doesNotMatch(creditNoticeText(false), /\n/);
 });
 
