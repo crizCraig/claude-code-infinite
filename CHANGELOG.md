@@ -3,12 +3,6 @@
 ## [1.0.27](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.26...v1.0.27) (2026-10-20)
 
 
-### Features
-
-* first-ever MemTree notice links the "what your agent did" report ([46db9a9](https://github.com/crizCraig/claude-code-infinite/commit/46db9a9cce13a0a78798268b91b65a63cb727192))
-* rebuild dist for the first-ever report link ([8ef85e9](https://github.com/crizCraig/claude-code-infinite/commit/8ef85e947e9ea061df31962729f8e122ea1fa26e))
-
-
 ### Bug Fixes
 
 * a subscription on file always silences the no-plan line; skip Store app aliases ([7e8b7e6](https://github.com/crizCraig/claude-code-infinite/commit/7e8b7e65a6da5094a44539c02774e0ff4c6957bc))
