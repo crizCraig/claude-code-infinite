@@ -115,7 +115,7 @@ export class PaymentLinkCache {
         let timer;
         await Promise.race([
             this.inFlight,
-            new Promise((resolve) => { timer = setTimeout(resolve, ms); timer.unref(); }),
+            new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
         ]);
         clearTimeout(timer);
     }
