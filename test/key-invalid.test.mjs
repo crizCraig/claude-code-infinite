@@ -414,15 +414,23 @@ test("memtree state: a background index call's 401 marks the key invalid", async
 });
 
 test("memtree state: an aborted call leaves the key state unchanged", async () => {
-  const server = await serve(() => {}); // never answers
+  let answer = true;
+  const server = await serve((req, res) => {
+    if (!answer) return; // never answers
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "Invalid API key" }));
+  });
   const memtree = new MemtreeClient({ baseUrl: server.url, apiKey: "k" });
   try {
+    assert.equal(await memtree.compress("h0", [{ role: "user", content: "a" }], 200_000), null);
+    assert.equal(memtree.keyInvalid, true);
+    answer = false;
     const controller = new AbortController();
     const pending = memtree.compress("h", [{ role: "user", content: "hi" }], 200_000,
       controller.signal);
     controller.abort();
     assert.equal(await pending, null);
-    assert.equal(memtree.keyInvalid, false);
+    assert.equal(memtree.keyInvalid, true, "an abort says nothing about the key");
   } finally { server.close(); }
 });
 

@@ -5473,6 +5473,7 @@ function cancelPausedNotice(state: ProxyState, rec: MessagesRecord): void {
 function warnPausedNearWindow(
   state: ProxyState, rec: MessagesRecord, sessionId: string | undefined
 ): void {
+  if (state.keyInvalid()) return; // a refused key, not a pause: the key notice says why
   const detail = state.unpaidDetail();
   // Paid again: a later pause (next month's limit) warns afresh.
   if (detail === null) state.pausedNearWindowWarned.clear();

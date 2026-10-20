@@ -4046,6 +4046,8 @@ function cancelPausedNotice(state, rec) {
  * already queued the paused notice carries the line itself.
  */
 function warnPausedNearWindow(state, rec, sessionId) {
+    if (state.keyInvalid())
+        return; // a refused key, not a pause: the key notice says why
     const detail = state.unpaidDetail();
     // Paid again: a later pause (next month's limit) warns afresh.
     if (detail === null)

@@ -326,7 +326,7 @@ export declare class MemtreeClient {
     private unpaidDetail;
     /** Whether the latest call that got an answer, or timed out, got a 402. */
     private lastAnswerUnpaid;
-    /** Whether the latest call that got an answer, or timed out, got a 401/403. */
+    /** Whether the latest call that got an answer, or timed out, refused the key (key-page.ts). */
     private lastAnswerKeyInvalid;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
@@ -345,7 +345,8 @@ export declare class MemtreeClient {
     get pausedDetail(): string | null;
     /**
      * Whether the server's latest answer (or timeout) refused the key itself:
-     * 401/403, i.e. a mistyped or revoked key. Cleared by any later answer.
+     * 401, or 403 with polychat's detail (key-page.ts): a mistyped or revoked
+     * key. Cleared by any later answer.
      */
     get keyInvalid(): boolean;
     /** Where to get a new key for this client's environment (its base URL). */
