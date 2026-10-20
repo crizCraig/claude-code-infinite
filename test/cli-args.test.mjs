@@ -60,3 +60,13 @@ test("CCC_COMPACT_TARGET: a token count, off, or ignored with a warning", () => 
   assert.match(small.warning, /ignoring CCC_COMPACT_TARGET=5k/);
   assert.equal(compactTargetFromEnv("lots", parse, 20_000).value, undefined);
 });
+
+test("--version / -v alone (optionally after local/staging) is a version request", async () => {
+  const { isVersionRequest } = await import("../dist/cli-args.js");
+  for (const args of [["--version"], ["-v"], ["staging", "--version"], ["local", "-v"]]) {
+    assert.equal(isVersionRequest(args), true, args.join(" "));
+  }
+  for (const args of [[], ["-p", "--version"], ["--version", "-p", "x"], ["--", "--version"]]) {
+    assert.equal(isVersionRequest(args), false, args.join(" "));
+  }
+});

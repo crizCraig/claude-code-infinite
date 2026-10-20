@@ -51,6 +51,7 @@ import {
   parseWrapperArgs,
   memtreeLinkPlacementFromEnv,
   environmentOf,
+  isVersionRequest,
   subcommandArgs,
 } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
@@ -283,6 +284,20 @@ function printBanner() {
   );
 }
 
+/**
+ * `ccc --version`: ccc's version, then Claude Code's (its own `--version` line) when it is
+ * installed, else how to install it. Needs no key, so it never prompts for one.
+ */
+function printVersions(): void {
+  console.log(`${CLIENT_VERSION} (Claude Code Infinite)`);
+  const claude = locateClaude();
+  if (!claude) {
+    console.error(claudeDesktopInstalled() ? claudeDesktopOnlyText() : claudeMissingText());
+    return;
+  }
+  spawn.sync(claude.command, ["--version"], { stdio: "inherit" });
+}
+
 /** Unknown/old versions get the longstanding Stop fallback only. */
 function installedClaudeSupportsMessageDisplay(command: string): boolean {
   try {
@@ -326,6 +341,11 @@ async function main() {
   }
   if (subcommand?.name === "memtree-mcp") {
     runMemtreeMcpServer();
+    return;
+  }
+
+  if (isVersionRequest(filteredArgs)) {
+    printVersions();
     return;
   }
 

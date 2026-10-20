@@ -29,7 +29,7 @@ import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, hyperlink, } from "./payment-gate.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
-import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, subcommandArgs, } from "./cli-args.js";
+import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runLinkCommand } from "./link-command.js";
@@ -181,6 +181,19 @@ function askLine(question) {
 function printBanner() {
     console.log(`\n\x1b[38;5;209m∞\x1b[0m \x1b[1;38;5;209mClaude Code Infinite\x1b[0m \x1b[38;5;209m∞\x1b[0m \x1b[38;5;48mfrom \x1b]8;;https://MemTree.dev\x1b\\MemTree\x1b]8;;\x1b\\\x1b[0m\n`);
 }
+/**
+ * `ccc --version`: ccc's version, then Claude Code's (its own `--version` line) when it is
+ * installed, else how to install it. Needs no key, so it never prompts for one.
+ */
+function printVersions() {
+    console.log(`${CLIENT_VERSION} (Claude Code Infinite)`);
+    const claude = locateClaude();
+    if (!claude) {
+        console.error(claudeDesktopInstalled() ? claudeDesktopOnlyText() : claudeMissingText());
+        return;
+    }
+    spawn.sync(claude.command, ["--version"], { stdio: "inherit" });
+}
 /** Unknown/old versions get the longstanding Stop fallback only. */
 function installedClaudeSupportsMessageDisplay(command) {
     try {
@@ -221,6 +234,10 @@ async function main() {
     }
     if (subcommand?.name === "memtree-mcp") {
         runMemtreeMcpServer();
+        return;
+    }
+    if (isVersionRequest(filteredArgs)) {
+        printVersions();
         return;
     }
     const mode = environmentOf(filteredArgs);
