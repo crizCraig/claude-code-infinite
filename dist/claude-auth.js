@@ -51,6 +51,23 @@ export function claudeAuthFromConfig(opts = {}) {
     return authFromGlobalConfig(read(globalConfig));
 }
 /**
+ * Whether a claude.ai login is on file, by key names only: `oauthAccount` in
+ * `~/.claude.json` without a Console key, or `claudeAiOauth` in
+ * `.credentials.json` (Linux and Windows). Unlike claudeAuthFromConfig it
+ * ignores env keys, which Claude Code asks about before using.
+ */
+export function claudeSubscriptionLogin(opts = {}) {
+    const env = opts.env ?? process.env;
+    const read = opts.readFile ?? readTextOrNull;
+    const home = opts.homedir ?? os.homedir();
+    const dir = nonEmpty(env.CLAUDE_CONFIG_DIR) ? env.CLAUDE_CONFIG_DIR : null;
+    const global = read(dir ? path.join(dir, ".claude.json") : path.join(home, ".claude.json"));
+    if (authFromGlobalConfig(global) === "subscription")
+        return true;
+    const credentials = read(path.join(dir ?? path.join(home, ".claude"), ".credentials.json"));
+    return credentials !== null && /"claudeAiOauth"\s*:\s*\{/.test(credentials);
+}
+/**
  * The Claude.ai plan tier Claude Code recorded locally: `organizationType` and
  * `organizationRateLimitTier` in `~/.claude.json`, else `subscriptionType` in
  * `.credentials.json` (Linux and Windows). Only those values are matched, and

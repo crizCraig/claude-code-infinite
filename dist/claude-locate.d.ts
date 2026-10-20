@@ -21,7 +21,6 @@ export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native"
 export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
 export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
-export type ClaudeFound = (typeof CLAUDE_FOUND)[number];
 export interface ClaudeLocation {
     /** What to spawn: `claude` when it is on PATH, else its absolute path. */
     command: string;

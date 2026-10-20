@@ -150,12 +150,11 @@ function desktopAppPaths(platform, env, home) {
         return [];
     const w = path.win32;
     const profile = envValue(env, "USERPROFILE") || home;
-    const appData = envValue(env, "APPDATA") || w.join(profile, "AppData", "Roaming");
     const localAppData = envValue(env, "LOCALAPPDATA") || w.join(profile, "AppData", "Local");
+    // Not %APPDATA%\Claude: MCP guides have people create it by hand.
     return [
         w.join(localAppData, "AnthropicClaude"),
         w.join(localAppData, "Packages", DESKTOP_MSIX_FAMILY),
-        w.join(appData, "Claude"),
     ];
 }
 /** The Microsoft Store / MSIX package family of the Claude desktop app. */
@@ -163,14 +162,17 @@ const DESKTOP_MSIX_FAMILY = "Claude_pzs8sxrjxfjjc";
 /**
  * The desktop app's own `claude.exe` (Squirrel: %LOCALAPPDATA%\AnthropicClaude
  * and its app-<version> folders; MSIX: WindowsApps\Claude_<version>_<arch>__<id>).
- * Launched as Claude Code it opens the app instead, so it is skipped.
+ * Launched as Claude Code it opens the app instead, so it is skipped. So is a
+ * Store app execution alias (%LOCALAPPDATA%\Microsoft\WindowsApps): none of the
+ * CLI's installers puts claude.exe there.
  */
 function isDesktopAppExe(file, platform) {
     if (platform !== "win32")
         return false;
     const dir = path.win32.dirname(file).toLowerCase();
     return /\\anthropicclaude(\\app-[^\\]+)?$/.test(dir) ||
-        /\\windowsapps\\claude_[^\\]*__pzs8sxrjxfjjc(\\app)?$/.test(dir);
+        /\\windowsapps\\claude_[^\\]*__pzs8sxrjxfjjc(\\app)?$/.test(dir) ||
+        /\\microsoft\\windowsapps(\\claude_pzs8sxrjxfjjc)?$/.test(dir);
 }
 /**
  * `claude` on PATH, skipping the desktop app's exe. Spawned by name when it is

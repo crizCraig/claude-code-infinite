@@ -49,7 +49,7 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "test-key", claudeJson } = {}) {
+function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
@@ -74,6 +74,7 @@ function fakeClaudeHome({ key = "test-key", claudeJson } = {}) {
   fs.writeFileSync(path.join(configDir, "config.json"),
     JSON.stringify({ localPolychatApiKey: key, diagnostics: false, updateCheck: false }),
     { mode: 0o600 });
+  if (seenAuth) fs.writeFileSync(path.join(configDir, "claude-auth-seen"), `${seenAuth}\n`);
   return { home, bin };
 }
 
@@ -154,4 +155,16 @@ test("ccc -p on a Claude subscription: no no-plan line", { timeout: 30_000 }, as
   });
   assert.equal(code, 0, stderr);
   assert.doesNotMatch(stderr, /Pro or Max plan/);
+});
+
+test("ccc -p: the sign-in Claude Code last sent through ccc decides when the config is silent", { timeout: 30_000 }, async () => {
+  const quiet = await runCcc(["-p", "hi"], {}, { seenAuth: "subscription" });
+  assert.equal(quiet.code, 0, quiet.stderr);
+  assert.doesNotMatch(quiet.stderr, /Pro or Max plan/);
+  const max = await runCcc(["-p", "hi"], {}, {
+    seenAuth: "api_key", claudeJson: { oauthAccount: { x: 1 }, organizationType: "claude_max" },
+  });
+  assert.doesNotMatch(max.stderr, /Pro or Max plan/, "a /login to Max since then wins");
+  const key = await runCcc(["-p", "hi"], {}, { seenAuth: "api_key" });
+  assert.match(key.stderr, NO_PLAN);
 });

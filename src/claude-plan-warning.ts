@@ -34,18 +34,24 @@ export interface PlanWarningInput {
   plan: ClaudePlan;
   /** What Claude Code's own requests last showed, when known. */
   seen?: ClaudeAuthType;
+  /** A claude.ai login is on file (claudeSubscriptionLogin), whatever else is set. */
+  subscriptionLogin?: boolean;
 }
 
 /**
  * True when Claude Code is on an API key or not signed in, and nothing shows a
- * paid plan. Any sign of a subscription wins, so a subscriber is never warned.
+ * paid plan. Any sign of a subscription wins, a stale API-key sighting
+ * included (the user may have run `/login` outside ccc since), so a subscriber
+ * is never warned.
  */
-export function needsPlanWarning({ auth, plan, seen }: PlanWarningInput): boolean {
-  if (seen === "subscription") return false;
-  if (seen === "api_key") return true;
+export function needsPlanWarning(input: PlanWarningInput): boolean {
+  const { auth, plan, seen } = input;
   if (auth === "bedrock" || auth === "vertex" || auth === "foundry") return false;
-  if (auth === "subscription") return plan === "free";
-  return !PAID_PLANS.includes(plan);
+  if (PAID_PLANS.includes(plan)) return false;
+  if (plan !== "free" && (auth === "subscription" || input.subscriptionLogin === true)) {
+    return false;
+  }
+  return seen !== "subscription";
 }
 
 export function noPlanWarningText(color: boolean): string {

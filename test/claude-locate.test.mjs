@@ -48,6 +48,13 @@ function locateWin(files, extra = {}) {
 test("on PATH: spawned by name, as before (claude.cmd or claude.exe both count)", () => {
   const shim = "C:\\Program Files\\nodejs\\claude.cmd";
   assert.deepEqual(locateWin([shim]), { command: "claude", source: "path" });
+  // A later desktop exe on PATH changes nothing: the first claude is still spawned by name.
+  const desktopLater = locateClaude({
+    platform: "win32", env: { ...WIN_ENV, Path: `${WIN_ENV.Path};C:\\Users\\ada\\AppData\\Local\\AnthropicClaude` },
+    homedir: "C:\\Users\\ada", registryPath: () => [], listDir: () => [],
+    isExecutable: fakeFs([shim, "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude\\claude.exe"], "win32"),
+  });
+  assert.deepEqual(desktopLater, { command: "claude", source: "path" });
   assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "claude", source: "path" });
   // An extensionless `claude` (npm's script for Git Bash) is not something cmd can run.
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
@@ -150,7 +157,10 @@ test("the diagnostics schema allows exactly the sources locate reports, plus des
 test("Windows: the desktop app's own claude.exe on PATH is not taken for the CLI", () => {
   const squirrel = "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude";
   const store = "C:\\Program Files\\WindowsApps\\Claude_1.2.3.0_x64__pzs8sxrjxfjjc\\app";
-  for (const dir of [squirrel, `${squirrel}\\app-1.2.3`, store]) {
+  // A Store app's execution alias: the CLI's installers never put claude.exe there.
+  const alias = "C:\\Users\\ada\\AppData\\Local\\Microsoft\\WindowsApps";
+  for (const dir of [squirrel, `${squirrel}\\app-1.2.3`, store, alias,
+    `${alias}\\Claude_pzs8sxrjxfjjc`]) {
     const env = { ...WIN_ENV, Path: `${dir};${WIN_ENV.Path}` };
     const locate = (files) => locateClaude({
       platform: "win32", env, homedir: "C:\\Users\\ada", isExecutable: fakeFs(files, "win32"),
@@ -174,7 +184,8 @@ test("desktop app installed, no CLI: detected per OS, never from the CLI's own f
   const local = "C:\\Users\\ada\\AppData\\Local";
   assert.equal(claudeDesktopInstalled(winOpts([`${local}\\AnthropicClaude`])), true);
   assert.equal(claudeDesktopInstalled(winOpts([`${local}\\Packages\\Claude_pzs8sxrjxfjjc`])), true);
-  assert.equal(claudeDesktopInstalled(winOpts(["C:\\Users\\ada\\AppData\\Roaming\\Claude"])), true);
+  // MCP guides have people create %APPDATA%\Claude by hand; it is not an install.
+  assert.equal(claudeDesktopInstalled(winOpts(["C:\\Users\\ada\\AppData\\Roaming\\Claude"])), false);
   assert.equal(claudeDesktopInstalled(winOpts([
     "C:\\Users\\ada\\.claude", "C:\\Users\\ada\\.local\\bin",
   ])), false, "~/.claude is shared with the CLI");

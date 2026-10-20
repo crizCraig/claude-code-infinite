@@ -52,15 +52,29 @@ test("never fires for a subscription", () => {
       assert.equal(needsPlanWarning({ auth: "unknown", plan }), false, `unknown/${plan}`);
     }
   }
-  // What Claude Code last sent through ccc beats the config files' guess.
+  // What Claude Code last sent through ccc beats the config files' silence.
   assert.equal(needsPlanWarning({ auth: "api_key", plan: "unknown", seen: "subscription" }), false);
   assert.equal(needsPlanWarning({ auth: "unknown", plan: "free", seen: "subscription" }), false);
-  assert.equal(needsPlanWarning({ auth: "subscription", plan: "max", seen: "api_key" }), true);
+  // A claude.ai login on file (oauthAccount, no Console key) with ANTHROPIC_API_KEY exported:
+  // Claude Code asks whether to use the key, so the login may well be what it uses.
+  assert.equal(needsPlanWarning({ auth: "api_key", plan: "unknown", subscriptionLogin: true }),
+    false);
+});
+
+test("a stale API-key sighting never outweighs a subscription on file", () => {
+  // Refused for credit, then `claude` → `/login` to Max outside ccc: the next ccc launch.
+  assert.equal(needsPlanWarning({ auth: "subscription", plan: "max", seen: "api_key" }), false);
+  assert.equal(needsPlanWarning({ auth: "api_key", plan: "pro", seen: "api_key" }), false);
+  assert.equal(needsPlanWarning({ auth: "subscription", plan: "unknown", seen: "api_key" }), false);
+  // Nothing on file but the key: still warned.
+  assert.equal(needsPlanWarning({ auth: "unknown", plan: "unknown", seen: "api_key" }), true);
+  assert.equal(needsPlanWarning({ auth: "subscription", plan: "free", seen: "api_key" }), true);
 });
 
 test("cloud providers are not Claude plans and are not warned", () => {
   for (const auth of ["bedrock", "vertex", "foundry"]) {
     assert.equal(needsPlanWarning({ auth, plan: "unknown" }), false, auth);
+    assert.equal(needsPlanWarning({ auth, plan: "unknown", seen: "api_key" }), false, auth);
   }
 });
 
@@ -72,6 +86,19 @@ test("a long-lived subscription token (claude setup-token) counts as a subscript
   const both = { ...env, ANTHROPIC_API_KEY: "sk-ant-api03-x" };
   assert.equal(claudeAuthFromConfig({ env: both, homedir: "/home/ada", readFile: () => null }),
     "api_key");
+});
+
+test("a claude.ai login on file, by key names only", async () => {
+  const { claudeSubscriptionLogin } = await import("../dist/claude-auth.js");
+  const at = (files) => claudeSubscriptionLogin({
+    env: {}, homedir: "/home/ada", readFile: (f) => files[f.replace(/\\/g, "/")] ?? null,
+  });
+  assert.equal(at({ "/home/ada/.claude.json": '{"oauthAccount": {"emailAddress": "a@b.c"}}' }), true);
+  assert.equal(at({ "/home/ada/.claude.json":
+    '{"oauthAccount": {"x": 1}, "primaryApiKey": "sk-ant-api03-x"}' }), false, "a Console login");
+  assert.equal(at({ "/home/ada/.claude/.credentials.json": '{"claudeAiOauth": {"accessToken": "t"}}' }),
+    true);
+  assert.equal(at({}), false);
 });
 
 test("the sign-in type Claude Code last used is kept as a type only", () => {
@@ -100,7 +127,10 @@ test("the tee reports each request's sign-in type, and a credit refusal as an AP
   sink.log(rec({ claudeAuth: "unknown", upstreamStatus: 200 }));
   sink.log(rec({ claudeAuth: "api_key", upstreamStatus: 400, upstreamError: "credit_balance_too_low" }));
   sink.log(rec({ upstreamStatus: 400, upstreamError: "credit_balance_too_low" }));
-  assert.deepEqual(seen, ["subscription", "api_key", "api_key"]);
+  // A credit refusal on a subscription token stays a subscription (extra usage ran out).
+  sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 400,
+                 upstreamError: "credit_balance_too_low" }));
+  assert.deepEqual(seen, ["subscription", "api_key", "api_key", "subscription"]);
 });
 
 test("diagnostics: the warning is recorded by sign-in type only", () => {

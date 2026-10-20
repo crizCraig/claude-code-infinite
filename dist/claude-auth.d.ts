@@ -30,6 +30,13 @@ export interface ClaudeAuthOptions {
 /** The sign-in type from env and Claude Code's config, before any request. */
 export declare function claudeAuthFromConfig(opts?: ClaudeAuthOptions): ClaudeAuthType;
 /**
+ * Whether a claude.ai login is on file, by key names only: `oauthAccount` in
+ * `~/.claude.json` without a Console key, or `claudeAiOauth` in
+ * `.credentials.json` (Linux and Windows). Unlike claudeAuthFromConfig it
+ * ignores env keys, which Claude Code asks about before using.
+ */
+export declare function claudeSubscriptionLogin(opts?: ClaudeAuthOptions): boolean;
+/**
  * The Claude.ai plan tier Claude Code recorded locally: `organizationType` and
  * `organizationRateLimitTier` in `~/.claude.json`, else `subscriptionType` in
  * `.credentials.json` (Linux and Windows). Only those values are matched, and

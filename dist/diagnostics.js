@@ -252,9 +252,10 @@ export class DiagnosticsRequestSink {
         if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
             this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
             this.onCreditBalanceTooLow?.();
-            // Only an API key is refused for credit, whatever its header looked like.
-            if (rec.claudeAuth !== "api_key")
+            // An API key's refusal; a subscription token's header (extra usage spent) stays one.
+            if (rec.claudeAuth === undefined || rec.claudeAuth === "unknown") {
                 this.onClaudeAuth?.("api_key");
+            }
         }
         if (rec.compress?.timedOut) {
             this.diagnostics.recordLimited("compress_timeout", "compress_timeout", { ms: rec.compress.ms, request_kb: kb(rec.requestBytes) });

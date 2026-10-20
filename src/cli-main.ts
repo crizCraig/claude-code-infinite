@@ -101,7 +101,12 @@ import {
   locateClaude,
   withClaudeOnPath,
 } from "./claude-locate.js";
-import { claudeAuthFromConfig, claudePlanFromConfig, creditNoticeText } from "./claude-auth.js";
+import {
+  claudeAuthFromConfig,
+  claudePlanFromConfig,
+  claudeSubscriptionLogin,
+  creditNoticeText,
+} from "./claude-auth.js";
 import {
   printNoPlanWarning,
   readSeenClaudeAuth,
@@ -381,6 +386,7 @@ async function main() {
     auth: claudeAuthFromConfig({ readFile }),
     plan: claudePlanFromConfig({ readFile }),
     seen: readSeenClaudeAuth(getConfigDir()),
+    subscriptionLogin: claudeSubscriptionLogin({ readFile }),
   };
   diagnostics.setContext({
     claude_found: desktopOnly ? "desktop_only" : claude?.source,
@@ -558,7 +564,8 @@ async function main() {
   // One unobtrusive (dim) line so users can find the log during an incident.
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
   // On an API key or not signed in: one line before the first prompt (stderr).
-  if (printNoPlanWarning(claudeSignIn, interactiveUi && terminalSupportsColor())) {
+  if (printNoPlanWarning(claudeSignIn,
+    process.stderr.isTTY === true && terminalSupportsColor())) {
     diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
   }
   reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);

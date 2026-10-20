@@ -43,7 +43,7 @@ import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
 import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
-import { claudeAuthFromConfig, claudePlanFromConfig, creditNoticeText } from "./claude-auth.js";
+import { claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, } from "./claude-auth.js";
 import { printNoPlanWarning, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
 import { exitResumeHint } from "./resume-hint.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -273,6 +273,7 @@ async function main() {
         auth: claudeAuthFromConfig({ readFile }),
         plan: claudePlanFromConfig({ readFile }),
         seen: readSeenClaudeAuth(getConfigDir()),
+        subscriptionLogin: claudeSubscriptionLogin({ readFile }),
     };
     diagnostics.setContext({
         claude_found: desktopOnly ? "desktop_only" : claude?.source,
@@ -443,7 +444,7 @@ async function main() {
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
     // On an API key or not signed in: one line before the first prompt (stderr).
-    if (printNoPlanWarning(claudeSignIn, interactiveUi && terminalSupportsColor())) {
+    if (printNoPlanWarning(claudeSignIn, process.stderr.isTTY === true && terminalSupportsColor())) {
         diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
     }
     reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
