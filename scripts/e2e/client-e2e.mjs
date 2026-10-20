@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   FAIL, PASS, PROD_BASE_URL, SKIP, E2E_EMAIL_MARKER, claudeMissingProblems, exitCode,
-  installedVersion, journeyLines, noKeyProblems, parsePrintResult, redactUrl,
+  VERSION_WITHOUT_KEY_SINCE, installedVersion, journeyLines, noKeyProblems, versionAtLeast, versionProblems, parsePrintResult, redactUrl,
   requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "./lib.mjs";
 
@@ -78,6 +78,16 @@ async function firstRun() {
     const problems = noKeyProblems(runCcc(["-p", "hi"]));
     assert(problems.length === 0, problems.join("; "));
   });
+  const installed = installedVersion(npm(["ls", "-g", "claude-code-infinite", "--json"]).stdout);
+  if (versionAtLeast(installed, VERSION_WITHOUT_KEY_SINCE)) {
+    await check("first-run", "ccc --version with no key", () => {
+      const problems = versionProblems(runCcc(["--version"]), installed);
+      assert(problems.length === 0, problems.join("; "));
+    });
+  } else {
+    record("first-run", "ccc --version with no key", SKIP,
+      `ccc ${installed} asks for a key first (fixed from ${VERSION_WITHOUT_KEY_SINCE})`);
+  }
   if (!KEY) {
     record("first-run", "key accepted by production", SKIP, "secret MEMTREE_E2E_KEY not set");
     return phaseDone("first-run");

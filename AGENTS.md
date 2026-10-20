@@ -25,3 +25,11 @@ environment before `npm publish --provenance`.
   (check `git merge-base --is-ancestor origin/main HEAD` first).
 - Before merging: `npm test` (both colour modes) and `dist/` matching a fresh build; CI must be
   green on Linux, macOS and Windows.
+
+## Daily e2e checks
+
+`.github/workflows/e2e-daily.yml` installs the published ccc on Linux, macOS and Windows every
+morning and checks the first run against production (`scripts/e2e/client-e2e.mjs`). It runs
+only on schedule and manual dispatch, never on pull requests (its secrets: the e2e-test
+account's MemTree key and a low-limit Anthropic key). Keep its output free of keys, emails and
+tree ids: this repo's logs are public. Overview: polychat's docs/e2e_daily_checks.md.

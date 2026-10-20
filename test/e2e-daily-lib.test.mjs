@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   CLAUDE_MISSING_MESSAGE, FAIL, NO_KEY_MESSAGE, PASS, SKIP, claudeInstallCommand,
   claudeMissingProblems, exitCode, installedVersion, journeyLines, noKeyProblems,
-  parsePrintResult, redactUrl, requestLogLines, summaryMarkdown, uniqueFirstMessage,
+  parsePrintResult, redactUrl, versionAtLeast, versionProblems, requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "../scripts/e2e/lib.mjs";
 import { claudeDesktopOnlyText, claudeMissingText } from "../dist/claude-locate.js";
 
@@ -78,4 +78,14 @@ test("e2e: journey lines, summary and exit code", () => {
   const md = summaryMarkdown("T", results, ["turn"], "https://x/runs/1");
   assert.ok(md.includes("- FAIL phase turn did not finish"));
   assert.ok(md.includes("| FAIL | first-run | b | x\\|y |"));
+});
+
+test("e2e: version comparisons and the --version expectation", () => {
+  assert.ok(versionAtLeast("1.0.28", "1.0.28"));
+  assert.ok(versionAtLeast("1.1.0", "1.0.28"));
+  assert.ok(!versionAtLeast("1.0.27", "1.0.28"));
+  const good = { status: 0, stdout: "1.0.28 (Claude Code Infinite)\n2.1.304 (Claude Code)\n", stderr: "" };
+  assert.deepEqual(versionProblems(good, "1.0.28"), []);
+  const old = { status: 1, stdout: "", stderr: "A MemTree API key is required" };
+  assert.equal(versionProblems(old, "1.0.28").length, 4);
 });
