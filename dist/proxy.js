@@ -3566,7 +3566,9 @@ async function recoverToolRouteMiss(args) {
         // a later turn. An unpaid key (402, possibly set by this very compress)
         // or a shutting-down proxy gets no retry.
         if (!state.shutdownSignal.aborted &&
-            opts.memtree.paymentRequiredDetail === null) {
+            opts.memtree.paymentRequiredDetail === null &&
+            !opts.memtree.keyInvalid // a refused key refuses the index too
+        ) {
             opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, requestSessionId(req), args.clientMeta, transcriptTimesFor(opts, requestSessionId(req), agentAttributionId(req)));
         }
         return forwardOriginal();
@@ -3992,6 +3994,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         inputTokens, outputTokens: args.body.max_tokens ?? 0,
         outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
         budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
+        ...(keyInvalid ? { keyInvalid: true } : {}),
     };
     if (unpaid !== null || keyInvalid)
         cancelPausedNotice(args.state, args.rec);

@@ -23,7 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
-import { keyPageUrl } from "./key-page.js";
+import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -1615,6 +1615,7 @@ export class MemtreeClient {
     const started = Date.now();
     let status: number | undefined;
     let ok = false;
+    let keyRefused = false;
     let diagnostics: {
       indexedTokens?: number;
       rawPromptTokens?: number;
@@ -1657,6 +1658,7 @@ export class MemtreeClient {
         if (response.status === 402) {
           this.unpaidDetail = extract402Detail(text);
         }
+        keyRefused = isKeyRejected(response.status, text);
         // The status rides on the error so compress() can classify the
         // failure for the fuse without parsing message text.
         throw Object.assign(
@@ -1720,7 +1722,6 @@ export class MemtreeClient {
       // A background index call that failed otherwise (a timeout, a 413 on a big
       // body) is no news about payment; a compress call's answer always is.
       // A refused key is news from any call, like a 402.
-      const keyRefused = status === 401 || status === 403;
       const news = status === 402 || keyRefused || ok || !opts.indexOnly;
       if (news && (status !== undefined || !opts.signal?.aborted)) {
         this.lastAnswerUnpaid = status === 402;

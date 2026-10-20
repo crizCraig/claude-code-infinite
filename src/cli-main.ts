@@ -46,9 +46,8 @@ import {
   KEY_PAGE_URL,
   LOCAL_KEY_PAGE_URL,
   fetchKeyStatus,
-  keyInvalidLine,
   keyPageUrl,
-  runKeyGate,
+  resolveInvalidKey,
   type KeyCheck,
 } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
@@ -187,16 +186,14 @@ async function handleInvalidKey(
   ctx: { mode: Mode; baseUrl: string; apiKey: string; interactive: boolean;
     diagnostics: Diagnostics }
 ): Promise<{ apiKey: string; check: KeyCheck }> {
-  if (check !== "invalid") return { apiKey: ctx.apiKey, check };
-  const url = keyPageUrl(ctx.baseUrl);
-  if (!ctx.interactive) {
-    // console.log is routed to stderr (uncoloured off a terminal) in these runs.
-    console.log(keyInvalidLine(url, ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`));
-    return { apiKey: ctx.apiKey, check };
-  }
+  if (check === "invalid" && ctx.interactive) ctx.diagnostics.flushNow(); // may quit at the gate
   const color = terminalSupportsColor();
-  const result = await runKeyGate({
-    keyPageUrl: url,
+  const result = await resolveInvalidKey(check, ctx.apiKey, {
+    interactive: ctx.interactive,
+    command: ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`,
+    keyPageUrl: keyPageUrl(ctx.baseUrl),
+    // console.log is routed to stderr (uncoloured off a terminal) in print/non-TTY runs.
+    stderrLine: (text) => console.log(text),
     ask: askLine,
     open: openUrl,
     warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
@@ -204,11 +201,11 @@ async function handleInvalidKey(
     check: (apiKey) => fetchKeyStatus(ctx.baseUrl, apiKey, { diagnostics: ctx.diagnostics }),
     saveKey: (apiKey) => saveApiKey(ctx.mode, apiKey, ctx.diagnostics),
   });
-  if (result.action === "quit") {
+  if (result === "quit") {
     await ctx.diagnostics.flush();
     process.exit(0);
   }
-  return result.action === "rekeyed" ? result : { apiKey: ctx.apiKey, check };
+  return result;
 }
 
 /** Save `apiKey` as this environment's key; diagnostics now go by it. */

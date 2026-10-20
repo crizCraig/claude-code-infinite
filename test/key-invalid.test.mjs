@@ -17,8 +17,10 @@ import {
   keyInvalidLine,
   keyInvalidNoticeText,
   keyInvalidRefusalMessage,
+  isKeyRejected,
   keyPageUrl,
   parseKeyChoice,
+  resolveInvalidKey,
   runKeyGate,
 } from "../dist/key-status.js";
 
@@ -54,8 +56,30 @@ test("the key page is polychat's MemTree sign-in (local: the dev front end)", ()
   assert.equal(keyPageUrl("not a url"), KEY_PAGE_URL);
 });
 
+test("401, or 403 with polychat's own detail, is a refused key; a bare 403 is not", () => {
+  assert.equal(isKeyRejected(401), true);
+  assert.equal(isKeyRejected(401, "<html>"), true);
+  assert.equal(isKeyRejected(403, '{"detail":"Invalid API key"}'), true);
+  assert.equal(isKeyRejected(403, '{"detail": "invalid api key"}'), true);
+  assert.equal(isKeyRejected(403), false, "Cloudflare's WAF, a corporate proxy");
+  assert.equal(isKeyRejected(403, "<html>Attention Required! | Cloudflare</html>"), false);
+  assert.equal(isKeyRejected(403, '{"detail":"Untrusted origin"}'), false);
+  assert.equal(isKeyRejected(402, '{"detail":"Invalid API key"}'), false);
+  assert.equal(isKeyRejected(undefined), false);
+});
+
+test("startup check: a bare 403 (WAF, proxy) stays unknown", async () => {
+  const server = await serve((req, res) => {
+    res.writeHead(403, { "content-type": "text/html" });
+    res.end("<html>Attention Required! | Cloudflare</html>");
+  });
+  try {
+    assert.equal(await fetchKeyStatus(server.url, "k"), null);
+  } finally { server.close(); }
+});
+
 for (const status of [401, 403]) {
-  test(`startup check: ${status} means the key is invalid`, async () => {
+  test(`startup check: ${status} with polychat's detail means the key is invalid`, async () => {
     const server = await statusServer(status, { detail: "Invalid API key" });
     const diagnostics = recorder();
     try {
@@ -65,7 +89,7 @@ for (const status of [401, 403]) {
   });
 }
 
-for (const status of [400, 404, 405, 429, 500, 502, 503]) {
+for (const status of [400, 403, 404, 405, 429, 500, 502, 503]) {
   test(`startup check: ${status} stays unknown (no false alarm)`, async () => {
     const server = await statusServer(status, { detail: "nope" });
     const diagnostics = recorder();
@@ -158,6 +182,39 @@ test("gate: an empty paste or another invalid key asks again; the bad key is nev
   assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: "ok", check: null });
   assert.deepEqual(log.saved, ["ok"], "an unknown status (network) still saves the pasted key");
   assert.equal(log.warned.length, 3, "the headline again after each failed attempt");
+  assert.deepEqual(log.opened, [KEY_PAGE_URL], "the key page opens once, not per attempt");
+  assert.match(log.warned[2], /^⚠ That key isn't valid either\. Get a new one at /);
+});
+
+test("print/non-TTY: one stderr line, the run carries on with the old key, no prompt", async () => {
+  const { deps, log } = gateDeps([]);
+  const lines = [];
+  const result = await resolveInvalidKey("invalid", "old", {
+    ...deps, interactive: false, command: "ccc", stderrLine: (text) => lines.push(text),
+  });
+  assert.deepEqual(result, { apiKey: "old", check: "invalid" });
+  assert.deepEqual(lines, [keyInvalidLine(KEY_PAGE_URL, "ccc")]);
+  assert.deepEqual(log.asked, []);
+  assert.deepEqual(log.warned, []);
+});
+
+test("resolveInvalidKey: a known status passes through; interactive gates re-key or quit", async () => {
+  const none = (text) => assert.fail(`no line expected: ${text}`);
+  const paid = { paid: true, message: null, url: null };
+  const unpaid = { paid: false, message: null, url: null };
+  const base = { interactive: true, command: "ccc", stderrLine: none };
+  assert.deepEqual(await resolveInvalidKey(paid, "k", { ...gateDeps([]).deps, ...base }),
+    { apiKey: "k", check: paid });
+  assert.deepEqual(await resolveInvalidKey(null, "k", { ...gateDeps([]).deps, ...base }),
+    { apiKey: "k", check: null });
+  assert.equal(await resolveInvalidKey("invalid", "k", { ...gateDeps(["q"]).deps, ...base }), "quit");
+  assert.deepEqual(
+    await resolveInvalidKey("invalid", "k", { ...gateDeps(["c"]).deps, ...base }),
+    { apiKey: "k", check: "invalid" });
+  // A new key that is unpaid comes back unpaid, for the payment gate next.
+  assert.deepEqual(await resolveInvalidKey("invalid", "k",
+    { ...gateDeps(["", "new"], { new: unpaid }).deps, ...base }),
+  { apiKey: "new", check: unpaid });
 });
 
 // ---------------------------------------------------------------- mid-session
@@ -170,7 +227,7 @@ const humanTurn = (tokens) => [{ role: "user", content: history(tokens) },
 
 /** Upstream counts and answers; MemTree answers `h.status` until it is 200. */
 async function harness(status, extra = {}) {
-  const h = { status, delivered: [] };
+  const h = { status, delivered: [], calls: [] };
   const upstream = await serve((req, res, raw) => {
     res.setHeader("content-type", "application/json");
     if (req.url.includes("/count_tokens")) {
@@ -183,11 +240,14 @@ async function harness(status, extra = {}) {
   const memory = await serve((req, res, raw) => {
     res.setHeader("content-type", "application/json");
     if (req.method === "GET") { res.statusCode = 202; return res.end("{}"); }
+    const indexOnly = raw && JSON.parse(raw).index_only;
+    h.calls.push({ status: h.status, indexOnly: Boolean(indexOnly) });
     if (h.status !== 200) {
       res.statusCode = h.status;
-      return res.end(JSON.stringify({ detail: "Invalid API key" }));
+      return res.end(h.body ?? JSON.stringify({ detail: h.status === 402
+        ? "Payment required" : "Invalid API key" }));
     }
-    if (JSON.parse(raw).index_only) return res.end(JSON.stringify({ messages: [] }));
+    if (indexOnly) return res.end(JSON.stringify({ messages: [] }));
     const messages = [{ role: "user", content: "saved memory ".repeat(200) }];
     res.end(JSON.stringify({ compressed: true, messages, flattened_messages: messages,
       usage: { indexed_tokens: 990_000, raw_prompt_tokens: 995_000 } }));
@@ -226,7 +286,7 @@ const display = (h, promptId) => hook(h, { hook_event_name: "MessageDisplay",
 test("the in-session notice: key invalid, the key page bare on its own line, session continues", () => {
   assert.equal(keyInvalidNoticeText(KEY_PAGE_URL),
     "⚠ MemTree is off: your MemTree key isn't valid (revoked or mistyped). " +
-    "Get a new one, then restart ccc to paste it:\n" +
+    "Get a new one, then run `ccc` in a terminal to paste it:\n" +
     "  https://polychat.co/auth?memtree=true&utm_source=ccc\n" +
     "Your session continues uncompressed.");
 });
@@ -236,7 +296,8 @@ test("the refusal names the invalid key and the key page, on one line", () => {
   assert.equal(text,
     "Your MemTree key isn't valid (revoked or mistyped), so this long conversation can't be " +
     "compressed to fit the model's context window. Get a new key at " +
-    "https://polychat.co/auth?memtree=true&utm_source=ccc and restart ccc to paste it · " +
+    "https://polychat.co/auth?memtree=true&utm_source=ccc, then run `ccc` in a terminal to paste " +
+    "it · " +
     "or start fresh with /clear.");
   assert.ok(!text.includes("\n"));
 });
@@ -310,5 +371,79 @@ test("an invalid-key refusal is not followed by a duplicate key notice", async (
     await submit(h, "p2");
     assert.equal((await post(h, humanTurn(1_000))).status, 200);
     assert.equal((await display(h, "p2")).status, 204);
+  } finally { h.close(); }
+});
+
+test("mid-session bare 403 (WAF, proxy): the generic degraded notice, not a key alarm", async () => {
+  const h = await harness(403);
+  h.body = "<html>Attention Required! | Cloudflare</html>";
+  try {
+    await submit(h, "p1");
+    await post(h, humanTurn(1_000));
+    assert.equal(h.memtree.keyInvalid, false);
+    const text = (await display(h, "p1")).body.hookSpecificOutput.displayContent;
+    assert.ok(text.includes(DEGRADED_NOTICE));
+  } finally { h.close(); }
+});
+
+test("memtree state: the latest answer wins between 402 and 401", async () => {
+  const h = await harness(402);
+  try {
+    await post(h, humanTurn(1_000));
+    assert.notEqual(h.memtree.pausedDetail, null);
+    assert.equal(h.memtree.keyInvalid, false);
+    h.status = 401;
+    await post(h, humanTurn(1_000));
+    assert.equal(h.memtree.keyInvalid, true);
+    assert.equal(h.memtree.pausedDetail, null);
+    h.status = 402;
+    await post(h, humanTurn(1_000));
+    assert.equal(h.memtree.keyInvalid, false);
+    assert.notEqual(h.memtree.pausedDetail, null);
+  } finally { h.close(); }
+});
+
+test("memtree state: a background index call's 401 marks the key invalid", async () => {
+  const server = await statusServer(401, { detail: "Invalid API key" });
+  const memtree = new MemtreeClient({ baseUrl: server.url, apiKey: "revoked" });
+  try {
+    memtree.indexInBackground("h1", [{ role: "user", content: "hi" }], 200_000, "s1");
+    for (let i = 0; i < 50 && !memtree.keyInvalid; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(memtree.keyInvalid, true);
+  } finally { server.close(); }
+});
+
+test("memtree state: an aborted call leaves the key state unchanged", async () => {
+  const server = await serve(() => {}); // never answers
+  const memtree = new MemtreeClient({ baseUrl: server.url, apiKey: "k" });
+  try {
+    const controller = new AbortController();
+    const pending = memtree.compress("h", [{ role: "user", content: "hi" }], 200_000,
+      controller.signal);
+    controller.abort();
+    assert.equal(await pending, null);
+    assert.equal(memtree.keyInvalid, false);
+  } finally { server.close(); }
+});
+
+test("an invalid-key refusal in a subagent's lane keeps the user's key notice due", async () => {
+  const h = await harness(401);
+  try {
+    const response = await fetch(`http://127.0.0.1:${h.proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-claude-code-session-id": SESSION,
+        "x-claude-code-agent-id": "sub-1" },
+      body: JSON.stringify({ model: MODEL, max_tokens: 128_000, messages: [
+        { role: "user", content: history(988_000) },
+        { role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "done" }] },
+      ] }),
+    });
+    assert.equal(response.status, 400);
+    assert.match(JSON.parse(await response.text()).error.message, /isn't valid/);
+    await submit(h, "p1");
+    assert.equal((await post(h, humanTurn(1_000))).status, 200);
+    const shown = await display(h, "p1");
+    assert.match(shown.body.hookSpecificOutput.displayContent, /isn't valid/);
   } finally { h.close(); }
 });

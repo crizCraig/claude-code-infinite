@@ -249,6 +249,8 @@ export interface MessagesRecord {
     indexBehind: boolean; budgetTokens: number; modelContextLimit: number;
     /** MemTree was paused (402): the refusal said so, outside the strike episode. */
     paused?: true;
+    /** MemTree refused the key (401): the refusal said so, outside the strike episode. */
+    keyInvalid?: true;
   };
   /** Searchable flag explaining a forward above the advisory compression budget. */
   overBudgetForward?: {

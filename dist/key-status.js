@@ -1,8 +1,9 @@
 /**
  * Whether the MemTree key works, and what to say when it does not.
  *
- * GET /v1/context_memory/status answers 401 (403 from some proxies) for a key
- * polychat does not know: mistyped, or revoked. That is definite, so ccc says
+ * GET /v1/context_memory/status answers 401 for a key polychat does not know:
+ * mistyped, or revoked (a 403 counts only with polychat's own detail, see
+ * key-page.ts). That is definite, so ccc says
  * so before Claude Code starts — interactive runs offer to paste a new key,
  * print/non-TTY runs get one line on stderr — and mid-session the degraded
  * turn says the key is the reason. Network errors, timeouts, 5xx and other
@@ -12,15 +13,13 @@ import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
 import { parsePaymentStatus } from "./payment-gate.js";
 import { PAYMENT_CONTINUES_LINE } from "./payment-notice.js";
 import { recordError } from "./diagnostics.js";
-export { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, keyPageUrl } from "./key-page.js";
+import { isKeyRejected } from "./key-page.js";
+export { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, isKeyRejected, keyPageUrl } from "./key-page.js";
 export const KEY_INVALID_TEXT = "Your MemTree key isn't valid (revoked or mistyped)";
 export const KEY_GATE_PROMPT = "[Enter] paste a new key   [c] use claude without MemTree   [q] quit: ";
 export const KEY_PASTE_PROMPT = "Copy your new MemTree key and paste it here: ";
+export const KEY_STILL_INVALID = "That key isn't valid either.";
 const DEFAULT_TIMEOUT_MS = 2000;
-/** A status that says the key itself is unknown or revoked. */
-export function isKeyRejected(status) {
-    return status === 401 || status === 403;
-}
 /**
  * Startup check: GET /v1/context_memory/status, bounded by a short timeout,
  * never throws. 401/403 → "invalid"; a paid/unpaid body → its status; any
@@ -38,7 +37,8 @@ export async function fetchKeyStatus(baseUrl, apiKey, options = {}) {
             signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
         });
         if (!res.ok) {
-            const result = isKeyRejected(res.status) ? "invalid"
+            const body = await res.text().catch(() => "");
+            const result = isKeyRejected(res.status, body) ? "invalid"
                 : res.status === 402 ? "payment_required" : "unknown";
             diagnostics?.record("key_status", { result, status: res.status });
             return result === "invalid" ? "invalid" : null;
@@ -63,8 +63,10 @@ export async function fetchKeyStatus(baseUrl, apiKey, options = {}) {
  * chose it.
  */
 export async function runKeyGate(deps) {
+    let opened = false;
+    let headline = `⚠ ${KEY_INVALID_TEXT}. Get a new one at ${deps.keyPageUrl}`;
     for (;;) {
-        deps.warn(`⚠ ${KEY_INVALID_TEXT}. Get a new one at ${deps.keyPageUrl}`);
+        deps.warn(headline);
         const choice = parseKeyChoice(await deps.ask(KEY_GATE_PROMPT));
         if (choice === "quit")
             return { action: "quit" };
@@ -72,17 +74,41 @@ export async function runKeyGate(deps) {
             deps.say("\nStarting claude without MemTree.\n");
             return { action: "continue" };
         }
-        deps.open(deps.keyPageUrl);
+        // The key page once: a retry already has it open.
+        if (!opened)
+            deps.open(deps.keyPageUrl);
+        opened = true;
         const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
         if (!apiKey)
             continue;
         const check = await deps.check(apiKey);
-        if (check === "invalid")
+        if (check === "invalid") {
+            headline = `⚠ ${KEY_STILL_INVALID} Get a new one at ${deps.keyPageUrl}`;
             continue;
+        }
         deps.saveKey(apiKey);
         deps.say("API key saved.\n");
         return { action: "rekeyed", apiKey, check };
     }
+}
+/**
+ * The startup check's answer, after dealing with an invalid key: a print or
+ * non-TTY run gets one line (`stderrLine`; their stdout is Claude's alone) and
+ * carries on without MemTree; an interactive run gets the gate, which may
+ * re-key or quit. Anything but "invalid" passes through unchanged.
+ */
+export async function resolveInvalidKey(check, apiKey, deps) {
+    if (check !== "invalid")
+        return { apiKey, check };
+    if (!deps.interactive) {
+        deps.stderrLine(keyInvalidLine(deps.keyPageUrl, deps.command));
+        return { apiKey, check };
+    }
+    const result = await runKeyGate(deps);
+    if (result.action === "quit")
+        return "quit";
+    return result.action === "rekeyed" ? { apiKey: result.apiKey, check: result.check }
+        : { apiKey, check };
 }
 /** Map a gate answer to a choice. Enter (empty) or `p` pastes a key. */
 export function parseKeyChoice(answer) {
@@ -102,7 +128,7 @@ export function keyInvalidLine(url, command) {
 export function keyInvalidNoticeText(url) {
     return [
         "⚠ MemTree is off: your MemTree key isn't valid (revoked or mistyped). " +
-            "Get a new one, then restart ccc to paste it:",
+            "Get a new one, then run `ccc` in a terminal to paste it:",
         `  ${url}`,
         PAYMENT_CONTINUES_LINE,
     ].join("\n");
@@ -110,7 +136,8 @@ export function keyInvalidNoticeText(url) {
 /** The API error Claude Code shows when only compression could fit the request. */
 export function keyInvalidRefusalMessage(url) {
     return `${KEY_INVALID_TEXT}, so this long conversation can't be compressed to fit the ` +
-        `model's context window. Get a new key at ${url} and restart ccc to paste it · ` +
+        `model's context window. Get a new key at ${url}, then run \`ccc\` in a terminal to ` +
+        "paste it · " +
         "or start fresh with /clear.";
 }
 //# sourceMappingURL=key-status.js.map

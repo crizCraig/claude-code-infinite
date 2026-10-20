@@ -27,7 +27,7 @@ import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { startupNoticeText } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, PAYMENT_GATE_PROMPT, formatPaymentNotice, parsePaymentChoice, hyperlink, } from "./payment-gate.js";
-import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyInvalidLine, keyPageUrl, runKeyGate, } from "./key-status.js";
+import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
@@ -93,17 +93,15 @@ async function promptForApiKey(mode, output) {
  * Anything else passes through unchanged.
  */
 async function handleInvalidKey(check, ctx) {
-    if (check !== "invalid")
-        return { apiKey: ctx.apiKey, check };
-    const url = keyPageUrl(ctx.baseUrl);
-    if (!ctx.interactive) {
-        // console.log is routed to stderr (uncoloured off a terminal) in these runs.
-        console.log(keyInvalidLine(url, ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`));
-        return { apiKey: ctx.apiKey, check };
-    }
+    if (check === "invalid" && ctx.interactive)
+        ctx.diagnostics.flushNow(); // may quit at the gate
     const color = terminalSupportsColor();
-    const result = await runKeyGate({
-        keyPageUrl: url,
+    const result = await resolveInvalidKey(check, ctx.apiKey, {
+        interactive: ctx.interactive,
+        command: ctx.mode === "production" ? "ccc" : `ccc ${ctx.mode}`,
+        keyPageUrl: keyPageUrl(ctx.baseUrl),
+        // console.log is routed to stderr (uncoloured off a terminal) in print/non-TTY runs.
+        stderrLine: (text) => console.log(text),
         ask: askLine,
         open: openUrl,
         warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
@@ -111,11 +109,11 @@ async function handleInvalidKey(check, ctx) {
         check: (apiKey) => fetchKeyStatus(ctx.baseUrl, apiKey, { diagnostics: ctx.diagnostics }),
         saveKey: (apiKey) => saveApiKey(ctx.mode, apiKey, ctx.diagnostics),
     });
-    if (result.action === "quit") {
+    if (result === "quit") {
         await ctx.diagnostics.flush();
         process.exit(0);
     }
-    return result.action === "rekeyed" ? result : { apiKey: ctx.apiKey, check };
+    return result;
 }
 /** Save `apiKey` as this environment's key; diagnostics now go by it. */
 function saveApiKey(mode, apiKey, diagnostics) {
