@@ -33,8 +33,14 @@ export interface PlanWarningInput {
  * is never warned.
  */
 export declare function needsPlanWarning(input: PlanWarningInput): boolean;
-/** `claude --version`, `claude mcp --help` and the like: no session, so no line. */
+/** `claude --version`, `claude doctor` and the like: no session, so no line. */
 export declare function isInfoOnlyRun(args: readonly string[]): boolean;
+/**
+ * Whether a credit_balance_too_low refusal gets the advice at exit: for an API
+ * key, or a request with no auth header ccc could read; not for a subscription
+ * token (extra usage spent) or a bearer ccc does not recognise.
+ */
+export declare function creditAdviceApplies(auth: ClaudeAuthType | undefined): boolean;
 export declare function noPlanWarningText(color: boolean): string;
 /**
  * The line on stderr when it applies: stdout stays Claude Code's in print

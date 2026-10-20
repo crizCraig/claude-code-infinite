@@ -108,6 +108,7 @@ import {
   creditNoticeText,
 } from "./claude-auth.js";
 import {
+  creditAdviceApplies,
   isInfoOnlyRun,
   printNoPlanWarning,
   readSeenClaudeAuth,
@@ -486,8 +487,7 @@ async function main() {
   // Anthropic refusing an API key for no credit gets one line as ccc exits.
   let creditTooLow = false;
   const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
-    // Its advice is for API keys; a subscription's refusal (extra usage spent) is not one.
-    if (auth !== "subscription") creditTooLow = true;
+    if (creditAdviceApplies(auth)) creditTooLow = true;
   }, (auth) => {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);

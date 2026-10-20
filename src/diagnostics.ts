@@ -281,7 +281,7 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     }
     if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
       this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
-      this.onCreditBalanceTooLow?.(rec.claudeAuth === "unknown" ? undefined : rec.claudeAuth);
+      this.onCreditBalanceTooLow?.(rec.claudeAuth);
       // An API key's refusal; a subscription token's header (extra usage spent) stays one.
       if (rec.claudeAuth === undefined || rec.claudeAuth === "unknown") {
         this.onClaudeAuth?.("api_key");

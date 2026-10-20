@@ -44,7 +44,7 @@ import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
 import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
 import { claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, } from "./claude-auth.js";
-import { isInfoOnlyRun, printNoPlanWarning, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
+import { creditAdviceApplies, isInfoOnlyRun, printNoPlanWarning, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
 import { exitResumeHint } from "./resume-hint.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
@@ -370,8 +370,7 @@ async function main() {
     // Anthropic refusing an API key for no credit gets one line as ccc exits.
     let creditTooLow = false;
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
-        // Its advice is for API keys; a subscription's refusal (extra usage spent) is not one.
-        if (auth !== "subscription")
+        if (creditAdviceApplies(auth))
             creditTooLow = true;
     }, (auth) => {
         // The next launch's no-plan line goes by what Claude Code really sent.

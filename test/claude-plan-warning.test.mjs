@@ -111,7 +111,10 @@ test("info-only runs (--version, --help) get no line", async () => {
   for (const args of [["--version"], ["-v"], ["--help"], ["-h"], ["mcp", "--help"]]) {
     assert.equal(isInfoOnlyRun(args), true, args.join(" "));
   }
-  for (const args of [[], ["-p", "hi"], ["--resume"], ["-p", "--", "--help"]]) {
+  for (const sub of ["setup-token", "doctor", "update", "mcp", "config", "install", "plugin"]) {
+    assert.equal(isInfoOnlyRun([sub, "x"]), true, sub);
+  }
+  for (const args of [[], ["-p", "hi"], ["--resume"], ["-p", "--", "--help"], ["fix", "mcp"]]) {
     assert.equal(isInfoOnlyRun(args), false, args.join(" "));
   }
 });
@@ -171,4 +174,12 @@ test("print mode: the warning goes to stderr, stdout stays Claude's", () => {
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, "");
   assert.equal(r.stderr, `${EXPECTED}\n`);
+});
+
+test("the exit credit advice is for API keys only", async () => {
+  const { creditAdviceApplies } = await import("../dist/claude-plan-warning.js");
+  assert.equal(creditAdviceApplies("api_key"), true);
+  assert.equal(creditAdviceApplies(undefined), true, "no auth header seen: an API key's refusal");
+  assert.equal(creditAdviceApplies("subscription"), false);
+  assert.equal(creditAdviceApplies("unknown"), false, "an unrecognised bearer may be a subscription");
 });

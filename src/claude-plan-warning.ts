@@ -54,11 +54,25 @@ export function needsPlanWarning(input: PlanWarningInput): boolean {
 }
 
 const INFO_FLAGS = ["--version", "-v", "--help", "-h"];
+/** Claude Code subcommands that start no session (`setup-token` makes a subscription token). */
+const NO_SESSION_COMMANDS = [
+  "setup-token", "doctor", "update", "mcp", "config", "install", "plugin",
+];
 
-/** `claude --version`, `claude mcp --help` and the like: no session, so no line. */
+/** `claude --version`, `claude doctor` and the like: no session, so no line. */
 export function isInfoOnlyRun(args: readonly string[]): boolean {
+  if (args.length > 0 && NO_SESSION_COMMANDS.includes(args[0])) return true;
   const end = args.indexOf("--");
   return (end === -1 ? args : args.slice(0, end)).some((a) => INFO_FLAGS.includes(a));
+}
+
+/**
+ * Whether a credit_balance_too_low refusal gets the advice at exit: for an API
+ * key, or a request with no auth header ccc could read; not for a subscription
+ * token (extra usage spent) or a bearer ccc does not recognise.
+ */
+export function creditAdviceApplies(auth: ClaudeAuthType | undefined): boolean {
+  return auth === "api_key" || auth === undefined;
 }
 
 export function noPlanWarningText(color: boolean): string {
