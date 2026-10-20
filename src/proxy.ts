@@ -139,6 +139,7 @@ import {
 import type { MessageTimes, TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
+import type { ProjectTreesHint } from "./project-trees.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
@@ -322,6 +323,11 @@ export interface ProxyOptions {
    */
   sessionStartNotice?: () => string | undefined;
   /**
+   * Earlier MemTree sessions in this project, added to a main session's
+   * SessionStart as model context (project-trees.ts). Omitted means none.
+   */
+  projectTrees?: ProjectTreesHint;
+  /**
    * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
    * and refusals, as allowlisted enums and numbers. Never content.
    */
@@ -405,6 +411,8 @@ interface ProxyState {
   usageUrl: string | undefined;
   /** ProxyOptions.sessionStartNotice. */
   sessionStartNotice?: () => string | undefined;
+  /** ProxyOptions.projectTrees. */
+  projectTrees?: ProjectTreesHint;
   /** ProxyOptions.diagnostics. */
   diagnostics?: DiagnosticsRecorder;
   notices: NoticeDeliveryQueue;
@@ -898,6 +906,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     pausedDetail: () => opts.memtree.pausedDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
+    projectTrees: opts.projectTrees,
     diagnostics: opts.diagnostics,
     notices: new NoticeDeliveryQueue(),
     mainNoticePending: false,
@@ -1393,12 +1402,13 @@ async function handleNoticeHook(
       resumePaymentNotice(state, parsed),
       extraSessionStartLine(state.sessionStartNotice, parsed)
     );
-    if (!line) {
+    const context = await projectTreesContext(state.projectTrees, parsed);
+    if (!line && !context) {
       res.writeHead(204);
       res.end();
       return;
     }
-    const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+    const body = Buffer.from(JSON.stringify(sessionStartOutput(line, context)), "utf-8");
     res.writeHead(200, {
       "content-type": "application/json",
       "content-length": String(body.length),
@@ -2840,6 +2850,38 @@ function extraSessionStartLine(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Earlier sessions in this project (project-trees.ts) for a main session's
+ * start: fresh, resumed, cleared or forked, never a compaction. Never throws.
+ */
+async function projectTreesContext(
+  hint: ProjectTreesHint | undefined,
+  input: SessionStartHookInput
+): Promise<string | undefined> {
+  if (!hint || input.agent_id !== undefined || input.source === "compact") return undefined;
+  try {
+    return await hint.contextFor(input.session_id);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The SessionStart hook's answer: the banner line for the user
+ * (`systemMessage`), model context (`additionalContext`), or both.
+ */
+export function sessionStartOutput(
+  line: string | undefined,
+  context: string | undefined
+): Record<string, unknown> {
+  return {
+    ...(line ? { systemMessage: line } : {}),
+    ...(context
+      ? { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } }
+      : {}),
+  };
 }
 
 function joinNoticeLines(...parts: (string | undefined)[]): string | undefined {

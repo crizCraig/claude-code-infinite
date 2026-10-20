@@ -3120,6 +3120,54 @@ test("SessionStart carries the auto-update line for main sessions, not compactio
   }
 });
 
+test("SessionStart adds earlier project trees as model context for main session starts only", async () => {
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:9", apiKey: "k" });
+  const asked = [];
+  const projectTrees = {
+    async contextFor(sessionId) {
+      asked.push(sessionId);
+      return sessionId === "none" ? undefined : `Earlier sessions (not ${sessionId})`;
+    },
+  };
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, projectTrees });
+  try {
+    const start = { hook_event_name: "SessionStart", source: "startup" };
+    const first = await postHook(proxy, start);
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body, {
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: "Earlier sessions (not session-1)",
+      },
+    });
+    assert.equal(first.body.systemMessage, undefined, "nothing shown to the user");
+    for (const source of ["resume", "clear"]) {
+      const hit = await postHook(proxy, { ...start, source });
+      assert.equal(hit.body.hookSpecificOutput.additionalContext, "Earlier sessions (not session-1)");
+    }
+    assert.equal((await postHook(proxy, { ...start, source: "compact" })).status, 204);
+    assert.equal((await postHook(proxy, { ...start, agent_id: "a1" })).status, 204);
+    assert.equal((await postHook(proxy, { ...start, session_id: "none" })).status, 204);
+    assert.deepEqual(asked, ["session-1", "session-1", "session-1", "none"]);
+  } finally {
+    proxy.close();
+  }
+  const throwing = await startProxy({
+    memtree,
+    upstreamOrigin: upstream.origin,
+    projectTrees: { contextFor: async () => { throw new Error("boom"); } },
+    sessionStartNotice: () => "banner",
+  });
+  try {
+    const both = await postHook(throwing, { hook_event_name: "SessionStart", source: "startup" });
+    assert.deepEqual(both.body, { systemMessage: "banner" }, "a failing hint leaves the banner alone");
+  } finally {
+    throwing.close();
+    upstream.close();
+  }
+});
+
 test("the resume relay script forwards SessionStart stdin to the proxy and prints its answer", async () => {
   const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
   const { createSessionNoticePlugin } = await import("../dist/hooks.js");

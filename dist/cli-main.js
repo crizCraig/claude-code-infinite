@@ -35,6 +35,7 @@ import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
+import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, settleWithin, writeStdout, } from "./cli-lifecycle.js";
@@ -411,6 +412,11 @@ async function main() {
         // Mutable below: a failed config write withdraws it before any call.
         memtreeTools: memtreeMcpPlan.tools.length ? memtreeMcpPlan.tools.join(",") : undefined,
     });
+    // Earlier sessions in this project, named to the model at session start
+    // (project-trees.ts). Asked now so the answer is in before Claude Code's
+    // first SessionStart hook; interactive sessions with the memtree tools only.
+    const projectTrees = projectTreesHintFor(interactiveUi, memtreeMcpPlan.tools, projectMeta, process.env, (pathAndQuery, signal) => memtree.fetchMemTree(pathAndQuery, "application/json", signal));
+    projectTrees?.prefetch();
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
     const memtreeLinkStore = new MemtreeLinkStore();
@@ -458,6 +464,7 @@ async function main() {
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
         // install) on a later SessionStart of this session, once.
         sessionStartNotice: autoUpdate ? () => autoUpdate.notices.sessionStartLine() : undefined,
+        projectTrees,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
@@ -518,6 +525,7 @@ async function main() {
             // Optional like the notice plugin; without it MemTree must not name
             // tools the session lacks (ccc registers only when the caller has none).
             memtree.setMemtreeTools(undefined);
+            projectTrees?.disable();
             if (isDebugMode) {
                 console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
             }

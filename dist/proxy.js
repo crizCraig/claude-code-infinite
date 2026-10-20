@@ -309,6 +309,7 @@ export function startProxy(opts) {
         pausedDetail: () => opts.memtree.pausedDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
+        projectTrees: opts.projectTrees,
         diagnostics: opts.diagnostics,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
@@ -731,12 +732,13 @@ onMainStop) {
             await state.newestTrees?.settle(parsed.session_id);
         }
         const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed), extraSessionStartLine(state.sessionStartNotice, parsed));
-        if (!line) {
+        const context = await projectTreesContext(state.projectTrees, parsed);
+        if (!line && !context) {
             res.writeHead(204);
             res.end();
             return;
         }
-        const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+        const body = Buffer.from(JSON.stringify(sessionStartOutput(line, context)), "utf-8");
         res.writeHead(200, {
             "content-type": "application/json",
             "content-length": String(body.length),
@@ -1983,6 +1985,32 @@ function extraSessionStartLine(provider, input) {
     catch {
         return undefined;
     }
+}
+/**
+ * Earlier sessions in this project (project-trees.ts) for a main session's
+ * start: fresh, resumed, cleared or forked, never a compaction. Never throws.
+ */
+async function projectTreesContext(hint, input) {
+    if (!hint || input.agent_id !== undefined || input.source === "compact")
+        return undefined;
+    try {
+        return await hint.contextFor(input.session_id);
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The SessionStart hook's answer: the banner line for the user
+ * (`systemMessage`), model context (`additionalContext`), or both.
+ */
+export function sessionStartOutput(line, context) {
+    return {
+        ...(line ? { systemMessage: line } : {}),
+        ...(context
+            ? { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } }
+            : {}),
+    };
 }
 function joinNoticeLines(...parts) {
     const present = parts.filter((part) => !!part);

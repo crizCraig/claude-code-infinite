@@ -48,6 +48,7 @@ import type { StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
+import type { ProjectTreesHint } from "./project-trees.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
@@ -186,6 +187,11 @@ export interface ProxyOptions {
      */
     sessionStartNotice?: () => string | undefined;
     /**
+     * Earlier MemTree sessions in this project, added to a main session's
+     * SessionStart as model context (project-trees.ts). Omitted means none.
+     */
+    projectTrees?: ProjectTreesHint;
+    /**
      * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
      * and refusals, as allowlisted enums and numbers. Never content.
      */
@@ -239,6 +245,11 @@ export declare function fallbackBudgetRatio(model: unknown, modelContextLimit: n
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
+/**
+ * The SessionStart hook's answer: the banner line for the user
+ * (`systemMessage`), model context (`additionalContext`), or both.
+ */
+export declare function sessionStartOutput(line: string | undefined, context: string | undefined): Record<string, unknown>;
 export declare const MEMTREE_COMPACT_MIN_TOKENS = 20000;
 export declare const SUBAGENT_VIEW_NOTE = "(main session's page; subagent pages aren't linked yet)";
 export declare const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main session only.";
