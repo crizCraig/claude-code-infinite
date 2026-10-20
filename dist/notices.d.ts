@@ -55,7 +55,7 @@ export declare function startupNoticeText(color: boolean, update?: UpdateAvailab
  * SessionStart banner for a paused session that runs as plain Claude Code
  * (paused-session.ts): MemTree is off for it, and how to turn it back on.
  */
-export declare function memtreeOffNoticeText(color: boolean, subscribeUrl: string): string;
+export declare function memtreeOffNoticeText(color: boolean, updateLine?: string | null): string;
 /**
  * After a background install (auto-update.ts): the running session keeps its
  * version until ccc restarts. `✔ ccc 1.0.21 installed · restart ccc to use it`.

@@ -170,7 +170,7 @@ test("ccc -p: the sign-in Claude Code last sent through ccc decides when the con
   assert.match(key.stderr, NO_PLAN);
 });
 
-/** A fake MemTree server on local mode's fixed port; null when the port is taken. */
+/** A fake MemTree server that says the key is unpaid, on a free port. */
 function fakeUnpaidServer(requests) {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
@@ -184,17 +184,17 @@ function fakeUnpaidServer(requests) {
         res.end(JSON.stringify({ detail: "Payment required" }));
       }
     });
-    server.once("error", () => resolve(null));
-    server.listen(8080, "localhost", () => resolve(server));
+    server.listen(0, "127.0.0.1", () => resolve(server));
   });
 }
 
-test("ccc -p with an unpaid key: one stderr line, then plain Claude Code with no MemTree calls", { timeout: 30_000 }, async (t) => {
+const localBase = (server) => ({ CCC_LOCAL_BASE_URL: `http://127.0.0.1:${server.address().port}` });
+
+test("ccc -p with an unpaid key: one stderr line, then plain Claude Code with no MemTree calls", { timeout: 30_000 }, async () => {
   const requests = [];
   const server = await fakeUnpaidServer(requests);
-  if (!server) return t.skip("port 8080 is in use");
   try {
-    const { code, stdout, stderr } = await runCcc(["-p", "hi"]);
+    const { code, stdout, stderr } = await runCcc(["-p", "hi"], localBase(server));
     assert.equal(code, 0, stderr);
     // No memtree MCP server or plugin: Claude Code's own argv, exactly.
     assert.deepEqual(JSON.parse(stdout.trim()).args, ["-p", "hi"]);
@@ -202,6 +202,22 @@ test("ccc -p with an unpaid key: one stderr line, then plain Claude Code with no
     assert.match(stderr, /plain Claude Code/);
     assert.doesNotMatch(stderr, /Request log:/, "no proxy was started");
     assert.deepEqual(requests, ["GET /v1/context_memory/status"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session may be past the window)", { timeout: 30_000 }, async () => {
+  const requests = [];
+  const server = await fakeUnpaidServer(requests);
+  try {
+    const id = "6472823f-ca4f-4027-9b89-64a81c367dc3";
+    const { code, stdout, stderr } = await runCcc(["-p", "--resume", id, "hi"], localBase(server));
+    assert.equal(code, 0, stderr);
+    const { args } = JSON.parse(stdout.trim());
+    assert.match(args[0], /^--mcp-config=/, "still through ccc");
+    assert.deepEqual(args.slice(-4), ["-p", "--resume", id, "hi"]);
+    assert.match(stderr, /Request log:/);
   } finally {
     server.close();
   }

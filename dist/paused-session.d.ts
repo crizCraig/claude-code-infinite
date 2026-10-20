@@ -16,6 +16,14 @@ export declare function runWithoutMemtree(opts: PausedSessionOptions): Promise<n
  * The parent's environment minus ccc's own controls: none of the settings ccc
  * gives Claude Code under MemTree (base URL, auto-compaction off, lifted
  * context-limit refusal) apply, so Claude Code behaves exactly as without ccc.
+ * A ccc started inside another ccc session (a tool, a script) inherits the outer
+ * session's settings (claude-env.ts); those are dropped too.
  */
 export declare function plainClaudeEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
+/**
+ * Whether these Claude Code arguments resume or continue an earlier session. Such a
+ * session may have grown past the model's window under MemTree, which plain Claude
+ * Code could not send or compact, so it keeps ccc's own handling (cli-main.ts).
+ */
+export declare function resumesSession(args: readonly string[]): boolean;
 //# sourceMappingURL=paused-session.d.ts.map

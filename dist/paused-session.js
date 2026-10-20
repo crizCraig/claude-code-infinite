@@ -14,6 +14,7 @@
  */
 import spawn from "cross-spawn";
 import { claudeExitFields, createSignalShutdownHandler, exitCodeForChild, settleWithin, } from "./cli-lifecycle.js";
+import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { claudeMissingText, withClaudeOnPath } from "./claude-locate.js";
 import { recordError } from "./diagnostics.js";
 import { createStartupBannerPlugin, withSessionNoticePluginArgs, } from "./hooks.js";
@@ -36,7 +37,7 @@ export async function runWithoutMemtree(opts) {
             resolve(exitCodeForChild(code, signal));
         });
     });
-    forwardSignals(child, exited, opts.diagnostics, (code) => void finish(code, plugin, opts));
+    forwardSignals(child, exited, opts, (code) => void finish(code, plugin, opts));
     opts.autoUpdate?.scheduleInstall(undefined, (result) => {
         opts.diagnostics.record("auto_update", { result });
         opts.diagnostics.flushNow();
@@ -47,11 +48,44 @@ export async function runWithoutMemtree(opts) {
  * The parent's environment minus ccc's own controls: none of the settings ccc
  * gives Claude Code under MemTree (base URL, auto-compaction off, lifted
  * context-limit refusal) apply, so Claude Code behaves exactly as without ccc.
+ * A ccc started inside another ccc session (a tool, a script) inherits the outer
+ * session's settings (claude-env.ts); those are dropped too.
  */
 export function plainClaudeEnv(parentEnv) {
     const env = { ...parentEnv };
     delete env.CCC_AUTO_COMPACT;
+    if (insideCccSession(parentEnv)) {
+        for (const name of OUTER_CCC_SETTINGS)
+            delete env[name];
+        if (env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE === UNREACHABLE_BLOCKING_LIMIT) {
+            delete env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE;
+        }
+    }
     return env;
+}
+/**
+ * Whether these Claude Code arguments resume or continue an earlier session. Such a
+ * session may have grown past the model's window under MemTree, which plain Claude
+ * Code could not send or compact, so it keeps ccc's own handling (cli-main.ts).
+ */
+export function resumesSession(args) {
+    for (const arg of args) {
+        if (arg === "--")
+            return false;
+        if (["-r", "--resume", "-c", "--continue"].includes(arg) || arg.startsWith("--resume=")) {
+            return true;
+        }
+    }
+    return false;
+}
+/** What claudeChildEnv sets for the Claude Code it starts, besides the blocking limit. */
+const OUTER_CCC_SETTINGS = [
+    "ANTHROPIC_BASE_URL", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "DISABLE_AUTO_COMPACT",
+];
+function insideCccSession(env) {
+    return env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL === "1" &&
+        /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(env.ANTHROPIC_BASE_URL ?? "");
 }
 function bannerPlugin(banner) {
     try {
@@ -61,7 +95,7 @@ function bannerPlugin(banner) {
         return null; // The banner is optional: a full temp dir must never stop the session.
     }
 }
-function forwardSignals(child, exited, diagnostics, exit) {
+function forwardSignals(child, exited, opts, exit) {
     const handle = createSignalShutdownHandler({
         forward: (signal) => {
             if (child.exitCode !== null || child.signalCode !== null)
@@ -80,8 +114,10 @@ function forwardSignals(child, exited, diagnostics, exit) {
     process.on("SIGTERM", () => handle("SIGTERM"));
     if (process.platform === "win32") {
         // Closing the console window (SIGHUP) gives ccc a few seconds, as in cli-main.ts.
+        // The update starts first: Windows may end ccc before Claude Code exits.
         process.on("SIGHUP", () => {
-            diagnostics.record("console_closed");
+            opts.diagnostics.record("console_closed");
+            opts.autoUpdate?.installOnExit((result) => opts.diagnostics.record("auto_update", { result }));
             handle("SIGTERM");
         });
     }

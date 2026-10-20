@@ -16,7 +16,7 @@ export declare const PAYMENT_LINK_PATH = "/v1/payment/link";
 export declare const PAYMENT_LINK_REFRESH_MARGIN_MS: number;
 /** After a failed fetch (old server, outage), wait this long before asking again. */
 export declare const PAYMENT_LINK_RETRY_MS: number;
-export declare const PAYMENT_LINK_TIMEOUT_MS = 2000;
+export declare const PAYMENT_LINK_TIMEOUT_MS = 1500;
 export declare const REASON_FREE_CREDIT_USED = "free_credit_used";
 export declare const REASON_PLAN_LIMIT = "plan_limit";
 export type PaymentLink = {

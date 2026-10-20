@@ -2469,8 +2469,10 @@ async function handleMessages(
   // it pending for the next turn.
   if (result && sessionId !== undefined) state.compactNow.delete(sessionId);
   // A first 402 starts fetching the short checkout link (memtree.ts): give the
-  // paused notice below a moment to show it instead of the long one.
-  if (!result && state.paymentNotice.due() && opts.memtree.paymentRequiredDetail !== null) {
+  // paused notice below a moment to show it instead of the long one. Only a turn
+  // that can show the notice waits, and only while that fetch is in flight.
+  if (!result && displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration &&
+      state.paymentNotice.due() && opts.memtree.paymentRequiredDetail !== null) {
     await opts.memtree.paymentLinkSettled?.(PAYMENT_LINK_NOTICE_WAIT_MS);
   }
 

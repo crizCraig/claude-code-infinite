@@ -58,6 +58,13 @@ test("server payment_url wins over the message link", () => {
   assert.equal(status.url, "https://app.polychat.co/payment?user_id=x&source=ccc");
 });
 
+test("a status link that isn't a plain http(s) URL is dropped (it is printed and opened)", () => {
+  for (const bad of ['https://x/payment?a="$(rm -rf ~)"', "https://x/payment?a=`id`",
+    "https://x/payment?a=\u001b]8;;", "file:///etc/passwd"]) {
+    assert.equal(parsePaymentStatus({ paid: false, payment_url: bad }).url, null, bad);
+  }
+});
+
 test("bodies without a boolean paid are unknown (null)", () => {
   assert.equal(parsePaymentStatus(null), null);
   assert.equal(parsePaymentStatus("nope"), null);
@@ -77,13 +84,13 @@ test("the gate with a short link: five lines in all, the server's plan and price
   const prompt = paymentGatePrompt(LINK);
   assert.deepEqual([...text.split("\n"), prompt], [
     "MemTree is paused: your free credit is used up.",
-    "Without it, long sessions hit the context limit and get compacted, losing information,",
-    "and your sessions aren't saved or searchable.",
+    "Without it, long sessions hit the context limit and get compacted, losing",
+    "information, and your sessions aren't saved or searchable.",
     `Starter is $5/month: ${SHORT}`,
     "[Enter] subscribe ($5/mo)   [c] continue without MemTree   [q] quit: ",
   ]);
   assert.ok(!text.includes("Subscription Plans"));
-  assert.ok(text.split("\n").every((line) => line.length <= 90), "fits a terminal");
+  assert.ok([...text.split("\n"), prompt].every((line) => line.length <= 78), "fits 80 columns");
 });
 
 test("interactive gate: the url is its own OSC 8 link, the headline bold yellow", () => {

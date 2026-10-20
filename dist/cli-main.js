@@ -25,10 +25,10 @@ import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
-import { memtreeOffNoticeText, startupNoticeText } from "./notices.js";
+import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, updateNoticeText, } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, parsePaymentStatus, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
-import { runWithoutMemtree } from "./paused-session.js";
+import { resumesSession, runWithoutMemtree } from "./paused-session.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
 import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
@@ -274,7 +274,8 @@ async function main() {
     else if (mode === "staging") {
         console.log("\x1b[1;35m🚧 STAGING MODE\x1b[0m\n");
     }
-    const memtreeBaseUrl = mode === "local" ? LOCAL_BASE_URL :
+    // CCC_LOCAL_BASE_URL: local mode's server elsewhere than :8080 (tests use a free port).
+    const memtreeBaseUrl = mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
     // Get or prompt for the MemTree API key (separate keys per environment)
@@ -392,11 +393,12 @@ async function main() {
         console.log(`[DEBUG] ${autoUpdate.debugLine}`);
     diagnostics.setContext({ interactive: interactiveUi });
     recordAutoUpdateDecision(diagnostics, autoUpdate);
-    if (memtreeOff) {
-        const link = paymentLinks.current()?.url ?? paymentStatus?.url ?? FALLBACK_SUBSCRIBE_URL;
+    // A resumed session may be past the window under MemTree; plain Claude Code
+    // could not send or compact it, so it keeps ccc's paused handling (402 notices).
+    if (memtreeOff && !resumesSession(claudeArgs)) {
         await runWithoutMemtree({
             claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
-            banner: memtreeOffNoticeText(terminalSupportsColor(), link),
+            banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate)),
         });
     }
     // Always-on request/timing log (reqlog.ts): messages, MemTree calls, and
@@ -763,5 +765,12 @@ function budgetFromEnv(raw) {
         return undefined;
     }
     return budget;
+}
+/** The update line a paused session's banner carries (the normal banner's, see notices.ts). */
+function pausedUpdateLine(autoUpdate) {
+    const color = terminalSupportsColor();
+    if (autoUpdate?.bannerInstalled)
+        return updateInstalledNoticeText(autoUpdate.bannerInstalled, color);
+    return autoUpdate?.bannerUpdate ? updateNoticeText(autoUpdate.bannerUpdate, color) : null;
 }
 //# sourceMappingURL=cli-main.js.map

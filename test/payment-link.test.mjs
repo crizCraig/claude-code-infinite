@@ -30,8 +30,13 @@ test("a server body becomes a link; anything off-shape is no link", () => {
     { ...BODY, url: "https://app.polychat.co/p/short" }, { ...BODY, plan: "Starter\u001b[31m" },
     { ...BODY, plan: "" }, { ...BODY, monthly_price_usd: 0 }, { ...BODY, monthly_price_usd: "5" },
     { ...BODY, monthly_price_usd: Infinity },
+    { ...BODY, url: "https://evil.example/p/Ab3xY9qwertyuiop" },
+    { ...BODY, url: "http://app.polychat.co/p/Ab3xY9qwertyuiop" },
+    { ...BODY, url: "https://polychat.co.evil.example/p/Ab3xY9qwertyuiop" },
   ]) assert.equal(parsePaymentLink(bad), null, JSON.stringify(bad));
   assert.ok(parsePaymentLink({ ...BODY, url: "http://local.polychat.co:8000/p/Ab3xY9qwertyuiop" }));
+  assert.ok(parsePaymentLink({ ...BODY,
+    url: "https://polychat-staging-421312241218.us-west2.run.app/p/Ab3xY9qwertyuiop" }));
 });
 
 test("fetchPaymentLink: POST with the key; 404, errors and timeouts are null", async () => {
@@ -71,6 +76,12 @@ test("cache: one fetch shared, reused while fresh, refetched near expiry", async
   assert.equal(cache.current(), null, "too close to expiry to show");
   await cache.get();
   assert.equal(fetches, 2);
+});
+
+test("cache: a fetch that throws counts as a failure, never a stuck promise", async () => {
+  const cache = new PaymentLinkCache(async () => { throw new Error("boom"); });
+  assert.equal(await cache.get(), null);
+  assert.equal(await cache.get(), null);
 });
 
 test("cache: after a failure (old server) it waits before asking again", async () => {

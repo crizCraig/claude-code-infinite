@@ -6,27 +6,43 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { plainClaudeEnv } from "../dist/paused-session.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { plainClaudeEnv, resumesSession } from "../dist/paused-session.js";
 import { createStartupBannerPlugin } from "../dist/hooks.js";
 import { memtreeOffNoticeText } from "../dist/notices.js";
 
-const DIST = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(\w:)/, "$1")),
-  "..", "dist");
-const SHORT = "https://app.polychat.co/p/Ab3xY9qwertyuiop";
+const DIST = fileURLToPath(new URL("../dist", import.meta.url));
 
 test("plain env: only ccc's own control is dropped; the user's settings stay", () => {
   const env = plainClaudeEnv({ CCC_AUTO_COMPACT: "1", DISABLE_AUTO_COMPACT: "1", HOME: "/h" });
   assert.deepEqual(env, { DISABLE_AUTO_COMPACT: "1", HOME: "/h" });
 });
 
-test("the MemTree-off banner says why and how to turn it back on, in both colour modes", () => {
-  const plain = memtreeOffNoticeText(false, SHORT);
-  assert.equal(plain,
-    `\n\n·─╼ MemTree is off for this session ╾─·\nSubscribe, then restart ccc to turn it back on: ${SHORT}`);
-  const color = memtreeOffNoticeText(true, `${SHORT}\u001b[31m`);
-  assert.match(color, /\x1b\[33mMemTree is off for this session\x1b\[39m/);
-  assert.ok(!color.split("back on: ")[1].includes("\u001b"), "no control characters from the url");
+test("inside another ccc session, the outer session's settings are dropped too", () => {
+  const outer = {
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:51234", _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
+    CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000", DISABLE_AUTO_COMPACT: "1",
+    CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000", HOME: "/h",
+  };
+  assert.deepEqual(plainClaudeEnv(outer), { HOME: "/h" });
+  const own = { ANTHROPIC_BASE_URL: "https://gw.example", DISABLE_AUTO_COMPACT: "1" };
+  assert.deepEqual(plainClaudeEnv(own), own, "a user's own gateway and settings stay");
+  const ownLimit = { ...outer, CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "150000" };
+  assert.equal(plainClaudeEnv(ownLimit).CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, "150000");
+});
+
+test("resumes and continues are recognised", () => {
+  for (const args of [["-r"], ["--resume", "x"], ["--resume=x"], ["-c"], ["--continue", "-p", "q"]]) {
+    assert.ok(resumesSession(args), args.join(" "));
+  }
+  for (const args of [[], ["-p", "hi"], ["--", "-c"]]) assert.ok(!resumesSession(args), args.join(" "));
+});
+
+test("the MemTree-off banner says how to turn it back on, with the update line, in both colour modes", () => {
+  assert.equal(memtreeOffNoticeText(false),
+    "\n\n·─╼ MemTree is off for this session ╾─·\nRestart ccc to subscribe and turn it back on.");
+  assert.match(memtreeOffNoticeText(true), /\x1b\[33mMemTree is off for this session\x1b\[39m/);
+  assert.ok(memtreeOffNoticeText(false, "• ccc 9.9.9 is available").endsWith("\n• ccc 9.9.9 is available"));
 });
 
 test("the banner-only plugin has just a SessionStart hook, removed on close", () => {

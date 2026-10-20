@@ -17,7 +17,7 @@ export const PAYMENT_LINK_PATH = "/v1/payment/link";
 export const PAYMENT_LINK_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 /** After a failed fetch (old server, outage), wait this long before asking again. */
 export const PAYMENT_LINK_RETRY_MS = 10 * 60 * 1000;
-export const PAYMENT_LINK_TIMEOUT_MS = 2000;
+export const PAYMENT_LINK_TIMEOUT_MS = 1500;
 
 export const REASON_FREE_CREDIT_USED = "free_credit_used";
 export const REASON_PLAN_LIMIT = "plan_limit";
@@ -44,9 +44,13 @@ export type PaymentLinkFetchOptions = {
   fetchImpl?: FetchLike;
 };
 
-// The link must be our short path: a hostile or broken body can't put an arbitrary
-// URL (or terminal controls) on screen or into `open`.
-const SHORT_LINK_RE = /^https?:\/\/[A-Za-z0-9.-]+(?::\d+)?\/p\/[A-Za-z0-9]{12,64}$/;
+// The link must be our short path on one of our hosts: a hostile or broken body
+// can't put an arbitrary URL (or terminal controls) on screen or into `open`.
+const SHORT_LINK_RE = new RegExp(
+  "^(?:https:\\/\\/(?:[a-z0-9-]+\\.)*(?:polychat\\.co|run\\.app)" +
+  "|http:\\/\\/(?:local\\.polychat\\.co|localhost|127\\.0\\.0\\.1)(?::\\d+)?)" +
+  "\\/p\\/[A-Za-z0-9]{12,64}$"
+);
 const PLAN_RE = /^[A-Za-z0-9 %.+-]{1,40}$/;
 
 /** Ask the server for a short link; null on any failure. Never throws. */
@@ -123,7 +127,7 @@ export class PaymentLinkCache {
     if (this.failedAt !== undefined && this.now() - this.failedAt < PAYMENT_LINK_RETRY_MS) {
       return Promise.resolve(null);
     }
-    this.inFlight = this.fetchLink().then((link) => {
+    this.inFlight = this.fetchLink().catch(() => null).then((link) => {
       this.inFlight = null;
       if (link) this.link = link;
       else this.failedAt = this.now();
@@ -138,7 +142,7 @@ export class PaymentLinkCache {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
       this.inFlight,
-      new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
+      new Promise((resolve) => { timer = setTimeout(resolve, ms); timer.unref(); }),
     ]);
     clearTimeout(timer);
   }

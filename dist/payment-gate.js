@@ -31,8 +31,8 @@ export const PAUSED_HEADLINE = "MemTree is paused: payment required.";
  * (cli-main.ts), whose own auto-compaction summarizes a long session, and nothing
  * reaches MemTree, so the session is not indexed, saved there, or searchable.
  */
-export const PAUSED_LOSS_LINES = "Without it, long sessions hit the context limit and get compacted, losing information,\n" +
-    "and your sessions aren't saved or searchable.";
+export const PAUSED_LOSS_LINES = "Without it, long sessions hit the context limit and get compacted, losing\n" +
+    "information, and your sessions aren't saved or searchable.";
 /** After [c]: the session runs as plain Claude Code; the next start checks again. */
 export const MEMTREE_OFF_LINE = "MemTree is off for this session. ccc checks again the next time you start it.";
 /** Print/non-TTY runs of an unpaid key: one stderr line, then plain Claude Code. */
@@ -43,6 +43,7 @@ const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
 const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
 // "we recommend 🌱 Starter plan for $5/month" → plan name + price.
 const RECOMMENDED_PLAN_RE = /recommend\s+(?:\S+\s+)?([A-Za-z][\w ]*?plan)\s+for\s+(\$[\d.]+\/month)/i;
+const SAFE_URL_RE = /^https?:\/\/[^\s"'`$<>\\\u0000-\u001f\u007f-\u009f]+$/;
 // C0 controls, DEL, and C1 controls.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 /**
@@ -62,7 +63,9 @@ export function parsePaymentStatus(body) {
     const explicitUrl = typeof record.payment_url === "string" && record.payment_url.trim()
         ? record.payment_url.trim()
         : null;
-    const url = explicitUrl ?? extractPaymentUrl(message);
+    const found = explicitUrl ?? extractPaymentUrl(message);
+    // Printed and handed to the browser opener: a plain http(s) URL only.
+    const url = found && SAFE_URL_RE.test(found) ? found : null;
     return {
         paid: record.paid,
         message,
@@ -89,7 +92,7 @@ export function extractPaymentUrl(message) {
 export function withShortPaymentUrl(detail, shortUrl) {
     if (!shortUrl)
         return detail;
-    return detail.replace(PAYMENT_URL_RE, () => shortUrl);
+    return detail.replace(new RegExp(PAYMENT_URL_RE.source, "g"), () => shortUrl);
 }
 /**
  * The gate's text, at most four lines above the prompt: why MemTree is paused,

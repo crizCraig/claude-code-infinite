@@ -102,12 +102,14 @@ export function startupNoticeText(
  * SessionStart banner for a paused session that runs as plain Claude Code
  * (paused-session.ts): MemTree is off for it, and how to turn it back on.
  */
-export function memtreeOffNoticeText(color: boolean, subscribeUrl: string): string {
-  const url = sanitizeNoticeDetail(subscribeUrl, 400);
-  const how = `Subscribe, then restart ccc to turn it back on: ${url}`;
-  if (!color) return `\n\n·─╼ MemTree is off for this session ╾─·\n${how}`;
-  return "\n\n\x1b[2m·─╼\x1b[22m \x1b[33mMemTree is off for this session\x1b[39m " +
-    `\x1b[2m╾─·\x1b[22m\n${how}`;
+export function memtreeOffNoticeText(color: boolean, updateLine: string | null = null): string {
+  // No link: the banner re-shows on /clear and resume for hours, past a link's hour.
+  const how = "Restart ccc to subscribe and turn it back on.";
+  const banner = color
+    ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[33mMemTree is off for this session\x1b[39m " +
+      `\x1b[2m╾─·\x1b[22m\n${how}`
+    : `\n\n·─╼ MemTree is off for this session ╾─·\n${how}`;
+  return updateLine ? `${banner}\n${updateLine}` : banner;
 }
 
 /**
