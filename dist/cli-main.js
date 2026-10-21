@@ -417,7 +417,7 @@ async function main() {
     // An API key that beats the user's `/login` (claude-auth.ts), by source name only.
     const keyOverride = apiKeyOverride({ readFile, interactive: interactiveUi });
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
-        if (creditAdviceApplies(auth))
+        if (creditAdviceApplies(auth, claudeSignIn.plan))
             creditTooLow = true;
     }, (auth) => {
         // The next launch's no-plan line goes by what Claude Code really sent.
@@ -667,7 +667,8 @@ async function main() {
             color: terminalSupportsColor(),
         });
         // Print/non-TTY stdout is Claude's alone: the notice goes to stderr there.
-        const source = keyOverride?.source;
+        // A new key the user may have declined at Claude Code's question isn't named.
+        const source = keyOverride?.asks ? undefined : keyOverride?.source;
         if (creditTooLow && !interactiveUi)
             console.error(creditNoticeText(false, source));
         const credit = creditTooLow && interactiveUi

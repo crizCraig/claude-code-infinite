@@ -176,11 +176,11 @@ test("print mode: the warning goes to stderr, stdout stays Claude's", () => {
   assert.equal(r.stderr, `${EXPECTED}\n`);
 });
 
-test("the exit credit advice is for every sign-in type", async () => {
+test("the exit credit advice is for every sign-in type without a paid tier", async () => {
   const { creditAdviceApplies } = await import("../dist/claude-plan-warning.js");
   // An OAuth token is also how Claude Code signs in to an Anthropic Console
   // account (API usage billing), whose refusal is the commonest first-run failure.
   for (const auth of ["api_key", undefined, "subscription", "unknown"]) {
-    assert.equal(creditAdviceApplies(auth), true, String(auth));
+    assert.equal(creditAdviceApplies(auth, "unknown"), true, String(auth));
   }
 });

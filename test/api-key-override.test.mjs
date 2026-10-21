@@ -95,9 +95,10 @@ test("the line is printed only when a Claude.ai login is on file too", () => {
   const script = [
     "import { printApiKeyOverrideWarning } from './dist/claude-plan-warning.js';",
     "const o = { source: 'ANTHROPIC_API_KEY', asks: false };",
-    "console.log(printApiKeyOverrideWarning(o, false, false));",
-    "console.log(printApiKeyOverrideWarning(undefined, true, false));",
-    "console.log(printApiKeyOverrideWarning(o, true, false));",
+    "const out = (v) => process.stdout.write(`${v}\\n`);",
+    "out(printApiKeyOverrideWarning(o, false, false));",
+    "out(printApiKeyOverrideWarning(undefined, true, false));",
+    "out(printApiKeyOverrideWarning(o, true, false));",
   ].join("\n");
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     encoding: "utf8", cwd: new URL("..", import.meta.url),
@@ -110,7 +111,13 @@ test("the line is printed only when a Claude.ai login is on file too", () => {
 
 test("credit balance too low: the plan advice for every sign-in type", () => {
   for (const auth of ["api_key", "subscription", "unknown", undefined]) {
-    assert.equal(creditAdviceApplies(auth), true, String(auth));
+    assert.equal(creditAdviceApplies(auth, "unknown"), true, String(auth));
+    assert.equal(creditAdviceApplies(auth, "free"), true, String(auth));
+  }
+  // An OAuth token with a paid tier on record already has the plan the advice asks for.
+  for (const plan of ["pro", "max", "max_5x", "max_20x", "team", "enterprise"]) {
+    assert.equal(creditAdviceApplies("subscription", plan), false, plan);
+    assert.equal(creditAdviceApplies("api_key", plan), true, `api_key/${plan}`);
   }
 });
 

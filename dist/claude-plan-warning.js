@@ -57,13 +57,15 @@ export function isInfoOnlyRun(args) {
     return (end === -1 ? args : args.slice(0, end)).some((a) => INFO_FLAGS.includes(a));
 }
 /**
- * Whether a credit_balance_too_low refusal gets the advice at exit: always.
- * An OAuth token is no proof of a plan: Claude Code's "Anthropic Console
- * account" sign-in (API usage billing) sends one too, and that is how most new
- * users met this refusal.
+ * Whether a credit_balance_too_low refusal gets the advice at exit: for every
+ * sign-in type. An OAuth token is no proof of a plan: Claude Code's "Anthropic
+ * Console account" sign-in (API usage billing) sends one too, with no plan tier
+ * on record, and that is how most new users met this refusal. Only a
+ * subscription token with a paid tier on record is spared the advice to
+ * `/login` with a plan it already has.
  */
-export function creditAdviceApplies(_auth) {
-    return true;
+export function creditAdviceApplies(auth, plan) {
+    return !(auth === "subscription" && PAID_PLANS.includes(plan));
 }
 /** The credit refusal's advice, naming the env variable or setting when one is known. */
 export function creditAdviceText(color, source) {
