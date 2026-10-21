@@ -20,6 +20,14 @@ export type ClaudePlan = (typeof CLAUDE_PLANS)[number];
 /** Anthropic's 400 for an API key whose organization has no credit left. */
 export declare const CREDIT_BALANCE_TOO_LOW = "credit_balance_too_low";
 export type UpstreamErrorCode = typeof CREDIT_BALANCE_TOO_LOW;
+/** What makes Claude Code bill an API key ahead of a `/login`, by name only. */
+export type ApiKeySource = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY" | "apiKeyHelper";
+/** An API key Claude Code uses (or, `asks`, will ask to use) ahead of a Claude.ai login. */
+export interface ApiKeyOverride {
+    source: ApiKeySource;
+    /** An interactive session asks before using a new ANTHROPIC_API_KEY. */
+    asks: boolean;
+}
 export interface ClaudeAuthOptions {
     env?: NodeJS.ProcessEnv;
     homedir?: string;
@@ -29,6 +37,20 @@ export interface ClaudeAuthOptions {
 }
 /** The sign-in type from env and Claude Code's config, before any request. */
 export declare function claudeAuthFromConfig(opts?: ClaudeAuthOptions): ClaudeAuthType;
+/**
+ * The API key Claude Code uses ahead of a `/login`, in its documented auth
+ * precedence: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, then an apiKeyHelper
+ * setting, all above a `claude setup-token` token and the Claude.ai login.
+ * An interactive session uses ANTHROPIC_API_KEY only once the user approved it
+ * (Claude Code keeps the key's last 20 characters in `~/.claude.json`
+ * customApiKeyResponses), asks when it is new, and skips a rejected one; print
+ * mode always uses it. Only the source's name leaves this function.
+ */
+export declare function apiKeyOverride(opts: ClaudeAuthOptions & {
+    interactive: boolean;
+}): ApiKeyOverride | undefined;
+/** ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set (names only, for diagnostics). */
+export declare function envApiKeySet(env?: NodeJS.ProcessEnv): boolean;
 /**
  * Whether a claude.ai login is on file, by key names only: `oauthAccount` in
  * `~/.claude.json` without a Console key, or `claudeAiOauth` in
@@ -48,8 +70,11 @@ export declare function claudePlanFromConfig(opts?: ClaudeAuthOptions): ClaudePl
 export declare function claudeAuthFromHeaders(headers: Record<string, string | string[] | undefined>): ClaudeAuthType | undefined;
 /** A known Anthropic error in a JSON error body, by code; undefined otherwise. */
 export declare function upstreamErrorCode(body: Buffer | string): UpstreamErrorCode | undefined;
-/** Printed once when Anthropic refused an API key for having no credit: the no-plan advice. */
-export declare function creditNoticeText(color: boolean): string;
+/**
+ * Printed once when Anthropic answered credit_balance_too_low, whatever the
+ * sign-in: an Anthropic Console login sends an OAuth token just like a plan.
+ */
+export declare function creditNoticeText(color: boolean, source?: ApiKeySource): string;
 /** "claude_max" + "default_claude_max_20x" → "max_20x"; "pro" → "pro". */
 export declare function planFrom(type: string | undefined, rateTier: string | undefined): ClaudePlan;
 //# sourceMappingURL=claude-auth.d.ts.map

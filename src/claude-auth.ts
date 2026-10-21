@@ -16,7 +16,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { noPlanWarningText } from "./claude-plan-warning.js";
+import { creditAdviceText } from "./claude-plan-warning.js";
 
 export const CLAUDE_AUTH_TYPES = [
   "subscription", "api_key", "bedrock", "vertex", "foundry", "unknown",
@@ -32,6 +32,16 @@ export type ClaudePlan = (typeof CLAUDE_PLANS)[number];
 /** Anthropic's 400 for an API key whose organization has no credit left. */
 export const CREDIT_BALANCE_TOO_LOW = "credit_balance_too_low";
 export type UpstreamErrorCode = typeof CREDIT_BALANCE_TOO_LOW;
+
+/** What makes Claude Code bill an API key ahead of a `/login`, by name only. */
+export type ApiKeySource = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY" | "apiKeyHelper";
+
+/** An API key Claude Code uses (or, `asks`, will ask to use) ahead of a Claude.ai login. */
+export interface ApiKeyOverride {
+  source: ApiKeySource;
+  /** An interactive session asks before using a new ANTHROPIC_API_KEY. */
+  asks: boolean;
+}
 
 export interface ClaudeAuthOptions {
   env?: NodeJS.ProcessEnv;
@@ -60,6 +70,40 @@ export function claudeAuthFromConfig(opts: ClaudeAuthOptions = {}): ClaudeAuthTy
     ? path.join(env.CLAUDE_CONFIG_DIR!, ".claude.json")
     : path.join(home, ".claude.json");
   return authFromGlobalConfig(read(globalConfig));
+}
+
+/**
+ * The API key Claude Code uses ahead of a `/login`, in its documented auth
+ * precedence: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, then an apiKeyHelper
+ * setting, all above a `claude setup-token` token and the Claude.ai login.
+ * An interactive session uses ANTHROPIC_API_KEY only once the user approved it
+ * (Claude Code keeps the key's last 20 characters in `~/.claude.json`
+ * customApiKeyResponses), asks when it is new, and skips a rejected one; print
+ * mode always uses it. Only the source's name leaves this function.
+ */
+export function apiKeyOverride(
+  opts: ClaudeAuthOptions & { interactive: boolean }
+): ApiKeyOverride | undefined {
+  const env = opts.env ?? process.env;
+  const read = opts.readFile ?? readTextOrNull;
+  if (cloudProvider(env)) return undefined;
+  if (nonEmpty(env.ANTHROPIC_AUTH_TOKEN)) return { source: "ANTHROPIC_AUTH_TOKEN", asks: false };
+  if (nonEmpty(env.ANTHROPIC_API_KEY)) {
+    const answer = opts.interactive
+      ? envKeyAnswer(read(globalConfigPath(env, opts.homedir)), env.ANTHROPIC_API_KEY!)
+      : "approved";
+    if (answer !== "rejected") return { source: "ANTHROPIC_API_KEY", asks: answer === "new" };
+  }
+  const configDir = claudeConfigDir(env, opts.homedir);
+  if (settingsFiles(configDir, opts.cwd ?? process.cwd()).some((f) => hasApiKeyHelper(read(f)))) {
+    return { source: "apiKeyHelper", asks: false };
+  }
+  return undefined;
+}
+
+/** ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set (names only, for diagnostics). */
+export function envApiKeySet(env: NodeJS.ProcessEnv = process.env): boolean {
+  return nonEmpty(env.ANTHROPIC_API_KEY) || nonEmpty(env.ANTHROPIC_AUTH_TOKEN);
 }
 
 /**
@@ -127,9 +171,12 @@ export function upstreamErrorCode(body: Buffer | string): UpstreamErrorCode | un
     : undefined;
 }
 
-/** Printed once when Anthropic refused an API key for having no credit: the no-plan advice. */
-export function creditNoticeText(color: boolean): string {
-  return noPlanWarningText(color);
+/**
+ * Printed once when Anthropic answered credit_balance_too_low, whatever the
+ * sign-in: an Anthropic Console login sends an OAuth token just like a plan.
+ */
+export function creditNoticeText(color: boolean, source?: ApiKeySource): string {
+  return creditAdviceText(color, source);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +189,42 @@ function settingsFiles(configDir: string, cwd: string): string[] {
     path.join(cwd, ".claude", "settings.json"),
     path.join(cwd, ".claude", "settings.local.json"),
   ];
+}
+
+function claudeConfigDir(env: NodeJS.ProcessEnv, homedir: string | undefined): string {
+  return nonEmpty(env.CLAUDE_CONFIG_DIR)
+    ? env.CLAUDE_CONFIG_DIR!
+    : path.join(homedir ?? os.homedir(), ".claude");
+}
+
+function globalConfigPath(env: NodeJS.ProcessEnv, homedir: string | undefined): string {
+  return nonEmpty(env.CLAUDE_CONFIG_DIR)
+    ? path.join(env.CLAUDE_CONFIG_DIR!, ".claude.json")
+    : path.join(homedir ?? os.homedir(), ".claude.json");
+}
+
+/**
+ * Claude Code's recorded answer for this env key, compared in memory by the
+ * last 20 characters as Claude Code does; nothing about the key is kept.
+ */
+function envKeyAnswer(text: string | null, key: string): "approved" | "rejected" | "new" {
+  const block = text === null ? null : /"customApiKeyResponses"\s*:\s*(\{[^{}]*\})/.exec(text);
+  if (!block) return "new";
+  let responses: { approved?: unknown; rejected?: unknown };
+  try {
+    responses = JSON.parse(block[1]);
+  } catch {
+    return "new";
+  }
+  const tail = key.trim().slice(-20);
+  if (Array.isArray(responses.approved) && responses.approved.includes(tail)) return "approved";
+  if (Array.isArray(responses.rejected) && responses.rejected.includes(tail)) return "rejected";
+  return "new";
+}
+
+function cloudProvider(env: NodeJS.ProcessEnv): boolean {
+  return envFlag(env.CLAUDE_CODE_USE_BEDROCK) || envFlag(env.CLAUDE_CODE_USE_VERTEX)
+    || envFlag(env.CLAUDE_CODE_USE_FOUNDRY);
 }
 
 function hasApiKeyHelper(text: string | null): boolean {

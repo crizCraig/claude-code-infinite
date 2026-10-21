@@ -415,11 +415,17 @@ too. If it is not there, install it with the official command (Windows PowerShel
 to sign in, then run
 `ccc` again, from your project folder.
 
-### "This API key has no credit"
+### "Credit balance too low"
 
 `ccc` isn't free Claude: it runs your own Claude Code with your own Anthropic login. When
-Anthropic refuses an API key for having no credit, `ccc` says so as it exits. Sign in with
-a Claude Pro or Max plan (`claude`, then `/login`) or add credit to the key.
+Anthropic answers "credit balance too low", Claude Code is billing an API key or an
+Anthropic Console account (API usage billing) with no credit, and `ccc` says so as it exits.
+Sign in with a Claude Pro or Max plan: run `claude`, `/logout`, then `/login` and choose
+"Claude account with subscription" (not "Anthropic Console account"). Or add credit.
+
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and an `apiKeyHelper` setting beat `/login`:
+with one of them set, Claude Code bills that key even when you're signed in with a plan.
+`ccc` prints a line before Claude Code starts when that happens; unset it to use your plan.
 
 ### MemTree degraded / passthrough mode
 

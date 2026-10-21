@@ -47,8 +47,8 @@ import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
 import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
-import { claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, } from "./claude-auth.js";
-import { creditAdviceApplies, isInfoOnlyRun, printNoPlanWarning, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
+import { apiKeyOverride, claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, envApiKeySet, } from "./claude-auth.js";
+import { creditAdviceApplies, isInfoOnlyRun, printApiKeyOverrideWarning, printNoPlanWarning, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
 import { exitResumeHint } from "./resume-hint.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
@@ -306,6 +306,7 @@ async function main() {
         claude_found: desktopOnly ? "desktop_only" : claude?.source,
         claude_auth: claudeSignIn.auth,
         claude_plan: claudeSignIn.plan,
+        env_api_key_set: envApiKeySet(),
     });
     if (!claude) {
         diagnostics.record("claude_missing");
@@ -411,8 +412,10 @@ async function main() {
     const reqlog = new RequestLogger();
     // The proxy and MemTree client log through this tee: unchanged lines in the
     // request log, plus a few allowlisted numbers for diagnostics.
-    // Anthropic refusing an API key for no credit gets one line as ccc exits.
+    // Anthropic refusing for no credit gets one line as ccc exits, whatever the sign-in.
     let creditTooLow = false;
+    // An API key that beats the user's `/login` (claude-auth.ts), by source name only.
+    const keyOverride = apiKeyOverride({ readFile, interactive: interactiveUi });
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
         if (creditAdviceApplies(auth))
             creditTooLow = true;
@@ -502,8 +505,13 @@ async function main() {
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
     // On an API key or not signed in: one line before the first prompt (stderr).
-    if (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn, process.stderr.isTTY === true && terminalSupportsColor())) {
+    const stderrColor = process.stderr.isTTY === true && terminalSupportsColor();
+    if (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn, stderrColor)) {
         diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
+    }
+    // A subscriber whose env or settings make Claude Code bill an API key instead.
+    if (!isInfoOnlyRun(claudeArgs)) {
+        printApiKeyOverrideWarning(keyOverride, claudeSignIn.subscriptionLogin, stderrColor);
     }
     reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
     // The first request after a resume must count the whole session's thinking.
@@ -659,10 +667,11 @@ async function main() {
             color: terminalSupportsColor(),
         });
         // Print/non-TTY stdout is Claude's alone: the notice goes to stderr there.
+        const source = keyOverride?.source;
         if (creditTooLow && !interactiveUi)
-            console.error(creditNoticeText(false));
+            console.error(creditNoticeText(false, source));
         const credit = creditTooLow && interactiveUi
-            ? `${creditNoticeText(terminalSupportsColor())}\n`
+            ? `${creditNoticeText(terminalSupportsColor(), source)}\n`
             : "";
         const exitText = `${credit}${hint ?? ""}`;
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.

@@ -4,8 +4,10 @@
  * is billed by Anthropic, and a key with no credit is refused outright
  * (credit_balance_too_low, the most common first-prompt failure). The line is
  * printed once before Claude Code starts when its sign-in is an API key or
- * missing, and never for a subscription; the credit refusal gets the same text
- * as ccc exits (claude-auth.ts creditNoticeText).
+ * missing, and never for a subscription. When ANTHROPIC_AUTH_TOKEN,
+ * ANTHROPIC_API_KEY or an apiKeyHelper beats a Claude.ai login on file, a
+ * line says so instead. A credit refusal gets the plan advice as ccc exits,
+ * whatever the sign-in (claude-auth.ts creditNoticeText).
  *
  * Which sign-in Claude Code really used is only known from its requests'
  * auth headers (claude-auth.ts claudeAuthFromHeaders). The last one seen is
@@ -16,6 +18,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 export const NO_PLAN_TEXT = "ccc needs Claude Code signed in with a Claude Pro or Max plan (run `claude`, then `/login`). " +
     "With an API key you pay Anthropic per token, and a key with no credit won't work.";
+const CREDIT_TEXT = "Anthropic refused Claude Code's request: credit balance too low. Claude Code is billing " +
+    "an API key or an Anthropic Console account, not a Claude plan. ccc needs a Pro or Max " +
+    "plan: run `claude`, `/logout`, then `/login` and choose \"Claude account with " +
+    "subscription\".";
+const CREDIT_ENV_HINT = " If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it beats `/login`.";
 /** The file in ccc's config directory holding the last sign-in type Claude Code sent. */
 export const SEEN_AUTH_FILE = "claude-auth-seen";
 const PAID_PLANS = ["pro", "max", "max_5x", "max_20x", "team", "enterprise"];
@@ -50,12 +57,49 @@ export function isInfoOnlyRun(args) {
     return (end === -1 ? args : args.slice(0, end)).some((a) => INFO_FLAGS.includes(a));
 }
 /**
- * Whether a credit_balance_too_low refusal gets the advice at exit: for an API
- * key, or a request with no auth header ccc could read; not for a subscription
- * token (extra usage spent) or a bearer ccc does not recognise.
+ * Whether a credit_balance_too_low refusal gets the advice at exit: always.
+ * An OAuth token is no proof of a plan: Claude Code's "Anthropic Console
+ * account" sign-in (API usage billing) sends one too, and that is how most new
+ * users met this refusal.
  */
-export function creditAdviceApplies(auth) {
-    return auth === "api_key" || auth === undefined;
+export function creditAdviceApplies(_auth) {
+    return true;
+}
+/** The credit refusal's advice, naming the env variable or setting when one is known. */
+export function creditAdviceText(color, source) {
+    const text = `${CREDIT_TEXT}${creditSourceHint(source)}`;
+    return color ? `\x1b[33m${text}\x1b[39m` : text;
+}
+/**
+ * The line when an API key beats a Claude.ai login that is on file (stderr,
+ * like the no-plan line). Returns whether it was printed.
+ */
+export function printApiKeyOverrideWarning(override, subscriptionLogin, color) {
+    if (!override || !subscriptionLogin)
+        return false;
+    process.stderr.write(`${apiKeyOverrideText(override, color)}\n`);
+    return true;
+}
+export function apiKeyOverrideText(override, color) {
+    const text = override.source === "apiKeyHelper"
+        ? "Claude Code's settings set an apiKeyHelper, so Claude Code bills that API key instead " +
+            "of your Pro/Max plan. Remove apiKeyHelper from settings.json to use your plan."
+        : override.asks
+            ? `${override.source} is set: if Claude Code asks whether to use it, answer No, or it ` +
+                "bills that API key instead of your Pro/Max plan. Unset it to stop the question."
+            : `${override.source} is set, so Claude Code bills that API key instead of your Pro/Max ` +
+                "plan. Unset it (or run `ccc` without it) to use your plan.";
+    return color ? `\x1b[33m${text}\x1b[39m` : text;
+}
+function creditSourceHint(source) {
+    if (source === "apiKeyHelper") {
+        return " Claude Code's settings set an apiKeyHelper, and it beats `/login`: remove it " +
+            "from settings.json.";
+    }
+    if (source) {
+        return ` ${source} is set, and it beats \`/login\`: unset it (or run \`ccc\` without it).`;
+    }
+    return CREDIT_ENV_HINT;
 }
 export function noPlanWarningText(color) {
     return color ? `\x1b[33m${NO_PLAN_TEXT}\x1b[39m` : NO_PLAN_TEXT;
