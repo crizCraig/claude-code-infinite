@@ -11,6 +11,12 @@
 #   E2E_ANTHROPIC_API_KEY  low-limit Anthropic key for the one Haiku `-p` turn per OS
 #   E2E_RESEND_API_KEY, E2E_ALERT_TO, E2E_ALERT_FROM   extra failure email / SMS gateway
 #
+# Manual runs pick a `target`: production (the default, and every scheduled run) or staging
+# (`ccc staging` against polychat-staging; polychat/deploy/deploy.sh staging dispatches it).
+# Staging shares production's Open WebUI accounts, so account A's MEMTREE_E2E_KEY works
+# there too; MEMTREE_E2E_STAGING_KEY, when set, replaces it on staging runs. Staging never
+# 402s, so the key's `paid` is only checked on production.
+#
 # Never runs on pull requests (this repo is public: forks must not reach the secrets), and
 # nothing it prints contains a key, an email or a tree id.
 name: E2E daily
@@ -19,21 +25,28 @@ on:
   schedule:
     - cron: "17 13 * * *" # 06:17 Phoenix, quiet; before the 08:00 daily email
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Server the checks use"
+        type: choice
+        options: [production, staging]
+        default: production
 
 permissions:
   contents: read
 
 concurrency:
-  group: e2e-daily
+  group: e2e-daily-${{ inputs.target || 'production' }}
   cancel-in-progress: false
 
 env:
   CCC_NO_DIAGNOSTICS: "1" # keep test installs out of the client diagnostics panel
+  E2E_TARGET: ${{ inputs.target || 'production' }} # scheduled runs have no inputs
   NO_COLOR: "1"
 
 jobs:
   client:
-    name: ccc on ${{ matrix.os }}
+    name: ccc on ${{ matrix.os }} (${{ inputs.target || 'production' }})
     runs-on: ${{ matrix.os }}
     environment: e2e # its secrets are readable from main only
     timeout-minutes: 60
@@ -69,14 +82,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: node scripts/e2e/client-e2e.mjs first-run
         env:
-          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+          MEMTREE_E2E_KEY: ${{ (inputs.target == 'staging' && secrets.MEMTREE_E2E_STAGING_KEY) || secrets.MEMTREE_E2E_KEY }}
 
       - name: One real -p turn and its MemTree
         if: ${{ !cancelled() }}
         timeout-minutes: 25 # a 4 min turn, then up to 12 min for its tree
         run: node scripts/e2e/client-e2e.mjs turn
         env:
-          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+          MEMTREE_E2E_KEY: ${{ (inputs.target == 'staging' && secrets.MEMTREE_E2E_STAGING_KEY) || secrets.MEMTREE_E2E_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.E2E_ANTHROPIC_API_KEY }}
 
       - name: MemTree after first use (scripted call)
@@ -84,7 +97,7 @@ jobs:
         timeout-minutes: 20 # up to 12 min for the tree
         run: node scripts/e2e/client-e2e.mjs memtree
         env:
-          MEMTREE_E2E_KEY: ${{ secrets.MEMTREE_E2E_KEY }}
+          MEMTREE_E2E_KEY: ${{ (inputs.target == 'staging' && secrets.MEMTREE_E2E_STAGING_KEY) || secrets.MEMTREE_E2E_KEY }}
 
       - name: Summary
         if: ${{ !cancelled() }}
@@ -94,7 +107,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ccc-e2e-${{ matrix.os }}
+          name: ccc-e2e-${{ matrix.os }}-${{ inputs.target || 'production' }}
           path: ${{ runner.temp }}/ccc-e2e-results.jsonl
           retention-days: 14
 
@@ -117,5 +130,5 @@ jobs:
           E2E_RESEND_API_KEY: ${{ secrets.E2E_RESEND_API_KEY }}
           E2E_ALERT_TO: ${{ secrets.E2E_ALERT_TO }}
           E2E_ALERT_FROM: ${{ secrets.E2E_ALERT_FROM }}
-          E2E_ALERT_SUBJECT: "ccc e2e daily FAILED"
+          E2E_ALERT_SUBJECT: "ccc e2e daily (${{ inputs.target || 'production' }}) FAILED"
           E2E_ALERT_BODY: "A daily ccc install/first-run check failed. Status per OS and check in the run summary:"

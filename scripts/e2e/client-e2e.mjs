@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * Daily end-to-end checks of installing and first-running ccc, run by
- * .github/workflows/e2e-daily.yml on Linux, macOS and Windows, against PRODUCTION:
+ * .github/workflows/e2e-daily.yml on Linux, macOS and Windows, against PRODUCTION, or with
+ * E2E_TARGET=staging against staging (`ccc staging`, the key saved as staging's; staging
+ * never 402s, so the key's `paid` is not checked there):
  *
  *   node scripts/e2e/client-e2e.mjs install     after `npm i -g claude-code-infinite@latest`,
  *                                               before Claude Code is installed
@@ -21,7 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  FAIL, PASS, PROD_BASE_URL, SKIP, E2E_EMAIL_MARKER, claudeMissingProblems, exitCode,
+  FAIL, PASS, SKIP, E2E_EMAIL_MARKER, claudeMissingProblems, e2eTarget, exitCode,
   VERSION_WITHOUT_KEY_SINCE, installedVersion, isMemtreeUrl, redactText, journeyLines, noKeyProblems, versionAtLeast, versionProblems, parsePrintResult, redactUrl,
   requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "./lib.mjs";
@@ -36,6 +38,7 @@ const IS_WINDOWS = process.platform === "win32";
 const TREE_WAIT_MS = 12 * 60_000; // for the tree and its page together
 const TREE_POLL_MS = 20_000;
 const TURN_TIMEOUT_MS = 4 * 60_000;
+const TARGET = e2eTarget(process.env.E2E_TARGET);
 const CLIENT = "cc-infinite-e2e"; // labels the scripted call's usage row as e2e traffic
 let cliPath; // cccCli()
 const PHASES = { install, "first-run": firstRun, turn, memtree, summary };
@@ -89,10 +92,10 @@ async function firstRun() {
       `ccc ${installed} asks for a key first (fixed from ${VERSION_WITHOUT_KEY_SINCE})`);
   }
   if (!KEY) {
-    record("first-run", "key accepted by production", SKIP, "secret MEMTREE_E2E_KEY not set");
+    record("first-run", `key accepted by ${TARGET.name}`, SKIP, "secret MEMTREE_E2E_KEY not set");
     return phaseDone("first-run");
   }
-  const verified = await check("first-run", "key accepted by production's status endpoint", keyStatus);
+  const verified = await check("first-run", `key accepted by ${TARGET.name}'s status endpoint`, keyStatus);
   await check("first-run", "a wrong key is refused (401)", async () => {
     const res = await statusRequest("sk-e2e-not-a-real-key");
     assert(res.status === 401, `HTTP ${res.status}`);
@@ -100,7 +103,7 @@ async function firstRun() {
   if (!verified) return phaseDone("first-run");
   saveKey();
   await check("first-run", "ccc --version", () => {
-    const run = spawnSync("ccc", ["--version"], { encoding: "utf8", input: "", shell: IS_WINDOWS, timeout: 60_000 });
+    const run = spawnSync("ccc", [...TARGET.cccArgs, "--version"], { encoding: "utf8", input: "", shell: IS_WINDOWS, timeout: 60_000 });
     assert(run.status === 0, `exit ${run.status}: ${tail(run.stderr)}`);
     assert(/\(Claude Code\)/.test(run.stdout), "no Claude Code version in the output");
     return run.stdout.trim().split("\n").at(-1);
@@ -121,7 +124,7 @@ async function turn() {
   const ok = await check("model-turn", "one ccc -p turn returns clean JSON", () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-e2e-turn-"));
     const run = runCcc(
-      ["-p", "Reply with exactly the word OK and nothing else.", "--model", "haiku", "--output-format", "json"],
+      [...TARGET.cccArgs, "-p", "Reply with exactly the word OK and nothing else.", "--model", "haiku", "--output-format", "json"],
       { cwd, timeout: TURN_TIMEOUT_MS, env: { ...process.env, ANTHROPIC_API_KEY: ANTHROPIC_KEY } }
     );
     assert(run.status === 0, `exit ${run.status}: ${tail(run.stderr)}`);
@@ -151,7 +154,7 @@ async function memtree() {
   saveKey();
   const sessionId = randomUUID();
   const ok = await check("memtree", "scripted index call accepted", async () => {
-    const res = await fetch(`${PROD_BASE_URL}/v1/context_memory`, {
+    const res = await fetch(`${TARGET.baseUrl}/v1/context_memory`, {
       method: "POST",
       headers: { ...clientHeaders(KEY), "content-type": "application/json", "x-claude-code-session-id": sessionId },
       body: JSON.stringify({
@@ -186,10 +189,10 @@ async function treeChecks(journey, sessionId) {
     const started = Date.now();
     let last;
     while (Date.now() < deadline) {
-      last = runCcc(["link", sessionId], { timeout: 60_000 });
+      last = runCcc([...TARGET.cccArgs, "link", sessionId], { timeout: 60_000 });
       if (last.status === 0) {
         url = last.stdout.trim();
-        assert(isMemtreeUrl(url), `ccc link printed a URL off ${PROD_BASE_URL}`);
+        assert(isMemtreeUrl(url, TARGET.baseUrl), `ccc link printed a URL off ${TARGET.baseUrl}`);
         return `${redactUrl(url)} after ${Math.round((Date.now() - started) / 1000)} s`;
       }
       await sleep(TREE_POLL_MS);
@@ -212,9 +215,13 @@ async function treeChecks(journey, sessionId) {
   });
 }
 
-/** Use the key only when production says it is a paid e2e-test account (never a real one). */
+/**
+ * Use the key only when the server says it is the e2e-test account's (never a real one), and,
+ * on production, a paid one. Staging never 402s, so its `paid` is not asserted.
+ */
 async function usableKey(journey) {
-  return check(journey, "the key is the paid e2e-test account's", keyStatus);
+  const what = TARGET.requirePaid ? "paid e2e-test account's" : "e2e-test account's";
+  return check(journey, `the key is the ${what}`, keyStatus);
 }
 
 async function keyStatus() {
@@ -224,12 +231,13 @@ async function keyStatus() {
   assert(typeof body.paid === "boolean", "no `paid` in the status");
   assert(String(body.email ?? "").includes(E2E_EMAIL_MARKER),
     "MEMTREE_E2E_KEY is not a dedicated e2e-test account's key");
+  if (!TARGET.requirePaid) return `${TARGET.name}: paid not checked (never 402s)`;
   assert(body.paid, "the e2e test account is unpaid, so MemTree calls get 402 (give it a free subscription)");
   return "paid";
 }
 
 function statusRequest(key) {
-  return fetch(`${PROD_BASE_URL}/v1/context_memory/status`, {
+  return fetch(`${TARGET.baseUrl}/v1/context_memory/status`, {
     headers: clientHeaders(key), signal: AbortSignal.timeout(30_000),
   });
 }
@@ -240,7 +248,8 @@ async function summary() {
   const done = rows.filter((r) => r.phaseDone).map((r) => r.phaseDone);
   const expected = ["install", "first-run", "turn", ...(process.platform === "linux" ? ["memtree"] : [])];
   const missing = expected.filter((p) => !done.includes(p));
-  const title = `ccc e2e (daily) on ${process.env.RUNNER_OS ?? process.platform}`;
+  const where = TARGET.name === "production" ? "" : ` against ${TARGET.name}`;
+  const title = `ccc e2e (daily)${where} on ${process.env.RUNNER_OS ?? process.platform}`;
   const runUrl = process.env.GITHUB_RUN_ID
     ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
     : "";
@@ -311,7 +320,7 @@ function claudeInstalled() {
 function saveKey() {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   const config = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) : {};
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...config, polychatApiKey: KEY }, null, 2), { mode: 0o600 });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...config, [TARGET.keyField]: KEY }, null, 2), { mode: 0o600 });
 }
 
 function readText(file) {

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CLAUDE_MISSING_MESSAGE, FAIL, NO_KEY_MESSAGE, PASS, SKIP, claudeInstallCommand,
-  claudeMissingProblems, exitCode, installedVersion, journeyLines, noKeyProblems,
+  claudeMissingProblems, e2eTarget, exitCode, PROD_BASE_URL, STAGING_BASE_URL, installedVersion, journeyLines, noKeyProblems,
   isMemtreeUrl, parsePrintResult, redactText, redactUrl, versionAtLeast, versionProblems, requestLogLines, summaryMarkdown, uniqueFirstMessage,
 } from "../scripts/e2e/lib.mjs";
 import { claudeDesktopOnlyText, claudeMissingText } from "../dist/claude-locate.js";
@@ -105,4 +105,20 @@ test("e2e: the key is only sent to the MemTree server's own URLs", () => {
   assert.ok(isMemtreeUrl("https://app.polychat.co/m/x"));
   assert.ok(!isMemtreeUrl("https://evil.example/m/x"));
   assert.ok(!isMemtreeUrl("not a url"));
+});
+
+test("e2e: the target picks the server, ccc's mode word, the key's field and the paid check", () => {
+  assert.deepEqual(e2eTarget(undefined), e2eTarget("production"));
+  assert.deepEqual(e2eTarget(""), e2eTarget("production"));
+  const prod = e2eTarget("production");
+  assert.equal(prod.baseUrl, PROD_BASE_URL);
+  assert.deepEqual(prod.cccArgs, []);
+  assert.equal(prod.keyField, "polychatApiKey");
+  assert.equal(prod.requirePaid, true);
+  const staging = e2eTarget(" staging ");
+  assert.equal(staging.baseUrl, STAGING_BASE_URL);
+  assert.deepEqual(staging.cccArgs, ["staging"]);
+  assert.equal(staging.keyField, "stagingPolychatApiKey");
+  assert.equal(staging.requirePaid, false, "staging never 402s, so paid is not checked");
+  assert.throws(() => e2eTarget("local"), /unknown E2E_TARGET/);
 });

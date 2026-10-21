@@ -6,11 +6,29 @@ export const FAIL = "FAIL";
 export const SKIP = "SKIP";
 
 export const PROD_BASE_URL = "https://app.polychat.co";
+export const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 export const NO_KEY_MESSAGE = "A MemTree API key is required: run `ccc` in a terminal once to save one.";
 export const CLAUDE_MISSING_MESSAGE = "Claude Code isn't installed. ccc runs Claude Code, so install it first:";
 /** Said instead when only the Claude desktop app is installed (a developer machine, not CI). */
 export const DESKTOP_ONLY_MESSAGE = "Found the Claude desktop app, but ccc needs Claude Code in the terminal";
 export const E2E_EMAIL_MARKER = "e2e-test";
+
+/**
+ * The server a run checks (E2E_TARGET, the workflow's `target` input): its base URL, the
+ * words ccc takes before its arguments, the config field `ccc` reads that server's key
+ * from, and whether the key must be paid. Staging never 402s (it gives no payment prompt),
+ * so its `paid` says nothing about billing and is not checked there.
+ */
+export function e2eTarget(name) {
+  const target = String(name ?? "").trim() || "production";
+  if (target === "production") {
+    return { name: target, baseUrl: PROD_BASE_URL, cccArgs: [], keyField: "polychatApiKey", requirePaid: true };
+  }
+  if (target === "staging") {
+    return { name: target, baseUrl: STAGING_BASE_URL, cccArgs: ["staging"], keyField: "stagingPolychatApiKey", requirePaid: false };
+  }
+  throw new Error(`unknown E2E_TARGET ${JSON.stringify(target)} (production or staging)`);
+}
 
 /** The first ccc whose `--version` answers without a key (fix/version-without-key). */
 export const VERSION_WITHOUT_KEY_SINCE = "1.0.28";
