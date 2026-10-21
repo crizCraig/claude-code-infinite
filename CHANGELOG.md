@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.28](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.27...v1.0.28) (2026-10-21)
+
+
+### Features
+
+* name earlier MemTree sessions in this project at session start ([#17](https://github.com/crizCraig/claude-code-infinite/issues/17)) ([0b8dd9b](https://github.com/crizCraig/claude-code-infinite/commit/0b8dd9b78fa7f641d5ff002aebe394895dcbc170))
+* one-click short checkout link, clearer payment prompt, plain Claude Code after continue ([#16](https://github.com/crizCraig/claude-code-infinite/issues/16)) ([8863b15](https://github.com/crizCraig/claude-code-infinite/commit/8863b154e3ca9e049743f78493ff161902d05448))
+
+
+### Bug Fixes
+
+* ccc --version prints ccc's version without asking for a MemTree key ([99854fa](https://github.com/crizCraig/claude-code-infinite/commit/99854fa196536ee89a467b441b5ec872d4bdd24b))
+* warn at startup when the MemTree key is invalid (401/403) ([#13](https://github.com/crizCraig/claude-code-infinite/issues/13)) ([f3586ec](https://github.com/crizCraig/claude-code-infinite/commit/f3586ec9e5d1983b2f4fa67e7b9f019d0043a587))
+
 ## [1.0.27](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.26...v1.0.27) (2026-10-20)
 
 
