@@ -1,0 +1,200 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  PROJECT_TREES_FOOTER,
+  PROJECT_TREES_HEADER,
+  PROJECT_TREES_WAIT_MS,
+  ProjectTreesHint,
+  formatProjectTrees,
+  parseProjectTrees,
+  projectIdentity,
+  projectTreesHintFor,
+} from "../dist/project-trees.js";
+
+const tree = (session, day, title = `Work on ${session}`) => ({
+  session_id: session,
+  last_at: `2026-10-${day}T12:00:00+00:00`,
+  title,
+  tree: { request_id: `${session}-req`, ref: `${session}-req-v1-own` },
+});
+
+/** A hint over a scripted fetch: `answer(call)` is a body, a status, a promise, or throws. */
+function scripted(answer, waitMs = 300) {
+  const asked = [];
+  const hint = new ProjectTreesHint(async (path) => {
+    asked.push(path);
+    const a = await answer(asked.length - 1);
+    if (typeof a === "number") return { status: a, body: Buffer.from("{}") };
+    return { status: 200, body: Buffer.from(JSON.stringify(a)) };
+  }, "crizCraig/polychat", waitMs);
+  return { hint, asked };
+}
+
+test("the block names up to five earlier trees, newest first, without the current session", () => {
+  const trees = parseProjectTrees({
+    trees: ["s1", "s2", "s3", "s4", "s5", "s6"].map((s, i) => tree(s, 20 - i)),
+  });
+  const block = formatProjectTrees(trees, "s2");
+  const lines = block.split("\n");
+  assert.equal(lines[0], PROJECT_TREES_HEADER);
+  assert.equal(lines.at(-1), PROJECT_TREES_FOOTER);
+  assert.deepEqual(lines.slice(1, -1), [
+    "- 2026-10-20: Work on s1 (tree s1-req-v1-own)",
+    "- 2026-10-18: Work on s3 (tree s3-req-v1-own)",
+    "- 2026-10-17: Work on s4 (tree s4-req-v1-own)",
+    "- 2026-10-16: Work on s5 (tree s5-req-v1-own)",
+    "- 2026-10-15: Work on s6 (tree s6-req-v1-own)",
+  ]);
+  // Under ~600 tokens even with five long summaries (~4 chars per token).
+  const long = parseProjectTrees({ trees: [1, 2, 3, 4, 5].map((i) => tree(`s${i}`, 10, "w ".repeat(400))) });
+  const longBlock = formatProjectTrees(long, undefined);
+  assert.ok(longBlock.length < 1_600, longBlock.length);
+  assert.ok(longBlock.split("\n").every((line) => line.length < 260), "summaries cut to one short line");
+  assert.equal(formatProjectTrees(parseProjectTrees({ trees: [tree("only", 1)] }), "only"), undefined);
+  assert.equal(formatProjectTrees([], undefined), undefined);
+});
+
+test("malformed answers and entries are dropped", () => {
+  assert.equal(parseProjectTrees(null), undefined);
+  assert.equal(parseProjectTrees({ trees: "x" }), undefined);
+  const parsed = parseProjectTrees({
+    trees: [
+      tree("ok", 1),
+      { ...tree("bad-ref", 1), tree: { ref: "../../etc" } },
+      { ...tree("no-title", 1), title: "  " },
+      { ...tree("multi", 1), title: "line one\nline two" },
+      "junk",
+    ],
+  });
+  assert.deepEqual(parsed.map((t) => t.session_id), ["ok", "multi"]);
+  assert.ok(formatProjectTrees(parsed, undefined).includes("line one line two"), "one line each");
+});
+
+test("the project is the origin remote's owner/repo, never a bare directory", () => {
+  assert.equal(projectIdentity({ git_repo: "o/r", project_dir: "d" }), "o/r");
+  assert.equal(projectIdentity({ project_dir: "d" }), undefined, "a bare directory name is too loose");
+  assert.equal(projectIdentity({}), undefined);
+  assert.equal(projectIdentity(undefined), undefined);
+});
+
+/** A paid interactive startup with the memtree tools; `over` changes one thing. */
+function startup(over = {}) {
+  return {
+    interactive: true, keyCheck: { paid: true, message: null, url: null }, memtreeOff: false,
+    tools: ["search", "list", "read_node", "read_lines"], meta: { git_repo: "o/r" }, env: {},
+    fetchJson: async () => ({ status: 200, body: Buffer.from("{}") }),
+    ...over,
+  };
+}
+
+test("the hint is on only for interactive sessions with search and read_node and a project", () => {
+  assert.ok(projectTreesHintFor(startup()));
+  assert.equal(projectTreesHintFor(startup({ interactive: false })), undefined, "print runs");
+  assert.equal(projectTreesHintFor(startup({ tools: ["search", "list"] })), undefined);
+  assert.equal(projectTreesHintFor(startup({ meta: {} })), undefined, "no project");
+  assert.equal(projectTreesHintFor(startup({ meta: { project_dir: "app" } })), undefined);
+  assert.equal(projectTreesHintFor(startup({ env: { CCC_PROJECT_TREES: "0" } })), undefined);
+});
+
+test("startup: an unknown key status (offline check) still gets the hint", () => {
+  assert.ok(projectTreesHintFor(startup({ keyCheck: null })));
+});
+
+test("startup: an invalid key (401/403, carried on with [c]) never asks for the hint", () => {
+  let asked = 0;
+  const fetchJson = async () => { asked++; return { status: 200, body: Buffer.from("{}") }; };
+  assert.equal(projectTreesHintFor(startup({ keyCheck: "invalid", fetchJson })), undefined);
+  assert.equal(asked, 0);
+});
+
+test("startup: [c] at the payment gate (MemTree off, e.g. a paused resume) never asks", () => {
+  const unpaid = { paid: false, message: "pay", url: null };
+  assert.equal(projectTreesHintFor(startup({ keyCheck: unpaid, memtreeOff: true })), undefined);
+  assert.equal(projectTreesHintFor(startup({ memtreeOff: true })), undefined);
+});
+
+test("startup: paid at the gate (stale unpaid check, MemTree on) gets the hint", () => {
+  const unpaid = { paid: false, message: "pay", url: null };
+  assert.ok(projectTreesHintFor(startup({ keyCheck: unpaid, memtreeOff: false })));
+});
+
+test("startup: the paid path asks once at prefetch, within the wait, silent on 404", async () => {
+  let asked = 0;
+  const hint = projectTreesHintFor(startup({
+    fetchJson: async () => { asked++; return { status: 404, body: Buffer.from("") }; },
+  }));
+  hint.prefetch();
+  hint.prefetch();
+  const t0 = Date.now();
+  assert.equal(await hint.contextFor("s1"), undefined);
+  assert.ok(Date.now() - t0 < PROJECT_TREES_WAIT_MS + 200, "within the wait budget");
+  hint.prefetch();
+  assert.equal(await hint.contextFor("s2"), undefined);
+  assert.equal(asked, 1, "404 is remembered: asked once");
+});
+
+test("contextFor uses the startup prefetch and asks for one more than it shows", async () => {
+  const { hint, asked } = scripted(() => ({ trees: [tree("a", 19), tree("b", 18)] }));
+  hint.prefetch();
+  hint.prefetch();
+  const block = await hint.contextFor("a");
+  assert.equal(asked.length >= 1, true);
+  const url = new URL(asked[0], "http://x");
+  assert.equal(url.pathname, "/v1/memtree/project_trees");
+  assert.equal(url.searchParams.get("project"), "crizCraig/polychat");
+  assert.equal(url.searchParams.get("limit"), "6");
+  assert.ok(block.includes("(tree b-req-v1-own)") && !block.includes("a-req"), block);
+});
+
+test("a slow, failed or old server adds nothing and never throws", async () => {
+  for (const answer of [() => 404, () => 500, () => { throw new Error("offline"); }, () => ({ trees: [] })]) {
+    const { hint } = scripted(answer);
+    hint.prefetch();
+    assert.equal(await hint.contextFor("s"), undefined);
+  }
+  // The hint's own timer is unref'd (it never holds ccc open); keep the loop alive here.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    let release;
+    const { hint } = scripted(() => new Promise((resolve) => { release = resolve; }), 20);
+    hint.prefetch();
+    const started = Date.now();
+    assert.equal(await hint.contextFor("s"), undefined, "does not wait past its bound");
+    assert.ok(Date.now() - started < 1_000);
+    release({ trees: [tree("late", 3)] });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok((await hint.contextFor("s")).includes("late-req"), "a late answer serves the next start");
+  } finally {
+    clearInterval(keepAlive);
+  }
+});
+
+test("a fresh answer is reused; an old server is not asked again", async () => {
+  const clock = { t: 0 };
+  const asked = [];
+  const hint = new ProjectTreesHint(async (path) => {
+    asked.push(path);
+    return { status: 200, body: Buffer.from(JSON.stringify({ trees: [tree("a", 1)] })) };
+  }, "o/r", 300, () => clock.t);
+  hint.prefetch();
+  assert.ok(await hint.contextFor("x"));
+  assert.ok(await hint.contextFor("y"));
+  assert.equal(asked.length, 1, "within a minute: no second request");
+  clock.t = 61_000;
+  await hint.contextFor("z");
+  assert.equal(asked.length, 2, "then refreshed in the background");
+
+  const { hint: old, asked: oldAsked } = scripted(() => 404);
+  old.prefetch();
+  assert.equal(await old.contextFor("s"), undefined);
+  await old.contextFor("s");
+  assert.equal(oldAsked.length, 1, "a 404 is remembered for the run");
+});
+
+test("disable() stops the block (the session lost its memtree tools)", async () => {
+  const { hint, asked } = scripted(() => ({ trees: [tree("a", 1)] }));
+  hint.disable();
+  hint.prefetch();
+  assert.equal(await hint.contextFor("x"), undefined);
+  assert.equal(asked.length, 0);
+});
