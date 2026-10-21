@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
+import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
@@ -765,6 +766,7 @@ export class MemtreeClient {
     finalIndexed = new Map();
     finalPreparing = new Map();
     finalDrainDeadline;
+    paymentLinks;
     /** FastAPI `detail` text from the most recent 402, or null while paid. */
     unpaidDetail = null;
     /** Whether the latest call that got an answer, or timed out, got a 402. */
@@ -779,7 +781,7 @@ export class MemtreeClient {
      * background-indexing calls; cleared by any subsequent success.
      */
     get paymentRequiredDetail() {
-        return this.unpaidDetail;
+        return this.withShortLink(this.unpaidDetail);
     }
     /**
      * The 402 detail while the server's latest answer (or timeout) was that 402,
@@ -788,7 +790,19 @@ export class MemtreeClient {
      * relies on this instead.
      */
     get pausedDetail() {
-        return this.lastAnswerUnpaid ? this.unpaidDetail : null;
+        return this.lastAnswerUnpaid ? this.withShortLink(this.unpaidDetail) : null;
+    }
+    /**
+     * Wait at most `ms` for a short checkout link already being fetched, so a
+     * notice about to be built from the 402 detail can show it. Never throws.
+     */
+    paymentLinkSettled(ms) {
+        return this.paymentLinks?.settled(ms) ?? Promise.resolve();
+    }
+    withShortLink(detail) {
+        if (detail === null)
+            return null;
+        return withShortPaymentUrl(detail, this.paymentLinks?.current()?.url);
     }
     /**
      * Whether the server's latest answer (or timeout) refused the key itself:
@@ -866,6 +880,7 @@ export class MemtreeClient {
         this.debug = opts.debug ?? false;
         this.reqlog = opts.reqlog;
         this.memtreeTools = opts.memtreeTools || undefined;
+        this.paymentLinks = opts.paymentLinks;
     }
     static hashMessages(messages) {
         return createHash("sha256")
@@ -1355,6 +1370,8 @@ export class MemtreeClient {
                 const text = await response.text().catch(() => "");
                 if (response.status === 402) {
                     this.unpaidDetail = extract402Detail(text);
+                    // Shared, cached and backed off: one request per hour at most while paused.
+                    void this.paymentLinks?.get();
                 }
                 keyRefused = isKeyRejected(response.status, text);
                 // The status rides on the error so compress() can classify the

@@ -178,15 +178,19 @@ async function withinMs(promise, ms) {
 }
 /**
  * The hint for this run, or undefined: interactive sessions only (print runs
- * keep Claude Code's output as it is), with both `search` and `read_node`
- * (the block names them), a known project, and not `CCC_PROJECT_TREES=0`.
+ * keep Claude Code's output as it is) with MemTree on (a valid key, not
+ * continued past the payment gate: the lookup could only fail), with both
+ * `search` and `read_node` (the block names them), a known project, and not
+ * `CCC_PROJECT_TREES=0`.
  */
-export function projectTreesHintFor(interactive, tools, meta, env, fetchJson) {
-    if (!interactive || env.CCC_PROJECT_TREES === "0")
+export function projectTreesHintFor(s) {
+    if (!s.interactive || s.env.CCC_PROJECT_TREES === "0")
         return undefined;
-    if (!tools.includes("search") || !tools.includes("read_node"))
+    if (s.keyCheck === "invalid" || s.memtreeOff)
         return undefined;
-    const project = projectIdentity(meta);
-    return project ? new ProjectTreesHint(fetchJson, project) : undefined;
+    if (!s.tools.includes("search") || !s.tools.includes("read_node"))
+        return undefined;
+    const project = projectIdentity(s.meta);
+    return project ? new ProjectTreesHint(s.fetchJson, project) : undefined;
 }
 //# sourceMappingURL=project-trees.js.map

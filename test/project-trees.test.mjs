@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   PROJECT_TREES_FOOTER,
   PROJECT_TREES_HEADER,
+  PROJECT_TREES_WAIT_MS,
   ProjectTreesHint,
   formatProjectTrees,
   parseProjectTrees,
@@ -76,16 +77,60 @@ test("the project is the origin remote's owner/repo, never a bare directory", ()
   assert.equal(projectIdentity(undefined), undefined);
 });
 
+/** A paid interactive startup with the memtree tools; `over` changes one thing. */
+function startup(over = {}) {
+  return {
+    interactive: true, keyCheck: { paid: true, message: null, url: null }, memtreeOff: false,
+    tools: ["search", "list", "read_node", "read_lines"], meta: { git_repo: "o/r" }, env: {},
+    fetchJson: async () => ({ status: 200, body: Buffer.from("{}") }),
+    ...over,
+  };
+}
+
 test("the hint is on only for interactive sessions with search and read_node and a project", () => {
-  const fetch = async () => ({ status: 200, body: Buffer.from("{}") });
-  const all = ["search", "list", "read_node", "read_lines"];
-  const meta = { git_repo: "o/r" };
-  assert.ok(projectTreesHintFor(true, all, meta, {}, fetch));
-  assert.equal(projectTreesHintFor(false, all, meta, {}, fetch), undefined, "print runs");
-  assert.equal(projectTreesHintFor(true, ["search", "list"], meta, {}, fetch), undefined);
-  assert.equal(projectTreesHintFor(true, all, {}, {}, fetch), undefined, "no project");
-  assert.equal(projectTreesHintFor(true, all, { project_dir: "app" }, {}, fetch), undefined);
-  assert.equal(projectTreesHintFor(true, all, meta, { CCC_PROJECT_TREES: "0" }, fetch), undefined);
+  assert.ok(projectTreesHintFor(startup()));
+  assert.equal(projectTreesHintFor(startup({ interactive: false })), undefined, "print runs");
+  assert.equal(projectTreesHintFor(startup({ tools: ["search", "list"] })), undefined);
+  assert.equal(projectTreesHintFor(startup({ meta: {} })), undefined, "no project");
+  assert.equal(projectTreesHintFor(startup({ meta: { project_dir: "app" } })), undefined);
+  assert.equal(projectTreesHintFor(startup({ env: { CCC_PROJECT_TREES: "0" } })), undefined);
+});
+
+test("startup: an unknown key status (offline check) still gets the hint", () => {
+  assert.ok(projectTreesHintFor(startup({ keyCheck: null })));
+});
+
+test("startup: an invalid key (401/403, carried on with [c]) never asks for the hint", () => {
+  let asked = 0;
+  const fetchJson = async () => { asked++; return { status: 200, body: Buffer.from("{}") }; };
+  assert.equal(projectTreesHintFor(startup({ keyCheck: "invalid", fetchJson })), undefined);
+  assert.equal(asked, 0);
+});
+
+test("startup: [c] at the payment gate (MemTree off, e.g. a paused resume) never asks", () => {
+  const unpaid = { paid: false, message: "pay", url: null };
+  assert.equal(projectTreesHintFor(startup({ keyCheck: unpaid, memtreeOff: true })), undefined);
+  assert.equal(projectTreesHintFor(startup({ memtreeOff: true })), undefined);
+});
+
+test("startup: paid at the gate (stale unpaid check, MemTree on) gets the hint", () => {
+  const unpaid = { paid: false, message: "pay", url: null };
+  assert.ok(projectTreesHintFor(startup({ keyCheck: unpaid, memtreeOff: false })));
+});
+
+test("startup: the paid path asks once at prefetch, within the wait, silent on 404", async () => {
+  let asked = 0;
+  const hint = projectTreesHintFor(startup({
+    fetchJson: async () => { asked++; return { status: 404, body: Buffer.from("") }; },
+  }));
+  hint.prefetch();
+  hint.prefetch();
+  const t0 = Date.now();
+  assert.equal(await hint.contextFor("s1"), undefined);
+  assert.ok(Date.now() - t0 < PROJECT_TREES_WAIT_MS + 200, "within the wait budget");
+  hint.prefetch();
+  assert.equal(await hint.contextFor("s2"), undefined);
+  assert.equal(asked, 1, "404 is remembered: asked once");
 });
 
 test("contextFor uses the startup prefetch and asks for one more than it shows", async () => {

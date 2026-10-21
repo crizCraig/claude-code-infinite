@@ -30,6 +30,7 @@ import {
   PAYMENT_PAUSED_HEADLINE,
 } from "../dist/payment-notice.js";
 import { SessionFinder } from "../dist/memtree-mcp.js";
+import { PaymentLinkCache, fetchPaymentLink } from "../dist/payment-link.js";
 
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
@@ -4881,6 +4882,43 @@ test("402 notice carries the server's checkout link tagged source=ccc", async ()
     const text = hook.body.hookSpecificOutput.displayContent;
     // The URL line is bare (no SGR) in either colour mode: linkifier-safe.
     assert.ok(text.includes(`\n  ${CHECKOUT_URL}&source=ccc\n`), text);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("402 notice shows the short checkout link once the server mints one", async () => {
+  const shortUrl = "https://app.polychat.co/p/Ab3xY9qwertyuiop";
+  const linkRequests = [];
+  const upstream = await mockUpstream();
+  const memtreeSrv = await listen((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/v1/payment/link") {
+        linkRequests.push({ method: req.method, auth: req.headers.authorization });
+        res.end(JSON.stringify({ url: shortUrl, plan: "Starter", monthly_price_usd: 5,
+          reason: "free_credit_used", expires_at: new Date(Date.now() + 3_600_000).toISOString() }));
+        return;
+      }
+      res.statusCode = 402;
+      res.end(JSON.stringify({ detail: PAYMENT_DETAIL_WITH_LINK }));
+    });
+  });
+  const paymentLinks = new PaymentLinkCache(() =>
+    fetchPaymentLink({ baseUrl: memtreeSrv.origin, apiKey: "k" }));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k", paymentLinks });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, followupTurn("turn two"));
+    const hook = await postHook(proxy, displayHook({ final: true }));
+    const text = hook.body.hookSpecificOutput.displayContent;
+    assert.ok(text.includes(`\n  ${shortUrl}\n`), text);
+    assert.ok(!text.includes("/payment?"), text);
+    assert.deepEqual(linkRequests, [{ method: "POST", auth: "Bearer k" }]);
   } finally {
     proxy.close();
     upstream.close();

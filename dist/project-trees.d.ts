@@ -15,6 +15,7 @@
  * compaction, and not at all on any failure: an older server (404), a slow or
  * failed request, no project, or no earlier trees.
  */
+import type { KeyCheck } from "./key-status.js";
 /** Trees named at most. */
 export declare const PROJECT_TREES_LIMIT = 5;
 /** Most a SessionStart hook waits for an answer still on its way. */
@@ -74,12 +75,26 @@ export declare function projectIdentity(meta: {
 export declare function parseProjectTrees(body: unknown): ProjectTree[] | undefined;
 /** The context block, or undefined when no tree but the current session's is left. */
 export declare function formatProjectTrees(trees: readonly ProjectTree[], currentSessionId: string | undefined): string | undefined;
+/** What startup knows when it decides on the hint (cli-main.ts). */
+export interface ProjectTreesStartup {
+    interactive: boolean;
+    /** The startup key check: "invalid" (401/403, even after [c]) means no MemTree calls. */
+    keyCheck: KeyCheck;
+    /** Unpaid and [c] at the payment gate (or a print run): MemTree is off this session. */
+    memtreeOff: boolean;
+    tools: readonly string[];
+    meta: {
+        git_repo?: string;
+    } | undefined;
+    env: NodeJS.ProcessEnv;
+    fetchJson: ProjectTreesFetch;
+}
 /**
  * The hint for this run, or undefined: interactive sessions only (print runs
- * keep Claude Code's output as it is), with both `search` and `read_node`
- * (the block names them), a known project, and not `CCC_PROJECT_TREES=0`.
+ * keep Claude Code's output as it is) with MemTree on (a valid key, not
+ * continued past the payment gate: the lookup could only fail), with both
+ * `search` and `read_node` (the block names them), a known project, and not
+ * `CCC_PROJECT_TREES=0`.
  */
-export declare function projectTreesHintFor(interactive: boolean, tools: readonly string[], meta: {
-    git_repo?: string;
-} | undefined, env: NodeJS.ProcessEnv, fetchJson: ProjectTreesFetch): ProjectTreesHint | undefined;
+export declare function projectTreesHintFor(s: ProjectTreesStartup): ProjectTreesHint | undefined;
 //# sourceMappingURL=project-trees.d.ts.map

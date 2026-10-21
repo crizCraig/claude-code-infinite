@@ -2490,6 +2490,13 @@ async function handleMessages(
   // prefix, a passthrough means there was nothing to compact. A failure keeps
   // it pending for the next turn.
   if (result && sessionId !== undefined) state.compactNow.delete(sessionId);
+  // A first 402 starts fetching the short checkout link (memtree.ts): give the
+  // paused notice below a moment to show it instead of the long one. Only a turn
+  // that can show the notice waits, and only while that fetch is in flight.
+  if (!result && displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration &&
+      state.paymentNotice.due() && opts.memtree.paymentRequiredDetail !== null) {
+    await opts.memtree.paymentLinkSettled?.(PAYMENT_LINK_NOTICE_WAIT_MS);
+  }
 
   if (
     downstreamClosedDuringCompression ||
@@ -2910,6 +2917,8 @@ function joinNoticeLines(...parts: (string | undefined)[]): string | undefined {
 }
 
 export const MEMTREE_COMPACT_MIN_TOKENS = 20_000;
+/** How long a paused turn waits for the short checkout link before its notice (once). */
+export const PAYMENT_LINK_NOTICE_WAIT_MS = 1_000;
 
 /** The reply to a ccc slash command, or undefined for an ordinary prompt. */
 function sessionCommandReply(

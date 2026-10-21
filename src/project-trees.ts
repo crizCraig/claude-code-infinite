@@ -16,6 +16,8 @@
  * failed request, no project, or no earlier trees.
  */
 
+import type { KeyCheck } from "./key-status.js";
+
 /** Trees named at most. */
 export const PROJECT_TREES_LIMIT = 5;
 /** Most a SessionStart hook waits for an answer still on its way. */
@@ -194,20 +196,30 @@ async function withinMs<T>(promise: Promise<T>, ms: number): Promise<T | undefin
   }
 }
 
+/** What startup knows when it decides on the hint (cli-main.ts). */
+export interface ProjectTreesStartup {
+  interactive: boolean;
+  /** The startup key check: "invalid" (401/403, even after [c]) means no MemTree calls. */
+  keyCheck: KeyCheck;
+  /** Unpaid and [c] at the payment gate (or a print run): MemTree is off this session. */
+  memtreeOff: boolean;
+  tools: readonly string[];
+  meta: { git_repo?: string } | undefined;
+  env: NodeJS.ProcessEnv;
+  fetchJson: ProjectTreesFetch;
+}
+
 /**
  * The hint for this run, or undefined: interactive sessions only (print runs
- * keep Claude Code's output as it is), with both `search` and `read_node`
- * (the block names them), a known project, and not `CCC_PROJECT_TREES=0`.
+ * keep Claude Code's output as it is) with MemTree on (a valid key, not
+ * continued past the payment gate: the lookup could only fail), with both
+ * `search` and `read_node` (the block names them), a known project, and not
+ * `CCC_PROJECT_TREES=0`.
  */
-export function projectTreesHintFor(
-  interactive: boolean,
-  tools: readonly string[],
-  meta: { git_repo?: string } | undefined,
-  env: NodeJS.ProcessEnv,
-  fetchJson: ProjectTreesFetch
-): ProjectTreesHint | undefined {
-  if (!interactive || env.CCC_PROJECT_TREES === "0") return undefined;
-  if (!tools.includes("search") || !tools.includes("read_node")) return undefined;
-  const project = projectIdentity(meta);
-  return project ? new ProjectTreesHint(fetchJson, project) : undefined;
+export function projectTreesHintFor(s: ProjectTreesStartup): ProjectTreesHint | undefined {
+  if (!s.interactive || s.env.CCC_PROJECT_TREES === "0") return undefined;
+  if (s.keyCheck === "invalid" || s.memtreeOff) return undefined;
+  if (!s.tools.includes("search") || !s.tools.includes("read_node")) return undefined;
+  const project = projectIdentity(s.meta);
+  return project ? new ProjectTreesHint(s.fetchJson, project) : undefined;
 }
