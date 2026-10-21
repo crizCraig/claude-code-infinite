@@ -29,9 +29,9 @@ test("the line is the agreed text, one line", () => {
   assert.doesNotMatch(NO_PLAN_TEXT, /\n/);
 });
 
-test("credit_balance_too_low gets the same advice", () => {
-  assert.equal(creditNoticeText(false), EXPECTED);
-  assert.equal(creditNoticeText(true), noPlanWarningText(true));
+test("credit_balance_too_low gets the plan advice, with the Console sign-in named", () => {
+  assert.match(creditNoticeText(false), /Pro or Max plan.*\/logout.*\/login/);
+  assert.match(creditNoticeText(false), /Anthropic Console account/);
 });
 
 test("warns on an API key or no sign-in, unless a paid plan is recorded", () => {
@@ -151,7 +151,7 @@ test("the tee reports each request's sign-in type, and a credit refusal as an AP
   sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 400,
                  upstreamError: "credit_balance_too_low" }));
   assert.deepEqual(seen, ["subscription", "api_key", "api_key", "subscription"]);
-  // ccc's exit line is for API keys: the subscription's refusal is passed on as one.
+  // Every refusal is passed on with its sign-in type.
   assert.deepEqual(credit, ["api_key", "none", "subscription"]);
 });
 
@@ -176,10 +176,11 @@ test("print mode: the warning goes to stderr, stdout stays Claude's", () => {
   assert.equal(r.stderr, `${EXPECTED}\n`);
 });
 
-test("the exit credit advice is for API keys only", async () => {
+test("the exit credit advice is for every sign-in type without a paid tier", async () => {
   const { creditAdviceApplies } = await import("../dist/claude-plan-warning.js");
-  assert.equal(creditAdviceApplies("api_key"), true);
-  assert.equal(creditAdviceApplies(undefined), true, "no auth header seen: an API key's refusal");
-  assert.equal(creditAdviceApplies("subscription"), false);
-  assert.equal(creditAdviceApplies("unknown"), false, "an unrecognised bearer may be a subscription");
+  // An OAuth token is also how Claude Code signs in to an Anthropic Console
+  // account (API usage billing), whose refusal is the commonest first-run failure.
+  for (const auth of ["api_key", undefined, "subscription", "unknown"]) {
+    assert.equal(creditAdviceApplies(auth, "unknown"), true, String(auth));
+  }
 });

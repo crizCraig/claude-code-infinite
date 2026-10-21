@@ -159,6 +159,8 @@ export const CONTEXT_FIELDS = {
     claude_auth: oneOf(CLAUDE_AUTH_TYPES),
     claude_plan: oneOf(CLAUDE_PLANS),
     claude_found: oneOf(CLAUDE_FOUND),
+    /** ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set; never the value (claude-auth.ts). */
+    env_api_key_set: bool,
     /** The main model's context window ccc inferred, in thousands of tokens. */
     context_window_k: integer(0, 100_000),
 };
