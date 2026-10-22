@@ -425,7 +425,7 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
   const children = (node.k ?? []).filter((child) => index.nodes.has(child));
   if (children.length) {
     const dated = childrenDiffer(index, id, children);
-    const same = !dated && index.times.has(id) ? ", same time as the node" : "";
+    const same = dated ? "" : ", same time as the node";
     out.push("", `children (${children.length}${same}):`);
     for (const child of children) {
       const c = index.nodes.get(child)!;
@@ -443,7 +443,7 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
  */
 function childrenDiffer(index: MemtreeIndex, id: number, children: number[]): boolean {
   const own = index.times.get(id);
-  if (!own) return false;
+  if (!own) return true; // nothing in the header: show what the children know
   return children.some((child) => {
     const span = index.times.get(child);
     return !span || span[0] !== own[0] || span[1] !== own[1];

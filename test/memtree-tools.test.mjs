@@ -976,6 +976,10 @@ test("read_node dates the node and each child by when its messages were written"
     const mixed = new MemtreeIndex({ ...TIMED, block_times: { "0": TIMED.block_times["0"] } });
     assert.match(formatNode(mixed, 0), /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy[^\n]*\n  node 4 \(branch\): Migration/);
     assert.match(formatNode(timed, 5), /^node 5 · leaf · depth 2 \[2026-09-30 14:20–14:40 PT\]\n/);
+    // A detached branch (no span of its own) still shows its children's.
+    const detached = new MemtreeIndex({ ...TIMED, nodes: [...TIMED.nodes, { id: 7, s: "loose", k: [8] },
+      { id: 8, s: "loose leaf", k: [], l: [1, 1, 2] }] });
+    assert.match(formatNode(detached, 7), /\n  node 8 \(leaf, block 1 lines 1-2\) \[2026-09-30 14:20–14:40 PT\]: loose leaf/);
     // An old tree (no block_times): exactly as before.
     assert.doesNotMatch(formatNode(index(), 0) + formatNode(index(), 1), /\[20/);
   });
