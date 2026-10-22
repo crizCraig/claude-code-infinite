@@ -229,7 +229,7 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onCreditBalanceTooLow?: (auth: ClaudeAuthType | undefined) => void,
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?: (auth: ClaudeAuthType) => void,
-    /** Anthropic answered a request (2xx): a remembered credit refusal is stale. */
+    /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
     private readonly onUpstreamOk?: () => void
   ) {}
 
@@ -278,7 +278,11 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     rec: Extract<RequestRecord, { kind: "messages" }>, fields: Record<string, unknown>
   ): void {
     const status = rec.upstreamStatus;
-    if (typeof status === "number" && status >= 200 && status < 300) this.onUpstreamOk?.();
+    // Claude Code's own side requests (the security monitor) don't speak for its turns.
+    if (typeof status === "number" && status >= 200 && status < 300 &&
+        rec.turnType !== "side-request") {
+      this.onUpstreamOk?.();
+    }
     if (typeof status === "number" && status >= 400) {
       this.diagnostics.recordLimited(`upstream:${status}`, "upstream_error", fields);
     }

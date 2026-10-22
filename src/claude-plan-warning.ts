@@ -156,17 +156,65 @@ export function needsCreditReminder(input: CreditReminderInput): boolean {
   return input.refused && !PAID_PLANS.includes(input.plan);
 }
 
+export interface StartupSignInInput extends CreditReminderInput {
+  signIn: PlanWarningInput;
+  /** An API key that beats the user's `/login` (claude-auth.ts apiKeyOverride). */
+  override: ApiKeyOverride | undefined;
+  color: boolean;
+}
+
 /**
- * The remembered refusal's advice on stderr before the first prompt, when it
- * applies. Returns whether it was printed.
+ * The sign-in lines before Claude Code starts: a remembered credit refusal's
+ * advice (naming the overriding key, so the override line would repeat it),
+ * else the no-plan line, plus the override line. `warned` is whether a
+ * no-plan or credit line is among them.
  */
-export function printCreditReminder(
-  input: CreditReminderInput, color: boolean, source?: ApiKeySource
-): boolean {
-  if (!needsCreditReminder(input)) return false;
-  const text = `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
-  process.stderr.write(`${color ? `\x1b[33m${text}\x1b[39m` : text}\n`);
-  return true;
+export function startupSignInLines(
+  input: StartupSignInInput
+): { lines: string[]; warned: boolean } {
+  const { override, color } = input;
+  if (needsCreditReminder(input)) {
+    // A key the user may decline at Claude Code's question isn't named (as at exit).
+    const source = override?.asks ? undefined : override?.source;
+    const text = `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
+    return { lines: [color ? `\x1b[33m${text}\x1b[39m` : text], warned: true };
+  }
+  const lines: string[] = [];
+  const warned = needsPlanWarning(input.signIn);
+  if (warned) lines.push(noPlanWarningText(color));
+  if (override && input.signIn.subscriptionLogin === true) {
+    lines.push(apiKeyOverrideText(override, color));
+  }
+  return { lines, warned };
+}
+
+/** startupSignInLines on stderr (stdout stays Claude Code's); returns `warned`. */
+export function printStartupSignInLines(input: StartupSignInInput): boolean {
+  const { lines, warned } = startupSignInLines(input);
+  for (const line of lines) process.stderr.write(`${line}\n`);
+  return warned;
+}
+
+/**
+ * Remembers a credit refusal across launches and sessions: every refusal
+ * writes the marker and every answered request removes it, whatever this
+ * process saw before, since other ccc sessions share the file.
+ */
+export class CreditRefusalMemory {
+  /** A refusal was on file when this launch started. */
+  readonly refusedAtStart: boolean;
+
+  constructor(private readonly configDir: string) {
+    this.refusedAtStart = creditRefusedOnFile(configDir);
+  }
+
+  refused(): void {
+    markCreditRefused(this.configDir);
+  }
+
+  answered(): void {
+    if (creditRefusedOnFile(this.configDir)) clearCreditRefused(this.configDir);
+  }
 }
 
 export function noPlanWarningText(color: boolean): string {

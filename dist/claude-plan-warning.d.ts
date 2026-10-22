@@ -68,11 +68,37 @@ export interface CreditReminderInput {
 }
 /** True when an earlier session was refused for credit and no paid tier is on record yet. */
 export declare function needsCreditReminder(input: CreditReminderInput): boolean;
+export interface StartupSignInInput extends CreditReminderInput {
+    signIn: PlanWarningInput;
+    /** An API key that beats the user's `/login` (claude-auth.ts apiKeyOverride). */
+    override: ApiKeyOverride | undefined;
+    color: boolean;
+}
 /**
- * The remembered refusal's advice on stderr before the first prompt, when it
- * applies. Returns whether it was printed.
+ * The sign-in lines before Claude Code starts: a remembered credit refusal's
+ * advice (naming the overriding key, so the override line would repeat it),
+ * else the no-plan line, plus the override line. `warned` is whether a
+ * no-plan or credit line is among them.
  */
-export declare function printCreditReminder(input: CreditReminderInput, color: boolean, source?: ApiKeySource): boolean;
+export declare function startupSignInLines(input: StartupSignInInput): {
+    lines: string[];
+    warned: boolean;
+};
+/** startupSignInLines on stderr (stdout stays Claude Code's); returns `warned`. */
+export declare function printStartupSignInLines(input: StartupSignInInput): boolean;
+/**
+ * Remembers a credit refusal across launches and sessions: every refusal
+ * writes the marker and every answered request removes it, whatever this
+ * process saw before, since other ccc sessions share the file.
+ */
+export declare class CreditRefusalMemory {
+    private readonly configDir;
+    /** A refusal was on file when this launch started. */
+    readonly refusedAtStart: boolean;
+    constructor(configDir: string);
+    refused(): void;
+    answered(): void;
+}
 export declare function noPlanWarningText(color: boolean): string;
 /**
  * The line on stderr when it applies: stdout stays Claude Code's in print

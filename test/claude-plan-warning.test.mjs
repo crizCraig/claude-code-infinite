@@ -237,10 +237,11 @@ test("the tee reports a request Anthropic answered, so a stale refusal can be fo
 
 test("print mode: the credit reminder goes to stderr with the plan advice", () => {
   const script = [
-    "import { printCreditReminder } from './dist/claude-plan-warning.js';",
-    "printCreditReminder({ refused: true, plan: 'unknown' }, false);",
-    "printCreditReminder({ refused: true, plan: 'pro' }, false);",
-    "printCreditReminder({ refused: false, plan: 'unknown' }, false);",
+    "import { printStartupSignInLines } from './dist/claude-plan-warning.js';",
+    "const signIn = { auth: 'subscription', plan: 'unknown' };",
+    "printStartupSignInLines({ refused: true, plan: 'unknown', signIn, color: false });",
+    "printStartupSignInLines({ refused: true, plan: 'pro', signIn, color: false });",
+    "printStartupSignInLines({ refused: false, plan: 'unknown', signIn, color: false });",
   ].join("\n");
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     encoding: "utf8", cwd: new URL("..", import.meta.url),
@@ -251,4 +252,59 @@ test("print mode: the credit reminder goes to stderr with the plan advice", () =
   assert.equal(lines.length, 1, r.stderr);
   assert.match(lines[0], /^Last time, Anthropic refused/);
   assert.match(lines[0], /Pro or Max plan.*\/logout.*\/login/);
+});
+
+test("a side request's 2xx does not count as the sign-in working again", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-tee-side-"));
+  const diagnostics = new Diagnostics({
+    baseUrl: "http://127.0.0.1:9", configDir: dir, clientName: "t", clientVersion: "1.0.0",
+    config: {}, env: { CCC_DIAGNOSTICS: "0" },
+  });
+  const ok = [];
+  const sink = new DiagnosticsRequestSink(undefined, diagnostics, undefined, undefined,
+    () => ok.push(true));
+  sink.log({ kind: "messages", turnType: "side-request", upstreamStatus: 200 });
+  assert.equal(ok.length, 0);
+  sink.log({ kind: "messages", turnType: "tool", upstreamStatus: 200 });
+  assert.equal(ok.length, 1);
+});
+
+test("two sessions sharing the marker: each refusal writes it, each success removes it", async () => {
+  const { CreditRefusalMemory, creditRefusedOnFile } =
+    await import("../dist/claude-plan-warning.js");
+  const dir = mkdtempSync(join(tmpdir(), "ccc-credit-two-"));
+  const a = new CreditRefusalMemory(dir);
+  const b = new CreditRefusalMemory(dir);
+  assert.equal(a.refusedAtStart, false);
+  a.refused();
+  assert.equal(creditRefusedOnFile(dir), true);
+  b.answered(); // B started before A's refusal, and its request went through
+  assert.equal(creditRefusedOnFile(dir), false);
+  a.refused(); // A is refused again after B removed the marker
+  assert.equal(creditRefusedOnFile(dir), true);
+  assert.equal(new CreditRefusalMemory(dir).refusedAtStart, true);
+});
+
+test("the credit reminder replaces the API-key override line, which says the same", async () => {
+  const { startupSignInLines } = await import("../dist/claude-plan-warning.js");
+  const override = { source: "ANTHROPIC_AUTH_TOKEN", asks: false };
+  const reminded = startupSignInLines({
+    refused: true, plan: "unknown", signIn: { auth: "subscription", plan: "unknown",
+      subscriptionLogin: true }, override, color: false,
+  });
+  assert.equal(reminded.lines.length, 1);
+  assert.match(reminded.lines[0], /^Last time, Anthropic refused.*ANTHROPIC_AUTH_TOKEN is set/);
+  assert.equal(reminded.warned, true);
+  const plain = startupSignInLines({
+    refused: false, plan: "unknown", signIn: { auth: "subscription", plan: "unknown",
+      subscriptionLogin: true }, override, color: false,
+  });
+  assert.equal(plain.lines.length, 1);
+  assert.match(plain.lines[0], /^ANTHROPIC_AUTH_TOKEN is set/);
+  assert.equal(plain.warned, false, "the override line is not a no-plan warning");
+  const noPlan = startupSignInLines({
+    refused: false, plan: "unknown", signIn: { auth: "api_key", plan: "unknown" },
+    override: undefined, color: false,
+  });
+  assert.deepEqual(noPlan, { lines: [NO_PLAN_TEXT], warned: true });
 });

@@ -122,15 +122,55 @@ export function needsCreditReminder(input) {
     return input.refused && !PAID_PLANS.includes(input.plan);
 }
 /**
- * The remembered refusal's advice on stderr before the first prompt, when it
- * applies. Returns whether it was printed.
+ * The sign-in lines before Claude Code starts: a remembered credit refusal's
+ * advice (naming the overriding key, so the override line would repeat it),
+ * else the no-plan line, plus the override line. `warned` is whether a
+ * no-plan or credit line is among them.
  */
-export function printCreditReminder(input, color, source) {
-    if (!needsCreditReminder(input))
-        return false;
-    const text = `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
-    process.stderr.write(`${color ? `\x1b[33m${text}\x1b[39m` : text}\n`);
-    return true;
+export function startupSignInLines(input) {
+    const { override, color } = input;
+    if (needsCreditReminder(input)) {
+        // A key the user may decline at Claude Code's question isn't named (as at exit).
+        const source = override?.asks ? undefined : override?.source;
+        const text = `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
+        return { lines: [color ? `\x1b[33m${text}\x1b[39m` : text], warned: true };
+    }
+    const lines = [];
+    const warned = needsPlanWarning(input.signIn);
+    if (warned)
+        lines.push(noPlanWarningText(color));
+    if (override && input.signIn.subscriptionLogin === true) {
+        lines.push(apiKeyOverrideText(override, color));
+    }
+    return { lines, warned };
+}
+/** startupSignInLines on stderr (stdout stays Claude Code's); returns `warned`. */
+export function printStartupSignInLines(input) {
+    const { lines, warned } = startupSignInLines(input);
+    for (const line of lines)
+        process.stderr.write(`${line}\n`);
+    return warned;
+}
+/**
+ * Remembers a credit refusal across launches and sessions: every refusal
+ * writes the marker and every answered request removes it, whatever this
+ * process saw before, since other ccc sessions share the file.
+ */
+export class CreditRefusalMemory {
+    configDir;
+    /** A refusal was on file when this launch started. */
+    refusedAtStart;
+    constructor(configDir) {
+        this.configDir = configDir;
+        this.refusedAtStart = creditRefusedOnFile(configDir);
+    }
+    refused() {
+        markCreditRefused(this.configDir);
+    }
+    answered() {
+        if (creditRefusedOnFile(this.configDir))
+            clearCreditRefused(this.configDir);
+    }
 }
 export function noPlanWarningText(color) {
     return color ? `\x1b[33m${NO_PLAN_TEXT}\x1b[39m` : NO_PLAN_TEXT;
