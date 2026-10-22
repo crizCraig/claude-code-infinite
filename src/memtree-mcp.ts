@@ -153,7 +153,7 @@ export const MEMTREE_TOOLS = [
       "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
       "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
-      "Results show when the messages were written.",
+      "Results show when the messages were written (per transcript block).",
     inputSchema: {
       type: "object",
       properties: {
@@ -174,7 +174,7 @@ export const MEMTREE_TOOLS = [
     description:
       "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
       "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
-      "Results show when the messages were written.",
+      "Results show when the messages were written (per transcript block).",
     inputSchema: {
       type: "object",
       properties: {
@@ -192,7 +192,7 @@ export const MEMTREE_TOOLS = [
       "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
       "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
       "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole. " +
-      "Results show when the messages were written.",
+      "Results show when the messages were written (per transcript block).",
     inputSchema: {
       type: "object",
       properties: {

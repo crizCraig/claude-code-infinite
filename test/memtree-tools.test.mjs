@@ -34,8 +34,10 @@ import {
   withMemtreeMcpArgs,
 } from "../dist/memtree-mcp-config.js";
 
-// Times are shown in the process's zone: pin it so the expected text is fixed.
-process.env.TZ = "UTC";
+import { setDisplayTimeZone } from "../dist/memtree-times.js";
+
+// Times are shown in the local zone: pin it so the expected text is fixed.
+setDisplayTimeZone("UTC");
 
 const PAGE = JSON.parse(
   fs.readFileSync(new URL("./fixtures/memtree-page.json", import.meta.url), "utf-8")
@@ -952,14 +954,13 @@ const TIMED = {
     "1": ["2026-09-30T21:20:00.000Z", "2026-09-30T21:40:00.000Z"] },
 };
 
-/** Run ``fn`` with this process's zone set to ``zone``. */
+/** Run ``fn`` with times shown in ``zone``. */
 function inZone(zone, fn) {
-  const saved = process.env.TZ;
-  process.env.TZ = zone;
+  setDisplayTimeZone(zone);
   try {
     return fn();
   } finally {
-    process.env.TZ = saved;
+    setDisplayTimeZone("UTC");
   }
 }
 
@@ -971,7 +972,7 @@ test("read_node dates the node and each child by when its messages were written"
     assert.match(root, /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy pipeline/);
     assert.match(root, /\n  node 4 \(branch\) \[2026-09-30 14:20–14:40 PT\]: Migration/);
     // Children all written when the node was (one block): the header says it once.
-    assert.match(formatNode(timed, 1), /\nchildren \(2, same time\):\n  node 2 \(leaf, block 0 lines 1-5\): User asks/);
+    assert.match(formatNode(timed, 1), /\nchildren \(2, same time as the node\):\n  node 2 \(leaf, block 0 lines 1-5\): User asks/);
     const mixed = new MemtreeIndex({ ...TIMED, block_times: { "0": TIMED.block_times["0"] } });
     assert.match(formatNode(mixed, 0), /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy[^\n]*\n  node 4 \(branch\): Migration/);
     assert.match(formatNode(timed, 5), /^node 5 · leaf · depth 2 \[2026-09-30 14:20–14:40 PT\]\n/);

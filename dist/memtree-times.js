@@ -8,16 +8,19 @@
  * `2026-09-30 14:02–14:40 PT`, one date when both ends share it. Trees from
  * before times were recorded have none, and nothing is shown for them.
  */
-/** A well-formed span (two parseable times), else undefined. */
+/** An ISO 8601 time with a zone (`Z` or an offset); anything else is not a time here. */
+const ISO_TIME_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?(Z|[+-]\d\d:?\d\d)$/;
+/** A well-formed span (two ISO times with a zone), earliest first; else undefined. */
 export function timeSpan(value) {
     if (!Array.isArray(value) || value.length !== 2)
         return undefined;
     const [start, end] = value;
-    if (typeof start !== "string" || typeof end !== "string")
+    if (!isIsoTime(start) || !isIsoTime(end))
         return undefined;
-    if (Number.isNaN(Date.parse(start)) || Number.isNaN(Date.parse(end)))
-        return undefined;
-    return [start, end];
+    return Date.parse(start) <= Date.parse(end) ? [start, end] : [end, start];
+}
+function isIsoTime(value) {
+    return typeof value === "string" && ISO_TIME_RE.test(value) && !Number.isNaN(Date.parse(value));
 }
 /** `block_times` (`{"3": [start, end]}`) as block -> span; malformed entries dropped. */
 export function blockTimes(raw) {
@@ -40,8 +43,18 @@ export function mergeSpans(a, b) {
         Date.parse(b[1]) > Date.parse(a[1]) ? b[1] : a[1],
     ];
 }
-/** This process's IANA zone, or "UTC" when it has none. */
+let displayZone;
+/**
+ * Show times in ``zone`` instead of this process's (undefined: back to the
+ * process's). For tests: Windows ICU ignores a TZ set at runtime.
+ */
+export function setDisplayTimeZone(zone) {
+    displayZone = zone;
+}
+/** The zone times are shown in: the override, else this process's, else "UTC". */
 export function localTimeZone() {
+    if (displayZone)
+        return displayZone;
     try {
         return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     }
@@ -57,15 +70,23 @@ export function formatTimeSpan(span, zone = localTimeZone()) {
     const valid = timeSpan(span);
     if (!valid)
         return undefined;
+    const [from, to] = valid.map((t) => new Date(t));
     const parts = zoneParts(zone);
-    const start = parts.format(new Date(valid[0]));
-    const end = parts.format(new Date(valid[1]));
-    const label = parts.label(new Date(valid[0]));
-    if (start === end)
-        return `${start} ${label}`;
+    const [start, end] = [parts.format(from), parts.format(to)];
+    const [startLabel, endLabel] = [parts.label(from), parts.label(to)];
+    // By instant, not by text: when clocks go back, an hour apart can read the same.
+    if (Math.floor(from.getTime() / 60_000) === Math.floor(to.getTime() / 60_000)) {
+        return `${start} ${startLabel}`;
+    }
+    if (start === end) {
+        // The hour clocks went back: the zone's DST names (PDT, PST) tell the two apart.
+        return `${start} ${parts.offsetLabel(from)}–${end} ${parts.offsetLabel(to)}`;
+    }
+    if (startLabel !== endLabel)
+        return `${start} ${startLabel}–${end} ${endLabel}`;
     if (start.slice(0, 10) === end.slice(0, 10))
-        return `${start}–${end.slice(11)} ${label}`;
-    return `${start}–${end} ${label}`;
+        return `${start}–${end.slice(11)} ${endLabel}`;
+    return `${start}–${end} ${endLabel}`;
 }
 /** One time (`2026-09-30 14:02 PT`), or undefined when it does not parse. */
 export function formatTime(value, zone) {
@@ -77,33 +98,60 @@ export function bracketedSpan(span, zone) {
     return text ? ` [${text}]` : "";
 }
 const UTC_ZONES = new Set(["UTC", "Etc/UTC", "Etc/GMT", "GMT", "Etc/Universal", "Etc/Zulu"]);
+/** Formatters per zone: a read_node with many children formats many spans. */
+const ZONE_FORMATS = new Map();
 function zoneParts(zone) {
     const resolved = UTC_ZONES.has(zone) ? "UTC" : zone;
+    let format = ZONE_FORMATS.get(resolved);
+    if (!format) {
+        format = buildZoneFormat(resolved);
+        if (ZONE_FORMATS.size > 16)
+            ZONE_FORMATS.clear();
+        ZONE_FORMATS.set(resolved, format);
+    }
+    return format;
+}
+function buildZoneFormat(zone) {
+    let fmt;
     try {
-        const fmt = new Intl.DateTimeFormat("en-US", {
-            timeZone: resolved, year: "numeric", month: "2-digit", day: "2-digit",
+        fmt = new Intl.DateTimeFormat("en-US", {
+            timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
             hour: "2-digit", minute: "2-digit", hourCycle: "h23",
         });
-        return {
-            format: (date) => {
-                const p = Object.fromEntries(fmt.formatToParts(date).map((x) => [x.type, x.value]));
-                return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
-            },
-            label: (date) => (resolved === "UTC" ? "UTC" : zoneLabel(resolved, date)),
-        };
     }
     catch {
         return zoneParts("UTC"); // an unknown zone name: say UTC, labelled
     }
+    const names = zone === "UTC" ? undefined : zoneNames(zone);
+    return {
+        format: (date) => {
+            const p = Object.fromEntries(fmt.formatToParts(date).map((x) => [x.type, x.value]));
+            return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+        },
+        label: (date) => (names ? zoneLabel(names, date) : "UTC"),
+        offsetLabel: (date) => (names ? zoneLabel({ short: names.short }, date) : "UTC"),
+    };
+}
+/** The zone's name formatters; a style this ICU build lacks is left out. */
+function zoneNames(zone) {
+    const names = {};
+    for (const style of ["shortGeneric", "short"]) {
+        try {
+            names[style] = new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: style });
+        }
+        catch {
+            // older ICU: no shortGeneric
+        }
+    }
+    return names;
 }
 /** `PT`, `ET`, `MST`; else the offset form (`GMT+2`) where no short name exists. */
-function zoneLabel(zone, date) {
-    const name = (style) => new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: style })
-        .formatToParts(date).find((p) => p.type === "timeZoneName")?.value ?? "";
-    const generic = name("shortGeneric");
+function zoneLabel(names, date) {
+    const name = (fmt) => fmt?.formatToParts(date).find((p) => p.type === "timeZoneName")?.value ?? "";
+    const generic = name(names.shortGeneric);
     if (/^[A-Z]{2,5}$/.test(generic))
         return generic;
-    const short = name("short");
-    return short === "GMT+0" ? "UTC" : short || "UTC";
+    const short = name(names.short);
+    return short === "GMT+0" || !short ? "UTC" : short;
 }
 //# sourceMappingURL=memtree-times.js.map

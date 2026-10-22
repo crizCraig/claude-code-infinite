@@ -10,13 +10,18 @@
  */
 /** `[earliest, latest]` UTC ISO times. */
 export type TimeSpan = [string, string];
-/** A well-formed span (two parseable times), else undefined. */
+/** A well-formed span (two ISO times with a zone), earliest first; else undefined. */
 export declare function timeSpan(value: unknown): TimeSpan | undefined;
 /** `block_times` (`{"3": [start, end]}`) as block -> span; malformed entries dropped. */
 export declare function blockTimes(raw: unknown): Map<number, TimeSpan>;
 /** The span covering both. */
 export declare function mergeSpans(a: TimeSpan | undefined, b: TimeSpan): TimeSpan;
-/** This process's IANA zone, or "UTC" when it has none. */
+/**
+ * Show times in ``zone`` instead of this process's (undefined: back to the
+ * process's). For tests: Windows ICU ignores a TZ set at runtime.
+ */
+export declare function setDisplayTimeZone(zone: string | undefined): void;
+/** The zone times are shown in: the override, else this process's, else "UTC". */
 export declare function localTimeZone(): string;
 /**
  * `2026-09-30 14:02–14:40 PT` (same day), `2026-09-30 23:50–2026-10-01 00:10 PT`,

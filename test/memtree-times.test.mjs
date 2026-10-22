@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { blockTimes, bracketedSpan, formatTime, formatTimeSpan, mergeSpans } from "../dist/memtree-times.js";
+import { blockTimes, bracketedSpan, formatTime, formatTimeSpan, mergeSpans, setDisplayTimeZone } from "../dist/memtree-times.js";
 
 const PT = "America/Los_Angeles";
 
@@ -25,7 +25,27 @@ test("time spans: unknown or malformed spans show nothing", () => {
   assert.equal(formatTime(undefined, PT), undefined);
 });
 
-test("the default zone is this process's (TZ), labelled", () => {
+test("an hour apart when clocks go back is still a span, each end labelled when the zone's name changes", () => {
+  assert.equal(formatTimeSpan(["2026-11-01T08:30:00Z", "2026-11-01T09:30:00Z"], PT), "2026-11-01 01:30 PDT–2026-11-01 01:30 PST");
+  assert.equal(formatTimeSpan(["2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z"], "Europe/Berlin"),
+    "2026-10-25 02:30 GMT+2–2026-10-25 02:30 GMT+1");
+  assert.equal(formatTimeSpan(["2026-09-30T21:40:00Z", "2026-09-30T21:02:00Z"], PT), "2026-09-30 14:02–14:40 PT", "reversed: earliest first");
+  for (const junk of [["1", "2"], ["2026-09-30T21:02:00", "2026-09-30T21:40:00"], ["2026-09-30", "2026-10-01"]]) {
+    assert.equal(formatTimeSpan(junk, PT), undefined, "times need a zone");
+  }
+});
+
+test("an override sets the zone shown", () => {
+  try {
+    setDisplayTimeZone("Asia/Tokyo");
+    assert.equal(formatTime("2026-09-30T21:02:00Z"), "2026-10-01 06:02 GMT+9");
+  } finally {
+    setDisplayTimeZone(undefined);
+  }
+});
+
+// Windows ICU reads the zone from the OS and ignores a TZ set at runtime.
+test("the default zone is this process's (TZ), labelled", { skip: process.platform === "win32" }, () => {
   const saved = process.env.TZ;
   try {
     process.env.TZ = "America/New_York";

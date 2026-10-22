@@ -347,7 +347,7 @@ export function formatNode(index, id, tree) {
     const children = (node.k ?? []).filter((child) => index.nodes.has(child));
     if (children.length) {
         const dated = childrenDiffer(index, id, children);
-        const same = !dated && index.times.has(id) ? ", same time" : "";
+        const same = !dated && index.times.has(id) ? ", same time as the node" : "";
         out.push("", `children (${children.length}${same}):`);
         for (const child of children) {
             const c = index.nodes.get(child);

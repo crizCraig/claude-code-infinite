@@ -31,9 +31,10 @@ import {
 } from "../dist/payment-notice.js";
 import { SessionFinder } from "../dist/memtree-mcp.js";
 import { PaymentLinkCache, fetchPaymentLink } from "../dist/payment-link.js";
+import { setDisplayTimeZone } from "../dist/memtree-times.js";
 
-// MemTree tool times are shown in the process's zone: pin it so the expected text is fixed.
-process.env.TZ = "UTC";
+// MemTree tool times are shown in the local zone: pin it so the expected text is fixed.
+setDisplayTimeZone("UTC");
 
 const GREEN = "\x1b[32m";
 const DEFAULT_FOREGROUND = "\x1b[39m";
