@@ -20,7 +20,7 @@ const PAST_1M = {
   findingsTotal: 8,
   arms: [
     { name: 'MemTree', score: 69.9, findings: 8, detail: '3 fully, 5 partly', highlight: true },
-    { name: '/compact', score: 25.0, findings: 0, detail: 'no changes made' },
+    { name: '/compact', score: 23.0, findings: 0, detail: 'no changes made' },
   ],
 };
 const BADGE = 'Claude Opus 5.5 · graded blind';

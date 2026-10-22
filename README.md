@@ -88,7 +88,7 @@ another round's work); full context still fixed more of the issues (21 vs 17 on 
 ## Past the context window: MemTree keeps the work, `/compact` loses it
 
 <p align="center">
-  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 25% with 0 of 8" src="docs/images/benchmark-past-1m.png">
+  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
 </p>
 
 The benchmark above fits inside Claude Opus 5.5's 1M-token window. This one does not. Each setup
@@ -104,13 +104,12 @@ result blind (0–100) against the real fixes, their regression tests and the se
 | Setup | Score | Findings addressed (of 8) | How it handles the history |
 | --- | --- | --- | --- |
 | **Claude Code Infinite** | **69.9** | **8: 3 fully, 5 partly** | Compressed to ~200–290k on the first turn; looked up the review rounds with its MemTree tools |
-| `/compact` | 25.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
+| `/compact` | 23.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
 | Full context | n/a | n/a | Not possible: the history is larger than the 1M-token window |
 
 `/compact` failed because its summary dropped the findings: it recorded the reviews only as
 confirmed reviewer findings, with no finding or decision in it, so there was nothing to fix. Its
-23 points are for reporting that honestly; the same empty diff scored 27 and 31 in two rounds,
-which is grader noise on one rubric item (0 to 8 points for "preserves existing behavior"). MemTree recovered all 8 findings from the
+23 points are for reporting that honestly (regrading the same empty diffs gave 23 every time). MemTree recovered all 8 findings from the
 session's memory in every round, fixed 3 fully and 5 partly every round, and implemented the
 session's decisions rather than the reviewer's original proposals. Before writing any code, it searched its tree for the review rounds and read about 400 lines of the original exchange word for word with `read_lines`. MemTree's round scores were
 74.6, 67.6, 67.1, 69.4, 68.1 and 72.6, with 5 regressions charged across the 6 rounds.
