@@ -3,8 +3,7 @@
 //
 // Edit the numbers below, then run:
 //   node scripts/benchmark-chart/past-1m-chart.mjs
-// It writes docs/images/benchmark-past-1m.{svg,png} (MemTree vs /compact past 1M)
-// and docs/images/benchmark-past-1m-with-800k.{svg,png} (plus the 800k three-arm panel).
+// It writes docs/images/benchmark-past-1m.{svg,png} (MemTree vs /compact past 1M).
 // PNGs are rendered at 2x by headless Chrome (set CHROME to override its path); pass
 // --svg-only to skip them. The style matches docs/images/benchmark-chart.png.
 
@@ -17,21 +16,11 @@ import { fileURLToPath } from 'node:url';
 // ---- Numbers: update these when rounds finish -------------------------------------------
 const PAST_1M = {
   title: 'Past the context window',
-  subtitle: '1.15M-token session, mean of 3 rounds',
+  subtitle: '1.15M-token session, mean of 6 rounds',
   findingsTotal: 8,
   arms: [
-    { name: 'MemTree', score: 69.8, findings: 8, detail: '3 fully, 5 partly', highlight: true },
-    { name: '/compact', score: 23.0, findings: 0, detail: 'no changes made' },
-  ],
-};
-const WITHIN_800K = {
-  title: 'Inside the window',
-  subtitle: '775k-token session, Oct 20 rerun',
-  note: 'MemTree: mean of the 2 clean rounds',
-  arms: [
-    { name: 'MemTree', score: 65.3, highlight: true },
-    { name: 'Full context', score: 66.3 },
-    { name: '/compact', score: 44.5 },
+    { name: 'MemTree', score: 69.9, findings: 8, detail: '3 fully, 5 partly', highlight: true },
+    { name: '/compact', score: 25.0, findings: 0, detail: 'no changes made' },
   ],
 };
 const BADGE = 'Claude Opus 5.5 · graded blind';
@@ -51,15 +40,11 @@ main();
 
 function main() {
   const svgOnly = process.argv.includes('--svg-only');
-  const single = chartSvg([{ panel: PAST_1M, x: 0, w: 700 }], 700);
-  const both = chartSvg(
-    [{ panel: PAST_1M, x: 0, w: 640 }, { panel: WITHIN_800K, x: 640, w: 760 }], 1400);
-  for (const [name, svg] of [['benchmark-past-1m', single], ['benchmark-past-1m-with-800k', both]]) {
-    const svgPath = join(OUT_DIR, `${name}.svg`);
-    writeFileSync(svgPath, svg);
-    console.log(`wrote ${svgPath}`);
-    if (!svgOnly) renderPng(svgPath, join(OUT_DIR, `${name}.png`), svgWidth(svg));
-  }
+  const svg = chartSvg([{ panel: PAST_1M, x: 0, w: 700 }], 700);
+  const svgPath = join(OUT_DIR, 'benchmark-past-1m.svg');
+  writeFileSync(svgPath, svg);
+  console.log(`wrote ${svgPath}`);
+  if (!svgOnly) renderPng(svgPath, join(OUT_DIR, 'benchmark-past-1m.png'), svgWidth(svg));
 }
 
 function chartSvg(panels, width) {

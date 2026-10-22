@@ -88,7 +88,7 @@ another round's work); full context still fixed more of the issues (21 vs 17 on 
 ## Past the context window: MemTree keeps the work, `/compact` loses it
 
 <p align="center">
-  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 3 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
+  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 25% with 0 of 8" src="docs/images/benchmark-past-1m.png">
 </p>
 
 The benchmark above fits inside Claude Opus 5.5's 1M-token window. This one does not. Each setup
@@ -103,19 +103,19 @@ result blind (0–100) against the real fixes, their regression tests and the se
 
 | Setup | Score | Findings addressed (of 8) | How it handles the history |
 | --- | --- | --- | --- |
-| **Claude Code Infinite** | **69.8** | **8: 3 fully, 5 partly** | Compressed to ~200–285k on the first turn; looked up the review rounds with its MemTree tools |
-| `/compact` | 23.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
+| **Claude Code Infinite** | **69.9** | **8: 3 fully, 5 partly** | Compressed to ~200–290k on the first turn; looked up the review rounds with its MemTree tools |
+| `/compact` | 25.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
 | Full context | n/a | n/a | Not possible: the history is larger than the 1M-token window |
 
 `/compact` failed because its summary dropped the findings: it recorded the reviews only as
 confirmed reviewer findings, with no finding or decision in it, so there was nothing to fix. Its
-23 points are for reporting that honestly. MemTree recovered all 8 findings from the session's
-memory in every round, fixed 3 fully and 5 partly, and implemented the session's decisions rather
-than the reviewer's original proposals. Round scores were 74.6, 67.6 and 67.1 for MemTree (one
-regression, in the first round) and 23 each for `/compact`.
+23 points are for reporting that honestly; the same empty diff scored 27 and 31 in two rounds,
+which is grader noise on one rubric item (0 to 8 points for "preserves existing behavior"). MemTree recovered all 8 findings from the
+session's memory in every round, fixed 3 fully and 5 partly every round, and implemented the
+session's decisions rather than the reviewer's original proposals. MemTree's round scores were
+74.6, 67.6, 67.1, 69.4, 68.1 and 72.6, with 5 regressions charged across the 6 rounds.
 
-Caveats: these are the first 3 rounds, with more running; one task, one model, no significance
-claims. Blinding is weak: `/compact` made no changes and its report says it worked from a summary,
+Caveats: 6 rounds, one task, one model, one grader; no significance claims. Blinding is weak: `/compact` made no changes and its report says it worked from a summary,
 so a grader can tell the setups apart. The same task prompt went to both setups and mentions
 MemTree's lookup tools, which plain Claude Code doesn't have. There is no full-context arm, since
 the history doesn't fit. Grading used a fixed rubric (coverage 30, fix quality 30, fidelity to the
