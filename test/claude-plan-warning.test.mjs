@@ -308,3 +308,13 @@ test("the credit reminder replaces the API-key override line, which says the sam
   });
   assert.deepEqual(noPlan, { lines: [NO_PLAN_TEXT], warned: true });
 });
+
+test("a remembered refusal is not repeated once Claude Code runs on a cloud provider", async () => {
+  const { startupSignInLines } = await import("../dist/claude-plan-warning.js");
+  for (const auth of ["bedrock", "vertex", "foundry"]) {
+    assert.deepEqual(startupSignInLines({
+      refused: true, plan: "unknown", signIn: { auth, plan: "unknown" },
+      override: undefined, color: false,
+    }), { lines: [], warned: false }, auth);
+  }
+});

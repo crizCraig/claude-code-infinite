@@ -51,6 +51,7 @@ const CREDIT_REMINDER_LEAD = "Last time, Anthropic refused Claude Code's request
 
 const PAID_PLANS: readonly ClaudePlan[] = ["pro", "max", "max_5x", "max_20x", "team", "enterprise"];
 const SEEN_TYPES: readonly ClaudeAuthType[] = ["subscription", "api_key"];
+const CLOUD_AUTH: readonly ClaudeAuthType[] = ["bedrock", "vertex", "foundry"];
 
 export interface PlanWarningInput {
   /** From env and Claude Code's config files (claudeAuthFromConfig). */
@@ -71,7 +72,7 @@ export interface PlanWarningInput {
  */
 export function needsPlanWarning(input: PlanWarningInput): boolean {
   const { auth, plan, seen } = input;
-  if (auth === "bedrock" || auth === "vertex" || auth === "foundry") return false;
+  if (CLOUD_AUTH.includes(auth)) return false;
   if (PAID_PLANS.includes(plan)) return false;
   // Even a "free" plan on record: it may predate an upgrade.
   if (auth === "subscription" || input.subscriptionLogin === true) return false;
@@ -173,6 +174,8 @@ export function startupSignInLines(
   input: StartupSignInInput
 ): { lines: string[]; warned: boolean } {
   const { override, color } = input;
+  // Bedrock, Vertex and Foundry bill elsewhere: an Anthropic refusal no longer applies.
+  if (CLOUD_AUTH.includes(input.signIn.auth)) return { lines: [], warned: false };
   if (needsCreditReminder(input)) {
     // A key the user may decline at Claude Code's question isn't named (as at exit).
     const source = override?.asks ? undefined : override?.source;

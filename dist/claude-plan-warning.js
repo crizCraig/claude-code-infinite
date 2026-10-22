@@ -41,6 +41,7 @@ const CREDIT_REMINDER_LEAD = "Last time, Anthropic refused Claude Code's request
     "balance too low. ";
 const PAID_PLANS = ["pro", "max", "max_5x", "max_20x", "team", "enterprise"];
 const SEEN_TYPES = ["subscription", "api_key"];
+const CLOUD_AUTH = ["bedrock", "vertex", "foundry"];
 /**
  * True when Claude Code is on an API key or not signed in, and nothing shows a
  * paid plan. Any sign of a subscription wins, a stale API-key sighting
@@ -49,7 +50,7 @@ const SEEN_TYPES = ["subscription", "api_key"];
  */
 export function needsPlanWarning(input) {
     const { auth, plan, seen } = input;
-    if (auth === "bedrock" || auth === "vertex" || auth === "foundry")
+    if (CLOUD_AUTH.includes(auth))
         return false;
     if (PAID_PLANS.includes(plan))
         return false;
@@ -129,6 +130,9 @@ export function needsCreditReminder(input) {
  */
 export function startupSignInLines(input) {
     const { override, color } = input;
+    // Bedrock, Vertex and Foundry bill elsewhere: an Anthropic refusal no longer applies.
+    if (CLOUD_AUTH.includes(input.signIn.auth))
+        return { lines: [], warned: false };
     if (needsCreditReminder(input)) {
         // A key the user may decline at Claude Code's question isn't named (as at exit).
         const source = override?.asks ? undefined : override?.source;
