@@ -409,10 +409,14 @@ export function formatLines(
     throw new ToolInputError(`read_lines: this MemTree page carries no transcript blocks${note}`);
   }
   const lines = index.blockLines(block);
+  // A just-built tree whose transcript is still uploading: say so, not just "no block".
+  // Its missing blocks are past the array's end or, inside it, empty placeholders.
+  const pending = index.page.blocks_pending === true && typeof index.page.source_note === "string"
+    ? ` (${index.page.source_note})` : "";
+  if (pending && lines && lines.length === 0) {
+    throw new ToolInputError(`read_lines: block ${block} is not readable yet${pending}`);
+  }
   if (!lines) {
-    // A just-built tree whose transcript is still uploading: say so, not just "no block".
-    const pending = index.page.blocks_pending === true && typeof index.page.source_note === "string"
-      ? ` (${index.page.source_note})` : "";
     throw new ToolInputError(
       `read_lines: no block ${block} (blocks 0-${index.blockCount - 1})${pending}`
     );

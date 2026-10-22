@@ -462,6 +462,9 @@ test("CurrentTree refetches a page whose transcript blocks are still uploading",
     const partial = new MemtreeIndex({ ...pending, blocks: [PAGE.blocks[0]] });
     assert.throws(() => formatLines(partial, 1, 1, 1), /no block 1 \(blocks 0-0\) \(This tree was just built/,
       "a block not uploaded yet says so too");
+    const hole = new MemtreeIndex({ ...pending, blocks: [PAGE.blocks[0], "", PAGE.blocks[0]] });
+    assert.throws(() => formatLines(hole, 1, 1, 1), /block 1 is not readable yet \(This tree was just built/,
+      "an interior block not uploaded yet too");
     assert.throws(() => formatLines(new MemtreeIndex({ ...PAGE, blocks: [PAGE.blocks[0]] }), 1, 1, 1),
       /no block 1 \(blocks 0-0\)$/, "no note on a finished page");
     await tree.get(id);
