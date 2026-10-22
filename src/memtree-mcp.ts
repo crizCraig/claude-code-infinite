@@ -536,8 +536,13 @@ export class CurrentTree implements TreeSource {
   }
 }
 
-/** A served prefix that may later switch to the request's own tree (a pinned ref never does). */
+/**
+ * A page that may still change: a served prefix that may later switch to the request's
+ * own tree (a pinned ref never does), or any page whose transcript blocks are still
+ * uploading (`blocks_pending`: the tree was just built), so a retry can read them.
+ */
 function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
+  if (index.page.blocks_pending === true) return true;
   return index.page.served_prefix === true && index.page.ref !== id;
 }
 
@@ -709,7 +714,7 @@ async function searchTool(
 function nodeTarget(args: Record<string, unknown>, field: string): { tree?: string; id: number } {
   if (args.node !== undefined && args.node !== null && args.node !== "") {
     const { tree, id } = parseNodeAddress(args.node);
-    return { tree: checkTreeId(tree), id };
+    return { tree: treeArgument(tree), id };
   }
   return { tree: treeArgument(args.tree), id: Number(args[field]) };
 }
@@ -739,10 +744,11 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
   const { tree: ref, id } = nodeTarget(args, "id");
   const index = await tree.get(ref);
   const node = index.nodes.get(id);
-  if (!node) throw new ToolInputError(`read_lines: no node ${id} in tree ${ref}`);
+  const label = ref ?? CURRENT_TREE;
+  if (!node) throw new ToolInputError(`read_lines: no node ${id} in tree ${label}`);
   if (!index.isLeaf(node)) {
     throw new ToolInputError(
-      `read_lines: node ${ref}#${id} is a branch; read_node {"node": "${ref}#${id}"} lists the leaves under it`
+      `read_lines: node ${label}#${id} is a branch; read_node {"node": "${label}#${id}"} lists the leaves under it`
     );
   }
   const [block, start, end] = node.l!;

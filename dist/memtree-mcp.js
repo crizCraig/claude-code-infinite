@@ -464,8 +464,14 @@ export class CurrentTree {
         return new ToolInputError(`This MemTree page is a temporary prefix while newer messages are indexing; try again in ${seconds} second${seconds === 1 ? "" : "s"}.`);
     }
 }
-/** A served prefix that may later switch to the request's own tree (a pinned ref never does). */
+/**
+ * A page that may still change: a served prefix that may later switch to the request's
+ * own tree (a pinned ref never does), or any page whose transcript blocks are still
+ * uploading (`blocks_pending`: the tree was just built), so a retry can read them.
+ */
 function isTemporaryPrefix(index, id) {
+    if (index.page.blocks_pending === true)
+        return true;
     return index.page.served_prefix === true && index.page.ref !== id;
 }
 export class SessionFinder {
@@ -611,7 +617,7 @@ async function searchTool(args, tree, finder) {
 function nodeTarget(args, field) {
     if (args.node !== undefined && args.node !== null && args.node !== "") {
         const { tree, id } = parseNodeAddress(args.node);
-        return { tree: checkTreeId(tree), id };
+        return { tree: treeArgument(tree), id };
     }
     return { tree: treeArgument(args.tree), id: Number(args[field]) };
 }
@@ -640,10 +646,11 @@ async function readLinesTool(args, tree) {
     const { tree: ref, id } = nodeTarget(args, "id");
     const index = await tree.get(ref);
     const node = index.nodes.get(id);
+    const label = ref ?? CURRENT_TREE;
     if (!node)
-        throw new ToolInputError(`read_lines: no node ${id} in tree ${ref}`);
+        throw new ToolInputError(`read_lines: no node ${id} in tree ${label}`);
     if (!index.isLeaf(node)) {
-        throw new ToolInputError(`read_lines: node ${ref}#${id} is a branch; read_node {"node": "${ref}#${id}"} lists the leaves under it`);
+        throw new ToolInputError(`read_lines: node ${label}#${id} is a branch; read_node {"node": "${label}#${id}"} lists the leaves under it`);
     }
     const [block, start, end] = node.l;
     const pick = (v, fallback) => (v === undefined || v === null ? fallback : Number(v));

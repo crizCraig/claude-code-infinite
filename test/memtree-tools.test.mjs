@@ -447,6 +447,43 @@ test("CurrentTree caches immutable pinned served trees", async () => {
   }
 });
 
+test("CurrentTree refetches a page whose transcript blocks are still uploading", async () => {
+  for (const id of [undefined, "ea18af90-658b-485f-ad71-063e0ca5e724-v1-served"]) {
+    const path = `/memtree/${id ?? "aaa111"}.json`;
+    const pending = { ...PAGE, session_id: "session-1", blocks: [], blocks_pending: true,
+      source_note: "This tree was just built and its transcript is still uploading" };
+    const state = { urls: [], pageFetches: 0, current: "aaa111", pages: { [path]: pending } };
+    let clock = 0;
+    const tree = new CurrentTree({
+      proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", now: () => clock, fetch: fakeProxyFetch(state),
+    });
+    assert.throws(() => formatLines(new MemtreeIndex(pending), 0, 1, 1),
+      /no transcript blocks \(This tree was just built/, "the note says what to do");
+    await tree.get(id);
+    state.pages[path] = { ...PAGE, session_id: "session-1", ...(id ? { served_prefix: true, ref: id } : {}) };
+    clock += 45_001;
+    const uploaded = await tree.get(id);
+    assert.equal(uploaded.blockCount, PAGE.blocks.length, `${id ?? "current"}: the blocks are read once uploaded`);
+    assert.equal(await tree.get(id), uploaded, "then cached");
+    assert.equal(state.pageFetches, 2);
+  }
+});
+
+test("read_lines and read_node take current#N as this session's current tree", async () => {
+  const state = { urls: [], pageFetches: 0, current: "aaa111",
+    pages: { "/memtree/aaa111.json": { ...PAGE, session_id: "session-1" } } };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", fetch: fakeProxyFetch(state) });
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree))
+      .result.content[0].text;
+  assert.match(await call("read_lines", { node: "current#2" }), /^block 0 lines 1-5/);
+  assert.match(await call("read_node", { node: "current#2" }), /^node 2 · leaf/);
+  assert.match(await call("read_lines", { node: "current#0" }), /node current#0 is a branch; read_node \{"node": "current#0"\}/);
+  assert.match(await call("read_lines", { node: "current#99" }), /no node 99 in tree current/);
+  assert.ok(!state.urls.some((u) => u.startsWith("/memtree/current.json")), "never the session-less current.json");
+  assert.equal(state.pageFetches, 1, "the current page, fetched once");
+});
+
 test("MCP handler: initialize, tools/list, tools/call results and errors", async () => {
   const tree = { get: async () => index() };
   const init = await handleMcpMessage(
