@@ -152,7 +152,8 @@ export const MEMTREE_TOOLS = [
       "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
       "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
-      "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail).",
+      "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
+      "Results show when the messages were written.",
     inputSchema: {
       type: "object",
       properties: {
@@ -172,7 +173,8 @@ export const MEMTREE_TOOLS = [
     name: "read_node",
     description:
       "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
-      "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree.",
+      "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
+      "Results show when the messages were written.",
     inputSchema: {
       type: "object",
       properties: {
@@ -189,7 +191,8 @@ export const MEMTREE_TOOLS = [
       `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped. ` +
       "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
       "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
-      "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole.",
+      "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole. " +
+      "Results show when the messages were written.",
     inputSchema: {
       type: "object",
       properties: {

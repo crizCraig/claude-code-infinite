@@ -10,7 +10,19 @@
  * Search is plain lexical matching: query terms, case-insensitive substring,
  * ranked by how many distinct terms a node covers, then how many one line
  * covers, then total hits. No embeddings and no server calls.
+ *
+ * Nodes, hits and read lines are dated by when their messages were written
+ * (the page's `block_times`, memtree-times.ts) when the tree has times.
  */
+import {
+  blockTimes,
+  bracketedSpan,
+  formatTime,
+  formatTimeSpan,
+  mergeSpans,
+  timeSpan,
+  type TimeSpan,
+} from "./memtree-times.js";
 
 export interface MemtreeNode {
   id: number;
@@ -43,6 +55,10 @@ export class MemtreeIndex {
   readonly nodes = new Map<number, MemtreeNode>();
   readonly parent = new Map<number, number>();
   readonly depth = new Map<number, number>();
+  /** Block -> when its messages were written; empty for trees without times. */
+  readonly blockSpans: Map<number, TimeSpan>;
+  /** Node -> its span: a leaf's block's, a branch's merged over its subtree. */
+  readonly times = new Map<number, TimeSpan>();
   private readonly lines: string[][];
   private readonly lowerLines: string[][];
 
@@ -52,11 +68,13 @@ export class MemtreeIndex {
     }
     // Breadth-first from the root; a node reached twice keeps its first
     // (shallowest) parent, so a malformed tree cannot loop.
+    const order: number[] = [];
     if (this.nodes.has(0)) {
       this.depth.set(0, 0);
       const queue = [0];
       while (queue.length) {
         const id = queue.shift()!;
+        order.push(id);
         for (const child of this.nodes.get(id)?.k ?? []) {
           if (this.depth.has(child) || !this.nodes.has(child)) continue;
           this.parent.set(child, id);
@@ -67,6 +85,21 @@ export class MemtreeIndex {
     }
     this.lines = (page.blocks ?? []).map(splitLines);
     this.lowerLines = this.lines.map((block) => block.map((line) => line.toLowerCase()));
+    this.blockSpans = blockTimes(page.block_times);
+    if (this.blockSpans.size) this.spanNodes(order);
+  }
+
+  /** Leaves take their block's span; then each span merges into its parent's, children first. */
+  private spanNodes(order: number[]): void {
+    for (const node of this.nodes.values()) {
+      const span = this.isLeaf(node) ? this.blockSpans.get(node.l![0]) : undefined;
+      if (span) this.times.set(node.id, span);
+    }
+    for (const id of order.reverse()) {
+      const span = this.times.get(id);
+      const parent = this.parent.get(id);
+      if (span && parent !== undefined) this.times.set(parent, mergeSpans(this.times.get(parent), span));
+    }
   }
 
   get blockCount(): number {
@@ -162,6 +195,7 @@ export class MemtreeIndex {
         text: snippet(this.lines[range!.block][line - 1], terms),
       }));
 
+    const times = this.times.get(node.id);
     return {
       id: node.id,
       depth: this.depth.get(node.id),
@@ -171,6 +205,7 @@ export class MemtreeIndex {
       lineHits: lineMatches.length,
       score,
       ...(range ? { range } : {}),
+      ...(times ? { times } : {}),
       snippets,
     };
   }
@@ -202,6 +237,8 @@ export interface SearchHit {
   address?: string;
   /** Ancestors, root first (servers that address hits). */
   path?: { id: number; summary: string }[];
+  /** When the node's messages were written, `[earliest, latest]` UTC. */
+  times?: TimeSpan;
 }
 
 /** A node address, `<tree>#<node id>` (search hits carry them). */
@@ -307,6 +344,7 @@ export function serverSearchHits(body: unknown): { hits: SearchHit[]; terms: str
       snippets: Array.isArray(raw.snippets) ? (raw.snippets as SearchHit["snippets"]) : [],
       ...(typeof raw.address === "string" ? { address: raw.address } : {}),
       ...(Array.isArray(raw.path) ? { path: raw.path as SearchHit["path"] } : {}),
+      ...(timeSpan(raw.times) ? { times: timeSpan(raw.times) } : {}),
     });
   }
   return { hits, terms: (json.terms as unknown[]).map(String) };
@@ -334,6 +372,7 @@ export function formatSearchHits(
       hit.leaf ? "leaf" : "branch",
       hit.depth !== undefined ? `depth ${hit.depth}` : undefined,
       hit.range ? `block ${hit.range.block} lines ${hit.range.start}-${hit.range.end}` : undefined,
+      formatTimeSpan(hit.times),
       `matched ${hit.matchedTerms.join(", ")}`,
       hit.leaf ? `${hit.lineHits} matching line${hit.lineHits === 1 ? "" : "s"}` : undefined,
     ]
@@ -366,7 +405,8 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
   }
   const out = [
     `node ${id} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
-      (index.depth.has(id) ? ` · depth ${index.depth.get(id)}` : ""),
+      (index.depth.has(id) ? ` · depth ${index.depth.get(id)}` : "") +
+      bracketedSpan(index.times.get(id)),
     `summary: ${node.s ?? ""}`,
   ];
   if (index.isLeaf(node)) {
@@ -384,14 +424,30 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
   }
   const children = (node.k ?? []).filter((child) => index.nodes.has(child));
   if (children.length) {
-    out.push("", `children (${children.length}):`);
+    const dated = childrenDiffer(index, id, children);
+    const same = !dated && index.times.has(id) ? ", same time" : "";
+    out.push("", `children (${children.length}${same}):`);
     for (const child of children) {
       const c = index.nodes.get(child)!;
       const tag = index.isLeaf(c) ? `leaf, block ${c.l![0]} lines ${c.l![1]}-${c.l![2]}` : "branch";
-      out.push(`  node ${child} (${tag}): ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
+      const when = dated ? bracketedSpan(index.times.get(child)) : "";
+      out.push(`  node ${child} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
     }
   }
   return out.join("\n");
+}
+
+/**
+ * Whether the children's times say more than the node's own: when every child
+ * spans exactly the node's time (one block), the header already says it.
+ */
+function childrenDiffer(index: MemtreeIndex, id: number, children: number[]): boolean {
+  const own = index.times.get(id);
+  if (!own) return false;
+  return children.some((child) => {
+    const span = index.times.get(child);
+    return !span || span[0] !== own[0] || span[1] !== own[1];
+  });
 }
 
 export function formatLines(
@@ -457,7 +513,7 @@ export function formatLines(
         `continue with read_lines {${treeArg(tree)}"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`
     );
   }
-  const header = `block ${block} lines ${start}-${shown} (line number, tab, exact text):`;
+  const header = `block ${block}${bracketedSpan(index.blockSpans.get(block))} lines ${start}-${shown} (line number, tab, exact text):`;
   return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
 }
 
@@ -508,7 +564,7 @@ export function formatTailHits(hits: TailHit[], tree?: string): string[] {
   if (!hits.length) return [];
   const out = ["", `Also in the newest messages, which no tree covers yet (${hits.length}):`];
   for (const hit of hits) {
-    const head = [`message ${hit.i}`, hit.k, hit.at, `matched ${hit.matched_terms.join(", ")}`]
+    const head = [`message ${hit.i}`, hit.k, formatTime(hit.at) ?? hit.at, `matched ${hit.matched_terms.join(", ")}`]
       .filter(Boolean)
       .join(" · ");
     out.push("", `[${head}]`);
@@ -544,7 +600,8 @@ export function formatTail(body: unknown, tree?: string): string {
   for (const m of messages) {
     const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
     const cut = m.shortened ? " · shortened" : "";
-    out.push("", `[${m.i}] ${m.k ?? "message"}${m.at ? ` · ${m.at}` : ""}${state}${cut}`, m.x ?? "");
+    const at = m.at ? ` · ${formatTime(m.at) ?? m.at}` : "";
+    out.push("", `[${m.i}] ${m.k ?? "message"}${at}${state}${cut}`, m.x ?? "");
   }
   const notes: string[] = [];
   const shortened = messages.filter((m) => m.shortened);

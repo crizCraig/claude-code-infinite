@@ -10,7 +10,11 @@
  * Search is plain lexical matching: query terms, case-insensitive substring,
  * ranked by how many distinct terms a node covers, then how many one line
  * covers, then total hits. No embeddings and no server calls.
+ *
+ * Nodes, hits and read lines are dated by when their messages were written
+ * (the page's `block_times`, memtree-times.ts) when the tree has times.
  */
+import { type TimeSpan } from "./memtree-times.js";
 export interface MemtreeNode {
     id: number;
     s?: string;
@@ -37,9 +41,15 @@ export declare class MemtreeIndex {
     readonly nodes: Map<number, MemtreeNode>;
     readonly parent: Map<number, number>;
     readonly depth: Map<number, number>;
+    /** Block -> when its messages were written; empty for trees without times. */
+    readonly blockSpans: Map<number, TimeSpan>;
+    /** Node -> its span: a leaf's block's, a branch's merged over its subtree. */
+    readonly times: Map<number, TimeSpan>;
     private readonly lines;
     private readonly lowerLines;
     constructor(page: MemtreePageJson);
+    /** Leaves take their block's span; then each span merges into its parent's, children first. */
+    private spanNodes;
     get blockCount(): number;
     blockLines(block: number): string[] | undefined;
     /** Root first, the node's parent last. */
@@ -74,6 +84,8 @@ export interface SearchHit {
         id: number;
         summary: string;
     }[];
+    /** When the node's messages were written, `[earliest, latest]` UTC. */
+    times?: TimeSpan;
 }
 /** A node address, `<tree>#<node id>` (search hits carry them). */
 export declare function parseNodeAddress(value: unknown): {
