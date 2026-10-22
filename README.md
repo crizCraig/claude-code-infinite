@@ -224,6 +224,26 @@ Claude Code ──▶ localhost proxy (ccc)
 - Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted. While MemTree is paused (usage limit reached), a request that still fits the model's context window (by Anthropic's token count, or ccc's conservative estimate when counting is unavailable) goes out unchanged, as plain Claude Code would send it, and once the session reaches the compression budget the paused notice suggests Claude Code's own `/compact` while it still fits. A request that no longer fits is refused at once with "MemTree is paused (usage limit reached), so this long conversation can't be compressed…", your subscribe link, and `/clear` to start fresh (`/memtree-compact` needs MemTree, so it is not offered then). After you subscribe, the next request compresses again with no restart.
 
+### How we handle secrets
+
+Coding sessions often contain keys and passwords: a `.env` file Claude read, a connection
+string in a log. `ccc` sends the conversation to MemTree as Claude Code wrote it, and MemTree
+scans it on the server for common secret formats (provider API keys such as `sk-…`, `AKIA…`,
+`ghp_…`, JWTs, private key blocks, passwords in connection URLs, and values assigned to names
+like `PASSWORD=` or `api_key:`). Each match is replaced with `[REDACTED:<kind>]` before the
+text is indexed or embedded, and in everything MemTree shows: summaries, search, transcript
+lines, `ccc`'s memory tools, downloads and shared links.
+
+- We can't catch every secret: a random string with no label, an unusual key format, a secret
+  split across messages, or one in a screenshot is not detected.
+- The messages are kept as sent so MemTree can build and check your tree; detected secrets are
+  masked whenever any of it is shown. The recent part of the conversation reaches the model as
+  Claude Code sent it.
+- Shares: a summaries-only share shows no transcript; a full share shows the transcript with
+  detected secrets masked, and images as they are. Widening a share to full asks you to
+  confirm.
+- Don't paste secrets into a session, and rotate any key or password you have.
+
 ### Diagnostics
 
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
