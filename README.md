@@ -418,10 +418,12 @@ to sign in, then run
 ### "Credit balance too low"
 
 `ccc` isn't free Claude: it runs your own Claude Code with your own Anthropic login. When
-Anthropic answers "credit balance too low", Claude Code is billing an API key or an
-Anthropic Console account (API usage billing) with no credit, and `ccc` says so as it exits.
-Sign in with a Claude Pro or Max plan: run `claude`, `/logout`, then `/login` and choose
-"Claude account with subscription" (not "Anthropic Console account"). Or add credit.
+Anthropic answers "credit balance too low", Claude Code is billing an API key, an
+Anthropic Console account (API usage billing) or a Claude account without a paid plan, and
+that balance is empty. `ccc` says so as it exits, and again before the first prompt of the
+next launch until a request goes through. Sign in with a Claude Pro or Max plan: run
+`claude`, `/logout`, then `/login` and choose "Claude account with subscription" (not
+"Anthropic Console account"). Or add credit.
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and an `apiKeyHelper` setting beat `/login`:
 with one of them set, Claude Code bills that key even when you're signed in with a plan.

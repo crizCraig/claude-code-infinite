@@ -129,10 +129,10 @@ import {
   envApiKeySet,
 } from "./claude-auth.js";
 import {
+  CreditRefusalMemory,
   creditAdviceApplies,
   isInfoOnlyRun,
-  printApiKeyOverrideWarning,
-  printNoPlanWarning,
+  printStartupSignInLines,
   readSeenClaudeAuth,
   writeSeenClaudeAuth,
 } from "./claude-plan-warning.js";
@@ -554,13 +554,18 @@ async function main() {
   let creditTooLow = false;
   // An API key that beats the user's `/login` (claude-auth.ts), by source name only.
   const keyOverride = apiKeyOverride({ readFile, interactive: interactiveUi });
+  // A refusal is also remembered for the next launch's startup line, until
+  // Anthropic answers a request (claude-plan-warning.ts CREDIT_REFUSED_FILE).
+  const creditMemory = new CreditRefusalMemory(getConfigDir());
   const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
-    if (creditAdviceApplies(auth, claudeSignIn.plan)) creditTooLow = true;
+    if (!creditAdviceApplies(auth, claudeSignIn.plan)) return;
+    creditTooLow = true;
+    creditMemory.refused();
   }, (auth) => {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
     claudeSignIn.seen = auth;
-  });
+  }, () => creditMemory.answered());
 
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
   // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
@@ -649,12 +654,14 @@ async function main() {
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
   // On an API key or not signed in: one line before the first prompt (stderr).
   const stderrColor = process.stderr.isTTY === true && terminalSupportsColor();
-  if (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn, stderrColor)) {
+  // An earlier session's credit refusal (its advice, in place of the no-plan
+  // line), else the no-plan line; then a subscriber whose env or settings make
+  // Claude Code bill an API key instead.
+  if (!isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
+    refused: creditMemory.refusedAtStart, plan: claudeSignIn.plan, signIn: claudeSignIn,
+    override: keyOverride, color: stderrColor,
+  })) {
     diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
-  }
-  // A subscriber whose env or settings make Claude Code bill an API key instead.
-  if (!isInfoOnlyRun(claudeArgs)) {
-    printApiKeyOverrideWarning(keyOverride, claudeSignIn.subscriptionLogin, stderrColor);
   }
   reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
   // The first request after a resume must count the whole session's thinking.
