@@ -410,8 +410,11 @@ export function formatLines(
   }
   const lines = index.blockLines(block);
   if (!lines) {
+    // A just-built tree whose transcript is still uploading: say so, not just "no block".
+    const pending = index.page.blocks_pending === true && typeof index.page.source_note === "string"
+      ? ` (${index.page.source_note})` : "";
     throw new ToolInputError(
-      `read_lines: no block ${block} (blocks 0-${index.blockCount - 1})`
+      `read_lines: no block ${block} (blocks 0-${index.blockCount - 1})${pending}`
     );
   }
   if (start < 1) throw new ToolInputError("read_lines: start is 1-based and must be at least 1");
