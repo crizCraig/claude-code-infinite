@@ -13,6 +13,7 @@
  * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
+import { formatTime, formatTimeSpan } from "./memtree-times.js";
 import { ToolInputError } from "./memtree-tools.js";
 export const SESSIONS_DEFAULT_LIMIT = 20;
 export const SESSIONS_MAX_LIMIT = 100;
@@ -157,6 +158,7 @@ function formatHit(hit, n) {
         hit.tree?.created_at ? `tree ${tree} of ${shortTime(hit.tree.created_at)}` : `tree ${tree}`,
         hit.leaf ? `leaf ${hit.leaf}` : undefined,
         range ? `block ${range.block} lines ${range.start}-${range.end}` : undefined,
+        formatTimeSpan(hit.times),
         typeof hit.score === "number" ? `score ${hit.score.toFixed(3)}` : undefined,
     ]
         .filter(Boolean)
@@ -216,7 +218,6 @@ function projectLabel(project) {
     const at = [project.branch, project.commit ? `@ ${project.commit}` : undefined].filter(Boolean).join(" ");
     return [where || project.dir, at].filter(Boolean).join(" · ") || undefined;
 }
-/** `2026-09-29T01:40:57.018000+00:00` → `2026-09-29 01:40 UTC`. */
 /** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
 export function endingLines(ending) {
     if (!ending)
@@ -234,13 +235,11 @@ export function endingLines(ending) {
         lines.push(`${lines.length ? "      then" : head} ${after.join("; ")}`);
     return lines;
 }
+/** `2026-09-29T01:40:57.018000+00:00` → `2026-09-28 18:40 PT` (local zone; UTC labelled). */
 function shortTime(value) {
     if (!value)
         return undefined;
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime()))
-        return value;
-    return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+    return formatTime(value) ?? value;
 }
 function oneLine(text, max) {
     const flat = (text ?? "").replace(/\s+/g, " ").trim();

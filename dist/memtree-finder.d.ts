@@ -72,6 +72,8 @@ export interface FinderHit {
         id: number;
         summary: string;
     }[];
+    /** When the hit's messages were written, `[earliest, latest]` UTC (servers with block times). */
+    times?: unknown;
 }
 export interface FinderSessionsResponse {
     sessions?: FinderSession[];
@@ -104,7 +106,6 @@ export declare function formatPath(path: {
     id: number;
     summary: string;
 }[], ref?: string): string;
-/** `2026-09-29T01:40:57.018000+00:00` → `2026-09-29 01:40 UTC`. */
 /** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
 export declare function endingLines(ending: FinderSessionEnding | null | undefined): string[];
 //# sourceMappingURL=memtree-finder.d.ts.map

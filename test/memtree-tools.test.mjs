@@ -34,6 +34,11 @@ import {
   withMemtreeMcpArgs,
 } from "../dist/memtree-mcp-config.js";
 
+import { setDisplayTimeZone } from "../dist/memtree-times.js";
+
+// Times are shown in the local zone: pin it so the expected text is fixed.
+setDisplayTimeZone("UTC");
+
 const PAGE = JSON.parse(
   fs.readFileSync(new URL("./fixtures/memtree-page.json", import.meta.url), "utf-8")
 );
@@ -279,7 +284,7 @@ test("read_lines {tail: true} reads the un-indexed messages fresh from the serve
   assert.match(text, /^After this tree: messages 2051-2052 of the conversation's newest record/);
   assert.match(text, /no tree covers it yet/, "older servers send no not_indexed_from");
   assert.match(text, /\[2052\] assistant\nPR #42 opened/);
-  assert.match(text, /\[2051\] user · 2026-10-06T01:00:00Z\nopen the PR/);
+  assert.match(text, /\[2051\] user · 2026-10-06 01:00 UTC\nopen the PR/);
   assert.match(text, /earlier: read_lines \{"tail": true, "end": 2050\}/);
   assert.equal(urls.at(-1), "/memtree/aaa111/messages", "no range: the server's newest messages");
   await call({ tail: true, start: 2050, end: 2051 });
@@ -445,6 +450,51 @@ test("CurrentTree caches immutable pinned served trees", async () => {
     assert.equal(await tree.get(ref), first, "a pinned served tree cannot switch to the own tree");
     assert.equal(state.pageFetches, 1);
   }
+});
+
+test("CurrentTree refetches a page whose transcript blocks are still uploading", async () => {
+  for (const id of [undefined, "ea18af90-658b-485f-ad71-063e0ca5e724-v1-served"]) {
+    const path = `/memtree/${id ?? "aaa111"}.json`;
+    const pending = { ...PAGE, session_id: "session-1", blocks: [], blocks_pending: true,
+      source_note: "This tree was just built and its transcript is still uploading" };
+    const state = { urls: [], pageFetches: 0, current: "aaa111", pages: { [path]: pending } };
+    let clock = 0;
+    const tree = new CurrentTree({
+      proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", now: () => clock, fetch: fakeProxyFetch(state),
+    });
+    assert.throws(() => formatLines(new MemtreeIndex(pending), 0, 1, 1),
+      /no transcript blocks \(This tree was just built/, "the note says what to do");
+    const partial = new MemtreeIndex({ ...pending, blocks: [PAGE.blocks[0]] });
+    assert.throws(() => formatLines(partial, 1, 1, 1), /no block 1 \(blocks 0-0\) \(This tree was just built/,
+      "a block not uploaded yet says so too");
+    const hole = new MemtreeIndex({ ...pending, blocks: [PAGE.blocks[0], "", PAGE.blocks[0]] });
+    assert.throws(() => formatLines(hole, 1, 1, 1), /block 1 is not readable yet \(This tree was just built/,
+      "an interior block not uploaded yet too");
+    assert.throws(() => formatLines(new MemtreeIndex({ ...PAGE, blocks: [PAGE.blocks[0]] }), 1, 1, 1),
+      /no block 1 \(blocks 0-0\)$/, "no note on a finished page");
+    await tree.get(id);
+    state.pages[path] = { ...PAGE, session_id: "session-1", ...(id ? { served_prefix: true, ref: id } : {}) };
+    clock += 45_001;
+    const uploaded = await tree.get(id);
+    assert.equal(uploaded.blockCount, PAGE.blocks.length, `${id ?? "current"}: the blocks are read once uploaded`);
+    assert.equal(await tree.get(id), uploaded, "then cached");
+    assert.equal(state.pageFetches, 2);
+  }
+});
+
+test("read_lines and read_node take current#N as this session's current tree", async () => {
+  const state = { urls: [], pageFetches: 0, current: "aaa111",
+    pages: { "/memtree/aaa111.json": { ...PAGE, session_id: "session-1" } } };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", fetch: fakeProxyFetch(state) });
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree))
+      .result.content[0].text;
+  assert.match(await call("read_lines", { node: "current#2" }), /^block 0 lines 1-5/);
+  assert.match(await call("read_node", { node: "current#2" }), /^node 2 · leaf/);
+  assert.match(await call("read_lines", { node: "current#0" }), /node current#0 is a branch; read_node \{"node": "current#0"\}/);
+  assert.match(await call("read_lines", { node: "current#99" }), /no node 99 in tree current/);
+  assert.ok(!state.urls.some((u) => u.startsWith("/memtree/current.json")), "never the session-less current.json");
+  assert.equal(state.pageFetches, 1, "the current page, fetched once");
 });
 
 test("MCP handler: initialize, tools/list, tools/call results and errors", async () => {
@@ -875,7 +925,7 @@ test("tree search lists matching newest messages no tree covers yet", async () =
   const local = serverSearchHits(body);
   const text = formatSearchHits(local.hits, "pr", local.terms, "r1-v1-own", tailHits);
   assert.match(text, /Also in the newest messages, which no tree covers yet \(1\):/);
-  assert.match(text, /\[message 2051 · assistant · 2026-10-06T01:00:00Z · matched pr\]\n  L1: PR #42 opened/);
+  assert.match(text, /\[message 2051 · assistant · 2026-10-06 01:00 UTC · matched pr\]\n  L1: PR #42 opened/);
   assert.match(text, /read_lines \{"tree": "r1-v1-own", "tail": true, "start": <message>, "end": <message>\}/);
   const onlyTail = formatSearchHits([], "pr", ["pr"], undefined, tailHits);
   assert.match(onlyTail, /^No node of the tree matches "pr"/);
@@ -896,4 +946,76 @@ test("list shows how each session ended", () => {
   assert.match(text, /\n    ended: tools Read/);
   const list = MEMTREE_TOOLS.find((t) => t.name === "list");
   assert.match(list.description, /how it ended/);
+});
+
+const TIMED = {
+  ...PAGE,
+  block_times: { "0": ["2026-09-30T21:02:00.000Z", "2026-09-30T21:10:00.000Z"],
+    "1": ["2026-09-30T21:20:00.000Z", "2026-09-30T21:40:00.000Z"] },
+};
+
+/** Run ``fn`` with times shown in ``zone``. */
+function inZone(zone, fn) {
+  setDisplayTimeZone(zone);
+  try {
+    return fn();
+  } finally {
+    setDisplayTimeZone("UTC");
+  }
+}
+
+test("read_node dates the node and each child by when its messages were written", () => {
+  inZone("America/Los_Angeles", () => {
+    const timed = new MemtreeIndex(TIMED);
+    const root = formatNode(timed, 0);
+    assert.match(root, /^node 0 · branch · depth 0 \[2026-09-30 14:02–14:40 PT\]\n/);
+    assert.match(root, /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy pipeline/);
+    assert.match(root, /\n  node 4 \(branch\) \[2026-09-30 14:20–14:40 PT\]: Migration/);
+    // Children all written when the node was (one block): the header says it once.
+    assert.match(formatNode(timed, 1), /\nchildren \(2, same time as the node\):\n  node 2 \(leaf, block 0 lines 1-5\): User asks/);
+    const mixed = new MemtreeIndex({ ...TIMED, block_times: { "0": TIMED.block_times["0"] } });
+    assert.match(formatNode(mixed, 0), /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy[^\n]*\n  node 4 \(branch\): Migration/);
+    assert.match(formatNode(timed, 5), /^node 5 · leaf · depth 2 \[2026-09-30 14:20–14:40 PT\]\n/);
+    // A detached branch (no span of its own) still shows its children's.
+    const detached = new MemtreeIndex({ ...TIMED, nodes: [...TIMED.nodes, { id: 7, s: "loose", k: [8] },
+      { id: 8, s: "loose leaf", k: [], l: [1, 1, 2] }] });
+    assert.match(formatNode(detached, 7), /\n  node 8 \(leaf, block 1 lines 1-2\) \[2026-09-30 14:20–14:40 PT\]: loose leaf/);
+    // An old tree (no block_times): exactly as before.
+    assert.doesNotMatch(formatNode(index(), 0) + formatNode(index(), 1), /\[20/);
+  });
+});
+
+test("read_lines dates its block in the header", () => {
+  inZone("America/Los_Angeles", () => {
+    const timed = new MemtreeIndex(TIMED);
+    assert.match(formatLines(timed, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2 \(line number, tab, exact text\):\n/);
+    assert.match(formatLines(index(), 1, 1, 2), /^block 1 lines 1-2 \(line number/);
+  });
+});
+
+test("search hits are dated: local search, the server's tree search and search across sessions", () => {
+  inZone("America/Los_Angeles", () => {
+    const local = formatSearch(new MemtreeIndex(TIMED), "migration");
+    assert.match(local, /\[node 5 · leaf · depth 2 · block 1 lines 1-6 · 2026-09-30 14:20–14:40 PT · matched migration/);
+    assert.doesNotMatch(formatSearch(index(), "migration"), / PT /);
+    const body = { terms: ["pr"], hits: [
+      { id: 5, leaf: true, summary: "s", times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:40:00.000Z"] },
+      { id: 6, leaf: true, summary: "t", times: ["bad"] }] };
+    const parsed = serverSearchHits(body);
+    const text = formatSearchHits(parsed.hits, "pr", parsed.terms);
+    assert.match(text, /\[node 5 · leaf · 2026-09-30 14:20–14:40 PT · matched/);
+    assert.match(text, /\[node 6 · leaf · matched/);
+    const across = formatSearchResults({ hits: [
+      { id: "s1", kind: "claude_code_session", session_id: "s1", tree: { request_id: "r1", created_at: "2026-09-30T22:00:00Z" },
+        range: { block: 1, start: 1, end: 6 }, times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:40:00.000Z"] },
+      { id: "s2", tree: { request_id: "r2" }, range: { block: 0, start: 1, end: 2 } }] }, { query: "x" });
+    assert.match(across, /\[1\] session s1 · tree r1 of 2026-09-30 15:00 PT · block 1 lines 1-6 · 2026-09-30 14:20–14:40 PT\n/);
+    assert.match(across, /\[2\] session s2 · tree r2 · block 0 lines 1-2\n/);
+  });
+});
+
+test("tool descriptions say results show when the messages were written", () => {
+  for (const name of ["search", "read_node", "read_lines"]) {
+    assert.match(MEMTREE_TOOLS.find((t) => t.name === name).description, /[Rr]esults show when the messages were written/, name);
+  }
 });

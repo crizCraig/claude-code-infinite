@@ -116,7 +116,8 @@ export const MEMTREE_TOOLS = [
             "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
             "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
-            "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail).",
+            "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
+            "Results show when the messages were written (per transcript block).",
         inputSchema: {
             type: "object",
             properties: {
@@ -135,7 +136,8 @@ export const MEMTREE_TOOLS = [
     {
         name: "read_node",
         description: "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
-            "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree.",
+            "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
+            "Results show when the messages were written (per transcript block).",
         inputSchema: {
             type: "object",
             properties: {
@@ -151,7 +153,8 @@ export const MEMTREE_TOOLS = [
             `At most ${READ_LINES_MAX_LINES} lines / ${READ_LINES_MAX_CHARS} characters per call; the reply says where to continue when capped. ` +
             "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
             "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
-            "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole.",
+            "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole. " +
+            "Results show when the messages were written (per transcript block).",
         inputSchema: {
             type: "object",
             properties: {
@@ -464,8 +467,14 @@ export class CurrentTree {
         return new ToolInputError(`This MemTree page is a temporary prefix while newer messages are indexing; try again in ${seconds} second${seconds === 1 ? "" : "s"}.`);
     }
 }
-/** A served prefix that may later switch to the request's own tree (a pinned ref never does). */
+/**
+ * A page that may still change: a served prefix that may later switch to the request's
+ * own tree (a pinned ref never does), or any page whose transcript blocks are still
+ * uploading (`blocks_pending`: the tree was just built), so a retry can read them.
+ */
 function isTemporaryPrefix(index, id) {
+    if (index.page.blocks_pending === true)
+        return true;
     return index.page.served_prefix === true && index.page.ref !== id;
 }
 export class SessionFinder {
@@ -611,7 +620,7 @@ async function searchTool(args, tree, finder) {
 function nodeTarget(args, field) {
     if (args.node !== undefined && args.node !== null && args.node !== "") {
         const { tree, id } = parseNodeAddress(args.node);
-        return { tree: checkTreeId(tree), id };
+        return { tree: treeArgument(tree), id };
     }
     return { tree: treeArgument(args.tree), id: Number(args[field]) };
 }
@@ -640,10 +649,11 @@ async function readLinesTool(args, tree) {
     const { tree: ref, id } = nodeTarget(args, "id");
     const index = await tree.get(ref);
     const node = index.nodes.get(id);
+    const label = ref ?? CURRENT_TREE;
     if (!node)
-        throw new ToolInputError(`read_lines: no node ${id} in tree ${ref}`);
+        throw new ToolInputError(`read_lines: no node ${id} in tree ${label}`);
     if (!index.isLeaf(node)) {
-        throw new ToolInputError(`read_lines: node ${ref}#${id} is a branch; read_node {"node": "${ref}#${id}"} lists the leaves under it`);
+        throw new ToolInputError(`read_lines: node ${label}#${id} is a branch; read_node {"node": "${label}#${id}"} lists the leaves under it`);
     }
     const [block, start, end] = node.l;
     const pick = (v, fallback) => (v === undefined || v === null ? fallback : Number(v));
