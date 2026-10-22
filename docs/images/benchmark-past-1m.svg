@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="398" viewBox="0 0 700 398" font-family="'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-label="Judged score out of 100: MemTree 70, /compact 23">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#121119"/><stop offset="1" stop-color="#1b1a24"/></linearGradient>
+<radialGradient id="glow" cx="0.3" cy="0.45" r="0.6">
+<stop offset="0" stop-color="#4ade80" stop-opacity="0.06"/>
+<stop offset="1" stop-color="#4ade80" stop-opacity="0"/></radialGradient>
+<linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#93e9a8"/><stop offset="1" stop-color="#5cc86a"/></linearGradient>
+<linearGradient id="gray" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#5a5c6a" stop-opacity="0.85"/>
+<stop offset="1" stop-color="#3a3b46" stop-opacity="0.85"/></linearGradient>
+<filter id="blur" x="-30%" y="-30%" width="160%" height="160%">
+<feGaussianBlur stdDeviation="12"/></filter>
+<style>@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&amp;display=swap');</style>
+</defs>
+<rect width="700" height="398" fill="url(#bg)"/>
+<rect width="700" height="398" fill="url(#glow)"/>
+<text x="382" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">Past the context window</text>
+<text x="382" y="54" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.6)">1.15M-token session, mean of 3 rounds</text>
+<text transform="translate(22 196) rotate(-90)" text-anchor="middle" font-size="11" font-weight="600" letter-spacing="0.5" fill="rgba(255,255,255,0.55)">Score</text>
+<line x1="92" y1="300" x2="672" y2="300" stroke="rgba(255,255,255,0.22)"/>
+<text x="82" y="304" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">0%</text>
+<line x1="92" y1="258.4" x2="672" y2="258.4" stroke="rgba(255,255,255,0.06)"/>
+<text x="82" y="262.4" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">20%</text>
+<line x1="92" y1="216.8" x2="672" y2="216.8" stroke="rgba(255,255,255,0.06)"/>
+<text x="82" y="220.8" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">40%</text>
+<line x1="92" y1="175.2" x2="672" y2="175.2" stroke="rgba(255,255,255,0.06)"/>
+<text x="82" y="179.2" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">60%</text>
+<line x1="92" y1="133.6" x2="672" y2="133.6" stroke="rgba(255,255,255,0.06)"/>
+<text x="82" y="137.6" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">80%</text>
+<line x1="92" y1="92" x2="672" y2="92" stroke="rgba(255,255,255,0.06)"/>
+<text x="82" y="96" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">100%</text>
+<rect x="162" y="154.816" width="150" height="145.184" rx="6" fill="#6ee787" opacity="0.35" filter="url(#blur)"/>
+<path d="M162,300V160.816Q162,154.816 168,154.816H306Q312,154.816 312,160.816V300Z" fill="url(#green)" stroke="none"/>
+<text x="237" y="142.816" text-anchor="middle" font-size="17" font-weight="700" fill="#6ee787">70%</text>
+<text x="237" y="324" text-anchor="middle" font-size="13" font-weight="600" fill="#6ee787">MemTree</text>
+<text x="237" y="260" text-anchor="middle" fill="#0f2a17"><tspan font-family="'SF Mono',Monaco,Menlo,monospace" font-size="16" font-weight="700">8 of 8</tspan><tspan x="237" dy="15" font-size="10">findings addressed</tspan><tspan x="237" dy="13" font-size="10" opacity="0.8">3 fully, 5 partly</tspan></text>
+<path d="M452,300V258.15999999999997Q452,252.16 458,252.16H596Q602,252.16 602,258.15999999999997V300Z" fill="url(#gray)" stroke="rgba(255,255,255,0.10)"/>
+<text x="527" y="240.16" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">23%</text>
+<text x="527" y="324" text-anchor="middle" font-size="13" font-weight="600" fill="rgba(255,255,255,0.9)">/compact</text>
+<text x="527" y="168.16" text-anchor="middle" fill="#fff"><tspan font-family="'SF Mono',Monaco,Menlo,monospace" font-size="16" font-weight="700">0 of 8</tspan><tspan x="527" dy="15" font-size="10">findings addressed</tspan><tspan x="527" dy="13" font-size="10" opacity="0.8">no changes made</tspan></text>
+<rect x="243" y="351" width="214" height="30" rx="15" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.12)"/><text x="350" y="370.5" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.75)">Claude Opus 5.5 · graded blind</text>
+</svg>

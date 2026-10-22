@@ -80,6 +80,48 @@ for MemTree and 38 min for full context. Input tokens count uncached, cache-read
 tokens; `/compact`'s exclude the one-time `/compact` step. This is one task family, one model and
 3 rounds, not a general benchmark.
 
+A rerun on Oct 20, with MemTree's lookup tools loaded and the same outputs graded again at a
+higher reasoning effort, gave the same shape: MemTree 65, full context 66, `/compact` 45.
+MemTree's figure there is the mean of its 2 clean rounds (a harness bug let the third round read
+another round's work); full context still fixed more of the issues (21 vs 17 on average).
+
+## Past the context window: MemTree keeps the work, `/compact` loses it
+
+<p align="center">
+  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 3 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
+</p>
+
+The benchmark above fits inside Claude Opus 5.5's 1M-token window. This one does not. Each setup
+resumes the same 1.15M-token history, built in time order from real Claude Code sessions of our
+own engineering work: the design and implementation of a backend feature, four rounds of code
+review in which an outside reviewer's findings were confirmed and, for several, re-scoped by the
+session, then about 550k tokens of later, unrelated work. The task comes at the end: the commits
+that fixed review rounds 2–4 were lost, so re-implement every fix as the session approved it, each
+with a regression test, in one commit. The findings and decisions exist only in the conversation,
+and the task forbids re-reviewing the code to find them again. An independent grader scored each
+result blind (0–100) against the real fixes, their regression tests and the session's decisions.
+
+| Setup | Score | Findings addressed (of 8) | How it handles the history |
+| --- | --- | --- | --- |
+| **Claude Code Infinite** | **69.8** | **8: 3 fully, 5 partly** | Compressed to ~200–285k on the first turn; looked up the review rounds with its MemTree tools |
+| `/compact` | 23.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
+| Full context | n/a | n/a | Not possible: the history is larger than the 1M-token window |
+
+`/compact` failed because its summary dropped the findings: it recorded the reviews only as
+confirmed reviewer findings, with no finding or decision in it, so there was nothing to fix. Its
+23 points are for reporting that honestly. MemTree recovered all 8 findings from the session's
+memory in every round, fixed 3 fully and 5 partly, and implemented the session's decisions rather
+than the reviewer's original proposals. Round scores were 74.6, 67.6 and 67.1 for MemTree (one
+regression, in the first round) and 23 each for `/compact`.
+
+Caveats: these are the first 3 rounds, with more running; one task, one model, no significance
+claims. Blinding is weak: `/compact` made no changes and its report says it worked from a summary,
+so a grader can tell the setups apart. The same task prompt went to both setups and mentions
+MemTree's lookup tools, which plain Claude Code doesn't have. There is no full-context arm, since
+the history doesn't fit. Grading used a fixed rubric (coverage 30, fix quality 30, fidelity to the
+session's decisions 15, report accuracy 20, process 5); the harness and the answer key stay
+private because they come from a private codebase.
+
 ## Requirements
 
 * **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
