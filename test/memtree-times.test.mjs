@@ -26,9 +26,14 @@ test("time spans: unknown or malformed spans show nothing", () => {
 });
 
 test("an hour apart when clocks go back is still a span, each end labelled when the zone's name changes", () => {
-  assert.equal(formatTimeSpan(["2026-11-01T08:30:00Z", "2026-11-01T09:30:00Z"], PT), "2026-11-01 01:30 PDT–2026-11-01 01:30 PST");
+  assert.equal(formatTimeSpan(["2026-11-01T08:30:00Z", "2026-11-01T09:30:00Z"], PT), "2026-11-01 01:30 PDT–01:30 PST");
+  // Twenty minutes apart, the later one at an earlier clock time: the names keep the order clear.
+  assert.equal(formatTimeSpan(["2026-11-01T08:50:00Z", "2026-11-01T09:10:00Z"], PT), "2026-11-01 01:50 PDT–01:10 PST");
+  assert.equal(formatTime("2026-11-01T08:50:00Z", PT), "2026-11-01 01:50 PDT");
+  assert.equal(formatTime("2026-11-01T09:10:00Z", PT), "2026-11-01 01:10 PST");
+  assert.equal(formatTime("2026-11-01T12:00:00Z", PT), "2026-11-01 04:00 PT", "away from the change: generic");
   assert.equal(formatTimeSpan(["2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z"], "Europe/Berlin"),
-    "2026-10-25 02:30 GMT+2–2026-10-25 02:30 GMT+1");
+    "2026-10-25 02:30 GMT+2–02:30 GMT+1");
   assert.equal(formatTimeSpan(["2026-09-30T21:40:00Z", "2026-09-30T21:02:00Z"], PT), "2026-09-30 14:02–14:40 PT", "reversed: earliest first");
   for (const junk of [["1", "2"], ["2026-09-30T21:02:00", "2026-09-30T21:40:00"], ["2026-09-30", "2026-10-01"]]) {
     assert.equal(formatTimeSpan(junk, PT), undefined, "times need a zone");

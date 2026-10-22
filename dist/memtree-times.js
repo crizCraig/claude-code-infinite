@@ -73,20 +73,29 @@ export function formatTimeSpan(span, zone = localTimeZone()) {
     const [from, to] = valid.map((t) => new Date(t));
     const parts = zoneParts(zone);
     const [start, end] = [parts.format(from), parts.format(to)];
-    const [startLabel, endLabel] = [parts.label(from), parts.label(to)];
+    const [startLabel, endLabel] = [labelAt(parts, from), labelAt(parts, to)];
     // By instant, not by text: when clocks go back, an hour apart can read the same.
     if (Math.floor(from.getTime() / 60_000) === Math.floor(to.getTime() / 60_000)) {
         return `${start} ${startLabel}`;
     }
-    if (start === end) {
-        // The hour clocks went back: the zone's DST names (PDT, PST) tell the two apart.
-        return `${start} ${parts.offsetLabel(from)}–${end} ${parts.offsetLabel(to)}`;
+    if (startLabel !== endLabel) {
+        const tail = start.slice(0, 10) === end.slice(0, 10) ? end.slice(11) : end;
+        return `${start} ${startLabel}–${tail} ${endLabel}`;
     }
-    if (startLabel !== endLabel)
-        return `${start} ${startLabel}–${end} ${endLabel}`;
     if (start.slice(0, 10) === end.slice(0, 10))
         return `${start}–${end.slice(11)} ${endLabel}`;
     return `${start}–${end} ${endLabel}`;
+}
+const HOUR_MS = 3_600_000;
+/**
+ * The zone's name at ``date``: the generic one (`PT`), except within an hour of a
+ * DST change, where the clock repeats or skips and only `PDT` / `PST` say which.
+ */
+function labelAt(parts, date) {
+    const offset = parts.offsetLabel(date);
+    const near = [date.getTime() - HOUR_MS, date.getTime() + HOUR_MS]
+        .some((t) => parts.offsetLabel(new Date(t)) !== offset);
+    return near ? offset : parts.label(date);
 }
 /** One time (`2026-09-30 14:02 PT`), or undefined when it does not parse. */
 export function formatTime(value, zone) {
