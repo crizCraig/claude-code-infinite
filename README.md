@@ -112,7 +112,7 @@ confirmed reviewer findings, with no finding or decision in it, so there was not
 23 points are for reporting that honestly; the same empty diff scored 27 and 31 in two rounds,
 which is grader noise on one rubric item (0 to 8 points for "preserves existing behavior"). MemTree recovered all 8 findings from the
 session's memory in every round, fixed 3 fully and 5 partly every round, and implemented the
-session's decisions rather than the reviewer's original proposals. MemTree's round scores were
+session's decisions rather than the reviewer's original proposals. Before writing any code, it searched its tree for the review rounds and read about 400 lines of the original exchange word for word with `read_lines`. MemTree's round scores were
 74.6, 67.6, 67.1, 69.4, 68.1 and 72.6, with 5 regressions charged across the 6 rounds.
 
 Caveats: 6 rounds, one task, one model, one grader; no significance claims. Blinding is weak: `/compact` made no changes and its report says it worked from a summary,
