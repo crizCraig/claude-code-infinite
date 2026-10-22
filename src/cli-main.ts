@@ -129,9 +129,13 @@ import {
   envApiKeySet,
 } from "./claude-auth.js";
 import {
+  clearCreditRefused,
   creditAdviceApplies,
+  creditRefusedOnFile,
   isInfoOnlyRun,
+  markCreditRefused,
   printApiKeyOverrideWarning,
+  printCreditReminder,
   printNoPlanWarning,
   readSeenClaudeAuth,
   writeSeenClaudeAuth,
@@ -554,12 +558,21 @@ async function main() {
   let creditTooLow = false;
   // An API key that beats the user's `/login` (claude-auth.ts), by source name only.
   const keyOverride = apiKeyOverride({ readFile, interactive: interactiveUi });
+  // A refusal is also remembered for the next launch's startup line, until
+  // Anthropic answers a request (claude-plan-warning.ts CREDIT_REFUSED_FILE).
+  let creditRefused = creditRefusedOnFile(getConfigDir());
   const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
-    if (creditAdviceApplies(auth, claudeSignIn.plan)) creditTooLow = true;
+    if (!creditAdviceApplies(auth, claudeSignIn.plan)) return;
+    creditTooLow = true;
+    if (!creditRefused) markCreditRefused(getConfigDir());
+    creditRefused = true;
   }, (auth) => {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
     claudeSignIn.seen = auth;
+  }, () => {
+    if (creditRefused) clearCreditRefused(getConfigDir());
+    creditRefused = false;
   });
 
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
@@ -649,7 +662,11 @@ async function main() {
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
   // On an API key or not signed in: one line before the first prompt (stderr).
   const stderrColor = process.stderr.isTTY === true && terminalSupportsColor();
-  if (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn, stderrColor)) {
+  // An earlier session's credit refusal: its advice now, in place of the no-plan line.
+  const reminded = !isInfoOnlyRun(claudeArgs) && printCreditReminder(
+    { refused: creditRefused, plan: claudeSignIn.plan }, stderrColor,
+    keyOverride?.asks ? undefined : keyOverride?.source);
+  if (reminded || (!isInfoOnlyRun(claudeArgs) && printNoPlanWarning(claudeSignIn, stderrColor))) {
     diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
   }
   // A subscriber whose env or settings make Claude Code bill an API key instead.

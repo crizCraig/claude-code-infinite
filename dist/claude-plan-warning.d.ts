@@ -9,6 +9,10 @@
  * line says so instead. A credit refusal gets the plan advice as ccc exits,
  * whatever the sign-in (claude-auth.ts creditNoticeText).
  *
+ * A credit refusal is also remembered (CREDIT_REFUSED_FILE, a bare marker) until
+ * Anthropic answers a request or a paid tier is on record, so the next launch
+ * gives the same advice before the first prompt rather than after it fails.
+ *
  * Which sign-in Claude Code really used is only known from its requests'
  * auth headers (claude-auth.ts claudeAuthFromHeaders). The last one seen is
  * kept as a type name in ccc's config directory so the next launch decides on
@@ -18,6 +22,8 @@ import type { ApiKeyOverride, ApiKeySource, ClaudeAuthType, ClaudePlan } from ".
 export declare const NO_PLAN_TEXT: string;
 /** The file in ccc's config directory holding the last sign-in type Claude Code sent. */
 export declare const SEEN_AUTH_FILE = "claude-auth-seen";
+/** Present while Anthropic's last answer to Claude Code was a credit refusal. */
+export declare const CREDIT_REFUSED_FILE = "claude-credit-refused";
 export interface PlanWarningInput {
     /** From env and Claude Code's config files (claudeAuthFromConfig). */
     auth: ClaudeAuthType;
@@ -54,6 +60,19 @@ export declare function creditAdviceText(color: boolean, source?: ApiKeySource):
  */
 export declare function printApiKeyOverrideWarning(override: ApiKeyOverride | undefined, subscriptionLogin: boolean, color: boolean): boolean;
 export declare function apiKeyOverrideText(override: ApiKeyOverride, color: boolean): string;
+export interface CreditReminderInput {
+    /** A credit refusal is on file from an earlier session (creditRefusedOnFile). */
+    refused: boolean;
+    /** From Claude Code's config files (claudePlanFromConfig). */
+    plan: ClaudePlan;
+}
+/** True when an earlier session was refused for credit and no paid tier is on record yet. */
+export declare function needsCreditReminder(input: CreditReminderInput): boolean;
+/**
+ * The remembered refusal's advice on stderr before the first prompt, when it
+ * applies. Returns whether it was printed.
+ */
+export declare function printCreditReminder(input: CreditReminderInput, color: boolean, source?: ApiKeySource): boolean;
 export declare function noPlanWarningText(color: boolean): string;
 /**
  * The line on stderr when it applies: stdout stays Claude Code's in print
@@ -65,4 +84,9 @@ export declare function printNoPlanWarning(input: PlanWarningInput, color: boole
 export declare function readSeenClaudeAuth(configDir: string): ClaudeAuthType | undefined;
 /** Keep a subscription or API-key sign-in for the next launch; never throws. */
 export declare function writeSeenClaudeAuth(configDir: string, auth: ClaudeAuthType): void;
+/** Remember a credit refusal for the next launch; never throws. */
+export declare function markCreditRefused(configDir: string): void;
+/** Forget a remembered credit refusal; never throws. */
+export declare function clearCreditRefused(configDir: string): void;
+export declare function creditRefusedOnFile(configDir: string): boolean;
 //# sourceMappingURL=claude-plan-warning.d.ts.map

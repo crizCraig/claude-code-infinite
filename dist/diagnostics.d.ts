@@ -98,13 +98,17 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onCreditBalanceTooLow?;
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?;
+    /** Anthropic answered a request (2xx): a remembered credit refusal is stale. */
+    private readonly onUpstreamOk?;
     private firstRequest;
     private firstTurn;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
     /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
     onCreditBalanceTooLow?: ((auth: ClaudeAuthType | undefined) => void) | undefined, 
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
-    onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined);
+    onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined, 
+    /** Anthropic answered a request (2xx): a remembered credit refusal is stale. */
+    onUpstreamOk?: (() => void) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;

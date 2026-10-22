@@ -125,15 +125,15 @@ test("credit advice: Console sign-in, the plan login, and the env variable case"
   const generic = creditNoticeText(false);
   assert.equal(generic,
     "Anthropic refused Claude Code's request: credit balance too low. Claude Code is billing " +
-    "an API key or an Anthropic Console account, not a Claude plan. ccc needs a Pro or Max " +
-    "plan: run `claude`, `/logout`, then `/login` and choose \"Claude account with " +
-    "subscription\". If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it " +
+    "an API key, an Anthropic Console account or a Claude account without a paid plan. ccc " +
+    "needs a Pro or Max plan: run `claude`, `/logout`, then `/login` and choose \"Claude " +
+    "account with subscription\". If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it " +
     "beats `/login`.");
   assert.equal(creditNoticeText(false, "ANTHROPIC_API_KEY"),
     "Anthropic refused Claude Code's request: credit balance too low. Claude Code is billing " +
-    "an API key or an Anthropic Console account, not a Claude plan. ccc needs a Pro or Max " +
-    "plan: run `claude`, `/logout`, then `/login` and choose \"Claude account with " +
-    "subscription\". ANTHROPIC_API_KEY is set, and it beats `/login`: unset it (or run `ccc` " +
+    "an API key, an Anthropic Console account or a Claude account without a paid plan. ccc " +
+    "needs a Pro or Max plan: run `claude`, `/logout`, then `/login` and choose \"Claude " +
+    "account with subscription\". ANTHROPIC_API_KEY is set, and it beats `/login`: unset it (or run `ccc` " +
     "without it).");
   assert.match(creditNoticeText(false, "apiKeyHelper"), /settings set an apiKeyHelper.*remove/);
   assert.match(creditNoticeText(true), /^\x1b\[33m.*\x1b\[39m$/);

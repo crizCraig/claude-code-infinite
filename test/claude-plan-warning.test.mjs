@@ -184,3 +184,71 @@ test("the exit credit advice is for every sign-in type without a paid tier", asy
     assert.equal(creditAdviceApplies(auth, "unknown"), true, String(auth));
   }
 });
+
+// A credit refusal is remembered (as a bare marker) so the next launch says why
+// before the first prompt, instead of after every prompt has failed again: on
+// 2026-10-21, 3 of 4 new users retried several sessions on a sign-in Anthropic
+// refused for no credit (an OAuth token with no paid tier on record).
+test("a credit refusal is remembered for the next launch, and forgotten on success", async () => {
+  const { markCreditRefused, clearCreditRefused, creditRefusedOnFile, CREDIT_REFUSED_FILE } =
+    await import("../dist/claude-plan-warning.js");
+  const dir = mkdtempSync(join(tmpdir(), "ccc-credit-"));
+  assert.equal(creditRefusedOnFile(dir), false);
+  markCreditRefused(dir);
+  assert.equal(creditRefusedOnFile(dir), true);
+  const { readFileSync } = await import("node:fs");
+  assert.equal(readFileSync(join(dir, CREDIT_REFUSED_FILE), "utf8"), "credit_balance_too_low\n");
+  clearCreditRefused(dir);
+  assert.equal(creditRefusedOnFile(dir), false);
+  clearCreditRefused(dir); // already gone: never throws
+  markCreditRefused(join(dir, "no", "such", "dir")); // never throws
+  assert.equal(creditRefusedOnFile(join(dir, "no", "such", "dir")), false);
+});
+
+test("the next launch repeats the credit advice unless a paid tier is now on record", async () => {
+  const { needsCreditReminder } = await import("../dist/claude-plan-warning.js");
+  for (const plan of ["unknown", "free"]) {
+    assert.equal(needsCreditReminder({ refused: true, plan }), true, plan);
+    assert.equal(needsCreditReminder({ refused: false, plan }), false, plan);
+  }
+  for (const plan of ["pro", "max", "max_5x", "max_20x", "team", "enterprise"]) {
+    assert.equal(needsCreditReminder({ refused: true, plan }), false, plan);
+  }
+});
+
+test("the tee reports a request Anthropic answered, so a stale refusal can be forgotten", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-tee-ok-"));
+  const diagnostics = new Diagnostics({
+    baseUrl: "http://127.0.0.1:9", configDir: dir, clientName: "t", clientVersion: "1.0.0",
+    config: {}, env: { CCC_DIAGNOSTICS: "0" },
+  });
+  const ok = [];
+  const sink = new DiagnosticsRequestSink(undefined, diagnostics, undefined, undefined,
+    () => ok.push(true));
+  const rec = (extra) => ({ kind: "messages", turnType: "first-user", ...extra });
+  sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 400,
+                 upstreamError: "credit_balance_too_low" }));
+  sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 429 }));
+  sink.log(rec({ claudeAuth: "subscription" })); // no answer (aborted, network)
+  assert.equal(ok.length, 0);
+  sink.log(rec({ claudeAuth: "subscription", upstreamStatus: 200 }));
+  assert.equal(ok.length, 1);
+});
+
+test("print mode: the credit reminder goes to stderr with the plan advice", () => {
+  const script = [
+    "import { printCreditReminder } from './dist/claude-plan-warning.js';",
+    "printCreditReminder({ refused: true, plan: 'unknown' }, false);",
+    "printCreditReminder({ refused: true, plan: 'pro' }, false);",
+    "printCreditReminder({ refused: false, plan: 'unknown' }, false);",
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8", cwd: new URL("..", import.meta.url),
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "");
+  const lines = r.stderr.trimEnd().split("\n");
+  assert.equal(lines.length, 1, r.stderr);
+  assert.match(lines[0], /^Last time, Anthropic refused/);
+  assert.match(lines[0], /Pro or Max plan.*\/logout.*\/login/);
+});
