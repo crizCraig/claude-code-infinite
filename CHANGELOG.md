@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.0.29](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.28...v1.0.29) (2026-10-23)
+
+
+### Features
+
+* anonymous npm install ping and first_answer diagnostics event ([#30](https://github.com/crizCraig/claude-code-infinite/issues/30)) ([25f4830](https://github.com/crizCraig/claude-code-infinite/commit/25f48309d2a017bf8a0d5079272e66444ef0a508))
+* **memtree:** tools show when the messages were written (with current#N fix, for 1.0.29) ([#24](https://github.com/crizCraig/claude-code-infinite/issues/24)) ([2bdb190](https://github.com/crizCraig/claude-code-infinite/commit/2bdb190be751d9cdb17fade1b9608e87bf42e46b))
+* offer to install Claude Code when it's missing; say which rate limit Anthropic hit ([#27](https://github.com/crizCraig/claude-code-infinite/issues/27)) ([db47d86](https://github.com/crizCraig/claude-code-infinite/commit/db47d8620f1969a38f3270d82f723dec0ad484d9))
+
+
+### Bug Fixes
+
+* credit-balance advice for every sign-in; warn when an API key beats a Pro/Max login ([d890cbc](https://github.com/crizCraig/claude-code-infinite/commit/d890cbc0a07f752063e75fd3dbcfe69e0efd8079))
+* credit-balance advice for every sign-in; warn when an API key beats a Pro/Max login ([7a171b9](https://github.com/crizCraig/claude-code-infinite/commit/7a171b903d7ffdc2b24d9e7329022cf027e33fbc))
+* fallback budget mirrors the server, every Claude model near its window ([#28](https://github.com/crizCraig/claude-code-infinite/issues/28)) ([7595d8a](https://github.com/crizCraig/claude-code-infinite/commit/7595d8a781635a1c44faa919e16707b31673e2c3))
+* keep the credit advice from a subscriber with a paid tier on record; no source hint for an unanswered key ([67c1b24](https://github.com/crizCraig/claude-code-infinite/commit/67c1b2465890e839de0c548c233356407071f4f5))
+* no "MemTree degraded" notice on a turn under its compression budget ([#26](https://github.com/crizCraig/claude-code-infinite/issues/26)) ([0c8d71a](https://github.com/crizCraig/claude-code-infinite/commit/0c8d71ab4865c8302ed4299f780634f54961ad1d))
+* remember a credit refusal; give its advice before the next launch's first prompt ([#25](https://github.com/crizCraig/claude-code-infinite/issues/25)) ([04dfa79](https://github.com/crizCraig/claude-code-infinite/commit/04dfa797acb11afafd2b3d5c3c95cfd64dbefb30))
+
 ## [1.0.28](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.27...v1.0.28) (2026-10-21)
 
 
