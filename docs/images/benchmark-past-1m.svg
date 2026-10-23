@@ -17,7 +17,7 @@
 <rect width="700" height="398" fill="url(#bg)"/>
 <rect width="700" height="398" fill="url(#glow)"/>
 <text x="382" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">Past the context window</text>
-<text x="382" y="54" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.6)">1.15M-token session, mean of 6 rounds</text>
+<text x="382" y="54" text-anchor="middle" font-size="12" fill="rgba(255,255,255,0.6)"><tspan font-weight="700" fill="#fff">1M+</tspan>-token session, mean of 6 rounds</text>
 <text transform="translate(22 196) rotate(-90)" text-anchor="middle" font-size="11" font-weight="600" letter-spacing="0.5" fill="rgba(255,255,255,0.55)">Score</text>
 <line x1="92" y1="300" x2="672" y2="300" stroke="rgba(255,255,255,0.22)"/>
 <text x="82" y="304" text-anchor="end" font-family="'SF Mono',Monaco,Menlo,monospace" font-size="10" fill="rgba(255,255,255,0.55)">0%</text>

@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 // ---- Numbers: update these when rounds finish -------------------------------------------
 const PAST_1M = {
   title: 'Past the context window',
-  subtitle: '1.15M-token session, mean of 6 rounds',
+  subtitleBold: '1M+',
+  subtitle: '-token session, mean of 6 rounds',
   findingsTotal: 8,
   arms: [
     { name: 'MemTree', score: 69.9, findings: 8, detail: '3 fully, 5 partly', highlight: true },
@@ -74,7 +75,7 @@ function panelSvg(panel, x0, w, divider) {
   parts.push(`<text x="${(left + right) / 2}" y="34" text-anchor="middle" font-size="17" `
     + `font-weight="700" fill="#fff">${esc(panel.title)}</text>`);
   parts.push(`<text x="${(left + right) / 2}" y="54" text-anchor="middle" font-size="12" `
-    + `fill="rgba(255,255,255,0.6)">${esc(panel.subtitle)}</text>`);
+    + `fill="rgba(255,255,255,0.6)">${subtitleSvg(panel)}</text>`);
   parts.push(axis(x0, left, right));
   const slot = (right - left) / panel.arms.length;
   const barW = Math.min(150, slot * 0.72);
@@ -184,4 +185,11 @@ function renderPng(svgPath, pngPath, width) {
 
 function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** The subtitle, with its optional `subtitleBold` lead (e.g. 1M+) set in bold white. */
+function subtitleSvg(panel) {
+  const lead = panel.subtitleBold
+    ? `<tspan font-weight="700" fill="#fff">${esc(panel.subtitleBold)}</tspan>` : '';
+  return lead + esc(panel.subtitle);
 }

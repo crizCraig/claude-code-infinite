@@ -24,8 +24,11 @@ follows it down to the original messages.
 * **Search across every session.** Claude can find what was decided, tried or ruled out in any of
   your past sessions, by exact words or by meaning, filtered by project and date
 * **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
-* **Never loses anything vs Claude Code.** Sessions are sent word for word until near the context
-  limit; past it, MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
+* **Never loses anything vs Claude Code.** MemTree compresses as late as possible: on Opus 5.5,
+  Opus 5, Opus 4.8 and Fable 5 every message is sent word for word, exactly as Claude Code sends
+  it, until 900k tokens (Claude Code itself auto-compacts at 967k). Past that, your most recent
+  messages stay word for word and older ones become a searchable memory whose originals Claude can
+  read back. MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
 * **Unlimited-length sessions**, with relevant past information recalled automatically
 * **A local proxy, so no slowdown.** Requests go straight from your machine to Anthropic and
   MemTree indexes in the background; only the occasional compression step, when a session
@@ -80,6 +83,11 @@ for MemTree and 38 min for full context. Input tokens count uncached, cache-read
 tokens; `/compact`'s exclude the one-time `/compact` step. This is one task family, one model and
 3 rounds, not a general benchmark.
 
+MemTree compresses as late as possible. Here the whole ~775k-token history went out word for word,
+exactly as Claude Code would send it, and MemTree compressed once, partway through the task, when
+the session passed the 800k budget it used then; the most recent messages stayed word for word.
+`ccc` now waits until 900k on Opus 5.5.
+
 A rerun on Oct 20, with MemTree's lookup tools loaded and the same outputs graded again at a
 higher reasoning effort, gave the same shape: MemTree 65, full context 66, `/compact` 45.
 MemTree's figure there is the mean of its 2 clean rounds (a harness bug let the third round read
@@ -88,17 +96,20 @@ another round's work); full context still fixed more of the issues (21 vs 17 on 
 ## Past the context window: MemTree keeps the work, `/compact` loses it
 
 <p align="center">
-  <img width="560" alt="Past the context window, 1.15M-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
+  <img width="560" alt="Past the context window, 1M+-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
 </p>
 
 The benchmark above fits inside Claude Opus 5.5's 1M-token window. This one does not. Each setup
-resumes the same 1.15M-token history, built in time order from real Claude Code sessions of our
+resumes the same **1M+**-token history, built in time order from real Claude Code sessions of our
 own engineering work: the design and implementation of a backend feature, four rounds of code
 review in which an outside reviewer's findings were confirmed and, for several, re-scoped by the
 session, then about 550k tokens of later, unrelated work. The task comes at the end: the commits
 that fixed review rounds 2–4 were lost, so re-implement every fix as the session approved it, each
 with a regression test, in one commit. The findings and decisions exist only in the conversation,
-and the task forbids re-reviewing the code to find them again. An independent grader scored each
+and the task forbids re-reviewing the code to find them again. Since the history is already past
+the window, MemTree compressed it on the first turn: the most recent messages stayed word for word,
+and the older ones became a memory tree whose original messages Claude can read back with one tool
+call. An independent grader scored each
 result blind (0–100) against the real fixes, their regression tests and the session's decisions.
 
 | Setup | Score | Findings addressed (of 8) | How it handles the history |
