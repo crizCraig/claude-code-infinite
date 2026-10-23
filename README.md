@@ -26,7 +26,7 @@ follows it down to the original messages.
 * **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
 * **Never loses anything vs Claude Code.** On Opus 5 and up, you get the vast majority of the
   1M-token window word for word, exactly as Claude Code sends it. Only near the limit does MemTree
-  compress, to about half the window so it compresses rarely: recent messages stay word for word
+  compress, to about half the window to minimize the number of compressions: recent messages stay word for word
   and older ones become a searchable memory, the originals one tool call away. MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
 * **Unlimited-length sessions**, with relevant past information recalled automatically
 * **A local proxy, so no slowdown.** Requests go straight from your machine to Anthropic and
