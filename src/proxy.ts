@@ -2552,7 +2552,14 @@ async function handleMessages(
       pausedNotices.set(rec, handle);
       if (overBudget) state.nearWindowNotice = handle;
     } else if (mayQueueNotice && paymentDetail === null) {
-      state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+      // Under the budget the whole request is what compression would have
+      // sent: the turn is not degraded, so the failure stays in the logs.
+      if (compressionNeeded(rec.compaction)) {
+        state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+        rec.degradedNotice = "shown";
+      } else {
+        rec.degradedNotice = "quiet-under-budget";
+      }
     }
     return logged(
       forwardRaw(
@@ -5559,6 +5566,18 @@ function nearWindowWarned(state: ProxyState, sessionId: string | undefined): boo
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction: CompactionRecord | undefined): boolean {
   return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
+}
+
+/**
+ * Whether a turn needed MemTree to compress it: a forced compaction (budget,
+ * window, `/memtree-compact`, a rebuilt prefix), a size at or over the budget,
+ * or a size nobody measured. False only for a turn known to fit its budget,
+ * whose whole request is what a working MemTree would have passed through.
+ */
+function compressionNeeded(compaction: CompactionRecord | undefined): boolean {
+  if (compaction === undefined || compaction.reason !== undefined) return true;
+  if (compaction.estimatedTokens === undefined) return true;
+  return compaction.estimatedTokens >= compaction.budgetTokens;
 }
 
 /** The paused notice a degraded request queued, until it is refused or settles. */

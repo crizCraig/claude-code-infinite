@@ -126,6 +126,12 @@ export interface MessagesRecord {
     forwardedBytes?: number;
     /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
     approxInputTokens?: number;
+    /**
+     * A failed compress on a visible turn: "shown" queued the degraded notice
+     * (the turn needed compression); "quiet-under-budget" did not, because the
+     * turn fit its budget and went out exactly as MemTree would have sent it.
+     */
+    degradedNotice?: "shown" | "quiet-under-budget";
     /** Present when a blocking MemTree compress was attempted for this turn. */
     compress?: {
         /** Overall wall time of the compress step (all concurrent legs). */
