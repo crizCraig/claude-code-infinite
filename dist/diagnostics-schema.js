@@ -72,6 +72,10 @@ export const CLAUDE_SOURCES = [
 ];
 /** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
 export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"];
+/** claude-install.ts InstallFailure: couldn't start, failed, or finished but no claude found. */
+export const INSTALL_FAILURES = ["spawn", "exit", "not_found"];
+/** rate-limit.ts RateLimitKind: the Claude plan's usage limit, or Anthropic busy (retried). */
+export const RATE_LIMIT_KINDS = ["plan_limit", "busy"];
 /** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
 export const AUTO_UPDATE_RESULTS = [
     "started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed",
@@ -190,6 +194,15 @@ export const EVENT_FIELDS = {
     claude_exit: { code: integer(-1000, 1000), signal: oneOf(SIGNALS),
         code_raw: integer(-2147483648, 4294967295), uptime_ms: MS },
     claude_missing: {},
+    /** The offer to install Claude Code (claude-install.ts) and how it went. */
+    install_offered: { desktop_only: bool },
+    install_declined: {},
+    install_accepted: {},
+    install_succeeded: { ms: MS, claude_found: oneOf(CLAUDE_SOURCES) },
+    install_failed: { reason: oneOf(INSTALL_FAILURES), code: integer(-2147483648, 4294967295),
+        ms: MS },
+    /** Anthropic answered 429/529 (rate-limit.ts), and the notice ccc showed for it. */
+    rate_limit: { kind: oneOf(RATE_LIMIT_KINDS), status: STATUS },
     /** Windows: ccc got SIGHUP, i.e. its console window was closed (Claude Code then exits 129). */
     console_closed: {},
     /** The "no Claude plan" line was shown (claude-plan-warning.ts), by sign-in type. */

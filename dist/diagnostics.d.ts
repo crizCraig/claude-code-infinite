@@ -20,6 +20,7 @@
 import { type DiagnosticsErrorCode, type DiagnosticsEvent } from "./diagnostics-schema.js";
 import type { RequestLogSink, RequestRecord } from "./reqlog.js";
 import { type ClaudeAuthType } from "./claude-auth.js";
+import type { RateLimitInfo } from "./rate-limit.js";
 export declare const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export declare const INSTALL_ID_FILE = "install_id";
 export declare const FLUSH_INTERVAL_MS = 30000;
@@ -100,6 +101,8 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onClaudeAuth?;
     /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
     private readonly onUpstreamOk?;
+    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
+    private readonly onRateLimit?;
     private firstRequest;
     private firstTurn;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
@@ -108,7 +111,9 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined, 
     /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
-    onUpstreamOk?: (() => void) | undefined);
+    onUpstreamOk?: (() => void) | undefined, 
+    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
+    onRateLimit?: ((info: RateLimitInfo) => void) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;

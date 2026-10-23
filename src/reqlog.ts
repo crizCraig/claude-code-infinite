@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import { getConfigDir } from "./config.js";
 import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
+import type { RateLimitInfo } from "./rate-limit.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
 const APPROX_CHARS_PER_TOKEN = 4;
@@ -376,6 +377,8 @@ export interface MessagesRecord {
   contextWindow?: number;
   /** A known Anthropic error in the response body, by code (claude-auth.ts). */
   upstreamError?: UpstreamErrorCode;
+  /** Anthropic's 429/529, by kind and reset time from its headers (rate-limit.ts). */
+  rateLimit?: RateLimitInfo;
   /** The downstream client aborted before the response finished. */
   clientAborted?: true;
   /** Forward start → first response byte from Anthropic. */

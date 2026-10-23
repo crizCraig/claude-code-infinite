@@ -19,6 +19,7 @@
  */
 import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
+import type { RateLimitInfo } from "./rate-limit.js";
 /** Rough bytes→tokens estimate (bytes/4). Label the result approximate. */
 export declare function approxTokensFromBytes(bytes: number): number;
 export declare function defaultLogPath(): string;
@@ -351,6 +352,8 @@ export interface MessagesRecord {
     contextWindow?: number;
     /** A known Anthropic error in the response body, by code (claude-auth.ts). */
     upstreamError?: UpstreamErrorCode;
+    /** Anthropic's 429/529, by kind and reset time from its headers (rate-limit.ts). */
+    rateLimit?: RateLimitInfo;
     /** The downstream client aborted before the response finished. */
     clientAborted?: true;
     /** Forward start → first response byte from Anthropic. */

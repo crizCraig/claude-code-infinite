@@ -37,6 +37,7 @@ import {
 } from "./diagnostics-schema.js";
 import type { RequestLogSink, RequestRecord } from "./reqlog.js";
 import { CREDIT_BALANCE_TOO_LOW, type ClaudeAuthType } from "./claude-auth.js";
+import type { RateLimitInfo } from "./rate-limit.js";
 
 export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export const INSTALL_ID_FILE = "install_id";
@@ -230,7 +231,9 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?: (auth: ClaudeAuthType) => void,
     /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
-    private readonly onUpstreamOk?: () => void
+    private readonly onUpstreamOk?: () => void,
+    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
+    private readonly onRateLimit?: (info: RateLimitInfo) => void
   ) {}
 
   log(record: RequestRecord): void {
@@ -285,6 +288,12 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     }
     if (typeof status === "number" && status >= 400) {
       this.diagnostics.recordLimited(`upstream:${status}`, "upstream_error", fields);
+    }
+    if (rec.rateLimit && rec.turnType !== "side-request") {
+      const { kind, status: limitStatus } = rec.rateLimit;
+      this.diagnostics.recordLimited(`rate_limit:${kind}`, "rate_limit",
+        { kind, status: limitStatus });
+      this.onRateLimit?.(rec.rateLimit);
     }
     if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
       this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });

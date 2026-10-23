@@ -144,6 +144,7 @@ import type { ProjectTreesHint } from "./project-trees.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
+import { rateLimitFromResponse } from "./rate-limit.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -324,6 +325,11 @@ export interface ProxyOptions {
    */
   sessionStartNotice?: () => string | undefined;
   /**
+   * A line to show as the user submits a main-session prompt (UserPromptSubmit),
+   * e.g. a rate limit Anthropic answered with (rate-limit.ts). Called once per prompt.
+   */
+  promptSubmitNotice?: () => string | undefined;
+  /**
    * Earlier MemTree sessions in this project, added to a main session's
    * SessionStart as model context (project-trees.ts). Omitted means none.
    */
@@ -418,6 +424,8 @@ interface ProxyState {
   usageUrl: string | undefined;
   /** ProxyOptions.sessionStartNotice. */
   sessionStartNotice?: () => string | undefined;
+  /** ProxyOptions.promptSubmitNotice. */
+  promptSubmitNotice?: () => string | undefined;
   /** ProxyOptions.projectTrees. */
   projectTrees?: ProjectTreesHint;
   /** ProxyOptions.diagnostics. */
@@ -916,6 +924,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     pausedDetail: () => opts.memtree.pausedDetail,
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
+    promptSubmitNotice: opts.promptSubmitNotice,
     projectTrees: opts.projectTrees,
     diagnostics: opts.diagnostics,
     notices: new NoticeDeliveryQueue(),
@@ -1467,6 +1476,17 @@ async function handleNoticeHook(
     if (parsed.agent_id === undefined) {
       state.promptAccounting.add(parsed.session_id, parsed.prompt_id, parsed.prompt);
       recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
+    }
+    const line = parsed.agent_id === undefined ? promptSubmitLine(state) : undefined;
+    if (line) {
+      const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+      res.end(body);
+      return;
     }
     res.writeHead(204);
     res.end();
@@ -2882,6 +2902,15 @@ function resumePaymentNotice(
 }
 
 /** The caller's extra SessionStart line; a throwing provider shows nothing. */
+/** ProxyOptions.promptSubmitNotice's line for this prompt; never throws. */
+function promptSubmitLine(state: ProxyState): string | undefined {
+  try {
+    return state.promptSubmitNotice?.();
+  } catch {
+    return undefined;
+  }
+}
+
 function extraSessionStartLine(
   provider: (() => string | undefined) | undefined,
   input: SessionStartHookInput
@@ -5832,6 +5861,8 @@ function forwardAccepted(
         };
         if (rec) {
           rec.upstreamStatus = upstreamRes.statusCode ?? 502;
+          const rateLimit = rateLimitFromResponse(rec.upstreamStatus, upstreamRes.headers);
+          if (rateLimit) rec.rateLimit = rateLimit;
         }
         successfulStatus =
           typeof upstreamRes.statusCode === "number" &&

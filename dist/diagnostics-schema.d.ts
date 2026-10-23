@@ -31,6 +31,10 @@ export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "ma
 export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
 /** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
 export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
+/** claude-install.ts InstallFailure: couldn't start, failed, or finished but no claude found. */
+export declare const INSTALL_FAILURES: readonly ["spawn", "exit", "not_found"];
+/** rate-limit.ts RateLimitKind: the Claude plan's usage limit, or Anthropic busy (retried). */
+export declare const RATE_LIMIT_KINDS: readonly ["plan_limit", "busy"];
 /** auto-update.ts StartInstallResult, plus a launch's view of the last install. */
 export declare const AUTO_UPDATE_RESULTS: readonly ["started", "locked", "not-planned", "spawn-failed", "skipped", "installed", "ok", "failed"];
 /** auto-update.ts SKIP_CODES. */
