@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { startProxy, fallbackBudgetRatio } from '../dist/proxy.js';
+import { startProxy, fallbackBudgetTokens } from '../dist/proxy.js';
 import { MemtreeClient } from '../dist/memtree.js';
 import { AWAY_SUMMARY_PROMPT_PREFIX } from '../dist/turns.js';
 
@@ -832,14 +832,27 @@ for (const outcome of ['compressed', 'failed']) {
   });
 }
 
-test('the 0.9 fallback is only for the 1M-window models the server budgets at 900k', () => {
+test('the fallback budget mirrors the server: every Claude model near its window', () => {
+  // Opus 4.6 / 4.7 used to fall to 0.8 here and to the server's 50k after it.
   for (const model of ['claude-opus-5-5', 'claude-opus-5-5[1m]', 'claude-opus-5',
-    'claude-opus-4-8', 'claude-fable-5', 'claude-fable-5-1', 'claude-opus-5-5-20261001']) {
-    assert.equal(fallbackBudgetRatio(model, 1_000_000), 0.9, model);
-    assert.equal(fallbackBudgetRatio(model, 200_000), 0.8, `${model} on a 200k window`);
+    'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-opus-4-6[1m]',
+    'claude-fable-5', 'claude-fable-5-1', 'claude-opus-5-5-20261001', 'claude-mythos-5']) {
+    assert.equal(fallbackBudgetTokens(model, 1_000_000), 900_000, model);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, `${model} on a 200k window`);
   }
-  for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-sonnet-4-6',
-    'claude-haiku-4-5', 'claude-opus-4-6', 'claude-x', undefined]) {
-    assert.equal(fallbackBudgetRatio(model, 1_000_000), 0.8, String(model));
+  for (const model of ['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-haiku-5-5',
+    'claude-opus-4-5', 'claude-opus-4-1']) {
+    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, model);
+  }
+  // The Sonnets keep their usable-context ceilings on a 1M window.
+  for (const [model, ceiling] of [['claude-sonnet-5', 550_000], ['claude-sonnet-5-5', 550_000],
+    ['claude-sonnet-5-5[1m]', 550_000], ['claude-sonnet-4-6', 400_000],
+    ['claude-sonnet-4-5-20250929', 400_000]]) {
+    assert.equal(fallbackBudgetTokens(model, 1_000_000), ceiling, model);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, `${model} on a 200k window`);
+  }
+  // Not a Claude family the server knows: the plain 0.8 share.
+  for (const model of ['claude-x', 'gpt-6', undefined]) {
+    assert.equal(fallbackBudgetTokens(model, 1_000_000), 800_000, String(model));
   }
 });

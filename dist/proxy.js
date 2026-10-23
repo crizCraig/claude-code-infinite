@@ -95,23 +95,35 @@ const SKIP_RESPONSE_HEADERS = new Set([
     "transfer-encoding",
 ]);
 /**
- * Budget fallback until the server reports `model_budget_tokens`: this share
- * of the model's context window. 0.8 by default; NEAR_WINDOW_FALLBACK_RATIO
- * (900k of 1M) for the 1M-window models the server budgets at 900k for ccc
- * (NEAR_WINDOW_MODEL_RE). Plain Claude Code 2.1.302 auto-compacts a 1M window
- * at 967k, so MemTree compresses no earlier than ~70k before it would; ccc
- * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * Budget fallback until the server reports `model_budget_tokens`, mirroring the
+ * server's ccc policy (polychat index_budget.py): every Claude model compresses
+ * near its window, NEAR_WINDOW_FALLBACK_RATIO of it (900k of 1M, 180k of 200k),
+ * at most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
+ * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts a 1M
+ * window at 967k, so MemTree compresses no earlier than ~70k before it would;
+ * ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
  * jumps past the budget reaches the proxy and is compressed here.
  */
 export const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
 export const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
-/** Opus 5.5, Opus 5, Opus 4.8 and Fable 5 / 5.1 (polychat LARGE_CONTEXT_MODELS). */
-const NEAR_WINDOW_MODEL_RE = /claude-(?:opus-(?:4-8|5-5|5)|fable-5(?:-1)?)(?![0-9])/i;
-const ONE_MILLION_TOKENS = 1_000_000;
-/** The fallback share of the window for `model` (see FALLBACK_BUDGET_WINDOW_RATIO). */
-export function fallbackBudgetRatio(model, modelContextLimit) {
-    return typeof model === "string" && modelContextLimit >= ONE_MILLION_TOKENS &&
-        NEAR_WINDOW_MODEL_RE.test(model) ? NEAR_WINDOW_FALLBACK_RATIO : FALLBACK_BUDGET_WINDOW_RATIO;
+/** The ids the server resolves to a Claude model (polychat ANTHROPIC_MODEL_FAMILIES). */
+const CLAUDE_FAMILY_RE = /opus|sonnet|haiku|fable|mythos/i;
+/**
+ * polychat USABLE_CONTEXT_CEILING_TOKENS_BY_MODEL: the Sonnets degrade well
+ * before their window. Sonnet 5 / 5.5 550k; every other Sonnet 400k. First match wins.
+ */
+const SONNET_CEILINGS = [
+    [/sonnet-5(?![0-9])/i, 550_000],
+    [/sonnet/i, 400_000],
+];
+/** The fallback whole-request budget for `model` on this window (see above). */
+export function fallbackBudgetTokens(model, modelContextLimit) {
+    if (typeof model !== "string" || !CLAUDE_FAMILY_RE.test(model)) {
+        return Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO);
+    }
+    const nearWindow = Math.floor(modelContextLimit * NEAR_WINDOW_FALLBACK_RATIO);
+    const ceiling = SONNET_CEILINGS.find(([re]) => re.test(model))?.[1];
+    return ceiling === undefined ? nearWindow : Math.min(nearWindow, ceiling);
 }
 /**
  * An explicit target is capped at this share of the budget: a compaction to
@@ -2590,8 +2602,8 @@ function serverBudgetKey(model, modelContextLimit) {
 /**
  * The session's whole-request budget: CCC_BUDGET_TOKENS when set (tests),
  * else the model budget the server last reported for this model and window,
- * else the window times fallbackBudgetRatio (servers that predate
- * `model_budget_tokens`, and the first request before any response).
+ * else fallbackBudgetTokens (servers that predate `model_budget_tokens`, and
+ * the first request before any response).
  */
 function resolveBudget(opts, state, model, modelContextLimit) {
     if (opts.budgetTokensOverride !== undefined) {
@@ -2601,7 +2613,7 @@ function resolveBudget(opts, state, model, modelContextLimit) {
     if (reported !== undefined)
         return { tokens: reported, source: "server" };
     return {
-        tokens: Math.floor(modelContextLimit * fallbackBudgetRatio(model, modelContextLimit)),
+        tokens: fallbackBudgetTokens(model, modelContextLimit),
         source: "window-ratio",
     };
 }
