@@ -6,7 +6,10 @@
  * One file per distinct output under ~/.claude-code-infinite/tool-outputs/,
  * named by its content hash (the same output always gets the same path, so a
  * repeated truncation sends the same bytes), mode 600 in a private mode-700
- * directory, at most MAX_FILES files and MAX_BYTES bytes (oldest dropped).
+ * directory, at most MAX_FILES files and MAX_BYTES bytes (oldest dropped),
+ * except that a copy saved or reused within PIN_MS (its mtime) is never
+ * dropped: the request pointing at it may still be on its way (counted,
+ * forwarded) while another request, in this ccc or another, saves.
  */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -16,25 +19,27 @@ import { getConfigDir } from "./config.js";
 const MAX_FILES = 64;
 const MAX_BYTES = 512 * 1024 * 1024;
 const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+/** How long a copy saved or reused (its mtime) is protected from eviction. */
+const PIN_MS = 60 * 60 * 1000;
 
 export class ToolOutputStore {
-  constructor(readonly dir: string = path.join(getConfigDir(), "tool-outputs")) {}
+  constructor(
+    readonly dir: string = path.join(getConfigDir(), "tool-outputs"),
+    private readonly now: () => number = Date.now,
+  ) {}
 
-  /**
-   * Save `text` and return its path, or undefined when it could not be written.
-   * Eviction never removes a path in `keep` (the other copies one shortened
-   * request points at).
-   */
-  save(text: string, keep: ReadonlySet<string> = new Set()): string | undefined {
+  /** Save `text` and return its path, or undefined when it could not be written. */
+  save(text: string): string | undefined {
     if (!this.privateDir()) return undefined;
     const name = createHash("sha256").update(text).digest("hex").slice(0, 32);
     const file = path.join(this.dir, `${name}.txt`);
     if (isOurFile(file)) {
-      touch(file);
+      touch(file, this.now());
       return file;
     }
     if (!writeAtomically(this.dir, file, text)) return undefined;
-    this.evict(new Set([...keep, file]));
+    touch(file, this.now());
+    this.evict();
     return file;
   }
 
@@ -51,14 +56,14 @@ export class ToolOutputStore {
     }
   }
 
-  /** Drop the oldest files (never one in `keep`) until both limits hold. */
-  private evict(keep: ReadonlySet<string>): void {
-    const files = listFiles(this.dir).sort((a, b) =>
-      Number(keep.has(b.file)) - Number(keep.has(a.file)) || b.mtimeMs - a.mtimeMs);
+  /** Drop the oldest files not touched within PIN_MS until both limits hold. */
+  private evict(): void {
+    const recent = this.now() - PIN_MS;
+    const files = listFiles(this.dir).sort((a, b) => b.mtimeMs - a.mtimeMs);
     let bytes = 0;
     files.forEach((entry, i) => {
       bytes += entry.size;
-      if (!keep.has(entry.file) && (i >= MAX_FILES || bytes > MAX_BYTES)) unlinkQuietly(entry.file);
+      if (entry.mtimeMs < recent && (i >= MAX_FILES || bytes > MAX_BYTES)) unlinkQuietly(entry.file);
     });
   }
 }
@@ -90,12 +95,12 @@ function isOurFile(file: string): boolean {
   }
 }
 
-function touch(file: string): void {
+function touch(file: string, nowMs: number): void {
   try {
-    const now = new Date();
+    const now = new Date(nowMs);
     fs.utimesSync(file, now, now);
   } catch {
-    // Only eviction order depends on it.
+    // Only eviction depends on it.
   }
 }
 

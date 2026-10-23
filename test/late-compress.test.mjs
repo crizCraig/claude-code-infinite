@@ -461,11 +461,18 @@ test('tool output store: one private file per distinct output, same path every t
       assert.equal(fs.statSync(path.dirname(a)).mode & 0o777, 0o700);
       assert.equal(fs.statSync(a).mode & 0o777, 0o600);
     }
-    // Past the cap, a kept set survives eviction: one request's 70 copies all stay.
-    const kept = new Set();
-    for (let i = 0; i < 70; i++) kept.add(store.save(`output ${i}`, kept));
-    assert.ok([...kept].every((file) => fs.existsSync(file)), 'every kept copy is still there');
-    store.save('one more');
-    assert.ok(fs.readdirSync(path.dirname(a)).filter((n) => n.endsWith('.txt')).length <= 64);
+    // Past the cap, recent copies (by mtime) are kept: a request's 70 copies all
+    // stay while another request saves (Codex r6: concurrent eviction).
+    let clock = 1_000;
+    const pinnedStore = new ToolOutputStore(path.join(dir, 'pinned'), () => clock);
+    const first = Array.from({ length: 70 }, (_, i) => pinnedStore.save(`output ${i}`));
+    // Another ccc process sharing the directory saves meanwhile.
+    new ToolOutputStore(path.join(dir, 'pinned'), () => clock).save('another request');
+    assert.ok(first.every((file) => fs.existsSync(file)), 'every pinned copy is still there');
+    // An hour later the pins have expired and the cap holds again.
+    clock += 61 * 60 * 1000;
+    pinnedStore.save('one more');
+    const count = fs.readdirSync(path.join(dir, 'pinned')).filter((n) => n.endsWith('.txt')).length;
+    assert.ok(count <= 65, `${count} files`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

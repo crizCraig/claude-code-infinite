@@ -5913,13 +5913,9 @@ async function truncateCandidate(
   for (let attempt = 1; attempt <= TRUNCATION_ATTEMPTS; attempt++) {
     const excess = Math.max(1_000, first.tokens - goal);
     const cut = Math.ceil(excess * bytesPerToken * TRUNCATION_MARGIN * attempt);
-    // Every copy this request points at survives the others' eviction.
-    const kept = new Set<string>();
-    const plan = truncateToolResults(parsed, cut, (text) => {
-      const savedAt = store.save(text, kept);
-      if (savedAt !== undefined) kept.add(savedAt);
-      return savedAt;
-    });
+    // The store pins each copy it saves, so none this request points at is
+    // evicted while it is counted and forwarded.
+    const plan = truncateToolResults(parsed, cut, (text) => store.save(text));
     if (!plan) return undefined;
     const candidate = sizing.register(Buffer.from(JSON.stringify(plan.body), "utf-8"),
       "replacement");
