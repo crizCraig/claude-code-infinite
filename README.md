@@ -414,8 +414,9 @@ PATH and, failing that, where its installers put it (`%USERPROFILE%\.local\bin`,
 too. If it is not there, `ccc` asks "Claude Code isn't installed. Install it now? [Y/n]"
 (also when only the Claude desktop app is installed). Yes runs Anthropic's official installer
 (Windows PowerShell: `irm https://claude.ai/install.ps1 | iex`; macOS/Linux:
-`curl -fsSL https://claude.ai/install.sh | bash`) with its output on screen, then starts
-Claude Code in the same terminal, which asks you to sign in. `ccc` never installs anything
+`curl -fsSL https://claude.ai/install.sh | bash`) with its output on screen, then carries on
+in the same terminal (on a first run, after your MemTree key) into Claude Code, which asks you
+to sign in. `ccc` never installs anything
 without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those commands.
 To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
 then run `ccc` again, from your project folder.
@@ -429,7 +430,8 @@ prompt and as `ccc` exits. Anything else (529 overloaded, another 429) is Anthro
 Claude Code retries it itself, and if it still failed you get "Anthropic was busy; try again in
 a moment." on your next prompt or as `ccc` exits. The response itself reaches Claude Code
 unchanged, so its own retries and messages work as they do without `ccc`. In a print run
-(`ccc -p`) the line goes to stderr right away ("Anthropic is busy; Claude Code will retry.").
+(`ccc -p`) the line goes to stderr right away (for busy: "Anthropic is busy; Claude Code will
+retry.").
 
 ### "Credit balance too low"
 
