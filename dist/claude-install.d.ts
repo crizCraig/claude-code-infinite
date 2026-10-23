@@ -10,7 +10,8 @@
  * the install steps, as before.
  *
  * CCC_INSTALL_PROMPT=1 asks even without a terminal, reading the answer from stdin
- * (the CI check of this flow); it still installs only on a yes.
+ * (the CI check of this flow); it still installs only on a yes. The answer is read
+ * with readline, which takes all of piped stdin, so don't also pipe a prompt then.
  */
 import { type ClaudeLocation } from "./claude-locate.js";
 /** Anthropic's official install one-liners (https://code.claude.com/docs/en/setup). */
@@ -63,7 +64,10 @@ export declare function offerClaudeInstall(deps: InstallOfferDeps): Promise<Clau
 /** A yes: Enter (the default) or y/yes, in any case. Anything else, or no answer, is a no. */
 export declare function isYes(answer: string | null): boolean;
 /** The installer for this OS: the official one-liner, run by the shell its docs name. */
-export declare function installerCommand(platform?: NodeJS.Platform, env?: NodeJS.ProcessEnv, exists?: (file: string) => boolean): InstallerCommand;
-/** Run the installer with its output on this terminal; never throws. */
-export declare function runInstaller(installer: InstallerCommand): Promise<InstallerRun>;
+export declare function installerCommand(platform?: NodeJS.Platform, env?: NodeJS.ProcessEnv): InstallerCommand;
+/**
+ * Run the installer with its output on this terminal; never throws. `toStderr`:
+ * its stdout goes to stderr too (a print run's stdout is Claude Code's alone).
+ */
+export declare function runInstaller(installer: InstallerCommand, toStderr?: boolean): Promise<InstallerRun>;
 //# sourceMappingURL=claude-install.d.ts.map

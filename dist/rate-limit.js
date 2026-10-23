@@ -13,6 +13,10 @@
  * show anything on a turn an API error ended), or on stderr right away (print runs).
  */
 export const BUSY_NOTICE = "Anthropic is busy; Claude Code will retry.";
+/** Busy, said after the fact (next prompt, exit): Claude Code's retries have run out or stopped. */
+export const BUSY_AFTER_NOTICE = "Anthropic was busy; try again in a moment.";
+/** A plan limit with no reset time is forgotten after this (the 5-hour window). */
+export const UNKNOWN_RESET_TTL_MS = 5 * 3600 * 1000;
 export const PLAN_LIMIT_NOTICE = "You've hit your Claude plan's usage limit.";
 /** A 429/529 from Anthropic, classified; null for any other status. */
 export function rateLimitFromResponse(status, headers, now = Date.now()) {
@@ -24,9 +28,11 @@ export function rateLimitFromResponse(status, headers, now = Date.now()) {
     return { kind: "busy", status };
 }
 /** The line for a rate limit: the plan's reset in local time when known. */
-export function rateLimitNoticeText(info, now = Date.now(), formatTime = localResetTime) {
+export function rateLimitNoticeText(info, now = Date.now(), formatTime = localResetTime, 
+/** Said after the turn ended (next prompt, exit) rather than as it happens. */
+after = false) {
     if (info.kind === "busy")
-        return BUSY_NOTICE;
+        return after ? BUSY_AFTER_NOTICE : BUSY_NOTICE;
     if (info.resetsAt === undefined || info.resetsAt <= now)
         return PLAN_LIMIT_NOTICE;
     return `${PLAN_LIMIT_NOTICE} It resets at ${formatTime(info.resetsAt, now)}.`;
@@ -48,15 +54,19 @@ export function localResetTime(ms, now) {
 export class RateLimitNotices {
     clock;
     current = null;
+    seenAt = 0;
     promptShown = false;
     constructor(clock = Date.now) {
         this.clock = clock;
     }
     /** A refusal of a turn's request; true when it starts a new episode (say it now). */
     observe(info) {
+        // Resets a minute apart are one limit (retry-after counts down per refusal).
+        const minute = (ms) => ms === undefined ? -1 : Math.round(ms / 60_000);
         const fresh = !this.current || this.current.kind !== info.kind ||
-            this.current.resetsAt !== info.resetsAt;
+            minute(this.current.resetsAt) !== minute(info.resetsAt);
         this.current = info;
+        this.seenAt = this.clock();
         if (fresh)
             this.promptShown = false;
         return fresh;
@@ -71,19 +81,20 @@ export class RateLimitNotices {
         if (!info || (info.kind === "busy" && this.promptShown))
             return undefined;
         this.promptShown = true;
-        return rateLimitNoticeText(info, this.clock());
+        return rateLimitNoticeText(info, this.clock(), localResetTime, true);
     }
     /** For ccc's exit: the limit still in force, if any. */
     exitLine() {
         const info = this.active();
-        return info ? rateLimitNoticeText(info, this.clock()) : undefined;
+        return info ? rateLimitNoticeText(info, this.clock(), localResetTime, true) : undefined;
     }
     active() {
         const info = this.current;
-        if (info?.kind === "plan_limit" && info.resetsAt !== undefined &&
-            info.resetsAt <= this.clock()) {
+        const now = this.clock();
+        const over = info?.kind === "plan_limit" && (info.resetsAt !== undefined
+            ? info.resetsAt <= now : now - this.seenAt >= UNKNOWN_RESET_TTL_MS);
+        if (over)
             this.current = null;
-        }
         return this.current;
     }
 }

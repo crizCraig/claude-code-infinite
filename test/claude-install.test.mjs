@@ -107,16 +107,18 @@ test("a failed install: the error, the manual steps, and why in diagnostics", as
 });
 
 test("the installer per OS: PowerShell's one-liner on Windows, curl | bash elsewhere", () => {
-  const win = installerCommand("win32", { SystemRoot: "D:\\Win" }, (f) => f.startsWith("D:\\Win"));
+  const win = installerCommand("win32", { SystemRoot: "D:\\Win" });
   assert.equal(win.command, "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   assert.deepEqual(win.args, ["-NoProfile", "-Command", "irm https://claude.ai/install.ps1 | iex"]);
-  assert.equal(installerCommand("win32", {}, () => false).command, "powershell.exe");
+  // Never by name: a search would try the current folder first.
+  assert.equal(installerCommand("win32", {}).command,
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   // PowerShell 7's module path breaks Windows PowerShell 5.1's own cmdlets: dropped.
   const fromPwsh = installerCommand("win32",
-    { PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules", Path: "C:\\x" }, () => false);
+    { PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules", Path: "C:\\x" });
   assert.deepEqual(fromPwsh.env, { Path: "C:\\x" });
   for (const platform of ["darwin", "linux"]) {
-    const posix = installerCommand(platform, {}, () => true);
+    const posix = installerCommand(platform, {});
     assert.equal(posix.command, "bash");
     assert.equal(posix.env, undefined, "ccc's own environment");
     assert.deepEqual(posix.args,
@@ -198,7 +200,8 @@ test("ccc with CCC_INSTALL_PROMPT=1, answered yes: installs, finds claude, conti
     ].join("\n"), { mode: 0o755 });
     const run = freshCcc({ input: "y\n", env: { CCC_INSTALL_PROMPT: "1" }, bin });
     assert.ok(run.stderr.includes(INSTALL_QUESTION), run.stderr);
-    assert.match(run.stdout + run.stderr, /fake installer ran/);
+    assert.match(run.stderr, /fake installer ran/, "the installer's output goes to stderr");
+    assert.equal(run.stdout, "", "a print run's stdout stays Claude Code's");
     assert.match(run.stderr, /✔ Claude Code is installed/);
     assert.ok(fs.existsSync(path.join(run.home, ".local", "bin", "claude")));
     // On to the next step of a first run: no key and no terminal.

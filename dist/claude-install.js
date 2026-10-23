@@ -10,10 +10,10 @@
  * the install steps, as before.
  *
  * CCC_INSTALL_PROMPT=1 asks even without a terminal, reading the answer from stdin
- * (the CI check of this flow); it still installs only on a yes.
+ * (the CI check of this flow); it still installs only on a yes. The answer is read
+ * with readline, which takes all of piped stdin, so don't also pipe a prompt then.
  */
 import spawn from "cross-spawn";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { claudeMissingText } from "./claude-locate.js";
 /** Anthropic's official install one-liners (https://code.claude.com/docs/en/setup). */
@@ -52,10 +52,10 @@ export function isYes(answer) {
     return /^(y|yes)?$/i.test(answer.trim());
 }
 /** The installer for this OS: the official one-liner, run by the shell its docs name. */
-export function installerCommand(platform = process.platform, env = process.env, exists = fs.existsSync) {
+export function installerCommand(platform = process.platform, env = process.env) {
     if (platform === "win32") {
         return {
-            command: windowsPowerShell(env, exists),
+            command: windowsPowerShell(env),
             args: ["-NoProfile", "-Command", WINDOWS_INSTALL_SCRIPT],
             display: WINDOWS_INSTALL_SCRIPT,
             env: withoutPsModulePath(env),
@@ -68,12 +68,16 @@ export function installerCommand(platform = process.platform, env = process.env,
         display: POSIX_INSTALL_SCRIPT,
     };
 }
-/** Run the installer with its output on this terminal; never throws. */
-export function runInstaller(installer) {
+/**
+ * Run the installer with its output on this terminal; never throws. `toStderr`:
+ * its stdout goes to stderr too (a print run's stdout is Claude Code's alone).
+ */
+export function runInstaller(installer, toStderr = false) {
     return new Promise((resolve) => {
         try {
             const child = spawn(installer.command, installer.args, {
-                stdio: "inherit", ...(installer.env ? { env: installer.env } : {}),
+                stdio: ["inherit", toStderr ? process.stderr : "inherit", "inherit"],
+                ...(installer.env ? { env: installer.env } : {}),
             });
             child.on("error", (error) => resolve({ code: null, error }));
             child.on("close", (code) => resolve({ code }));
@@ -114,11 +118,14 @@ function failureLine(run, installer) {
     }
     return "Claude Code's installer finished, but ccc still can't find `claude`.";
 }
-/** Windows PowerShell by full path (PATH may be what is broken), else by name. */
-function windowsPowerShell(env, exists) {
+/**
+ * Windows PowerShell, always by full path: PATH may be what is broken, and a
+ * search by name would try the current folder (a project's powershell.exe) first.
+ * Missing, the spawn fails and the manual steps are shown.
+ */
+function windowsPowerShell(env) {
     const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
-    const full = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    return exists(full) ? full : "powershell.exe";
+    return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 /**
  * ccc started from PowerShell 7 inherits its PSModulePath, which makes Windows

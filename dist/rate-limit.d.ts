@@ -21,11 +21,17 @@ export interface RateLimitInfo {
     resetsAt?: number;
 }
 export declare const BUSY_NOTICE = "Anthropic is busy; Claude Code will retry.";
+/** Busy, said after the fact (next prompt, exit): Claude Code's retries have run out or stopped. */
+export declare const BUSY_AFTER_NOTICE = "Anthropic was busy; try again in a moment.";
+/** A plan limit with no reset time is forgotten after this (the 5-hour window). */
+export declare const UNKNOWN_RESET_TTL_MS: number;
 export declare const PLAN_LIMIT_NOTICE = "You've hit your Claude plan's usage limit.";
 /** A 429/529 from Anthropic, classified; null for any other status. */
 export declare function rateLimitFromResponse(status: number | undefined, headers: IncomingHttpHeaders, now?: number): RateLimitInfo | null;
 /** The line for a rate limit: the plan's reset in local time when known. */
-export declare function rateLimitNoticeText(info: RateLimitInfo, now?: number, formatTime?: (ms: number, now: number) => string): string;
+export declare function rateLimitNoticeText(info: RateLimitInfo, now?: number, formatTime?: (ms: number, now: number) => string, 
+/** Said after the turn ended (next prompt, exit) rather than as it happens. */
+after?: boolean): string;
 /** `3:00 PM` today; `Sat 3:00 PM` on another day (this machine's locale and time zone). */
 export declare function localResetTime(ms: number, now: number): string;
 /**
@@ -35,6 +41,7 @@ export declare function localResetTime(ms: number, now: number): string;
 export declare class RateLimitNotices {
     private readonly clock;
     private current;
+    private seenAt;
     private promptShown;
     constructor(clock?: () => number);
     /** A refusal of a turn's request; true when it starts a new episode (say it now). */

@@ -425,9 +425,11 @@ then run `ccc` again, from your project folder.
 When Anthropic answers a turn with 429 or 529, `ccc` tells the two apart the way Claude Code
 does. Your Claude plan's usage limit (a 429 its limiter rejected) gets "You've hit your Claude
 plan's usage limit. It resets at <time>." (your local time, when Anthropic says) on your next
-prompt and as `ccc` exits. Anything else (529 overloaded, another 429) gets "Anthropic is busy;
-Claude Code will retry." The response itself reaches Claude Code unchanged, so its own retries
-and messages work as they do without `ccc`. In a print run (`ccc -p`) the line goes to stderr.
+prompt and as `ccc` exits. Anything else (529 overloaded, another 429) is Anthropic being busy:
+Claude Code retries it itself, and if it still failed you get "Anthropic was busy; try again in
+a moment." on your next prompt or as `ccc` exits. The response itself reaches Claude Code
+unchanged, so its own retries and messages work as they do without `ccc`. In a print run
+(`ccc -p`) the line goes to stderr right away ("Anthropic is busy; Claude Code will retry.").
 
 ### "Credit balance too low"
 

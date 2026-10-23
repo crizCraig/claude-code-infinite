@@ -10,11 +10,11 @@
  * the install steps, as before.
  *
  * CCC_INSTALL_PROMPT=1 asks even without a terminal, reading the answer from stdin
- * (the CI check of this flow); it still installs only on a yes.
+ * (the CI check of this flow); it still installs only on a yes. The answer is read
+ * with readline, which takes all of piped stdin, so don't also pipe a prompt then.
  */
 
 import spawn from "cross-spawn";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { claudeMissingText, type ClaudeLocation } from "./claude-locate.js";
 
@@ -95,12 +95,11 @@ export function isYes(answer: string | null): boolean {
 /** The installer for this OS: the official one-liner, run by the shell its docs name. */
 export function installerCommand(
   platform: NodeJS.Platform = process.platform,
-  env: NodeJS.ProcessEnv = process.env,
-  exists: (file: string) => boolean = fs.existsSync
+  env: NodeJS.ProcessEnv = process.env
 ): InstallerCommand {
   if (platform === "win32") {
     return {
-      command: windowsPowerShell(env, exists),
+      command: windowsPowerShell(env),
       args: ["-NoProfile", "-Command", WINDOWS_INSTALL_SCRIPT],
       display: WINDOWS_INSTALL_SCRIPT,
       env: withoutPsModulePath(env),
@@ -114,12 +113,16 @@ export function installerCommand(
   };
 }
 
-/** Run the installer with its output on this terminal; never throws. */
-export function runInstaller(installer: InstallerCommand): Promise<InstallerRun> {
+/**
+ * Run the installer with its output on this terminal; never throws. `toStderr`:
+ * its stdout goes to stderr too (a print run's stdout is Claude Code's alone).
+ */
+export function runInstaller(installer: InstallerCommand, toStderr = false): Promise<InstallerRun> {
   return new Promise((resolve) => {
     try {
       const child = spawn(installer.command, installer.args, {
-        stdio: "inherit", ...(installer.env ? { env: installer.env } : {}),
+        stdio: ["inherit", toStderr ? process.stderr : "inherit", "inherit"],
+        ...(installer.env ? { env: installer.env } : {}),
       });
       child.on("error", (error: Error) => resolve({ code: null, error }));
       child.on("close", (code: number | null) => resolve({ code }));
@@ -165,11 +168,14 @@ function failureLine(run: InstallerRun, installer: InstallerCommand): string {
   return "Claude Code's installer finished, but ccc still can't find `claude`.";
 }
 
-/** Windows PowerShell by full path (PATH may be what is broken), else by name. */
-function windowsPowerShell(env: NodeJS.ProcessEnv, exists: (file: string) => boolean): string {
+/**
+ * Windows PowerShell, always by full path: PATH may be what is broken, and a
+ * search by name would try the current folder (a project's powershell.exe) first.
+ * Missing, the spawn fails and the manual steps are shown.
+ */
+function windowsPowerShell(env: NodeJS.ProcessEnv): string {
   const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
-  const full = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  return exists(full) ? full : "powershell.exe";
+  return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
 /**

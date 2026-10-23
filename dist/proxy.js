@@ -2026,7 +2026,6 @@ function resumePaymentNotice(state, input) {
     state.diagnostics?.record("paused_notice", { trigger: "resume" });
     return state.notices.warningText(paymentNoticeText(detail));
 }
-/** The caller's extra SessionStart line; a throwing provider shows nothing. */
 /** ProxyOptions.promptSubmitNotice's line for this prompt; never throws. */
 function promptSubmitLine(state) {
     try {
@@ -2036,6 +2035,7 @@ function promptSubmitLine(state) {
         return undefined;
     }
 }
+/** The caller's extra SessionStart line; a throwing provider shows nothing. */
 function extraSessionStartLine(provider, input) {
     if (!provider || input.agent_id !== undefined || input.source === "compact")
         return undefined;

@@ -2901,7 +2901,6 @@ function resumePaymentNotice(
   return state.notices.warningText(paymentNoticeText(detail));
 }
 
-/** The caller's extra SessionStart line; a throwing provider shows nothing. */
 /** ProxyOptions.promptSubmitNotice's line for this prompt; never throws. */
 function promptSubmitLine(state: ProxyState): string | undefined {
   try {
@@ -2911,6 +2910,7 @@ function promptSubmitLine(state: ProxyState): string | undefined {
   }
 }
 
+/** The caller's extra SessionStart line; a throwing provider shows nothing. */
 function extraSessionStartLine(
   provider: (() => string | undefined) | undefined,
   input: SessionStartHookInput

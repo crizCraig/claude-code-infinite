@@ -7,7 +7,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BUSY_AFTER_NOTICE,
   BUSY_NOTICE,
+  UNKNOWN_RESET_TTL_MS,
   PLAN_LIMIT_NOTICE,
   RateLimitNotices,
   localResetTime,
@@ -84,12 +86,28 @@ test("notices: plan limit on every prompt until it resets; busy once; an answer 
   assert.equal(notices.exitLine(), undefined);
 
   assert.equal(notices.observe({ kind: "busy", status: 529 }), true);
-  assert.equal(notices.promptLine(), BUSY_NOTICE);
+  // After the fact Claude Code's retries are over: no "will retry".
+  assert.equal(notices.promptLine(), BUSY_AFTER_NOTICE);
   assert.equal(notices.promptLine(), undefined, "busy is said once per episode");
-  assert.equal(notices.exitLine(), BUSY_NOTICE, "still busy when ccc exits");
+  assert.equal(notices.exitLine(), "Anthropic was busy; try again in a moment.");
   notices.answered();
   assert.equal(notices.exitLine(), undefined);
   assert.equal(notices.observe({ kind: "busy", status: 429 }), true, "a new episode after an answer");
+});
+
+test("notices: one plan limit per reset minute; no reset time is forgotten after 5 hours", () => {
+  let now = NOW;
+  const notices = new RateLimitNotices(() => now);
+  // retry-after counts down per refusal: the same limit, said once.
+  assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 600_000 }), true);
+  now += 2000;
+  assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 601_000 }), false);
+  assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 3_600_000 }), true);
+  notices.answered();
+  notices.observe({ kind: "plan_limit", status: 429 });
+  assert.equal(notices.promptLine(), PLAN_LIMIT_NOTICE);
+  now += UNKNOWN_RESET_TTL_MS;
+  assert.equal(notices.promptLine(), undefined);
 });
 
 test("the tee: a turn's 429/529 calls back and is recorded; side requests are not", async () => {

@@ -25,6 +25,10 @@ export interface RateLimitInfo {
 }
 
 export const BUSY_NOTICE = "Anthropic is busy; Claude Code will retry.";
+/** Busy, said after the fact (next prompt, exit): Claude Code's retries have run out or stopped. */
+export const BUSY_AFTER_NOTICE = "Anthropic was busy; try again in a moment.";
+/** A plan limit with no reset time is forgotten after this (the 5-hour window). */
+export const UNKNOWN_RESET_TTL_MS = 5 * 3600 * 1000;
 export const PLAN_LIMIT_NOTICE = "You've hit your Claude plan's usage limit.";
 
 /** A 429/529 from Anthropic, classified; null for any other status. */
@@ -44,9 +48,11 @@ export function rateLimitFromResponse(
 export function rateLimitNoticeText(
   info: RateLimitInfo,
   now: number = Date.now(),
-  formatTime: (ms: number, now: number) => string = localResetTime
+  formatTime: (ms: number, now: number) => string = localResetTime,
+  /** Said after the turn ended (next prompt, exit) rather than as it happens. */
+  after = false
 ): string {
-  if (info.kind === "busy") return BUSY_NOTICE;
+  if (info.kind === "busy") return after ? BUSY_AFTER_NOTICE : BUSY_NOTICE;
   if (info.resetsAt === undefined || info.resetsAt <= now) return PLAN_LIMIT_NOTICE;
   return `${PLAN_LIMIT_NOTICE} It resets at ${formatTime(info.resetsAt, now)}.`;
 }
@@ -68,15 +74,19 @@ export function localResetTime(ms: number, now: number): string {
  */
 export class RateLimitNotices {
   private current: RateLimitInfo | null = null;
+  private seenAt = 0;
   private promptShown = false;
 
   constructor(private readonly clock: () => number = Date.now) {}
 
   /** A refusal of a turn's request; true when it starts a new episode (say it now). */
   observe(info: RateLimitInfo): boolean {
+    // Resets a minute apart are one limit (retry-after counts down per refusal).
+    const minute = (ms: number | undefined) => ms === undefined ? -1 : Math.round(ms / 60_000);
     const fresh = !this.current || this.current.kind !== info.kind ||
-      this.current.resetsAt !== info.resetsAt;
+      minute(this.current.resetsAt) !== minute(info.resetsAt);
     this.current = info;
+    this.seenAt = this.clock();
     if (fresh) this.promptShown = false;
     return fresh;
   }
@@ -91,21 +101,21 @@ export class RateLimitNotices {
     const info = this.active();
     if (!info || (info.kind === "busy" && this.promptShown)) return undefined;
     this.promptShown = true;
-    return rateLimitNoticeText(info, this.clock());
+    return rateLimitNoticeText(info, this.clock(), localResetTime, true);
   }
 
   /** For ccc's exit: the limit still in force, if any. */
   exitLine(): string | undefined {
     const info = this.active();
-    return info ? rateLimitNoticeText(info, this.clock()) : undefined;
+    return info ? rateLimitNoticeText(info, this.clock(), localResetTime, true) : undefined;
   }
 
   private active(): RateLimitInfo | null {
     const info = this.current;
-    if (info?.kind === "plan_limit" && info.resetsAt !== undefined &&
-        info.resetsAt <= this.clock()) {
-      this.current = null;
-    }
+    const now = this.clock();
+    const over = info?.kind === "plan_limit" && (info.resetsAt !== undefined
+      ? info.resetsAt <= now : now - this.seenAt >= UNKNOWN_RESET_TTL_MS);
+    if (over) this.current = null;
     return this.current;
   }
 }

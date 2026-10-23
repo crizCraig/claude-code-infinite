@@ -196,7 +196,7 @@ async function installMissingClaude(desktopOnly, interactiveUi, diagnostics) {
     const claude = await offerClaudeInstall({
         canAsk, desktopOnly,
         ask: (question) => askAnswer(question, out),
-        runInstaller: (installer) => runInstaller(installer),
+        runInstaller: (installer) => runInstaller(installer, out === process.stderr),
         locate: () => locateClaude(),
         print: (text) => out.write(`${text}\n`),
         record: (name, fields) => diagnostics.record(name, fields),
@@ -569,7 +569,8 @@ async function main() {
     // An earlier session's credit refusal (its advice, in place of the no-plan
     // line), else the no-plan line; then a subscriber whose env or settings make
     // Claude Code bill an API key instead.
-    if (!isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
+    // Not right after ccc installed Claude Code: it has just said Claude Code asks to sign in.
+    if (found && !isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
         refused: creditMemory.refusedAtStart, plan: claudeSignIn.plan, signIn: claudeSignIn,
         override: keyOverride, color: stderrColor,
     })) {
