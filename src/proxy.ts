@@ -2243,20 +2243,20 @@ async function handleMessages(
   const sessionId = requestSessionId(req);
   // Stable-prefix (edge) compaction: the main thread's human turns only. The
   // recap rides the main route above; subagents keep per-turn compression.
-  const edge =
-    isMainRequest && sessionId !== undefined
-      ? await planEdgeCompaction({
-          sizing: requestSizing,
-          opts,
-          state,
-          body,
-          messages,
-          sessionId,
-          modelContextLimit,
-          forwardBody,
-          rec,
-        })
-      : undefined;
+  const planEdge = () => planEdgeCompaction({ sizing: requestSizing, opts, state, body, messages,
+    sessionId: sessionId!, modelContextLimit, forwardBody, rec });
+  let edge = isMainRequest && sessionId !== undefined ? await planEdge() : undefined;
+  if (edge?.kind === "compress" &&
+      (state.preparing.has(sessionId!) || rec.compaction?.preparedWaitMs !== undefined)) {
+    // Never beside the session's preparation (both would be billed): wait for
+    // it, then plan again with the settings now current (a /memtree-compact
+    // that arrived meanwhile) and the preparation it may have left.
+    const waited = rec.compaction?.preparedWaitMs ?? 0;
+    await awaitPreparation(state, sessionId!, opts.memtree.longCompressBudgetMs, rec.compaction!);
+    const total = waited + (rec.compaction?.preparedWaitMs ?? 0);
+    edge = await planEdge();
+    if (rec.compaction) rec.compaction.preparedWaitMs = total;
+  }
   // Not beside a blocking compress call: the two would overlap on the server.
   if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass")) {
     maybePrepareCompression({ opts, state, body, messages, msgsForMemtree, hash, sessionId,
@@ -4257,12 +4257,18 @@ async function planToolCompaction(args: {
     return { kind: "ride",
       ride: { raw: adopted.routed.raw, turnType: "tool-prefix", sizeHolder: adopted.prefix } };
   }
+  // Settings current after any wait for a preparation (a /memtree-compact N meanwhile).
+  const modeNow = compactionMode(opts, state, sessionId);
+  if (modeNow.mode === "off") return { kind: "off" };
+  const targetNow = compactionTarget(modeNow, budget.tokens);
+  compaction.mode = modeNow.mode;
+  compaction.targetTokens = targetNow;
   compaction.reason = "budget";
   return {
     kind: "compress",
-    ...budgetCompaction(state, compaction, targetTokens, body, modelContextLimit),
-    targetTokens,
-    explicitTarget: mode.mode === "explicit",
+    ...budgetCompaction(state, compaction, targetNow, body, modelContextLimit),
+    targetTokens: targetNow,
+    explicitTarget: modeNow.mode === "explicit",
     estimateTokens: size.tokens,
     budgetTokens: budget.tokens,
     overWindow,

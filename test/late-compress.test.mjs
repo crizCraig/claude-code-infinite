@@ -64,6 +64,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     };
     if (body.index_only) return reply(200, { index_only: true, messages: [] });
     calls.push(body);
+    body.receivedAt = Date.now();
     const custom = compress?.(body, calls);
     if (custom) {
       if (custom.delayMs) await new Promise(resolve => setTimeout(resolve, custom.delayMs));
@@ -71,6 +72,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     }
     if (body.prepare) {
       if (prepareDelayMs) await new Promise(resolve => setTimeout(resolve, prepareDelayMs));
+      body.answeredAt = Date.now();
       res.setHeader('x-polychat-memtree-url', `https://app/m/prep${calls.length}-s`);
       res.setHeader('x-polychat-memtree-index', `prep${calls.length}`);
       return reply(200, prepares ? compressedReply(preparedTokens, { prepared: true })
@@ -102,8 +104,12 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     const res = await fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${session}`);
     return res.status === 200 ? (await res.json()).id : res.status;
   }
+  async function command(prompt, session = 'late-session') {
+    await fetch(proxy.hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: session, prompt }) });
+  }
   return {
-    post, forwards, calls, records, currentPage,
+    post, forwards, calls, records, currentPage, command,
     prepareCalls: () => calls.filter(c => c.prepare),
     blockingCalls: () => calls.filter(c => !c.prepare),
     close() {
@@ -224,6 +230,26 @@ test('the overflow turn waits for a preparation still in flight instead of compr
     assert.ok(overflow.ms < BLOCKING_DELAY_MS, `${overflow.ms}ms`);
     // Its MemTree page is now the session's memory source (bare node ids resolve there).
     assert.equal(await h.currentPage(), 'prep1-s');
+  } finally { h.close(); }
+});
+
+test('a /memtree-compact while a preparation is in flight compresses after it, to its own target', async () => {
+  const h = await harness({ prepareDelayMs: 800, blockingDelayMs: 0 });
+  try {
+    const conv = session(880_000);
+    assert.equal((await h.post(conv)).status, 200);
+    await until(() => h.prepareCalls().length === 1);
+    await h.command('/memtree-compact 100k');
+    conv.push({ role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+      { role: 'user', content: 'now compact' });
+    const turn = await h.post(conv);
+    assert.equal(turn.status, 200);
+    const [prep] = h.prepareCalls();
+    const [manual] = h.blockingCalls();
+    assert.ok(manual, 'the manual compaction ran');
+    assert.ok(manual.receivedAt >= prep.answeredAt, 'never beside the preparation');
+    assert.equal(manual.compression_target_tokens, 100_000, 'its own target');
+    assert.equal(turn.record.compaction.reason, 'manual');
   } finally { h.close(); }
 });
 
