@@ -163,8 +163,12 @@ test("a failing or hanging send never throws and gives up at the timeout", async
     init.signal.addEventListener("abort", () => reject(init.signal.reason));
   });
   const started = Date.now();
-  assert.equal(await runInstallPing({ env: GLOBAL_ENV, packageDir, configDir,
-    fetchImpl: hanging }), "failed");
+  // AbortSignal.timeout's timer doesn't hold the event loop open (a real socket does).
+  const keepAlive = setInterval(() => {}, 1000);
+  const result = await runInstallPing({ env: GLOBAL_ENV, packageDir, configDir,
+    fetchImpl: hanging });
+  clearInterval(keepAlive);
+  assert.equal(result, "failed");
   const took = Date.now() - started;
   assert.ok(took >= INSTALL_PING_TIMEOUT_MS - 100 && took < INSTALL_PING_TIMEOUT_MS + 1500, took);
   rmSync(base, { recursive: true, force: true });
