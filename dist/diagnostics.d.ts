@@ -99,13 +99,13 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onCreditBalanceTooLow?;
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?;
-    /**
-     * Anthropic answered a turn's request (2xx): a remembered credit refusal is stale.
-     * `startedAt` (epoch ms): when that request reached ccc.
-     */
+    /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
     private readonly onUpstreamOk?;
-    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
-    private readonly onRateLimit?;
+    /**
+     * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
+     * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
+     */
+    private readonly onMainTurnAnswer?;
     private firstRequest;
     private firstTurn;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
@@ -113,13 +113,13 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     onCreditBalanceTooLow?: ((auth: ClaudeAuthType | undefined) => void) | undefined, 
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     onClaudeAuth?: ((auth: ClaudeAuthType) => void) | undefined, 
+    /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
+    onUpstreamOk?: (() => void) | undefined, 
     /**
-     * Anthropic answered a turn's request (2xx): a remembered credit refusal is stale.
-     * `startedAt` (epoch ms): when that request reached ccc.
+     * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
+     * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
-    onUpstreamOk?: ((startedAt: number) => void) | undefined, 
-    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
-    onRateLimit?: ((info: RateLimitInfo) => void) | undefined);
+    onMainTurnAnswer?: ((rateLimit: RateLimitInfo | null, startedAt: number) => void) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;

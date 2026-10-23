@@ -616,11 +616,9 @@ async function main() {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
     claudeSignIn.seen = auth;
-  }, (startedAt) => {
-    creditMemory.answered();
-    rateLimits.answered(startedAt);
-  }, (info) => {
-    if (rateLimits.observe(info) && !interactiveUi) console.error(rateLimitNoticeText(info));
+  }, () => creditMemory.answered(), (info, startedAt) => {
+    if (!info) rateLimits.answered(startedAt);
+    else if (rateLimits.observe(info) && !interactiveUi) console.error(rateLimitNoticeText(info));
   });
 
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for

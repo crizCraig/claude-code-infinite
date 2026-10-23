@@ -32,7 +32,10 @@ export declare function rateLimitFromResponse(status: number | undefined, header
 export declare function rateLimitNoticeText(info: RateLimitInfo, now?: number, formatTime?: (ms: number, now: number) => string, 
 /** Said after the turn ended (next prompt, exit) rather than as it happens. */
 after?: boolean): string;
-/** `3:00 PM` today; `Sat 3:00 PM` on another day (this machine's locale and time zone). */
+/**
+ * `3:00 PM` today; `Sat 3:00 PM` on another day; `Sat, Oct 31, 3:00 PM` six or more
+ * days away, where the weekday alone could mean today (this machine's locale and zone).
+ */
 export declare function localResetTime(ms: number, now: number): string;
 /**
  * What ccc has said about rate limits this run. A limit stays current until

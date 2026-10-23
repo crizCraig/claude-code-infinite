@@ -49,7 +49,7 @@ test("yes (or Enter) runs the official installer, finds Claude Code and returns 
     assert.deepEqual(r.asked, [INSTALL_QUESTION]);
     assert.equal(r.installers.length, 1);
     assert.equal(r.installers[0].display, POSIX_INSTALL_SCRIPT);
-    assert.match(r.out, /✔ Claude Code is installed\. Starting it now/);
+    assert.match(r.out, /✔ Claude Code is installed\. When it starts/);
     assert.match(r.out, /sign in/);
     assert.deepEqual(r.events.map((e) => e.name),
       ["install_offered", "install_accepted", "install_succeeded"]);

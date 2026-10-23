@@ -57,12 +57,17 @@ export function rateLimitNoticeText(
   return `${PLAN_LIMIT_NOTICE} It resets at ${formatTime(info.resetsAt, now)}.`;
 }
 
-/** `3:00 PM` today; `Sat 3:00 PM` on another day (this machine's locale and time zone). */
+/**
+ * `3:00 PM` today; `Sat 3:00 PM` on another day; `Sat, Oct 31, 3:00 PM` six or more
+ * days away, where the weekday alone could mean today (this machine's locale and zone).
+ */
 export function localResetTime(ms: number, now: number): string {
   const at = new Date(ms);
   const sameDay = at.toDateString() === new Date(now).toDateString();
+  const farOff = ms - now >= 6 * 86_400_000;
   return at.toLocaleString(undefined, {
     ...(sameDay ? {} : { weekday: "short" }),
+    ...(farOff ? { month: "short", day: "numeric" } : {}),
     hour: "numeric",
     minute: "2-digit",
   });
@@ -81,10 +86,8 @@ export class RateLimitNotices {
 
   /** A refusal of a turn's request; true when it starts a new episode (say it now). */
   observe(info: RateLimitInfo): boolean {
-    // Resets a minute apart are one limit (retry-after counts down per refusal).
-    const minute = (ms: number | undefined) => ms === undefined ? -1 : Math.round(ms / 60_000);
     const fresh = !this.current || this.current.kind !== info.kind ||
-      minute(this.current.resetsAt) !== minute(info.resetsAt);
+      !sameReset(this.current.resetsAt, info.resetsAt);
     this.current = info;
     this.seenAt = this.clock();
     if (fresh) this.promptShown = false;
@@ -122,6 +125,12 @@ export class RateLimitNotices {
     if (over) this.current = null;
     return this.current;
   }
+}
+
+/** Resets within a minute are one limit (retry-after counts down per refusal). */
+function sameReset(a: number | undefined, b: number | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return Math.abs(a - b) < 60_000;
 }
 
 function resetTime(headers: IncomingHttpHeaders, now: number): number | undefined {

@@ -477,11 +477,10 @@ async function main() {
         if (auth !== claudeSignIn.seen)
             writeSeenClaudeAuth(getConfigDir(), auth);
         claudeSignIn.seen = auth;
-    }, (startedAt) => {
-        creditMemory.answered();
-        rateLimits.answered(startedAt);
-    }, (info) => {
-        if (rateLimits.observe(info) && !interactiveUi)
+    }, () => creditMemory.answered(), (info, startedAt) => {
+        if (!info)
+            rateLimits.answered(startedAt);
+        else if (rateLimits.observe(info) && !interactiveUi)
             console.error(rateLimitNoticeText(info));
     });
     // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for

@@ -69,6 +69,10 @@ test("the reset time is local: no weekday today, a weekday on another day", () =
   assert.doesNotMatch(sameDay, /Mon|Tue|Wed|Thu|Fri|Sat|Sun/);
   const later = localResetTime(NOW + 3 * 86_400_000, NOW);
   assert.notEqual(later, localResetTime(NOW + 3 * 86_400_000, NOW + 3 * 86_400_000));
+  // A week off (a weekly limit): the date too, or the weekday could mean today.
+  const week = localResetTime(NOW + 6.5 * 86_400_000, NOW);
+  assert.ok(week.length > later.length, week);
+  assert.match(week, /\b(Oct|Nov|10|11)\b|29|30/, week);
 });
 
 test("notices: plan limit on every prompt until it resets; busy once; an answer clears both", () => {
@@ -105,6 +109,8 @@ test("notices: one plan limit per reset minute; no reset time is forgotten after
   assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 600_000 }), true);
   now += 2000;
   assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 601_000 }), false);
+  // Across a half-minute boundary too (whole-second retry-after, jitter).
+  assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 629_500 }), false);
   assert.equal(notices.observe({ kind: "plan_limit", status: 429, resetsAt: NOW + 3_600_000 }), true);
   notices.answered();
   notices.observe({ kind: "plan_limit", status: 429 });
@@ -113,7 +119,8 @@ test("notices: one plan limit per reset minute; no reset time is forgotten after
   assert.equal(notices.promptLine(), undefined);
 });
 
-test("the tee: a turn's 429/529 calls back and is recorded; side requests are not", async () => {
+test("the tee: main-conversation turns drive the notices; background calls and subagents don't",
+  async () => {
   const sent = [];
   const diagnostics = new Diagnostics({
     baseUrl: "https://api.example.test/", configDir: mkdtempSync(join(tmpdir(), "ccc-rl-")),
@@ -122,24 +129,30 @@ test("the tee: a turn's 429/529 calls back and is recorded; side requests are no
     now: () => NOW,
   });
   const seen = [];
-  let answered = 0;
-  const startedAts = [];
   const sink = new DiagnosticsRequestSink(undefined, diagnostics, undefined, undefined,
-    (startedAt) => { answered += 1; startedAts.push(startedAt); }, (info) => seen.push(info.kind));
-  const rec = (over) => ({ kind: "messages", turnType: "first-user", requestBytes: 10, ...over });
-  sink.log(rec({ upstreamStatus: 429, rateLimit: { kind: "plan_limit", status: 429, resetsAt: 1 } }));
-  sink.log(rec({ upstreamStatus: 529, turnType: "side-request",
-                 rateLimit: { kind: "busy", status: 529 } }));
-  sink.log(rec({ upstreamStatus: 529, turnType: "tool", rateLimit: { kind: "busy", status: 529 } }));
+    undefined, (info, startedAt) => seen.push([info?.kind ?? "answered", startedAt]));
+  const turn = (over) => ({ kind: "messages", turnType: "first-user", requestBytes: 10,
+    routeLane: "main", client: { tools: 26 }, ...over });
+  const plan = { kind: "plan_limit", status: 429, resetsAt: 1 };
+  const busy = { kind: "busy", status: 529 };
+  sink.log(turn({ upstreamStatus: 429, rateLimit: plan }));
+  sink.log(turn({ upstreamStatus: 529, turnType: "side-request", rateLimit: busy }));
+  // Claude Code's background calls (a title: no tools) and a subagent's turns.
+  sink.log(turn({ upstreamStatus: 529, client: { tools: 0 }, rateLimit: busy }));
+  sink.log(turn({ upstreamStatus: 200, client: { tools: 1 } }));
+  sink.log(turn({ upstreamStatus: 200, routeLane: "agent" }));
+  sink.log(turn({ upstreamStatus: 529, turnType: "tool", rateLimit: busy }));
   const before = Date.now();
-  sink.log(rec({ upstreamStatus: 200, totalMs: 60_000 }));
+  sink.log(turn({ upstreamStatus: 200, totalMs: 60_000 }));
   await diagnostics.flush(1000);
-  assert.deepEqual(seen, ["plan_limit", "busy"]);
-  assert.equal(answered, 1);
+  assert.deepEqual(seen.map(([kind]) => kind), ["plan_limit", "busy", "answered"]);
   // When that request reached ccc: now minus its total time.
-  assert.ok(startedAts[0] <= Date.now() - 60_000 && startedAts[0] >= before - 60_000);
+  const startedAt = seen[2][1];
+  assert.ok(startedAt <= Date.now() - 60_000 && startedAt >= before - 60_000);
+  // Diagnostics still count every 429/529 but the security monitor's.
   const events = sent.flatMap((b) => b.events).filter((e) => e.name === "rate_limit");
-  assert.deepEqual(events.map((e) => [e.kind, e.status]), [["plan_limit", 429], ["busy", 529]]);
+  assert.deepEqual(events.map((e) => [e.kind, e.status]),
+    [["plan_limit", 429], ["busy", 529], ["busy", 529]]);
   assert.equal(sanitizeEvent("rate_limit", { kind: "other", status: 429 }, 1).kind, undefined);
 });
 

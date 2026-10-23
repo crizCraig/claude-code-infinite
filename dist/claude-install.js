@@ -100,8 +100,8 @@ async function installClaude(deps, platform) {
     const found = run.error ? null : deps.locate();
     if (found) {
         deps.record("install_succeeded", { ms, claude_found: found.source });
-        deps.print("\n✔ Claude Code is installed. Starting it now: " +
-            "the first time, it asks you to sign in to your Claude account.\n");
+        deps.print("\n✔ Claude Code is installed. When it starts, " +
+            "it asks you to sign in to your Claude account the first time.\n");
         return found;
     }
     const reason = run.error ? "spawn" : run.code !== 0 ? "exit" : "not_found";

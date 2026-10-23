@@ -230,13 +230,13 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onCreditBalanceTooLow?: (auth: ClaudeAuthType | undefined) => void,
     /** The sign-in type a request showed: subscription or api_key (claude-plan-warning.ts). */
     private readonly onClaudeAuth?: (auth: ClaudeAuthType) => void,
+    /** Anthropic answered a turn's request (2xx): a remembered credit refusal is stale. */
+    private readonly onUpstreamOk?: () => void,
     /**
-     * Anthropic answered a turn's request (2xx): a remembered credit refusal is stale.
-     * `startedAt` (epoch ms): when that request reached ccc.
+     * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
+     * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
-    private readonly onUpstreamOk?: (startedAt: number) => void,
-    /** Anthropic refused a turn's request with 429/529 (rate-limit.ts). */
-    private readonly onRateLimit?: (info: RateLimitInfo) => void
+    private readonly onMainTurnAnswer?: (rateLimit: RateLimitInfo | null, startedAt: number) => void
   ) {}
 
   log(record: RequestRecord): void {
@@ -287,7 +287,7 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     // Claude Code's own side requests (the security monitor) don't speak for its turns.
     if (typeof status === "number" && status >= 200 && status < 300 &&
         rec.turnType !== "side-request") {
-      this.onUpstreamOk?.(Date.now() - (rec.totalMs ?? 0));
+      this.onUpstreamOk?.();
     }
     if (typeof status === "number" && status >= 400) {
       this.diagnostics.recordLimited(`upstream:${status}`, "upstream_error", fields);
@@ -296,7 +296,10 @@ export class DiagnosticsRequestSink implements RequestLogSink {
       const { kind, status: limitStatus } = rec.rateLimit;
       this.diagnostics.recordLimited(`rate_limit:${kind}`, "rate_limit",
         { kind, status: limitStatus });
-      this.onRateLimit?.(rec.rateLimit);
+    }
+    const answered = typeof status === "number" && status >= 200 && status < 300;
+    if ((rec.rateLimit || answered) && mainTurn(rec)) {
+      this.onMainTurnAnswer?.(rec.rateLimit ?? null, Date.now() - (rec.totalMs ?? 0));
     }
     if (rec.upstreamError === CREDIT_BALANCE_TOO_LOW) {
       this.diagnostics.recordLimited("credit", "error", { code: CREDIT_BALANCE_TOO_LOW });
@@ -380,6 +383,16 @@ export function localeName(): string {
   } catch {
     return "other";
   }
+}
+
+/**
+ * A turn of the main conversation, as the user sees it: its lane, with Claude
+ * Code's tool list. Not a subagent's, nor Claude Code's background calls (titles,
+ * suggestions: no tools, or one), which may fail or succeed on their own.
+ */
+function mainTurn(rec: Extract<RequestRecord, { kind: "messages" }>): boolean {
+  return rec.turnType !== "side-request" && rec.routeLane === "main" &&
+    (rec.client?.tools ?? 0) > 1;
 }
 
 function turnType(value: string): string {
