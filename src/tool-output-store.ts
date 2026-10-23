@@ -20,8 +20,12 @@ const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 export class ToolOutputStore {
   constructor(readonly dir: string = path.join(getConfigDir(), "tool-outputs")) {}
 
-  /** Save `text` and return its path, or undefined when it could not be written. */
-  save(text: string): string | undefined {
+  /**
+   * Save `text` and return its path, or undefined when it could not be written.
+   * Eviction never removes a path in `keep` (the other copies one shortened
+   * request points at).
+   */
+  save(text: string, keep: ReadonlySet<string> = new Set()): string | undefined {
     if (!this.privateDir()) return undefined;
     const name = createHash("sha256").update(text).digest("hex").slice(0, 32);
     const file = path.join(this.dir, `${name}.txt`);
@@ -30,7 +34,7 @@ export class ToolOutputStore {
       return file;
     }
     if (!writeAtomically(this.dir, file, text)) return undefined;
-    this.evict(file);
+    this.evict(new Set([...keep, file]));
     return file;
   }
 
@@ -47,13 +51,14 @@ export class ToolOutputStore {
     }
   }
 
-  /** Drop the oldest files (never `keep`) until both limits hold. */
-  private evict(keep: string): void {
-    const files = listFiles(this.dir).sort((a, b) => b.mtimeMs - a.mtimeMs);
+  /** Drop the oldest files (never one in `keep`) until both limits hold. */
+  private evict(keep: ReadonlySet<string>): void {
+    const files = listFiles(this.dir).sort((a, b) =>
+      Number(keep.has(b.file)) - Number(keep.has(a.file)) || b.mtimeMs - a.mtimeMs);
     let bytes = 0;
     files.forEach((entry, i) => {
       bytes += entry.size;
-      if (entry.file !== keep && (i >= MAX_FILES || bytes > MAX_BYTES)) unlinkQuietly(entry.file);
+      if (!keep.has(entry.file) && (i >= MAX_FILES || bytes > MAX_BYTES)) unlinkQuietly(entry.file);
     });
   }
 }

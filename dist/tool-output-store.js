@@ -20,8 +20,12 @@ export class ToolOutputStore {
     constructor(dir = path.join(getConfigDir(), "tool-outputs")) {
         this.dir = dir;
     }
-    /** Save `text` and return its path, or undefined when it could not be written. */
-    save(text) {
+    /**
+     * Save `text` and return its path, or undefined when it could not be written.
+     * Eviction never removes a path in `keep` (the other copies one shortened
+     * request points at).
+     */
+    save(text, keep = new Set()) {
         if (!this.privateDir())
             return undefined;
         const name = createHash("sha256").update(text).digest("hex").slice(0, 32);
@@ -32,7 +36,7 @@ export class ToolOutputStore {
         }
         if (!writeAtomically(this.dir, file, text))
             return undefined;
-        this.evict(file);
+        this.evict(new Set([...keep, file]));
         return file;
     }
     /** The directory exists, is a real directory owned by this user, mode 700. */
@@ -50,13 +54,13 @@ export class ToolOutputStore {
             return false;
         }
     }
-    /** Drop the oldest files (never `keep`) until both limits hold. */
+    /** Drop the oldest files (never one in `keep`) until both limits hold. */
     evict(keep) {
-        const files = listFiles(this.dir).sort((a, b) => b.mtimeMs - a.mtimeMs);
+        const files = listFiles(this.dir).sort((a, b) => Number(keep.has(b.file)) - Number(keep.has(a.file)) || b.mtimeMs - a.mtimeMs);
         let bytes = 0;
         files.forEach((entry, i) => {
             bytes += entry.size;
-            if (entry.file !== keep && (i >= MAX_FILES || bytes > MAX_BYTES))
+            if (!keep.has(entry.file) && (i >= MAX_FILES || bytes > MAX_BYTES))
                 unlinkQuietly(entry.file);
         });
     }

@@ -461,5 +461,11 @@ test('tool output store: one private file per distinct output, same path every t
       assert.equal(fs.statSync(path.dirname(a)).mode & 0o777, 0o700);
       assert.equal(fs.statSync(a).mode & 0o777, 0o600);
     }
+    // Past the cap, a kept set survives eviction: one request's 70 copies all stay.
+    const kept = new Set();
+    for (let i = 0; i < 70; i++) kept.add(store.save(`output ${i}`, kept));
+    assert.ok([...kept].every((file) => fs.existsSync(file)), 'every kept copy is still there');
+    store.save('one more');
+    assert.ok(fs.readdirSync(path.dirname(a)).filter((n) => n.endsWith('.txt')).length <= 64);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
