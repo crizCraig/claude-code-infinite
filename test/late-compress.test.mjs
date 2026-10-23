@@ -461,31 +461,24 @@ test('tool output store: one private file per distinct output, same path every t
       assert.equal(fs.statSync(path.dirname(a)).mode & 0o777, 0o700);
       assert.equal(fs.statSync(a).mode & 0o777, 0o600);
     }
-    // Past the cap, recent copies (by mtime) are kept: a request's 70 copies all
-    // stay while another request saves (Codex r6: concurrent eviction).
-    let clock = 1_000;
+    // Past the cap, nothing under an hour old is evicted: a request's 70
+    // copies all stay while another ccc process saves (Codex r6-r9).
+    let clock = Date.now();
     const pinnedStore = new ToolOutputStore(path.join(dir, 'pinned'), () => clock);
     const first = Array.from({ length: 70 }, (_, i) => pinnedStore.save(`output ${i}`));
-    // Another ccc process sharing the directory saves meanwhile.
     new ToolOutputStore(path.join(dir, 'pinned'), () => clock).save('another request');
-    assert.ok(first.every((file) => fs.existsSync(file)), 'every pinned copy is still there');
-    // An hour later the pins have expired and the cap holds again.
-    clock += 61 * 60 * 1000;
+    assert.ok(first.every((file) => fs.existsSync(file)), 'every recent copy is still there');
+    // Within its half hour an output keeps its path (no rewrite: same bytes).
+    clock += 60_000;
+    assert.equal(pinnedStore.save('output 3'), first[3]);
+    // Later it gets a new path, so an old path is never handed out again and
+    // eviction (only of copies over an hour old) cannot race a request.
+    clock += 31 * 60_000;
+    const later = pinnedStore.save('output 3');
+    assert.notEqual(later, first[3]);
+    clock += 61 * 60_000;
     pinnedStore.save('one more');
     const count = fs.readdirSync(path.join(dir, 'pinned')).filter((n) => n.endsWith('.txt')).length;
-    assert.ok(count <= 65, `${count} files`);
-    // Eviction racing a reuse (another process touching the file between the
-    // listing and the delete) keeps the file: evictOne re-checks it aside.
-    const racer = new ToolOutputStore(path.join(dir, 'race'), () => clock);
-    const victim = racer.save('reused while evicted');
-    const stale = new Date(clock - 2 * 60 * 60 * 1000);
-    fs.utimesSync(victim, stale, stale);
-    fs.utimesSync(victim, new Date(clock), new Date(clock)); // the reuse's touch
-    racer.evictOne(victim, clock - 60 * 60 * 1000);
-    assert.equal(fs.readFileSync(victim, 'utf-8'), 'reused while evicted', 'put back');
-    // And a reuse after the delete writes it again.
-    fs.unlinkSync(victim);
-    assert.equal(racer.save('reused while evicted'), victim);
-    assert.equal(fs.readFileSync(victim, 'utf-8'), 'reused while evicted');
+    assert.ok(count <= 64, `${count} files`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

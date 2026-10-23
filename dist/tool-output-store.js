@@ -3,18 +3,17 @@
  * (tool-result-truncation.ts), so the model can read the omitted part
  * verbatim with Claude Code's own Read or Grep tools.
  *
- * One file per distinct output under ~/.claude-code-infinite/tool-outputs/,
- * named by its content hash (the same output always gets the same path, so a
- * repeated truncation sends the same bytes), mode 600 in a private mode-700
- * directory, at most MAX_FILES files and MAX_BYTES bytes (oldest dropped),
- * except that a copy saved or reused within PIN_MS (its mtime) is never
- * dropped: the request pointing at it may still be on its way (counted,
- * forwarded) while another request, in this ccc or another, saves.
+ * One file per distinct output and half hour under
+ * ~/.claude-code-infinite/tool-outputs/, named by its content hash and the
+ * half hour it was first needed (within a half hour the same output gets the
+ * same path, so a repeated truncation sends the same bytes), mode 600 in a
+ * private mode-700 directory, at most MAX_FILES files and MAX_BYTES bytes.
  *
- * No lock: copies are content-addressed, so any process may write the same
- * bytes again. Eviction first renames a file aside and re-checks its mtime
- * there, restoring it when a reuse touched it meanwhile; a reuse touches,
- * then confirms the file is still in place, and writes it again if not.
+ * No lock is needed between ccc processes: a path is only ever returned while
+ * its file is under BUCKET_MS old, and eviction only removes files over
+ * EVICT_AFTER_MS old, so a path handed out is never removed while the request
+ * that points at it is on its way. Rewriting the same name writes the same
+ * bytes (an atomic rename), so concurrent saves agree.
  */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -23,8 +22,10 @@ import { getConfigDir } from "./config.js";
 const MAX_FILES = 64;
 const MAX_BYTES = 512 * 1024 * 1024;
 const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
-/** How long a copy saved or reused (its mtime) is protected from eviction. */
-const PIN_MS = 60 * 60 * 1000;
+/** A copy is reused only within the half hour its name carries. */
+const BUCKET_MS = 30 * 60 * 1000;
+/** Only copies older than this (twice a bucket) are ever evicted. */
+const EVICT_AFTER_MS = 2 * BUCKET_MS;
 export class ToolOutputStore {
     dir;
     now;
@@ -37,12 +38,13 @@ export class ToolOutputStore {
         if (!this.privateDir())
             return undefined;
         const name = createHash("sha256").update(text).digest("hex").slice(0, 32);
-        const file = path.join(this.dir, `${name}.txt`);
-        if (isOurFile(file) && touch(file, this.now()) && isOurFile(file))
+        const bucket = Math.floor(this.now() / BUCKET_MS);
+        const file = path.join(this.dir, `${name}-${bucket}.txt`);
+        if (isOurFile(file))
             return file;
         if (!writeAtomically(this.dir, file, text))
             return undefined;
-        touch(file, this.now());
+        stamp(file, this.now());
         this.evict();
         return file;
     }
@@ -61,39 +63,16 @@ export class ToolOutputStore {
             return false;
         }
     }
-    /** Drop the oldest files not touched within PIN_MS until both limits hold. */
+    /** Drop the oldest files over EVICT_AFTER_MS old until both limits hold. */
     evict() {
-        const recent = this.now() - PIN_MS;
+        const old = this.now() - EVICT_AFTER_MS;
         const files = listFiles(this.dir).sort((a, b) => b.mtimeMs - a.mtimeMs);
         let bytes = 0;
         files.forEach((entry, i) => {
             bytes += entry.size;
-            if (entry.mtimeMs < recent && (i >= MAX_FILES || bytes > MAX_BYTES)) {
-                this.evictOne(entry.file, recent);
-            }
+            if (entry.mtimeMs < old && (i >= MAX_FILES || bytes > MAX_BYTES))
+                unlinkQuietly(entry.file);
         });
-    }
-    /**
-     * Remove `file` unless it was touched since `recent`: renamed aside first,
-     * so a reuse that touched it before the rename is seen there (and the file
-     * put back) and one after it finds the file gone and writes it again.
-     */
-    evictOne(file, recent) {
-        const aside = path.join(this.dir, `.${randomBytes(12).toString("hex")}.evict`);
-        try {
-            fs.renameSync(file, aside);
-        }
-        catch {
-            return;
-        }
-        try {
-            if (fs.lstatSync(aside).mtimeMs >= recent)
-                fs.linkSync(aside, file);
-        }
-        catch {
-            // Already back (a reuse wrote it again), or gone: either way it is safe.
-        }
-        unlinkQuietly(aside);
     }
 }
 function listFiles(dir) {
@@ -124,15 +103,14 @@ function isOurFile(file) {
         return false;
     }
 }
-/** Set `file`'s mtime to `nowMs`; false when it is not there to touch. */
-function touch(file, nowMs) {
+/** Set a new copy's mtime to the store's clock (its age for eviction). */
+function stamp(file, nowMs) {
     try {
         const now = new Date(nowMs);
         fs.utimesSync(file, now, now);
-        return true;
     }
     catch {
-        return false;
+        // Its real mtime is close enough.
     }
 }
 /** Write through an exclusive, unpredictable temporary file and rename it. */
