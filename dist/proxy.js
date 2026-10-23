@@ -2941,7 +2941,7 @@ async function planEdgeCompaction(args) {
         }
         if (size.tokens >= budget.tokens || overWindow) {
             const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
-                waitMs: opts.memtree.compressBudgetMs });
+                waitMs: opts.memtree.longCompressBudgetMs });
             if (adopted)
                 return { kind: "ride", ...adopted };
             return forced("budget", fallback);
@@ -2959,7 +2959,7 @@ async function planEdgeCompaction(args) {
     noteUncountedBound(compaction, args.sizing, originalCandidate, body, modelContextLimit);
     if (calibratedSizeExceedsLimits(compaction, body, modelContextLimit)) {
         const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
-            waitMs: opts.memtree.compressBudgetMs });
+            waitMs: opts.memtree.longCompressBudgetMs });
         if (adopted)
             return { kind: "ride", ...adopted };
         return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
@@ -3050,7 +3050,7 @@ async function planToolCompaction(args) {
     }
     const adopted = stableLane
         ? await adoptPreparedPrefix({ ...args, sessionId: sessionId, budgetTokens: budget.tokens,
-            compaction, waitMs: opts.memtree.compressBudgetMs })
+            compaction, waitMs: opts.memtree.longCompressBudgetMs })
         : undefined;
     if (adopted) {
         return { kind: "ride",
@@ -3113,12 +3113,18 @@ async function adoptPreparedPrefix(args) {
         return undefined;
     state.prepared.discard(sessionId);
     const fit = await preparedFit(args, entry);
-    // Another request installed a prefix while this one counted: it wins.
-    const kind = fit.kind === "used" && state.stablePrefixes.get(sessionId) !== base
+    // Another request installed a prefix, or `/memtree-compact` asked for its
+    // own target, while this one waited or counted: that wins.
+    const kind = fit.kind === "used" && (state.stablePrefixes.get(sessionId) !== base ||
+        state.compactNow.has(sessionId) || compactionMode(args.opts, state, sessionId).mode !== "auto")
         ? "stale" : fit.kind;
     args.compaction.prepared = kind;
-    if (kind !== "used" || fit.kind !== "used")
+    if (kind !== "used" || fit.kind !== "used") {
+        // A preparation not adopted is never sent, not even as a fallback.
+        if (fit.candidate)
+            args.sizing.excludeFallback(fit.candidate);
         return undefined;
+    }
     args.compaction.estimatedTokens = fit.tokens;
     args.compaction.estimatedBytes = fit.routed.raw.length;
     boundedSet(state.stablePrefixes, sessionId, entry.prefix);
@@ -3175,7 +3181,7 @@ async function preparedFit(args, entry) {
     // Too large, the turn compresses as before; the ride stays registered, so
     // if that cannot fit either, delivery's safety net may shorten its newest
     // tool result instead (truncatedToFit).
-    return fits ? { kind: "used", routed, tokens } : { kind: "too-large" };
+    return fits ? { kind: "used", routed, tokens, candidate } : { kind: "too-large", candidate };
 }
 /**
  * After a main-thread turn's plan: once its size nears the budget, ask
@@ -4300,8 +4306,8 @@ async function selectForwardCandidate(args) {
             target = policy.sizing.register(replacement, "replacement");
     }
     const selection = await policy.sizing.select(target, args.limits) ??
-        (args.rec.routeLane === "main" && !args.state.keyInvalid() && args.state.pausedDetail() === null
-            ? await truncatedToFit(args.rec, args.body, policy.sizing, target, args.limits)
+        (args.rec.routeLane === "main" && args.opts.toolOutputs
+            ? await truncatedToFit(args.rec, policy.sizing, target, args.limits, args.opts.toolOutputs)
             : undefined);
     const quietDegrade = quietDegrades.get(args.rec);
     quietDegrades.delete(args.rec);
@@ -4342,49 +4348,45 @@ const TRUNCATION_ATTEMPTS = 3;
 const TRUNCATION_MARGIN = 1.25;
 /**
  * The safety net for a main-thread request that does not fit even after
- * compression (tool-result-truncation.ts): its newest tool result with the
- * middle replaced by a pointer to the full output in MemTree, cut until the
- * request leaves the reply's room below the window. A compressed candidate
- * (a ride on a prefix, or a replacement whose suffix is structured) first,
- * else the whole history. Main thread only: the pointer reads the session's
- * own MemTree.
+ * compression (tool-result-truncation.ts): its newest tool result saved whole
+ * (tool-output-store.ts) and sent with the middle replaced by a pointer to
+ * that copy, cut until the request leaves the reply's room below the window.
+ * A compressed candidate first (a ride on a prefix, or a replacement whose
+ * suffix is structured), else the whole history.
  */
-async function truncatedToFit(rec, body, sizing, preferred, limits) {
-    if (!memtreeHoldsConversation(rec))
+async function truncatedToFit(rec, sizing, preferred, limits, store) {
+    if (!compressionSettled(rec))
         return undefined;
-    const position = normalizeMessagesForMemtree(messagesWithSystem(Array.isArray(body.messages) ? body.messages : [], body.system)).length - 1;
-    // Compressed candidates first (smallest first); the whole history last, for
-    // a result that alone is most of it.
     const rank = (item) => item.kind === "original" ? 1 : 0;
     const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred)]
         .sort((a, b) => rank(a) - rank(b) || a.body.length - b.body.length);
     for (const base of bases) {
-        const fitted = await truncateCandidate(rec, sizing, base, limits, position);
+        const fitted = await truncateCandidate(rec, sizing, base, limits, store);
         if (fitted)
             return fitted;
     }
     return undefined;
 }
 /**
- * Whether the request was compressed (or found uncompressible) by a MemTree
- * that took the whole conversation in, so the pointer names a result it holds:
- * a ride on a prepared prefix, a compression that went out and still does not
- * fit, or MemTree's own 413 (it cannot fit the window even compressed). Not
- * after a failed or skipped compress call (an outage, an exception, an auth or
- * payment refusal, a backoff), a passthrough (the index is still warming: the
- * wait keeps the result whole), or while the index is behind.
+ * Whether compression had its chance and the request still cannot fit: a ride
+ * on a prepared prefix, a compress answer that compressed (sent or found too
+ * large), or MemTree's 413 (it cannot fit the window even compressed). Not
+ * after a failed or skipped compress call (an outage, an exception, an auth
+ * or payment refusal, a backoff: the retryable refusal stands), a passthrough
+ * of a warming index, or while the index is behind: waiting for it lets
+ * compression summarize instead.
  */
-function memtreeHoldsConversation(rec) {
+function compressionSettled(rec) {
     if (rec.indexBehind === true)
         return false;
     if (rec.compress?.refused === true || rec.compaction?.prepared === "used")
         return true;
-    return rec.compress?.ok === true &&
-        (rec.turnType === "tool-recompressed" || rec.turnType === "followup-compressed");
+    return rec.compress?.ok === true && rec.routeRecovery?.outcome !== "noop" &&
+        rec.turnType !== "followup-noop";
 }
-/** truncatedToFit for one compressed candidate; undefined when it has no
- * tool result to shorten or cannot be made to fit. */
-async function truncateCandidate(rec, sizing, base, limits, position) {
+/** truncatedToFit for one candidate; undefined when it has no tool result to
+ * shorten, the copy could not be saved, or it cannot be made to fit. */
+async function truncateCandidate(rec, sizing, base, limits, store) {
     const goal = limits.context - Math.max(limits.output, COMPRESSION_RESERVE_TOKENS);
     const parsed = JSON.parse(base.body.toString("utf-8"));
     const first = await sizing.measure(base, limits);
@@ -4392,14 +4394,14 @@ async function truncateCandidate(rec, sizing, base, limits, position) {
     for (let attempt = 1; attempt <= TRUNCATION_ATTEMPTS; attempt++) {
         const excess = Math.max(1_000, first.tokens - goal);
         const cut = Math.ceil(excess * bytesPerToken * TRUNCATION_MARGIN * attempt);
-        const plan = truncateLargestToolResult(parsed, cut, position);
+        const plan = truncateLargestToolResult(parsed, cut, (text) => store.save(text));
         if (!plan)
             return undefined;
         const candidate = sizing.register(Buffer.from(JSON.stringify(plan.body), "utf-8"), "replacement");
         const measurement = await sizing.measure(candidate, limits);
         if (fitsMeasured(measurement, limits) && measurement.tokens <= goal) {
             rec.truncatedToolResult = { originalChars: plan.originalChars,
-                omittedChars: plan.omittedChars, memtreePosition: position };
+                omittedChars: plan.omittedChars };
             return { candidate, measurement };
         }
     }

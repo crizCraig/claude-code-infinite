@@ -40,6 +40,7 @@
  */
 import { capCacheBreakpoints } from "./route-cache.js";
 import { estimateRequestTokens } from "./request-sizing.js";
+import type { ToolOutputStore } from "./tool-output-store.js";
 import { MemtreeClient } from "./memtree.js";
 import { type FirstTreeIntro } from "./hooks.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -161,6 +162,12 @@ export interface ProxyOptions {
      * persistence (tests); the CLI passes the store under ~/.claude-code-infinite.
      */
     stablePrefixStore?: StablePrefixStore;
+    /**
+     * Where a tool result shortened to fit the window (truncatedToFit) is saved
+     * whole, for the model to read with its Read tool. Omitted means no such
+     * shortening (tests); the CLI passes the store under ~/.claude-code-infinite.
+     */
+    toolOutputs?: ToolOutputStore;
     /**
      * The session's newest completed tree, asked of the server, which the link
      * shown to the user points at (the compress page is only the tree the memory

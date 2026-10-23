@@ -236,13 +236,13 @@ export interface MessagesRecord {
      */
     prepare?: "prepare" | "too-small" | "in-flight" | "fresh" | "unsupported";
     /**
-     * A tool result too large for the window even after compression, sent with
-     * its middle replaced by a pointer to the full output in MemTree.
+     * A tool result too large for the window even after compression, saved
+     * whole (tool-output-store.ts) and sent with its middle replaced by a
+     * pointer to that copy.
      */
     truncatedToolResult?: {
         originalChars: number;
         omittedChars: number;
-        memtreePosition: number;
     };
     /** Every actual counting attempt, in order; cached results add no entry. */
     countTokens?: CountTokensRecord[];

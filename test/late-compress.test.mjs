@@ -12,6 +12,10 @@ import { MemtreeClient } from '../dist/memtree.js';
 import { compressionTrigger, PreparedCompressions, prepareRefreshTokens, prepareStartTokens }
   from '../dist/prepared-compression.js';
 import { truncateLargestToolResult } from '../dist/tool-result-truncation.js';
+import { ToolOutputStore } from '../dist/tool-output-store.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const OPUS = 'claude-opus-5-5';
 /** Anthropic's count in this harness: one token per 4 bytes of the body. */
@@ -76,7 +80,9 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     reply(200, compressedReply(480_000));
   });
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret' });
+  const outputsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccc-outputs-'));
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+    toolOutputs: new ToolOutputStore(path.join(outputsDir, 'tool-outputs')),
     countTokens: true, ...(budget !== undefined ? { budgetTokensOverride: budget } : {}),
     reqlog: { log: record => records.push(structuredClone(record)) } });
   async function post(messages, { session = 'late-session', agent } = {}) {
@@ -103,6 +109,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     close() {
       proxy.close();
       for (const { server } of [upstream, memory]) { server.closeAllConnections(); server.close(); }
+      fs.rmSync(outputsDir, { recursive: true, force: true });
     },
   };
 }
@@ -297,11 +304,12 @@ test('replay: a 300k tool result too large even on the compressed prefix keeps i
     assert.ok(result.startsWith(head), 'the head word for word');
     assert.ok(result.endsWith(tail), 'the tail word for word');
     assert.match(result, /output truncated by MemTree to fit the context window/);
-    assert.match(result, /read_lines \{"tail": true, "start": \d+, "end": \d+, "full": true\}/);
-    const position = Number(result.match(/"start": (\d+)/)[1]);
-    assert.equal(position, conv.length - 1, 'its position in what MemTree received');
+    const saved = result.match(/The full output is saved at (.+?): read the omitted part with the Read tool/)?.[1];
+    assert.ok(saved, 'points at the saved copy');
+    assert.equal(fs.readFileSync(saved, 'utf-8'), conv.at(-1).content[0].content,
+      'the whole result, word for word');
+    if (process.platform !== 'win32') assert.equal(fs.statSync(saved).mode & 0o777, 0o600);
     assert.ok(tokensOf(sent) <= 960_000, `${tokensOf(sent)} tokens sent`);
-    assert.equal(overflow.record.truncatedToolResult.memtreePosition, position);
     assert.ok(overflow.record.truncatedToolResult.omittedChars > 200_000);
   } finally { h.close(); }
 });
@@ -379,32 +387,46 @@ test('tool result truncation keeps head and tail and points at MemTree', () => {
     { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Bash', input: {} }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'small', content: 'tiny' },
       { type: 'tool_result', tool_use_id: 't', content: [{ type: 'text', text }] }] }] };
-  const plan = truncateLargestToolResult(body, 60_000, 3);
+  const saved = [];
+  const save = (full) => { saved.push(full); return '/tmp/ccc-outputs/abc.txt'; };
+  const plan = truncateLargestToolResult(body, 60_000, save);
   assert.ok(plan);
   const kept = plan.body.messages[2].content[1].content[0].text;
   assert.ok(kept.startsWith('a'.repeat(1_000)) && kept.endsWith('c'.repeat(1_000)));
   assert.ok(kept.length <= text.length - 60_000 + 500, `${kept.length}`);
-  assert.match(kept, /"start": 3, "end": 3/);
+  assert.match(kept, /The full output is saved at \/tmp\/ccc-outputs\/abc.txt: read the omitted part/);
+  assert.equal(saved[0], text, 'the whole text is saved');
   assert.equal(plan.toolUseId, 't');
   assert.equal(plan.body.messages[2].content[0].content, 'tiny', 'other results untouched');
   assert.equal(body.messages[2].content[1].content[0].text, text, 'input not mutated');
   // Deterministic: the same cut gives the same bytes (a prompt-cache hit next time).
-  assert.equal(JSON.stringify(truncateLargestToolResult(body, 60_000, 3).body), JSON.stringify(plan.body));
-  assert.equal(truncateLargestToolResult({ messages: [{ role: 'user', content: 'plain' }] }, 10, 0), null);
+  assert.equal(JSON.stringify(truncateLargestToolResult(body, 60_000, save).body),
+    JSON.stringify(plan.body));
+  assert.equal(truncateLargestToolResult({ messages: [{ role: 'user', content: 'plain' }] }, 10, save),
+    null);
+  assert.equal(truncateLargestToolResult(body, 60_000, () => undefined), null,
+    'never shortened when the copy cannot be saved');
   // A cut past the whole result keeps the minimum head and tail.
-  const minimal = truncateLargestToolResult(body, 10_000_000, 3);
+  const minimal = truncateLargestToolResult(body, 10_000_000, save);
   const minimalText = minimal.body.messages[2].content[1].content[0].text;
   assert.ok(minimalText.startsWith('a'.repeat(900)) && minimalText.endsWith('c'.repeat(900)));
   assert.ok(minimal.omittedChars > text.length - 3_000, `${minimal.omittedChars}`);
-  const log = Array.from({ length: 4_000 }, (_, i) => `step ${i} compiled module m${i} ok`)
-    .join('\n');
-  const logBody = { messages: [{ role: 'user', content: [{ type: 'tool_result',
-    tool_use_id: 'b', content: log }] }] };
-  const logged = truncateLargestToolResult(logBody, 100_000, 7).body.messages[0].content[0].content;
-  const phrase = logged.match(/"query": "([^"]+)"/)?.[1];
-  assert.ok(phrase && log.includes(phrase.split(' ').slice(0, 2).join(' ')),
-    `a phrase from the omitted part to find it once indexed: ${phrase}`);
   const short = { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't',
     content: 'z'.repeat(3_000) }] }] };
-  assert.equal(truncateLargestToolResult(short, 10, 0), null, 'too short to shorten');
+  assert.equal(truncateLargestToolResult(short, 10, save), null, 'too short to shorten');
+});
+
+test('tool output store: one private file per distinct output, same path every time', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccc-store-'));
+  try {
+    const store = new ToolOutputStore(path.join(dir, 'tool-outputs'));
+    const a = store.save('first output');
+    assert.equal(store.save('first output'), a);
+    assert.notEqual(store.save('second output'), a);
+    assert.equal(fs.readFileSync(a, 'utf-8'), 'first output');
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.dirname(a)).mode & 0o777, 0o700);
+      assert.equal(fs.statSync(a).mode & 0o777, 0o600);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

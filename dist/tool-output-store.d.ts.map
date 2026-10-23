@@ -1,0 +1,1 @@
+{"version":3,"file":"tool-output-store.d.ts","sourceRoot":"","sources":["../src/tool-output-store.ts"],"names":[],"mappings":"AAmBA,qBAAa,eAAe;IACd,QAAQ,CAAC,GAAG,EAAE,MAAM;gBAAX,GAAG,GAAE,MAAkD;IAE5E,kFAAkF;IAClF,IAAI,CAAC,IAAI,EAAE,MAAM,GAAG,MAAM,GAAG,SAAS;IAatC,8EAA8E;IAC9E,OAAO,CAAC,UAAU;IAYlB,mEAAmE;IACnE,OAAO,CAAC,KAAK;CAQd"}

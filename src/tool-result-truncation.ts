@@ -2,15 +2,11 @@
  * Last-resort fit for a single tool result too large for the window even
  * after compression (polychat docs/context_memory_request_pipeline.md,
  * "Prepared compression"): keep its head and tail word for word and replace
- * the middle with a pointer to the full output in MemTree, instead of
- * refusing the request.
- *
- * MemTree has the whole result: the proxy sends every main-thread request's
- * full conversation to it for indexing (the caller checks it got there). Its
- * read_lines tool reads a message no tree covers yet ("tail") by position, up
- * to 40,000 characters a call; once the message is indexed, a search for a
- * phrase from the omitted part finds its transcript lines, which read_lines
- * pages through.
+ * the middle with a pointer to the full output, instead of refusing the
+ * request. The full output is saved first (`saveFull`, tool-output-store.ts),
+ * and the pointer names that file, which the model reads verbatim, page by
+ * page, with Claude Code's own Read tool (MemTree indexes the conversation
+ * too, but its tail read returns at most 40,000 characters of one message).
  */
 
 /** Kept text is a multiple of this, so a slightly different overflow on the
@@ -31,18 +27,20 @@ export interface TruncationPlan {
   toolUseId?: string;
   originalChars: number;
   omittedChars: number;
+  /** Where the full output was saved. */
+  savedAt: string;
 }
 
 /**
  * Truncate the largest text of a tool result in the body's last message so
- * the body loses at least `cutChars` characters, or null when it has no
- * tool result text that large. `memtreePosition` is that message's position
- * in the conversation MemTree receives (the system prompt is its message 0).
+ * the body loses at least `cutChars` characters (or keeps the minimum), or
+ * null when it has none worth shortening or `saveFull` could not save it.
+ * `saveFull` stores the whole text and returns where.
  */
 export function truncateLargestToolResult(
   body: Record<string, any>,
   cutChars: number,
-  memtreePosition: number
+  saveFull: (text: string) => string | undefined
 ): TruncationPlan | null {
   const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const messageIndex = messages.length - 1;
@@ -50,11 +48,12 @@ export function truncateLargestToolResult(
   if (!last || last.role !== "user" || !Array.isArray(last.content)) return null;
   const site = largestToolText(last.content);
   if (!site) return null;
-  const pointer = (omitted: number, phrase: string) =>
-    pointerText(omitted, site.text.length, memtreePosition, phrase);
-  const longest = pointer(site.text.length, "x".repeat(SEARCH_PHRASE_MAX_CHARS)).length;
+  const longest = pointerText(site.text.length, site.text.length, "").length + PATH_ALLOWANCE;
   const keep = keptChars(site.text.length, cutChars + longest);
   if (keep === null) return null;
+  const savedAt = saveFull(site.text);
+  if (savedAt === undefined) return null;
+  const pointer = (omitted: number) => pointerText(omitted, site.text.length, savedAt);
   const { text, omitted } = cutMiddle(site.text, keep, pointer);
   const content = last.content.map((block: any, i: number) =>
     i === site.blockIndex ? withToolText(block, site.partIndex, text) : block);
@@ -64,40 +63,20 @@ export function truncateLargestToolResult(
     ...(typeof site.toolUseId === "string" ? { toolUseId: site.toolUseId } : {}),
     originalChars: site.text.length,
     omittedChars: omitted,
+    savedAt,
   };
 }
 
 /** The pointer that stands for the omitted middle. */
-export function pointerText(
-  omittedChars: number, totalChars: number, position: number, phrase: string
-): string {
-  const search = phrase
-    ? `; once it is indexed, MemTree search {"tree": "current", "query": "${phrase}"} ` +
-      `finds the omitted part and read_lines on that hit reads it page by page`
-    : "";
+export function pointerText(omittedChars: number, totalChars: number, savedAt: string): string {
   return `\n\n[… output truncated by MemTree to fit the context window: ` +
     `${omittedChars.toLocaleString("en-US")} of ${totalChars.toLocaleString("en-US")} ` +
-    `characters omitted here. The full output is in MemTree: read_lines ` +
-    `{"tail": true, "start": ${position}, "end": ${position}, "full": true} shows its ` +
-    `first 40,000 characters while it is not yet indexed${search} ` +
-    `(if MemTree does not have it yet, retry shortly) …]\n\n`;
+    `characters omitted here. The full output is saved at ${savedAt}: read the omitted ` +
+    `part with the Read tool (offset and limit) or search it with Grep …]\n\n`;
 }
 
-/** Longest search phrase quoted in a pointer. */
-const SEARCH_PHRASE_MAX_CHARS = 60;
-
-/** A few plain words from the start of the omitted part, for MemTree search. */
-function searchPhrase(omitted: string): string {
-  const words = omitted.slice(0, 400).replace(/[^A-Za-z0-9_.\-]+/g, " ").trim().split(" ")
-    .filter((word) => word.length > 1 && word.length <= 30).slice(0, 6);
-  let phrase = "";
-  for (const word of words) {
-    const next = phrase ? `${phrase} ${word}` : word;
-    if (next.length > SEARCH_PHRASE_MAX_CHARS) break;
-    phrase = next;
-  }
-  return phrase;
-}
+/** Room left in the pointer estimate for the saved file's path. */
+const PATH_ALLOWANCE = 512;
 
 interface ToolTextSite {
   blockIndex: number;
@@ -146,15 +125,13 @@ function keptChars(length: number, cut: number): number | null {
 }
 
 function cutMiddle(
-  text: string, keep: number, pointer: (omitted: number, phrase: string) => string
+  text: string, keep: number, pointer: (omitted: number) => string
 ): { text: string; omitted: number } {
   const headEnd = safeBoundary(text, snapToLine(text, Math.floor(keep * HEAD_SHARE), -1));
   const tailStart = Math.max(headEnd,
     safeBoundary(text, snapToLine(text, text.length - (keep - headEnd), 1)));
   const omitted = tailStart - headEnd;
-  const phrase = searchPhrase(text.slice(headEnd, tailStart));
-  return { text: text.slice(0, headEnd) + pointer(omitted, phrase) + text.slice(tailStart),
-    omitted };
+  return { text: text.slice(0, headEnd) + pointer(omitted) + text.slice(tailStart), omitted };
 }
 
 /** Move `at` to just after a nearby line break, toward `direction` first. */
