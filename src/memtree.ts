@@ -997,6 +997,8 @@ export class MemtreeClient {
   private lastAnswerKeyInvalid = false;
   /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
+  /** HTTP status of each key's latest failed compress (absent: no response). */
+  private compressFailureStatus = new Map<string, number>();
 
   /**
    * Non-null when the server last answered 402 (unpaid MemTree key): the
@@ -1175,6 +1177,18 @@ export class MemtreeClient {
   }
 
   /**
+   * The HTTP status of the latest failed compress of this request, sampled at
+   * its settle like lastCompressFailureArming; undefined when it got none.
+   */
+  lastCompressFailureStatus(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): number | undefined {
+    return this.compressFailureStatus.get(this.compressKey(hash, modelContextLimit, meta));
+  }
+
+  /**
    * Blocking user-turn compression. Returns null on ANY failure (timeout,
    * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
    * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -1226,6 +1240,12 @@ export class MemtreeClient {
       if (this.compressFailureArming.size > DEDUPE_CACHE_MAX) {
         const first = this.compressFailureArming.keys().next().value;
         if (first !== undefined) this.compressFailureArming.delete(first);
+      }
+      this.compressFailureStatus.delete(cacheKey);
+      if (status !== undefined) this.compressFailureStatus.set(cacheKey, status);
+      if (this.compressFailureStatus.size > DEDUPE_CACHE_MAX) {
+        const first = this.compressFailureStatus.keys().next().value;
+        if (first !== undefined) this.compressFailureStatus.delete(first);
       }
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
       // automatic retry of an identical request) hit the server again.

@@ -6,8 +6,11 @@
  * refusing the request.
  *
  * MemTree has the whole result: the proxy sends every main-thread request's
- * full conversation to it for indexing, and its read_lines tool reads the
- * messages no tree covers yet ("tail") by their position.
+ * full conversation to it for indexing (the caller checks it got there). Its
+ * read_lines tool reads a message no tree covers yet ("tail") by position, up
+ * to 40,000 characters a call; once the message is indexed, a search for a
+ * phrase from the omitted part finds its transcript lines, which read_lines
+ * pages through.
  */
 
 /** Kept text is a multiple of this, so a slightly different overflow on the
@@ -47,8 +50,10 @@ export function truncateLargestToolResult(
   if (!last || last.role !== "user" || !Array.isArray(last.content)) return null;
   const site = largestToolText(last.content);
   if (!site) return null;
-  const pointer = (omitted: number) => pointerText(omitted, site.text.length, memtreePosition);
-  const keep = keptChars(site.text.length, cutChars + pointer(cutChars).length);
+  const pointer = (omitted: number, phrase: string) =>
+    pointerText(omitted, site.text.length, memtreePosition, phrase);
+  const longest = pointer(site.text.length, "x".repeat(SEARCH_PHRASE_MAX_CHARS)).length;
+  const keep = keptChars(site.text.length, cutChars + longest);
   if (keep === null) return null;
   const { text, omitted } = cutMiddle(site.text, keep, pointer);
   const content = last.content.map((block: any, i: number) =>
@@ -63,12 +68,35 @@ export function truncateLargestToolResult(
 }
 
 /** The pointer that stands for the omitted middle. */
-export function pointerText(omittedChars: number, totalChars: number, position: number): string {
+export function pointerText(
+  omittedChars: number, totalChars: number, position: number, phrase: string
+): string {
+  const search = phrase
+    ? `; once it is indexed, MemTree search {"tree": "current", "query": "${phrase}"} ` +
+      `finds the omitted part and read_lines on that hit reads it page by page`
+    : "";
   return `\n\n[… output truncated by MemTree to fit the context window: ` +
     `${omittedChars.toLocaleString("en-US")} of ${totalChars.toLocaleString("en-US")} ` +
-    `characters omitted here. Full result: MemTree read_lines ` +
-    `{"tail": true, "start": ${position}, "end": ${position}, "full": true} ` +
-    `(if it is not there yet, MemTree is still receiving it: retry shortly) …]\n\n`;
+    `characters omitted here. The full output is in MemTree: read_lines ` +
+    `{"tail": true, "start": ${position}, "end": ${position}, "full": true} shows its ` +
+    `first 40,000 characters while it is not yet indexed${search} ` +
+    `(if MemTree does not have it yet, retry shortly) …]\n\n`;
+}
+
+/** Longest search phrase quoted in a pointer. */
+const SEARCH_PHRASE_MAX_CHARS = 60;
+
+/** A few plain words from the start of the omitted part, for MemTree search. */
+function searchPhrase(omitted: string): string {
+  const words = omitted.slice(0, 400).replace(/[^A-Za-z0-9_.\-]+/g, " ").trim().split(" ")
+    .filter((word) => word.length > 1 && word.length <= 30).slice(0, 6);
+  let phrase = "";
+  for (const word of words) {
+    const next = phrase ? `${phrase} ${word}` : word;
+    if (next.length > SEARCH_PHRASE_MAX_CHARS) break;
+    phrase = next;
+  }
+  return phrase;
 }
 
 interface ToolTextSite {
@@ -106,21 +134,27 @@ function withToolText(block: any, partIndex: number, text: string): any {
   return { ...block, content: parts };
 }
 
-/** Characters of the original to keep, quantized down; null if too few remain. */
+/**
+ * Characters of the original to keep, quantized down; at least MIN_KEEP_CHARS
+ * (a cut past that keeps the minimum, and the caller measures whether it is
+ * enough); null when the result is too short to shorten at all.
+ */
 function keptChars(length: number, cut: number): number | null {
-  const raw = length - cut;
-  const keep = Math.floor(raw / KEEP_QUANTUM_CHARS) * KEEP_QUANTUM_CHARS;
-  return keep >= MIN_KEEP_CHARS ? keep : raw >= MIN_KEEP_CHARS ? MIN_KEEP_CHARS : null;
+  if (length <= MIN_KEEP_CHARS * 2) return null;
+  const keep = Math.floor((length - cut) / KEEP_QUANTUM_CHARS) * KEEP_QUANTUM_CHARS;
+  return Math.max(MIN_KEEP_CHARS, keep);
 }
 
 function cutMiddle(
-  text: string, keep: number, pointer: (omitted: number) => string
+  text: string, keep: number, pointer: (omitted: number, phrase: string) => string
 ): { text: string; omitted: number } {
   const headEnd = safeBoundary(text, snapToLine(text, Math.floor(keep * HEAD_SHARE), -1));
   const tailStart = Math.max(headEnd,
     safeBoundary(text, snapToLine(text, text.length - (keep - headEnd), 1)));
   const omitted = tailStart - headEnd;
-  return { text: text.slice(0, headEnd) + pointer(omitted) + text.slice(tailStart), omitted };
+  const phrase = searchPhrase(text.slice(headEnd, tailStart));
+  return { text: text.slice(0, headEnd) + pointer(omitted, phrase) + text.slice(tailStart),
+    omitted };
 }
 
 /** Move `at` to just after a nearby line break, toward `direction` first. */

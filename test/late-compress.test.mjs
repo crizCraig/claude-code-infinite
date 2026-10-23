@@ -42,7 +42,7 @@ function compressedReply(tokens, { prepared = false, budget = 960_000 } = {}) {
 }
 
 async function harness({ prepares = true, preparedTokens = 480_000, blockingDelayMs = BLOCKING_DELAY_MS,
-  budget, model = OPUS, oneMillion = true, compress } = {}) {
+  budget, model = OPUS, oneMillion = true, compress, prepareDelayMs = 0 } = {}) {
   const forwards = [], calls = [], records = [];
   const upstream = await listen(async (req, res) => {
     const body = await readJson(req);
@@ -66,6 +66,9 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
       return reply(custom.status ?? 200, custom.body);
     }
     if (body.prepare) {
+      if (prepareDelayMs) await new Promise(resolve => setTimeout(resolve, prepareDelayMs));
+      res.setHeader('x-polychat-memtree-url', `https://app/m/prep${calls.length}-s`);
+      res.setHeader('x-polychat-memtree-index', `prep${calls.length}`);
       return reply(200, prepares ? compressedReply(preparedTokens, { prepared: true })
         : compressedReply(preparedTokens));
     }
@@ -76,11 +79,12 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
     countTokens: true, ...(budget !== undefined ? { budgetTokensOverride: budget } : {}),
     reqlog: { log: record => records.push(structuredClone(record)) } });
-  async function post(messages, { session = 'late-session' } = {}) {
+  async function post(messages, { session = 'late-session', agent } = {}) {
     const started = Date.now();
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-claude-code-session-id': session,
+        ...(agent ? { 'x-claude-code-agent-id': agent } : {}),
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
       body: JSON.stringify({ model, max_tokens: 32_000, messages }),
     });
@@ -88,8 +92,12 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     return { status: response.status, ms: Date.now() - started, text,
       record: records.filter(r => r.kind === 'messages').at(-1) };
   }
+  async function currentPage(session = 'late-session') {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${session}`);
+    return res.status === 200 ? (await res.json()).id : res.status;
+  }
   return {
-    post, forwards, calls, records,
+    post, forwards, calls, records, currentPage,
     prepareCalls: () => calls.filter(c => c.prepare),
     blockingCalls: () => calls.filter(c => !c.prepare),
     close() {
@@ -194,14 +202,49 @@ test('replay: a 100k tool result landing at 940k rides the prepared prefix with 
   } finally { h.close(); }
 });
 
+test('the overflow turn waits for a preparation still in flight instead of compressing again', async () => {
+  const h = await harness({ prepareDelayMs: 700 });
+  try {
+    const conv = session(880_000);
+    assert.equal((await h.post(conv)).status, 200);
+    await until(() => h.prepareCalls().length === 1);
+    addRound(conv, 'big', 100_000 * 4);
+    const overflow = await h.post(conv);
+    assert.equal(overflow.status, 200);
+    assert.equal(h.blockingCalls().length, 0, 'one compression, the prepared one');
+    assert.equal(overflow.record.compaction.prepared, 'used');
+    assert.ok(overflow.record.compaction.preparedWaitMs > 0);
+    assert.ok(overflow.ms < BLOCKING_DELAY_MS, `${overflow.ms}ms`);
+    // Its MemTree page is now the session's memory source (bare node ids resolve there).
+    assert.equal(await h.currentPage(), 'prep1-s');
+  } finally { h.close(); }
+});
+
+test('no truncation without MemTree holding the result, nor on a subagent', async () => {
+  for (const [label, status, agent] of [['an auth failure', 401, undefined],
+    ['a subagent', 413, 'sub-1']]) {
+    const h = await harness({ preparedTokens: 700_000, compress: body => body.prepare ? undefined
+      : { status, body: { detail: 'refused' } } });
+    try {
+      const conv = session(880_000);
+      assert.equal((await h.post(conv, { agent })).status, 200);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      addRound(conv, 'huge', 300_000 * 4);
+      const overflow = await h.post(conv, { agent });
+      assert.notEqual(overflow.status, 200, `${label}: refused, not truncated`);
+      assert.equal(overflow.record.truncatedToolResult, undefined, label);
+    } finally { h.close(); }
+  }
+});
+
 test('replay: without a prepared prefix the overflow turn compresses blocking, as before', async () => {
   const h = await harness({ prepares: false });
   try {
     const conv = session(880_000);
     assert.equal((await h.post(conv)).status, 200);
     await until(() => h.prepareCalls().length === 1);
-    await growTo(h, conv, 940_000);
-    assert.equal(h.prepareCalls().length, 1, 'a server that does not prepare is asked once');
+    await growTo(h, conv, 1_000_000 * 0.95);
+    assert.ok(h.prepareCalls().length <= 3, 'a server that does not prepare is asked a few times');
     addRound(conv, 'big', 100_000 * 4);
     const overflow = await h.post(conv);
     assert.equal(overflow.status, 200);
@@ -281,7 +324,9 @@ test('an under-budget human turn does not wait for a slow MemTree', async () => 
     assert.equal(fast.record.turnType, 'followup-under-budget');
     assert.deepEqual(h.forwards.at(-1).messages, conv, 'sent whole');
     await until(() => h.calls.length === 2, 5_000);
-    assert.equal(h.calls[1].compression_threshold_tokens, 100_000, 'the same call, in the background');
+    assert.equal(h.calls[1].compression_target_tokens, -1,
+      'in the background, and never compressing: the turn already went out whole');
+    assert.equal(h.calls[1].compression_threshold_tokens, undefined);
 
     // Near the trigger (over 85% of it) the turn compresses as before.
     conv.push({ role: 'assistant', content: 'a3' },
@@ -297,6 +342,8 @@ test('compression trigger leaves the reply room below the window', () => {
   assert.equal(compressionTrigger(1_000_000, 1_000_000), 960_000);
   assert.equal(compressionTrigger(200_000, 200_000), 160_000);
   assert.equal(compressionTrigger(64_000, 200_000), 64_000);
+  // A small window keeps the server's 0.8 share (the window less 40k is lower).
+  assert.equal(compressionTrigger(100_000, 100_000), 80_000);
   assert.equal(prepareStartTokens(960_000), 850_000);
   assert.equal(prepareRefreshTokens(960_000), 50_000);
 });
@@ -320,8 +367,10 @@ test('prepared compressions: one call per session, refreshed by growth, backoff 
   prepared.discard('s');
   assert.equal(prepared.get('s'), undefined);
   assert.equal(prepared.decide('s', 930_000, 960_000), 'prepare');
-  prepared.noteServerSupport(false);
+  for (let i = 0; i < 3; i++) prepared.noteServerAnswer(false);
   assert.equal(prepared.decide('t', 900_000, 960_000), 'unsupported');
+  prepared.noteServerAnswer(true);
+  assert.equal(prepared.decide('t', 900_000, 960_000), 'prepare');
 });
 
 test('tool result truncation keeps head and tail and points at MemTree', () => {
@@ -342,5 +391,20 @@ test('tool result truncation keeps head and tail and points at MemTree', () => {
   // Deterministic: the same cut gives the same bytes (a prompt-cache hit next time).
   assert.equal(JSON.stringify(truncateLargestToolResult(body, 60_000, 3).body), JSON.stringify(plan.body));
   assert.equal(truncateLargestToolResult({ messages: [{ role: 'user', content: 'plain' }] }, 10, 0), null);
-  assert.equal(truncateLargestToolResult(body, 10_000_000, 3), null, 'nothing left to keep');
+  // A cut past the whole result keeps the minimum head and tail.
+  const minimal = truncateLargestToolResult(body, 10_000_000, 3);
+  const minimalText = minimal.body.messages[2].content[1].content[0].text;
+  assert.ok(minimalText.startsWith('a'.repeat(900)) && minimalText.endsWith('c'.repeat(900)));
+  assert.ok(minimal.omittedChars > text.length - 3_000, `${minimal.omittedChars}`);
+  const log = Array.from({ length: 4_000 }, (_, i) => `step ${i} compiled module m${i} ok`)
+    .join('\n');
+  const logBody = { messages: [{ role: 'user', content: [{ type: 'tool_result',
+    tool_use_id: 'b', content: log }] }] };
+  const logged = truncateLargestToolResult(logBody, 100_000, 7).body.messages[0].content[0].content;
+  const phrase = logged.match(/"query": "([^"]+)"/)?.[1];
+  assert.ok(phrase && log.includes(phrase.split(' ').slice(0, 2).join(' ')),
+    `a phrase from the omitted part to find it once indexed: ${phrase}`);
+  const short = { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't',
+    content: 'z'.repeat(3_000) }] }] };
+  assert.equal(truncateLargestToolResult(short, 10, 0), null, 'too short to shorten');
 });

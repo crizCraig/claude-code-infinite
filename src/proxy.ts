@@ -528,6 +528,8 @@ interface ProxyState {
    * would cross it.
    */
   prepared: PreparedCompressions<StablePrefix>;
+  /** Each session's preparation still in flight (maybePrepareCompression). */
+  preparing: Map<string, Promise<void>>;
   /**
    * Model budgets the server reported (`model_budget_tokens`), keyed by
    * model and context window (serverBudgetKey).
@@ -989,6 +991,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     compactNow: new Set(),
     stablePrefixes: new Map(),
     prepared: new PreparedCompressions(),
+    preparing: new Map(),
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
@@ -2247,8 +2250,8 @@ async function handleMessages(
           rec,
         })
       : undefined;
-  if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass" ||
-      (edge.kind === "compress" && edge.reason === undefined))) {
+  // Not beside a blocking compress call: the two would overlap on the server.
+  if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass")) {
     maybePrepareCompression({ opts, state, body, messages, msgsForMemtree, hash, sessionId,
       modelContextLimit, rec, clientMeta });
   }
@@ -2494,7 +2497,9 @@ async function handleMessages(
     // indexes it and reports the page and budget) runs in the background.
     compressInBackground({ opts, state, body, msgsForMemtree, hash, modelContextLimit, rec,
       sessionId, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
-      compaction: { target: edge.target, threshold: edge.threshold },
+      // Never compress: the turn went out whole, so a compression the server's
+      // own (more conservative) sizing chose could not be used, only billed.
+      compaction: { target: NEVER_COMPRESS_TARGET_TOKENS },
       linkSeq: isAwaySummary ? undefined : nextMemtreeCallSeq(state) });
     releaseForOriginalFallback();
     sendingWhole();
@@ -3957,7 +3962,7 @@ type EdgePlan =
    * (clearlyUnderBudget): forward whole now and make the compress call, which
    * could only pass it through, in the background.
    */
-  | { kind: "pass"; target: number; threshold: number }
+  | { kind: "pass" }
   /** Send on the stored prefix; no compress call. */
   | { kind: "ride"; prefix: StablePrefix; routed: { body: Record<string, any>; raw: Buffer } }
   /**
@@ -4075,7 +4080,8 @@ async function planEdgeCompaction(args: {
       return forced("target-change", fallback);
     }
     if (size.tokens >= budget.tokens || overWindow) {
-      const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction });
+      const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+        waitMs: opts.memtree.compressBudgetMs });
       if (adopted) return { kind: "ride", ...adopted };
       return forced("budget", fallback);
     }
@@ -4091,7 +4097,8 @@ async function planEdgeCompaction(args: {
   compaction.sizeSource = size.source;
   noteUncountedBound(compaction, args.sizing, originalCandidate, body, modelContextLimit);
   if (calibratedSizeExceedsLimits(compaction, body, modelContextLimit)) {
-    const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction });
+    const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+      waitMs: opts.memtree.compressBudgetMs });
     if (adopted) return { kind: "ride", ...adopted };
     return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
   }
@@ -4099,9 +4106,7 @@ async function planEdgeCompaction(args: {
     // The server measures the request and compresses only past the budget.
     const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
     compaction.thresholdTokens = threshold;
-    if (clearlyUnderBudget(budget, size, compaction)) {
-      return { kind: "pass", target: targetTokens, threshold };
-    }
+    if (clearlyUnderBudget(opts, state, budget, size, compaction)) return { kind: "pass" };
     return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
   }
   // Without calibrated usage or threshold support, let the server decide
@@ -4239,7 +4244,7 @@ async function planToolCompaction(args: {
   }
   const adopted = stableLane
     ? await adoptPreparedPrefix({ ...args, sessionId: sessionId!, budgetTokens: budget.tokens,
-      compaction })
+      compaction, waitMs: opts.memtree.compressBudgetMs })
     : undefined;
   if (adopted) {
     return { kind: "ride",
@@ -4260,6 +4265,8 @@ async function planToolCompaction(args: {
   };
 }
 
+/** Server `compression_target_tokens` sentinel: never compress, always pass through. */
+const NEVER_COMPRESS_TARGET_TOKENS = -1;
 /** Share of the budget under which a counted human turn skips its blocking call. */
 const CLEARLY_UNDER_BUDGET_RATIO = 0.85;
 
@@ -4269,7 +4276,12 @@ const CLEARLY_UNDER_BUDGET_RATIO = 0.85;
  * usage; never a byte guess) against a budget the server reported. The
  * compress call could then only pass it through, so it need not wait for it.
  */
-function clearlyUnderBudget(budget: Budget, size: PlannedSize, compaction: CompactionRecord): boolean {
+function clearlyUnderBudget(
+  opts: ProxyOptions, state: ProxyState, budget: Budget, size: PlannedSize,
+  compaction: CompactionRecord,
+): boolean {
+  // A known payment or key failure keeps the blocking path: it gives the notice.
+  if (opts.memtree.paymentRequiredDetail !== null || state.keyInvalid()) return false;
   return budget.source !== "window-ratio" && size.source === "reported" &&
     compaction.uncountedOverWindow !== true &&
     size.tokens <= Math.floor(budget.tokens * CLEARLY_UNDER_BUDGET_RATIO);
@@ -4301,20 +4313,56 @@ async function adoptPreparedPrefix(args: {
   modelContextLimit: number;
   budgetTokens: number;
   compaction: CompactionRecord;
+  /** How long to wait for a preparation still in flight (the compress budget). */
+  waitMs: number;
 }): Promise<{ prefix: StablePrefix; routed: { body: Record<string, any>; raw: Buffer } } | undefined> {
   const { state, sessionId } = args;
+  const base = state.stablePrefixes.get(sessionId);
+  await awaitPreparation(state, sessionId, args.waitMs, args.compaction);
   const entry = state.prepared.get(sessionId);
   if (!entry) return undefined;
   state.prepared.discard(sessionId);
   const fit = await preparedFit(args, entry);
-  args.compaction.prepared = fit.kind;
-  if (fit.kind !== "used") return undefined;
+  // Another request installed a prefix while this one counted: it wins.
+  const kind = fit.kind === "used" && state.stablePrefixes.get(sessionId) !== base
+    ? "stale" : fit.kind;
+  args.compaction.prepared = kind;
+  if (kind !== "used" || fit.kind !== "used") return undefined;
   args.compaction.estimatedTokens = fit.tokens;
   args.compaction.estimatedBytes = fit.routed.raw.length;
   boundedSet(state.stablePrefixes, sessionId, entry.prefix);
   state.compactNow.delete(sessionId);
+  if (entry.source) notePreparedSource(state, sessionId, entry.source);
   persistStablePrefix(state, sessionId, entry.prefix);
   return { prefix: entry.prefix, routed: fit.routed };
+}
+
+/**
+ * The turn that crosses the budget while its session's preparation is still
+ * in flight waits for it (it started earlier than a fresh compression could),
+ * for at most `waitMs`, rather than making a second, concurrent compress call.
+ */
+async function awaitPreparation(
+  state: ProxyState, sessionId: string, waitMs: number, compaction: CompactionRecord
+): Promise<void> {
+  const pending = state.preparing.get(sessionId);
+  if (!pending) return;
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([pending, new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, waitMs));
+  })]).finally(() => clearTimeout(timer));
+  compaction.preparedWaitMs = Date.now() - started;
+}
+
+/** An adopted preparation's MemTree page becomes the session's memory source and page. */
+function notePreparedSource(
+  state: ProxyState, sessionId: string, source: NonNullable<Prepared<StablePrefix>["source"]>
+): void {
+  const result = { messages: [], compressed: true, memtreeUrl: source.url,
+    memtreeIndex: source.index } as CompressResult;
+  noteMemtreePage(state, source.seq, sessionId, result);
+  noteMemorySource(state, source.seq, sessionId, result);
 }
 
 type PreparedFit =
@@ -4325,8 +4373,10 @@ type PreparedFit =
 async function preparedFit(
   args: Parameters<typeof adoptPreparedPrefix>[0], entry: Prepared<StablePrefix>
 ): Promise<PreparedFit> {
-  const { sizing, body, messages, modelContextLimit, budgetTokens } = args;
-  if (entry.prefix.modelContextLimit !== modelContextLimit || entry.triggerTokens !== budgetTokens) {
+  const { sizing, body, messages, modelContextLimit, budgetTokens, compaction } = args;
+  if (entry.prefix.modelContextLimit !== modelContextLimit || entry.triggerTokens !== budgetTokens ||
+      entry.prefix.targetTokens !== compaction.targetTokens ||
+      entry.prefix.explicitTarget !== (compaction.mode === "explicit")) {
     return { kind: "stale" };
   }
   if (prefixMismatch(body, messages, entry.prefix, args.sessionId, stablePrefixMessageHash)) {
@@ -4368,8 +4418,11 @@ function maybePrepareCompression(args: {
 }): void {
   const { state, sessionId, rec } = args;
   const compaction = rec.compaction;
-  if (!compaction || compaction.mode === "off" || compaction.estimatedTokens === undefined ||
-      compaction.targetTokens === undefined ||
+  // Automatic compaction only: an explicit target (/memtree-compact N) is the
+  // user's own schedule, and a high one would leave nothing to prepare for.
+  if (!compaction || compaction.mode !== "auto" || compaction.estimatedTokens === undefined ||
+      compaction.targetTokens === undefined || state.keyInvalid() ||
+      state.pausedDetail() !== null ||
       !preparesCompression(args.body.model, args.modelContextLimit)) return;
   const tokens = compaction.estimatedTokens;
   if (tokens < prepareStartTokens(compaction.budgetTokens)) return;
@@ -4378,26 +4431,30 @@ function maybePrepareCompression(args: {
   if (decision !== "prepare" ||
       !state.prepared.begin(sessionId, tokens, compaction.budgetTokens)) return;
   const base = state.stablePrefixes.get(sessionId);
-  void prepareInBackground({ ...args, tokens, targetTokens: compaction.targetTokens,
-    explicitTarget: compaction.mode === "explicit", triggerTokens: compaction.budgetTokens })
+  const pending = prepareInBackground({ ...args, tokens, targetTokens: compaction.targetTokens,
+    explicitTarget: false, triggerTokens: compaction.budgetTokens,
+    linkSeq: nextMemtreeCallSeq(state) })
     .catch(() => undefined)
     .then((prepared) => {
       // A prefix installed meanwhile (a blocking compaction) supersedes it.
       const current = state.stablePrefixes.get(sessionId) === base;
       state.prepared.finish(sessionId, current ? prepared : undefined);
+      if (state.preparing.get(sessionId) === pending) state.preparing.delete(sessionId);
     });
+  boundedSet(state.preparing, sessionId, pending);
 }
 
 /** The background prepare call and the prefix it yields (maybePrepareCompression). */
 async function prepareInBackground(args: Parameters<typeof maybePrepareCompression>[0] & {
   tokens: number; targetTokens: number; explicitTarget: boolean; triggerTokens: number;
+  linkSeq: number;
 }): Promise<Prepared<StablePrefix> | undefined> {
   const { opts, state, body, msgsForMemtree, modelContextLimit, sessionId } = args;
   const result = await opts.memtree.compress(args.hash, msgsForMemtree, modelContextLimit,
     state.shutdownSignal, preparedCompressMeta(args));
   noteServerBudget(state, body.model, modelContextLimit, result);
   if (!result) return undefined;
-  state.prepared.noteServerSupport(result.prepared === true);
+  state.prepared.noteServerAnswer(result.prepared === true);
   if (result.prepared !== true || !didMemtreeCompress(result) ||
       !checkCompressedHistory(result, msgsForMemtree).usable) return undefined;
   const built = buildCompressedBody(body, result);
@@ -4413,7 +4470,10 @@ async function prepareInBackground(args: Parameters<typeof maybePrepareCompressi
     explicitTarget: args.explicitTarget,
     modelContextLimit,
   };
-  return { prefix, atTokens: args.tokens, triggerTokens: args.triggerTokens };
+  const source = result.memtreeUrl && result.memtreeIndex
+    ? { url: result.memtreeUrl, index: result.memtreeIndex, seq: args.linkSeq } : undefined;
+  return { prefix, atTokens: args.tokens, triggerTokens: args.triggerTokens,
+    ...(source ? { source } : {}) };
 }
 
 /** What a prepare call sends: a forced compression to the target, no threshold. */
@@ -4992,6 +5052,8 @@ async function runBlockingCompression(args: {
   const failureArming =
     result === null &&
     opts.memtree.lastCompressFailureArming(hash, modelContextLimit, compressMeta);
+  const failureStatus = result === null
+    ? opts.memtree.lastCompressFailureStatus?.(hash, modelContextLimit, compressMeta) : undefined;
   const hadLiveSuccess = !cached && result !== null;
   // Only arming-class live failures (network error, timeout, 5xx, 402) are
   // fuse evidence. A responsive server's other 4xx failed THIS call but says
@@ -5005,7 +5067,7 @@ async function runBlockingCompression(args: {
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
     timedOut: result === null && compressMs >= budgetMs,
-    ...(result === null && !cached && !failureArming ? { refused: true as const } : {}),
+    ...(!cached && failureStatus === OVER_CONTEXT_STATUS ? { refused: true as const } : {}),
   };
   return {
     result,
@@ -5734,7 +5796,9 @@ async function selectForwardCandidate(args: {
     if (replacement) target = policy.sizing.register(replacement, "replacement");
   }
   const selection = await policy.sizing.select(target, args.limits) ??
-    await truncatedToFit(args.rec, args.body, policy.sizing, target, args.limits);
+    (args.rec.routeLane === "main" && !args.state.keyInvalid() && args.state.pausedDetail() === null
+      ? await truncatedToFit(args.rec, args.body, policy.sizing, target, args.limits)
+      : undefined);
   const quietDegrade = quietDegrades.get(args.rec);
   quietDegrades.delete(args.rec);
   if (!selection) {
@@ -5765,17 +5829,21 @@ async function selectForwardCandidate(args: {
   return changed ? candidate.body : intended;
 }
 
+/** MemTree's answer when the conversation cannot fit the window even compressed. */
+const OVER_CONTEXT_STATUS = 413;
 /** Truncation attempts, each cutting more, before the request is refused. */
 const TRUNCATION_ATTEMPTS = 3;
 /** Cut this much more than the measured excess (tokens per character vary). */
 const TRUNCATION_MARGIN = 1.25;
 
 /**
- * The safety net for a compressed request that still does not fit
- * (tool-result-truncation.ts): its newest tool result with the middle
- * replaced by a pointer to the full output in MemTree, cut until the request
- * leaves the reply's room below the window. Only a compressed candidate
- * (a ride on a prefix, or a replacement whose suffix is structured).
+ * The safety net for a main-thread request that does not fit even after
+ * compression (tool-result-truncation.ts): its newest tool result with the
+ * middle replaced by a pointer to the full output in MemTree, cut until the
+ * request leaves the reply's room below the window. A compressed candidate
+ * (a ride on a prefix, or a replacement whose suffix is structured) first,
+ * else the whole history. Main thread only: the pointer reads the session's
+ * own MemTree.
  */
 async function truncatedToFit(
   rec: MessagesRecord, body: Record<string, any>, sizing: RequestSizing,
@@ -5784,8 +5852,11 @@ async function truncatedToFit(
   if (!memtreeHoldsConversation(rec)) return undefined;
   const position = normalizeMessagesForMemtree(
     messagesWithSystem(Array.isArray(body.messages) ? body.messages : [], body.system)).length - 1;
-  const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred)
-    .sort((a, b) => a.body.length - b.body.length)].filter((item) => item.kind !== "original");
+  // Compressed candidates first (smallest first); the whole history last, for
+  // a result that alone is most of it.
+  const rank = (item: RequestCandidate) => item.kind === "original" ? 1 : 0;
+  const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred)]
+    .sort((a, b) => rank(a) - rank(b) || a.body.length - b.body.length);
   for (const base of bases) {
     const fitted = await truncateCandidate(rec, sizing, base, limits, position);
     if (fitted) return fitted;
@@ -5794,16 +5865,19 @@ async function truncatedToFit(
 }
 
 /**
- * Whether MemTree can serve the full result a truncation pointer names: not
- * after a failed compress call (an outage, an unpaid pause, an exception)
- * unless a responsive MemTree refused it, and not while the index is behind
- * (waiting for it keeps the result whole).
+ * Whether the request was compressed (or found uncompressible) by a MemTree
+ * that took the whole conversation in, so the pointer names a result it holds:
+ * a ride on a prepared prefix, a compression that went out and still does not
+ * fit, or MemTree's own 413 (it cannot fit the window even compressed). Not
+ * after a failed or skipped compress call (an outage, an exception, an auth or
+ * payment refusal, a backoff), a passthrough (the index is still warming: the
+ * wait keeps the result whole), or while the index is behind.
  */
 function memtreeHoldsConversation(rec: MessagesRecord): boolean {
   if (rec.indexBehind === true) return false;
-  if (rec.compress) return rec.compress.ok || rec.compress.refused === true;
-  const outcome = rec.routeRecovery?.outcome;
-  return outcome !== "failed" && outcome !== "cooldown";
+  if (rec.compress?.refused === true || rec.compaction?.prepared === "used") return true;
+  return rec.compress?.ok === true &&
+    (rec.turnType === "tool-recompressed" || rec.turnType === "followup-compressed");
 }
 
 /** truncatedToFit for one compressed candidate; undefined when it has no

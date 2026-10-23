@@ -9843,7 +9843,11 @@ test("edge compaction budget: context window x ratio until the server reports it
     assert.equal(second.compaction.budgetSource, "server");
     assert.equal(second.compaction.budgetTokens, 150_000);
     assert.equal(second.compaction.targetTokens, 75_000);
-    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, 150_000);
+    assert.equal(second.compaction.thresholdTokens, 150_000);
+    // Clearly under it by its count: sent at once, its call in the background.
+    assert.equal(second.turnType, "followup-under-budget");
+    await waitFor(() => h.compressCalls().length === 2);
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, -1);
   } finally {
     h.close();
   }
@@ -10493,9 +10497,13 @@ test("a bytes-only window alarm does not force below the calibrated budget and w
     assert.equal(rec.compaction.sizeSource, "reported");
     assert.ok(rec.compaction.estimatedTokens < 160_000);
     assert.ok(rec.requestBytes / 4 > 200_000);
-    const call = h.compressCalls().at(-1);
-    assert.equal(call.compression_target_tokens, 80_000);
-    assert.equal(call.compression_threshold_tokens, 160_000);
+    assert.equal(rec.compaction.reason, undefined, "the byte bound does not force it");
+    // The human turn before it was clearly under the budget by its count:
+    // sent at once, with its compress call (never compressing) in the background.
+    const human = h.records.filter(r => r.kind === "messages" && r.turnType === "followup-under-budget");
+    assert.equal(human.length, 1);
+    assert.equal(human[0].compaction.thresholdTokens, 160_000);
+    await waitFor(() => h.compressCalls().some(c => c.compression_target_tokens === -1));
   } finally { h.close(); }
 });
 
