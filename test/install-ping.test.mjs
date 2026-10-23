@@ -139,20 +139,16 @@ test("opt-outs, CI, a ccc checkout and ccc's own updates send nothing and write 
   rmSync(base, { recursive: true, force: true });
 });
 
-test("under sudo nothing is written and the install says root", async () => {
+test("under sudo or as root: no send and nothing written (sudo drops the user's opt-outs)", async () => {
   const { base, packageDir, configDir } = setup();
   const { sent, fetchImpl } = capture();
   for (const opts of [{ uid: 0 }, { uid: 501, env: { ...GLOBAL_ENV, SUDO_UID: "501" } }]) {
-    await runInstallPing({ env: GLOBAL_ENV, packageDir, configDir, fetchImpl, platform: "linux",
-      ...opts });
+    const result = await runInstallPing({ env: GLOBAL_ENV, packageDir, configDir, fetchImpl,
+      platform: "linux", ...opts });
+    assert.equal(result, "root");
   }
   assert.equal(existsSync(configDir), false);
-  assert.equal(sent.length, 2);
-  for (const { body } of sent) {
-    assert.equal(body.context.install_method, "root");
-    assert.match(body.install_id, /^[0-9a-f-]{36}$/);
-    assert.deepEqual(body.events[0], { name: "installed", t: body.events[0].t });
-  }
+  assert.equal(sent.length, 0);
   rmSync(base, { recursive: true, force: true });
 });
 

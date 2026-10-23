@@ -11,8 +11,8 @@
  *
  * Skipped under every diagnostics opt-out (CCC_NO_DIAGNOSTICS, DO_NOT_TRACK,
  * DISABLE_TELEMETRY, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "diagnostics":
- * false), in CI, for `npm install` inside a ccc checkout, and for ccc's own
- * background updates. Never fails or slows the install for long: one POST
+ * false), in CI, under sudo or as root (sudo drops the user's opt-outs), for
+ * `npm install` inside a ccc checkout, and for ccc's own background updates. Never fails or slows the install for long: one POST
  * with a 2 s timeout, every error swallowed, and the process always exits 0.
  */
 
@@ -25,7 +25,6 @@ import { AUTO_UPDATE_ENV } from "./auto-update.js";
 import {
   DIAGNOSTICS_PATH,
   FIRST_RUN_PENDING_FILE,
-  INSTALL_ID_FILE,
   diagnosticsEnabled,
   readOrCreateInstallId,
 } from "./diagnostics.js";
@@ -39,7 +38,6 @@ import {
 export const INSTALL_PING_TIMEOUT_MS = 2_000;
 export const INSTALL_PING_URL = `https://api.polychat.co${DIAGNOSTICS_PATH}`;
 const CLIENT_NAME = "cc-infinite";
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Set to anything but 0/false on CI services (the `ci-info` list, abridged). */
 const CI_FLAGS = ["CI", "CONTINUOUS_INTEGRATION"];
 /** Present only on a CI service. */
@@ -63,7 +61,7 @@ export interface InstallPingOptions {
 }
 
 export type InstallPingResult = "sent" | "failed" | "opted-out" | "ci" | "dev-install" |
-  "auto-update";
+  "auto-update" | "root";
 
 /** Send the ping (or say why not). Never throws. */
 export async function runInstallPing(opts: InstallPingOptions = {}): Promise<InstallPingResult> {
@@ -71,7 +69,7 @@ export async function runInstallPing(opts: InstallPingOptions = {}): Promise<Ins
     const env = opts.env ?? process.env;
     const packageDir = opts.packageDir ?? fileURLToPath(new URL("..", import.meta.url));
     const configDir = opts.configDir ?? join(homedir(), ".claude-code-infinite");
-    const skip = skipReason(env, packageDir, configDir);
+    const skip = skipReason(env, packageDir, configDir, opts);
     if (skip) return skip;
     const body = installBody(env, packageDir, configDir, opts);
     await (opts.fetchImpl ?? fetch)(opts.url ?? INSTALL_PING_URL, {
@@ -91,8 +89,12 @@ export async function runInstallPing(opts: InstallPingOptions = {}): Promise<Ins
 
 /** Why this install sends nothing, or null to send. */
 export function skipReason(
-  env: NodeJS.ProcessEnv, packageDir: string, configDir: string
+  env: NodeJS.ProcessEnv, packageDir: string, configDir: string,
+  opts: { platform?: NodeJS.Platform; uid?: number } = {}
 ): Exclude<InstallPingResult, "sent" | "failed"> | null {
+  // sudo resets the env and (on Linux) HOME, so the user's opt-outs can't be read: skip.
+  // Nothing is written either (a root-owned config folder would break ccc later).
+  if (isRoot(env, opts)) return "root";
   if (!diagnosticsEnabled(env, readConfig(configDir))) return "opted-out";
   if (isCi(env)) return "ci";
   if (env[AUTO_UPDATE_ENV]) return "auto-update";
@@ -105,10 +107,8 @@ export function installBody(
   env: NodeJS.ProcessEnv, packageDir: string, configDir: string, opts: InstallPingOptions = {}
 ): Record<string, unknown> {
   const platform = opts.platform ?? process.platform;
-  const root = platform !== "win32" &&
-    ((opts.uid ?? process.getuid?.()) === 0 || env.SUDO_UID !== undefined);
-  const install = root ? existingInstallId(configDir) : installIdForPing(configDir);
-  const method = root ? "root" : installMethod(env, packageDir);
+  const install = installIdForPing(configDir);
+  const method = installMethod(env, packageDir);
   const context = sanitizeContext({
     ccc_version: threePartVersion(packageVersion(packageDir) ?? ""),
     node: threePartVersion(process.versions.node), os: platform, arch: process.arch,
@@ -159,15 +159,12 @@ function installIdForPing(configDir: string): { id: string; created?: boolean } 
   return install;
 }
 
-/** Under sudo nothing is written (a root-owned config folder would break ccc later). */
-function existingInstallId(configDir: string): { id: string; created?: boolean } {
-  try {
-    const id = readFileSync(join(configDir, INSTALL_ID_FILE), "utf-8").trim();
-    if (UUID_RE.test(id)) return { id, created: false };
-  } catch {
-    // None readable: a one-off id that joins nothing.
-  }
-  return { id: randomUUID() };
+/** Running as root or under sudo (POSIX only). */
+export function isRoot(
+  env: NodeJS.ProcessEnv, opts: { platform?: NodeJS.Platform; uid?: number } = {}
+): boolean {
+  if ((opts.platform ?? process.platform) === "win32") return false;
+  return (opts.uid ?? process.getuid?.()) === 0 || env.SUDO_UID !== undefined;
 }
 
 function readConfig(configDir: string): { diagnostics?: boolean } {
