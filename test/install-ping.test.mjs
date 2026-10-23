@@ -177,6 +177,7 @@ test("a failing or hanging send never throws and gives up at the timeout", async
 test("install method from npm's own environment and the package folder", () => {
   const global = "/usr/local/lib/node_modules/claude-code-infinite";
   assert.equal(installMethod({ npm_config_global: "true" }, global), "npm-global");
+  assert.equal(installMethod({ npm_config_location: "global" }, global), "npm-global");
   assert.equal(installMethod({}, "/home/a/proj/node_modules/claude-code-infinite"), "local");
   assert.equal(installMethod({ npm_config_global: "true" },
     "/home/a/.npm/_npx/1a2b/node_modules/claude-code-infinite"), "npx");

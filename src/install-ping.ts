@@ -126,7 +126,7 @@ export function installMethod(env: NodeJS.ProcessEnv, packageDir: string): strin
   const agent = (env.npm_config_user_agent ?? "").split("/")[0];
   if (agent === "pnpm" || agent === "yarn" || agent === "bun") return agent;
   if (/\/\.?volta\//.test(p)) return "volta";
-  if (env.npm_config_global === "true") return "npm-global";
+  if (env.npm_config_global === "true" || env.npm_config_location === "global") return "npm-global";
   return "local";
 }
 

@@ -113,6 +113,7 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
     private readonly onMainTurnAnswer?;
     private firstRequest;
     private firstTurn;
+    private firstAnswer;
     constructor(inner: RequestLogSink | undefined, diagnostics: Diagnostics, 
     /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
     onCreditBalanceTooLow?: ((auth: ClaudeAuthType | undefined) => void) | undefined, 

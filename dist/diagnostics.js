@@ -199,6 +199,7 @@ export class DiagnosticsRequestSink {
     onMainTurnAnswer;
     firstRequest = false;
     firstTurn = false;
+    firstAnswer = false;
     constructor(inner, diagnostics, 
     /** Anthropic refused for no credit (claude-auth.ts), with the request's sign-in type. */
     onCreditBalanceTooLow, 
@@ -255,9 +256,16 @@ export class DiagnosticsRequestSink {
             this.firstRequest = true;
             this.diagnostics.record("first_request", fields);
         }
-        if (!this.firstTurn && rec.client?.turnOrigin === "human") {
+        const human = rec.client?.turnOrigin === "human";
+        if (!this.firstTurn && human) {
             this.firstTurn = true;
             this.diagnostics.record("first_turn", fields);
+        }
+        const status = rec.upstreamStatus;
+        if (!this.firstAnswer && human && typeof status === "number" && status >= 200 && status < 300) {
+            // first_turn is the first attempt, whatever its outcome; this is the first success.
+            this.firstAnswer = true;
+            this.diagnostics.record("first_answer", fields);
         }
         this.observeMessageErrors(rec, fields);
     }

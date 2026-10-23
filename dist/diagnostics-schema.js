@@ -181,6 +181,9 @@ export const EVENT_FIELDS = {
         request_kb: KB },
     first_turn: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
         request_kb: KB },
+    /** The first human turn Anthropic answered with a 2xx (first_turn is the first attempt). */
+    first_answer: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
+        request_kb: KB },
     upstream_error: { status: STATUS, turn_type: oneOf(TURN_TYPES), total_ms: MS,
         request_kb: KB },
     memtree_error: { status: STATUS, index_only: bool, ms: MS, request_kb: KB },

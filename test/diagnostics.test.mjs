@@ -120,6 +120,21 @@ test("unknown events and fields are dropped before queueing", async () => {
   ]);
 });
 
+test("first_answer: the first human turn Anthropic answered (2xx), after failed attempts", async () => {
+  const { diagnostics, sent } = make();
+  const sink = new DiagnosticsRequestSink(undefined, diagnostics);
+  const human = { kind: "messages", turnType: "first-user", requestBytes: 1024, totalMs: 900,
+                  client: { turnOrigin: "human", tools: 20 } };
+  sink.log({ ...human, upstreamStatus: 529 });
+  sink.log({ ...human, upstreamStatus: 200, client: { turnOrigin: "tool", tools: 20 } });
+  sink.log({ ...human, upstreamStatus: 200 });
+  sink.log({ ...human, upstreamStatus: 200 });
+  await diagnostics.flush(1000);
+  const events = sent.flatMap((s) => s.body.events);
+  assert.deepEqual(events.filter((e) => e.name === "first_turn").map((e) => e.status), [529]);
+  assert.deepEqual(events.filter((e) => e.name === "first_answer").map((e) => e.status), [200]);
+});
+
 test("the request-log tee: records pass through unchanged; first request, first turn, errors", async () => {
   const { diagnostics, sent } = make();
   const seen = [];

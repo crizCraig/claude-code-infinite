@@ -98,7 +98,7 @@ export function installMethod(env, packageDir) {
         return agent;
     if (/\/\.?volta\//.test(p))
         return "volta";
-    if (env.npm_config_global === "true")
+    if (env.npm_config_global === "true" || env.npm_config_location === "global")
         return "npm-global";
     return "local";
 }
