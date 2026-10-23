@@ -4132,14 +4132,21 @@ function reachedBudget(compaction) {
  * window, `/memtree-compact`, a rebuilt prefix), a size at or over the budget,
  * or a size nobody measured. False only for a turn known to fit its budget,
  * whose whole request is what a working MemTree would have passed through.
+ * A bytes/4 guess can undercount (dense text, a rejected prefix's stale
+ * sizing; a later exact count may land over the budget), so it proves a fit
+ * only well inside the budget.
  */
 function compressionNeeded(compaction) {
     if (compaction === undefined || compaction.reason !== undefined)
         return true;
-    if (compaction.estimatedTokens === undefined)
+    const tokens = compaction.estimatedTokens;
+    if (tokens === undefined)
         return true;
-    return compaction.estimatedTokens >= compaction.budgetTokens;
+    const margin = compaction.sizeSource === "reported" ? 1 : BYTES_ESTIMATE_FIT_MARGIN;
+    return tokens * margin >= compaction.budgetTokens;
 }
+/** How far a bytes/4 size guess must sit under the budget to count as fitting it. */
+const BYTES_ESTIMATE_FIT_MARGIN = 2;
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap();
 const changedDeliveryRecords = new WeakSet();

@@ -5064,6 +5064,34 @@ for (const failure of ["500", "timeout"]) {
   });
 }
 
+test("a bytes-guessed size within 2x of the budget still warns when compress fails", async () => {
+  // Codex review P2: bytes/4 can undercount (a later exact count may land over
+  // the budget), so only a guess well inside the budget proves the turn fits.
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(500, { detail: "boom" });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const records = [];
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    // followupTurn guesses ~50 tokens: under 80, but not under half of it.
+    budgetTokensOverride: 80 });
+  try {
+    await armMainTurn(proxy, "turn two");
+    await postMessages(proxy.port, followupTurn("turn two"), DEGRADE_SESSION);
+    const rec = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(rec.compaction.sizeSource, "bytes");
+    assert.ok(rec.compaction.estimatedTokens < rec.compaction.budgetTokens);
+    assert.ok(rec.compaction.estimatedTokens * 2 >= rec.compaction.budgetTokens);
+    assert.equal(rec.degradedNotice, "shown");
+    const hook = await postHook(proxy, displayHook({ final: true }));
+    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("an over-budget turn whose compress fails still shows the degraded notice", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(500, { detail: "boom" });
