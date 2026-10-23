@@ -1764,12 +1764,21 @@ async function handleMessages(req, res, opts, upstream, state) {
         else if (mayQueueNotice && paymentDetail === null) {
             // Under the budget the whole request is what compression would have
             // sent: the turn is not degraded, so the failure stays in the logs.
-            if (compressionNeeded(rec.compaction)) {
+            const warn = () => {
                 state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
                 rec.degradedNotice = "shown";
+            };
+            if (compressionNeeded(rec.compaction)) {
+                warn();
             }
             else {
+                // Delivery sizes the request again (an exact count, else a
+                // conservative bound): a turn it finds over the budget warns then.
                 rec.degradedNotice = "quiet-under-budget";
+                quietDegrades.set(rec, () => {
+                    if (state.mainPromptGeneration === noticePromptGeneration)
+                        warn();
+                });
             }
         }
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
@@ -3979,6 +3988,8 @@ async function selectForwardCandidate(args) {
             target = policy.sizing.register(replacement, "replacement");
     }
     const selection = await policy.sizing.select(target, args.limits);
+    const quietDegrade = quietDegrades.get(args.rec);
+    quietDegrades.delete(args.rec);
     if (!selection) {
         if (args.rec.lateCountRecovery)
             args.rec.lateCountRecovery.outcome = "refused";
@@ -4004,6 +4015,7 @@ async function selectForwardCandidate(args) {
                 ? "exact-count-fits-window" : measurement.source === "bytes"
                 ? "bytes-fallback-fits-window" : "estimate-fits-window" };
         warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
+        quietDegrade?.();
     }
     return changed ? candidate.body : intended;
 }
@@ -4128,25 +4140,24 @@ function reachedBudget(compaction) {
     return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
 }
 /**
- * Whether a turn needed MemTree to compress it: a forced compaction (budget,
- * window, `/memtree-compact`, a rebuilt prefix), a size at or over the budget,
- * or a size nobody measured. False only for a turn known to fit its budget,
- * whose whole request is what a working MemTree would have passed through.
- * A bytes/4 guess can undercount (dense text, a rejected prefix's stale
- * sizing; a later exact count may land over the budget), so it proves a fit
- * only well inside the budget.
+ * Whether the planned size says a turn needed MemTree to compress it: a
+ * forced compaction (budget, window, `/memtree-compact`, a rebuilt prefix), a
+ * size at or over the budget, or a size nobody measured. A planned fit is
+ * provisional: delivery's own sizing can still find the turn over the budget
+ * (quietDegrades), since a plan can undercount.
  */
 function compressionNeeded(compaction) {
     if (compaction === undefined || compaction.reason !== undefined)
         return true;
-    const tokens = compaction.estimatedTokens;
-    if (tokens === undefined)
+    if (compaction.estimatedTokens === undefined)
         return true;
-    const margin = compaction.sizeSource === "reported" ? 1 : BYTES_ESTIMATE_FIT_MARGIN;
-    return tokens * margin >= compaction.budgetTokens;
+    return compaction.estimatedTokens >= compaction.budgetTokens;
 }
-/** How far a bytes/4 size guess must sit under the budget to count as fitting it. */
-const BYTES_ESTIMATE_FIT_MARGIN = 2;
+/**
+ * A degraded turn whose plan fit the budget, so it queued no notice: the
+ * notice to queue if delivery's sizing finds it over the budget after all.
+ */
+const quietDegrades = new WeakMap();
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap();
 const changedDeliveryRecords = new WeakSet();

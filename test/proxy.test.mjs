@@ -5064,34 +5064,6 @@ for (const failure of ["500", "timeout"]) {
   });
 }
 
-test("a bytes-guessed size within 2x of the budget still warns when compress fails", async () => {
-  // Codex review P2: bytes/4 can undercount (a later exact count may land over
-  // the budget), so only a guess well inside the budget proves the turn fits.
-  const upstream = await mockUpstream();
-  const memtreeSrv = await mockMemtree(500, { detail: "boom" });
-  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
-  const records = [];
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
-    reqlog: { log: (r) => records.push(structuredClone(r)) },
-    // followupTurn guesses ~50 tokens: under 80, but not under half of it.
-    budgetTokensOverride: 80 });
-  try {
-    await armMainTurn(proxy, "turn two");
-    await postMessages(proxy.port, followupTurn("turn two"), DEGRADE_SESSION);
-    const rec = records.filter((r) => r.kind === "messages").at(-1);
-    assert.equal(rec.compaction.sizeSource, "bytes");
-    assert.ok(rec.compaction.estimatedTokens < rec.compaction.budgetTokens);
-    assert.ok(rec.compaction.estimatedTokens * 2 >= rec.compaction.budgetTokens);
-    assert.equal(rec.degradedNotice, "shown");
-    const hook = await postHook(proxy, displayHook({ final: true }));
-    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
-  } finally {
-    proxy.close();
-    upstream.close();
-    memtreeSrv.close();
-  }
-});
-
 test("an over-budget turn whose compress fails still shows the degraded notice", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(500, { detail: "boom" });
@@ -9724,6 +9696,36 @@ test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses inst
     assert.equal(cleared.turnType, "followup-noop");
     assert.equal(cleared.compaction.reason, undefined);
     assert.equal(h.compressCalls().length, calls + 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("degraded notice: a planned fit that delivery sizes over the budget still warns", async () => {
+  // Codex review P2: the plan can undercount (here bytes/4, with Count Tokens
+  // down). The notice follows delivery's own sizing: its conservative bound.
+  const h = await edgeHarness({ budget: 20_000, proxyOpts: { countTokens: true },
+    upstreamOptions: { countFailures: 1_000 } });
+  try {
+    await compactOnce(h);
+    // MemTree goes down.
+    h.memtreeSrv.server.removeAllListeners("request");
+    h.memtreeSrv.server.on("request", (req, res) => {
+      req.resume();
+      req.on("end", () => { res.writeHead(500); res.end("{}"); });
+    });
+    // /clear and a fresh conversation planned just under the budget (~18k).
+    await armMainTurn(h.proxy, "fresh");
+    const rec = await h.post([userText("new"), assistantText("hi"), userText(BIG("fresh", 72_000))],
+      { "x-claude-code-session-id": "s-edge" });
+    assert.equal(rec.turnType, "followup-degraded");
+    assert.equal(rec.compaction.prefixMiss, "prefix");
+    assert.equal(rec.compaction.reason, undefined);
+    assert.ok(rec.compaction.estimatedTokens < rec.compaction.budgetTokens, "planned to fit");
+    assert.equal(rec.overBudgetForward?.reason, "bytes-fallback-fits-window");
+    assert.equal(rec.degradedNotice, "shown");
+    const hook = await postHook(h.proxy, { ...displayHook({ final: true }), session_id: "s-edge" });
+    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
   } finally {
     h.close();
   }
