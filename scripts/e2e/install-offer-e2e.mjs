@@ -7,6 +7,7 @@
 // CCC_E2E_INSTALL=1. No keys, no network beyond the installer; diagnostics are off.
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { locateClaude } from "../../dist/claude-locate.js";
@@ -16,6 +17,9 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 const CLI = path.join(ROOT, "dist", "cli.js");
 const TIMEOUT_MS = 10 * 60_000;
 const results = [];
+// A terminal opened before the install: the installer's folder is not on its PATH
+// (GitHub's macOS and Linux images already have ~/.local/bin there).
+const ENV = withoutInstallDirOnPath(process.env);
 
 if (process.env.CI !== "true" && process.env.CCC_E2E_INSTALL !== "1") {
   console.error("This installs Claude Code for this user: run it in CI, or set CCC_E2E_INSTALL=1.");
@@ -23,7 +27,7 @@ if (process.env.CI !== "true" && process.env.CCC_E2E_INSTALL !== "1") {
 }
 
 check("Claude Code is not installed before the run", () => {
-  const before = locateClaude();
+  const before = locateClaude({ env: ENV });
   if (before) throw new Error(`already installed (${before.source}): this check needs a clean runner`);
 });
 const run = await runCccAnsweringYes();
@@ -34,18 +38,20 @@ check("ccc found Claude Code after the install", () =>
   expect(run.stderr.includes("✔ Claude Code is installed"), `exit ${run.status}`));
 check("ccc went on to the next first-run step (no MemTree key, no terminal)", () =>
   expect(run.stderr.includes("A MemTree API key is required"), `exit ${run.status}`));
-const after = locateClaude();
+const after = locateClaude({ env: ENV });
 check("claude-locate finds it, in this same terminal session", () =>
   expect(after !== null, "locateClaude() is null"));
 if (after) {
-  check(`\`claude --version\` works (${after.source})`, () => {
+  check(`found where the installer put it, not on PATH (${after.source})`, () =>
+    expect(after.source === "native", after.source));
+  check("`claude --version` works", () => {
     const version = spawnSync(after.command, ["--version"], { encoding: "utf8", shell: false });
     expect(/\(Claude Code\)/.test(version.stdout ?? ""), `${version.status}: ${version.stdout}`);
     return version.stdout.trim();
   });
 }
 check("`ccc --version` shows Claude Code's version", () => {
-  const version = spawnSync(process.execPath, [CLI, "--version"], { encoding: "utf8" });
+  const version = spawnSync(process.execPath, [CLI, "--version"], { encoding: "utf8", env: ENV });
   expect(/\(Claude Code\)/.test(version.stdout), version.stdout + version.stderr);
 });
 
@@ -55,7 +61,7 @@ report();
 function runCccAnsweringYes() {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [CLI, "-p", "hi"], {
-      env: { ...process.env, CCC_INSTALL_PROMPT: "1", CCC_NO_DIAGNOSTICS: "1" },
+      env: { ...ENV, CCC_INSTALL_PROMPT: "1", CCC_NO_DIAGNOSTICS: "1" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -77,6 +83,17 @@ function runCccAnsweringYes() {
       resolve({ status, stdout, stderr });
     });
   });
+}
+
+function withoutInstallDirOnPath(env) {
+  const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  const installDir = path.join(os.homedir(), ".local", "bin");
+  const out = { ...env };
+  for (const key of Object.keys(out).filter((k) => k.toUpperCase() === "PATH")) {
+    out[key] = out[key].split(path.delimiter).filter((dir) => dir && !same(dir, installDir))
+      .join(path.delimiter);
+  }
+  return out;
 }
 
 function check(name, fn) {
