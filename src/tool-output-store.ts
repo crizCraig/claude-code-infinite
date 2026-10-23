@@ -9,7 +9,9 @@
  * directory, at most MAX_FILES files and MAX_BYTES bytes (oldest dropped),
  * except that a copy saved or reused within PIN_MS (its mtime) is never
  * dropped: the request pointing at it may still be on its way (counted,
- * forwarded) while another request, in this ccc or another, saves.
+ * forwarded) while another request, in this ccc or another, saves. Saving,
+ * reusing and evicting run under a lock file in the directory, so a reuse
+ * cannot interleave with another process's eviction of the same file.
  */
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -21,6 +23,12 @@ const MAX_BYTES = 512 * 1024 * 1024;
 const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 /** How long a copy saved or reused (its mtime) is protected from eviction. */
 const PIN_MS = 60 * 60 * 1000;
+const LOCK_NAME = ".lock";
+/** A lock older than this was left by a process that died holding it. */
+const STALE_LOCK_MS = 30_000;
+/** How long a save waits for the lock before giving up (no copy, no shortening). */
+const LOCK_WAIT_MS = 2_000;
+const LOCK_POLL_MS = 10;
 
 export class ToolOutputStore {
   constructor(
@@ -33,14 +41,16 @@ export class ToolOutputStore {
     if (!this.privateDir()) return undefined;
     const name = createHash("sha256").update(text).digest("hex").slice(0, 32);
     const file = path.join(this.dir, `${name}.txt`);
-    if (isOurFile(file)) {
+    return withLock(path.join(this.dir, LOCK_NAME), () => {
+      if (isOurFile(file)) {
+        touch(file, this.now());
+        return file;
+      }
+      if (!writeAtomically(this.dir, file, text)) return undefined;
       touch(file, this.now());
+      this.evict();
       return file;
-    }
-    if (!writeAtomically(this.dir, file, text)) return undefined;
-    touch(file, this.now());
-    this.evict();
-    return file;
+    });
   }
 
   /** The directory exists, is a real directory owned by this user, mode 700. */
@@ -65,6 +75,40 @@ export class ToolOutputStore {
       bytes += entry.size;
       if (entry.mtimeMs < recent && (i >= MAX_FILES || bytes > MAX_BYTES)) unlinkQuietly(entry.file);
     });
+  }
+}
+
+/**
+ * Run `fn` holding the directory's lock file (created exclusively; one left
+ * by a dead process is taken over after STALE_LOCK_MS), or return undefined
+ * when it stays held for LOCK_WAIT_MS. Synchronous: saves are rare, short,
+ * and only on the safety-net path.
+ */
+function withLock<T>(lock: string, fn: () => T | undefined): T | undefined {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      fs.closeSync(fs.openSync(lock, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+        fs.constants.O_EXCL | NO_FOLLOW, 0o600));
+      break;
+    } catch {
+      if (staleLock(lock)) unlinkQuietly(lock);
+      else if (Date.now() >= deadline) return undefined;
+      else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_POLL_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    unlinkQuietly(lock);
+  }
+}
+
+function staleLock(lock: string): boolean {
+  try {
+    return Date.now() - fs.lstatSync(lock).mtimeMs > STALE_LOCK_MS;
+  } catch {
+    return false;
   }
 }
 
