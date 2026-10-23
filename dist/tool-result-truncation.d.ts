@@ -18,10 +18,13 @@ export interface TruncationPlan {
     savedAt: string[];
 }
 /**
- * Shorten the tool result texts of the body's last message, largest first,
- * until the body loses at least `cutChars` characters (or every text worth
+ * Shorten the tool result texts sent verbatim in the body (every user message's
+ * tool_result blocks; a compressed prefix carries none), largest first, until
+ * the body loses at least `cutChars` characters (or every text worth
  * shortening keeps only the minimum), or null when there is none or
  * `saveFull` could not save one. `saveFull` stores a whole text, returns where.
+ * Every message, not only the newest: Claude Code resends an oversized result
+ * on the turns after it, and each is shortened the same way again.
  */
 export declare function truncateToolResults(body: Record<string, any>, cutChars: number, saveFull: (text: string) => string | undefined): TruncationPlan | null;
 /** The pointer that stands for the omitted middle. */

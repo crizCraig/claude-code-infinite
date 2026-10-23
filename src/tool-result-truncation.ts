@@ -30,34 +30,35 @@ export interface TruncationPlan {
 }
 
 /**
- * Shorten the tool result texts of the body's last message, largest first,
- * until the body loses at least `cutChars` characters (or every text worth
+ * Shorten the tool result texts sent verbatim in the body (every user message's
+ * tool_result blocks; a compressed prefix carries none), largest first, until
+ * the body loses at least `cutChars` characters (or every text worth
  * shortening keeps only the minimum), or null when there is none or
  * `saveFull` could not save one. `saveFull` stores a whole text, returns where.
+ * Every message, not only the newest: Claude Code resends an oversized result
+ * on the turns after it, and each is shortened the same way again.
  */
 export function truncateToolResults(
   body: Record<string, any>,
   cutChars: number,
   saveFull: (text: string) => string | undefined
 ): TruncationPlan | null {
-  const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user" || !Array.isArray(last.content)) return null;
-  let content: any[] = last.content;
+  const messages: any[] = Array.isArray(body.messages) ? [...body.messages] : [];
   const plan = { originalChars: 0, omittedChars: 0, savedAt: [] as string[] };
-  for (const site of toolTextSites(content)) {
+  for (const site of toolTextSites(messages)) {
     if (plan.omittedChars >= cutChars) break;
     const cut = shortenSite(site, cutChars - plan.omittedChars, saveFull);
     if (cut === null) continue;
     if (cut === undefined) return null;
-    content = content.map((block: any, i: number) =>
-      i === site.blockIndex ? withToolText(block, site.partIndex, cut.text) : block);
+    const message = messages[site.messageIndex];
+    messages[site.messageIndex] = { ...message, content: message.content.map((block: any,
+      i: number) => i === site.blockIndex ? withToolText(block, site.partIndex, cut.text) : block) };
     plan.originalChars += site.text.length;
     plan.omittedChars += cut.omitted;
     plan.savedAt.push(cut.savedAt);
   }
   if (!plan.savedAt.length) return null;
-  return { body: { ...body, messages: [...messages.slice(0, -1), { ...last, content }] }, ...plan };
+  return { body: { ...body, messages }, ...plan };
 }
 
 /**
@@ -88,6 +89,7 @@ export function pointerText(omittedChars: number, totalChars: number, savedAt: s
 const PATH_ALLOWANCE = 512;
 
 interface ToolTextSite {
+  messageIndex: number;
   blockIndex: number;
   /** Index of the text block inside an array `content`; -1 for string content. */
   partIndex: number;
@@ -95,16 +97,19 @@ interface ToolTextSite {
   toolUseId?: string;
 }
 
-/** Every tool result text of `content`, largest first. */
-function toolTextSites(content: any[]): ToolTextSite[] {
+/** Every tool result text of the user messages, largest first (newest first on a tie). */
+function toolTextSites(messages: any[]): ToolTextSite[] {
   const sites: ToolTextSite[] = [];
-  content.forEach((block, blockIndex) => {
-    if (block?.type !== "tool_result") return;
-    for (const [partIndex, text] of toolTexts(block.content)) {
-      sites.push({ blockIndex, partIndex, text, toolUseId: block.tool_use_id });
-    }
+  messages.forEach((message, messageIndex) => {
+    if (message?.role !== "user" || !Array.isArray(message.content)) return;
+    message.content.forEach((block: any, blockIndex: number) => {
+      if (block?.type !== "tool_result") return;
+      for (const [partIndex, text] of toolTexts(block.content)) {
+        sites.push({ messageIndex, blockIndex, partIndex, text, toolUseId: block.tool_use_id });
+      }
+    });
   });
-  return sites.sort((a, b) => b.text.length - a.text.length);
+  return sites.sort((a, b) => b.text.length - a.text.length || b.messageIndex - a.messageIndex);
 }
 
 function toolTexts(content: unknown): Array<[number, string]> {

@@ -1891,11 +1891,15 @@ async function handleMessages(
     },
     // The ride's bytes are only what failed; recovery always compresses the
     // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
-    recoverLate: async (_ride, rideTokens) => {
-      if (rec.compress || compactionMode(opts, state, requestSessionKey).mode === "off" ||
+    recoverLate: async (_ride, rideTokens, target) => {
+      // A compression already made may be redone only to a smaller target.
+      if ((rec.compress && target === undefined) ||
+          compactionMode(opts, state, requestSessionKey).mode === "off" ||
+          !hasEarlierNonToolUserMessage(messages) ||
           (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false)) return undefined;
       return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
-        modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate });
+        modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
+        ...(target !== undefined ? { target } : {}) });
     },
     delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
   });
@@ -2286,6 +2290,11 @@ async function handleMessages(
     if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
       // A lagging index left history verbatim: a refusal waits for indexing.
       if (result) noteIndexLag(opts, rec, result);
+      // Too large for the window: delivery recompresses it once, smaller.
+      if (result && !rec.indexBehind) {
+        noteOversizedCompression(rec, requestSizing, body, compressedRaw,
+          rec.compaction?.targetTokens);
+      }
       releaseUncommittedRouteDecision();
       recordTurn(rec, "followup-degraded", rawBody);
       return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
@@ -5460,6 +5469,8 @@ async function recoverToolRouteMiss(args: {
   const { compressedBody, compressedRaw } = built;
   if (!(await requestSendPolicies.get(req)!.fitsNative(compressedRaw))) {
     rec.routeRecovery = { conversationBytes, outcome: "unusable" };
+    noteOversizedCompression(rec, args.sizing, body, compressedRaw,
+      args.compaction?.target ?? rec.compaction?.targetTokens);
     releaseOwnReservation();
     if (!noteIndexLag(opts, rec, result)) return forwardOriginal();
     // The index trails the conversation, so this result kept most of it
@@ -5763,11 +5774,13 @@ async function recoverLateCount(args: {
   rideTokens: number;
   modelContextLimit: number; sizing: RequestSizing; inputCandidate: RequestCandidate;
   clientMeta: Record<string, string>;
+  /** The target to recompress to (a compression came back too large); else derived. */
+  target?: number;
 }): Promise<Buffer | undefined> {
   try {
     const { body, msgsForMemtree: messages } = args;
     const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
-    const target = lateRecoveryTarget(compactionTarget(
+    const target = args.target ?? lateRecoveryTarget(compactionTarget(
       compactionMode(args.opts, args.state, requestSessionId(args.req)), budget),
       budget, args.rideTokens);
     const outcome = await runBlockingCompression({
@@ -5814,10 +5827,10 @@ async function selectForwardCandidate(args: {
     policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
   const measured = await policy.sizing.measure(preferred, args.limits);
   let target = preferred;
-  if (preferred.kind === "ride" && measured.source === "exact" &&
-      measured.tokens > args.limits.budget && !args.rec.compress && !args.rec.lateCountRecovery) {
+  const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits);
+  if (late) {
     args.rec.lateCountRecovery = { outcome: "forwarded" };
-    const replacement = await policy.recoverLate(preferred.body, measured.tokens);
+    const replacement = await policy.recoverLate(preferred.body, late.tokens, late.target);
     if (replacement) target = policy.sizing.register(replacement, "replacement");
   }
   const selection = await policy.sizing.select(target, args.limits) ??
@@ -5927,6 +5940,57 @@ async function truncateCandidate(
     }
   }
   return undefined;
+}
+
+/**
+ * Whether delivery recompresses before sending, and to what: a ride counted
+ * over the budget (no compression yet); the whole history counted over the
+ * window with no compression yet (outside an outage cooldown: a refusal is
+ * all that is left otherwise); or a compression that came back too large for
+ * the window (oversizedCompressions), redone once to a target smaller by the
+ * excess, so the turn is compressed and sent in the same request instead of
+ * being refused and retried.
+ */
+function lateRecoveryPlan(
+  state: ProxyState, rec: MessagesRecord, preferred: RequestCandidate,
+  measured: CandidateMeasurement, limits: SizingLimits,
+): { tokens: number; target?: number } | undefined {
+  if (rec.lateCountRecovery) return undefined;
+  const oversized = oversizedCompressions.get(rec);
+  // A lagging index kept history verbatim: the refusal waits for it instead.
+  if (oversized && rec.indexBehind !== true) {
+    const goal = limits.context - Math.max(limits.output, COMPRESSION_RESERVE_TOKENS);
+    const excess = oversized.tokens - goal;
+    const target = Math.floor(oversized.target - excess - oversized.target * SMALLER_TARGET_MARGIN);
+    return target >= SERVER_MIN_TARGET_TOKENS ? { tokens: oversized.tokens, target } : undefined;
+  }
+  if (rec.compress || measured.source !== "exact" || !(measured.tokens > limits.budget)) {
+    return undefined;
+  }
+  if (preferred.kind === "ride") return { tokens: measured.tokens };
+  const overWindow = !fitsMeasured(measured, limits);
+  return preferred.kind === "original" && overWindow &&
+    Date.now() >= state.toolRecoveryCooldownUntil ? { tokens: measured.tokens } : undefined;
+}
+
+/** A recompression aims this share of its old target lower than the excess alone. */
+const SMALLER_TARGET_MARGIN = 0.1;
+
+/**
+ * Compressions of this request that came back too large for the window: their
+ * size (an exact count, else the conservative bound) and the target they had.
+ */
+const oversizedCompressions = new WeakMap<MessagesRecord, { tokens: number; target: number }>();
+
+/** Note a compression of `rec` that does not fit the window (lateRecoveryPlan). */
+function noteOversizedCompression(
+  rec: MessagesRecord, sizing: RequestSizing, body: Record<string, any>, compressedRaw: Buffer,
+  target: number | undefined,
+): void {
+  if (target === undefined) return;
+  const tokens = sizing.exactTokensFor(compressedRaw) ??
+    conservativeBodyTokens(compressedRaw, typeof body.model === "string" ? body.model : undefined);
+  oversizedCompressions.set(rec, { tokens, target });
 }
 
 /**
@@ -6092,7 +6156,7 @@ const requestSendPolicies = new WeakMap<http.IncomingMessage, {
   sizing: RequestSizing;
   fitsNative: (body: Buffer) => Promise<boolean>;
   /** Recompress the ORIGINAL conversation after a ride counted `tokens` late. */
-  recoverLate: (ride: Buffer, tokens: number) => Promise<Buffer | undefined>;
+  recoverLate: (ride: Buffer, tokens: number, target?: number) => Promise<Buffer | undefined>;
   /** The exact body selected for delivery, or undefined after a refusal. */
   select: (body: Buffer) => Promise<Buffer | undefined>;
   delivered: () => void;

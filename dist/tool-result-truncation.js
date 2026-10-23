@@ -18,19 +18,18 @@ const MIN_KEEP_CHARS = 2_000;
 /** The head's share of what is kept (errors and summaries often end a log). */
 const HEAD_SHARE = 0.5;
 /**
- * Shorten the tool result texts of the body's last message, largest first,
- * until the body loses at least `cutChars` characters (or every text worth
+ * Shorten the tool result texts sent verbatim in the body (every user message's
+ * tool_result blocks; a compressed prefix carries none), largest first, until
+ * the body loses at least `cutChars` characters (or every text worth
  * shortening keeps only the minimum), or null when there is none or
  * `saveFull` could not save one. `saveFull` stores a whole text, returns where.
+ * Every message, not only the newest: Claude Code resends an oversized result
+ * on the turns after it, and each is shortened the same way again.
  */
 export function truncateToolResults(body, cutChars, saveFull) {
-    const messages = Array.isArray(body.messages) ? body.messages : [];
-    const last = messages[messages.length - 1];
-    if (!last || last.role !== "user" || !Array.isArray(last.content))
-        return null;
-    let content = last.content;
+    const messages = Array.isArray(body.messages) ? [...body.messages] : [];
     const plan = { originalChars: 0, omittedChars: 0, savedAt: [] };
-    for (const site of toolTextSites(content)) {
+    for (const site of toolTextSites(messages)) {
         if (plan.omittedChars >= cutChars)
             break;
         const cut = shortenSite(site, cutChars - plan.omittedChars, saveFull);
@@ -38,14 +37,15 @@ export function truncateToolResults(body, cutChars, saveFull) {
             continue;
         if (cut === undefined)
             return null;
-        content = content.map((block, i) => i === site.blockIndex ? withToolText(block, site.partIndex, cut.text) : block);
+        const message = messages[site.messageIndex];
+        messages[site.messageIndex] = { ...message, content: message.content.map((block, i) => i === site.blockIndex ? withToolText(block, site.partIndex, cut.text) : block) };
         plan.originalChars += site.text.length;
         plan.omittedChars += cut.omitted;
         plan.savedAt.push(cut.savedAt);
     }
     if (!plan.savedAt.length)
         return null;
-    return { body: { ...body, messages: [...messages.slice(0, -1), { ...last, content }] }, ...plan };
+    return { body: { ...body, messages }, ...plan };
 }
 /**
  * One text cut so it loses about `cutChars` (at most down to the minimum):
@@ -71,17 +71,21 @@ export function pointerText(omittedChars, totalChars, savedAt) {
 }
 /** Room left in the pointer estimate for the saved file's path. */
 const PATH_ALLOWANCE = 512;
-/** Every tool result text of `content`, largest first. */
-function toolTextSites(content) {
+/** Every tool result text of the user messages, largest first (newest first on a tie). */
+function toolTextSites(messages) {
     const sites = [];
-    content.forEach((block, blockIndex) => {
-        if (block?.type !== "tool_result")
+    messages.forEach((message, messageIndex) => {
+        if (message?.role !== "user" || !Array.isArray(message.content))
             return;
-        for (const [partIndex, text] of toolTexts(block.content)) {
-            sites.push({ blockIndex, partIndex, text, toolUseId: block.tool_use_id });
-        }
+        message.content.forEach((block, blockIndex) => {
+            if (block?.type !== "tool_result")
+                return;
+            for (const [partIndex, text] of toolTexts(block.content)) {
+                sites.push({ messageIndex, blockIndex, partIndex, text, toolUseId: block.tool_use_id });
+            }
+        });
     });
-    return sites.sort((a, b) => b.text.length - a.text.length);
+    return sites.sort((a, b) => b.text.length - a.text.length || b.messageIndex - a.messageIndex);
 }
 function toolTexts(content) {
     if (typeof content === "string")

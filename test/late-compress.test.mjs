@@ -18,8 +18,16 @@ import os from 'node:os';
 import path from 'node:path';
 
 const OPUS = 'claude-opus-5-5';
-/** Anthropic's count in this harness: one token per 4 bytes of the body. */
-const tokensOf = body => Math.floor(Buffer.byteLength(JSON.stringify(body)) / 4);
+/** Anthropic's count in this harness: one token per 4 bytes of text, 1,600 per image. */
+const IMAGE_TOKENS = 1_600;
+const tokensOf = body => {
+  let images = 0;
+  const text = JSON.stringify(body, (key, value) => {
+    if (value?.type === 'image' && value.source?.data) { images++; return { type: 'image' }; }
+    return value;
+  });
+  return Math.floor(Buffer.byteLength(text) / 4) + images * IMAGE_TOKENS;
+};
 const BLOCKING_DELAY_MS = 1_500;
 
 async function listen(handler) {
@@ -270,6 +278,34 @@ test('no truncation without MemTree holding the result, nor on a subagent', asyn
   }
 });
 
+test('a screenshot landing at the limit: an oversized compression is redone smaller in the same request', async () => {
+  // Coordinator's staging case (2026-10-23): Reading a 216 KB PNG near the
+  // limit got "MemTree couldn't fit this request" until the user typed again.
+  // Here the first compression comes back too large (a verbatim tail), and the
+  // proxy recompresses at once to a smaller target instead of refusing.
+  const h = await harness({ prepares: false, blockingDelayMs: 0,
+    compress: (body) => body.prepare ? undefined
+      : { body: compressedReply(body.compression_target_tokens >= 480_000 ? 990_000 : 400_000) } });
+  try {
+    const conv = session(950_000);
+    assert.equal((await h.post(conv)).status, 200);
+    await growTo(h, conv, 958_000);
+    conv.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'Read',
+      input: { file_path: '/tmp/screen.png' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png',
+        data: 'iVBORw0KGgo'.repeat(26_200) } },
+      { type: 'text', text: 'line of output\n'.repeat(400) }] }] });
+    const shot = await h.post(conv);
+    assert.equal(shot.status, 200, 'no 400');
+    const blocking = h.blockingCalls();
+    assert.equal(blocking.length, 2, 'compressed, then compressed again smaller');
+    assert.ok(blocking[1].compression_target_tokens < blocking[0].compression_target_tokens,
+      `${blocking[0].compression_target_tokens} then ${blocking[1].compression_target_tokens}`);
+    assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
+  } finally { h.close(); }
+});
+
 test('replay: without a prepared prefix the overflow turn compresses blocking, as before', async () => {
   const h = await harness({ prepares: false });
   try {
@@ -337,6 +373,15 @@ test('replay: a 300k tool result too large even on the compressed prefix keeps i
     if (process.platform !== 'win32') assert.equal(fs.statSync(saved).mode & 0o777, 0o600);
     assert.ok(tokensOf(sent) <= 960_000, `${tokensOf(sent)} tokens sent`);
     assert.ok(overflow.record.truncatedToolResult.omittedChars > 200_000);
+
+    // The next turn (Claude Code reading the file, say) resends the whole
+    // result: it is shortened again, the same way, rather than refused.
+    addRound(conv, 'read-back', 4_000);
+    const next = await h.post(conv);
+    assert.equal(next.status, 200, 'the turn after it is sent too');
+    const again = h.forwards.at(-1).messages.find(m => Array.isArray(m.content) &&
+      m.content[0]?.tool_use_id === 'huge')?.content[0].content;
+    assert.equal(again, result, 'shortened to the same bytes');
   } finally { h.close(); }
 });
 
@@ -463,7 +508,8 @@ test('tool output store: one private file per distinct output, same path every t
     }
     // Past the cap, nothing under an hour old is evicted: a request's 70
     // copies all stay while another ccc process saves (Codex r6-r9).
-    let clock = Date.now();
+    // Fixed one minute into a half hour, so the next minute stays in it.
+    let clock = 1_800_000 * 1_000_000 + 60_000;
     const pinnedStore = new ToolOutputStore(path.join(dir, 'pinned'), () => clock);
     const first = Array.from({ length: 70 }, (_, i) => pinnedStore.save(`output ${i}`));
     new ToolOutputStore(path.join(dir, 'pinned'), () => clock).save('another request');
