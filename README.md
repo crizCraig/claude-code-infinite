@@ -116,8 +116,10 @@ irm https://claude.ai/install.ps1 | iex
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Then open a new terminal and run `claude` once to sign in. The Claude desktop app isn't enough:
-`ccc` needs the `claude` command in your terminal ([help](#claude-code-isnt-installed)).
+Or just run `ccc`: when Claude Code isn't installed it offers to install it for you (with the
+same official command) and starts it, and Claude Code asks you to sign in. The Claude desktop
+app isn't enough: `ccc` needs the `claude` command in your terminal
+([help](#claude-code-isnt-installed)).
 
 </details>
 
@@ -409,11 +411,27 @@ publish.yml still tests that tag but skips publishing, since the version is alre
 PATH and, failing that, where its installers put it (`%USERPROFILE%\.local\bin`,
 `%APPDATA%\npm`, winget's folder and your saved user PATH on Windows; `~/.local/bin`,
 `~/.claude/local` and Homebrew elsewhere), so a terminal opened before the install works
-too. If it is not there, install it with the official command (Windows PowerShell:
-`irm https://claude.ai/install.ps1 | iex`; macOS/Linux:
-`curl -fsSL https://claude.ai/install.sh | bash`), open a new terminal, run `claude` once
-to sign in, then run
-`ccc` again, from your project folder.
+too. If it is not there, `ccc` asks "Claude Code isn't installed. Install it now? [Y/n]"
+(also when only the Claude desktop app is installed). Yes runs Anthropic's official installer
+(Windows PowerShell: `irm https://claude.ai/install.ps1 | iex`; macOS/Linux:
+`curl -fsSL https://claude.ai/install.sh | bash`) with its output on screen, then carries on
+in the same terminal (on a first run, after your MemTree key) into Claude Code, which asks you
+to sign in. `ccc` never installs anything
+without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those commands.
+To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
+then run `ccc` again, from your project folder.
+
+### "You've hit your Claude plan's usage limit" / "Anthropic is busy"
+
+When Anthropic answers a turn with 429 or 529, `ccc` tells the two apart the way Claude Code
+does. Your Claude plan's usage limit (a 429 its limiter rejected) gets "You've hit your Claude
+plan's usage limit. It resets at <time>." (your local time, when Anthropic says) on your next
+prompt and as `ccc` exits. Anything else (529 overloaded, another 429) is Anthropic being busy:
+Claude Code retries it itself, and if it still failed you get "Anthropic was busy; try again in
+a moment." on your next prompt or as `ccc` exits. The response itself reaches Claude Code
+unchanged, so its own retries and messages work as they do without `ccc`. In a print run
+(`ccc -p`) the line goes to stderr right away (for busy: "Anthropic is busy; Claude Code will
+retry.").
 
 ### "Credit balance too low"
 

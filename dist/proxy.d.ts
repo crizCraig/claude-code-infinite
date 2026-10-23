@@ -187,6 +187,11 @@ export interface ProxyOptions {
      */
     sessionStartNotice?: () => string | undefined;
     /**
+     * A line to show as the user submits a main-session prompt (UserPromptSubmit),
+     * e.g. a rate limit Anthropic answered with (rate-limit.ts). Called once per prompt.
+     */
+    promptSubmitNotice?: () => string | undefined;
+    /**
      * Earlier MemTree sessions in this project, added to a main session's
      * SessionStart as model context (project-trees.ts). Omitted means none.
      */

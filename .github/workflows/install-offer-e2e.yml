@@ -1,0 +1,50 @@
+# ccc on a clean runner WITHOUT Claude Code: it offers to install it, "y" runs Anthropic's
+# real official installer, and Claude Code is then found and runs (`claude --version`).
+# Opt-in and cheap: manual dispatch, and pull requests that touch the setup flow.
+# No secrets; diagnostics off.
+name: Install offer e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/claude-install.ts
+      - src/claude-locate.ts
+      - src/cli-main.ts
+      - scripts/e2e/install-offer-e2e.mjs
+      - .github/workflows/install-offer-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-offer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offer:
+    name: install offer / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    env:
+      CCC_NO_DIAGNOSTICS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Offer, answer y, real installer, claude --version
+        run: node scripts/e2e/install-offer-e2e.mjs

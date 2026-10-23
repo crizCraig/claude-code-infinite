@@ -63,6 +63,7 @@ import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKi
 import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
+import { rateLimitFromResponse } from "./rate-limit.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -313,6 +314,7 @@ export function startProxy(opts) {
         pausedDetail: () => opts.memtree.pausedDetail,
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
+        promptSubmitNotice: opts.promptSubmitNotice,
         projectTrees: opts.projectTrees,
         diagnostics: opts.diagnostics,
         notices: new NoticeDeliveryQueue(),
@@ -789,6 +791,17 @@ onMainStop) {
         if (parsed.agent_id === undefined) {
             state.promptAccounting.add(parsed.session_id, parsed.prompt_id, parsed.prompt);
             recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
+        }
+        const line = parsed.agent_id === undefined ? promptSubmitLine(state) : undefined;
+        if (line) {
+            const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+            res.writeHead(200, {
+                "content-type": "application/json",
+                "content-length": String(body.length),
+                "cache-control": "no-store",
+            });
+            res.end(body);
+            return;
         }
         res.writeHead(204);
         res.end();
@@ -2012,6 +2025,15 @@ function resumePaymentNotice(state, input) {
     state.paymentNotice.markShown();
     state.diagnostics?.record("paused_notice", { trigger: "resume" });
     return state.notices.warningText(paymentNoticeText(detail));
+}
+/** ProxyOptions.promptSubmitNotice's line for this prompt; never throws. */
+function promptSubmitLine(state) {
+    try {
+        return state.promptSubmitNotice?.();
+    }
+    catch {
+        return undefined;
+    }
 }
 /** The caller's extra SessionStart line; a throwing provider shows nothing. */
 function extraSessionStartLine(provider, input) {
@@ -4368,6 +4390,9 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             };
             if (rec) {
                 rec.upstreamStatus = upstreamRes.statusCode ?? 502;
+                const rateLimit = rateLimitFromResponse(rec.upstreamStatus, upstreamRes.headers);
+                if (rateLimit)
+                    rec.rateLimit = rateLimit;
             }
             successfulStatus =
                 typeof upstreamRes.statusCode === "number" &&

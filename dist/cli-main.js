@@ -47,6 +47,8 @@ import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
 import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
+import { INSTALL_PROMPT_ENV, offerClaudeInstall, runInstaller } from "./claude-install.js";
+import { RateLimitNotices, rateLimitNoticeText } from "./rate-limit.js";
 import { apiKeyOverride, claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, envApiKeySet, } from "./claude-auth.js";
 import { CreditRefusalMemory, creditAdviceApplies, isInfoOnlyRun, printStartupSignInLines, readSeenClaudeAuth, writeSeenClaudeAuth, } from "./claude-plan-warning.js";
 import { exitResumeHint } from "./resume-hint.js";
@@ -178,6 +180,49 @@ async function waitUntilPaid(recheck, totalMs, everyMs) {
     }
     return false;
 }
+/**
+ * Claude Code isn't installed: offer to install it when someone can answer
+ * (claude-install.ts), else say how. Null when it is still not installed.
+ */
+async function installMissingClaude(desktopOnly, interactiveUi, diagnostics) {
+    diagnostics.record("claude_missing");
+    const canAsk = interactiveUi || process.env[INSTALL_PROMPT_ENV] === "1";
+    if (!canAsk) {
+        console.error(desktopOnly ? claudeDesktopOnlyText() : claudeMissingText());
+        return null;
+    }
+    // A forced prompt without a terminal (CI) keeps stdout for Claude Code.
+    const out = interactiveUi ? process.stdout : process.stderr;
+    const claude = await offerClaudeInstall({
+        canAsk, desktopOnly,
+        ask: (question) => askAnswer(question, out),
+        runInstaller: (installer) => runInstaller(installer, out === process.stderr),
+        locate: () => locateClaude(),
+        print: (text) => out.write(`${text}\n`),
+        record: (name, fields) => diagnostics.record(name, fields),
+        flushNow: () => diagnostics.flushNow(),
+    });
+    if (claude)
+        diagnostics.setContext({ claude_found: claude.source });
+    return claude;
+}
+/** One typed line, or null when stdin ends or Ctrl+C is pressed first. */
+function askAnswer(question, output) {
+    const rl = readline.createInterface({ input: process.stdin, output });
+    return new Promise((resolve) => {
+        let answered = false;
+        rl.on("close", () => {
+            if (!answered)
+                resolve(null);
+        });
+        rl.on("SIGINT", () => rl.close());
+        rl.question(question, (answer) => {
+            answered = true;
+            rl.close();
+            resolve(answer);
+        });
+    });
+}
 function askLine(question) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => {
@@ -291,9 +336,9 @@ async function main() {
     // Started before the key prompt so a signup that stalls there is visible too.
     const diagnostics = startDiagnostics(mode, memtreeBaseUrl, polychatApiKey);
     // Before the key prompt: someone without Claude Code learns that first.
-    const claude = locateClaude();
+    const found = locateClaude();
     // Only the desktop app (its Claude Code is not a terminal command) gets its own message.
-    const desktopOnly = !claude && claudeDesktopInstalled();
+    const desktopOnly = !found && claudeDesktopInstalled();
     // One read each of Claude Code's config files (~/.claude.json can be large).
     const readFile = memoizedTextReader();
     const claudeSignIn = {
@@ -303,14 +348,14 @@ async function main() {
         subscriptionLogin: claudeSubscriptionLogin({ readFile }),
     };
     diagnostics.setContext({
-        claude_found: desktopOnly ? "desktop_only" : claude?.source,
+        claude_found: desktopOnly ? "desktop_only" : found?.source,
         claude_auth: claudeSignIn.auth,
         claude_plan: claudeSignIn.plan,
         env_api_key_set: envApiKeySet(),
     });
+    // Not installed: offered in a terminal (claude-install.ts), else how to install it.
+    const claude = found ?? await installMissingClaude(desktopOnly, interactiveUi, diagnostics);
     if (!claude) {
-        diagnostics.record("claude_missing");
-        console.error(desktopOnly ? claudeDesktopOnlyText() : claudeMissingText());
         await diagnostics.flush();
         process.exit(1);
     }
@@ -414,6 +459,9 @@ async function main() {
     // request log, plus a few allowlisted numbers for diagnostics.
     // Anthropic refusing for no credit gets one line as ccc exits, whatever the sign-in.
     let creditTooLow = false;
+    // Anthropic's 429/529 (rate-limit.ts): said on the next prompt and at exit, or
+    // right away on stderr in a print run. Claude Code's own retries are untouched.
+    const rateLimits = new RateLimitNotices();
     // An API key that beats the user's `/login` (claude-auth.ts), by source name only.
     const keyOverride = apiKeyOverride({ readFile, interactive: interactiveUi });
     // A refusal is also remembered for the next launch's startup line, until
@@ -429,7 +477,12 @@ async function main() {
         if (auth !== claudeSignIn.seen)
             writeSeenClaudeAuth(getConfigDir(), auth);
         claudeSignIn.seen = auth;
-    }, () => creditMemory.answered());
+    }, () => creditMemory.answered(), (info, startedAt) => {
+        if (!info)
+            rateLimits.answered(startedAt);
+        else if (rateLimits.observe(info) && !interactiveUi)
+            console.error(rateLimitNoticeText(info));
+    });
     // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
     // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
     // the caller's own --mcp-config names a `memtree` server, or its
@@ -505,6 +558,7 @@ async function main() {
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
         // install) on a later SessionStart of this session, once.
         sessionStartNotice: autoUpdate ? () => autoUpdate.notices.sessionStartLine() : undefined,
+        promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
         projectTrees,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
@@ -514,7 +568,8 @@ async function main() {
     // An earlier session's credit refusal (its advice, in place of the no-plan
     // line), else the no-plan line; then a subscriber whose env or settings make
     // Claude Code bill an API key instead.
-    if (!isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
+    // Not right after ccc installed Claude Code: it has just said Claude Code asks to sign in.
+    if (found && !isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
         refused: creditMemory.refusedAtStart, plan: claudeSignIn.plan, signIn: claudeSignIn,
         override: keyOverride, color: stderrColor,
     })) {
@@ -681,7 +736,8 @@ async function main() {
         const credit = creditTooLow && interactiveUi
             ? `${creditNoticeText(terminalSupportsColor(), source)}\n`
             : "";
-        const exitText = `${credit}${hint ?? ""}`;
+        const limit = interactiveUi ? rateLimits.exitLine() : undefined;
+        const exitText = `${limit ? `${limit}\n` : ""}${credit}${hint ?? ""}`;
         // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
         void (exitText ? writeStdout(exitText) : Promise.resolve()).then(markChildDone);
         void shutdown(exitCodeForChild(code, signal));
