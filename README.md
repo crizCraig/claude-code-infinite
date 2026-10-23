@@ -24,11 +24,10 @@ follows it down to the original messages.
 * **Search across every session.** Claude can find what was decided, tried or ruled out in any of
   your past sessions, by exact words or by meaning, filtered by project and date
 * **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
-* **Never loses anything vs Claude Code.** MemTree compresses as late as possible: on Opus 5.5,
-  Opus 5, Opus 4.8 and Fable 5 every message is sent word for word, exactly as Claude Code sends
-  it, until 900k tokens (Claude Code itself auto-compacts at 967k). Past that, your most recent
-  messages stay word for word and older ones become a searchable memory whose originals Claude can
-  read back. MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
+* **Never loses anything vs Claude Code.** On Opus 5 and up, you get the vast majority of the
+  1M-token window word for word, exactly as Claude Code sends it. Only near the limit does MemTree
+  compress, to about half the window so it compresses rarely: recent messages stay word for word
+  and older ones become a searchable memory, the originals one tool call away. MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
 * **Unlimited-length sessions**, with relevant past information recalled automatically
 * **A local proxy, so no slowdown.** Requests go straight from your machine to Anthropic and
   MemTree indexes in the background; only the occasional compression step, when a session
@@ -83,10 +82,9 @@ for MemTree and 38 min for full context. Input tokens count uncached, cache-read
 tokens; `/compact`'s exclude the one-time `/compact` step. This is one task family, one model and
 3 rounds, not a general benchmark.
 
-MemTree compresses as late as possible. Here the whole ~775k-token history went out word for word,
-exactly as Claude Code would send it, and MemTree compressed once, partway through the task, when
-the session passed the 800k budget it used then; the most recent messages stayed word for word.
-`ccc` now waits until 900k on Opus 5.5.
+MemTree compresses as late as possible: the whole ~775k-token history went out word for word,
+exactly as Claude Code would send it, and MemTree compressed only once, near the limit, keeping the
+most recent messages word for word.
 
 A rerun on Oct 20, with MemTree's lookup tools loaded and the same outputs graded again at a
 higher reasoning effort, gave the same shape: MemTree 65, full context 66, `/compact` 45.
