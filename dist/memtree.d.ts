@@ -349,6 +349,8 @@ export declare class MemtreeClient {
     private lastAnswerKeyInvalid;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
+    /** HTTP status of each key's latest failed compress (absent: no response). */
+    private compressFailureStatus;
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -433,6 +435,11 @@ export declare class MemtreeClient {
      * the fuse needs positive evidence of a responsive server.
      */
     lastCompressFailureArming(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): boolean;
+    /**
+     * The HTTP status of the latest failed compress of this request, sampled at
+     * its settle like lastCompressFailureArming; undefined when it got none.
+     */
+    lastCompressFailureStatus(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): number | undefined;
     /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.

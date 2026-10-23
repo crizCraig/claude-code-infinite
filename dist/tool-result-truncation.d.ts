@@ -6,8 +6,11 @@
  * refusing the request.
  *
  * MemTree has the whole result: the proxy sends every main-thread request's
- * full conversation to it for indexing, and its read_lines tool reads the
- * messages no tree covers yet ("tail") by their position.
+ * full conversation to it for indexing (the caller checks it got there). Its
+ * read_lines tool reads a message no tree covers yet ("tail") by position, up
+ * to 40,000 characters a call; once the message is indexed, a search for a
+ * phrase from the omitted part finds its transcript lines, which read_lines
+ * pages through.
  */
 export interface TruncationPlan {
     /** The rewritten body; the input is never mutated. */
@@ -26,5 +29,5 @@ export interface TruncationPlan {
  */
 export declare function truncateLargestToolResult(body: Record<string, any>, cutChars: number, memtreePosition: number): TruncationPlan | null;
 /** The pointer that stands for the omitted middle. */
-export declare function pointerText(omittedChars: number, totalChars: number, position: number): string;
+export declare function pointerText(omittedChars: number, totalChars: number, position: number, phrase: string): string;
 //# sourceMappingURL=tool-result-truncation.d.ts.map

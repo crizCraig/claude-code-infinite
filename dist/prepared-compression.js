@@ -29,9 +29,15 @@ const PREPARED_MAX_SESSIONS = 16;
  * plus the reserve would exceed the window or the trigger").
  */
 export function compressionTrigger(budgetTokens, contextTokens) {
-    const windowTrigger = contextTokens - COMPRESSION_RESERVE_TOKENS;
-    return windowTrigger > 0 ? Math.min(budgetTokens, windowTrigger) : budgetTokens;
+    // Never below the 0.8 share the server keeps on a small window (polychat
+    // near_window_budget_tokens), where the window less 40k would be lower.
+    const windowTrigger = Math.max(contextTokens - COMPRESSION_RESERVE_TOKENS, Math.floor(contextTokens * SMALL_WINDOW_RATIO));
+    return Math.min(budgetTokens, windowTrigger);
 }
+/** The share of a small window kept for compression (polychat NEAR_WINDOW_RATIO). */
+const SMALL_WINDOW_RATIO = 0.8;
+/** Answers without `prepared: true` after which a server is taken not to prepare. */
+const UNSUPPORTED_AFTER_MISSES = 3;
 /** Where preparing starts for a trigger. */
 export function prepareStartTokens(triggerTokens) {
     return Math.floor(triggerTokens * PREPARE_START_RATIO);
@@ -46,11 +52,11 @@ export class PreparedCompressions {
     inFlight = new Map();
     /** The size and trigger of each session's last call, answered or not. */
     lastAttempt = new Map();
-    /** Undefined until a prepare response says whether the server prepares. */
-    serverPrepares;
+    /** Consecutive answers without `prepared: true` (an older server, or a blocked request). */
+    misses = 0;
     /** Whether a request of `tokens` (under `triggerTokens`) should prepare now. */
     decide(sessionId, tokens, triggerTokens) {
-        if (this.serverPrepares === false)
+        if (this.misses >= UNSUPPORTED_AFTER_MISSES)
             return "unsupported";
         if (!(tokens >= prepareStartTokens(triggerTokens)) || tokens >= triggerTokens) {
             return "too-small";
@@ -95,9 +101,12 @@ export class PreparedCompressions {
             this.ready.delete(oldest);
         }
     }
-    /** The server's answer to a prepare call: `prepared: true` or not. */
-    noteServerSupport(prepares) {
-        this.serverPrepares = prepares;
+    /**
+     * A prepare call's answer: `prepared: true` or not. A server that never says
+     * so (one that predates preparing) is not asked again after a few answers.
+     */
+    noteServerAnswer(prepared) {
+        this.misses = prepared ? 0 : this.misses + 1;
     }
     get(sessionId) {
         return this.ready.get(sessionId);

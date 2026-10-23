@@ -775,6 +775,8 @@ export class MemtreeClient {
     lastAnswerKeyInvalid = false;
     /** Complete compression request key → whether its latest failure arms fuse. */
     compressFailureArming = new Map();
+    /** HTTP status of each key's latest failed compress (absent: no response). */
+    compressFailureStatus = new Map();
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -919,6 +921,13 @@ export class MemtreeClient {
         return (this.compressFailureArming.get(this.compressKey(hash, modelContextLimit, meta)) ?? true);
     }
     /**
+     * The HTTP status of the latest failed compress of this request, sampled at
+     * its settle like lastCompressFailureArming; undefined when it got none.
+     */
+    lastCompressFailureStatus(hash, modelContextLimit, meta) {
+        return this.compressFailureStatus.get(this.compressKey(hash, modelContextLimit, meta));
+    }
+    /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
      * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -963,6 +972,14 @@ export class MemtreeClient {
                 const first = this.compressFailureArming.keys().next().value;
                 if (first !== undefined)
                     this.compressFailureArming.delete(first);
+            }
+            this.compressFailureStatus.delete(cacheKey);
+            if (status !== undefined)
+                this.compressFailureStatus.set(cacheKey, status);
+            if (this.compressFailureStatus.size > DEDUPE_CACHE_MAX) {
+                const first = this.compressFailureStatus.keys().next().value;
+                if (first !== undefined)
+                    this.compressFailureStatus.delete(first);
             }
             // Don't cache failures — drop the entry so retries (e.g. Claude Code's
             // automatic retry of an identical request) hit the server again.

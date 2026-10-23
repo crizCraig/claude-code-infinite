@@ -450,6 +450,8 @@ export interface CompactionRecord {
      * window or budget; "mismatch": no longer this history; "too-large").
      */
     prepared?: "used" | "stale" | "mismatch" | "too-large";
+    /** How long the turn waited for its session's preparation still in flight. */
+    preparedWaitMs?: number;
 }
 /** One MemTree API call (blocking compress or background index). */
 export interface MemtreeRecord {

@@ -38,6 +38,12 @@ export interface Prepared<P> {
     atTokens: number;
     /** The trigger it was prepared against; a change discards it. */
     triggerTokens: number;
+    /** Its MemTree page, the session's memory source once it is adopted. */
+    source?: {
+        url: string;
+        index: string;
+        seq: number;
+    };
 }
 /** What the planner's size says about preparing for a session. */
 export type PrepareDecision = "prepare" | "too-small" | "in-flight" | "fresh" | "unsupported";
@@ -47,16 +53,19 @@ export declare class PreparedCompressions<P> {
     private readonly inFlight;
     /** The size and trigger of each session's last call, answered or not. */
     private readonly lastAttempt;
-    /** Undefined until a prepare response says whether the server prepares. */
-    private serverPrepares;
+    /** Consecutive answers without `prepared: true` (an older server, or a blocked request). */
+    private misses;
     /** Whether a request of `tokens` (under `triggerTokens`) should prepare now. */
     decide(sessionId: string, tokens: number, triggerTokens: number): PrepareDecision;
     /** Mark a call in flight for `sessionId`; false when one already is. */
     begin(sessionId: string, tokens: number, triggerTokens: number): boolean;
     /** End the session's call, storing what it prepared (undefined: nothing usable). */
     finish(sessionId: string, prepared: Prepared<P> | undefined): void;
-    /** The server's answer to a prepare call: `prepared: true` or not. */
-    noteServerSupport(prepares: boolean): void;
+    /**
+     * A prepare call's answer: `prepared: true` or not. A server that never says
+     * so (one that predates preparing) is not asked again after a few answers.
+     */
+    noteServerAnswer(prepared: boolean): void;
     get(sessionId: string): Prepared<P> | undefined;
     /**
      * Forget the session's prepared prefix and its refresh point (used,
