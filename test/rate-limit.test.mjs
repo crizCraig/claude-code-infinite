@@ -90,7 +90,10 @@ test("notices: plan limit on every prompt until it resets; busy once; an answer 
   assert.equal(notices.promptLine(), BUSY_AFTER_NOTICE);
   assert.equal(notices.promptLine(), undefined, "busy is said once per episode");
   assert.equal(notices.exitLine(), "Anthropic was busy; try again in a moment.");
-  notices.answered();
+  // A request that reached ccc before the refusal (a subagent's) proves nothing.
+  notices.answered(now - 1);
+  assert.equal(notices.exitLine(), BUSY_AFTER_NOTICE);
+  notices.answered(now);
   assert.equal(notices.exitLine(), undefined);
   assert.equal(notices.observe({ kind: "busy", status: 429 }), true, "a new episode after an answer");
 });
@@ -120,17 +123,21 @@ test("the tee: a turn's 429/529 calls back and is recorded; side requests are no
   });
   const seen = [];
   let answered = 0;
+  const startedAts = [];
   const sink = new DiagnosticsRequestSink(undefined, diagnostics, undefined, undefined,
-    () => { answered += 1; }, (info) => seen.push(info.kind));
+    (startedAt) => { answered += 1; startedAts.push(startedAt); }, (info) => seen.push(info.kind));
   const rec = (over) => ({ kind: "messages", turnType: "first-user", requestBytes: 10, ...over });
   sink.log(rec({ upstreamStatus: 429, rateLimit: { kind: "plan_limit", status: 429, resetsAt: 1 } }));
   sink.log(rec({ upstreamStatus: 529, turnType: "side-request",
                  rateLimit: { kind: "busy", status: 529 } }));
   sink.log(rec({ upstreamStatus: 529, turnType: "tool", rateLimit: { kind: "busy", status: 529 } }));
-  sink.log(rec({ upstreamStatus: 200 }));
+  const before = Date.now();
+  sink.log(rec({ upstreamStatus: 200, totalMs: 60_000 }));
   await diagnostics.flush(1000);
   assert.deepEqual(seen, ["plan_limit", "busy"]);
   assert.equal(answered, 1);
+  // When that request reached ccc: now minus its total time.
+  assert.ok(startedAts[0] <= Date.now() - 60_000 && startedAts[0] >= before - 60_000);
   const events = sent.flatMap((b) => b.events).filter((e) => e.name === "rate_limit");
   assert.deepEqual(events.map((e) => [e.kind, e.status]), [["plan_limit", 429], ["busy", 529]]);
   assert.equal(sanitizeEvent("rate_limit", { kind: "other", status: 429 }, 1).kind, undefined);

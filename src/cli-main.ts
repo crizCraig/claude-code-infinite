@@ -616,9 +616,9 @@ async function main() {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
     claudeSignIn.seen = auth;
-  }, () => {
+  }, (startedAt) => {
     creditMemory.answered();
-    rateLimits.answered();
+    rateLimits.answered(startedAt);
   }, (info) => {
     if (rateLimits.observe(info) && !interactiveUi) console.error(rateLimitNoticeText(info));
   });

@@ -46,8 +46,12 @@ export declare class RateLimitNotices {
     constructor(clock?: () => number);
     /** A refusal of a turn's request; true when it starts a new episode (say it now). */
     observe(info: RateLimitInfo): boolean;
-    /** Anthropic answered a turn: nothing to say any more. */
-    answered(): void;
+    /**
+     * Anthropic answered a turn's request that reached ccc at `startedAt`: nothing
+     * to say any more. One sent before the refusal (a subagent's, finishing late)
+     * proves nothing about the limit, so it is ignored.
+     */
+    answered(startedAt?: number): void;
     /** For the next prompt: the plan limit on every prompt until it resets; busy once. */
     promptLine(): string | undefined;
     /** For ccc's exit: the limit still in force, if any. */

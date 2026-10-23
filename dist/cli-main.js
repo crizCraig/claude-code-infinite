@@ -477,9 +477,9 @@ async function main() {
         if (auth !== claudeSignIn.seen)
             writeSeenClaudeAuth(getConfigDir(), auth);
         claudeSignIn.seen = auth;
-    }, () => {
+    }, (startedAt) => {
         creditMemory.answered();
-        rateLimits.answered();
+        rateLimits.answered(startedAt);
     }, (info) => {
         if (rateLimits.observe(info) && !interactiveUi)
             console.error(rateLimitNoticeText(info));

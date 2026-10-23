@@ -71,9 +71,14 @@ export class RateLimitNotices {
             this.promptShown = false;
         return fresh;
     }
-    /** Anthropic answered a turn: nothing to say any more. */
-    answered() {
-        this.current = null;
+    /**
+     * Anthropic answered a turn's request that reached ccc at `startedAt`: nothing
+     * to say any more. One sent before the refusal (a subagent's, finishing late)
+     * proves nothing about the limit, so it is ignored.
+     */
+    answered(startedAt = this.clock()) {
+        if (startedAt >= this.seenAt)
+            this.current = null;
     }
     /** For the next prompt: the plan limit on every prompt until it resets; busy once. */
     promptLine() {
