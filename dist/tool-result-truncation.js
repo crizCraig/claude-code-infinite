@@ -18,38 +18,49 @@ const MIN_KEEP_CHARS = 2_000;
 /** The head's share of what is kept (errors and summaries often end a log). */
 const HEAD_SHARE = 0.5;
 /**
- * Truncate the largest text of a tool result in the body's last message so
- * the body loses at least `cutChars` characters (or keeps the minimum), or
- * null when it has none worth shortening or `saveFull` could not save it.
- * `saveFull` stores the whole text and returns where.
+ * Shorten the tool result texts of the body's last message, largest first,
+ * until the body loses at least `cutChars` characters (or every text worth
+ * shortening keeps only the minimum), or null when there is none or
+ * `saveFull` could not save one. `saveFull` stores a whole text, returns where.
  */
-export function truncateLargestToolResult(body, cutChars, saveFull) {
+export function truncateToolResults(body, cutChars, saveFull) {
     const messages = Array.isArray(body.messages) ? body.messages : [];
-    const messageIndex = messages.length - 1;
-    const last = messages[messageIndex];
+    const last = messages[messages.length - 1];
     if (!last || last.role !== "user" || !Array.isArray(last.content))
         return null;
-    const site = largestToolText(last.content);
-    if (!site)
+    let content = last.content;
+    const plan = { originalChars: 0, omittedChars: 0, savedAt: [] };
+    for (const site of toolTextSites(content)) {
+        if (plan.omittedChars >= cutChars)
+            break;
+        const cut = shortenSite(site, cutChars - plan.omittedChars, saveFull);
+        if (cut === null)
+            continue;
+        if (cut === undefined)
+            return null;
+        content = content.map((block, i) => i === site.blockIndex ? withToolText(block, site.partIndex, cut.text) : block);
+        plan.originalChars += site.text.length;
+        plan.omittedChars += cut.omitted;
+        plan.savedAt.push(cut.savedAt);
+    }
+    if (!plan.savedAt.length)
         return null;
+    return { body: { ...body, messages: [...messages.slice(0, -1), { ...last, content }] }, ...plan };
+}
+/**
+ * One text cut so it loses about `cutChars` (at most down to the minimum):
+ * null when it is too short to shorten, undefined when it could not be saved.
+ */
+function shortenSite(site, cutChars, saveFull) {
     const longest = pointerText(site.text.length, site.text.length, "").length + PATH_ALLOWANCE;
     const keep = keptChars(site.text.length, cutChars + longest);
     if (keep === null)
         return null;
     const savedAt = saveFull(site.text);
     if (savedAt === undefined)
-        return null;
+        return undefined;
     const pointer = (omitted) => pointerText(omitted, site.text.length, savedAt);
-    const { text, omitted } = cutMiddle(site.text, keep, pointer);
-    const content = last.content.map((block, i) => i === site.blockIndex ? withToolText(block, site.partIndex, text) : block);
-    return {
-        body: { ...body, messages: [...messages.slice(0, -1), { ...last, content }] },
-        messageIndex,
-        ...(typeof site.toolUseId === "string" ? { toolUseId: site.toolUseId } : {}),
-        originalChars: site.text.length,
-        omittedChars: omitted,
-        savedAt,
-    };
+    return { ...cutMiddle(site.text, keep, pointer), savedAt };
 }
 /** The pointer that stands for the omitted middle. */
 export function pointerText(omittedChars, totalChars, savedAt) {
@@ -60,18 +71,17 @@ export function pointerText(omittedChars, totalChars, savedAt) {
 }
 /** Room left in the pointer estimate for the saved file's path. */
 const PATH_ALLOWANCE = 512;
-function largestToolText(content) {
-    let best = null;
+/** Every tool result text of `content`, largest first. */
+function toolTextSites(content) {
+    const sites = [];
     content.forEach((block, blockIndex) => {
         if (block?.type !== "tool_result")
             return;
         for (const [partIndex, text] of toolTexts(block.content)) {
-            if (!best || text.length > best.text.length) {
-                best = { blockIndex, partIndex, text, toolUseId: block.tool_use_id };
-            }
+            sites.push({ blockIndex, partIndex, text, toolUseId: block.tool_use_id });
         }
     });
-    return best;
+    return sites.sort((a, b) => b.text.length - a.text.length);
 }
 function toolTexts(content) {
     if (typeof content === "string")

@@ -11,21 +11,19 @@
 export interface TruncationPlan {
     /** The rewritten body; the input is never mutated. */
     body: Record<string, any>;
-    /** Message index (in the body) of the truncated result. */
-    messageIndex: number;
-    toolUseId?: string;
+    /** Characters of the tool result texts shortened, and of them omitted. */
     originalChars: number;
     omittedChars: number;
-    /** Where the full output was saved. */
-    savedAt: string;
+    /** Where each shortened text was saved whole. */
+    savedAt: string[];
 }
 /**
- * Truncate the largest text of a tool result in the body's last message so
- * the body loses at least `cutChars` characters (or keeps the minimum), or
- * null when it has none worth shortening or `saveFull` could not save it.
- * `saveFull` stores the whole text and returns where.
+ * Shorten the tool result texts of the body's last message, largest first,
+ * until the body loses at least `cutChars` characters (or every text worth
+ * shortening keeps only the minimum), or null when there is none or
+ * `saveFull` could not save one. `saveFull` stores a whole text, returns where.
  */
-export declare function truncateLargestToolResult(body: Record<string, any>, cutChars: number, saveFull: (text: string) => string | undefined): TruncationPlan | null;
+export declare function truncateToolResults(body: Record<string, any>, cutChars: number, saveFull: (text: string) => string | undefined): TruncationPlan | null;
 /** The pointer that stands for the omitted middle. */
 export declare function pointerText(omittedChars: number, totalChars: number, savedAt: string): string;
 //# sourceMappingURL=tool-result-truncation.d.ts.map

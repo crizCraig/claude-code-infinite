@@ -55,7 +55,7 @@ import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputR
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions,
   prepareStartTokens, type Prepared } from "./prepared-compression.js";
-import { truncateLargestToolResult } from "./tool-result-truncation.js";
+import { truncateToolResults } from "./tool-result-truncation.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
 import http from "node:http";
 import https from "node:https";
@@ -2246,16 +2246,20 @@ async function handleMessages(
   const planEdge = () => planEdgeCompaction({ sizing: requestSizing, opts, state, body, messages,
     sessionId: sessionId!, modelContextLimit, forwardBody, rec });
   let edge = isMainRequest && sessionId !== undefined ? await planEdge() : undefined;
-  if (edge?.kind === "compress" &&
-      (state.preparing.has(sessionId!) || rec.compaction?.preparedWaitMs !== undefined)) {
+  if (edge?.kind === "compress" && (state.preparing.has(sessionId!) ||
+      rec.compaction?.preparedWaitMs !== undefined || rec.compaction?.prepared !== undefined)) {
     // Never beside the session's preparation (both would be billed): wait for
     // it, then plan again with the settings now current (a /memtree-compact
-    // that arrived meanwhile) and the preparation it may have left.
+    // that arrived while it waited or counted) and the preparation it left.
     const waited = rec.compaction?.preparedWaitMs ?? 0;
+    const prepared = rec.compaction?.prepared;
     await awaitPreparation(state, sessionId!, opts.memtree.longCompressBudgetMs, rec.compaction!);
     const total = waited + (rec.compaction?.preparedWaitMs ?? 0);
     edge = await planEdge();
-    if (rec.compaction) rec.compaction.preparedWaitMs = total;
+    if (rec.compaction) {
+      rec.compaction.preparedWaitMs = total;
+      rec.compaction.prepared ??= prepared;
+    }
   }
   // Not beside a blocking compress call: the two would overlap on the server.
   if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass")) {
@@ -5909,7 +5913,7 @@ async function truncateCandidate(
   for (let attempt = 1; attempt <= TRUNCATION_ATTEMPTS; attempt++) {
     const excess = Math.max(1_000, first.tokens - goal);
     const cut = Math.ceil(excess * bytesPerToken * TRUNCATION_MARGIN * attempt);
-    const plan = truncateLargestToolResult(parsed, cut, (text) => store.save(text));
+    const plan = truncateToolResults(parsed, cut, (text) => store.save(text));
     if (!plan) return undefined;
     const candidate = sizing.register(Buffer.from(JSON.stringify(plan.body), "utf-8"),
       "replacement");

@@ -11,7 +11,7 @@ import { startProxy } from '../dist/proxy.js';
 import { MemtreeClient } from '../dist/memtree.js';
 import { compressionTrigger, PreparedCompressions, prepareRefreshTokens, prepareStartTokens }
   from '../dist/prepared-compression.js';
-import { truncateLargestToolResult } from '../dist/tool-result-truncation.js';
+import { truncateToolResults } from '../dist/tool-result-truncation.js';
 import { ToolOutputStore } from '../dist/tool-output-store.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -415,31 +415,38 @@ test('tool result truncation keeps head and tail and points at MemTree', () => {
       { type: 'tool_result', tool_use_id: 't', content: [{ type: 'text', text }] }] }] };
   const saved = [];
   const save = (full) => { saved.push(full); return '/tmp/ccc-outputs/abc.txt'; };
-  const plan = truncateLargestToolResult(body, 60_000, save);
+  const plan = truncateToolResults(body, 60_000, save);
   assert.ok(plan);
   const kept = plan.body.messages[2].content[1].content[0].text;
   assert.ok(kept.startsWith('a'.repeat(1_000)) && kept.endsWith('c'.repeat(1_000)));
   assert.ok(kept.length <= text.length - 60_000 + 500, `${kept.length}`);
   assert.match(kept, /The full output is saved at \/tmp\/ccc-outputs\/abc.txt: read the omitted part/);
   assert.equal(saved[0], text, 'the whole text is saved');
-  assert.equal(plan.toolUseId, 't');
   assert.equal(plan.body.messages[2].content[0].content, 'tiny', 'other results untouched');
   assert.equal(body.messages[2].content[1].content[0].text, text, 'input not mutated');
   // Deterministic: the same cut gives the same bytes (a prompt-cache hit next time).
-  assert.equal(JSON.stringify(truncateLargestToolResult(body, 60_000, save).body),
+  assert.equal(JSON.stringify(truncateToolResults(body, 60_000, save).body),
     JSON.stringify(plan.body));
-  assert.equal(truncateLargestToolResult({ messages: [{ role: 'user', content: 'plain' }] }, 10, save),
+  assert.equal(truncateToolResults({ messages: [{ role: 'user', content: 'plain' }] }, 10, save),
     null);
-  assert.equal(truncateLargestToolResult(body, 60_000, () => undefined), null,
+  assert.equal(truncateToolResults(body, 60_000, () => undefined), null,
     'never shortened when the copy cannot be saved');
   // A cut past the whole result keeps the minimum head and tail.
-  const minimal = truncateLargestToolResult(body, 10_000_000, save);
+  const minimal = truncateToolResults(body, 10_000_000, save);
   const minimalText = minimal.body.messages[2].content[1].content[0].text;
   assert.ok(minimalText.startsWith('a'.repeat(900)) && minimalText.endsWith('c'.repeat(900)));
   assert.ok(minimal.omittedChars > text.length - 3_000, `${minimal.omittedChars}`);
+  // Several large texts in one result: shortened largest first until enough is cut.
+  const two = { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'm',
+    content: [{ type: 'text', text: 'p'.repeat(100_000) }, { type: 'text', text: 'q'.repeat(90_000) }] }] }] };
+  const both = truncateToolResults(two, 150_000, save);
+  const parts = both.body.messages[0].content[0].content;
+  assert.ok(parts[0].text.length < 60_000 && parts[1].text.length < 60_000, 'both shortened');
+  assert.ok(both.omittedChars >= 150_000 && both.savedAt.length === 2);
+  assert.equal(truncateToolResults(two, 1_000, save).savedAt.length, 1, 'only as many as needed');
   const short = { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't',
     content: 'z'.repeat(3_000) }] }] };
-  assert.equal(truncateLargestToolResult(short, 10, save), null, 'too short to shorten');
+  assert.equal(truncateToolResults(short, 10, save), null, 'too short to shorten');
 });
 
 test('tool output store: one private file per distinct output, same path every time', () => {
