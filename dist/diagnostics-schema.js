@@ -169,6 +169,8 @@ export const CONTEXT_FIELDS = {
     context_window_k: integer(0, 100_000),
 };
 export const EVENT_FIELDS = {
+    /** npm's postinstall (install-ping.ts); false when this machine already had an install id. */
+    installed: { new_install: bool },
     first_run: {},
     sign_in_prompt: {},
     key_saved: {},
@@ -178,6 +180,9 @@ export const EVENT_FIELDS = {
     first_request: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
         request_kb: KB },
     first_turn: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
+        request_kb: KB },
+    /** The first human turn Anthropic answered with a 2xx (first_turn is the first attempt). */
+    first_answer: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
         request_kb: KB },
     upstream_error: { status: STATUS, turn_type: oneOf(TURN_TYPES), total_ms: MS,
         request_kb: KB },
