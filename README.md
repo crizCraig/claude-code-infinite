@@ -5,10 +5,10 @@
 # Claude Code Infinite
 
 <p align="center">
-  <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind: on a ~800k-token session, MemTree 69% (~420k tokens after MemTree), /compact 49% (~13k tokens after /compact)" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
+  <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind, on a ~800k-token Claude Code session: MemTree 69% (~420k tokens after MemTree), /compact 49% (~13k tokens after /compact)" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
 </p>
 <p align="center"><sub>Long-session benchmark (Claude Opus 5.5, graded blind): MemTree beat <code>/compact</code> by 20 points,
-running at ~800k tokens before compressing. It also matched full context on this test (69 vs 69).
+on a ~800k-token Claude Code session. It also matched full context on this test (69 vs 69).
 <a href="#long-session-benchmark">Full results</a></sub></p>
 
 Infinite context for Claude Code: memory for long-running agents. Claude Code Infinite indexes your Claude Code sessions with
