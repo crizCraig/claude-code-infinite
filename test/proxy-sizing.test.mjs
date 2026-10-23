@@ -838,19 +838,21 @@ test('the fallback budget mirrors the server: every Claude model near its window
     'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-opus-4-6[1m]',
     'claude-fable-5', 'claude-fable-5-1', 'claude-opus-5-5-20261001', 'claude-mythos-5']) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), 900_000, model);
-    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, `${model} on a 200k window`);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, `${model} on a 200k window`);
   }
   for (const model of ['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-haiku-5-5',
     'claude-opus-4-5', 'claude-opus-4-1']) {
-    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, model);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, model);
   }
   // The Sonnets keep their usable-context ceilings on a 1M window.
   for (const [model, ceiling] of [['claude-sonnet-5', 550_000], ['claude-sonnet-5-5', 550_000],
     ['claude-sonnet-5-5[1m]', 550_000], ['claude-sonnet-4-6', 400_000],
     ['claude-sonnet-4-5-20250929', 400_000]]) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), ceiling, model);
-    assert.equal(fallbackBudgetTokens(model, 200_000), 180_000, `${model} on a 200k window`);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, `${model} on a 200k window`);
   }
+  // A small window: never below the 0.8 share (Claude Code's point would be negative).
+  assert.equal(fallbackBudgetTokens('claude-opus-4-6', 32_000), 25_600);
   // Not a Claude family the server knows: the plain 0.8 share.
   for (const model of ['claude-x', 'gpt-6', undefined]) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), 800_000, String(model));

@@ -628,8 +628,10 @@ interface StablePrefixInstall {
 /**
  * Budget fallback until the server reports `model_budget_tokens`, mirroring the
  * server's ccc policy (polychat index_budget.py): every Claude model compresses
- * near its window, NEAR_WINDOW_FALLBACK_RATIO of it (900k of 1M, 180k of 200k),
- * at most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
+ * near its window, NEAR_WINDOW_FALLBACK_RATIO of it but no later than Claude
+ * Code's own auto-compact point (window - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS)
+ * and never below FALLBACK_BUDGET_WINDOW_RATIO: 900k of 1M, 167k of 200k; at
+ * most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
  * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts a 1M
  * window at 967k, so MemTree compresses no earlier than ~70k before it would;
  * ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
@@ -637,6 +639,8 @@ interface StablePrefixInstall {
  */
 export const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
 export const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
+/** Claude Code 2.1.302 auto-compacts at window - min(max_tokens, 20k) - 13k. */
+const CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS = 33_000;
 /** The ids the server resolves to a Claude model (polychat ANTHROPIC_MODEL_FAMILIES). */
 const CLAUDE_FAMILY_RE = /opus|sonnet|haiku|fable|mythos/i;
 /**
@@ -653,7 +657,10 @@ export function fallbackBudgetTokens(model: unknown, modelContextLimit: number):
   if (typeof model !== "string" || !CLAUDE_FAMILY_RE.test(model)) {
     return Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO);
   }
-  const nearWindow = Math.floor(modelContextLimit * NEAR_WINDOW_FALLBACK_RATIO);
+  const nearWindow = Math.max(
+    Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO),
+    Math.min(Math.floor(modelContextLimit * NEAR_WINDOW_FALLBACK_RATIO),
+      modelContextLimit - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS));
   const ceiling = SONNET_CEILINGS.find(([re]) => re.test(model))?.[1];
   return ceiling === undefined ? nearWindow : Math.min(nearWindow, ceiling);
 }
