@@ -49,6 +49,8 @@ export declare class RequestSizing {
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */
     excludeFallback(candidate: RequestCandidate): void;
+    /** Every registered candidate planning has not excluded, in registration order. */
+    fallbacks(): RequestCandidate[];
     /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
     plan(candidate: RequestCandidate): PlannedSize;
     /** Whether this body could still get an exact count: counting is on and

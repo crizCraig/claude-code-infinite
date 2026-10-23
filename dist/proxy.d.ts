@@ -236,18 +236,18 @@ export interface RunningProxy {
 }
 /**
  * Budget fallback until the server reports `model_budget_tokens`, mirroring the
- * server's ccc policy (polychat index_budget.py): every Claude model compresses
- * near its window, NEAR_WINDOW_FALLBACK_RATIO of it but no later than Claude
- * Code's own auto-compact point (window - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS)
- * and never below FALLBACK_BUDGET_WINDOW_RATIO: 900k of 1M, 167k of 200k; at
- * most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
- * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts a 1M
- * window at 967k, so MemTree compresses no earlier than ~70k before it would;
- * ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
- * jumps past the budget reaches the proxy and is compressed here.
+ * server's ccc policy (polychat index_budget.py near_window_budget_tokens):
+ * every Claude model compresses near its window, at the window less the
+ * reply's room (COMPRESSION_RESERVE_TOKENS, 40k) and never below
+ * FALLBACK_BUDGET_WINDOW_RATIO of it: 960k of 1M, 160k of 200k; at most a
+ * Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
+ * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts at
+ * window - 33k (967k of 1M), so MemTree compresses just before it would; ccc
+ * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * jumps past the budget reaches the proxy and is compressed here, on a
+ * prepared prefix when there is one (prepared-compression.ts).
  */
 export declare const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
-export declare const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
 /** The fallback whole-request budget for `model` on this window (see above). */
 export declare function fallbackBudgetTokens(model: unknown, modelContextLimit: number): number;
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;

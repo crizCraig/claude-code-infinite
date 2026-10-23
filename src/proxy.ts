@@ -50,8 +50,12 @@ import {
   type SizeSample,
 } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation,
-  type RequestCandidate, type SizingLimits } from "./request-sizing.js";
+  type CandidateMeasurement, type PlannedSize, type RequestCandidate, type SizingLimits }
+  from "./request-sizing.js";
 import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
+import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions,
+  prepareStartTokens, type Prepared } from "./prepared-compression.js";
+import { truncateLargestToolResult } from "./tool-result-truncation.js";
 import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes } from "node:crypto";
@@ -76,6 +80,7 @@ import {
   modelBudgetTokens,
   normalizeMessagesForMemtree,
   serverFlattenedMessages,
+  type CompressRequestMeta,
   type CompressResult,
   rawPromptTokenCount,
 } from "./memtree.js";
@@ -517,6 +522,13 @@ interface ProxyState {
    */
   stablePrefixes: Map<string, StablePrefix>;
   /**
+   * Each session's prepared compressed prefix (prepared-compression.ts): made
+   * in the background once the main thread's request nears the budget, and
+   * installed as the stable prefix, with no compress call, on the turn that
+   * would cross it.
+   */
+  prepared: PreparedCompressions<StablePrefix>;
+  /**
    * Model budgets the server reported (`model_budget_tokens`), keyed by
    * model and context window (serverBudgetKey).
    */
@@ -627,20 +639,18 @@ interface StablePrefixInstall {
 
 /**
  * Budget fallback until the server reports `model_budget_tokens`, mirroring the
- * server's ccc policy (polychat index_budget.py): every Claude model compresses
- * near its window, NEAR_WINDOW_FALLBACK_RATIO of it but no later than Claude
- * Code's own auto-compact point (window - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS)
- * and never below FALLBACK_BUDGET_WINDOW_RATIO: 900k of 1M, 167k of 200k; at
- * most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
- * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts a 1M
- * window at 967k, so MemTree compresses no earlier than ~70k before it would;
- * ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
- * jumps past the budget reaches the proxy and is compressed here.
+ * server's ccc policy (polychat index_budget.py near_window_budget_tokens):
+ * every Claude model compresses near its window, at the window less the
+ * reply's room (COMPRESSION_RESERVE_TOKENS, 40k) and never below
+ * FALLBACK_BUDGET_WINDOW_RATIO of it: 960k of 1M, 160k of 200k; at most a
+ * Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
+ * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts at
+ * window - 33k (967k of 1M), so MemTree compresses just before it would; ccc
+ * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * jumps past the budget reaches the proxy and is compressed here, on a
+ * prepared prefix when there is one (prepared-compression.ts).
  */
 export const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
-export const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
-/** Claude Code 2.1.302 auto-compacts at window - min(max_tokens, 20k) - 13k. */
-const CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS = 33_000;
 /** The ids the server resolves to a Claude model (polychat ANTHROPIC_MODEL_FAMILIES). */
 const CLAUDE_FAMILY_RE = /opus|sonnet|haiku|fable|mythos/i;
 /**
@@ -657,12 +667,15 @@ export function fallbackBudgetTokens(model: unknown, modelContextLimit: number):
   if (typeof model !== "string" || !CLAUDE_FAMILY_RE.test(model)) {
     return Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO);
   }
-  const nearWindow = Math.max(
-    Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO),
-    Math.min(Math.floor(modelContextLimit * NEAR_WINDOW_FALLBACK_RATIO),
-      modelContextLimit - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS));
+  const nearWindow = nearWindowBudgetTokens(modelContextLimit);
   const ceiling = SONNET_CEILINGS.find(([re]) => re.test(model))?.[1];
   return ceiling === undefined ? nearWindow : Math.min(nearWindow, ceiling);
+}
+
+/** A Claude model's near-window budget before any ceiling (fallbackBudgetTokens). */
+function nearWindowBudgetTokens(modelContextLimit: number): number {
+  return Math.max(Math.floor(modelContextLimit * FALLBACK_BUDGET_WINDOW_RATIO),
+    modelContextLimit - COMPRESSION_RESERVE_TOKENS);
 }
 /**
  * An explicit target is capped at this share of the budget: a compaction to
@@ -975,6 +988,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     defaultCompactOff: opts.defaultCompactTarget === null,
     compactNow: new Set(),
     stablePrefixes: new Map(),
+    prepared: new PreparedCompressions(),
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
@@ -2020,6 +2034,11 @@ async function handleMessages(
         ride: toolRide,
         canCompress,
       });
+      if (isMainRequest && toolSessionId !== undefined && canCompress &&
+          (plan.kind === "ride" || plan.kind === "pass")) {
+        maybePrepareCompression({ opts, state, body, messages, msgsForMemtree, hash,
+          sessionId: toolSessionId, modelContextLimit, rec, clientMeta });
+      }
       if (plan.kind === "ride") toolRide = plan.ride;
       if (plan.kind === "pass" && plan.original) {
         toolRide = undefined;
@@ -2228,6 +2247,11 @@ async function handleMessages(
           rec,
         })
       : undefined;
+  if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass" ||
+      (edge.kind === "compress" && edge.reason === undefined))) {
+    maybePrepareCompression({ opts, state, body, messages, msgsForMemtree, hash, sessionId,
+      modelContextLimit, rec, clientMeta });
+  }
 
   // An active subagent can repeat/embed the human prompt in its own request;
   // producer suppression must also preserve the arm for the later main call.
@@ -2417,7 +2441,7 @@ async function handleMessages(
     );
   };
 
-  if (existingRide && (!edge || edge.kind === "off")) {
+  if (existingRide && (!edge || edge.kind === "off" || edge.kind === "pass")) {
     const owner = rideableCandidate!.stablePrefix ?? rideableCandidate!;
     const candidate = requestSizing.register(existingRide, "ride", owner.lastSize);
     candidateSizeOwners.set(candidate, owner);
@@ -2463,6 +2487,28 @@ async function handleMessages(
   const noteWholeSize = () => {
     if (isMainRequest) notePassthroughSize(state, sessionId, body.model, rec, forwardBody.length);
   };
+
+  if (edge?.kind === "pass") {
+    // Clearly under the budget by its own count: the compress call could only
+    // pass it through, so the turn goes out now and the call (which also
+    // indexes it and reports the page and budget) runs in the background.
+    compressInBackground({ opts, state, body, msgsForMemtree, hash, modelContextLimit, rec,
+      sessionId, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
+      compaction: { target: edge.target, threshold: edge.threshold },
+      linkSeq: isAwaySummary ? undefined : nextMemtreeCallSeq(state) });
+    releaseForOriginalFallback();
+    sendingWhole();
+    recordTurn(rec, "followup-under-budget", forwardBody);
+    capture(opts, "anthropic-request", forwardBody);
+    return logged(
+      forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec)
+        .then((delivered) => {
+          noteWholeSize();
+          if (delivered) markMainPromptDelivered();
+        })
+    );
+  }
+
 
   // The complete request upload can outlive its downstream subscriber while
   // MemTree compression is in flight. Track that subscriber locally without
@@ -3401,6 +3447,9 @@ function storeStablePrefix(
   stable.installed = prefix;
   boundedSet(state.stablePrefixes, sessionId, prefix);
   state.compactNow.delete(sessionId);
+  // Prepared against the old prefix's ride sizes: a fresh one is made when
+  // the new prefix's rides near the budget again.
+  state.prepared.discard(sessionId);
   return prefix;
 }
 
@@ -3591,10 +3640,13 @@ function serverBudgetKey(model: unknown, modelContextLimit: number): string {
 }
 
 /**
- * The session's whole-request budget: CCC_BUDGET_TOKENS when set (tests),
- * else the model budget the server last reported for this model and window,
- * else fallbackBudgetTokens (servers that predate `model_budget_tokens`, and
- * the first request before any response).
+ * The session's whole-request budget, the size at which a request is
+ * compressed: CCC_BUDGET_TOKENS when set (tests), else the model budget the
+ * server last reported for this model and window, else fallbackBudgetTokens
+ * (servers that predate `model_budget_tokens`, and the first request before
+ * any response). Never above the window less the reply's room
+ * (compressionTrigger): a request is compressed when its projected size plus
+ * that reserve would exceed the window, or the budget.
  */
 function resolveBudget(
   opts: ProxyOptions,
@@ -3602,13 +3654,14 @@ function resolveBudget(
   model: unknown,
   modelContextLimit: number
 ): Budget {
+  const trigger = (tokens: number) => compressionTrigger(tokens, modelContextLimit);
   if (opts.budgetTokensOverride !== undefined) {
-    return { tokens: opts.budgetTokensOverride, source: "override" };
+    return { tokens: trigger(opts.budgetTokensOverride), source: "override" };
   }
   const reported = state.serverBudgets.get(serverBudgetKey(model, modelContextLimit));
-  if (reported !== undefined) return { tokens: reported, source: "server" };
+  if (reported !== undefined) return { tokens: trigger(reported), source: "server" };
   return {
-    tokens: fallbackBudgetTokens(model, modelContextLimit),
+    tokens: trigger(fallbackBudgetTokens(model, modelContextLimit)),
     source: "window-ratio",
   };
 }
@@ -3899,6 +3952,12 @@ function boundedSet<V>(
 type EdgePlan =
   /** `/memtree-compact off`: the pre-edge behaviour, no stable prefix. */
   | { kind: "off" }
+  /**
+   * No prefix, and clearly under the budget by its token count
+   * (clearlyUnderBudget): forward whole now and make the compress call, which
+   * could only pass it through, in the background.
+   */
+  | { kind: "pass"; target: number; threshold: number }
   /** Send on the stored prefix; no compress call. */
   | { kind: "ride"; prefix: StablePrefix; routed: { body: Record<string, any>; raw: Buffer } }
   /**
@@ -4015,7 +4074,11 @@ async function planEdgeCompaction(args: {
     ) {
       return forced("target-change", fallback);
     }
-    if (size.tokens >= budget.tokens || overWindow) return forced("budget", fallback);
+    if (size.tokens >= budget.tokens || overWindow) {
+      const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction });
+      if (adopted) return { kind: "ride", ...adopted };
+      return forced("budget", fallback);
+    }
     return { kind: "ride", prefix, routed };
   }
 
@@ -4028,12 +4091,17 @@ async function planEdgeCompaction(args: {
   compaction.sizeSource = size.source;
   noteUncountedBound(compaction, args.sizing, originalCandidate, body, modelContextLimit);
   if (calibratedSizeExceedsLimits(compaction, body, modelContextLimit)) {
+    const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction });
+    if (adopted) return { kind: "ride", ...adopted };
     return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
   }
   if (state.serverReportsBudget) {
     // The server measures the request and compresses only past the budget.
     const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
     compaction.thresholdTokens = threshold;
+    if (clearlyUnderBudget(budget, size, compaction)) {
+      return { kind: "pass", target: targetTokens, threshold };
+    }
     return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
   }
   // Without calibrated usage or threshold support, let the server decide
@@ -4169,6 +4237,14 @@ async function planToolCompaction(args: {
   if (size.tokens < budget.tokens && !overWindow) {
     return ride ? { kind: "ride", ride } : { kind: "pass" };
   }
+  const adopted = stableLane
+    ? await adoptPreparedPrefix({ ...args, sessionId: sessionId!, budgetTokens: budget.tokens,
+      compaction })
+    : undefined;
+  if (adopted) {
+    return { kind: "ride",
+      ride: { raw: adopted.routed.raw, turnType: "tool-prefix", sizeHolder: adopted.prefix } };
+  }
   compaction.reason = "budget";
   return {
     kind: "compress",
@@ -4181,6 +4257,182 @@ async function planToolCompaction(args: {
     ...(uncountedOnly ? { uncountedOverWindowOnly: true as const } : {}),
     ...(ride && !overWindow ? { fallback: ride } : {}),
     ...(stableLane ? { replaces: current ?? null } : {}),
+  };
+}
+
+/** Share of the budget under which a counted human turn skips its blocking call. */
+const CLEARLY_UNDER_BUDGET_RATIO = 0.85;
+
+/**
+ * Whether a main human turn with no prefix is clearly under the budget by its
+ * token count (an exact count, or a projection from Anthropic's reported
+ * usage; never a byte guess) against a budget the server reported. The
+ * compress call could then only pass it through, so it need not wait for it.
+ */
+function clearlyUnderBudget(budget: Budget, size: PlannedSize, compaction: CompactionRecord): boolean {
+  return budget.source !== "window-ratio" && size.source === "reported" &&
+    compaction.uncountedOverWindow !== true &&
+    size.tokens <= Math.floor(budget.tokens * CLEARLY_UNDER_BUDGET_RATIO);
+}
+
+/**
+ * Whether this model and window prepare compressions: a Claude model on a 1M
+ * window whose budget is the near-window one (not a Sonnet ceiling).
+ */
+function preparesCompression(model: unknown, modelContextLimit: number): boolean {
+  return modelContextLimit >= ONE_MILLION_TOKENS &&
+    fallbackBudgetTokens(model, modelContextLimit) === nearWindowBudgetTokens(modelContextLimit) &&
+    typeof model === "string" && CLAUDE_FAMILY_RE.test(model);
+}
+const ONE_MILLION_TOKENS = 1_000_000;
+
+/**
+ * The session's prepared prefix (prepared-compression.ts) as this turn's
+ * ride, now the session's stable prefix, when it still covers this history
+ * and prefix + the turns after it fit under the budget. Undefined otherwise,
+ * and the prepared prefix is dropped: the turn compresses as before.
+ */
+async function adoptPreparedPrefix(args: {
+  sizing: RequestSizing;
+  state: ProxyState;
+  body: Record<string, any>;
+  messages: Message[];
+  sessionId: string;
+  modelContextLimit: number;
+  budgetTokens: number;
+  compaction: CompactionRecord;
+}): Promise<{ prefix: StablePrefix; routed: { body: Record<string, any>; raw: Buffer } } | undefined> {
+  const { state, sessionId } = args;
+  const entry = state.prepared.get(sessionId);
+  if (!entry) return undefined;
+  state.prepared.discard(sessionId);
+  const fit = await preparedFit(args, entry);
+  args.compaction.prepared = fit.kind;
+  if (fit.kind !== "used") return undefined;
+  args.compaction.estimatedTokens = fit.tokens;
+  args.compaction.estimatedBytes = fit.routed.raw.length;
+  boundedSet(state.stablePrefixes, sessionId, entry.prefix);
+  state.compactNow.delete(sessionId);
+  persistStablePrefix(state, sessionId, entry.prefix);
+  return { prefix: entry.prefix, routed: fit.routed };
+}
+
+type PreparedFit =
+  | { kind: "used"; routed: { body: Record<string, any>; raw: Buffer }; tokens: number }
+  | { kind: "stale" | "mismatch" | "too-large" };
+
+/** Whether a prepared prefix can carry this request (adoptPreparedPrefix). */
+async function preparedFit(
+  args: Parameters<typeof adoptPreparedPrefix>[0], entry: Prepared<StablePrefix>
+): Promise<PreparedFit> {
+  const { sizing, body, messages, modelContextLimit, budgetTokens } = args;
+  if (entry.prefix.modelContextLimit !== modelContextLimit || entry.triggerTokens !== budgetTokens) {
+    return { kind: "stale" };
+  }
+  if (prefixMismatch(body, messages, entry.prefix, args.sessionId, stablePrefixMessageHash)) {
+    return { kind: "mismatch" };
+  }
+  const routed = prefixRoutedBody(body, messages, entry.prefix);
+  if (!routed) return { kind: "mismatch" };
+  const candidate = sizing.register(routed.raw, "ride", entry.prefix.lastSize);
+  candidateSizeOwners.set(candidate, entry.prefix);
+  await countIfOverBound(sizing, candidate, body, modelContextLimit);
+  const tokens = sizing.plan(candidate).tokens;
+  const fits = tokens < budgetTokens && fitsNative(tokens, { budget: budgetTokens,
+    context: modelContextLimit, output: bodyOutputReservation(body, sizing.isExact(candidate)) }) &&
+    (sizing.isExact(candidate) || sizing.boundFits(candidate,
+      { budget: budgetTokens, context: modelContextLimit, output: bodyOutputReservation(body, false) }));
+  // Too large, the turn compresses as before; the ride stays registered, so
+  // if that cannot fit either, delivery's safety net may shorten its newest
+  // tool result instead (truncatedToFit).
+  return fits ? { kind: "used", routed, tokens } : { kind: "too-large" };
+}
+
+/**
+ * After a main-thread turn's plan: once its size nears the budget, ask
+ * MemTree in the background for the compressed prefix the turn that crosses
+ * it will ride (prepared-compression.ts). Fire and forget, one call per
+ * session at a time; never delays this turn.
+ */
+function maybePrepareCompression(args: {
+  opts: ProxyOptions;
+  state: ProxyState;
+  body: Record<string, any>;
+  messages: Message[];
+  msgsForMemtree: Message[];
+  hash: string;
+  sessionId: string;
+  modelContextLimit: number;
+  rec: MessagesRecord;
+  clientMeta?: Record<string, string>;
+}): void {
+  const { state, sessionId, rec } = args;
+  const compaction = rec.compaction;
+  if (!compaction || compaction.mode === "off" || compaction.estimatedTokens === undefined ||
+      compaction.targetTokens === undefined ||
+      !preparesCompression(args.body.model, args.modelContextLimit)) return;
+  const tokens = compaction.estimatedTokens;
+  if (tokens < prepareStartTokens(compaction.budgetTokens)) return;
+  const decision = state.prepared.decide(sessionId, tokens, compaction.budgetTokens);
+  rec.prepare = decision;
+  if (decision !== "prepare" ||
+      !state.prepared.begin(sessionId, tokens, compaction.budgetTokens)) return;
+  const base = state.stablePrefixes.get(sessionId);
+  void prepareInBackground({ ...args, tokens, targetTokens: compaction.targetTokens,
+    explicitTarget: compaction.mode === "explicit", triggerTokens: compaction.budgetTokens })
+    .catch(() => undefined)
+    .then((prepared) => {
+      // A prefix installed meanwhile (a blocking compaction) supersedes it.
+      const current = state.stablePrefixes.get(sessionId) === base;
+      state.prepared.finish(sessionId, current ? prepared : undefined);
+    });
+}
+
+/** The background prepare call and the prefix it yields (maybePrepareCompression). */
+async function prepareInBackground(args: Parameters<typeof maybePrepareCompression>[0] & {
+  tokens: number; targetTokens: number; explicitTarget: boolean; triggerTokens: number;
+}): Promise<Prepared<StablePrefix> | undefined> {
+  const { opts, state, body, msgsForMemtree, modelContextLimit, sessionId } = args;
+  const result = await opts.memtree.compress(args.hash, msgsForMemtree, modelContextLimit,
+    state.shutdownSignal, preparedCompressMeta(args));
+  noteServerBudget(state, body.model, modelContextLimit, result);
+  if (!result) return undefined;
+  state.prepared.noteServerSupport(result.prepared === true);
+  if (result.prepared !== true || !didMemtreeCompress(result) ||
+      !checkCompressedHistory(result, msgsForMemtree).usable) return undefined;
+  const built = buildCompressedBody(body, result);
+  if (!built) return undefined;
+  const prefix: StablePrefix = {
+    sessionId,
+    originalSystemHash: routeValueHash(normalizeRouteSystem(body.system)),
+    originalPrefixHashes: args.messages.map(stablePrefixMessageHash),
+    compressedMessages: cloneJson(built.compressedBody.messages),
+    compressedSystem: cloneJson(built.compressedBody.system),
+    hasCompressedSystem: Object.prototype.hasOwnProperty.call(built.compressedBody, "system"),
+    targetTokens: args.targetTokens,
+    explicitTarget: args.explicitTarget,
+    modelContextLimit,
+  };
+  return { prefix, atTokens: args.tokens, triggerTokens: args.triggerTokens };
+}
+
+/** What a prepare call sends: a forced compression to the target, no threshold. */
+function preparedCompressMeta(args: Parameters<typeof prepareInBackground>[0]): CompressRequestMeta {
+  const { opts, body, sessionId, msgsForMemtree, modelContextLimit } = args;
+  const messageUsage = opts.transcriptUsage?.usageFor(sessionId, msgsForMemtree, undefined);
+  const messageTimes = transcriptTimesFor(opts, sessionId, undefined)?.(msgsForMemtree);
+  return {
+    model: modelForMemtree(typeof body.model === "string" ? body.model : undefined,
+      modelContextLimit),
+    tools: Array.isArray(body.tools) ? body.tools : undefined,
+    compressionTargetTokens: args.targetTokens,
+    prepare: true,
+    ...(messageUsage && Object.keys(messageUsage).length ? { messageUsage } : {}),
+    ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
+    sessionId,
+    ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
+    // Nothing waits on it: the long budget, so a slow server still prepares.
+    timeoutMs: opts.memtree.longCompressBudgetMs,
   };
 }
 
@@ -4753,6 +5005,7 @@ async function runBlockingCompression(args: {
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
     timedOut: result === null && compressMs >= budgetMs,
+    ...(result === null && !cached && !failureArming ? { refused: true as const } : {}),
   };
   return {
     result,
@@ -4763,6 +5016,23 @@ async function runBlockingCompression(args: {
         ? "failure"
         : "none",
   };
+}
+
+/**
+ * A clearly under-budget human turn's compress call, not awaited: its answer
+ * (a passthrough) only updates the server budget, MemTree health and the
+ * session's page link. Its telemetry goes to a copy of the turn's record.
+ */
+function compressInBackground(
+  args: Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & { linkSeq?: number }
+): void {
+  const { state, sessionId, linkSeq } = args;
+  void runBlockingCompression({ ...args, rec: { ...args.rec } })
+    .then((compression) => {
+      noteMemtreeHealth(state, compression);
+      if (linkSeq !== undefined) noteMemtreePage(state, linkSeq, sessionId, compression.result);
+    })
+    .catch(() => undefined);
 }
 
 /**
@@ -5463,7 +5733,8 @@ async function selectForwardCandidate(args: {
     const replacement = await policy.recoverLate(preferred.body, measured.tokens);
     if (replacement) target = policy.sizing.register(replacement, "replacement");
   }
-  const selection = await policy.sizing.select(target, args.limits);
+  const selection = await policy.sizing.select(target, args.limits) ??
+    await truncatedToFit(args.rec, args.body, policy.sizing, target, args.limits);
   const quietDegrade = quietDegrades.get(args.rec);
   quietDegrades.delete(args.rec);
   if (!selection) {
@@ -5492,6 +5763,74 @@ async function selectForwardCandidate(args: {
     quietDegrade?.();
   }
   return changed ? candidate.body : intended;
+}
+
+/** Truncation attempts, each cutting more, before the request is refused. */
+const TRUNCATION_ATTEMPTS = 3;
+/** Cut this much more than the measured excess (tokens per character vary). */
+const TRUNCATION_MARGIN = 1.25;
+
+/**
+ * The safety net for a compressed request that still does not fit
+ * (tool-result-truncation.ts): its newest tool result with the middle
+ * replaced by a pointer to the full output in MemTree, cut until the request
+ * leaves the reply's room below the window. Only a compressed candidate
+ * (a ride on a prefix, or a replacement whose suffix is structured).
+ */
+async function truncatedToFit(
+  rec: MessagesRecord, body: Record<string, any>, sizing: RequestSizing,
+  preferred: RequestCandidate, limits: SizingLimits,
+): Promise<{ candidate: RequestCandidate; measurement: CandidateMeasurement } | undefined> {
+  if (!memtreeHoldsConversation(rec)) return undefined;
+  const position = normalizeMessagesForMemtree(
+    messagesWithSystem(Array.isArray(body.messages) ? body.messages : [], body.system)).length - 1;
+  const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred)
+    .sort((a, b) => a.body.length - b.body.length)].filter((item) => item.kind !== "original");
+  for (const base of bases) {
+    const fitted = await truncateCandidate(rec, sizing, base, limits, position);
+    if (fitted) return fitted;
+  }
+  return undefined;
+}
+
+/**
+ * Whether MemTree can serve the full result a truncation pointer names: not
+ * after a failed compress call (an outage, an unpaid pause, an exception)
+ * unless a responsive MemTree refused it, and not while the index is behind
+ * (waiting for it keeps the result whole).
+ */
+function memtreeHoldsConversation(rec: MessagesRecord): boolean {
+  if (rec.indexBehind === true) return false;
+  if (rec.compress) return rec.compress.ok || rec.compress.refused === true;
+  const outcome = rec.routeRecovery?.outcome;
+  return outcome !== "failed" && outcome !== "cooldown";
+}
+
+/** truncatedToFit for one compressed candidate; undefined when it has no
+ * tool result to shorten or cannot be made to fit. */
+async function truncateCandidate(
+  rec: MessagesRecord, sizing: RequestSizing, base: RequestCandidate, limits: SizingLimits,
+  position: number,
+): Promise<{ candidate: RequestCandidate; measurement: CandidateMeasurement } | undefined> {
+  const goal = limits.context - Math.max(limits.output, COMPRESSION_RESERVE_TOKENS);
+  const parsed = JSON.parse(base.body.toString("utf-8"));
+  const first = await sizing.measure(base, limits);
+  const bytesPerToken = base.body.length / Math.max(1, first.tokens);
+  for (let attempt = 1; attempt <= TRUNCATION_ATTEMPTS; attempt++) {
+    const excess = Math.max(1_000, first.tokens - goal);
+    const cut = Math.ceil(excess * bytesPerToken * TRUNCATION_MARGIN * attempt);
+    const plan = truncateLargestToolResult(parsed, cut, position);
+    if (!plan) return undefined;
+    const candidate = sizing.register(Buffer.from(JSON.stringify(plan.body), "utf-8"),
+      "replacement");
+    const measurement = await sizing.measure(candidate, limits);
+    if (fitsMeasured(measurement, limits) && measurement.tokens <= goal) {
+      rec.truncatedToolResult = { originalChars: plan.originalChars,
+        omittedChars: plan.omittedChars, memtreePosition: position };
+      return { candidate, measurement };
+    }
+  }
+  return undefined;
 }
 
 /**

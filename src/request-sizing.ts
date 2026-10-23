@@ -73,6 +73,11 @@ export class RequestSizing {
     this.excludedFallbacks.add(candidate);
   }
 
+  /** Every registered candidate planning has not excluded, in registration order. */
+  fallbacks(): RequestCandidate[] {
+    return [...this.candidates.values()].filter(item => !this.excludedFallbacks.has(item));
+  }
+
   /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
   plan(candidate: RequestCandidate): PlannedSize {
     const exact = this.counts.peek(candidate.body)?.tokens;

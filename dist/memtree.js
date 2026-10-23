@@ -940,6 +940,7 @@ export class MemtreeClient {
             tools: meta?.tools,
             compressionTargetTokens: meta?.compressionTargetTokens,
             compressionThresholdTokens: meta?.compressionThresholdTokens,
+            prepare: meta?.prepare,
             clientInputTokens: meta?.clientInputTokens,
             clientInputTokensExact: meta?.clientInputTokensExact,
             messageUsage: meta?.messageUsage,
@@ -1216,6 +1217,7 @@ export class MemtreeClient {
             meta?.compressionTargetTokens ?? null,
             meta?.compressionThresholdTokens ?? null,
             meta?.clientInputTokens !== undefined && meta.clientInputTokensExact === true,
+            meta?.prepare === true,
         ];
     }
     /**
@@ -1300,6 +1302,8 @@ export class MemtreeClient {
             if (opts.compressionThresholdTokens !== undefined) {
                 body.compression_threshold_tokens = opts.compressionThresholdTokens;
             }
+            if (opts.prepare)
+                body.prepare = true;
             if (opts.clientInputTokens !== undefined) {
                 body.client_input_tokens = opts.clientInputTokens;
                 if (opts.clientInputTokensExact)

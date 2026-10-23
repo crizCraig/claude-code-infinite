@@ -9690,12 +9690,13 @@ test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses inst
     assert.equal(miss.turnType, "followup-compressed", "still over budget: compacted again");
     assert.equal(h.compressCalls().length, calls + 1);
 
-    // /clear: a new, small conversation passes through again.
+    // /clear: a new, small conversation passes through again, clearly under
+    // the budget by its count: sent at once, its compress call in the background.
     const cleared = await h.post([userText("new"), assistantText("hi"), userText("small")]);
     assert.equal(cleared.compaction.prefixMiss, "prefix");
-    assert.equal(cleared.turnType, "followup-noop");
+    assert.equal(cleared.turnType, "followup-under-budget");
     assert.equal(cleared.compaction.reason, undefined);
-    assert.equal(h.compressCalls().length, calls + 2);
+    await waitFor(() => h.compressCalls().length === calls + 2);
   } finally {
     h.close();
   }
@@ -9784,7 +9785,10 @@ test("edge compaction: /memtree-compact N compacts now to N, then rides", async 
     const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2", 150_000))];
     assert.equal((await h.post(conv)).turnType, "followup-noop");
     conv.push(assistantText("a2"), userText("q3"));
-    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    // Now sized from the last reply's usage, clearly under the budget: sent at
+    // once, its compress call in the background.
+    assert.equal((await h.post(conv)).turnType, "followup-under-budget");
+    await waitFor(() => h.compressCalls().length === 2);
 
     assert.match((await h.command("/memtree-compact 30k")).body.reason, /about 30k tokens/);
     conv.push(assistantText("a3"), userText("q4"));

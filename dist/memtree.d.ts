@@ -83,6 +83,13 @@ export interface CompressRequestMeta {
      */
     compressionThresholdTokens?: number;
     /**
+     * Server `prepare`: a compression asked for ahead of need (the proxy's
+     * prepared compression, prepared-compression.ts), compressed to
+     * `compressionTargetTokens` whatever its size and billed as the compression
+     * it replaces. Part of the cache key: it changes the server's answer.
+     */
+    prepare?: boolean;
+    /**
      * Server `client_input_tokens`: the proxy's own estimate of the request's
      * input tokens, the one its fallback gate refuses over-budget input by.
      * Over the budget, the server compresses even when its char estimate says
@@ -145,6 +152,11 @@ export interface CompressResult {
      * back to the cached_tokens heuristic (see didMemtreeCompress).
      */
     compressed?: boolean;
+    /**
+     * True on the answer to a `prepare` call from a server that prepares (and
+     * bills a preparation as the compression it replaces); older servers omit it.
+     */
+    prepared?: boolean;
     /**
      * The model's whole-request budget the server computed (tokens), whatever
      * target the request set. Servers that predate it omit the field.
