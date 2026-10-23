@@ -26,6 +26,8 @@ export interface InstallerCommand {
     args: string[];
     /** What the user would type themselves. */
     display: string;
+    /** The installer's environment, when it differs from ccc's. */
+    env?: NodeJS.ProcessEnv;
 }
 export interface InstallerRun {
     /** The installer's exit code; null when it was killed or never started. */

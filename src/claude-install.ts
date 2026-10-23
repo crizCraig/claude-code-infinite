@@ -33,6 +33,8 @@ export interface InstallerCommand {
   args: string[];
   /** What the user would type themselves. */
   display: string;
+  /** The installer's environment, when it differs from ccc's. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface InstallerRun {
@@ -101,6 +103,7 @@ export function installerCommand(
       command: windowsPowerShell(env, exists),
       args: ["-NoProfile", "-Command", WINDOWS_INSTALL_SCRIPT],
       display: WINDOWS_INSTALL_SCRIPT,
+      env: withoutPsModulePath(env),
     };
   }
   // pipefail: a failed download fails the install instead of running an empty script.
@@ -115,7 +118,9 @@ export function installerCommand(
 export function runInstaller(installer: InstallerCommand): Promise<InstallerRun> {
   return new Promise((resolve) => {
     try {
-      const child = spawn(installer.command, installer.args, { stdio: "inherit" });
+      const child = spawn(installer.command, installer.args, {
+        stdio: "inherit", ...(installer.env ? { env: installer.env } : {}),
+      });
       child.on("error", (error: Error) => resolve({ code: null, error }));
       child.on("close", (code: number | null) => resolve({ code }));
     } catch (error) {
@@ -165,6 +170,17 @@ function windowsPowerShell(env: NodeJS.ProcessEnv, exists: (file: string) => boo
   const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
   const full = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   return exists(full) ? full : "powershell.exe";
+}
+
+/**
+ * ccc started from PowerShell 7 inherits its PSModulePath, which makes Windows
+ * PowerShell 5.1 load 7's modules and lose its own (the installer's Get-FileHash
+ * is then "not recognized"). Without it, 5.1 builds its default path.
+ */
+function withoutPsModulePath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => key.toUpperCase() !== "PSMODULEPATH")
+  );
 }
 
 function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {

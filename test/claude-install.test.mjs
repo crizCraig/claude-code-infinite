@@ -111,9 +111,14 @@ test("the installer per OS: PowerShell's one-liner on Windows, curl | bash elsew
   assert.equal(win.command, "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   assert.deepEqual(win.args, ["-NoProfile", "-Command", "irm https://claude.ai/install.ps1 | iex"]);
   assert.equal(installerCommand("win32", {}, () => false).command, "powershell.exe");
+  // PowerShell 7's module path breaks Windows PowerShell 5.1's own cmdlets: dropped.
+  const fromPwsh = installerCommand("win32",
+    { PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules", Path: "C:\\x" }, () => false);
+  assert.deepEqual(fromPwsh.env, { Path: "C:\\x" });
   for (const platform of ["darwin", "linux"]) {
     const posix = installerCommand(platform, {}, () => true);
     assert.equal(posix.command, "bash");
+    assert.equal(posix.env, undefined, "ccc's own environment");
     assert.deepEqual(posix.args,
       ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"]);
   }
