@@ -474,16 +474,18 @@ test('tool output store: one private file per distinct output, same path every t
     pinnedStore.save('one more');
     const count = fs.readdirSync(path.join(dir, 'pinned')).filter((n) => n.endsWith('.txt')).length;
     assert.ok(count <= 65, `${count} files`);
-    // Saving waits for another process's lock and gives up (no copy) if it stays held.
-    const lock = path.join(dir, 'pinned', '.lock');
-    fs.writeFileSync(lock, '');
-    const started = Date.now();
-    assert.equal(pinnedStore.save('while locked'), undefined);
-    assert.ok(Date.now() - started >= 1_900, 'waited for the lock');
-    // A lock left by a dead process is taken over.
-    const old = new Date(Date.now() - 60_000);
-    fs.utimesSync(lock, old, old);
-    assert.ok(pinnedStore.save('after a stale lock'));
-    assert.equal(fs.existsSync(lock), false, 'released');
+    // Eviction racing a reuse (another process touching the file between the
+    // listing and the delete) keeps the file: evictOne re-checks it aside.
+    const racer = new ToolOutputStore(path.join(dir, 'race'), () => clock);
+    const victim = racer.save('reused while evicted');
+    const stale = new Date(clock - 2 * 60 * 60 * 1000);
+    fs.utimesSync(victim, stale, stale);
+    fs.utimesSync(victim, new Date(clock), new Date(clock)); // the reuse's touch
+    racer.evictOne(victim, clock - 60 * 60 * 1000);
+    assert.equal(fs.readFileSync(victim, 'utf-8'), 'reused while evicted', 'put back');
+    // And a reuse after the delete writes it again.
+    fs.unlinkSync(victim);
+    assert.equal(racer.save('reused while evicted'), victim);
+    assert.equal(fs.readFileSync(victim, 'utf-8'), 'reused while evicted');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
