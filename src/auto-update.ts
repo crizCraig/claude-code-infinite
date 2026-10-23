@@ -76,6 +76,8 @@ const VERSIONS_KEPT = 8;
 
 /** This package's own directory (dist/..), as Node resolved it. */
 export const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url));
+/** Set on the npm the background updater runs, so its install sends no install ping. */
+export const AUTO_UPDATE_ENV = "CCC_AUTO_UPDATE_INSTALL";
 
 // A plain release, nothing else: it becomes an npm argument, so no tag, range,
 // prefix, prerelease, whitespace or shell metacharacter can pass.
@@ -727,6 +729,8 @@ function runnerEnv(
     ...env,
     [key]: env[key] ? `${bin}${delimiter}${env[key]}` : bin,
     npm_config_update_notifier: "false",
+    // The install ping (install-ping.ts) is for installs people make, not these updates.
+    [AUTO_UPDATE_ENV]: "1",
   };
 }
 

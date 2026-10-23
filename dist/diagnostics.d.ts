@@ -23,6 +23,11 @@ import { type ClaudeAuthType } from "./claude-auth.js";
 import type { RateLimitInfo } from "./rate-limit.js";
 export declare const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export declare const INSTALL_ID_FILE = "install_id";
+/**
+ * Written by the npm install ping (install-ping.ts) when it created the install id,
+ * so ccc's first launch still records first_run; removed by that launch.
+ */
+export declare const FIRST_RUN_PENDING_FILE = "first_run_pending";
 export declare const FLUSH_INTERVAL_MS = 30000;
 export declare const MAX_QUEUE = 200;
 export declare const BATCH_SIZE = 50;
@@ -133,6 +138,8 @@ export declare function readOrCreateInstallId(configDir: string): {
     id: string;
     created: boolean;
 } | null;
+/** True (and the marker removed) when the install ping left a first-run marker. */
+export declare function takeFirstRunMarker(configDir: string): boolean;
 /** Environment context; every value is mapped onto an allowlisted shape. */
 export declare function environmentContext(env: NodeJS.ProcessEnv, cccVersion: string): Record<string, unknown>;
 export declare function terminalName(env: NodeJS.ProcessEnv): string;

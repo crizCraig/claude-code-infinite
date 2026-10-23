@@ -169,6 +169,8 @@ export const CONTEXT_FIELDS = {
     context_window_k: integer(0, 100_000),
 };
 export const EVENT_FIELDS = {
+    /** npm's postinstall (install-ping.ts); false when this machine already had an install id. */
+    installed: { new_install: bool },
     first_run: {},
     sign_in_prompt: {},
     key_saved: {},

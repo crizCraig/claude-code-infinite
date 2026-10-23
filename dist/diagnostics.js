@@ -18,13 +18,18 @@
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { DIAGNOSTICS_SCHEMA, TERMINALS, TURN_TYPES, errnoName, errorClassName, sanitizeContext, sanitizeEvent, threePartVersion, } from "./diagnostics-schema.js";
 import { CREDIT_BALANCE_TOO_LOW } from "./claude-auth.js";
 export const DIAGNOSTICS_PATH = "/v1/ccc/diagnostics";
 export const INSTALL_ID_FILE = "install_id";
+/**
+ * Written by the npm install ping (install-ping.ts) when it created the install id,
+ * so ccc's first launch still records first_run; removed by that launch.
+ */
+export const FIRST_RUN_PENDING_FILE = "first_run_pending";
 export const FLUSH_INTERVAL_MS = 30_000;
 export const MAX_QUEUE = 200;
 export const BATCH_SIZE = 50;
@@ -66,7 +71,8 @@ export class Diagnostics {
             enabled = false;
         this.enabled = enabled;
         this.installId = install?.id ?? null;
-        this.firstRun = install?.created === true;
+        this.firstRun = install?.created === true ||
+            (install !== null && takeFirstRunMarker(opts.configDir));
         this.apiKey = opts.apiKey;
         if (enabled)
             this.context = sanitizeContext(environmentContext(env, opts.clientVersion));
@@ -323,6 +329,23 @@ export function readOrCreateInstallId(configDir) {
     catch {
         return null;
     }
+}
+/** True (and the marker removed) when the install ping left a first-run marker. */
+export function takeFirstRunMarker(configDir) {
+    const file = join(configDir, FIRST_RUN_PENDING_FILE);
+    try {
+        statSync(file);
+    }
+    catch {
+        return false;
+    }
+    try {
+        rmSync(file, { force: true });
+    }
+    catch {
+        // Left behind: the next launch says first_run again, which is harmless.
+    }
+    return true;
 }
 /** Environment context; every value is mapped onto an allowlisted shape. */
 export function environmentContext(env, cccVersion) {

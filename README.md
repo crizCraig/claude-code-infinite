@@ -236,6 +236,7 @@ Claude Code ──▶ localhost proxy (ccc)
   Vertex, Foundry), the plan's tier name when Claude Code records one (Pro, Max, Team), the main
   model's context window ccc uses (200k or 1M), and where Claude Code was found (on PATH,
   its installer's folder, npm, winget);
+- once, when npm installs ccc: an anonymous `installed` event (ccc and Node versions, OS, CPU architecture, install method, the install id below; not in CI, not under any opt-out below);
 - lifecycle events (first run, sign-in prompt shown, key accepted or rejected, session start,
   the MemTree-paused notice shown, update hint or background update result);
 - errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a

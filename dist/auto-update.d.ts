@@ -47,6 +47,8 @@ export declare const INSTALL_TIMEOUT_MS: number;
 export declare const AUTO_UPDATE_DELAY_MS = 5000;
 /** This package's own directory (dist/..), as Node resolved it. */
 export declare const PACKAGE_DIR: string;
+/** Set on the npm the background updater runs, so its install sends no install ping. */
+export declare const AUTO_UPDATE_ENV = "CCC_AUTO_UPDATE_INSTALL";
 /** The config.json fields auto-update reads. */
 export interface AutoUpdateConfig extends UpdateCheckConfig {
     autoUpdate?: boolean;

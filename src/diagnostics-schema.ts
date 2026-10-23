@@ -197,6 +197,8 @@ export const CONTEXT_FIELDS: Record<string, Validator> = {
 };
 
 export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
+  /** npm's postinstall (install-ping.ts); false when this machine already had an install id. */
+  installed: { new_install: bool },
   first_run: {},
   sign_in_prompt: {},
   key_saved: {},
