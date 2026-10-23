@@ -1762,7 +1762,24 @@ async function handleMessages(req, res, opts, upstream, state) {
                 state.nearWindowNotice = handle;
         }
         else if (mayQueueNotice && paymentDetail === null) {
-            state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+            // Under the budget the whole request is what compression would have
+            // sent: the turn is not degraded, so the failure stays in the logs.
+            const warn = () => {
+                state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+                rec.degradedNotice = "shown";
+            };
+            if (compressionNeeded(rec.compaction)) {
+                warn();
+            }
+            else {
+                // Delivery sizes the request again (an exact count, else a
+                // conservative bound): a turn it finds over the budget warns then.
+                rec.degradedNotice = "quiet-under-budget";
+                quietDegrades.set(rec, () => {
+                    if (state.mainPromptGeneration === noticePromptGeneration)
+                        warn();
+                });
+            }
         }
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
             noteWholeSize();
@@ -3971,6 +3988,8 @@ async function selectForwardCandidate(args) {
             target = policy.sizing.register(replacement, "replacement");
     }
     const selection = await policy.sizing.select(target, args.limits);
+    const quietDegrade = quietDegrades.get(args.rec);
+    quietDegrades.delete(args.rec);
     if (!selection) {
         if (args.rec.lateCountRecovery)
             args.rec.lateCountRecovery.outcome = "refused";
@@ -3996,6 +4015,7 @@ async function selectForwardCandidate(args) {
                 ? "exact-count-fits-window" : measurement.source === "bytes"
                 ? "bytes-fallback-fits-window" : "estimate-fits-window" };
         warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
+        quietDegrade?.();
     }
     return changed ? candidate.body : intended;
 }
@@ -4119,6 +4139,25 @@ function nearWindowWarned(state, sessionId) {
 function reachedBudget(compaction) {
     return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
 }
+/**
+ * Whether the planned size says a turn needed MemTree to compress it: a
+ * forced compaction (budget, window, `/memtree-compact`, a rebuilt prefix), a
+ * size at or over the budget, or a size nobody measured. A planned fit is
+ * provisional: delivery's own sizing can still find the turn over the budget
+ * (quietDegrades), since a plan can undercount.
+ */
+function compressionNeeded(compaction) {
+    if (compaction === undefined || compaction.reason !== undefined)
+        return true;
+    if (compaction.estimatedTokens === undefined)
+        return true;
+    return compaction.estimatedTokens >= compaction.budgetTokens;
+}
+/**
+ * A degraded turn whose plan fit the budget, so it queued no notice: the
+ * notice to queue if delivery's sizing finds it over the budget after all.
+ */
+const quietDegrades = new WeakMap();
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap();
 const changedDeliveryRecords = new WeakSet();

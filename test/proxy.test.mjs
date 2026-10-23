@@ -5009,6 +5009,87 @@ test("non-402 compress failure keeps DEGRADED_NOTICE on every degraded turn", as
   }
 });
 
+/** A MemTree that holds every blocking compress until it closes; index calls ack. */
+async function hangingCompressMemtree() {
+  const held = [];
+  const srv = await listen((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      if (JSON.parse(Buffer.concat(chunks).toString("utf-8")).index_only) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ messages: [], index_only: true }));
+      }
+      held.push(res);
+    });
+  });
+  return { ...srv, close: () => { for (const res of held) res.destroy(); srv.close(); } };
+}
+
+const DEGRADE_SESSION = { "x-claude-code-session-id": "session-1" };
+
+for (const failure of ["500", "timeout"]) {
+  test(`an under-budget turn whose compress fails (${failure}) stays quiet`, async () => {
+    // Incident 2026-10-22: a 585k-token session under its 800k budget saw
+    // "MemTree degraded" on every turn while slow uploads timed out the
+    // compress. Under the budget the passthrough IS what compression would
+    // have sent, so the turn is not degraded: log it, don't warn.
+    const upstream = await mockUpstream();
+    const memtreeSrv = failure === "500"
+      ? await mockMemtree(500, { detail: "boom" })
+      : await hangingCompressMemtree();
+    const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k",
+      compressTimeoutMs: 100 });
+    const records = [];
+    const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+      reqlog: { log: (r) => records.push(structuredClone(r)) } });
+    try {
+      for (const q of ["turn two", "turn three"]) {
+        await armMainTurn(proxy, q);
+        const json = await postMessages(proxy.port, followupTurn(q), DEGRADE_SESSION);
+        assert.equal(json.content[0].text, "upstream answer");
+        const rec = records.filter((r) => r.kind === "messages").at(-1);
+        assert.equal(rec.turnType, "followup-degraded");
+        assert.equal(rec.compress.ok, false);
+        assert.equal(rec.compress.timedOut, failure === "timeout");
+        assert.ok(rec.compaction.estimatedTokens < rec.compaction.budgetTokens);
+        assert.equal(rec.degradedNotice, "quiet-under-budget");
+        assert.equal((await postHook(proxy, displayHook({ final: true }))).status, 204);
+      }
+    } finally {
+      proxy.close();
+      upstream.close();
+      memtreeSrv.close();
+    }
+  });
+}
+
+test("an over-budget turn whose compress fails still shows the degraded notice", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(500, { detail: "boom" });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const records = [];
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+    reqlog: { log: (r) => records.push(structuredClone(r)) },
+    // followupTurn is a few dozen tokens: over a 20-token budget.
+    budgetTokensOverride: 20 });
+  try {
+    await armMainTurn(proxy, "turn two");
+    const json = await postMessages(proxy.port, followupTurn("turn two"), DEGRADE_SESSION);
+    assert.equal(json.content[0].text, "upstream answer");
+    const rec = records.filter((r) => r.kind === "messages").at(-1);
+    assert.equal(rec.turnType, "followup-degraded");
+    assert.ok(rec.compaction.estimatedTokens >= rec.compaction.budgetTokens);
+    assert.equal(rec.degradedNotice, "shown");
+    const hook = await postHook(proxy, displayHook({ final: true }));
+    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("402 on background index sets unpaid state; next user turn shows payment notice", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(402, { detail: PAYMENT_DETAIL });
@@ -9615,6 +9696,36 @@ test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses inst
     assert.equal(cleared.turnType, "followup-noop");
     assert.equal(cleared.compaction.reason, undefined);
     assert.equal(h.compressCalls().length, calls + 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("degraded notice: a planned fit that delivery sizes over the budget still warns", async () => {
+  // Codex review P2: the plan can undercount (here bytes/4, with Count Tokens
+  // down). The notice follows delivery's own sizing: its conservative bound.
+  const h = await edgeHarness({ budget: 20_000, proxyOpts: { countTokens: true },
+    upstreamOptions: { countFailures: 1_000 } });
+  try {
+    await compactOnce(h);
+    // MemTree goes down.
+    h.memtreeSrv.server.removeAllListeners("request");
+    h.memtreeSrv.server.on("request", (req, res) => {
+      req.resume();
+      req.on("end", () => { res.writeHead(500); res.end("{}"); });
+    });
+    // /clear and a fresh conversation planned just under the budget (~18k).
+    await armMainTurn(h.proxy, "fresh");
+    const rec = await h.post([userText("new"), assistantText("hi"), userText(BIG("fresh", 72_000))],
+      { "x-claude-code-session-id": "s-edge" });
+    assert.equal(rec.turnType, "followup-degraded");
+    assert.equal(rec.compaction.prefixMiss, "prefix");
+    assert.equal(rec.compaction.reason, undefined);
+    assert.ok(rec.compaction.estimatedTokens < rec.compaction.budgetTokens, "planned to fit");
+    assert.equal(rec.overBudgetForward?.reason, "bytes-fallback-fits-window");
+    assert.equal(rec.degradedNotice, "shown");
+    const hook = await postHook(h.proxy, { ...displayHook({ final: true }), session_id: "s-edge" });
+    assert.ok(hook.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
   } finally {
     h.close();
   }

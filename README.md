@@ -431,7 +431,7 @@ with one of them set, Claude Code bills that key even when you're signed in with
 
 ### MemTree degraded / passthrough mode
 
-If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the compression API is unreachable or your MemTree key is invalid/expired. Your session keeps working uncompressed. Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
+If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the turn needed compression (over its budget, an explicit `/memtree-compact`, or a size ccc could not confirm fits) but the compression API could not be reached or answered too slowly, so the turn went out whole. Your session keeps working uncompressed. A turn still under the budget needs no compression, so a MemTree failure on it shows no notice (it is recorded in `~/.claude-code-infinite/logs/requests.jsonl`). Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
 
 ## Upgrading
 

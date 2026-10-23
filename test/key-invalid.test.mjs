@@ -349,7 +349,8 @@ test("mid-session: a success after a 401 clears the invalid-key state", async ()
 });
 
 test("mid-session 500: still the generic degraded notice (no false alarm)", async () => {
-  const h = await harness(500);
+  // Over a 500-token budget: the turn needed compression, so its failure warns.
+  const h = await harness(500, { budgetTokensOverride: 500 });
   try {
     await submit(h, "p1");
     await post(h, humanTurn(1_000));
@@ -375,7 +376,8 @@ test("an invalid-key refusal is not followed by a duplicate key notice", async (
 });
 
 test("mid-session bare 403 (WAF, proxy): the generic degraded notice, not a key alarm", async () => {
-  const h = await harness(403);
+  // Over a 500-token budget: the turn needed compression, so its failure warns.
+  const h = await harness(403, { budgetTokensOverride: 500 });
   h.body = "<html>Attention Required! | Cloudflare</html>";
   try {
     await submit(h, "p1");
