@@ -4295,6 +4295,7 @@ const recapLinkAppenders = new WeakMap();
  * miss the tree, index a divergent conversation and bill for it.
  */
 async function recoverLateCount(args) {
+    let generation;
     try {
         const { body, msgsForMemtree: messages } = args;
         const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
@@ -4303,6 +4304,10 @@ async function recoverLateCount(args) {
         const linkSeq = args.route.lane === "main" ? nextMemtreeCallSeq(args.state) : undefined;
         const replaces = sessionId !== undefined
             ? args.state.stablePrefixes.get(sessionId) ?? null : null;
+        // Reserved before the compress call: a newer same-lane decision made
+        // while it runs outranks this one, so this never overwrites its route.
+        generation = ++args.state.mainRouteDecisionGeneration;
+        reserveRouteDecision(args.state, args.route.key, generation);
         const outcome = await runBlockingCompression({
             opts: args.opts, state: args.state, body, msgsForMemtree: messages,
             hash: args.hash, modelContextLimit: args.modelContextLimit,
@@ -4326,20 +4331,25 @@ async function recoverLateCount(args) {
         lateRouteInstalls.set(args.rec, lateRouteInstall(args, built.compressedBody, outcome.result, {
             targetTokens: target, explicitTarget: true, modelContextLimit: args.modelContextLimit,
             replaces
-        }, linkSeq));
+        }, linkSeq, generation));
+        generation = undefined; // the install owns the reservation now
         return built.compressedRaw;
     }
     catch {
         return undefined;
     }
+    finally {
+        if (generation !== undefined)
+            releaseRouteDecision(args.state, args.route.key, generation);
+    }
 }
 /** Late recoveries' installs, per request, until delivery settles. */
 const lateRouteInstalls = new WeakMap();
-function lateRouteInstall(args, compressedBody, result, stable, linkSeq) {
+function lateRouteInstall(args, compressedBody, result, stable, linkSeq, 
+/** Reserved (reserveRouteDecision) before the compress call; released here if unused. */
+generation) {
     const { state, route } = args;
     const sessionId = requestSessionId(args.req);
-    const generation = ++state.mainRouteDecisionGeneration;
-    reserveRouteDecision(state, route.key, generation);
     let done = false;
     let installed;
     return {

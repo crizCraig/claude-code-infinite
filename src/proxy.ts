@@ -5803,6 +5803,7 @@ async function recoverLateCount(args: {
   /** The target to recompress to (a compression came back too large); else derived. */
   target?: number;
 }): Promise<Buffer | undefined> {
+  let generation: number | undefined;
   try {
     const { body, msgsForMemtree: messages } = args;
     const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
@@ -5813,6 +5814,10 @@ async function recoverLateCount(args: {
     const linkSeq = args.route.lane === "main" ? nextMemtreeCallSeq(args.state) : undefined;
     const replaces = sessionId !== undefined
       ? args.state.stablePrefixes.get(sessionId) ?? null : null;
+    // Reserved before the compress call: a newer same-lane decision made
+    // while it runs outranks this one, so this never overwrites its route.
+    generation = ++args.state.mainRouteDecisionGeneration;
+    reserveRouteDecision(args.state, args.route.key, generation);
     const outcome = await runBlockingCompression({
       opts: args.opts, state: args.state, body, msgsForMemtree: messages,
       hash: args.hash, modelContextLimit: args.modelContextLimit,
@@ -5831,10 +5836,13 @@ async function recoverLateCount(args: {
     if (!built) return undefined;
     lateRouteInstalls.set(args.rec, lateRouteInstall(args, built.compressedBody, outcome.result, {
       targetTokens: target, explicitTarget: true, modelContextLimit: args.modelContextLimit,
-      replaces }, linkSeq));
+      replaces }, linkSeq, generation));
+    generation = undefined; // the install owns the reservation now
     return built.compressedRaw;
   } catch {
     return undefined;
+  } finally {
+    if (generation !== undefined) releaseRouteDecision(args.state, args.route.key, generation);
   }
 }
 
@@ -5872,11 +5880,11 @@ function lateRouteInstall(
     rec: MessagesRecord; route: LateRouteContext },
   compressedBody: Record<string, any>, result: CompressResult, stable: StablePrefixInstall,
   linkSeq: number | undefined,
+  /** Reserved (reserveRouteDecision) before the compress call; released here if unused. */
+  generation: number,
 ): LateRouteInstall {
   const { state, route } = args;
   const sessionId = requestSessionId(args.req);
-  const generation = ++state.mainRouteDecisionGeneration;
-  reserveRouteDecision(state, route.key, generation);
   let done = false;
   let installed: MemoryRoute | undefined;
   return {
