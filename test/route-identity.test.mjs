@@ -69,3 +69,31 @@ test("million-token prefix hashes in milliseconds and repeated comparisons do no
   assert.ok(coldMs < 250, `cold comparison took ${coldMs}ms`);
   assert.ok(warmMs < 100, `cached comparisons took ${warmMs}ms`);
 });
+
+test("Claude Code's media eviction keeps a message's identity (route and stable prefix)", () => {
+  // Claude Code 2.1.310 caps media by count and by bytes; past a cap it evicts the oldest:
+  // inside a tool result an image becomes its placeholder, a top-level one is dropped,
+  // and a message left empty becomes the placeholder. The long-session test lost its
+  // route (and then every compress) the moment it did this to ~100 old screenshots.
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const removed = { type: "text", text: "[media removed: request limit]" };
+  const cases = [
+    [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [image("a"), { type: "text", text: "ok" }] }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [removed, { type: "text", text: "ok" }] }] }],
+    [{ role: "user", content: [{ type: "text", text: "look" }, image("b")] },
+      { role: "user", content: [{ type: "text", text: "look" }] }],
+    [{ role: "user", content: [image("c")] }, { role: "user", content: [removed] }],
+    [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "d" } }, { type: "text", text: "pdf" }] },
+      { role: "user", content: [{ type: "text", text: "pdf" }] }],
+  ];
+  for (const [before, after] of cases) {
+    assert.equal(routeMessageHash(before), routeMessageHash(after), JSON.stringify(after));
+    assert.equal(stablePrefixMessageHash(before), stablePrefixMessageHash(after), JSON.stringify(after));
+  }
+  // Everything else still counts: the text beside the image, the tool result's id.
+  const [before] = cases[0];
+  assert.notEqual(routeMessageHash(before), routeMessageHash(
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [removed, { type: "text", text: "changed" }] }] }));
+  assert.notEqual(routeMessageHash(before), routeMessageHash(
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "u", content: [removed, { type: "text", text: "ok" }] }] }));
+});

@@ -30,7 +30,9 @@ function messageHash(message: Message, stable: boolean): string {
     );
   }
   const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
-  const normalized = { ...message, content: stripBlockCache(normalizeReminders(blocks)) };
+  const normalized = {
+    ...message, content: stripBlockCache(withoutMedia(normalizeReminders(blocks))),
+  };
   const hash = createHash("sha256");
   updateCanonical(hash, normalized);
   const digest = hash.digest("hex");
@@ -53,6 +55,32 @@ function normalizeReminders(content: unknown): unknown {
     }
     return part;
   });
+}
+
+/** Claude Code's stand-ins for media it removed from its own history. */
+const MEDIA_PLACEHOLDERS = new Set([
+  "[media removed: request limit]", "(media removed \u2014 rejected by API)",
+]);
+
+/**
+ * Media is not identity. Past its media caps (count, and bytes in 2.1.310) Claude Code
+ * evicts the oldest images and documents from history: a tool result's becomes a
+ * placeholder, a top-level one is dropped, an emptied message becomes the placeholder.
+ * A route or stable prefix covering those messages stays valid (its compressed bytes
+ * stand in for them), so media blocks and the placeholders alike are left out.
+ */
+function withoutMedia(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.filter((part) => !isMediaOrPlaceholder(part)).map((part) =>
+    part && typeof part === "object" && part.type === "tool_result"
+      ? { ...part, content: withoutMedia(part.content) }
+      : part);
+}
+
+function isMediaOrPlaceholder(part: any): boolean {
+  if (!part || typeof part !== "object") return false;
+  if (part.type === "image" || part.type === "document") return true;
+  return part.type === "text" && MEDIA_PLACEHOLDERS.has(part.text);
 }
 
 /** Cache metadata on blocks is incidental; identically named tool input keys aren't. */
