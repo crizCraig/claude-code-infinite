@@ -1903,7 +1903,7 @@ async function handleMessages(
       return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
         modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
         route: { key: requestRouteKey, messages, epoch: routeEpoch,
-          lane: requestRouteLane === "main" && !isAwaySummary ? "main" : "other" },
+          lane: isAwaySummary ? "away" : requestRouteLane === "main" ? "main" : "other" },
         ...(target !== undefined ? { target } : {}) });
     },
     delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
@@ -5045,8 +5045,9 @@ async function runBlockingCompression(args: {
   const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
   const compressStarted = Date.now();
   // The upload is about the request's size: the budget grows with it.
-  const budgetMs = args.longBudget
-    ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetForBytes(rec.requestBytes);
+  const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS,
+    args.longBudget ? opts.memtree.longCompressBudgetMs
+      : opts.memtree.compressBudgetForBytes(rec.requestBytes));
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
     // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -5843,8 +5844,9 @@ interface LateRouteContext {
   /** The request's messages (the route's original prefix). */
   messages: Message[];
   epoch: number;
-  /** "main": the session's main thread (a stable prefix and memory source page). */
-  lane: "main" | "other";
+  /** "main": the session's main thread (a stable prefix and memory source page);
+   * "away": the hidden away summary, which nothing reads a route of (none stored). */
+  lane: "main" | "other" | "away";
 }
 
 /**
@@ -5881,7 +5883,7 @@ function lateRouteInstall(
     activate: () => {
       if (done) return;
       done = true;
-      if (sessionId !== undefined) {
+      if (sessionId !== undefined && route.lane !== "away") {
         installed = installMemoryRoute(state, route.key, args.req, args.body, route.messages,
           compressedBody, route.epoch, generation, route.lane === "main" ? stable : undefined);
       }
@@ -5890,8 +5892,17 @@ function lateRouteInstall(
     },
     settle(delivered, sent) {
       if (delivered) this.activate();
+      // The replacement is a changed delivery (reportedSample skips those):
+      // its reported size is this very body's, so it is noted directly.
       const holder: SizeHolder | undefined = stable.installed ?? installed;
-      if (holder && sent) notePrefixSize(holder, args.rec, sent);
+      const tokens = reportedInputTokens(args.rec);
+      if (holder && sent && delivered && tokens !== undefined &&
+          !serverToolRecords.has(args.rec) && !usedServerTools(args.rec)) {
+        const sample = sizeSampleOf(sent, tokens, args.rec.model);
+        if (plausibleSample(sample) && !(holder.lastSize && sent.length < holder.lastSize.forwardedBytes)) {
+          holder.lastSize = sample;
+        }
+      }
       if (!installed) {
         done = true;
         releaseRouteDecision(state, route.key, generation);
@@ -6091,13 +6102,15 @@ async function holdingLane<T>(state: ProxyState, routeKey: string, run: () => Pr
   const lanes = state.toolRecoveryAttemptedLanes;
   const prior = lanes.get(routeKey);
   const attempt: ToolRecoveryAttempt = prior ?? { modelContextLimit: 0, inFlight: true };
-  const wasInFlight = attempt.inFlight;
+  // Clears only what it set: an attempt another request holds in flight
+  // stays that request's to end.
+  const setHere = !attempt.inFlight;
   attempt.inFlight = true;
   if (!prior) lanes.set(routeKey, attempt);
   try {
     return await run();
   } finally {
-    attempt.inFlight = wasInFlight;
+    if (setHere) attempt.inFlight = false;
     if (!prior && lanes.get(routeKey) === attempt) lanes.delete(routeKey);
   }
 }
@@ -7066,3 +7079,4 @@ function transcriptTimesFor(
   if (sessionId === undefined || !source?.timesFor) return undefined;
   return (messages) => source.timesFor!(sessionId, messages, agentId);
 }
+export const __testHoldingLane = holdingLane;

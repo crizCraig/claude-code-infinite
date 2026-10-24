@@ -1169,7 +1169,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
                 modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
                 route: { key: requestRouteKey, messages, epoch: routeEpoch,
-                    lane: requestRouteLane === "main" && !isAwaySummary ? "main" : "other" },
+                    lane: isAwaySummary ? "away" : requestRouteLane === "main" ? "main" : "other" },
                 ...(target !== undefined ? { target } : {}) });
         },
         delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
@@ -3704,8 +3704,8 @@ async function runBlockingCompression(args) {
     const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
     const compressStarted = Date.now();
     // The upload is about the request's size: the budget grows with it.
-    const budgetMs = args.longBudget
-        ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetForBytes(rec.requestBytes);
+    const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, args.longBudget ? opts.memtree.longCompressBudgetMs
+        : opts.memtree.compressBudgetForBytes(rec.requestBytes));
     const compressMeta = {
         // Model + tools drive the server's model-based memory budget
         // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -4347,7 +4347,7 @@ function lateRouteInstall(args, compressedBody, result, stable, linkSeq) {
             if (done)
                 return;
             done = true;
-            if (sessionId !== undefined) {
+            if (sessionId !== undefined && route.lane !== "away") {
                 installed = installMemoryRoute(state, route.key, args.req, args.body, route.messages, compressedBody, route.epoch, generation, route.lane === "main" ? stable : undefined);
             }
             if (!installed)
@@ -4358,9 +4358,17 @@ function lateRouteInstall(args, compressedBody, result, stable, linkSeq) {
         settle(delivered, sent) {
             if (delivered)
                 this.activate();
+            // The replacement is a changed delivery (reportedSample skips those):
+            // its reported size is this very body's, so it is noted directly.
             const holder = stable.installed ?? installed;
-            if (holder && sent)
-                notePrefixSize(holder, args.rec, sent);
+            const tokens = reportedInputTokens(args.rec);
+            if (holder && sent && delivered && tokens !== undefined &&
+                !serverToolRecords.has(args.rec) && !usedServerTools(args.rec)) {
+                const sample = sizeSampleOf(sent, tokens, args.rec.model);
+                if (plausibleSample(sample) && !(holder.lastSize && sent.length < holder.lastSize.forwardedBytes)) {
+                    holder.lastSize = sample;
+                }
+            }
             if (!installed) {
                 done = true;
                 releaseRouteDecision(state, route.key, generation);
@@ -4547,7 +4555,9 @@ async function holdingLane(state, routeKey, run) {
     const lanes = state.toolRecoveryAttemptedLanes;
     const prior = lanes.get(routeKey);
     const attempt = prior ?? { modelContextLimit: 0, inFlight: true };
-    const wasInFlight = attempt.inFlight;
+    // Clears only what it set: an attempt another request holds in flight
+    // stays that request's to end.
+    const setHere = !attempt.inFlight;
     attempt.inFlight = true;
     if (!prior)
         lanes.set(routeKey, attempt);
@@ -4555,7 +4565,8 @@ async function holdingLane(state, routeKey, run) {
         return await run();
     }
     finally {
-        attempt.inFlight = wasInFlight;
+        if (setHere)
+            attempt.inFlight = false;
         if (!prior && lanes.get(routeKey) === attempt)
             lanes.delete(routeKey);
     }
@@ -5471,4 +5482,5 @@ function transcriptTimesFor(opts, sessionId, agentId) {
         return undefined;
     return (messages) => source.timesFor(sessionId, messages, agentId);
 }
+export const __testHoldingLane = holdingLane;
 //# sourceMappingURL=proxy.js.map

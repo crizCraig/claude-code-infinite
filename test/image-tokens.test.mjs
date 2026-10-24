@@ -134,3 +134,21 @@ test('a budget the caller set is not scaled: a preparation and its waiters end t
     assert.ok(scaled >= 200 + 3_000, `the default budget grew with the upload (${scaled} ms)`);
   } finally { server.closeAllConnections(); server.close(); }
 });
+
+test('a late recovery holding the lane leaves another request\'s attempt to that request', async () => {
+  const { __testHoldingLane: holdingLane } = await import('../dist/proxy.js');
+  const lanes = new Map();
+  const state = { toolRecoveryAttemptedLanes: lanes };
+  const other = { modelContextLimit: 1, inFlight: true };
+  lanes.set('lane', other);
+  let release;
+  const held = holdingLane(state, 'lane', () => new Promise(resolve => { release = resolve; }));
+  other.inFlight = false; // the other request finished meanwhile
+  release('done');
+  assert.equal(await held, 'done');
+  assert.equal(other.inFlight, false, 'not left in flight by the late recovery');
+  // A lane with no attempt: one is held for the run and removed after it.
+  const run = holdingLane(state, 'fresh', async () => lanes.get('fresh').inFlight);
+  assert.equal(await run, true);
+  assert.equal(lanes.has('fresh'), false);
+});
