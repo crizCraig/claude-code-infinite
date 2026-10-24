@@ -156,7 +156,9 @@ test("a completed recovered response can switch windows before its SSE transport
   }
 });
 
-test("a smaller-window regrant waits for the outage cooldown", async (t) => {
+test("a smaller-window regrant over the window compresses even in the outage cooldown", async () => {
+  // Over the window with no prefix to ride, a cooldown skip could only end in
+  // a refusal (image-overflow-400, 2026-10-23): it compresses instead.
   const fixture = await windowFixture({ status: (_request, index) => index === 1 ? 503 : 200 });
   try {
     const original = extend(FOLLOWUP, "t0");
@@ -166,15 +168,9 @@ test("a smaller-window regrant waits for the outage cooldown", async (t) => {
     }, 200);
     assert.equal(fixture.lastRecord().routeRecovery.outcome, "failed");
     const continued = extend(original, "t1");
-    await fixture.post(continued, { model: SMALL_MODEL }, {}, 503);
-    assert.equal(fixture.lastRecord().routeMiss, "rejected");
-    assert.equal(fixture.lastRecord().routeRecovery.outcome, "cooldown");
-    assert.equal(fixture.calls.length, 2, "the extra allowance cannot bypass cooldown");
-    assert.equal(fixture.forwarded.length, 2, "wide-window fallback forwards, small-window overflow does not");
-    const now = Date.now;
-    t.mock.method(Date, "now", () => now() + 61_000);
     await fixture.post(continued, { model: SMALL_MODEL });
-    assert.equal(fixture.calls.length, 3, "the deferred allowance survives the cooldown");
+    assert.equal(fixture.lastRecord().routeMiss, "rejected");
+    assert.equal(fixture.calls.length, 3, "compressed despite the cooldown");
     assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
     assert.equal(flatText(fixture.forwarded.at(-1).messages[0]), SMALL_MEMORY);
   } finally {
