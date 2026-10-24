@@ -82,7 +82,9 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     body.receivedAt = Date.now();
     const custom = compress?.(body, calls);
     if (custom) {
+      if (custom.waitFor) await custom.waitFor;
       if (custom.delayMs) await new Promise(resolve => setTimeout(resolve, custom.delayMs));
+      custom.done?.();
       for (const [name, value] of Object.entries(custom.headers ?? {})) res.setHeader(name, value);
       return reply(custom.status ?? 200, custom.body);
     }
@@ -523,16 +525,18 @@ test('an under-budget human turn does not wait for a slow MemTree', async () => 
 test('under the budget, one background call per conversation; the newest turn waits', async () => {
   // Long-session test, staging: each under-budget turn started its own whole-history
   // background call (16 to 22 s each there), about 12 at once beside the index uploads.
-  let inFlight = 0, peak = 0;
+  let inFlight = 0, peak = 0, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const reply = (request) => ({ messages: request.messages, compressed: false,
+    model_budget_tokens: 100_000, usage: {} });
   const h = await harness({ model: 'claude-sonnet-4-5', oneMillion: false, budget: 100_000,
-    compress: (request) => {
-      if (request.compression_target_tokens !== -1) {
-        return { body: { messages: request.messages, compressed: false, model_budget_tokens: 100_000, usage: {} } };
-      }
+    compress: (request, calls) => {
+      if (request.compression_target_tokens !== -1) return { body: reply(request) };
       inFlight++; peak = Math.max(peak, inFlight);
-      setTimeout(() => inFlight--, 800);
-      return { delayMs: 800, body: { messages: request.messages, compressed: false,
-        model_budget_tokens: 100_000, usage: {} } };
+      // The first background call answers only once every turn below has been sent.
+      const first = calls.filter(c => c.compression_target_tokens === -1).length === 1;
+      return { delayMs: first ? 0 : 50, waitFor: first ? gate : undefined,
+        body: reply(request), done: () => inFlight-- };
     } });
   try {
     const conv = [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
@@ -544,12 +548,14 @@ test('under the budget, one background call per conversation; the newest turn wa
       const turn = await h.post(conv);
       assert.equal(turn.record.turnType, 'followup-under-budget');
     }
+    await until(() => background().length === 1, 5_000);
+    release();
     await until(() => background().length === 2, 5_000);
-    await new Promise(resolve => setTimeout(resolve, 1_200));
+    await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(peak, 1, 'one at a time');
     assert.equal(background().length, 2, 'the first, then only the newest of those that waited');
     assert.equal(background()[1].messages.at(-1).content, 'q6');
-  } finally { h.close(); }
+  } finally { release(); h.close(); }
 });
 
 test('compression trigger leaves the reply room below the window', () => {

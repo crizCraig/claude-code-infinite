@@ -397,8 +397,11 @@ interface ProxyState {
     /**
      * Conversations with an under-budget background compress in flight
      * (compressInBackground), each with the newest call waiting for it, if any.
+     * An entry lives only while its call runs, so this holds no more than the calls.
      */
-    backgroundCompress: Map<string, BackgroundCompressArgs | undefined>;
+    backgroundCompress: Map<string, {
+        waiting?: BackgroundCompressArgs;
+    }>;
     /**
      * Model budgets the server reported (`model_budget_tokens`), keyed by
      * model and context window (serverBudgetKey).

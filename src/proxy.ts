@@ -543,8 +543,9 @@ interface ProxyState {
   /**
    * Conversations with an under-budget background compress in flight
    * (compressInBackground), each with the newest call waiting for it, if any.
+   * An entry lives only while its call runs, so this holds no more than the calls.
    */
-  backgroundCompress: Map<string, BackgroundCompressArgs | undefined>;
+  backgroundCompress: Map<string, { waiting?: BackgroundCompressArgs }>;
   /**
    * Model budgets the server reported (`model_budget_tokens`), keyed by
    * model and context window (serverBudgetKey).
@@ -5156,23 +5157,23 @@ function compressInBackground(args: BackgroundCompressArgs): void {
     void runBackgroundCompress(args);
     return;
   }
-  if (lanes.has(lane)) {
+  const busy = lanes.get(lane);
+  if (busy) {
     // One whole-history call at a time per conversation: under the budget each turn
     // started its own (16 to 22 s each on staging in the long-session test, about 12 at
     // once beside the index uploads). A waiting call is replaced only by one whose
     // history contains all of it; otherwise it goes now.
-    const waiting = lanes.get(lane);
-    if (waiting && !extendsHistory(args.msgsForMemtree, waiting.msgsForMemtree)) {
-      void runBackgroundCompress(waiting);
+    if (busy.waiting && !extendsHistory(args.msgsForMemtree, busy.waiting.msgsForMemtree)) {
+      void runBackgroundCompress(busy.waiting);
     }
-    lanes.set(lane, args);
+    busy.waiting = args;
     return;
   }
-  boundedSet(lanes, lane, undefined);
+  const owner: { waiting?: BackgroundCompressArgs } = {};
+  lanes.set(lane, owner);
   void runBackgroundCompress(args).finally(() => {
-    const next = lanes.get(lane);
-    lanes.delete(lane);
-    if (next && !args.state.shutdownSignal.aborted) compressInBackground(next);
+    if (lanes.get(lane) === owner) lanes.delete(lane);
+    if (owner.waiting && !args.state.shutdownSignal.aborted) compressInBackground(owner.waiting);
   });
 }
 
