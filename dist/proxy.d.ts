@@ -42,10 +42,10 @@ import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RouteFallbackFailures } from "./route-fallback.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
-import { estimateRequestTokens } from "./request-sizing.js";
+import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
 import { PreparedCompressions } from "./prepared-compression.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
-import { MemtreeClient } from "./memtree.js";
+import { MemtreeClient, type CompressResult } from "./memtree.js";
 import { type Message } from "./turns.js";
 import { NoticeDeliveryQueue, type FirstTreeIntro } from "./hooks.js";
 import { PaymentNoticeThrottle } from "./payment-notice.js";
@@ -395,6 +395,11 @@ interface ProxyState {
     /** Each session's preparation still in flight (maybePrepareCompression). */
     preparing: Map<string, Promise<void>>;
     /**
+     * Conversations with an under-budget background compress in flight
+     * (compressInBackground), each with the newest call waiting for it, if any.
+     */
+    backgroundCompress: Map<string, BackgroundCompressArgs | undefined>;
+    /**
      * Model budgets the server reported (`model_budget_tokens`), keyed by
      * model and context window (serverBudgetKey).
      */
@@ -550,6 +555,52 @@ export declare function parseTokenCount(text: string): number | undefined;
  * never bytes/4, which reads base64 images as text.
  */
 declare function compressedResultExceedsWindow(body: Record<string, any>, rec: MessagesRecord, compressedRaw: Buffer, modelContextLimit: number, exactTokens?: number): boolean;
+interface BlockingCompressionOutcome {
+    result: CompressResult | null;
+    /** Current server-health evidence contributed by this blocking operation. */
+    liveHealth: "success" | "failure" | "none";
+}
+/**
+ * The blocking-compression step, shared by the main followup path and
+ * tool-route miss recovery: the compress call plus the `compress` telemetry
+ * record. Callers own downstream-close tracking (compression promises are
+ * hash-deduped and may serve another live retry, so a per-request disconnect
+ * signal must never feed compress()) and all decisions about the returned
+ * result: both `didMemtreeCompress(result)` and
+ * `checkCompressedHistory(result, msgsForMemtree).usable` must hold before
+ * the result may be forwarded or become a route.
+ */
+declare function runBlockingCompression(args: {
+    opts: ProxyOptions;
+    state: ProxyState;
+    body: Record<string, any>;
+    msgsForMemtree: Message[];
+    hash: string;
+    modelContextLimit: number;
+    rec: MessagesRecord;
+    sessionId: string | undefined;
+    /** The subagent this request belongs to: its transcript has the usage and times. */
+    agentId?: string;
+    clientMeta?: Record<string, string>;
+    sizing: RequestSizing;
+    inputCandidate?: RequestCandidate;
+    /**
+     * compression_target_tokens / compression_threshold_tokens for this call.
+     * Omitted: laneCompaction's (never a bare forcing target).
+     */
+    compaction?: {
+        target?: number;
+        threshold?: number;
+    };
+    /**
+     * Nothing else could be sent if this compress fails (no prefix to ride, raw
+     * request known over the window): use the long budget. See longCompressFor.
+     */
+    longBudget?: boolean;
+}): Promise<BlockingCompressionOutcome>;
+type BackgroundCompressArgs = Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & {
+    linkSeq?: number;
+};
 /**
  * Run a delivery-time compression as the lane's in-flight operation, so a
  * concurrent request of the lane neither starts its own (planning sees

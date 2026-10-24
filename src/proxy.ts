@@ -541,6 +541,11 @@ interface ProxyState {
   /** Each session's preparation still in flight (maybePrepareCompression). */
   preparing: Map<string, Promise<void>>;
   /**
+   * Conversations with an under-budget background compress in flight
+   * (compressInBackground), each with the newest call waiting for it, if any.
+   */
+  backgroundCompress: Map<string, BackgroundCompressArgs | undefined>;
+  /**
    * Model budgets the server reported (`model_budget_tokens`), keyed by
    * model and context window (serverBudgetKey).
    */
@@ -1002,6 +1007,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     stablePrefixes: new Map(),
     prepared: new PreparedCompressions(),
     preparing: new Map(),
+    backgroundCompress: new Map(),
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
@@ -5143,16 +5149,59 @@ async function runBlockingCompression(args: {
  * (a passthrough) only updates the server budget, MemTree health and the
  * session's page link. Its telemetry goes to a copy of the turn's record.
  */
-function compressInBackground(
-  args: Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & { linkSeq?: number }
-): void {
+function compressInBackground(args: BackgroundCompressArgs): void {
+  const lanes = args.state.backgroundCompress;
+  const lane = backgroundCompressLane(args);
+  if (lane === undefined) {
+    void runBackgroundCompress(args);
+    return;
+  }
+  if (lanes.has(lane)) {
+    // One whole-history call at a time per conversation: under the budget each turn
+    // started its own (16 to 22 s each on staging in the long-session test, about 12 at
+    // once beside the index uploads). A waiting call is replaced only by one whose
+    // history contains all of it; otherwise it goes now.
+    const waiting = lanes.get(lane);
+    if (waiting && !extendsHistory(args.msgsForMemtree, waiting.msgsForMemtree)) {
+      void runBackgroundCompress(waiting);
+    }
+    lanes.set(lane, args);
+    return;
+  }
+  boundedSet(lanes, lane, undefined);
+  void runBackgroundCompress(args).finally(() => {
+    const next = lanes.get(lane);
+    lanes.delete(lane);
+    if (next && !args.state.shutdownSignal.aborted) compressInBackground(next);
+  });
+}
+
+type BackgroundCompressArgs =
+  Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & { linkSeq?: number };
+
+function runBackgroundCompress(args: BackgroundCompressArgs): Promise<void> {
   const { state, sessionId, linkSeq } = args;
-  void runBlockingCompression({ ...args, rec: { ...args.rec } })
+  return runBlockingCompression({ ...args, rec: { ...args.rec } })
     .then((compression) => {
       noteMemtreeHealth(state, compression);
       if (linkSeq !== undefined) noteMemtreePage(state, linkSeq, sessionId, compression.result);
     })
     .catch(() => undefined);
+}
+
+/** A conversation for compressInBackground: session and first message; none without a session. */
+function backgroundCompressLane(args: BackgroundCompressArgs): string | undefined {
+  if (args.sessionId === undefined) return undefined;
+  const first = args.msgsForMemtree.find((message) => message.role !== "system");
+  return JSON.stringify([args.sessionId, first ? routeMessageHash(first) : ""]);
+}
+
+/** Whether `newer` holds every message of `older` after the system prompt, in place. */
+function extendsHistory(newer: Message[], older: Message[]): boolean {
+  const a = newer.filter((message) => message.role !== "system");
+  const b = older.filter((message) => message.role !== "system");
+  return a.length >= b.length &&
+    b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
 }
 
 /**

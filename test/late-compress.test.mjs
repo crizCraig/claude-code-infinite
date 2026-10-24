@@ -520,6 +520,38 @@ test('an under-budget human turn does not wait for a slow MemTree', async () => 
   } finally { h.close(); }
 });
 
+test('under the budget, one background call per conversation; the newest turn waits', async () => {
+  // Long-session test, staging: each under-budget turn started its own whole-history
+  // background call (16 to 22 s each there), about 12 at once beside the index uploads.
+  let inFlight = 0, peak = 0;
+  const h = await harness({ model: 'claude-sonnet-4-5', oneMillion: false, budget: 100_000,
+    compress: (request) => {
+      if (request.compression_target_tokens !== -1) {
+        return { body: { messages: request.messages, compressed: false, model_budget_tokens: 100_000, usage: {} } };
+      }
+      inFlight++; peak = Math.max(peak, inFlight);
+      setTimeout(() => inFlight--, 800);
+      return { delayMs: 800, body: { messages: request.messages, compressed: false,
+        model_budget_tokens: 100_000, usage: {} } };
+    } });
+  try {
+    const conv = [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      { role: 'user', content: `q2 ${'x'.repeat(40_000)}` }];
+    await h.post(conv);
+    const background = () => h.calls.filter(c => c.compression_target_tokens === -1);
+    for (let i = 3; i <= 6; i++) {
+      conv.push({ role: 'assistant', content: `a${i - 1}` }, { role: 'user', content: `q${i}` });
+      const turn = await h.post(conv);
+      assert.equal(turn.record.turnType, 'followup-under-budget');
+    }
+    await until(() => background().length === 2, 5_000);
+    await new Promise(resolve => setTimeout(resolve, 1_200));
+    assert.equal(peak, 1, 'one at a time');
+    assert.equal(background().length, 2, 'the first, then only the newest of those that waited');
+    assert.equal(background()[1].messages.at(-1).content, 'q6');
+  } finally { h.close(); }
+});
+
 test('compression trigger leaves the reply room below the window', () => {
   assert.equal(compressionTrigger(960_000, 1_000_000), 960_000);
   assert.equal(compressionTrigger(1_000_000, 1_000_000), 960_000);
