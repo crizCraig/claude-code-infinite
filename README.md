@@ -5,10 +5,10 @@
 # Claude Code Infinite
 
 <p align="center">
-  <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind: MemTree 69% at 39M tokens per run, full context 69% at 113M, /compact 49% at 17M" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
+  <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind, on a ~800k-token Claude Code session: MemTree 69% (~420k tokens after MemTree), /compact 49% (~13k tokens after /compact)" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
 </p>
-<p align="center"><sub>Long-session benchmark on a 775k-token Claude Code session (Claude Opus 5.5, graded blind):
-MemTree matched full context at 69% with a third of the tokens; <code>/compact</code> scored 49%.
+<p align="center"><sub>Long-session benchmark (Claude Opus 5.5, graded blind): MemTree beat <code>/compact</code> by 20 points,
+on a ~800k-token Claude Code session. It also matched full context on this test (69 vs 69).
 <a href="#long-session-benchmark">Full results</a></sub></p>
 
 Infinite context for Claude Code: memory for long-running agents. Claude Code Infinite indexes your Claude Code sessions with
@@ -24,8 +24,10 @@ follows it down to the original messages.
 * **Search across every session.** Claude can find what was decided, tried or ruled out in any of
   your past sessions, by exact words or by meaning, filtered by project and date
 * **Browse each session's MemTree** in your browser, from the link `ccc` prints in the terminal
-* **Never loses anything vs Claude Code.** Sessions are sent word for word until near the context
-  limit; past it, MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
+* **Never loses anything vs Claude Code.** On Opus 5 and up, you get the vast majority of the
+  1M-token window word for word, exactly as Claude Code sends it. Only near the limit does MemTree
+  compress, to about half the window to minimize the number of compressions: recent messages stay word for word
+  and older ones become a searchable memory, the originals one tool call away. MemTree matched full context (69 vs 69) and beat `/compact` by 20 ([benchmark](#long-session-benchmark))
 * **Unlimited-length sessions**, with relevant past information recalled automatically
 * **A local proxy, so no slowdown.** Requests go straight from your machine to Anthropic and
   MemTree indexes in the background; only the occasional compression step, when a session
@@ -79,6 +81,54 @@ win, while MemTree was ahead of `/compact` in every round. Average wall time was
 for MemTree and 38 min for full context. Input tokens count uncached, cache-read and cache-write
 tokens; `/compact`'s exclude the one-time `/compact` step. This is one task family, one model and
 3 rounds, not a general benchmark.
+
+MemTree compresses as late as possible: the whole ~775k-token history went out word for word,
+exactly as Claude Code would send it, and MemTree compressed only once, near the limit, keeping the
+most recent messages word for word.
+
+A rerun on Oct 20, with MemTree's lookup tools loaded and the same outputs graded again at a
+higher reasoning effort, gave the same shape: MemTree 65, full context 66, `/compact` 45.
+MemTree's figure there is the mean of its 2 clean rounds (a harness bug let the third round read
+another round's work); full context still fixed more of the issues (21 vs 17 on average).
+
+## Past the context window: MemTree keeps the work, `/compact` loses it
+
+<p align="center">
+  <img width="560" alt="Past the context window, 1M+-token session, Claude Opus 5.5, graded blind, mean of 6 rounds: MemTree 70% with 8 of 8 findings addressed (3 fully, 5 partly); /compact 23% with 0 of 8" src="docs/images/benchmark-past-1m.png">
+</p>
+
+The benchmark above fits inside Claude Opus 5.5's 1M-token window. This one does not. Each setup
+resumes the same **1M+**-token history, built in time order from real Claude Code sessions of our
+own engineering work: the design and implementation of a backend feature, four rounds of code
+review in which an outside reviewer's findings were confirmed and, for several, re-scoped by the
+session, then about 550k tokens of later, unrelated work. The task comes at the end: the commits
+that fixed review rounds 2–4 were lost, so re-implement every fix as the session approved it, each
+with a regression test, in one commit. The findings and decisions exist only in the conversation,
+and the task forbids re-reviewing the code to find them again. Since the history is already past
+the window, MemTree compressed it on the first turn: the most recent messages stayed word for word,
+and the older ones became a memory tree whose original messages Claude can read back with one tool
+call. An independent grader scored each
+result blind (0–100) against the real fixes, their regression tests and the session's decisions.
+
+| Setup | Score | Findings addressed (of 8) | How it handles the history |
+| --- | --- | --- | --- |
+| **Claude Code Infinite** | **69.9** | **8: 3 fully, 5 partly** | Compressed to ~200–290k on the first turn; looked up the review rounds with its MemTree tools |
+| `/compact` | 23.0 | 0 | Claude Code's `/compact` before the task; made no changes and asked for the findings |
+| Full context | n/a | n/a | Not possible: the history is larger than the 1M-token window |
+
+`/compact` failed because its summary dropped the findings: it recorded the reviews only as
+confirmed reviewer findings, with no finding or decision in it, so there was nothing to fix. Its
+23 points are for reporting that honestly (regrading the same empty diffs gave 23 every time). MemTree recovered all 8 findings from the
+session's memory in every round, fixed 3 fully and 5 partly every round, and implemented the
+session's decisions rather than the reviewer's original proposals. Before writing any code, it searched its tree for the review rounds and read about 400 lines of the original exchange word for word with `read_lines`. MemTree's round scores were
+74.6, 67.6, 67.1, 69.4, 68.1 and 72.6, with 5 regressions charged across the 6 rounds.
+
+Caveats: 6 rounds, one task, one model, one grader; no significance claims. Blinding is weak: `/compact` made no changes and its report says it worked from a summary,
+so a grader can tell the setups apart. The same task prompt went to both setups and mentions
+MemTree's lookup tools, which plain Claude Code doesn't have. There is no full-context arm, since
+the history doesn't fit. Grading used a fixed rubric (coverage 30, fix quality 30, fidelity to the
+session's decisions 15, report accuracy 20, process 5); the harness and the answer key stay
+private because they come from a private codebase.
 
 ## Requirements
 
