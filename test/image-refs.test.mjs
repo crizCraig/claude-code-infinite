@@ -4,7 +4,7 @@ import http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import { MemtreeClient } from "../dist/memtree.js";
 import {
-  IMAGE_REF_PREFIX, ImageRefs, STORED_IMAGES_FIELD, isCanonicalBase64,
+  IMAGE_REF_PREFIX, ImageRefs, STORED_IMAGES_FIELD, isCanonicalBase64, refusesImageRefs,
 } from "../dist/image-refs.js";
 import {
   IMAGE_OMITTED_TEXT, MAX_MEMTREE_BODY_BYTES, planMemtreeBody,
@@ -47,6 +47,14 @@ test("references only images the server listed, copy on write", () => {
   assert.equal(JSON.stringify(messages), before, "what is forwarded to Anthropic is untouched");
   refs.forget([sha(b)]);
   assert.equal(refs.referenceMessages(messages).refs.length, 0);
+});
+
+test("a 400 naming the key stops references; a cap 400 only resends that request", () => {
+  assert.equal(refusesImageRefs(400, '{"detail":"Image references need the user\'s own MemTree key."}'), "never");
+  assert.equal(refusesImageRefs(400, '{"detail":"Image references expand past the request size limit."}'), "this");
+  assert.equal(refusesImageRefs(400, '{"detail":"Malformed image references."}'), "this");
+  assert.equal(refusesImageRefs(400, '{"detail":"model_context_limit too small"}'), false);
+  assert.equal(refusesImageRefs(409, "image references"), false);
 });
 
 test("only canonical base64 is referenced: the server re-encodes what it stores", () => {
@@ -106,6 +114,27 @@ test("a session's later calls send stored images as references; a 409 resends by
     assert.equal(server.bodies[3].json.messages[2].content[0].content[0].source.data, b);
     assert.equal(server.bodies[3].json.messages[0].content[1].source.data, a, "all bytes");
     assert.deepEqual(records.map((r) => r.ok), [true, true, true]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a resend after a slow 409 keeps the call's deadline", async () => {
+  const a = png(1000);
+  const server = await fakeMemtree();
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const messages = conversation(a, a);
+    server.stored = [sha(a)];
+    await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000);
+    server.missing = [sha(a)];
+    server.delays = [150, 150];  // the 409 and then the resend each take 150 ms
+    const next = [...messages, { role: "assistant", content: "x" }];
+    const started = Date.now();
+    const result = await client.compress(MemtreeClient.hashMessages(next), next, 200_000,
+      undefined, { timeoutMs: 200 });
+    assert.equal(result, null, "the resend is cut at the 200 ms deadline, not given 200 more");
+    assert.ok(Date.now() - started < 290, `${Date.now() - started} ms`);
   } finally {
     await server.close();
   }
@@ -263,7 +292,7 @@ function observed(records) {
  * answers 409 for `missing`, 400 when `refuse`, and never answers when `hang`.
  */
 async function fakeMemtree({ hang = false } = {}) {
-  const state = { stored: [], missing: [], refuse: false, bodies: [] };
+  const state = { stored: [], missing: [], refuse: false, bodies: [], delays: [] };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -273,10 +302,14 @@ async function fakeMemtree({ hang = false } = {}) {
       const entry = { headers: req.headers, bytes: Buffer.byteLength(raw), json, status: 200 };
       state.bodies.push(entry);
       const refs = raw.match(/memtree-image:sha256:[0-9a-f]{64}/g) ?? [];
+      const delay = state.delays.shift() ?? 0;
       const answer = (status, body) => {
         entry.status = status;
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify(body));
+        setTimeout(() => {
+          if (res.destroyed) return;
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(body));
+        }, delay);
       };
       if (refs.length && state.refuse) {
         return answer(400, { detail: "Image references need the user's own MemTree key." });

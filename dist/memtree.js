@@ -1364,9 +1364,11 @@ export class MemtreeClient {
             if (planned.refs.length && !response.ok) {
                 refusalText = await readUnlessAborted(response, controller.signal);
                 if (this.refusedRefs(response.status, refusalText, planned.refs)) {
-                    // A new call with bytes: its own size, timer and request-log record.
+                    // A new call with bytes: its own size and request-log record, within what is
+                    // left of this call's budget (a caller's deadline is never extended).
                     resent = true;
-                    return await this.callContextMemory(messages, modelContextLimit, { ...opts, imageRefs: false });
+                    const timeoutMs = Math.max(0, opts.timeoutMs - (Date.now() - started));
+                    return await this.callContextMemory(messages, modelContextLimit, { ...opts, timeoutMs, imageRefs: false });
                 }
             }
             if (!response.ok) {
@@ -1481,16 +1483,20 @@ export class MemtreeClient {
     }
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the
-     * server lacks some images (409: those are forgotten), or refuses references (400
-     * naming them: none are sent again).
+     * server lacks some images (409: those are forgotten), or refuses references (400:
+     * this request's forgotten, or none ever again when the key may not send them).
      */
     refusedRefs(status, text, refs) {
         const missing = status === MISSING_IMAGES_STATUS ? missingImageShas(text) : undefined;
+        const refused = refusesImageRefs(status, text);
         if (missing !== undefined) {
             this.imageRefs.forget(missing.length ? missing : refs);
         }
-        else if (refusesImageRefs(status, text)) {
+        else if (refused === "never") {
             this.imageRefs.disable();
+        }
+        else if (refused === "this") {
+            this.imageRefs.forget(refs);
         }
         else {
             return false;

@@ -153,9 +153,13 @@ export function missingImageShas(bodyText: string): string[] | undefined {
   }
 }
 
-/** True when the server refused references themselves (a 400 that names them). */
-export function refusesImageRefs(status: number, bodyText: string): boolean {
-  return status === 400 && /image reference/i.test(bodyText);
+/**
+ * A 400 about references: "never" when this key may not send any (stop for the
+ * process), "this" when only this request's were refused (too many: send its bytes).
+ */
+export function refusesImageRefs(status: number, bodyText: string): "never" | "this" | false {
+  if (status !== 400 || !/image reference/i.test(bodyText)) return false;
+  return /own MemTree key/i.test(bodyText) ? "never" : "this";
 }
 
 /**

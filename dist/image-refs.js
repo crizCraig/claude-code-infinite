@@ -146,9 +146,14 @@ export function missingImageShas(bodyText) {
         return undefined;
     }
 }
-/** True when the server refused references themselves (a 400 that names them). */
+/**
+ * A 400 about references: "never" when this key may not send any (stop for the
+ * process), "this" when only this request's were refused (too many: send its bytes).
+ */
 export function refusesImageRefs(status, bodyText) {
-    return status === 400 && /image reference/i.test(bodyText);
+    if (status !== 400 || !/image reference/i.test(bodyText))
+        return false;
+    return /own MemTree key/i.test(bodyText) ? "never" : "this";
 }
 /**
  * The server re-encodes the bytes it stores, so only base64 that decodes and re-encodes

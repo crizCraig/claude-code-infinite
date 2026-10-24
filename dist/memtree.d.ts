@@ -518,8 +518,8 @@ export declare class MemtreeClient {
     private postContextMemory;
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the
-     * server lacks some images (409: those are forgotten), or refuses references (400
-     * naming them: none are sent again).
+     * server lacks some images (409: those are forgotten), or refuses references (400:
+     * this request's forgotten, or none ever again when the key may not send them).
      */
     private refusedRefs;
     /**

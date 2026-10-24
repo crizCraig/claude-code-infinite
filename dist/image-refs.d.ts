@@ -38,8 +38,11 @@ export declare class ImageRefs {
 }
 /** The shas a refusal names (409 detail), or undefined when it names none. */
 export declare function missingImageShas(bodyText: string): string[] | undefined;
-/** True when the server refused references themselves (a 400 that names them). */
-export declare function refusesImageRefs(status: number, bodyText: string): boolean;
+/**
+ * A 400 about references: "never" when this key may not send any (stop for the
+ * process), "this" when only this request's were refused (too many: send its bytes).
+ */
+export declare function refusesImageRefs(status: number, bodyText: string): "never" | "this" | false;
 /**
  * The server re-encodes the bytes it stores, so only base64 that decodes and re-encodes
  * to the same text may be referenced (padding included, no whitespace).
