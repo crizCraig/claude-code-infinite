@@ -964,6 +964,9 @@ export class MemtreeClient {
         const inFlightKey = this.inFlightKey(hash, modelContextLimit, meta);
         const promise = this.callContextMemory(messages, modelContextLimit, {
             timeoutMs: meta?.timeoutMs ?? this.compressTimeoutMs,
+            // An explicit budget is the caller's deadline (a preparation's waiters,
+            // the proxy's own wait): kept as given so both end together.
+            scaleTimeout: meta?.timeoutMs === undefined,
             signal,
             model: meta?.model,
             tools: meta?.tools,
@@ -1380,9 +1383,10 @@ export class MemtreeClient {
         let diagnostics = {};
         const controller = new AbortController();
         const abort = () => controller.abort();
-        // A compress call's budget grows with what it uploads; an index call's is fixed.
-        const timeoutMs = opts.indexOnly ? opts.timeoutMs
-            : scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8"));
+        // A default compress budget grows with what it uploads; an index call's,
+        // and any budget a caller set, is fixed.
+        const timeoutMs = opts.scaleTimeout && !opts.indexOnly
+            ? scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8")) : opts.timeoutMs;
         const timeout = setTimeout(abort, timeoutMs);
         timeout.unref();
         opts.signal?.addEventListener("abort", abort, { once: true });

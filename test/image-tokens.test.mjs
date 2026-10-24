@@ -113,3 +113,24 @@ test('a count that ran out of time is retried once with a fresh allowance', asyn
     assert.equal(calls, 2);
   } finally { server.closeAllConnections(); server.close(); }
 });
+
+test('a budget the caller set is not scaled: a preparation and its waiters end together', async () => {
+  // Codex r12: a 21.5 MiB preparation scaled to ~142 s outlived the 120 s its
+  // overflow turn waits, which then compressed beside it (billed twice).
+  const server = http.createServer(req => { req.resume(); }); // never answers
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const memtree = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: 'k', compressTimeoutMs: 200 });
+    const messages = [{ role: 'user', content: 'x'.repeat(3 * 1024 * 1024) }];
+    const started = Date.now();
+    assert.equal(await memtree.compress('h', messages, 1_000_000, undefined,
+      { prepare: true, timeoutMs: 300 }), null);
+    const explicit = Date.now() - started;
+    assert.ok(explicit < 1_500, `an explicit 300 ms budget took ${explicit} ms`);
+    const scaledStart = Date.now();
+    assert.equal(await memtree.compress('h2', messages, 1_000_000), null);
+    const scaled = Date.now() - scaledStart;
+    assert.ok(scaled >= 200 + 3_000, `the default budget grew with the upload (${scaled} ms)`);
+  } finally { server.closeAllConnections(); server.close(); }
+});

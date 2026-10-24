@@ -5077,7 +5077,9 @@ async function runBlockingCompression(args: {
     ...(messageTimes && Object.keys(messageTimes).length ? { messageTimes } : {}),
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
     ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
-    ...(args.longBudget ? { timeoutMs: budgetMs } : {}),
+    // The deadline this wait uses (the upload-scaled budget included), so the
+    // call and its waiters end together.
+    timeoutMs: budgetMs,
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
