@@ -23,12 +23,13 @@ import type { PaymentLinkCache } from "./payment-link.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 /**
- * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Sent as `x-client-features` on every MemTree call. `near-window-budget`: ccc lifts
  * Claude Code's local refusal near the window (claude-env.ts) and compresses
  * mid-turn, so the server may give it the 900k budget on 1M-window models
- * (older ccc keeps 800k).
+ * (older ccc keeps 800k). `image-refs`: ccc reads the stored images an answer
+ * lists and sends those images as references afterwards (image-refs.ts).
  */
-export declare const CLIENT_FEATURES = "near-window-budget";
+export declare const CLIENT_FEATURES = "near-window-budget,image-refs";
 export declare const CLIENT_VERSION: string;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -320,6 +321,10 @@ export declare class MemtreeClient {
     private backgroundIndexes;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
+    /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
+    private drainCutting;
+    /** Images MemTree stores, sent as references instead of their bytes. */
+    private readonly imageRefs;
     /** Session → its main lane's latest conversation, for the final index. */
     private readonly mainConversations;
     /** Session → its final index waiting for the session to stay idle. */
@@ -509,6 +514,20 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
+    /** One POST of a MemTree call's body. */
+    private postContextMemory;
+    /**
+     * A failed answer to a call that sent references: whether to send it again with
+     * bytes (the server lacks some images, or refuses references), and the response to
+     * read otherwise (rebuilt, since its body was read here).
+     */
+    private answerToRefs;
+    /**
+     * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
+     * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
+     * error carries 413, the status the server's front end would have answered.
+     */
+    private oversized;
     private log;
 }
 /** What noteMainConversation keeps: the last main-lane request as sent to MemTree. */

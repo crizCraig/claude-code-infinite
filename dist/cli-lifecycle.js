@@ -58,4 +58,21 @@ export function settleWithin(pending, ms) {
         pending.then(() => { clearTimeout(timer); resolve(); }, () => { clearTimeout(timer); resolve(); });
     });
 }
+/** The exit drain's wait for MemTree calls in flight (the final index above all). */
+export const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
+/**
+ * On Windows: closing the console window (SIGHUP) leaves ccc a few seconds before it is
+ * killed (~5 s observed), and a cut final index was logged on every close at 2 s. The
+ * drain there is 4 s, counted from the close, so the diagnostics flush after it still fits.
+ */
+export const WIN32_MEMTREE_DRAIN_MS = 4_000;
+/** How long the exit drain may wait for MemTree calls, `now` being when it starts. */
+export function shutdownMemtreeDrainMs(platform, consoleClosedAt, now = Date.now()) {
+    if (platform !== "win32")
+        return SHUTDOWN_MEMTREE_DRAIN_MS;
+    if (consoleClosedAt === undefined)
+        return WIN32_MEMTREE_DRAIN_MS;
+    const left = consoleClosedAt + WIN32_MEMTREE_DRAIN_MS - now;
+    return Math.max(0, Math.min(WIN32_MEMTREE_DRAIN_MS, left));
+}
 //# sourceMappingURL=cli-lifecycle.js.map

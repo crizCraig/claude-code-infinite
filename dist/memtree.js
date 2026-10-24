@@ -22,15 +22,18 @@ import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
+import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
+import { planMemtreeBody } from "./memtree-body.js";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
 /**
- * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Sent as `x-client-features` on every MemTree call. `near-window-budget`: ccc lifts
  * Claude Code's local refusal near the window (claude-env.ts) and compresses
  * mid-turn, so the server may give it the 900k budget on 1M-window models
- * (older ccc keeps 800k).
+ * (older ccc keeps 800k). `image-refs`: ccc reads the stored images an answer
+ * lists and sends those images as references afterwards (image-refs.ts).
  */
-export const CLIENT_FEATURES = "near-window-budget";
+export const CLIENT_FEATURES = `near-window-budget,${IMAGE_REFS_FEATURE}`;
 // Sent on every MemTree call so the server can detect/warn stale clients
 // (plan: "API versioning").
 export const CLIENT_VERSION = createRequire(import.meta.url)("../package.json").version;
@@ -758,6 +761,10 @@ export class MemtreeClient {
     backgroundIndexes = new Map();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
+    /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
+    drainCutting = false;
+    /** Images MemTree stores, sent as references instead of their bytes. */
+    imageRefs = new ImageRefs();
     /** Session → its main lane's latest conversation, for the final index. */
     mainConversations = new Map();
     /** Session → its final index waiting for the session to stay idle. */
@@ -1110,7 +1117,7 @@ export class MemtreeClient {
     }
     async sendFinalIndex(sessionId, conversation, reader, signal) {
         const reply = await readFinalReply(reader, signal);
-        const prepared = await prepareFinalMessages(withFinalReply(conversation.messages, reply), signal);
+        const prepared = await prepareFinalMessages(withFinalReply(conversation.messages, reply), signal, (message) => this.imageRefs.referenceMessage(message));
         if (this.mainConversations.get(sessionId) !== conversation ||
             this.finalIndexed.get(sessionId) === prepared.key)
             return;
@@ -1120,7 +1127,7 @@ export class MemtreeClient {
         await this.callContextMemory(prepared.messages, conversation.modelContextLimit, {
             sessionId, clientMeta: conversation.clientMeta, messageTimes,
             indexOnly: true, finalIndex: true, signal, timeoutMs: INDEX_TIMEOUT_MS,
-            serializedMessages: prepared.serialized,
+            serializedMessages: prepared.serialized, serializedImageRefs: prepared.refs,
         });
     }
     submitIndexOnly(messages, modelContextLimit, opts) {
@@ -1181,6 +1188,7 @@ export class MemtreeClient {
             clearTimeout(timer);
         if (completed)
             return true;
+        this.drainCutting = true;
         for (const controller of this.backgroundIndexes.values()) {
             controller.abort();
         }
@@ -1323,14 +1331,17 @@ export class MemtreeClient {
             // (within its image allowance) instead of naming them in placeholders.
             body.flatten_images = true;
         }
-        let payload;
-        if (opts.serializedMessages !== undefined) {
-            delete body.messages;
-            payload = JSON.stringify(body).slice(0, -1) + ',"messages":' + opts.serializedMessages + "}";
-        }
-        else {
-            payload = JSON.stringify(body);
-        }
+        // Stored images as references, and never a body over the HTTP/1 limit (memtree-body.ts).
+        const plan = (refs) => planMemtreeBody({
+            body, messages, indexOnly: opts.indexOnly === true,
+            serialized: refs && opts.serializedMessages !== undefined
+                ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
+            imageRefs: refs ? this.imageRefs : undefined,
+        });
+        let planned = plan(true);
+        if (planned.payload === undefined)
+            throw this.oversized(planned.limit, opts);
+        let payload = planned.payload;
         opts.signal?.throwIfAborted();
         const started = Date.now();
         let status;
@@ -1345,26 +1356,20 @@ export class MemtreeClient {
         if (opts.signal?.aborted)
             abort();
         try {
-            const response = await fetch(`${this.baseUrl}/v1/context_memory`, {
-                method: "POST",
-                headers: {
-                    authorization: `Bearer ${this.apiKey}`,
-                    "content-type": "application/json",
-                    "x-client": CLIENT_NAME,
-                    "x-client-version": CLIENT_VERSION,
-                    "x-client-features": CLIENT_FEATURES,
-                    ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
-                    ...(opts.clientMeta && Object.keys(opts.clientMeta).length
-                        ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
-                        : {}),
-                    // Compress calls only: an index-only call returns no memory.
-                    ...(this.memtreeTools && !opts.indexOnly
-                        ? { "x-memtree-tools": this.memtreeTools }
-                        : {}),
-                },
-                body: payload,
-                signal: controller.signal,
-            });
+            let response = await this.postContextMemory(payload, opts, controller.signal);
+            if (planned.refs.length && !response.ok) {
+                // Images it could not serve (or references it refuses): send their bytes.
+                const answer = await this.answerToRefs(response, planned.refs);
+                response = answer.response;
+                if (answer.resend) {
+                    planned = plan(false);
+                    // Logged by the finally below, as this call.
+                    if (planned.payload === undefined)
+                        throw this.oversized(planned.limit, opts, false);
+                    payload = planned.payload;
+                    response = await this.postContextMemory(payload, opts, controller.signal);
+                }
+            }
             status = response.status;
             if (!response.ok) {
                 const text = await response.text().catch(() => "");
@@ -1379,6 +1384,7 @@ export class MemtreeClient {
                 throw Object.assign(new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`), { status: response.status });
             }
             const json = (await response.json());
+            this.imageRefs.noteAnswer(json);
             // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
             // true }` by contract: the server skips compression and returns no
             // messages. Only a compress call needs a non-empty conversation back.
@@ -1439,6 +1445,10 @@ export class MemtreeClient {
                 ok,
                 status,
                 requestBytes: Buffer.byteLength(payload),
+                ...(planned.limit ? { bodyLimit: planned.limit } : {}),
+                // Aborted by an exit drain that ran out: a known cut, not a server failure.
+                ...(!ok && status === undefined && this.drainCutting
+                    ? { exitCut: true, finalIndex: opts.finalIndex === true } : {}),
                 // Present only when the request carried a model for server-side
                 // budget resolution — the client-visible half of the server's
                 // "/v1/context_memory budget" log line.
@@ -1446,6 +1456,67 @@ export class MemtreeClient {
                 ...diagnostics,
             });
         }
+    }
+    /** One POST of a MemTree call's body. */
+    postContextMemory(payload, opts, signal) {
+        return fetch(`${this.baseUrl}/v1/context_memory`, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${this.apiKey}`,
+                "content-type": "application/json",
+                "x-client": CLIENT_NAME,
+                "x-client-version": CLIENT_VERSION,
+                "x-client-features": CLIENT_FEATURES,
+                ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
+                ...(opts.clientMeta && Object.keys(opts.clientMeta).length
+                    ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                    : {}),
+                // Compress calls only: an index-only call returns no memory.
+                ...(this.memtreeTools && !opts.indexOnly
+                    ? { "x-memtree-tools": this.memtreeTools }
+                    : {}),
+            },
+            body: payload,
+            signal,
+        });
+    }
+    /**
+     * A failed answer to a call that sent references: whether to send it again with
+     * bytes (the server lacks some images, or refuses references), and the response to
+     * read otherwise (rebuilt, since its body was read here).
+     */
+    async answerToRefs(response, refs) {
+        if (response.status !== MISSING_IMAGES_STATUS && response.status !== 400) {
+            return { response, resend: false };
+        }
+        const text = await response.text().catch(() => "");
+        const missing = response.status === MISSING_IMAGES_STATUS ? missingImageShas(text) : undefined;
+        if (missing !== undefined) {
+            this.imageRefs.forget(missing.length ? missing : refs);
+        }
+        else if (refusesImageRefs(response.status, text)) {
+            this.imageRefs.disable();
+        }
+        else {
+            return { response: new Response(text, response), resend: false };
+        }
+        this.log(`context_memory ${response.status} on image references: resending bytes`);
+        return { response, resend: true };
+    }
+    /**
+     * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
+     * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
+     * error carries 413, the status the server's front end would have answered.
+     */
+    oversized(limit, opts, record = true) {
+        if (record) {
+            this.reqlog?.log({
+                kind: "memtree", indexOnly: opts.indexOnly === true, ms: 0, ok: false,
+                requestBytes: limit?.requestBytes ?? 0, ...(limit ? { bodyLimit: limit } : {}),
+            });
+        }
+        this.log(`context_memory body of ${limit?.requestBytes ?? "?"} bytes over the limit: not sent`);
+        return Object.assign(new Error("context_memory body over the size limit (not sent)"), { status: 413, bodyLimit: true });
     }
     log(msg) {
         if (this.debug)

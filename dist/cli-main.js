@@ -41,7 +41,7 @@ import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
-import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, settleWithin, writeStdout, } from "./cli-lifecycle.js";
+import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
@@ -57,7 +57,6 @@ const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
-const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 /** Shutdown's wait for the child's exit and the resume hint's (asynchronous) write. */
 const SHUTDOWN_OUTPUT_FLUSH_MS = 1_000;
@@ -642,6 +641,8 @@ async function main() {
         stdio: "inherit",
     });
     let shuttingDown = false;
+    /** When the Windows console window was closed (SIGHUP): the exit drain counts from it. */
+    let consoleClosedAt;
     // Settles once the child has exited and the resume hint (if any) is written,
     // or the child failed to start. Awaited (bounded) just before exiting, so a
     // signal whose cleanup finishes first still lets the hint print.
@@ -663,8 +664,9 @@ async function main() {
         await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
         // A session ending now sends its final index at once (the idle timer
         // would never fire), inside the same bounded background drain.
-        memtree.flushFinalIndexes();
-        await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
+        const memtreeDrainMs = shutdownMemtreeDrainMs(process.platform, consoleClosedAt);
+        memtree.flushFinalIndexes(memtreeDrainMs);
+        await memtree.drainBackground(memtreeDrainMs);
         // Before the final flushes, so a late child exit's diagnostics event is sent.
         await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
         await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
@@ -694,6 +696,7 @@ async function main() {
         // Closing the console window (SIGHUP) gives ccc a few seconds: start the
         // update first, since the drains in shutdown may not finish in time.
         process.on("SIGHUP", () => {
+            consoleClosedAt ??= Date.now();
             diagnostics.record("console_closed");
             autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
             handleShutdownSignal("SIGTERM");

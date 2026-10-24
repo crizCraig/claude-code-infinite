@@ -452,6 +452,9 @@ test("MemtreeClient shutdown aborts and logs background indexes before flush", a
         indexOnly: true,
         ok: false,
         requestBytes: recordsAtFlush[0].requestBytes,
+        // Aborted by the drain on purpose: exit_index_cut, not memtree_error.
+        exitCut: true,
+        finalIndex: false,
       }]
     );
 

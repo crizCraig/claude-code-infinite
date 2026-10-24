@@ -603,7 +603,7 @@ for (const stale of [false, true]) {
   });
 }
 
-test('original over the 64 MiB request limit: no count, compressed instead of forwarded', async () => {
+test('original over the 64 MiB request limit: no count, never forwarded or uploaded whole', async () => {
   const memory = [{ role: 'user', content: 'memory ' + 'm'.repeat(100_000) }];
   const h = await harness({ budget: 800_000, count: () => ({ input_tokens: 50_000 }),
     compress: () => ({ body: { messages: memory, flattened_messages: memory, compressed: true,
@@ -611,13 +611,15 @@ test('original over the 64 MiB request limit: no count, compressed instead of fo
         prompt_tokens_details: { cached_tokens: 250_000 } } } }) });
   try {
     // A learned sample from a cheap image-heavy turn would call it small.
-    assert.equal(await h.post(64 * 1024 * 1024 + 1, { oneMillion: true }), 200);
+    const status = await h.post(64 * 1024 * 1024 + 1, { oneMillion: true });
     assert.ok(h.counts.every(c => JSON.stringify(c).length < 1_000_000), 'never counted');
-    assert.equal(h.compressions.length, 1);
-    assert.equal(h.forwards.length, 1);
-    assert.ok(JSON.stringify(h.forwards[0]).length < 200_000, 'the compressed body was sent');
+    assert.equal(h.forwards.length, 0, 'never forwarded whole');
     const rec = h.records.find(r => r.kind === 'messages');
     assert.equal(rec.compaction.uncountedOverWindow, true);
+    // Its MemTree body is over the 30 MiB HTTP/1 limit too (memtree-body.ts): the
+    // doomed upload is never made, and the turn fails as a failed compress does.
+    assert.equal(h.compressions.length, 0, 'no MemTree upload over the limit');
+    assert.notEqual(status, 200);
   } finally { h.close(); }
 });
 

@@ -455,6 +455,15 @@ export interface MemtreeRecord {
   /** HTTP status; absent when the call died before a response (network/timeout). */
   status?: number;
   requestBytes: number;
+  /**
+   * The body was over the HTTP/1 limit (memtree-body.ts): sent with its oldest images
+   * dropped (an index call) or not sent at all. Diagnostics: memtree_body_limit.
+   */
+  bodyLimit?: { action: "trimmed" | "skipped"; requestBytes: number; imagesDropped: number };
+  /** Aborted because the exit drain ran out of time (diagnostics: exit_index_cut). */
+  exitCut?: boolean;
+  /** With exitCut: the call was the session's final index. */
+  finalIndex?: boolean;
   /** Model sent for server-side budget resolution (compression calls only). */
   model?: string;
   /**

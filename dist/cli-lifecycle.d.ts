@@ -23,4 +23,14 @@ export declare function createSignalShutdownHandler(actions: SignalShutdownActio
 export declare function writeStdout(text: string, stream?: Pick<NodeJS.WriteStream, "write">): Promise<void>;
 /** Waits for `pending` at most `ms`; a bound for cleanup that must not hang exit. */
 export declare function settleWithin(pending: Promise<unknown>, ms: number): Promise<void>;
+/** The exit drain's wait for MemTree calls in flight (the final index above all). */
+export declare const SHUTDOWN_MEMTREE_DRAIN_MS = 2000;
+/**
+ * On Windows: closing the console window (SIGHUP) leaves ccc a few seconds before it is
+ * killed (~5 s observed), and a cut final index was logged on every close at 2 s. The
+ * drain there is 4 s, counted from the close, so the diagnostics flush after it still fits.
+ */
+export declare const WIN32_MEMTREE_DRAIN_MS = 4000;
+/** How long the exit drain may wait for MemTree calls, `now` being when it starts. */
+export declare function shutdownMemtreeDrainMs(platform: NodeJS.Platform, consoleClosedAt: number | undefined, now?: number): number;
 //# sourceMappingURL=cli-lifecycle.d.ts.map

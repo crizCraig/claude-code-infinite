@@ -300,6 +300,22 @@ export class DiagnosticsRequestSink {
         }
     }
     observeMemtree(rec) {
+        if (rec.bodyLimit) {
+            const { action, requestBytes, imagesDropped } = rec.bodyLimit;
+            this.diagnostics.recordLimited(`memtree_body_limit:${action}`, "memtree_body_limit", {
+                action, index_only: rec.indexOnly, request_kb: kb(requestBytes),
+                images_dropped: imagesDropped,
+            });
+            if (action === "skipped")
+                return;
+        }
+        if (rec.exitCut) {
+            // The exit drain ran out (a closed Windows console gives ~5 s): not a server failure.
+            this.diagnostics.recordLimited("exit_index_cut", "exit_index_cut", {
+                final: rec.finalIndex === true, ms: rec.ms, request_kb: kb(rec.requestBytes),
+            });
+            return;
+        }
         if (rec.ok)
             return;
         this.diagnostics.recordLimited(`memtree:${rec.status ?? "none"}`, "memtree_error", {

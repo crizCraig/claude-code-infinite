@@ -1,16 +1,25 @@
 /** Cooperative final-index preparation, covered by the background abort signal. */
 import { createHash } from "node:crypto";
 import { setImmediate as yieldTurn } from "node:timers/promises";
+import type { Referenced } from "./image-refs.js";
 import { stripCcSystemReminders, type Message } from "./turns.js";
 
 export type FinalReplyReader = (signal?: AbortSignal) =>
   Message | undefined | Promise<Message | undefined>;
 
-export async function prepareFinalMessages(messages: Message[], signal: AbortSignal): Promise<{
-  messages: Message[]; retained: Message[]; key: string; serialized: string;
+/**
+ * `serialized` is what is sent: each message as `reference` makes it (stored images as
+ * references, image-refs.ts), which `refs` lists; `messages` keeps the bytes.
+ */
+export async function prepareFinalMessages(
+  messages: Message[], signal: AbortSignal,
+  reference: (message: Message) => Referenced<Message> = (value) => ({ value, refs: [] })
+): Promise<{
+  messages: Message[]; retained: Message[]; key: string; serialized: string; refs: string[];
 }> {
   const hash = createHash("sha256").update("[");
   const cleaned: Message[] = [], retained: Message[] = [], serialized: string[] = [];
+  const refs: string[] = [];
   for (let i = 0; i < messages.length; i++) {
     await yieldTurn(undefined, { signal });
     hash.update((i ? "," : "") + JSON.stringify(messages[i]));
@@ -18,12 +27,14 @@ export async function prepareFinalMessages(messages: Message[], signal: AbortSig
     if (message) {
       cleaned.push(message);
       retained.push(messages[i]);
-      serialized.push(JSON.stringify(message));
+      const sent = reference(message);
+      refs.push(...sent.refs);
+      serialized.push(JSON.stringify(sent.value));
     }
   }
   signal.throwIfAborted();
   return { messages: cleaned, retained, key: hash.update("]").digest("hex"),
-    serialized: `[${serialized.join(",")}]` };
+    serialized: `[${serialized.join(",")}]`, refs };
 }
 
 export async function readFinalReply(reader: FinalReplyReader | undefined,
