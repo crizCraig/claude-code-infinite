@@ -1,4 +1,4 @@
-export type ShutdownSignal = "SIGINT" | "SIGTERM";
+export type ShutdownSignal = "SIGINT" | "SIGTERM" | "SIGHUP";
 /** Conventional shell status for a process terminated by a POSIX signal. */
 export declare function exitCodeForSignal(signal: NodeJS.Signals): number;
 /** Preserve a child's numeric status or translate its terminating signal. */
@@ -38,6 +38,23 @@ export declare const CONSOLE_CLOSE_MARKS_MS: {
     readonly childWait: 3750;
     readonly flush: 4500;
 };
+/**
+ * How a closed terminal reaches ccc. Windows: the console window closed, and Windows ends
+ * ccc ~5 s later ("console-close", each shutdown step ends by its mark). macOS and Linux:
+ * the terminal hung up ("terminal-hangup"); nothing ends ccc after it, but its terminal is
+ * gone. Either way it is SIGHUP, whose default is to exit at once: before this, closing a
+ * macOS or Linux terminal killed ccc with no final index.
+ */
+export type HangupKind = "console-close" | "terminal-hangup";
+/** Calls `handler` on every SIGHUP, on every platform, with the kind of close it means. */
+export declare function onHangup(proc: Pick<NodeJS.Process, "on" | "platform">, handler: (kind: HangupKind) => void): void;
+/** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */
+export declare function ignoreStreamErrors(streams: Array<Pick<NodeJS.EventEmitter, "on">>): void;
+/**
+ * The exit drain's wait for MemTree calls after a terminal hangup (macOS, Linux): nobody
+ * waits for ccc then, and a large session's final index takes seconds to upload.
+ */
+export declare const HANGUP_MEMTREE_DRAIN_MS = 10000;
 /** How long the exit drain may wait for MemTree calls, starting `now`. */
 export declare function shutdownMemtreeDrainMs(platform: NodeJS.Platform, consoleClosedAt: number | undefined, now?: number): number;
 /** `ms`, or less when it would end past `markMs` after the console's close. */

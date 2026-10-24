@@ -4,9 +4,12 @@ import {
   createSignalShutdownHandler,
   exitCodeForChild,
   exitCodeForSignal,
+  ignoreStreamErrors,
+  onHangup,
   settleWithin,
   writeStdout,
 } from "../dist/cli-lifecycle.js";
+import { EventEmitter } from "node:events";
 
 test("signals use conventional shell exit statuses", () => {
   assert.equal(exitCodeForSignal("SIGINT"), 130);
@@ -91,4 +94,25 @@ test("console_closed: an event with no fields", async () => {
   const { sanitizeEvent } = await import("../dist/diagnostics-schema.js");
   assert.deepEqual(sanitizeEvent("console_closed", { path: "C:\\x" }, 2),
     { name: "console_closed", t: 2 });
+});
+
+test("SIGHUP is handled on every platform: a console close on Windows, a hangup elsewhere", () => {
+  for (const [platform, kind] of [["win32", "console-close"], ["darwin", "terminal-hangup"],
+    ["linux", "terminal-hangup"]]) {
+    const proc = new EventEmitter();
+    proc.platform = platform;
+    const seen = [];
+    onHangup(proc, (k) => seen.push(k));
+    assert.equal(proc.listenerCount("SIGHUP"), 1, platform);
+    proc.emit("SIGHUP");
+    assert.deepEqual(seen, [kind], platform);
+  }
+  assert.equal(exitCodeForSignal("SIGHUP"), 129);
+});
+
+test("after a hangup, a write error on the gone terminal is not thrown", () => {
+  const stdout = new EventEmitter();
+  assert.throws(() => stdout.emit("error", new Error("EIO")), /EIO/, "unhandled by default");
+  ignoreStreamErrors([stdout]);
+  assert.doesNotThrow(() => stdout.emit("error", Object.assign(new Error("write EIO"), { code: "EIO" })));
 });

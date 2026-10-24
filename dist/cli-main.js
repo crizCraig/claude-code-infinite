@@ -41,7 +41,7 @@ import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
-import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
+import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, HANGUP_MEMTREE_DRAIN_MS, ignoreStreamErrors, onHangup, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS, } from "./diagnostics.js";
@@ -643,6 +643,8 @@ async function main() {
     let shuttingDown = false;
     /** When the Windows console window was closed (SIGHUP): the exit drain counts from it. */
     let consoleClosedAt;
+    /** When the terminal hung up (macOS, Linux SIGHUP). */
+    let terminalHungUp = false;
     // Settles once the child has exited and the resume hint (if any) is written,
     // or the child failed to start. Awaited (bounded) just before exiting, so a
     // signal whose cleanup finishes first still lets the hint print.
@@ -666,7 +668,9 @@ async function main() {
         await proxy.drain(closeBoundedMs(SHUTDOWN_PROXY_DRAIN_MS, consoleClosedAt, marks.proxyDrain));
         // A session ending now sends its final index at once (the idle timer
         // would never fire), inside the same bounded background drain.
-        const memtreeDrainMs = shutdownMemtreeDrainMs(process.platform, consoleClosedAt);
+        const memtreeDrainMs = terminalHungUp
+            ? HANGUP_MEMTREE_DRAIN_MS
+            : shutdownMemtreeDrainMs(process.platform, consoleClosedAt);
         memtree.flushFinalIndexes(memtreeDrainMs);
         await memtree.drainBackground(memtreeDrainMs);
         // Before the final flushes, so a late child exit's diagnostics event is sent.
@@ -697,16 +701,22 @@ async function main() {
     });
     process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
     process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
-    if (process.platform === "win32") {
-        // Closing the console window (SIGHUP) gives ccc a few seconds: start the
-        // update first, since the drains in shutdown may not finish in time.
-        process.on("SIGHUP", () => {
+    onHangup(process, (kind) => {
+        diagnostics.record("console_closed");
+        if (kind === "console-close") {
+            // Windows ends ccc a few seconds after its console window closes: start the
+            // update first, since the drains in shutdown may not finish in time.
             consoleClosedAt ??= Date.now();
-            diagnostics.record("console_closed");
             autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
             handleShutdownSignal("SIGTERM");
-        });
-    }
+            return;
+        }
+        // macOS, Linux: the terminal is gone, but nothing ends ccc, so the final index
+        // gets a longer drain than an ordinary exit.
+        terminalHungUp = true;
+        ignoreStreamErrors([process.stdout, process.stderr]);
+        handleShutdownSignal("SIGHUP");
+    });
     // The background install starts once Claude Code is up; it outlives this
     // process if the session ends first.
     autoUpdate?.scheduleInstall(undefined, (result) => {

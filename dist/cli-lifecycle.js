@@ -70,6 +70,20 @@ export const WIN32_MEMTREE_DRAIN_MS = 4_000;
 export const CONSOLE_CLOSE_MARKS_MS = {
     proxyDrain: 1_000, memtreeDrain: 3_500, childWait: 3_750, flush: 4_500,
 };
+/** Calls `handler` on every SIGHUP, on every platform, with the kind of close it means. */
+export function onHangup(proc, handler) {
+    proc.on("SIGHUP", () => handler(proc.platform === "win32" ? "console-close" : "terminal-hangup"));
+}
+/** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */
+export function ignoreStreamErrors(streams) {
+    for (const stream of streams)
+        stream.on("error", () => { });
+}
+/**
+ * The exit drain's wait for MemTree calls after a terminal hangup (macOS, Linux): nobody
+ * waits for ccc then, and a large session's final index takes seconds to upload.
+ */
+export const HANGUP_MEMTREE_DRAIN_MS = 10_000;
 /** How long the exit drain may wait for MemTree calls, starting `now`. */
 export function shutdownMemtreeDrainMs(platform, consoleClosedAt, now = Date.now()) {
     const base = platform === "win32" ? WIN32_MEMTREE_DRAIN_MS : SHUTDOWN_MEMTREE_DRAIN_MS;
