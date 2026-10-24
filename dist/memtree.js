@@ -40,6 +40,13 @@ export const CLIENT_VERSION = createRequire(import.meta.url)("../package.json").
 // latency target. Override via CCC_COMPRESS_TIMEOUT_MS (read below).
 const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
 /**
+ * Added to a compress call's budget per KiB of its upload: a large session's
+ * body (20+ MB) takes seconds to send on a slow link before the server even
+ * starts, so a flat budget times out on size alone (2026-10-23: every tool
+ * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ */
+export const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+/**
  * The budget for a compress with nothing else to send: no compressed prefix to
  * ride and a raw request known not to fit the window (the first turn after
  * `--resume`). A timeout there can only end in a refusal, and a large
@@ -736,6 +743,7 @@ export class MemtreeClient {
     baseUrl;
     apiKey;
     compressTimeoutMs;
+    compressSuccessAt = 0;
     longCompressTimeoutMs;
     debug;
     reqlog;
@@ -829,6 +837,18 @@ export class MemtreeClient {
      */
     get compressBudgetMs() {
         return this.compressTimeoutMs;
+    }
+    /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
+    compressBudgetForBytes(bytes) {
+        return scaledTimeout(this.compressBudgetMs, bytes);
+    }
+    /**
+     * When a compress call (not an index-only one) last got a live successful
+     * answer (epoch ms; 0: never). A compress timing out while others succeed
+     * is its size or a slow reply, not an outage.
+     */
+    get lastCompressSuccessAt() {
+        return this.compressSuccessAt;
     }
     /**
      * Non-secret identity of the MemTree backend and account this client uses:
@@ -1360,7 +1380,10 @@ export class MemtreeClient {
         let diagnostics = {};
         const controller = new AbortController();
         const abort = () => controller.abort();
-        const timeout = setTimeout(abort, opts.timeoutMs);
+        // A compress call's budget grows with what it uploads; an index call's is fixed.
+        const timeoutMs = opts.indexOnly ? opts.timeoutMs
+            : scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8"));
+        const timeout = setTimeout(abort, timeoutMs);
         timeout.unref();
         opts.signal?.addEventListener("abort", abort, { once: true });
         if (opts.signal?.aborted)
@@ -1414,6 +1437,8 @@ export class MemtreeClient {
             const memtreeIndex = response.headers.get("x-polychat-memtree-index") ?? undefined;
             this.unpaidDetail = null; // a success proves the key is paid (again)
             ok = true;
+            if (!opts.indexOnly)
+                this.compressSuccessAt = Date.now();
             diagnostics = {
                 ...(memtreeUrl ? { memtreeUrl } : {}),
                 ...(memtreeIndex ? { memtreeIndex } : {}),
@@ -1490,5 +1515,11 @@ export function withFinalReply(messages, reply) {
     if (!reply || messages.at(-1)?.role === "assistant")
         return messages;
     return [...messages, reply];
+}
+/** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
+function scaledTimeout(baseMs, bytes) {
+    if (!Number.isFinite(baseMs))
+        return baseMs;
+    return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * COMPRESS_TIMEOUT_MS_PER_KIB;
 }
 //# sourceMappingURL=memtree.js.map

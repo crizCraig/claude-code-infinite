@@ -31,6 +31,13 @@ export declare const CLIENT_NAME = "cc-infinite";
 export declare const CLIENT_FEATURES = "near-window-budget";
 export declare const CLIENT_VERSION: string;
 /**
+ * Added to a compress call's budget per KiB of its upload: a large session's
+ * body (20+ MB) takes seconds to send on a slow link before the server even
+ * starts, so a flat budget times out on size alone (2026-10-23: every tool
+ * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ */
+export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+/**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
  * pauses spend the server's once-per-30-minutes final index mid-session.
@@ -310,6 +317,7 @@ export declare class MemtreeClient {
     private baseUrl;
     private apiKey;
     private compressTimeoutMs;
+    private compressSuccessAt;
     private longCompressTimeoutMs;
     private debug;
     private reqlog;
@@ -386,6 +394,14 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
+    compressBudgetForBytes(bytes: number): number;
+    /**
+     * When a compress call (not an index-only one) last got a live successful
+     * answer (epoch ms; 0: never). A compress timing out while others succeed
+     * is its size or a slow reply, not an outage.
+     */
+    get lastCompressSuccessAt(): number;
     /**
      * Non-secret identity of the MemTree backend and account this client uses:
      * a hash over the origin and a hash of the key. Persisted state is valid only

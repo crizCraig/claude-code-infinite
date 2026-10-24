@@ -6039,12 +6039,17 @@ function recordingUpstream({ sizedCounts = false } = {}) {
  * Tool-loop conversation whose serialized non-system bytes exceed the 400KiB
  * recovery gate. `marker` differentiates conversations (and MemTree hashes).
  */
-function largeToolTurn(marker = "AAA") {
+/** largeToolTurn repeats over the budget but within the window by its
+ * conservative bound: a cooldown may skip it (an over-window turn with no
+ * prefix compresses anyway, since a skip could only refuse it). */
+const WITHIN_WINDOW_REPEATS = 24 * 1024;
+
+function largeToolTurn(marker = "AAA", repeats = 64 * 1024) {
   return [
     { role: "user", content: `${marker} first question` },
     {
       role: "assistant",
-      content: [{ type: "text", text: `${marker} ` + "history ".repeat(64 * 1024) }],
+      content: [{ type: "text", text: `${marker} ` + "history ".repeat(repeats) }],
     },
     {
       role: "assistant",
@@ -7688,7 +7693,7 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
   // nothing. That is the worst possible blind spot: the full-budget stall a
   // dead MemTree produces is itself the likeliest reason the user hits ESC,
   // so the outage would go unrecorded exactly when it is most expensive.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const held = deferred();
   let compressArrived = false;
   let blockingCompresses = 0;
@@ -7710,6 +7715,9 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -7914,7 +7922,7 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
   // about MemTree's health as main's, and its success clears the cooldown
   // too. What bounds any one lane to a single blocking stall per epoch is
   // the per-lane attempt budget, not the fuse.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   let healthy = false;
   const memtreeSrv = await listenMemtree((req, res) => {
     const chunks = [];
@@ -7935,6 +7943,9 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -8058,7 +8069,7 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
       "the replay must be served from cache for this test to mean anything"
     );
 
-    await postMessages(proxy.port, largeToolTurn("CCC"), SESSION);
+    await postMessages(proxy.port, largeToolTurn("CCC", WITHIN_WINDOW_REPEATS), SESSION);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
       "cooldown",
@@ -8744,7 +8755,7 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
   // responsive server rejecting one request, so later misses on other lanes
   // must still get their attempt; a 5xx is the outage signal and keeps
   // arming exactly as before (as do timeouts, network errors, and 402).
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   let failStatus = 400;
   let blockingCompresses = 0;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -8763,6 +8774,9 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -8806,7 +8820,7 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
 test("a compress timeout arms the cooldown", async () => {
   // No response inside the abort budget is the strongest outage evidence
   // there is — a stall is exactly what the fuse exists to bound.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const held = deferred();
   let blockingCompresses = 0;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -8826,6 +8840,9 @@ test("a compress timeout arms the cooldown", async () => {
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({
       baseUrl: memtreeSrv.origin,
       apiKey: "k",

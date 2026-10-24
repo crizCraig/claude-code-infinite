@@ -64,6 +64,7 @@ import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
+import { bodyImages } from "./image-tokens.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
@@ -80,6 +81,8 @@ const HOOK_BODY_LIMIT = 64 * 1024;
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
 /** Safety cap on a long-budget compress, should a transport ignore its abort. */
 const MAX_LONG_COMPRESS_WAIT_MS = 10 * 60_000;
+/** The most a blocking compress with a fallback may wait (its budget grows with its upload). */
+const MAX_COMPRESS_WAIT_MS = 60_000;
 const SKIP_REQUEST_HEADERS = new Set([
     "host",
     "connection",
@@ -1095,7 +1098,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     if (!rides) {
         const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
         if (measured.source === "exact") {
-            sizeSlot.set({ tokens: measured.tokens, forwardedBytes: forwardCandidate.body.length });
+            sizeSlot.set(sizeSampleOf(forwardCandidate.body, measured.tokens, rec.model ?? body.model));
         }
     }
     rec.routeLane = requestRouteLane;
@@ -1165,6 +1168,8 @@ async function handleMessages(req, res, opts, upstream, state) {
                 return undefined;
             return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
                 modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
+                route: { key: requestRouteKey, messages, epoch: routeEpoch,
+                    lane: requestRouteLane === "main" && !isAwaySummary ? "main" : "other" },
                 ...(target !== undefined ? { target } : {}) });
         },
         delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
@@ -1356,9 +1361,13 @@ async function handleMessages(req, res, opts, upstream, state) {
                     // for growth instead of paying a blocking call on every tool turn.
                     rec.routeRecovery = { outcome: "backoff" };
                 }
-                else if (Date.now() < state.toolRecoveryCooldownUntil) {
+                else if (Date.now() < state.toolRecoveryCooldownUntil &&
+                    !(plan.overWindow && !plan.fallback && (!plan.uncountedOverWindowOnly ||
+                        await wholeRequestRefused(requestSizing, originalCandidate, sizingLimits())))) {
                     // A recent attempt burned the full compress budget and still
-                    // failed. Every tool turn appends a tool_result and rehashes, so
+                    // failed. (Not when this turn is over the window with no prefix to
+                    // ride and delivery would refuse it: skipping could only end in a
+                    // refusal, so it compresses anyway, on the long budget.) Every tool turn appends a tool_result and rehashes, so
                     // compress() dedup can never absorb the repeat: without this
                     // cooldown a MemTree outage would add the whole blocking budget to
                     // every tool turn over the budget. A cooldown skip does not start
@@ -1439,9 +1448,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         return logged(forwardRaw(req, res, sendBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
             toolForwarding.settle(delivered);
             if (toolRide)
-                noteRideSize(toolRide.sizeHolder, rec, sendBody.length);
+                noteRideSize(toolRide.sizeHolder, rec, sendBody);
             else {
-                noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec, sendBody.length);
+                noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec, sendBody);
             }
         }));
     }
@@ -1625,7 +1634,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     : stable.installed
                 : undefined;
             if (sizePrefix)
-                notePrefixSize(sizePrefix, rec, compressedRaw.length);
+                notePrefixSize(sizePrefix, rec, compressedRaw);
             // A route already installed at protocol-complete deliberately survives
             // delivered=false: that settle may be the fast-tool abort (client
             // consumed message_stop, closed the SSE response, and its immediate
@@ -1694,7 +1703,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     const sendingWhole = () => { requestSendPolicies.get(req).failedRebuild = true; };
     const noteWholeSize = () => {
         if (isMainRequest)
-            notePassthroughSize(state, sessionId, body.model, rec, forwardBody.length);
+            notePassthroughSize(state, sessionId, body.model, rec, forwardBody);
     };
     if (edge?.kind === "pass") {
         // Clearly under the budget by its own count: the compress call could only
@@ -1766,7 +1775,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
             .then((delivered) => {
             if (isMainRequest)
-                notePassthroughSize(state, sessionId, body.model, rec, rawBody.length);
+                notePassthroughSize(state, sessionId, body.model, rec, rawBody);
             if (delivered)
                 markMainPromptDelivered();
         }));
@@ -2757,17 +2766,17 @@ function reportedInputTokens(rec) {
         (usage.cache_creation_input_tokens ?? 0));
 }
 /** Keep the newest (largest-body) reported size of a request on this prefix. */
-function notePrefixSize(prefix, rec, bytes) {
-    const sample = reportedSample(rec, bytes);
+function notePrefixSize(prefix, rec, sent) {
+    const sample = reportedSample(rec, sent);
     if (sample === undefined)
         return;
-    if (prefix.lastSize && bytes < prefix.lastSize.forwardedBytes)
+    if (prefix.lastSize && sent.length < prefix.lastSize.forwardedBytes)
         return;
     prefix.lastSize = sample;
 }
 /** Record the reported size of a main-thread request forwarded whole. */
-function notePassthroughSize(state, sessionId, model, rec, bytes) {
-    const sample = reportedSample(rec, bytes);
+function notePassthroughSize(state, sessionId, model, rec, sent) {
+    const sample = reportedSample(rec, sent);
     if (sessionId === undefined || sample === undefined)
         return;
     boundedSet(state.passthroughSizes, sessionSizeKey(sessionId, model), sample);
@@ -2797,12 +2806,17 @@ function usedServerTools(rec) {
  * an implausible ratio would mis-size every later request it anchors, so it
  * is dropped and the previous sample kept.
  */
-function reportedSample(rec, bytes) {
+function reportedSample(rec, sent) {
     const tokens = reportedBodyTokens(rec);
     if (tokens === undefined)
         return undefined;
-    const sample = { tokens, forwardedBytes: bytes };
+    const sample = sizeSampleOf(sent, tokens, rec.model);
     return plausibleSample(sample) ? sample : undefined;
+}
+/** A size sample of `sent` carrying its inline images (estimateRequestTokens). */
+function sizeSampleOf(sent, tokens, model) {
+    const { imageBytes, imageTokens } = bodyImages(sent, typeof model === "string" ? model : undefined);
+    return { tokens, forwardedBytes: sent.length, imageBytes, imageTokens };
 }
 /**
  * Anthropic's input tokens for the body this request forwarded, when its usage
@@ -2850,12 +2864,12 @@ const noteRideSize = notePrefixSize;
  * Record the reported size of a request forwarded whole: the session's
  * passthrough size on the main thread, else its lane's.
  */
-function noteWholeRequestSize(state, isMainRequest, sessionId, sizeKey, model, rec, bytes) {
+function noteWholeRequestSize(state, isMainRequest, sessionId, sizeKey, model, rec, sent) {
     if (isMainRequest && sessionId !== undefined) {
-        notePassthroughSize(state, sessionId, model, rec, bytes);
+        notePassthroughSize(state, sessionId, model, rec, sent);
         return;
     }
-    const sample = reportedSample(rec, bytes);
+    const sample = reportedSample(rec, sent);
     if (sample === undefined)
         return;
     boundedSet(state.laneSizes, sizeKey, sample, MEMORY_ROUTE_MAX_LANES);
@@ -3689,8 +3703,9 @@ async function runBlockingCompression(args) {
         : undefined;
     const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
     const compressStarted = Date.now();
+    // The upload is about the request's size: the budget grows with it.
     const budgetMs = args.longBudget
-        ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetMs;
+        ? opts.memtree.longCompressBudgetMs : opts.memtree.compressBudgetForBytes(rec.requestBytes);
     const compressMeta = {
         // Model + tools drive the server's model-based memory budget
         // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -3726,7 +3741,7 @@ async function runBlockingCompression(args) {
     // compress() maps every failure to a resolved null (it never rejects).
     // Keep foreground work finite even if a transport ignores its abort signal.
     let deadline;
-    const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : 30_000, Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
+    const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
     const result = await Promise.race([
         opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta),
         new Promise((resolve) => { deadline = setTimeout(() => resolve(null), maximumWait); }),
@@ -3745,14 +3760,19 @@ async function runBlockingCompression(args) {
     // fuse evidence. A responsive server's other 4xx failed THIS call but says
     // nothing about MemTree's health, so it contributes neither failure nor
     // success — the fuse is untouched.
-    const hadLiveFailure = !cached && result === null && failureArming;
+    // Budget-consumed heuristic: the client maps every failure to null, so a
+    // null that took (roughly) the whole abort budget was almost certainly
+    // the AbortSignal timeout, not a fast server error.
+    const timedOut = result === null && compressMs >= Math.min(budgetMs, maximumWait);
+    // A timeout while other compress calls answered (one succeeded after this
+    // one started) is this call's size or the server's slow reply, not an outage: it arms no cooldown (2026-10-23:
+    // healthy-server timeouts kept the fuse lit and a screenshot turn was refused).
+    const othersAnswered = timedOut && (opts.memtree.lastCompressSuccessAt ?? 0) >= compressStarted;
+    const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered;
     rec.compress = {
         ms: compressMs,
         ok: result !== null,
-        // Budget-consumed heuristic: the client maps every failure to null, so a
-        // null that took (roughly) the whole abort budget was almost certainly
-        // the AbortSignal timeout, not a fast server error.
-        timedOut: result === null && compressMs >= budgetMs,
+        timedOut,
         ...(!cached && failureStatus === OVER_CONTEXT_STATUS ? { refused: true } : {}),
     };
     return {
@@ -3879,14 +3899,14 @@ async function recoverToolRouteMiss(args) {
             capture(opts, "anthropic-request-memory-tool", fallback.raw);
             return forwardRaw(req, res, fallback.raw, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
                 toolForwarding.settle(delivered);
-                noteRideSize(fallback.sizeHolder, rec, fallback.raw.length);
+                noteRideSize(fallback.sizeHolder, rec, fallback.raw);
             });
         }
         recordTurn(rec, "tool", args.originalBody);
         capture(opts, "anthropic-request", args.originalBody);
         return forwardRaw(req, res, args.originalBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
             toolForwarding.settle(delivered);
-            noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, body.model, rec, args.originalBody.length);
+            noteWholeRequestSize(state, isMainRequest, sessionId, args.sizeKey, body.model, rec, args.originalBody);
         });
     };
     // Same downstream-close tracking as the followup path: compression
@@ -4174,7 +4194,7 @@ async function recoverToolRouteMiss(args) {
     // The compacted request's reported size anchors the next budget check.
     const sizeHolder = stable?.installed ?? installedRoute;
     if (sizeHolder)
-        notePrefixSize(sizeHolder, rec, compressedRaw.length);
+        notePrefixSize(sizeHolder, rec, compressedRaw);
     // Nothing to ride next turn, or a result that still does not fit the
     // window (the next turn would reject it and compress again): wait for
     // growth before the lane tries again.
@@ -4277,14 +4297,20 @@ async function recoverLateCount(args) {
         const { body, msgsForMemtree: messages } = args;
         const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
         const target = args.target ?? lateRecoveryTarget(compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget), budget, args.rideTokens);
+        const sessionId = requestSessionId(args.req);
+        const linkSeq = args.route.lane === "main" ? nextMemtreeCallSeq(args.state) : undefined;
+        const replaces = sessionId !== undefined
+            ? args.state.stablePrefixes.get(sessionId) ?? null : null;
         const outcome = await runBlockingCompression({
             opts: args.opts, state: args.state, body, msgsForMemtree: messages,
             hash: args.hash, modelContextLimit: args.modelContextLimit,
-            rec: args.rec, sessionId: requestSessionId(args.req), agentId: agentAttributionId(args.req),
+            rec: args.rec, sessionId, agentId: agentAttributionId(args.req),
             clientMeta: args.clientMeta, sizing: args.sizing, inputCandidate: args.inputCandidate,
             compaction: { target },
         });
         noteMemtreeHealth(args.state, outcome);
+        if (linkSeq !== undefined)
+            noteMemtreePage(args.state, linkSeq, sessionId, outcome.result);
         // Like every compress path: a refusal after a lagging answer waits for
         // the index, and the cached answer expires so a retry asks again.
         if (outcome.result)
@@ -4295,11 +4321,50 @@ async function recoverLateCount(args) {
         const built = buildCompressedBody(body, outcome.result);
         if (!built)
             return undefined;
+        lateRouteInstalls.set(args.rec, lateRouteInstall(args, built.compressedBody, outcome.result, {
+            targetTokens: target, explicitTarget: true, modelContextLimit: args.modelContextLimit,
+            replaces
+        }, linkSeq));
         return built.compressedRaw;
     }
     catch {
         return undefined;
     }
+}
+/** Late recoveries' installs, per request, until delivery settles. */
+const lateRouteInstalls = new WeakMap();
+function lateRouteInstall(args, compressedBody, result, stable, linkSeq) {
+    const { state, route } = args;
+    const sessionId = requestSessionId(args.req);
+    const generation = ++state.mainRouteDecisionGeneration;
+    reserveRouteDecision(state, route.key, generation);
+    let done = false;
+    let installed;
+    return {
+        activate: () => {
+            if (done)
+                return;
+            done = true;
+            if (sessionId !== undefined) {
+                installed = installMemoryRoute(state, route.key, args.req, args.body, route.messages, compressedBody, route.epoch, generation, route.lane === "main" ? stable : undefined);
+            }
+            if (!installed)
+                releaseRouteDecision(state, route.key, generation);
+            else if (linkSeq !== undefined)
+                noteMemorySource(state, linkSeq, sessionId, result);
+        },
+        settle(delivered, sent) {
+            if (delivered)
+                this.activate();
+            const holder = stable.installed ?? installed;
+            if (holder && sent)
+                notePrefixSize(holder, args.rec, sent);
+            if (!installed) {
+                done = true;
+                releaseRouteDecision(state, route.key, generation);
+            }
+        },
+    };
 }
 /**
  * The ride compressed to `target` still counted `rideTokens` (over the
@@ -4319,19 +4384,25 @@ async function selectForwardCandidate(args) {
     const preferred = policy.sizing.register(intended, policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
     const measured = await policy.sizing.measure(preferred, args.limits);
     let target = preferred;
-    const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits);
+    const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits, args.routeKey);
     if (late) {
         args.rec.lateCountRecovery = { outcome: "forwarded" };
-        const replacement = await policy.recoverLate(preferred.body, late.tokens, late.target);
+        const replacement = await holdingLane(args.state, args.routeKey, () => policy.recoverLate(preferred.body, late.tokens, late.target));
         if (replacement)
             target = policy.sizing.register(replacement, "replacement");
     }
     const selection = await policy.sizing.select(target, args.limits) ??
+        await policy.sizing.retryTimedOutCount(args.limits) ??
         (args.rec.routeLane === "main" && args.opts.toolOutputs
             ? await truncatedToFit(args.rec, policy.sizing, target, args.limits, args.opts.toolOutputs)
             : undefined);
     const quietDegrade = quietDegrades.get(args.rec);
     quietDegrades.delete(args.rec);
+    const lateInstall = lateRouteInstalls.get(args.rec);
+    if (lateInstall && (!selection || selection.candidate !== target || target === preferred)) {
+        lateRouteInstalls.delete(args.rec);
+        lateInstall.settle(false);
+    }
     if (!selection) {
         if (args.rec.lateCountRecovery)
             args.rec.lateCountRecovery.outcome = "refused";
@@ -4439,7 +4510,7 @@ async function truncateCandidate(rec, sizing, base, limits, store) {
  * excess, so the turn is compressed and sent in the same request instead of
  * being refused and retried.
  */
-function lateRecoveryPlan(state, rec, preferred, measured, limits) {
+function lateRecoveryPlan(state, rec, preferred, measured, limits, routeKey) {
     if (rec.lateCountRecovery)
         return undefined;
     const oversized = oversizedCompressions.get(rec);
@@ -4453,11 +4524,39 @@ function lateRecoveryPlan(state, rec, preferred, measured, limits) {
     if (rec.compress || measured.source !== "exact" || !(measured.tokens > limits.budget)) {
         return undefined;
     }
+    // Another request of this lane is compressing (rec.routeRecovery "in-flight"):
+    // a second compression of the same history at another target would miss its
+    // dedupe and bill twice. This one waits for neither and goes as it is.
+    if (state.toolRecoveryAttemptedLanes.get(routeKey)?.inFlight)
+        return undefined;
     if (preferred.kind === "ride")
         return { tokens: measured.tokens };
-    const overWindow = !fitsMeasured(measured, limits);
-    return preferred.kind === "original" && overWindow &&
-        Date.now() >= state.toolRecoveryCooldownUntil ? { tokens: measured.tokens } : undefined;
+    // Over the window with nothing compressed, a refusal is all that is left:
+    // an outage cooldown does not skip this one compress.
+    return preferred.kind === "original" && !fitsMeasured(measured, limits)
+        ? { tokens: measured.tokens } : undefined;
+}
+/**
+ * Run a delivery-time compression as the lane's in-flight operation, so a
+ * concurrent request of the lane neither starts its own (planning sees
+ * "in-flight") nor races it; the lane's own attempt state is kept.
+ */
+async function holdingLane(state, routeKey, run) {
+    const lanes = state.toolRecoveryAttemptedLanes;
+    const prior = lanes.get(routeKey);
+    const attempt = prior ?? { modelContextLimit: 0, inFlight: true };
+    const wasInFlight = attempt.inFlight;
+    attempt.inFlight = true;
+    if (!prior)
+        lanes.set(routeKey, attempt);
+    try {
+        return await run();
+    }
+    finally {
+        attempt.inFlight = wasInFlight;
+        if (!prior && lanes.get(routeKey) === attempt)
+            lanes.delete(routeKey);
+    }
 }
 /** A recompression aims this share of its old target lower than the excess alone. */
 const SMALLER_TARGET_MARGIN = 0.1;
@@ -4624,7 +4723,12 @@ async function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, 
     const selected = policy ? await policy.select(bodyBuffer) : bodyBuffer;
     if (!selected)
         return false;
-    const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : undefined);
+    // A late recovery's replacement went out instead: it installs as its route.
+    const lateInstall = rec && selected !== bodyBuffer ? lateRouteInstalls.get(rec) : undefined;
+    if (rec)
+        lateRouteInstalls.delete(rec);
+    const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate);
+    lateInstall?.settle(delivered, selected);
     if (delivered && rec)
         noteSelectedCandidateSize(rec);
     return delivered;
@@ -4639,7 +4743,7 @@ function noteSelectedCandidateSize(rec) {
     // Server tools' injected results inflate the reported input (reportedSample).
     if (serverToolRecords.has(rec) || usedServerTools(rec))
         return;
-    const sample = { tokens, forwardedBytes: candidate.body.length };
+    const sample = sizeSampleOf(candidate.body, tokens, rec.model);
     if (!plausibleSample(sample))
         return;
     if ("set" in owner)

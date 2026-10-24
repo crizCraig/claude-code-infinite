@@ -54,12 +54,19 @@ function compressedReply(tokens, { prepared = false, budget = 960_000 } = {}) {
 }
 
 async function harness({ prepares = true, preparedTokens = 480_000, blockingDelayMs = BLOCKING_DELAY_MS,
-  budget, model = OPUS, oneMillion = true, compress, prepareDelayMs = 0 } = {}) {
-  const forwards = [], calls = [], records = [];
+  budget, model = OPUS, oneMillion = true, compress, prepareDelayMs = 0, compressTimeoutMs,
+  countHangs = () => false } = {}) {
+  const forwards = [], calls = [], records = [], counts = [];
   const upstream = await listen(async (req, res) => {
     const body = await readJson(req);
+    if (req.url.includes('/count_tokens')) {
+      counts.push(body);
+      // `countHangs` true: this count never answers (Count Tokens is slow).
+      if (countHangs(body, counts.length)) return;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ input_tokens: tokensOf(body) }));
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    if (req.url.includes('/count_tokens')) return res.end(JSON.stringify({ input_tokens: tokensOf(body) }));
     forwards.push(body);
     res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }],
       usage: { input_tokens: tokensOf(body), output_tokens: 1 } }));
@@ -76,6 +83,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     const custom = compress?.(body, calls);
     if (custom) {
       if (custom.delayMs) await new Promise(resolve => setTimeout(resolve, custom.delayMs));
+      for (const [name, value] of Object.entries(custom.headers ?? {})) res.setHeader(name, value);
       return reply(custom.status ?? 200, custom.body);
     }
     if (body.prepare) {
@@ -89,7 +97,8 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     await new Promise(resolve => setTimeout(resolve, blockingDelayMs));
     reply(200, compressedReply(480_000));
   });
-  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret' });
+  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret',
+    ...(compressTimeoutMs !== undefined ? { compressTimeoutMs } : {}) });
   const outputsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccc-outputs-'));
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
     toolOutputs: new ToolOutputStore(path.join(outputsDir, 'tool-outputs')),
@@ -117,7 +126,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
       body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: session, prompt }) });
   }
   return {
-    post, forwards, calls, records, currentPage, command,
+    post, forwards, calls, records, counts, currentPage, command,
     prepareCalls: () => calls.filter(c => c.prepare),
     blockingCalls: () => calls.filter(c => !c.prepare),
     close() {
@@ -285,7 +294,9 @@ test('a screenshot landing at the limit: an oversized compression is redone smal
   // proxy recompresses at once to a smaller target instead of refusing.
   const h = await harness({ prepares: false, blockingDelayMs: 0,
     compress: (body) => body.prepare ? undefined
-      : { body: compressedReply(body.compression_target_tokens >= 480_000 ? 990_000 : 400_000) } });
+      : body.compression_target_tokens >= 480_000 ? { body: compressedReply(990_000) }
+        : { body: compressedReply(400_000), headers: { 'x-polychat-memtree-url': 'https://app/m/redo-s',
+          'x-polychat-memtree-index': 'redo' } } });
   try {
     const conv = session(950_000);
     assert.equal((await h.post(conv)).status, 200);
@@ -303,6 +314,99 @@ test('a screenshot landing at the limit: an oversized compression is redone smal
     assert.ok(blocking[1].compression_target_tokens < blocking[0].compression_target_tokens,
       `${blocking[0].compression_target_tokens} then ${blocking[1].compression_target_tokens}`);
     assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
+
+    // The smaller compression is installed like any other: the next tool turn
+    // rides it (no compress call) and its page is the session's memory source.
+    const redone = h.forwards.at(-1).messages[0];
+    addRound(conv, 'after-shot', 2_000);
+    const next = await h.post(conv);
+    assert.equal(next.status, 200);
+    assert.equal(h.blockingCalls().length, 2, 'rides the redone prefix');
+    assert.deepEqual(h.forwards.at(-1).messages[0], redone);
+    assert.equal(await h.currentPage(), 'redo-s');
+  } finally { h.close(); }
+});
+
+/** Base64 of a PNG whose header says `width` x `height`, padded to `chars` characters. */
+function screenshot(width, height, chars) {
+  const header = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(header, 0);
+  header.writeUInt32BE(13, 8);
+  header.write('IHDR', 12, 'ascii');
+  header.writeUInt32BE(width, 16);
+  header.writeUInt32BE(height, 20);
+  header.set([8, 6, 0, 0, 0], 24);
+  const filler = Buffer.alloc(Math.ceil(chars * 3 / 4) - header.length, 0x5a);
+  return Buffer.concat([header, filler]).toString('base64').slice(0, chars);
+}
+
+function addScreenshot(conv, id, data) {
+  conv.push({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read',
+    input: { file_path: `/tmp/${id}.png` } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: [
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data } }] }] });
+}
+
+test('replay: 849k + a 295 KB screenshot, cooldown armed, Count Tokens slow: delivered, not refused', async () => {
+  // The coordinator's staging 400 (agent-bus image-overflow-400/REPORT.md):
+  // ~850k real, the 574x551 PNG (420 tokens) estimated as ~74k of text, the
+  // count timed out, and the tool-recovery cooldown (armed by compress
+  // timeouts while MemTree was healthy) skipped compression.
+  let blocking = 0;
+  let hung = 0;
+  const h = await harness({ compressTimeoutMs: 200,
+    countHangs: body => JSON.stringify(body).includes('"image"') && hung++ === 0,
+    compress: body => body.prepare ? { status: 500, body: { error: 'prepare down' } }
+      : ++blocking === 1 ? { delayMs: 20_000, body: compressedReply(480_000) }
+        : { body: compressedReply(480_000) } });
+  try {
+    const conv = session(845_000);
+    assert.equal((await h.post(conv)).status, 200);
+    await growTo(h, conv, 849_000);
+    // A human turn's compress times out (MemTree slow to reply): the cooldown arms.
+    await h.command('/memtree-compact');
+    conv.push({ role: 'assistant', content: 'Done.' },
+      { role: 'user', content: 'Now look at the screenshot.' });
+    const human = await h.post(conv);
+    assert.equal(human.status, 200);
+    assert.equal(human.record.compress.timedOut, true);
+    assert.ok(human.record.compress.ms > 200 + 3_000,
+      `the budget grew with the upload (${human.record.compress.ms}ms)`);
+
+    addScreenshot(conv, 'shot', screenshot(574, 551, 295_000));
+    const shot = await h.post(conv);
+    assert.equal(shot.status, 200, 'delivered, not refused');
+    assert.equal(shot.record.refusal, undefined);
+    assert.ok(shot.record.compaction.estimatedTokens < 860_000,
+      `the image is 420 tokens, not ~74k (${shot.record.compaction.estimatedTokens})`);
+    const outcomes = shot.record.countTokens.map(c => c.statusClass);
+    assert.ok(outcomes.includes('success') && outcomes.some(o => o === 'timeout' || o === 'deadline'),
+      `the timed-out count was retried (${outcomes})`);
+    // In the cooldown it still compressed: over the window by its uncounted
+    // bound with no prefix to ride, a skip could only have refused it.
+    assert.notEqual(shot.record.routeRecovery?.outcome, 'cooldown');
+    assert.ok(blocking >= 2, `${blocking} compress calls`);
+    assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
+  } finally { h.close(); }
+});
+
+test('a late recovery does not compress beside a same-lane compression in flight', async () => {
+  let blocking = 0;
+  const h = await harness({ prepares: false, compress: body => body.prepare
+    ? { status: 500, body: {} }
+    : { delayMs: ++blocking === 1 ? 1_500 : 0, body: compressedReply(480_000) } });
+  try {
+    const conv = session(900_000);
+    assert.equal((await h.post(conv)).status, 200);
+    addRound(conv, 'big', 120_000 * 4);
+    const first = h.post(conv);
+    await until(() => blocking === 1);
+    const again = [...conv];
+    addRound(again, 'more', 2_000);
+    const second = await h.post(again);
+    assert.equal(second.record.routeRecovery.outcome, 'in-flight');
+    assert.equal((await first).status, 200);
+    assert.equal(blocking, 1, 'one compression of this history, not a second at another target');
   } finally { h.close(); }
 });
 
