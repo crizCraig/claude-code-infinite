@@ -41,10 +41,10 @@ import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
-import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
+import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
-import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
+import { Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS, } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
 import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
 import { INSTALL_PROMPT_ENV, offerClaudeInstall, runInstaller } from "./claude-install.js";
@@ -661,15 +661,20 @@ async function main() {
         // finalize their records. Background indexing is a separate log producer:
         // stop and drain it too before waiting for scheduled JSONL appends on
         // disk.
-        await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+        // After a console close every step ends by its mark (cli-lifecycle.ts).
+        const marks = CONSOLE_CLOSE_MARKS_MS;
+        await proxy.drain(closeBoundedMs(SHUTDOWN_PROXY_DRAIN_MS, consoleClosedAt, marks.proxyDrain));
         // A session ending now sends its final index at once (the idle timer
         // would never fire), inside the same bounded background drain.
         const memtreeDrainMs = shutdownMemtreeDrainMs(process.platform, consoleClosedAt);
         memtree.flushFinalIndexes(memtreeDrainMs);
         await memtree.drainBackground(memtreeDrainMs);
         // Before the final flushes, so a late child exit's diagnostics event is sent.
-        await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
-        await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+        await settleWithin(childDone, closeBoundedMs(SHUTDOWN_OUTPUT_FLUSH_MS, consoleClosedAt, marks.childWait));
+        await Promise.all([
+            reqlog.flush(closeBoundedMs(SHUTDOWN_LOG_FLUSH_MS, consoleClosedAt, marks.flush)),
+            diagnostics.flush(closeBoundedMs(SHUTDOWN_FLUSH_MS, consoleClosedAt, marks.flush)),
+        ]);
         process.exit(code);
     };
     const handleShutdownSignal = createSignalShutdownHandler({

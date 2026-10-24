@@ -14,6 +14,8 @@ import type { Message } from "./turns.js";
 export const MAX_MEMTREE_BODY_BYTES = 30 * 1024 * 1024;
 export const IMAGE_OMITTED_TEXT =
   "[image omitted by ccc: the MemTree upload was over its size limit]";
+const PLACEHOLDER = { type: "text", text: IMAGE_OMITTED_TEXT };
+const PLACEHOLDER_BYTES = Buffer.byteLength(JSON.stringify(PLACEHOLDER), "utf-8");
 
 /** What the limit did to a call: sent with images dropped, or not sent. */
 export interface BodyLimitNote {
@@ -59,11 +61,21 @@ export function planMemtreeBody(args: {
     imagesDropped: 0 } };
   if (!args.indexOnly) return skipped;
   const { value, refs } = referenced();
-  const trimmed = dropOldestImages(value, bytes - limit);
-  const fitted = withMessagesJson(args.body, JSON.stringify(trimmed.messages));
-  if (Buffer.byteLength(fitted, "utf-8") > limit) return skipped;
-  return { payload: fitted, refs,
-    limit: { action: "trimmed", requestBytes: bytes, imagesDropped: trimmed.dropped } };
+  // Each round drops what the last one left over; it stops when nothing is left to drop.
+  let trimmed = { messages: value, dropped: 0 };
+  let size = bytes;
+  while (size > limit) {
+    const next = dropOldestImages(trimmed.messages, size - limit);
+    if (next.dropped === 0) return skipped;
+    trimmed = { messages: next.messages, dropped: trimmed.dropped + next.dropped };
+    const fitted = withMessagesJson(args.body, JSON.stringify(trimmed.messages));
+    size = Buffer.byteLength(fitted, "utf-8");
+    if (size <= limit) {
+      return { payload: fitted, refs,
+        limit: { action: "trimmed", requestBytes: bytes, imagesDropped: trimmed.dropped } };
+    }
+  }
+  return skipped;
 }
 
 /** `body` (without messages) as JSON, with `messagesJson` as its `messages`. */
@@ -105,9 +117,9 @@ function dropInBlocks(blocks: unknown[], state: DropState): unknown[] {
     const data = block?.type === "image" ? block.source?.data : undefined;
     if (typeof data !== "string" || data.startsWith(IMAGE_REF_PREFIX)) return block;
     changed = true;
-    state.saved += data.length;
+    state.saved += Buffer.byteLength(JSON.stringify(block), "utf-8") - PLACEHOLDER_BYTES;
     state.dropped += 1;
-    return { type: "text", text: IMAGE_OMITTED_TEXT };
+    return PLACEHOLDER;
   });
   return changed ? out : blocks;
 }

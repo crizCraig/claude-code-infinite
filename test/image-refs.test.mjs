@@ -10,7 +10,7 @@ import {
   IMAGE_OMITTED_TEXT, MAX_MEMTREE_BODY_BYTES, planMemtreeBody,
 } from "../dist/memtree-body.js";
 import { Diagnostics, DiagnosticsRequestSink } from "../dist/diagnostics.js";
-import { shutdownMemtreeDrainMs } from "../dist/cli-lifecycle.js";
+import { closeBoundedMs, shutdownMemtreeDrainMs } from "../dist/cli-lifecycle.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -174,6 +174,32 @@ test("an exit drain that runs out reports exit_index_cut, not memtree_error", as
   }
 });
 
+test("an exit drain cutting a call mid-body is exit_index_cut too", async () => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"messages": [');  // headers and part of the body, then nothing
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const records = [];
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k", reqlog: { log: (r) => records.push(r) } });
+    client.noteMainConversation("s1", { messages: [{ role: "user", content: "hi" }],
+      modelContextLimit: 200_000 });
+    client.flushFinalIndexes(300);
+    assert.equal(await client.drainBackground(300), false);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].status, 200);
+    assert.deepEqual(observed(records).map((e) => e.name), ["exit_index_cut"]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("body-limit records become memtree_body_limit, a skipped one no memtree_error", () => {
   const events = observed([
     { kind: "memtree", indexOnly: true, ms: 50, ok: true, requestBytes: 2048,
@@ -189,12 +215,37 @@ test("body-limit records become memtree_body_limit, a skipped one no memtree_err
   ]);
 });
 
-test("Windows drains MemTree for 4 s, counted from the console's close", () => {
+test("Windows drains MemTree for 4 s; after a console close, until 3.5 s past it", () => {
   assert.equal(shutdownMemtreeDrainMs("linux", undefined), 2_000);
-  assert.equal(shutdownMemtreeDrainMs("darwin", 1_000, 1_500), 2_000);
   assert.equal(shutdownMemtreeDrainMs("win32", undefined), 4_000);
-  assert.equal(shutdownMemtreeDrainMs("win32", 10_000, 11_000), 3_000);
+  assert.equal(shutdownMemtreeDrainMs("win32", 10_000, 10_200), 3_300);
+  assert.equal(shutdownMemtreeDrainMs("win32", 10_000, 11_000), 2_500, "proxy drain took 1 s");
   assert.equal(shutdownMemtreeDrainMs("win32", 10_000, 20_000), 0);
+  // Every other step: unchanged without a close, else ended by its mark.
+  assert.equal(closeBoundedMs(5_000, undefined, 1_000), 5_000);
+  assert.equal(closeBoundedMs(5_000, 10_000, 1_000, 10_100), 900);
+  assert.equal(closeBoundedMs(1_000, 10_000, 4_500, 14_000), 500);
+});
+
+test("trimming always ends under the limit, or skips only when nothing is left to drop", () => {
+  const messages = [];
+  for (let i = 0; i < 6; i++) {
+    messages.push({ role: "user", content: [image(png(1000 + i * 700)), { type: "text", text: "t" }] });
+  }
+  const body = { model_context_limit: 200000, index_only: true, messages };
+  const plain = Buffer.byteLength(planMemtreeBody({ body, messages, indexOnly: true }).payload);
+  const allDropped = Buffer.byteLength(JSON.stringify({ model_context_limit: 200000,
+    index_only: true, messages: messages.map((m) => ({ ...m,
+      content: [{ type: "text", text: IMAGE_OMITTED_TEXT }, m.content[1]] })) }));
+  for (let limitBytes = plain - 1; limitBytes > allDropped - 50; limitBytes -= 97) {
+    const planned = planMemtreeBody({ body, messages, indexOnly: true, limitBytes });
+    if (limitBytes >= allDropped) {
+      assert.equal(planned.limit.action, "trimmed", String(limitBytes));
+      assert.ok(Buffer.byteLength(planned.payload) <= limitBytes, String(limitBytes));
+    } else {
+      assert.equal(planned.limit.action, "skipped", String(limitBytes));
+    }
+  }
 });
 
 /** The events DiagnosticsRequestSink makes of `records`, as queued (not sent). */

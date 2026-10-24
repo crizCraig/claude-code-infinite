@@ -87,19 +87,29 @@ export function settleWithin(pending: Promise<unknown>, ms: number): Promise<voi
 
 /** The exit drain's wait for MemTree calls in flight (the final index above all). */
 export const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
-/**
- * On Windows: closing the console window (SIGHUP) leaves ccc a few seconds before it is
- * killed (~5 s observed), and a cut final index was logged on every close at 2 s. The
- * drain there is 4 s, counted from the close, so the diagnostics flush after it still fits.
- */
+/** Windows: the final index of a large session needs longer than 2 s to upload. */
 export const WIN32_MEMTREE_DRAIN_MS = 4_000;
+/**
+ * Closing a Windows console window (SIGHUP) leaves ccc ~5 s before it is killed, and
+ * the final index was cut at 2 s on every close. From the close, each shutdown step
+ * ends by its mark here, so the diagnostics flush (exit_index_cut too) still fits.
+ */
+export const CONSOLE_CLOSE_MARKS_MS = {
+  proxyDrain: 1_000, memtreeDrain: 3_500, childWait: 3_750, flush: 4_500,
+} as const;
 
-/** How long the exit drain may wait for MemTree calls, `now` being when it starts. */
+/** How long the exit drain may wait for MemTree calls, starting `now`. */
 export function shutdownMemtreeDrainMs(
   platform: NodeJS.Platform, consoleClosedAt: number | undefined, now = Date.now()
 ): number {
-  if (platform !== "win32") return SHUTDOWN_MEMTREE_DRAIN_MS;
-  if (consoleClosedAt === undefined) return WIN32_MEMTREE_DRAIN_MS;
-  const left = consoleClosedAt + WIN32_MEMTREE_DRAIN_MS - now;
-  return Math.max(0, Math.min(WIN32_MEMTREE_DRAIN_MS, left));
+  const base = platform === "win32" ? WIN32_MEMTREE_DRAIN_MS : SHUTDOWN_MEMTREE_DRAIN_MS;
+  return closeBoundedMs(base, consoleClosedAt, CONSOLE_CLOSE_MARKS_MS.memtreeDrain, now);
+}
+
+/** `ms`, or less when it would end past `markMs` after the console's close. */
+export function closeBoundedMs(
+  ms: number, consoleClosedAt: number | undefined, markMs: number, now = Date.now()
+): number {
+  if (consoleClosedAt === undefined) return ms;
+  return Math.max(0, Math.min(ms, consoleClosedAt + markMs - now));
 }

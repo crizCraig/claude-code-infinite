@@ -1574,6 +1574,8 @@ export class MemtreeClient {
       serializedMessages?: string;
       /** The references serializedMessages carries (made with this client's imageRefs). */
       serializedImageRefs?: string[];
+      /** False: send every image's bytes (the resend after a refused reference). */
+      imageRefs?: boolean;
       signal?: AbortSignal;
       model?: string;
       tools?: unknown[];
@@ -1646,9 +1648,12 @@ export class MemtreeClient {
         ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
       imageRefs: refs ? this.imageRefs : undefined,
     });
-    let planned = plan(true);
+    const planned = plan(opts.imageRefs !== false);
     if (planned.payload === undefined) throw this.oversized(planned.limit, opts);
-    let payload = planned.payload;
+    const payload = planned.payload;
+    // The answer named references it could not serve: sent again as its own call.
+    let resent = false;
+    let refusalText: string | undefined;
     opts.signal?.throwIfAborted();
 
     const started = Date.now();
@@ -1670,23 +1675,20 @@ export class MemtreeClient {
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
     try {
-      let response = await this.postContextMemory(payload, opts, controller.signal);
+      const response = await this.postContextMemory(payload, opts, controller.signal);
+      status = response.status;
       if (planned.refs.length && !response.ok) {
-        // Images it could not serve (or references it refuses): send their bytes.
-        const answer = await this.answerToRefs(response, planned.refs);
-        response = answer.response;
-        if (answer.resend) {
-          planned = plan(false);
-          // Logged by the finally below, as this call.
-          if (planned.payload === undefined) throw this.oversized(planned.limit, opts, false);
-          payload = planned.payload;
-          response = await this.postContextMemory(payload, opts, controller.signal);
+        refusalText = await readUnlessAborted(response, controller.signal);
+        if (this.refusedRefs(response.status, refusalText, planned.refs)) {
+          // A new call with bytes: its own size, timer and request-log record.
+          resent = true;
+          return await this.callContextMemory(messages, modelContextLimit,
+            { ...opts, imageRefs: false });
         }
       }
-      status = response.status;
 
       if (!response.ok) {
-        const text = await response.text().catch(() => "");
+        const text = refusalText ?? await response.text().catch(() => "");
         if (response.status === 402) {
           this.unpaidDetail = extract402Detail(text);
           // Shared, cached and backed off: one request per hour at most while paused.
@@ -1757,14 +1759,14 @@ export class MemtreeClient {
       // A background index call that failed otherwise (a timeout, a 413 on a big
       // body) is no news about payment; a compress call's answer always is.
       // A refused key is news from any call, like a 402.
-      const news = status === 402 || keyRefused || ok || !opts.indexOnly;
+      const news = !resent && (status === 402 || keyRefused || ok || !opts.indexOnly);
       if (news && (status !== undefined || !opts.signal?.aborted)) {
         this.lastAnswerUnpaid = status === 402;
         this.lastAnswerKeyInvalid = keyRefused;
       }
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).
-      this.reqlog?.log({
+      if (!resent) this.reqlog?.log({
         kind: "memtree",
         indexOnly: opts.indexOnly === true,
         ms: Date.now() - started,
@@ -1773,7 +1775,7 @@ export class MemtreeClient {
         requestBytes: Buffer.byteLength(payload),
         ...(planned.limit ? { bodyLimit: planned.limit } : {}),
         // Aborted by an exit drain that ran out: a known cut, not a server failure.
-        ...(!ok && status === undefined && this.drainCutting
+        ...(!ok && this.drainCutting && controller.signal.aborted
           ? { exitCut: true, finalIndex: opts.finalIndex === true } : {}),
         // Present only when the request carried a model for server-side
         // budget resolution — the client-visible half of the server's
@@ -1813,27 +1815,21 @@ export class MemtreeClient {
   }
 
   /**
-   * A failed answer to a call that sent references: whether to send it again with
-   * bytes (the server lacks some images, or refuses references), and the response to
-   * read otherwise (rebuilt, since its body was read here).
+   * Whether a failed answer to a call that sent references asks for their bytes: the
+   * server lacks some images (409: those are forgotten), or refuses references (400
+   * naming them: none are sent again).
    */
-  private async answerToRefs(response: Response, refs: string[]): Promise<{
-    response: Response; resend: boolean;
-  }> {
-    if (response.status !== MISSING_IMAGES_STATUS && response.status !== 400) {
-      return { response, resend: false };
-    }
-    const text = await response.text().catch(() => "");
-    const missing = response.status === MISSING_IMAGES_STATUS ? missingImageShas(text) : undefined;
+  private refusedRefs(status: number, text: string, refs: string[]): boolean {
+    const missing = status === MISSING_IMAGES_STATUS ? missingImageShas(text) : undefined;
     if (missing !== undefined) {
       this.imageRefs.forget(missing.length ? missing : refs);
-    } else if (refusesImageRefs(response.status, text)) {
+    } else if (refusesImageRefs(status, text)) {
       this.imageRefs.disable();
     } else {
-      return { response: new Response(text, response), resend: false };
+      return false;
     }
-    this.log(`context_memory ${response.status} on image references: resending bytes`);
-    return { response, resend: true };
+    this.log(`context_memory ${status} on image references: sending their bytes`);
+    return true;
   }
 
   /**
@@ -1841,15 +1837,11 @@ export class MemtreeClient {
    * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
    * error carries 413, the status the server's front end would have answered.
    */
-  private oversized(
-    limit: BodyLimitNote | undefined, opts: { indexOnly?: boolean }, record = true
-  ): Error {
-    if (record) {
-      this.reqlog?.log({
-        kind: "memtree", indexOnly: opts.indexOnly === true, ms: 0, ok: false,
-        requestBytes: limit?.requestBytes ?? 0, ...(limit ? { bodyLimit: limit } : {}),
-      });
-    }
+  private oversized(limit: BodyLimitNote | undefined, opts: { indexOnly?: boolean }): Error {
+    this.reqlog?.log({
+      kind: "memtree", indexOnly: opts.indexOnly === true, ms: 0, ok: false,
+      requestBytes: limit?.requestBytes ?? 0, ...(limit ? { bodyLimit: limit } : {}),
+    });
     this.log(`context_memory body of ${limit?.requestBytes ?? "?"} bytes over the limit: not sent`);
     return Object.assign(new Error("context_memory body over the size limit (not sent)"),
       { status: 413, bodyLimit: true });
@@ -1858,6 +1850,13 @@ export class MemtreeClient {
   private log(msg: string) {
     if (this.debug) console.error(`[ccc proxy] ${msg}`);
   }
+}
+
+/** A failed answer's body; an abort while reading it is thrown, never read as "". */
+async function readUnlessAborted(response: Response, signal: AbortSignal): Promise<string> {
+  const text = await response.text().catch(() => "");
+  signal.throwIfAborted();
+  return text;
 }
 
 /** 402 bodies are FastAPI JSON: {"detail": "<human-readable payment text>"}. */

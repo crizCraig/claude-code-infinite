@@ -517,11 +517,11 @@ export declare class MemtreeClient {
     /** One POST of a MemTree call's body. */
     private postContextMemory;
     /**
-     * A failed answer to a call that sent references: whether to send it again with
-     * bytes (the server lacks some images, or refuses references), and the response to
-     * read otherwise (rebuilt, since its body was read here).
+     * Whether a failed answer to a call that sent references asks for their bytes: the
+     * server lacks some images (409: those are forgotten), or refuses references (400
+     * naming them: none are sent again).
      */
-    private answerToRefs;
+    private refusedRefs;
     /**
      * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
      * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the

@@ -25,12 +25,21 @@ export declare function writeStdout(text: string, stream?: Pick<NodeJS.WriteStre
 export declare function settleWithin(pending: Promise<unknown>, ms: number): Promise<void>;
 /** The exit drain's wait for MemTree calls in flight (the final index above all). */
 export declare const SHUTDOWN_MEMTREE_DRAIN_MS = 2000;
-/**
- * On Windows: closing the console window (SIGHUP) leaves ccc a few seconds before it is
- * killed (~5 s observed), and a cut final index was logged on every close at 2 s. The
- * drain there is 4 s, counted from the close, so the diagnostics flush after it still fits.
- */
+/** Windows: the final index of a large session needs longer than 2 s to upload. */
 export declare const WIN32_MEMTREE_DRAIN_MS = 4000;
-/** How long the exit drain may wait for MemTree calls, `now` being when it starts. */
+/**
+ * Closing a Windows console window (SIGHUP) leaves ccc ~5 s before it is killed, and
+ * the final index was cut at 2 s on every close. From the close, each shutdown step
+ * ends by its mark here, so the diagnostics flush (exit_index_cut too) still fits.
+ */
+export declare const CONSOLE_CLOSE_MARKS_MS: {
+    readonly proxyDrain: 1000;
+    readonly memtreeDrain: 3500;
+    readonly childWait: 3750;
+    readonly flush: 4500;
+};
+/** How long the exit drain may wait for MemTree calls, starting `now`. */
 export declare function shutdownMemtreeDrainMs(platform: NodeJS.Platform, consoleClosedAt: number | undefined, now?: number): number;
+/** `ms`, or less when it would end past `markMs` after the console's close. */
+export declare function closeBoundedMs(ms: number, consoleClosedAt: number | undefined, markMs: number, now?: number): number;
 //# sourceMappingURL=cli-lifecycle.d.ts.map
