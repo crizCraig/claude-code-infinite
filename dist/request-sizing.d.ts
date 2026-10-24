@@ -1,4 +1,5 @@
 import { type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
+import { type ImageTotals } from "./image-tokens.js";
 /** Output room kept free on models that accept input + max_tokens over the
  * window, so the model can still answer a request that barely fits. */
 export declare const OUTPUT_FLOOR_TOKENS = 16000;
@@ -49,6 +50,8 @@ export declare class RequestSizing {
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */
     excludeFallback(candidate: RequestCandidate): void;
+    /** Every registered candidate planning has not excluded, in registration order. */
+    fallbacks(): RequestCandidate[];
     /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
     plan(candidate: RequestCandidate): PlannedSize;
     /** Whether this body could still get an exact count: counting is on and
@@ -68,6 +71,16 @@ export declare class RequestSizing {
     clientInputTokens(candidate: RequestCandidate): number | undefined;
     /** Count only when a size decision needs it; all views reuse the same result. */
     measure(candidate: RequestCandidate, limits: SizingLimits, phase?: "plan" | "delivery"): Promise<CandidateMeasurement>;
+    /**
+     * When counting ran out of time, count again (once per request, with a
+     * fresh allowance) the smallest candidate whose count timed out, and select
+     * it if it then fits: a slow count must not refuse a body that fits
+     * (2026-10-23: an ~850k request was refused after its count timed out).
+     */
+    retryTimedOutCount(limits: SizingLimits): Promise<{
+        candidate: RequestCandidate;
+        measurement: CandidateMeasurement;
+    } | undefined>;
     /** The preferred body gets first chance; only validated registered candidates
      * are considered afterward. Exact overflow never degrades to a byte guess. */
     select(preferred: RequestCandidate, limits: SizingLimits): Promise<{
@@ -88,6 +101,12 @@ export declare function fitsMeasured(measurement: Pick<CandidateMeasurement, "to
 export declare function estimateLimits(limits: SizingLimits): SizingLimits;
 /** `limits.output` is the reservation from outputReservation, not raw max_tokens. */
 export declare function fitsNative(input: number, limits: SizingLimits): boolean;
-/** One shared estimator for planner telemetry and request-local snapshots. */
-export declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): PlannedSize;
+/**
+ * One shared estimator for planner telemetry and request-local snapshots.
+ * Inline images (`images`, and the sample's own) are not text: their base64
+ * bytes are left out of the scaling and their visual tokens added as they are.
+ * 2026-10-23: a 295k-character PNG (420 tokens) read as ~74k tokens of text
+ * put an ~850k request at 892k and it was refused.
+ */
+export declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number, images?: ImageTotals): PlannedSize;
 //# sourceMappingURL=request-sizing.d.ts.map

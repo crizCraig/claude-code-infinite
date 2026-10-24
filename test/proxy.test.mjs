@@ -6039,12 +6039,17 @@ function recordingUpstream({ sizedCounts = false } = {}) {
  * Tool-loop conversation whose serialized non-system bytes exceed the 400KiB
  * recovery gate. `marker` differentiates conversations (and MemTree hashes).
  */
-function largeToolTurn(marker = "AAA") {
+/** largeToolTurn repeats over the budget but within the window by its
+ * conservative bound: a cooldown may skip it (an over-window turn with no
+ * prefix compresses anyway, since a skip could only refuse it). */
+const WITHIN_WINDOW_REPEATS = 24 * 1024;
+
+function largeToolTurn(marker = "AAA", repeats = 64 * 1024) {
   return [
     { role: "user", content: `${marker} first question` },
     {
       role: "assistant",
-      content: [{ type: "text", text: `${marker} ` + "history ".repeat(64 * 1024) }],
+      content: [{ type: "text", text: `${marker} ` + "history ".repeat(repeats) }],
     },
     {
       role: "assistant",
@@ -7688,7 +7693,7 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
   // nothing. That is the worst possible blind spot: the full-budget stall a
   // dead MemTree produces is itself the likeliest reason the user hits ESC,
   // so the outage would go unrecorded exactly when it is most expensive.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const held = deferred();
   let compressArrived = false;
   let blockingCompresses = 0;
@@ -7710,6 +7715,9 @@ test("a failed compress arms the cooldown even when the client gave up waiting",
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -7914,7 +7922,7 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
   // about MemTree's health as main's, and its success clears the cooldown
   // too. What bounds any one lane to a single blocking stall per epoch is
   // the per-lane attempt budget, not the fuse.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   let healthy = false;
   const memtreeSrv = await listenMemtree((req, res) => {
     const chunks = [];
@@ -7935,6 +7943,9 @@ test("every lane shares the MemTree fuse: subagent evidence arms and lifts it", 
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -8058,7 +8069,7 @@ test("a cache-served compress result cannot lift the cooldown", async () => {
       "the replay must be served from cache for this test to mean anything"
     );
 
-    await postMessages(proxy.port, largeToolTurn("CCC"), SESSION);
+    await postMessages(proxy.port, largeToolTurn("CCC", WITHIN_WINDOW_REPEATS), SESSION);
     assert.equal(
       messageRecords(records).at(-1).routeRecovery.outcome,
       "cooldown",
@@ -8744,7 +8755,7 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
   // responsive server rejecting one request, so later misses on other lanes
   // must still get their attempt; a 5xx is the outage signal and keeps
   // arming exactly as before (as do timeouts, network errors, and 402).
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   let failStatus = 400;
   let blockingCompresses = 0;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -8763,6 +8774,9 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" }),
     upstreamOrigin: upstream.origin,
     reqlog: { log: (r) => records.push(structuredClone(r)) },
@@ -8806,7 +8820,7 @@ test("a live 4xx compress failure does not arm the cooldown; a 5xx still does", 
 test("a compress timeout arms the cooldown", async () => {
   // No response inside the abort budget is the strongest outage evidence
   // there is — a stall is exactly what the fuse exists to bound.
-  const upstream = await recordingUpstream();
+  const upstream = await recordingUpstream({ sizedCounts: true });
   const held = deferred();
   let blockingCompresses = 0;
   const memtreeSrv = await listenMemtree((req, res) => {
@@ -8826,6 +8840,9 @@ test("a compress timeout arms the cooldown", async () => {
   });
   const records = [];
   const proxy = await startRecoveryProxy({
+    // Counted, the probe turns fit the window: skipping them in the
+    // cooldown is no refusal (an over-window one compresses anyway).
+    countTokens: true,
     memtree: new MemtreeClient({
       baseUrl: memtreeSrv.origin,
       apiKey: "k",
@@ -9690,12 +9707,13 @@ test("edge compaction: a changed prefix (rewind, edit, /clear) recompresses inst
     assert.equal(miss.turnType, "followup-compressed", "still over budget: compacted again");
     assert.equal(h.compressCalls().length, calls + 1);
 
-    // /clear: a new, small conversation passes through again.
+    // /clear: a new, small conversation passes through again, clearly under
+    // the budget by its count: sent at once, its compress call in the background.
     const cleared = await h.post([userText("new"), assistantText("hi"), userText("small")]);
     assert.equal(cleared.compaction.prefixMiss, "prefix");
-    assert.equal(cleared.turnType, "followup-noop");
+    assert.equal(cleared.turnType, "followup-under-budget");
     assert.equal(cleared.compaction.reason, undefined);
-    assert.equal(h.compressCalls().length, calls + 2);
+    await waitFor(() => h.compressCalls().length === calls + 2);
   } finally {
     h.close();
   }
@@ -9784,7 +9802,10 @@ test("edge compaction: /memtree-compact N compacts now to N, then rides", async 
     const conv = [userText("q1"), assistantText("a1"), userText(BIG("q2", 150_000))];
     assert.equal((await h.post(conv)).turnType, "followup-noop");
     conv.push(assistantText("a2"), userText("q3"));
-    assert.equal((await h.post(conv)).turnType, "followup-noop");
+    // Now sized from the last reply's usage, clearly under the budget: sent at
+    // once, its compress call in the background.
+    assert.equal((await h.post(conv)).turnType, "followup-under-budget");
+    await waitFor(() => h.compressCalls().length === 2);
 
     assert.match((await h.command("/memtree-compact 30k")).body.reason, /about 30k tokens/);
     conv.push(assistantText("a3"), userText("q4"));
@@ -9839,7 +9860,11 @@ test("edge compaction budget: context window x ratio until the server reports it
     assert.equal(second.compaction.budgetSource, "server");
     assert.equal(second.compaction.budgetTokens, 150_000);
     assert.equal(second.compaction.targetTokens, 75_000);
-    assert.equal(h.compressCalls().at(-1).compression_threshold_tokens, 150_000);
+    assert.equal(second.compaction.thresholdTokens, 150_000);
+    // Clearly under it by its count: sent at once, its call in the background.
+    assert.equal(second.turnType, "followup-under-budget");
+    await waitFor(() => h.compressCalls().length === 2);
+    assert.equal(h.compressCalls().at(-1).compression_target_tokens, -1);
   } finally {
     h.close();
   }
@@ -10489,9 +10514,13 @@ test("a bytes-only window alarm does not force below the calibrated budget and w
     assert.equal(rec.compaction.sizeSource, "reported");
     assert.ok(rec.compaction.estimatedTokens < 160_000);
     assert.ok(rec.requestBytes / 4 > 200_000);
-    const call = h.compressCalls().at(-1);
-    assert.equal(call.compression_target_tokens, 80_000);
-    assert.equal(call.compression_threshold_tokens, 160_000);
+    assert.equal(rec.compaction.reason, undefined, "the byte bound does not force it");
+    // The human turn before it was clearly under the budget by its count:
+    // sent at once, with its compress call (never compressing) in the background.
+    const human = h.records.filter(r => r.kind === "messages" && r.turnType === "followup-under-budget");
+    assert.equal(human.length, 1);
+    assert.equal(human[0].compaction.thresholdTokens, 160_000);
+    await waitFor(() => h.compressCalls().some(c => c.compression_target_tokens === -1));
   } finally { h.close(); }
 });
 

@@ -13,6 +13,14 @@ async function listen(handler) {
 
 const HANG = Symbol('hang');
 
+async function until(condition, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition not met in time');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
   compressBudgetMs, longCompressBudgetMs } = {}) {
@@ -334,7 +342,9 @@ test('late recovery timeout stays bounded and forwards an already-counted fittin
     const start = Date.now();
     assert.equal(await h.post(0, { agent: '', messages: [...original,
       { role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }] }), 200);
-    assert.ok(Date.now() - start < 1_000, 'late compression does not hold the request indefinitely');
+    // The 100 ms budget plus 1 ms per KiB of the ~1.2 MB upload (memtree.ts
+    // COMPRESS_TIMEOUT_MS_PER_KIB).
+    assert.ok(Date.now() - start < 2_000, 'late compression does not hold the request indefinitely');
     assert.equal(h.compressions.length, 2);
     assert.equal(h.counts.length, 3, 'one request-local count for the ride, no recount after timeout');
     const rec = h.records.filter(r => r.kind === 'messages').at(-1);
@@ -532,7 +542,8 @@ for (const mode of ['disabled', 'timeout']) {
       assert.equal(rec.compaction.uncountedOverWindow, true);
       assert.equal(h.compressions.length, 1, 'compression is attempted, not a pass');
       assert.equal(h.compressions[0].compression_threshold_tokens, undefined, 'forced');
-      assert.ok(h.counts.length <= 1, 'at most one count, reused at delivery');
+      // Reused at delivery; a timed-out count is retried once before a refusal.
+      assert.ok(h.counts.length <= (mode === 'timeout' ? 2 : 1), `${h.counts.length} counts`);
     } finally { h.close(); }
   });
 }
@@ -770,7 +781,7 @@ test('a compressed result whose usage is unusable is judged by its exact count b
   assert.equal(exceeds(body, rec, raw, 200_000, 190_000), true);
 });
 
-// The 900k budget on a 1M window (fallbackBudgetRatio until the server
+// The 960k budget on a 1M window (fallbackBudgetRatio until the server
 // reports one): a main-thread tool loop passes through just under it, and the
 // tool round that jumps past the window is compressed mid-turn, never sent whole.
 const OPUS_1M = { oneMillion: true, model: 'claude-opus-5-5', maxTokens: 128_000, agent: '' };
@@ -781,18 +792,22 @@ const nearWindowTurn = () => [{ role: 'user', content: 'task' }, ...toolRound('t
 const quarterToken = body => ({ input_tokens: Math.floor(JSON.stringify(body).length / 4) });
 
 for (const outcome of ['compressed', 'failed']) {
-  test(`900k budget: a tool round jumping from 880k past the 1M window is compressed mid-turn (${outcome})`, async () => {
+  test(`960k budget: a tool round jumping from 880k past the 1M window is compressed mid-turn (${outcome})`, async () => {
     let failing = outcome === 'failed';
     const h = await harness({ budget: null, count: quarterToken,
       usage: (_body, bytes) => Math.floor(bytes / 4),
       compress: () => failing ? { status: 503, body: { detail: 'MemTree down' } }
-        : compressedReply(40_000, 900_000) });
+        : compressedReply(40_000, 960_000) });
     try {
       const first = nearWindowTurn();
       assert.equal(await h.post(0, { ...OPUS_1M, messages: first }), 200);
-      assert.equal(h.compressions.length, 0, '880k is under the 900k budget');
+      // 880k is under the 960k budget but past 850k: a background preparation
+      // only (prepared-compression.ts), which this server does not support.
+      assert.equal(h.compressions.filter(c => !c.prepare).length, 0, '880k is under the 960k budget');
+      await until(() => h.compressions.some(c => c.prepare));
+      assert.equal(h.compressions.filter(c => c.prepare).length, 1, 'prepared from 850k');
       const passed = h.records.filter(r => r.kind === 'messages').at(-1);
-      assert.equal(passed.compaction.budgetTokens, 900_000);
+      assert.equal(passed.compaction.budgetTokens, 960_000);
       assert.equal(passed.compaction.budgetSource, 'window-ratio');
       assert.ok(passed.compaction.estimatedTokens > 870_000 &&
         passed.compaction.estimatedTokens < 900_000, `${passed.compaction.estimatedTokens}`);
@@ -800,8 +815,9 @@ for (const outcome of ['compressed', 'failed']) {
       // A 150k-token tool result: about 1.03M, past the window.
       const jumped = [...first, ...toolRound('t2', 600_000)];
       const status = await h.post(0, { ...OPUS_1M, messages: jumped });
-      assert.equal(h.compressions.length, 1, 'one blocking compression in the tool loop');
-      assert.equal(h.compressions[0].compression_target_tokens, 450_000, 'half the budget');
+      const blocking = () => h.compressions.filter(c => !c.prepare);
+      assert.equal(blocking().length, 1, 'one blocking compression in the tool loop');
+      assert.equal(blocking()[0].compression_target_tokens, 480_000, 'half the budget');
       const rec = h.records.filter(r => r.kind === 'messages').at(-1);
       assert.equal(rec.compaction.reason, 'budget');
       assert.ok(rec.compaction.estimatedTokens > 1_000_000, `${rec.compaction.estimatedTokens}`);
@@ -834,24 +850,27 @@ for (const outcome of ['compressed', 'failed']) {
 
 test('the fallback budget mirrors the server: every Claude model near its window', () => {
   // Opus 4.6 / 4.7 used to fall to 0.8 here and to the server's 50k after it.
+  // ccc's budget is the window less the reply's room (40k): 960k of 1M.
   for (const model of ['claude-opus-5-5', 'claude-opus-5-5[1m]', 'claude-opus-5',
     'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-opus-4-6[1m]',
     'claude-fable-5', 'claude-fable-5-1', 'claude-opus-5-5-20261001', 'claude-mythos-5']) {
-    assert.equal(fallbackBudgetTokens(model, 1_000_000), 900_000, model);
-    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, `${model} on a 200k window`);
+    assert.equal(fallbackBudgetTokens(model, 1_000_000), 960_000, model);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 160_000, `${model} on a 200k window`);
   }
   for (const model of ['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-haiku-5-5',
     'claude-opus-4-5', 'claude-opus-4-1']) {
-    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, model);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 160_000, model);
   }
   // The Sonnets keep their usable-context ceilings on a 1M window.
   for (const [model, ceiling] of [['claude-sonnet-5', 550_000], ['claude-sonnet-5-5', 550_000],
     ['claude-sonnet-5-5[1m]', 550_000], ['claude-sonnet-4-6', 400_000],
     ['claude-sonnet-4-5-20250929', 400_000]]) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), ceiling, model);
-    assert.equal(fallbackBudgetTokens(model, 200_000), 167_000, `${model} on a 200k window`);
+    assert.equal(fallbackBudgetTokens(model, 200_000), 160_000, `${model} on a 200k window`);
   }
-  // A small window: never below the 0.8 share (Claude Code's point would be negative).
+  // Between: the window less the reply's room beats the 0.8 share.
+  assert.equal(fallbackBudgetTokens('claude-opus-4-6', 400_000), 360_000);
+  // A small window: never below the 0.8 share (the window less 40k would be lower).
   assert.equal(fallbackBudgetTokens('claude-opus-4-6', 32_000), 25_600);
   // Not a Claude family the server knows: the plain 0.8 share.
   for (const model of ['claude-x', 'gpt-6', undefined]) {

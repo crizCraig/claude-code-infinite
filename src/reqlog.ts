@@ -65,6 +65,12 @@ export type TurnType =
    */
   | "followup-prefix"
   | "followup-noop"
+  /**
+   * A main-thread human turn clearly under the budget by its token count,
+   * forwarded whole at once; its compress call (a passthrough) ran in the
+   * background instead of before it.
+   */
+  | "followup-under-budget"
   /** Indexed response that carried no prior conversation; history forwarded. */
   | "followup-empty-memory"
   /**
@@ -175,6 +181,12 @@ export interface MessagesRecord {
      * returned nothing.
      */
     timedOut: boolean;
+    /**
+     * It returned nothing because a responsive MemTree refused this request
+     * (a 4xx other than 402, e.g. a 413 when the newest message alone leaves
+     * no room): MemTree has the conversation, unlike in an outage.
+     */
+    refused?: true;
   };
   /**
    * How much conversation the compressed response actually carried. Recorded
@@ -241,6 +253,18 @@ export interface MessagesRecord {
    * the CCC_TOOL_ROUTE_RECOVERY=0 kill switch.
    */
   compaction?: CompactionRecord;
+  /**
+   * Main thread near the budget: what preparing a compressed prefix decided
+   * (prepared-compression.ts): "prepare" started a background call; "fresh",
+   * "in-flight" and "unsupported" (the server does not prepare) did not.
+   */
+  prepare?: "prepare" | "too-small" | "in-flight" | "fresh" | "unsupported";
+  /**
+   * A tool result too large for the window even after compression, saved
+   * whole (tool-output-store.ts) and sent with its middle replaced by a
+   * pointer to that copy.
+   */
+  truncatedToolResult?: { originalChars: number; omittedChars: number };
   /** Every actual counting attempt, in order; cached results add no entry. */
   countTokens?: CountTokensRecord[];
   /** One bounded compression after an assembled ride was counted above the soft budget. */
@@ -444,6 +468,14 @@ export interface CompactionRecord {
    * down, no-op, unusable) and the turn rode the old prefix instead.
    */
   keptPrefix?: true;
+  /**
+   * At the budget with a prepared prefix (prepared-compression.ts): "used"
+   * (the turn rode it, no compress call); else why not ("stale": another
+   * window or budget; "mismatch": no longer this history; "too-large").
+   */
+  prepared?: "used" | "stale" | "mismatch" | "too-large";
+  /** How long the turn waited for its session's preparation still in flight. */
+  preparedWaitMs?: number;
 }
 
 /** One MemTree API call (blocking compress or background index). */

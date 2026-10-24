@@ -1,0 +1,127 @@
+/**
+ * Prepared compression (polychat docs/context_memory_request_pipeline.md,
+ * "Prepared compression").
+ *
+ * On the 1M-window models MemTree compresses a session at 960k, just under
+ * where plain Claude Code would auto-compact. A tool result that lands near
+ * that line (100k at 940k) used to wait on a blocking compress call. Instead,
+ * once a session's main-thread request passes PREPARE_START (~850k), the proxy
+ * asks MemTree in the background (`prepare: true`, fire and forget, one call
+ * per session at a time) for the compressed prefix of the conversation so
+ * far, and asks again every ~50k of growth. The turn that would cross the
+ * trigger then sends that prefix plus the messages after it, with no compress
+ * call; without a usable prepared prefix it compresses as before.
+ *
+ * This module holds the policy and the per-session bookkeeping; the proxy
+ * owns the prefixes (their shape is its StablePrefix).
+ */
+/** Room left below the window for the reply (output and thinking). */
+export const COMPRESSION_RESERVE_TOKENS = 40_000;
+/** Preparing starts at this share of the trigger: 850k of 960k. */
+export const PREPARE_START_RATIO = 850 / 960;
+/** And refreshes after this much growth (share of the trigger): 50k of 960k. */
+export const PREPARE_REFRESH_RATIO = 50 / 960;
+/** Sessions whose prepared prefix is kept (LRU). */
+const PREPARED_MAX_SESSIONS = 16;
+/**
+ * The size at which a request is compressed: the budget, or the window less
+ * the reply's room when that is lower ("compress when the projected request
+ * plus the reserve would exceed the window or the trigger").
+ */
+export function compressionTrigger(budgetTokens, contextTokens) {
+    // Never below the 0.8 share the server keeps on a small window (polychat
+    // near_window_budget_tokens), where the window less 40k would be lower.
+    const windowTrigger = Math.max(contextTokens - COMPRESSION_RESERVE_TOKENS, Math.floor(contextTokens * SMALL_WINDOW_RATIO));
+    return Math.min(budgetTokens, windowTrigger);
+}
+/** The share of a small window kept for compression (polychat NEAR_WINDOW_RATIO). */
+const SMALL_WINDOW_RATIO = 0.8;
+/** Answers without `prepared: true` after which a server is taken not to prepare. */
+const UNSUPPORTED_AFTER_MISSES = 3;
+/** Where preparing starts for a trigger. */
+export function prepareStartTokens(triggerTokens) {
+    return Math.floor(triggerTokens * PREPARE_START_RATIO);
+}
+/** Growth after which a prepared prefix is refreshed. */
+export function prepareRefreshTokens(triggerTokens) {
+    return Math.floor(triggerTokens * PREPARE_REFRESH_RATIO);
+}
+/** Per-session prepared prefixes and the background calls making them. */
+export class PreparedCompressions {
+    ready = new Map();
+    inFlight = new Map();
+    /** The size and trigger of each session's last call, answered or not. */
+    lastAttempt = new Map();
+    /** Consecutive answers without `prepared: true` (an older server, or a blocked request). */
+    misses = 0;
+    /** Whether a request of `tokens` (under `triggerTokens`) should prepare now. */
+    decide(sessionId, tokens, triggerTokens) {
+        if (this.misses >= UNSUPPORTED_AFTER_MISSES)
+            return "unsupported";
+        if (!(tokens >= prepareStartTokens(triggerTokens)) || tokens >= triggerTokens) {
+            return "too-small";
+        }
+        if (this.inFlight.has(sessionId))
+            return "in-flight";
+        // A failed call waits for the same growth as a successful one: a MemTree
+        // outage costs one background call per refresh step, not one per turn.
+        const last = this.lastAttempt.get(sessionId);
+        if (last && last.triggerTokens === triggerTokens &&
+            tokens >= last.tokens && tokens < last.tokens + prepareRefreshTokens(triggerTokens)) {
+            return "fresh";
+        }
+        return "prepare";
+    }
+    /** Mark a call in flight for `sessionId`; false when one already is. */
+    begin(sessionId, tokens, triggerTokens) {
+        if (this.inFlight.has(sessionId))
+            return false;
+        this.inFlight.set(sessionId, tokens);
+        this.lastAttempt.delete(sessionId);
+        this.lastAttempt.set(sessionId, { tokens, triggerTokens });
+        while (this.lastAttempt.size > PREPARED_MAX_SESSIONS) {
+            const oldest = this.lastAttempt.keys().next().value;
+            if (oldest === undefined)
+                break;
+            this.lastAttempt.delete(oldest);
+        }
+        return true;
+    }
+    /** End the session's call, storing what it prepared (undefined: nothing usable). */
+    finish(sessionId, prepared) {
+        this.inFlight.delete(sessionId);
+        if (!prepared)
+            return;
+        this.ready.delete(sessionId);
+        this.ready.set(sessionId, prepared);
+        while (this.ready.size > PREPARED_MAX_SESSIONS) {
+            const oldest = this.ready.keys().next().value;
+            if (oldest === undefined)
+                break;
+            this.ready.delete(oldest);
+        }
+    }
+    /**
+     * A prepare call's answer: `prepared: true` or not. A server that never says
+     * so (one that predates preparing) is not asked again after a few answers.
+     */
+    noteServerAnswer(prepared) {
+        this.misses = prepared ? 0 : this.misses + 1;
+    }
+    get(sessionId) {
+        return this.ready.get(sessionId);
+    }
+    /**
+     * Forget the session's prepared prefix and its refresh point (used,
+     * superseded by a new stable prefix, or no longer a prefix of the history):
+     * the next request past the start prepares afresh.
+     */
+    discard(sessionId) {
+        this.ready.delete(sessionId);
+        this.lastAttempt.delete(sessionId);
+    }
+    isInFlight(sessionId) {
+        return this.inFlight.has(sessionId);
+    }
+}
+//# sourceMappingURL=prepared-compression.js.map
