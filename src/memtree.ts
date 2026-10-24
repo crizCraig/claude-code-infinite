@@ -1681,11 +1681,15 @@ export class MemtreeClient {
         refusalText = await readUnlessAborted(response, controller.signal);
         if (this.refusedRefs(response.status, refusalText, planned.refs)) {
           // A new call with bytes: its own size and request-log record, within what is
-          // left of this call's budget (a caller's deadline is never extended).
+          // left of this call's budget (a caller's deadline is never extended). Read when
+          // its timer starts, after its body is built, and never clamped: a size-scaled
+          // budget adds its allowance to what is left, however negative.
           resent = true;
-          const timeoutMs = Math.max(0, opts.timeoutMs - (Date.now() - started));
-          return await this.callContextMemory(messages, modelContextLimit,
-            { ...opts, timeoutMs, imageRefs: false });
+          const budget = opts.timeoutMs;
+          return await this.callContextMemory(messages, modelContextLimit, {
+            ...opts, imageRefs: false,
+            get timeoutMs() { return budget - (Date.now() - started); },
+          });
         }
       }
 

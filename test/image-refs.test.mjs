@@ -140,6 +140,31 @@ test("a resend after a slow 409 keeps the call's deadline", async () => {
   }
 });
 
+test("building the resend's body counts against the call's deadline", async () => {
+  const a = png(1000);
+  const server = await fakeMemtree();
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const messages = conversation(a, a);
+    server.stored = [sha(a)];
+    await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000);
+    // Serializing this message takes 120 ms (every body build: the first and the resend).
+    let slow = false;
+    const heavy = { role: "assistant", content: "x",
+      toJSON() { if (slow) { const end = Date.now() + 120; while (Date.now() < end); }
+        return { role: "assistant", content: "x" }; } };
+    const next = [...messages, heavy];
+    const hash = MemtreeClient.hashMessages(next);
+    server.missing = [sha(a)];
+    server.delays = [100];
+    slow = true;
+    const result = await client.compress(hash, next, 200_000, undefined, { timeoutMs: 200 });
+    assert.equal(result, null, "100 ms to the 409 + 120 ms rebuilding: past the 200 ms deadline");
+  } finally {
+    await server.close();
+  }
+});
+
 test("a server that refuses references gets bytes from then on", async () => {
   const a = png(1000);
   const server = await fakeMemtree();
