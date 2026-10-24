@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
+import { routeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
@@ -759,6 +760,10 @@ export class MemtreeClient {
     indexedHashes = new Set();
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
     backgroundIndexes = new Map();
+    /** Conversations (indexLaneKey) with a background index call in flight. */
+    indexLanesBusy = new Set();
+    /** Per busy conversation, the newest index call waiting for the one in flight. */
+    indexLanesNext = new Map();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1035,7 +1040,29 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexedHashes.delete(first);
         }
-        this.submitIndexOnly(messages, modelContextLimit, { sessionId, clientMeta, messageTimesFor });
+        this.enqueueIndex(indexLaneKey(sessionId, messages), { messages, modelContextLimit, opts: { sessionId, clientMeta, messageTimesFor } });
+    }
+    /**
+     * At most one background index call per conversation. Each call carries the whole
+     * history, so while one uploads only the newest waiting call is worth sending: a long
+     * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+     * the compress calls that share the link (long-session test, staging 2026-10-24).
+     */
+    enqueueIndex(lane, job) {
+        if (this.indexLanesBusy.has(lane)) {
+            this.indexLanesNext.delete(lane);
+            this.indexLanesNext.set(lane, job);
+            return;
+        }
+        this.indexLanesBusy.add(lane);
+        void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
+            this.indexLanesBusy.delete(lane);
+            const next = this.indexLanesNext.get(lane);
+            this.indexLanesNext.delete(lane);
+            // At shutdown the final index carries the newest history instead.
+            if (next && !this.backgroundClosing)
+                this.enqueueIndex(lane, next);
+        });
     }
     /**
      * The main lane's latest conversation for a session, kept for its final
@@ -1159,7 +1186,7 @@ export class MemtreeClient {
             this.backgroundIndexes.delete(operation);
         });
         this.backgroundIndexes.set(operation, controller);
-        void operation;
+        return operation;
     }
     /**
      * Stop accepting background indexes and wait boundedly for those already in
@@ -1550,5 +1577,13 @@ export function withFinalReply(messages, reply) {
     if (!reply || messages.at(-1)?.role === "assistant")
         return messages;
     return [...messages, reply];
+}
+/**
+ * One conversation for background indexing: its session and its first message (media
+ * left out, so Claude Code's media eviction keeps it). Subagents share the session id
+ * but not the first message.
+ */
+function indexLaneKey(sessionId, messages) {
+    return JSON.stringify([sessionId ?? null, messages.length ? routeMessageHash(messages[0]) : ""]);
 }
 //# sourceMappingURL=memtree.js.map

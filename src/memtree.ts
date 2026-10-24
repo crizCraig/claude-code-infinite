@@ -23,6 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
+import { routeMessageHash } from "./route-identity.js";
 import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
@@ -939,6 +940,17 @@ function transmittedTools(tools: unknown[] | undefined): unknown[] | undefined {
   return Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 }
 
+/** A background index call waiting for its conversation's call in flight. */
+interface QueuedIndex {
+  messages: Message[];
+  modelContextLimit: number;
+  opts: {
+    sessionId?: string;
+    clientMeta?: Record<string, string>;
+    messageTimesFor?: (messages: Message[]) => MessageTimes;
+  };
+}
+
 /** A compress in flight and the size hint it sent (clientInputTokens). */
 interface InFlightCompress {
   promise: Promise<CompressResult | null>;
@@ -969,6 +981,10 @@ export class MemtreeClient {
   private indexedHashes = new Set<string>();
   /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
   private backgroundIndexes = new Map<Promise<void>, AbortController>();
+  /** Conversations (indexLaneKey) with a background index call in flight. */
+  private readonly indexLanesBusy = new Set<string>();
+  /** Per busy conversation, the newest index call waiting for the one in flight. */
+  private readonly indexLanesNext = new Map<string, QueuedIndex>();
   /** Once draining begins, no later request may create another log producer. */
   private backgroundClosing = false;
   /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1292,7 +1308,30 @@ export class MemtreeClient {
       const first = this.indexedHashes.values().next().value;
       if (first !== undefined) this.indexedHashes.delete(first);
     }
-    this.submitIndexOnly(messages, modelContextLimit, { sessionId, clientMeta, messageTimesFor });
+    this.enqueueIndex(indexLaneKey(sessionId, messages),
+      { messages, modelContextLimit, opts: { sessionId, clientMeta, messageTimesFor } });
+  }
+
+  /**
+   * At most one background index call per conversation. Each call carries the whole
+   * history, so while one uploads only the newest waiting call is worth sending: a long
+   * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+   * the compress calls that share the link (long-session test, staging 2026-10-24).
+   */
+  private enqueueIndex(lane: string, job: QueuedIndex): void {
+    if (this.indexLanesBusy.has(lane)) {
+      this.indexLanesNext.delete(lane);
+      this.indexLanesNext.set(lane, job);
+      return;
+    }
+    this.indexLanesBusy.add(lane);
+    void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
+      this.indexLanesBusy.delete(lane);
+      const next = this.indexLanesNext.get(lane);
+      this.indexLanesNext.delete(lane);
+      // At shutdown the final index carries the newest history instead.
+      if (next && !this.backgroundClosing) this.enqueueIndex(lane, next);
+    });
   }
 
   /**
@@ -1398,7 +1437,7 @@ export class MemtreeClient {
       messageTimesFor?: (messages: Message[]) => MessageTimes;
       finalIndex?: boolean;
     }
-  ): void {
+  ): Promise<void> {
     const stripped: Message[] = [];
     const retained: Message[] = [];
     for (const message of messages) {
@@ -1430,7 +1469,7 @@ export class MemtreeClient {
         this.backgroundIndexes.delete(operation);
       });
     this.backgroundIndexes.set(operation, controller);
-    void operation;
+    return operation;
   }
 
   /**
@@ -1893,4 +1932,13 @@ export interface MainConversation {
 export function withFinalReply(messages: Message[], reply: Message | undefined): Message[] {
   if (!reply || messages.at(-1)?.role === "assistant") return messages;
   return [...messages, reply];
+}
+
+/**
+ * One conversation for background indexing: its session and its first message (media
+ * left out, so Claude Code's media eviction keeps it). Subagents share the session id
+ * but not the first message.
+ */
+function indexLaneKey(sessionId: string | undefined, messages: Message[]): string {
+  return JSON.stringify([sessionId ?? null, messages.length ? routeMessageHash(messages[0]) : ""]);
 }

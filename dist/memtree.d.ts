@@ -319,6 +319,10 @@ export declare class MemtreeClient {
     private indexedHashes;
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
     private backgroundIndexes;
+    /** Conversations (indexLaneKey) with a background index call in flight. */
+    private readonly indexLanesBusy;
+    /** Per busy conversation, the newest index call waiting for the one in flight. */
+    private readonly indexLanesNext;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -454,6 +458,13 @@ export declare class MemtreeClient {
     indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes): void;
+    /**
+     * At most one background index call per conversation. Each call carries the whole
+     * history, so while one uploads only the newest waiting call is worth sending: a long
+     * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+     * the compress calls that share the link (long-session test, staging 2026-10-24).
+     */
+    private enqueueIndex;
     /**
      * The main lane's latest conversation for a session, kept for its final
      * index (scheduleFinalIndex). A new request also means the session did not

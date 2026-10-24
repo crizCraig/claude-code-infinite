@@ -484,3 +484,40 @@ test("count provenance is part of compress identity: exact and projected hints n
     await held.close();
   }
 });
+
+test("background indexing keeps one call in flight per conversation; the newest waits", async () => {
+  // Long-session test, staging: every tool round sent the whole 25 MB history as its own
+  // index call, up to 16 at once (424 MB) while a compress of the same history timed out.
+  const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const history = (n) => Array.from({ length: n }, (_, i) =>
+      ({ role: i % 2 ? "assistant" : "user", content: `turn ${i}` }));
+    const send = (session, n) => client.indexInBackground(
+      MemtreeClient.hashMessages(history(n)), history(n), 100, session);
+    for (const n of [3, 5, 7, 9]) send("a", n);
+    send("b", 3);
+    const other = [{ role: "user", content: "another conversation" }];
+    client.indexInBackground(MemtreeClient.hashMessages(other), other, 100, "a");
+    await waitFor(() => fixture.calls.length === 3);
+    assert.deepEqual(fixture.calls.map((c) => c.messages.length).sort(), [1, 3, 3],
+      "one per conversation: the first of each, the rest wait");
+    fixture.release();
+    await waitFor(() => fixture.calls.length === 4);
+    assert.equal(await client.drainBackground(5_000), true);
+    const a = fixture.calls.filter((c) => c.messages[0].content === "turn 0" && c.messages.length !== 3);
+    assert.deepEqual(a.map((c) => c.messages.length), [9], "only the newest of the waiting ones");
+    assert.equal(fixture.calls.length, 4);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+async function waitFor(check, ms = 2_000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
