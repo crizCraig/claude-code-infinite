@@ -815,7 +815,10 @@ async function main() {
   let consoleClosedAt: number | undefined;
   /** When the terminal hung up (macOS, Linux SIGHUP). */
   let terminalHungUp = false;
-  /** A terminal to hang up: under nohup neither stdout nor stderr is one. */
+  /**
+   * A terminal to hang up: under nohup neither stdout nor stderr is one. Without one
+   * (`ccc -p ... >out 2>&1`) SIGHUP keeps its default, as before: it ends ccc at once.
+   */
   const hasTerminal = Boolean(process.stdout.isTTY || process.stderr.isTTY);
   const markTerminalHungUp = (): void => {
     if (terminalHungUp) return;

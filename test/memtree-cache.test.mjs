@@ -538,6 +538,49 @@ test("a waiting index call another branch does not extend is sent, not dropped",
   }
 });
 
+test("branches that end alike are not one history: the waiting one is still sent", async () => {
+  const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const branch = (n, tag) => Array.from({ length: n }, (_, i) =>
+      ({ role: i % 2 ? "assistant" : "user", content: i === 0 ? "task" : i === 5 ? "Continue" : `${tag} ${i}` }));
+    for (const messages of [branch(3, "a"), branch(6, "b"), branch(8, "c")]) {
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    }
+    await waitFor(() => fixture.calls.length === 2);
+    fixture.release();
+    await waitFor(() => fixture.calls.length === 3);
+    assert.deepEqual(fixture.calls.map((c) => c.messages[1].content).sort(), ["a 1", "b 1", "c 1"]);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+test("at shutdown a waiting call the final index does not contain (a rewind) is still sent", async () => {
+  const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const branch = (n, tag) => Array.from({ length: n }, (_, i) =>
+      ({ role: i % 2 ? "assistant" : "user", content: i < 2 ? `turn ${i}` : `${tag} ${i}` }));
+    for (const messages of [branch(3, "a"), branch(6, "b")]) {
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    }
+    await waitFor(() => fixture.calls.length === 1);
+    client.noteMainConversation("s", { messages: branch(5, "c"), modelContextLimit: 100 });
+    client.flushFinalIndexes(5_000);
+    const drained = client.drainBackground(5_000);
+    await waitFor(() => fixture.calls.length === 3);
+    fixture.release();
+    assert.equal(await drained, true);
+    assert.deepEqual(fixture.calls.map((c) => `${c.messages.at(-1).content}${c.final_index ? ":final" : ""}`).sort(),
+      ["a 2", "b 5", "c 4:final"]);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
 test("at shutdown a waiting index call is sent inside the drain unless the final index carries it", async () => {
   const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
   try {

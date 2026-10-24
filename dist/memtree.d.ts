@@ -323,7 +323,7 @@ export declare class MemtreeClient {
     private readonly indexLanesBusy;
     /** Per busy conversation, the newest index call waiting for the one in flight. */
     private readonly indexLanesNext;
-    /** Conversations whose newest history the exit's final index carries (flushFinalIndexes). */
+    /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
     private readonly finalIndexLanes;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
@@ -470,8 +470,8 @@ export declare class MemtreeClient {
     private enqueueIndex;
     private startLaneIndex;
     /**
-     * At shutdown: send every waiting call now, inside the drain, except a conversation
-     * whose newest history the final index already carries (a main session's).
+     * At shutdown: send every waiting call now, inside the drain, except one whose history
+     * the final index carries (a main session's, unless it was rewound since).
      */
     private sendWaitingIndexes;
     /**

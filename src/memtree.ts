@@ -985,8 +985,8 @@ export class MemtreeClient {
   private readonly indexLanesBusy = new Set<string>();
   /** Per busy conversation, the newest index call waiting for the one in flight. */
   private readonly indexLanesNext = new Map<string, QueuedIndex>();
-  /** Conversations whose newest history the exit's final index carries (flushFinalIndexes). */
-  private readonly finalIndexLanes = new Set<string>();
+  /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
+  private readonly finalIndexLanes = new Map<string, Message[]>();
   /** Once draining begins, no later request may create another log producer. */
   private backgroundClosing = false;
   /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1345,12 +1345,13 @@ export class MemtreeClient {
   }
 
   /**
-   * At shutdown: send every waiting call now, inside the drain, except a conversation
-   * whose newest history the final index already carries (a main session's).
+   * At shutdown: send every waiting call now, inside the drain, except one whose history
+   * the final index carries (a main session's, unless it was rewound since).
    */
   private sendWaitingIndexes(): void {
     for (const [lane, job] of this.indexLanesNext) {
-      if (!this.finalIndexLanes.has(lane)) {
+      const final = this.finalIndexLanes.get(lane);
+      if (!final || !extendsHistory(final, job.messages)) {
         void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
       }
     }
@@ -1408,7 +1409,9 @@ export class MemtreeClient {
     const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS).reverse();
     for (const sessionId of recent) {
       const conversation = this.mainConversations.get(sessionId);
-      if (conversation) this.finalIndexLanes.add(indexLaneKey(sessionId, conversation.messages));
+      if (conversation) {
+        this.finalIndexLanes.set(indexLaneKey(sessionId, conversation.messages), conversation.messages);
+      }
       this.fireFinalIndex(sessionId, true);
     }
     for (const sessionId of this.pendingFinals.keys()) this.cancelFinalIndex(sessionId);
@@ -1975,12 +1978,17 @@ function indexLaneKey(sessionId: string | undefined, messages: Message[]): strin
 }
 
 /**
- * Whether `newer` carries everything `older` does: at least as long, the same last
- * message of `older` at the same place (a rewind or another branch changes it).
+ * Whether `newer` carries everything `older` does: every message of `older` after the
+ * system prompt (whose billing line changes per call), unchanged and in place. About
+ * 20 ms for a 25 MB history; each message is hashed once.
  */
 function extendsHistory(newer: Message[], older: Message[]): boolean {
-  if (older.length === 0) return true;
-  const last = older.length - 1;
-  return newer.length >= older.length &&
-    routeMessageHash(newer[last]) === routeMessageHash(older[last]);
+  const a = withoutSystem(newer);
+  const b = withoutSystem(older);
+  if (a.length < b.length) return false;
+  return b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
+}
+
+function withoutSystem(messages: Message[]): Message[] {
+  return messages.filter((message) => message.role !== "system");
 }
