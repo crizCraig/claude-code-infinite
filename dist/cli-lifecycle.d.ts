@@ -46,8 +46,16 @@ export declare const CONSOLE_CLOSE_MARKS_MS: {
  * macOS or Linux terminal killed ccc with no final index.
  */
 export type HangupKind = "console-close" | "terminal-hangup";
-/** Calls `handler` on every SIGHUP, on every platform, with the kind of close it means. */
-export declare function onHangup(proc: Pick<NodeJS.Process, "on" | "platform">, handler: (kind: HangupKind) => void): void;
+/**
+ * Calls `handler` on SIGHUP with the kind of close it means. On macOS and Linux only
+ * with a terminal to hang up (`terminal`: stdout or stderr is a TTY): under nohup, which
+ * points both away from the terminal, SIGHUP stays ignored as nohup asked. There a
+ * hangup can arrive more than once (the shell's, then the terminal's) and is one close:
+ * a repeat must not become the second signal that skips the final index.
+ */
+export declare function onHangup(proc: Pick<NodeJS.Process, "on" | "platform">, handler: (kind: HangupKind) => void, terminal: boolean): void;
+/** Claude Code ended by the same hangup (macOS, Linux), possibly before ccc saw it. */
+export declare function childExitMeansHangup(platform: NodeJS.Platform, code: number | null, signal: NodeJS.Signals | null): boolean;
 /** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */
 export declare function ignoreStreamErrors(streams: Array<Pick<NodeJS.EventEmitter, "on">>): void;
 /**

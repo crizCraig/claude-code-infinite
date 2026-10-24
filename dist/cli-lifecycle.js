@@ -70,9 +70,31 @@ export const WIN32_MEMTREE_DRAIN_MS = 4_000;
 export const CONSOLE_CLOSE_MARKS_MS = {
     proxyDrain: 1_000, memtreeDrain: 3_500, childWait: 3_750, flush: 4_500,
 };
-/** Calls `handler` on every SIGHUP, on every platform, with the kind of close it means. */
-export function onHangup(proc, handler) {
-    proc.on("SIGHUP", () => handler(proc.platform === "win32" ? "console-close" : "terminal-hangup"));
+/**
+ * Calls `handler` on SIGHUP with the kind of close it means. On macOS and Linux only
+ * with a terminal to hang up (`terminal`: stdout or stderr is a TTY): under nohup, which
+ * points both away from the terminal, SIGHUP stays ignored as nohup asked. There a
+ * hangup can arrive more than once (the shell's, then the terminal's) and is one close:
+ * a repeat must not become the second signal that skips the final index.
+ */
+export function onHangup(proc, handler, terminal) {
+    if (proc.platform === "win32") {
+        proc.on("SIGHUP", () => handler("console-close"));
+        return;
+    }
+    if (!terminal)
+        return;
+    let hungUp = false;
+    proc.on("SIGHUP", () => {
+        if (hungUp)
+            return;
+        hungUp = true;
+        handler("terminal-hangup");
+    });
+}
+/** Claude Code ended by the same hangup (macOS, Linux), possibly before ccc saw it. */
+export function childExitMeansHangup(platform, code, signal) {
+    return platform !== "win32" && (signal === "SIGHUP" || code === exitCodeForSignal("SIGHUP"));
 }
 /** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */
 export function ignoreStreamErrors(streams) {

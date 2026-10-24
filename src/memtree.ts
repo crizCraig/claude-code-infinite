@@ -23,7 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
-import { routeMessageHash } from "./route-identity.js";
+import { mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
 import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
@@ -985,6 +985,8 @@ export class MemtreeClient {
   private readonly indexLanesBusy = new Set<string>();
   /** Per busy conversation, the newest index call waiting for the one in flight. */
   private readonly indexLanesNext = new Map<string, QueuedIndex>();
+  /** Conversations whose newest history the exit's final index carries (flushFinalIndexes). */
+  private readonly finalIndexLanes = new Set<string>();
   /** Once draining begins, no later request may create another log producer. */
   private backgroundClosing = false;
   /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1316,22 +1318,43 @@ export class MemtreeClient {
    * At most one background index call per conversation. Each call carries the whole
    * history, so while one uploads only the newest waiting call is worth sending: a long
    * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
-   * the compress calls that share the link (long-session test, staging 2026-10-24).
+   * the compress calls that share the link (long-session test, staging 2026-10-24). A
+   * waiting call is replaced only by one whose history extends it; otherwise it goes now.
    */
   private enqueueIndex(lane: string, job: QueuedIndex): void {
-    if (this.indexLanesBusy.has(lane)) {
-      this.indexLanesNext.delete(lane);
-      this.indexLanesNext.set(lane, job);
+    if (!this.indexLanesBusy.has(lane)) {
+      this.startLaneIndex(lane, job);
       return;
     }
+    const waiting = this.indexLanesNext.get(lane);
+    if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+      void this.submitIndexOnly(waiting.messages, waiting.modelContextLimit, waiting.opts);
+    }
+    this.indexLanesNext.set(lane, job);
+  }
+
+  private startLaneIndex(lane: string, job: QueuedIndex): void {
     this.indexLanesBusy.add(lane);
     void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
       this.indexLanesBusy.delete(lane);
       const next = this.indexLanesNext.get(lane);
       this.indexLanesNext.delete(lane);
-      // At shutdown the final index carries the newest history instead.
-      if (next && !this.backgroundClosing) this.enqueueIndex(lane, next);
+      // At shutdown drainBackground has already sent (or dropped) what was waiting.
+      if (next && !this.backgroundClosing) this.startLaneIndex(lane, next);
     });
+  }
+
+  /**
+   * At shutdown: send every waiting call now, inside the drain, except a conversation
+   * whose newest history the final index already carries (a main session's).
+   */
+  private sendWaitingIndexes(): void {
+    for (const [lane, job] of this.indexLanesNext) {
+      if (!this.finalIndexLanes.has(lane)) {
+        void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
+      }
+    }
+    this.indexLanesNext.clear();
   }
 
   /**
@@ -1383,7 +1406,11 @@ export class MemtreeClient {
     if (this.backgroundClosing) return;
     this.finalDrainDeadline ??= Date.now() + Math.max(0, timeoutMs);
     const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS).reverse();
-    for (const sessionId of recent) this.fireFinalIndex(sessionId, true);
+    for (const sessionId of recent) {
+      const conversation = this.mainConversations.get(sessionId);
+      if (conversation) this.finalIndexLanes.add(indexLaneKey(sessionId, conversation.messages));
+      this.fireFinalIndex(sessionId, true);
+    }
     for (const sessionId of this.pendingFinals.keys()) this.cancelFinalIndex(sessionId);
   }
 
@@ -1479,7 +1506,10 @@ export class MemtreeClient {
    * The boolean is true for a graceful drain and false when abort was needed.
    */
   async drainBackground(timeoutMs = 2_000): Promise<boolean> {
-    this.backgroundClosing = true;
+    if (!this.backgroundClosing) {
+      this.backgroundClosing = true;
+      this.sendWaitingIndexes();
+    }
     if (this.backgroundIndexes.size === 0) return true;
 
     const boundedMs =
@@ -1935,10 +1965,22 @@ export function withFinalReply(messages: Message[], reply: Message | undefined):
 }
 
 /**
- * One conversation for background indexing: its session and its first message (media
- * left out, so Claude Code's media eviction keeps it). Subagents share the session id
- * but not the first message.
+ * One conversation for background indexing: its session and its first message after the
+ * system prompt, media left out (Claude Code's media eviction keeps it). Subagents share
+ * the session id but not that message.
  */
 function indexLaneKey(sessionId: string | undefined, messages: Message[]): string {
-  return JSON.stringify([sessionId ?? null, messages.length ? routeMessageHash(messages[0]) : ""]);
+  const first = messages.find((message) => message.role !== "system");
+  return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
+}
+
+/**
+ * Whether `newer` carries everything `older` does: at least as long, the same last
+ * message of `older` at the same place (a rewind or another branch changes it).
+ */
+function extendsHistory(newer: Message[], older: Message[]): boolean {
+  if (older.length === 0) return true;
+  const last = older.length - 1;
+  return newer.length >= older.length &&
+    routeMessageHash(newer[last]) === routeMessageHash(older[last]);
 }

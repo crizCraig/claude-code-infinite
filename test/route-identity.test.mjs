@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
-import { routeMessageHash, stablePrefixMessageHash } from "../dist/route-identity.js";
+import {
+  prefixIdentity, prefixMessageMatches, routeMessageHash, stablePrefixMessageHash,
+} from "../dist/route-identity.js";
 
 test("route identity canonicalizes text, reminders and cache metadata symmetrically", () => {
   const a = { role: "user", content: "  hello <system-reminder>dynamic</system-reminder>world  " };
@@ -70,30 +72,41 @@ test("million-token prefix hashes in milliseconds and repeated comparisons do no
   assert.ok(warmMs < 100, `cached comparisons took ${warmMs}ms`);
 });
 
-test("Claude Code's media eviction keeps a message's identity (route and stable prefix)", () => {
+test("a prefix still covers a message Claude Code evicted media from, never a replaced one", () => {
   // Claude Code 2.1.310 caps media by count and by bytes; past a cap it evicts the oldest:
   // inside a tool result an image becomes its placeholder, a top-level one is dropped,
   // and a message left empty becomes the placeholder. The long-session test lost its
   // route (and then every compress) the moment it did this to ~100 old screenshots.
   const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
   const removed = { type: "text", text: "[media removed: request limit]" };
-  const cases = [
-    [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [image("a"), { type: "text", text: "ok" }] }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [removed, { type: "text", text: "ok" }] }] }],
+  const tool = (parts, id = "t") => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: parts }] });
+  const evictions = [
+    [tool([image("a"), { type: "text", text: "ok" }]), tool([removed, { type: "text", text: "ok" }])],
     [{ role: "user", content: [{ type: "text", text: "look" }, image("b")] },
       { role: "user", content: [{ type: "text", text: "look" }] }],
     [{ role: "user", content: [image("c")] }, { role: "user", content: [removed] }],
     [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "d" } }, { type: "text", text: "pdf" }] },
       { role: "user", content: [{ type: "text", text: "pdf" }] }],
   ];
-  for (const [before, after] of cases) {
-    assert.equal(routeMessageHash(before), routeMessageHash(after), JSON.stringify(after));
-    assert.equal(stablePrefixMessageHash(before), stablePrefixMessageHash(after), JSON.stringify(after));
+  for (const kind of ["route", "stable"]) {
+    for (const [before, after] of evictions) {
+      const id = prefixIdentity([before], kind);
+      assert.ok(prefixMessageMatches(after, kind, id.originalPrefixHashes[0], id.originalMediaFreeHashes[0]),
+        `${kind}: ${JSON.stringify(after)}`);
+      assert.ok(!prefixMessageMatches(after, kind, id.originalPrefixHashes[0], undefined),
+        `${kind}: a prefix stored without media-free hashes matches exactly only`);
+    }
+    const [before] = evictions[0];
+    const id = prefixIdentity([before], kind);
+    const matches = (message) =>
+      prefixMessageMatches(message, kind, id.originalPrefixHashes[0], id.originalMediaFreeHashes[0]);
+    assert.ok(matches(before), "unchanged");
+    assert.ok(!matches(tool([image("other"), { type: "text", text: "ok" }])), "a replaced image");
+    assert.ok(!matches(tool([removed, { type: "text", text: "changed" }])), "different text");
+    assert.ok(!matches(tool([removed, { type: "text", text: "ok" }], "u")), "different tool_use_id");
+    const two = { role: "user", content: [{ type: "text", text: "x" }, image("p"), image("q")] };
+    const twoId = prefixIdentity([two], kind);
+    assert.ok(!prefixMessageMatches({ role: "user", content: [{ type: "text", text: "x" }, image("r")] },
+      kind, twoId.originalPrefixHashes[0], twoId.originalMediaFreeHashes[0]), "media left: exact only");
   }
-  // Everything else still counts: the text beside the image, the tool result's id.
-  const [before] = cases[0];
-  assert.notEqual(routeMessageHash(before), routeMessageHash(
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [removed, { type: "text", text: "changed" }] }] }));
-  assert.notEqual(routeMessageHash(before), routeMessageHash(
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "u", content: [removed, { type: "text", text: "ok" }] }] }));
 });

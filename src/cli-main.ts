@@ -94,6 +94,7 @@ import {
   closeBoundedMs,
   CONSOLE_CLOSE_MARKS_MS,
   HANGUP_MEMTREE_DRAIN_MS,
+  childExitMeansHangup,
   ignoreStreamErrors,
   onHangup,
   settleWithin,
@@ -814,6 +815,13 @@ async function main() {
   let consoleClosedAt: number | undefined;
   /** When the terminal hung up (macOS, Linux SIGHUP). */
   let terminalHungUp = false;
+  /** A terminal to hang up: under nohup neither stdout nor stderr is one. */
+  const hasTerminal = Boolean(process.stdout.isTTY || process.stderr.isTTY);
+  const markTerminalHungUp = (): void => {
+    if (terminalHungUp) return;
+    terminalHungUp = true;
+    ignoreStreamErrors([process.stdout, process.stderr]);
+  };
   // Settles once the child has exited and the resume hint (if any) is written,
   // or the child failed to start. Awaited (bounded) just before exiting, so a
   // signal whose cleanup finishes first still lets the hint print.
@@ -881,10 +889,9 @@ async function main() {
     }
     // macOS, Linux: the terminal is gone, but nothing ends ccc, so the final index
     // gets a longer drain than an ordinary exit.
-    terminalHungUp = true;
-    ignoreStreamErrors([process.stdout, process.stderr]);
+    markTerminalHungUp();
     handleShutdownSignal("SIGHUP");
-  });
+  }, hasTerminal);
 
   // The background install starts once Claude Code is up; it outlives this
   // process if the session ends first.
@@ -906,6 +913,8 @@ async function main() {
   });
 
   child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    // Before anything is written: the hangup may reach Claude Code before ccc.
+    if (hasTerminal && childExitMeansHangup(process.platform, code, signal)) markTerminalHungUp();
     if (code !== 0) {
       diagnostics.record("claude_exit", claudeExitFields(code, signal, claudeStartedAt));
     }

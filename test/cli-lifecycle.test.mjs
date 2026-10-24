@@ -4,6 +4,7 @@ import {
   createSignalShutdownHandler,
   exitCodeForChild,
   exitCodeForSignal,
+  childExitMeansHangup,
   ignoreStreamErrors,
   onHangup,
   settleWithin,
@@ -102,12 +103,32 @@ test("SIGHUP is handled on every platform: a console close on Windows, a hangup 
     const proc = new EventEmitter();
     proc.platform = platform;
     const seen = [];
-    onHangup(proc, (k) => seen.push(k));
+    onHangup(proc, (k) => seen.push(k), true);
     assert.equal(proc.listenerCount("SIGHUP"), 1, platform);
     proc.emit("SIGHUP");
-    assert.deepEqual(seen, [kind], platform);
+    proc.emit("SIGHUP");
+    // A repeated hangup (the shell's, then the terminal's) is one close off Windows; on
+    // Windows a second close stays the escape it always was.
+    assert.deepEqual(seen, platform === "win32" ? [kind, kind] : [kind], platform);
   }
   assert.equal(exitCodeForSignal("SIGHUP"), 129);
+});
+
+test("under nohup (no terminal) ccc leaves SIGHUP alone off Windows", () => {
+  for (const platform of ["darwin", "linux"]) {
+    const proc = new EventEmitter();
+    proc.platform = platform;
+    onHangup(proc, () => assert.fail("no handler under nohup"), false);
+    assert.equal(proc.listenerCount("SIGHUP"), 0, platform);
+  }
+});
+
+test("Claude Code ending by the hangup counts as the hangup, off Windows only", () => {
+  assert.equal(childExitMeansHangup("darwin", null, "SIGHUP"), true);
+  assert.equal(childExitMeansHangup("linux", 129, null), true);
+  assert.equal(childExitMeansHangup("linux", 0, null), false);
+  assert.equal(childExitMeansHangup("darwin", null, "SIGTERM"), false);
+  assert.equal(childExitMeansHangup("win32", null, "SIGHUP"), false);
 });
 
 test("after a hangup, a write error on the gone terminal is not thrown", () => {

@@ -107,11 +107,35 @@ export const CONSOLE_CLOSE_MARKS_MS = {
  */
 export type HangupKind = "console-close" | "terminal-hangup";
 
-/** Calls `handler` on every SIGHUP, on every platform, with the kind of close it means. */
+/**
+ * Calls `handler` on SIGHUP with the kind of close it means. On macOS and Linux only
+ * with a terminal to hang up (`terminal`: stdout or stderr is a TTY): under nohup, which
+ * points both away from the terminal, SIGHUP stays ignored as nohup asked. There a
+ * hangup can arrive more than once (the shell's, then the terminal's) and is one close:
+ * a repeat must not become the second signal that skips the final index.
+ */
 export function onHangup(
-  proc: Pick<NodeJS.Process, "on" | "platform">, handler: (kind: HangupKind) => void
+  proc: Pick<NodeJS.Process, "on" | "platform">, handler: (kind: HangupKind) => void,
+  terminal: boolean
 ): void {
-  proc.on("SIGHUP", () => handler(proc.platform === "win32" ? "console-close" : "terminal-hangup"));
+  if (proc.platform === "win32") {
+    proc.on("SIGHUP", () => handler("console-close"));
+    return;
+  }
+  if (!terminal) return;
+  let hungUp = false;
+  proc.on("SIGHUP", () => {
+    if (hungUp) return;
+    hungUp = true;
+    handler("terminal-hangup");
+  });
+}
+
+/** Claude Code ended by the same hangup (macOS, Linux), possibly before ccc saw it. */
+export function childExitMeansHangup(
+  platform: NodeJS.Platform, code: number | null, signal: NodeJS.Signals | null
+): boolean {
+  return platform !== "win32" && (signal === "SIGHUP" || code === exitCodeForSignal("SIGHUP"));
 }
 
 /** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */

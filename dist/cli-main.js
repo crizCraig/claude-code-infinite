@@ -41,7 +41,7 @@ import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
-import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, HANGUP_MEMTREE_DRAIN_MS, ignoreStreamErrors, onHangup, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
+import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, HANGUP_MEMTREE_DRAIN_MS, childExitMeansHangup, ignoreStreamErrors, onHangup, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
 import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS, } from "./diagnostics.js";
@@ -645,6 +645,14 @@ async function main() {
     let consoleClosedAt;
     /** When the terminal hung up (macOS, Linux SIGHUP). */
     let terminalHungUp = false;
+    /** A terminal to hang up: under nohup neither stdout nor stderr is one. */
+    const hasTerminal = Boolean(process.stdout.isTTY || process.stderr.isTTY);
+    const markTerminalHungUp = () => {
+        if (terminalHungUp)
+            return;
+        terminalHungUp = true;
+        ignoreStreamErrors([process.stdout, process.stderr]);
+    };
     // Settles once the child has exited and the resume hint (if any) is written,
     // or the child failed to start. Awaited (bounded) just before exiting, so a
     // signal whose cleanup finishes first still lets the hint print.
@@ -713,10 +721,9 @@ async function main() {
         }
         // macOS, Linux: the terminal is gone, but nothing ends ccc, so the final index
         // gets a longer drain than an ordinary exit.
-        terminalHungUp = true;
-        ignoreStreamErrors([process.stdout, process.stderr]);
+        markTerminalHungUp();
         handleShutdownSignal("SIGHUP");
-    });
+    }, hasTerminal);
     // The background install starts once Claude Code is up; it outlives this
     // process if the session ends first.
     autoUpdate?.scheduleInstall(undefined, (result) => {
@@ -736,6 +743,9 @@ async function main() {
         void shutdown(1);
     });
     child.on("exit", (code, signal) => {
+        // Before anything is written: the hangup may reach Claude Code before ccc.
+        if (hasTerminal && childExitMeansHangup(process.platform, code, signal))
+            markTerminalHungUp();
         if (code !== 0) {
             diagnostics.record("claude_exit", claudeExitFields(code, signal, claudeStartedAt));
         }

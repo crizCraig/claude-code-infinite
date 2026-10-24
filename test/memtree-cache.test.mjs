@@ -491,23 +491,75 @@ test("background indexing keeps one call in flight per conversation; the newest 
   const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
   try {
     const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
-    const history = (n) => Array.from({ length: n }, (_, i) =>
-      ({ role: i % 2 ? "assistant" : "user", content: `turn ${i}` }));
-    const send = (session, n) => client.indexInBackground(
-      MemtreeClient.hashMessages(history(n)), history(n), 100, session);
-    for (const n of [3, 5, 7, 9]) send("a", n);
-    send("b", 3);
-    const other = [{ role: "user", content: "another conversation" }];
-    client.indexInBackground(MemtreeClient.hashMessages(other), other, 100, "a");
+    // As the proxy sends them: the system prompt first (its billing line changes per call).
+    const history = (n, first = "task", system = "sys 1") => [{ role: "system", content: system },
+      ...Array.from({ length: n }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: i ? `turn ${i}` : first }))];
+    const send = (session, messages) => client.indexInBackground(
+      MemtreeClient.hashMessages(messages), messages, 100, session);
+    send("a", history(3));
+    send("a", history(5, "task", "sys 2"));
+    send("a", history(7));
+    send("a", history(9, "task", "sys 3"));
+    send("b", history(3));
+    send("a", history(2, "a subagent's task"));
     await waitFor(() => fixture.calls.length === 3);
-    assert.deepEqual(fixture.calls.map((c) => c.messages.length).sort(), [1, 3, 3],
-      "one per conversation: the first of each, the rest wait");
+    const lengths = () => fixture.calls.map((c) => c.messages.length);
+    assert.deepEqual(lengths().slice().sort(), [3, 4, 4],
+      "one per conversation, whatever the system prompt: the first of each, the rest wait");
     fixture.release();
     await waitFor(() => fixture.calls.length === 4);
+    assert.equal(lengths()[3], 10, "only the newest of the waiting ones (9 turns and the system prompt)");
     assert.equal(await client.drainBackground(5_000), true);
-    const a = fixture.calls.filter((c) => c.messages[0].content === "turn 0" && c.messages.length !== 3);
-    assert.deepEqual(a.map((c) => c.messages.length), [9], "only the newest of the waiting ones");
     assert.equal(fixture.calls.length, 4);
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+test("a waiting index call another branch does not extend is sent, not dropped", async () => {
+  const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const branch = (n, tag) => Array.from({ length: n }, (_, i) =>
+      ({ role: i % 2 ? "assistant" : "user", content: i < 3 ? `turn ${i}` : `${tag} ${i}` }));
+    for (const messages of [branch(3, "x"), branch(6, "x"), branch(8, "y")]) {
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "a");
+    }
+    await waitFor(() => fixture.calls.length === 2);
+    assert.deepEqual(fixture.calls.map((c) => c.messages.at(-1).content).sort(), ["turn 2", "x 5"],
+      "the rewound branch y does not contain x's newest turn, so x's waiting call goes now");
+    fixture.release();
+    await waitFor(() => fixture.calls.length === 3);
+    assert.equal(fixture.calls[2].messages.at(-1).content, "y 7");
+  } finally {
+    fixture.release();
+    await fixture.close();
+  }
+});
+
+test("at shutdown a waiting index call is sent inside the drain unless the final index carries it", async () => {
+  const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const history = (n, first) => Array.from({ length: n }, (_, i) =>
+      ({ role: i % 2 ? "assistant" : "user", content: i ? `turn ${i}` : first }));
+    const send = (messages) => client.indexInBackground(
+      MemtreeClient.hashMessages(messages), messages, 100, "s");
+    send(history(3, "main"));
+    send(history(5, "main"));
+    send(history(3, "subagent"));
+    send(history(5, "subagent"));
+    await waitFor(() => fixture.calls.length === 2);
+    client.noteMainConversation("s", { messages: history(6, "main"), modelContextLimit: 100 });
+    client.flushFinalIndexes(5_000);
+    const drained = client.drainBackground(5_000);
+    await waitFor(() => fixture.calls.length === 4);
+    fixture.release();
+    assert.equal(await drained, true);
+    const sent = fixture.calls.map((c) => `${c.messages[0].content}:${c.messages.length}${c.final_index ? ":final" : ""}`);
+    assert.deepEqual(sent.slice().sort(), ["main:3", "main:6:final", "subagent:3", "subagent:5"],
+      "the subagent's newest history goes; the main one's is the final index");
   } finally {
     fixture.release();
     await fixture.close();

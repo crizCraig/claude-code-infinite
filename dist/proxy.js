@@ -43,7 +43,7 @@ import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures, pausedRefusal } from "./route-fallback.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
-import { routeMessageHash, stablePrefixMessageHash } from "./route-identity.js";
+import { prefixIdentity, prefixMessageMatches } from "./route-identity.js";
 import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes } from "node:crypto";
@@ -2398,7 +2398,7 @@ stable) {
         // Include trailing ambient role=system blocks: MemTree consolidated them
         // into compressedBody.system, so treating them as suffix would duplicate
         // those instructions on every tool request.
-        originalPrefixHashes: originalMessages.map(routeMessageHash),
+        ...prefixIdentity(originalMessages, "route"),
         compressedMessages: cloneJson(compressedBody.messages),
         compressedSystem: cloneJson(compressedBody.system),
         hasCompressedSystem: Object.prototype.hasOwnProperty.call(compressedBody, "system"),
@@ -2437,7 +2437,7 @@ function storeStablePrefix(state, sessionId, originalMessages, compressed, stabl
     const prefix = {
         sessionId,
         originalSystemHash: compressed.originalSystemHash,
-        originalPrefixHashes: originalMessages.map(stablePrefixMessageHash),
+        ...prefixIdentity(originalMessages, "stable"),
         compressedMessages: compressed.compressedMessages,
         compressedSystem: compressed.compressedSystem,
         hasCompressedSystem: compressed.hasCompressedSystem,
@@ -2468,6 +2468,7 @@ function persistStablePrefix(state, sessionId, prefix) {
         store.save(sessionId, owner, {
             originalSystemHash: prefix.originalSystemHash,
             originalPrefixHashes: prefix.originalPrefixHashes,
+            originalMediaFreeHashes: prefix.originalMediaFreeHashes,
             compressedMessages: prefix.compressedMessages,
             compressedSystem: prefix.compressedSystem,
             hasCompressedSystem: prefix.hasCompressedSystem,
@@ -2520,7 +2521,7 @@ function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelCon
 function storedPrefixVerdict(body, messages, prefix, modelContextLimit) {
     if (carriesServerTools(body) || prefix.modelContextLimit !== modelContextLimit)
         return "defer";
-    const miss = prefixMismatch(body, messages, prefix, prefix.sessionId, stablePrefixMessageHash);
+    const miss = prefixMismatch(body, messages, prefix, prefix.sessionId, "stable");
     if (miss === null)
         return prefixRoutedBody(body, messages, prefix) ? "adopt" : "defer";
     const authoritative = miss === "prefix" &&
@@ -2550,7 +2551,7 @@ function forkRoutedBody(body, messages, route, sessionId) {
  * at least one message after them. The suffix may be anything, human turns
  * included.
  */
-function prefixMismatch(body, messages, prefix, sessionId, hashMessage = routeMessageHash) {
+function prefixMismatch(body, messages, prefix, sessionId, kind = "route") {
     if (!sessionId || prefix.sessionId !== sessionId)
         return "session";
     if (routeValueHash(normalizeRouteSystem(body.system)) !== prefix.originalSystemHash) {
@@ -2560,7 +2561,7 @@ function prefixMismatch(body, messages, prefix, sessionId, hashMessage = routeMe
     if (messages.length < prefixLength)
         return "prefix";
     for (let i = 0; i < prefixLength; i++) {
-        if (hashMessage(messages[i]) !== prefix.originalPrefixHashes[i]) {
+        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i])) {
             return "prefix";
         }
     }
@@ -2859,7 +2860,7 @@ async function planEdgeCompaction(args) {
     };
     let prefix = state.stablePrefixes.get(sessionId);
     if (prefix) {
-        const miss = prefixMismatch(body, messages, prefix, sessionId, stablePrefixMessageHash);
+        const miss = prefixMismatch(body, messages, prefix, sessionId, "stable");
         if (miss) {
             // Rewind, edit, fork, /clear, or a changed system prompt: the prefix no
             // longer stands for this conversation. Start over from passthrough.
@@ -2955,7 +2956,7 @@ async function planToolCompaction(args) {
     const stableLane = args.isMainRequest && sessionId !== undefined;
     const current = stableLane ? state.stablePrefixes.get(sessionId) : undefined;
     let ride = args.ride;
-    if (!ride && current && !prefixMismatch(body, messages, current, sessionId, stablePrefixMessageHash)) {
+    if (!ride && current && !prefixMismatch(body, messages, current, sessionId, "stable")) {
         const routed = prefixRoutedBody(body, messages, current);
         if (routed) {
             const prefixCandidate = args.sizing.register(routed.raw, "ride", current.lastSize);
@@ -3024,7 +3025,7 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     if (messages.length < prefixLength)
         return null;
     for (let i = 0; i < prefixLength; i++) {
-        if (routeMessageHash(messages[i]) !== route.originalPrefixHashes[i]) {
+        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i])) {
             return null;
         }
     }

@@ -124,7 +124,7 @@ function forwardSignals(child, exited, opts, exit) {
         }
         ignoreStreamErrors([process.stdout, process.stderr]);
         handle("SIGHUP");
-    });
+    }, Boolean(process.stdout.isTTY || process.stderr.isTTY));
 }
 let finishing = null;
 /** Once: start a pending Windows update, remove the banner, flush diagnostics, exit. */

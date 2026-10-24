@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
-import { routeMessageHash } from "./route-identity.js";
+import { mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
@@ -764,6 +764,8 @@ export class MemtreeClient {
     indexLanesBusy = new Set();
     /** Per busy conversation, the newest index call waiting for the one in flight. */
     indexLanesNext = new Map();
+    /** Conversations whose newest history the exit's final index carries (flushFinalIndexes). */
+    finalIndexLanes = new Set();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1046,23 +1048,42 @@ export class MemtreeClient {
      * At most one background index call per conversation. Each call carries the whole
      * history, so while one uploads only the newest waiting call is worth sending: a long
      * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
-     * the compress calls that share the link (long-session test, staging 2026-10-24).
+     * the compress calls that share the link (long-session test, staging 2026-10-24). A
+     * waiting call is replaced only by one whose history extends it; otherwise it goes now.
      */
     enqueueIndex(lane, job) {
-        if (this.indexLanesBusy.has(lane)) {
-            this.indexLanesNext.delete(lane);
-            this.indexLanesNext.set(lane, job);
+        if (!this.indexLanesBusy.has(lane)) {
+            this.startLaneIndex(lane, job);
             return;
         }
+        const waiting = this.indexLanesNext.get(lane);
+        if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+            void this.submitIndexOnly(waiting.messages, waiting.modelContextLimit, waiting.opts);
+        }
+        this.indexLanesNext.set(lane, job);
+    }
+    startLaneIndex(lane, job) {
         this.indexLanesBusy.add(lane);
         void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
             this.indexLanesBusy.delete(lane);
             const next = this.indexLanesNext.get(lane);
             this.indexLanesNext.delete(lane);
-            // At shutdown the final index carries the newest history instead.
+            // At shutdown drainBackground has already sent (or dropped) what was waiting.
             if (next && !this.backgroundClosing)
-                this.enqueueIndex(lane, next);
+                this.startLaneIndex(lane, next);
         });
+    }
+    /**
+     * At shutdown: send every waiting call now, inside the drain, except a conversation
+     * whose newest history the final index already carries (a main session's).
+     */
+    sendWaitingIndexes() {
+        for (const [lane, job] of this.indexLanesNext) {
+            if (!this.finalIndexLanes.has(lane)) {
+                void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
+            }
+        }
+        this.indexLanesNext.clear();
     }
     /**
      * The main lane's latest conversation for a session, kept for its final
@@ -1112,8 +1133,12 @@ export class MemtreeClient {
             return;
         this.finalDrainDeadline ??= Date.now() + Math.max(0, timeoutMs);
         const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS).reverse();
-        for (const sessionId of recent)
+        for (const sessionId of recent) {
+            const conversation = this.mainConversations.get(sessionId);
+            if (conversation)
+                this.finalIndexLanes.add(indexLaneKey(sessionId, conversation.messages));
             this.fireFinalIndex(sessionId, true);
+        }
         for (const sessionId of this.pendingFinals.keys())
             this.cancelFinalIndex(sessionId);
     }
@@ -1195,7 +1220,10 @@ export class MemtreeClient {
      * The boolean is true for a graceful drain and false when abort was needed.
      */
     async drainBackground(timeoutMs = 2_000) {
-        this.backgroundClosing = true;
+        if (!this.backgroundClosing) {
+            this.backgroundClosing = true;
+            this.sendWaitingIndexes();
+        }
         if (this.backgroundIndexes.size === 0)
             return true;
         const boundedMs = Number.isFinite(timeoutMs) && timeoutMs >= 0
@@ -1579,11 +1607,23 @@ export function withFinalReply(messages, reply) {
     return [...messages, reply];
 }
 /**
- * One conversation for background indexing: its session and its first message (media
- * left out, so Claude Code's media eviction keeps it). Subagents share the session id
- * but not the first message.
+ * One conversation for background indexing: its session and its first message after the
+ * system prompt, media left out (Claude Code's media eviction keeps it). Subagents share
+ * the session id but not that message.
  */
 function indexLaneKey(sessionId, messages) {
-    return JSON.stringify([sessionId ?? null, messages.length ? routeMessageHash(messages[0]) : ""]);
+    const first = messages.find((message) => message.role !== "system");
+    return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
+}
+/**
+ * Whether `newer` carries everything `older` does: at least as long, the same last
+ * message of `older` at the same place (a rewind or another branch changes it).
+ */
+function extendsHistory(newer, older) {
+    if (older.length === 0)
+        return true;
+    const last = older.length - 1;
+    return newer.length >= older.length &&
+        routeMessageHash(newer[last]) === routeMessageHash(older[last]);
 }
 //# sourceMappingURL=memtree.js.map

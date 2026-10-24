@@ -151,7 +151,7 @@ function forwardSignals(
     }
     ignoreStreamErrors([process.stdout, process.stderr]);
     handle("SIGHUP");
-  });
+  }, Boolean(process.stdout.isTTY || process.stderr.isTTY));
 }
 
 let finishing: Promise<never> | null = null;
