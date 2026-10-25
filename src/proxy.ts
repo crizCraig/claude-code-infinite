@@ -53,8 +53,7 @@ import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputR
   type CandidateMeasurement, type PlannedSize, type RequestCandidate, type SizingLimits }
   from "./request-sizing.js";
 import {
-  extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, routeMessageHash,
-  type PrefixIdentity,
+  extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, type PrefixIdentity,
 } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions,
   prepareStartTokens, type Prepared } from "./prepared-compression.js";
@@ -3336,7 +3335,8 @@ function noteMemtreeHealth(
   compression: BlockingCompressionOutcome
 ): void {
   if (compression.liveHealth === "failure") {
-    if (state.shutdownSignal.aborted) return;
+    // Background calls the drain stopped (backgroundSignal) are no outage either.
+    if (state.shutdownSignal.aborted || state.backgroundSignal.aborted) return;
     state.toolRecoveryCooldownUntil =
       Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
     return;

@@ -23,7 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
-import { extendsHistory, mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
+import { extendsHistory, mediaFreeMessageHash } from "./route-identity.js";
 import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
@@ -1926,7 +1926,8 @@ export class MemtreeClient {
         ...(planned.limit ? { bodyLimit: planned.limit } : {}),
         // Aborted by an exit drain that ran out: a known cut, not a server failure.
         ...(!ok && this.drainCutting && controller.signal.aborted
-          ? { exitCut: true, finalIndex: opts.finalIndex === true } : {}),
+          ? { exitCut: true, finalIndex: opts.finalIndex === true }
+          : !ok && status === undefined && opts.signal?.aborted ? { callerAborted: true } : {}),
         // Present only when the request carried a model for server-side
         // budget resolution — the client-visible half of the server's
         // "/v1/context_memory budget" log line.

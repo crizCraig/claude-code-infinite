@@ -254,6 +254,15 @@ test("an exit drain cutting a call mid-body is exit_index_cut too", async () => 
   }
 });
 
+test("a MemTree call its caller aborted (a background call stopped at exit) is no memtree_error", () => {
+  assert.deepEqual(observed([
+    { kind: "memtree", indexOnly: false, ms: 120, ok: false, requestBytes: 4096, callerAborted: true },
+  ]), []);
+  assert.deepEqual(observed([
+    { kind: "memtree", indexOnly: false, ms: 120, ok: false, requestBytes: 4096 },
+  ]).map((e) => e.name), ["memtree_error"]);
+});
+
 test("body-limit records become memtree_body_limit, a skipped one no memtree_error", () => {
   const events = observed([
     { kind: "memtree", indexOnly: true, ms: 50, ok: true, requestBytes: 2048,

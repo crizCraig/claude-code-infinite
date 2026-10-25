@@ -345,7 +345,8 @@ export class DiagnosticsRequestSink implements RequestLogSink {
       });
       return;
     }
-    if (rec.ok) return;
+    // Its caller gave up on it (a background call stopped at exit): no news of the server.
+    if (rec.ok || rec.callerAborted) return;
     this.diagnostics.recordLimited(`memtree:${rec.status ?? "none"}`, "memtree_error", {
       status: rec.status, index_only: rec.indexOnly, ms: rec.ms, request_kb: kb(rec.requestBytes),
     });

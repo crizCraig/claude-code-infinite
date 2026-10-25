@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
-import { extendsHistory, mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
+import { extendsHistory, mediaFreeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
@@ -1564,7 +1564,8 @@ export class MemtreeClient {
                     ...(planned.limit ? { bodyLimit: planned.limit } : {}),
                     // Aborted by an exit drain that ran out: a known cut, not a server failure.
                     ...(!ok && this.drainCutting && controller.signal.aborted
-                        ? { exitCut: true, finalIndex: opts.finalIndex === true } : {}),
+                        ? { exitCut: true, finalIndex: opts.finalIndex === true }
+                        : !ok && status === undefined && opts.signal?.aborted ? { callerAborted: true } : {}),
                     // Present only when the request carried a model for server-side
                     // budget resolution — the client-visible half of the server's
                     // "/v1/context_memory budget" log line.

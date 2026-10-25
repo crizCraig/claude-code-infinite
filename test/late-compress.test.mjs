@@ -103,6 +103,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     reply(200, compressedReply(480_000));
   });
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret',
+    reqlog: { log: record => records.push(structuredClone(record)) },
     ...(compressTimeoutMs !== undefined ? { compressTimeoutMs } : {}) });
   const outputsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccc-outputs-'));
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
@@ -664,6 +665,9 @@ test('shutdown stops background compresses: the one in flight is aborted, none w
     release();
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(background().length, 1, 'the waiting call never starts after the drain');
+    const cut = h.records.filter(r => r.kind === 'memtree' && !r.indexOnly && !r.ok);
+    assert.equal(cut.length, 1);
+    assert.equal(cut[0].callerAborted, true, 'a call ccc stopped, not a MemTree failure');
   } finally { release(); h.close(); }
 });
 

@@ -43,7 +43,7 @@ import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures, pausedRefusal } from "./route-fallback.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
-import { extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, routeMessageHash, } from "./route-identity.js";
+import { extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions, prepareStartTokens } from "./prepared-compression.js";
 import { truncateToolResults } from "./tool-result-truncation.js";
 import http from "node:http";
@@ -2378,7 +2378,8 @@ function rememberPage(pages, sessionId, page) {
  */
 function noteMemtreeHealth(state, compression) {
     if (compression.liveHealth === "failure") {
-        if (state.shutdownSignal.aborted)
+        // Background calls the drain stopped (backgroundSignal) are no outage either.
+        if (state.shutdownSignal.aborted || state.backgroundSignal.aborted)
             return;
         state.toolRecoveryCooldownUntil =
             Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;

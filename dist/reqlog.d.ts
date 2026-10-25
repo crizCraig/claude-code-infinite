@@ -476,6 +476,11 @@ export interface MemtreeRecord {
     exitCut?: boolean;
     /** With exitCut: the call was the session's final index. */
     finalIndex?: boolean;
+    /**
+     * Aborted by its caller before any answer (the proxy's drain stops background compress
+     * and prepare calls): says nothing about the server, so no memtree_error.
+     */
+    callerAborted?: boolean;
     /** Model sent for server-side budget resolution (compression calls only). */
     model?: string;
     /**
