@@ -147,6 +147,19 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
   };
 }
 
+/**
+ * Every preparation a turn started (its record says `prepare: "prepare"`) has been answered
+ * and handed back to the proxy: its MemTree record is logged, and the proxy's bookkeeping
+ * after it (microtasks only) has run by the next macrotask.
+ */
+async function preparationsSettled(h) {
+  const count = kind => kind === 'messages'
+    ? h.records.filter(r => r.kind === 'messages' && r.prepare === 'prepare').length
+    : h.records.filter(r => r.kind === 'memtree' && !r.indexOnly).length;
+  await until(() => count('memtree') >= count('messages'));
+  await new Promise(resolve => setImmediate(resolve));
+}
+
 async function until(condition, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
@@ -205,13 +218,18 @@ test('replay: a 100k tool result landing at 940k rides the prepared prefix with 
     assert.equal(prep.compression_target_tokens, 480_000);
     assert.equal(prep.compression_threshold_tokens, undefined, 'prepared whatever its size');
     assert.equal(h.blockingCalls().length, 0);
+    // Answered before the session grows on: a turn while it is in flight never refreshes
+    // ("in-flight"), so on a slow machine the 930k turn could otherwise skip its refresh.
+    await preparationsSettled(h);
 
     // Refreshed once the session grew ~50k past it, not on every turn.
     await growTo(h, conv, 930_000);
-    await until(() => h.prepareCalls().length >= 2);
+    assert.equal(h.records.filter(r => r.kind === 'messages').at(-1).prepare, 'prepare');
+    await preparationsSettled(h);
+    assert.equal(h.prepareCalls().length, 2);
     const refreshedAt = h.prepareCalls().at(-1).messages.length;
     await growTo(h, conv, 940_000);
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await preparationsSettled(h);
     const prepared = h.prepareCalls().length;
     const coveredMessages = h.prepareCalls().at(-1).messages.filter(m => m.role !== 'system').length;
     assert.ok(h.prepareCalls().at(-1).messages.length >= refreshedAt);
@@ -221,8 +239,11 @@ test('replay: a 100k tool result landing at 940k rides the prepared prefix with 
     assert.ok(tokensOf({ messages: conv }) > 1_000_000);
     const overflow = await h.post(conv);
     assert.equal(overflow.status, 200, 'no 400');
+    // No blocking wait, shown by what the turn did rather than by its wall-clock time
+    // (a loaded CI runner can take longer than the blocking call's delay without one):
+    // no compress call reached MemTree, and no wait on a preparation in flight.
     assert.equal(h.blockingCalls().length, 0, 'no blocking compress call');
-    assert.ok(overflow.ms < BLOCKING_DELAY_MS, `overflow turn took ${overflow.ms}ms`);
+    assert.equal(overflow.record.compaction.preparedWaitMs, undefined, 'no wait on a preparation');
     assert.equal(overflow.record.compaction.prepared, 'used');
     assert.equal(overflow.record.turnType, 'tool-prefix');
     const sent = h.forwards.at(-1);

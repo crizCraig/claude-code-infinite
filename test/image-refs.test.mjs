@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
@@ -120,23 +120,43 @@ test("a session's later calls send stored images as references; a 409 resends by
 });
 
 test("a resend after a slow 409 keeps the call's deadline", async () => {
+  // Virtual time (mocked setTimeout and Date) and a scripted fetch: the deadline is checked
+  // to the millisecond, however slow the machine running the test.
   const a = png(1000);
-  const server = await fakeMemtree();
+  const scripted = scriptedFetch();
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
   try {
-    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const client = new MemtreeClient({ baseUrl: "http://memtree.test", apiKey: "k" });
     const messages = conversation(a, a);
-    server.stored = [sha(a)];
-    await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000);
-    server.missing = [sha(a)];
-    server.delays = [150, 150];  // the 409 and then the resend each take 150 ms
+    scripted.answers.push({ status: 200, body: { messages, [STORED_IMAGES_FIELD]: [sha(a)] } });
+    const first = client.compress(MemtreeClient.hashMessages(messages), messages, 200_000);
+    await advance(0);
+    assert.ok(await first);
+    // The 409 and then the resend each take 150 ms, against a 200 ms deadline.
+    scripted.answers.push(
+      { delayMs: 150, status: 409, body: { detail: { message: "x", missing_image_sha256s: [sha(a)] } } },
+      { delayMs: 150, status: 200, body: { messages, [STORED_IMAGES_FIELD]: [sha(a)] } });
     const next = [...messages, { role: "assistant", content: "x" }];
     const started = Date.now();
-    const result = await client.compress(MemtreeClient.hashMessages(next), next, 200_000,
+    let settled = false;
+    const call = client.compress(MemtreeClient.hashMessages(next), next, 200_000,
       undefined, { timeoutMs: 200 });
-    assert.equal(result, null, "the resend is cut at the 200 ms deadline, not given 200 more");
-    assert.ok(Date.now() - started < 290, `${Date.now() - started} ms`);
+    void call.then(() => { settled = true; });
+    await advance(150);
+    const [, refsCall, resend] = scripted.calls;
+    assert.equal(refsCall.status, 409);
+    assert.ok(resend, "the 409 is followed by a resend with bytes");
+    assert.ok(!JSON.stringify(resend.body).includes(IMAGE_REF_PREFIX));
+    assert.equal(resend.at - started, 150);
+    await advance(49);
+    assert.equal(settled, false, "the resend has the 50 ms left of the deadline");
+    await advance(1);
+    assert.equal(resend.abortedAt - started, 200, "cut at the 200 ms deadline, not given 200 more");
+    assert.equal(await call, null);
+    assert.equal(scripted.calls.length, 3);
   } finally {
-    await server.close();
+    mock.timers.reset();
+    scripted.restore();
   }
 });
 
@@ -364,4 +384,40 @@ async function fakeMemtree({ hang = false } = {}) {
     origin: `http://127.0.0.1:${server.address().port}`,
     close: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
   });
+}
+
+/**
+ * Replaces the global fetch for one test: each call takes the next of `answers`
+ * ({ delayMs, status, body }), answered after `delayMs` on the (mockable) setTimeout clock,
+ * and rejects when its signal aborts. `calls` records each body, when it was sent and when
+ * it was aborted.
+ */
+function scriptedFetch() {
+  const original = globalThis.fetch;
+  const answers = [], calls = [];
+  globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
+    const { delayMs = 0, status, body } = answers.shift();
+    const call = { body: JSON.parse(init.body), at: Date.now(), status };
+    calls.push(call);
+    const timer = setTimeout(() => resolve(new Response(JSON.stringify(body),
+      { status, headers: { "content-type": "application/json" } })), delayMs);
+    init.signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      call.abortedAt = Date.now();
+      reject(init.signal.reason);
+    }, { once: true });
+  });
+  return { answers, calls, restore: () => { globalThis.fetch = original; } };
+}
+
+/** Moves mocked time on by `ms`, letting the promise work each step starts run out. */
+async function advance(ms) {
+  await settle();
+  mock.timers.tick(ms);
+  await settle();
+}
+
+/** A few real event-loop turns (setImmediate is not mocked): pending callbacks run. */
+async function settle() {
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
 }

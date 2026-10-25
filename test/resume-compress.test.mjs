@@ -14,6 +14,13 @@ import { MemtreeClient } from "../dist/memtree.js";
 const SHORT_MS = 100;
 const LONG_MS = 3_000;
 const SLOW_MS = 500;
+/**
+ * A MemTree slower than any short budget here (100 ms plus 1 ms per KiB uploaded: ~450 ms
+ * for 350 KB) yet inside the long one. A turn that got the long budget would wait for it
+ * and compress; one that got the short budget returns long before it, with a wide margin
+ * for a loaded machine (SLOW_MS was only ~60 ms above the 350 KB turn's short budget).
+ */
+const STALLED_MS = LONG_MS - 500;
 const BIG = (tag, chars) => `${tag} ` + "x".repeat(chars);
 const user = (text) => ({ role: "user", content: [{ type: "text", text }] });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
@@ -51,7 +58,12 @@ function memtreeHandler(h) {
       return res.end(JSON.stringify({ messages: [], index_only: true }));
     }
     h.compressCalls++;
-    await new Promise((resolve) => setTimeout(resolve, h.delayMs));
+    // Ends early when ccc gives up on the call, so a stalled answer outlives no test.
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, h.delayMs);
+      res.on("close", () => { clearTimeout(timer); resolve(); });
+    });
+    if (res.destroyed) return;
     const size = Math.round(JSON.stringify(body.messages).length / 4);
     const threshold = body.compression_threshold_tokens ?? body.compression_target_tokens;
     if (threshold === undefined || (size <= threshold && !(body.client_input_tokens > threshold))) {
@@ -121,10 +133,11 @@ test("control: a raw request that fits the window keeps the short budget and pas
   async () => {
     const h = await harness();
     try {
+      h.delayMs = STALLED_MS;
       // ~75k tokens: over the 20k budget, inside the 200k window.
       const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 300_000))]);
       assert.equal(result.status, 200);
-      assert.ok(result.ms < SLOW_MS, `short budget (took ${result.ms} ms)`);
+      assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
       const rec = h.lastRecord();
       assert.equal(rec.turnType, "followup-degraded");
       assert.equal(rec.compress.timedOut, true);
@@ -143,11 +156,11 @@ test("control: with an old prefix, a compress timeout still rides it", async () 
     assert.equal(h.lastRecord().turnType, "followup-compressed");
     const prefix = JSON.stringify(h.forwarded.at(-1).messages[0]);
 
-    h.delayMs = SLOW_MS;
+    h.delayMs = STALLED_MS;
     conv.push(assistant("a3"), user(BIG("q4", 100_000)));
     const result = await h.post(conv);
     assert.equal(result.status, 200);
-    assert.ok(result.ms < SLOW_MS, `short budget (took ${result.ms} ms)`);
+    assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
     const rec = h.lastRecord();
     assert.equal(rec.turnType, "followup-prefix");
     assert.equal(rec.compaction.keptPrefix, true);
@@ -203,9 +216,10 @@ test("a calibrated overflow keeps the short budget when delivery could still sen
     const h = await harness({ countTokens: false, tokensPerByte: 0.6 });
     try {
       assert.equal((await h.post([user("q " + "s".repeat(100_000))])).status, 200);
+      h.delayMs = STALLED_MS;
       const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 350_000))]);
       assert.equal(result.status, 200);
-      assert.ok(result.ms < SLOW_MS, `short budget (took ${result.ms} ms)`);
+      assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
       const rec = h.lastRecord();
       assert.equal(rec.turnType, "followup-degraded");
       assert.equal(rec.compress.timedOut, true);

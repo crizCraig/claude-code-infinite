@@ -590,8 +590,11 @@ if (args[0] === "root") {
     process.exit(0);
   }
 } else if (args[0] === "install" && process.env.FAKE_NPM_HANG) {
-  fs.writeFileSync(process.env.FAKE_NPM_HANG, String(process.pid));
+  // Ignoring SIGTERM before the pid file exists (written whole, by rename): a pid file
+  // means a stubborn npm was running when the runner's timeout came.
   process.on("SIGTERM", () => {});
+  fs.writeFileSync(process.env.FAKE_NPM_HANG + ".tmp", String(process.pid));
+  fs.renameSync(process.env.FAKE_NPM_HANG + ".tmp", process.env.FAKE_NPM_HANG);
   setInterval(() => {}, 1000);
 } else if (args[0] === "install") {
   if (process.env.FAKE_NPM_SNAPSHOT) {
@@ -742,17 +745,29 @@ test("the plan is rechecked under the lock: racing sessions cannot bypass backof
 });
 
 test("runner: an npm that ignores SIGTERM is killed, the failure recorded, the lock freed", async () => {
-  const g = makeGlobal();
-  const started = Date.now();
-  const { state, lockLeft, pidFile } = await runRunner({
-    global: g, hang: true, timeoutMs: 300, killGraceMs: 300, pipeGraceMs: 300,
-  });
-  assert.ok(Date.now() - started < 20_000, "bounded");
-  assert.equal(state.last.status, "failed");
-  assert.match(state.last.error, /npm install timed out/);
-  assert.equal(lockLeft, false);
-  const pid = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
+  // The runner's install timeout starts at spawn. On a loaded runner (Windows CI) the fake
+  // npm can still be starting node when 300 ms pass: killed before it ignores SIGTERM, it
+  // proves nothing about a stubborn npm. Such a run still has to record the timeout and free
+  // the lock; then the case runs again with twice the timeout, until npm was up in time.
+  for (let timeoutMs = 300; ; timeoutMs *= 2) {
+    const g = makeGlobal();
+    const started = Date.now();
+    const { state, lockLeft, pidFile } = await runRunner({
+      global: g, hang: true, timeoutMs, killGraceMs: 300, pipeGraceMs: 300,
+    });
+    assert.ok(Date.now() - started < 20_000 + timeoutMs, "bounded");
+    assert.equal(state.last.status, "failed");
+    assert.match(state.last.error, /npm install timed out/);
+    assert.equal(lockLeft, false);
+    if (!fs.existsSync(pidFile)) {
+      assert.ok(timeoutMs < 10_000, "the fake npm never started within 10 s");
+      continue;
+    }
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    assert.ok(pid > 0);
+    assert.throws(() => process.kill(pid, 0), /ESRCH/, "the stubborn npm is gone");
+    return;
+  }
 });
 
 test("runner: a descendant npm leaves behind is reaped before the lock is freed", { skip: POSIX_GROUPS }, async () => {
