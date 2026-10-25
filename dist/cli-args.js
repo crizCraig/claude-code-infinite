@@ -43,6 +43,7 @@ export function parseWrapperArgs(args) {
     const claudeArgs = [];
     let beforeSeparator = true;
     let debug = false;
+    let board = { on: false };
     for (const arg of args) {
         if (beforeSeparator && arg === "--") {
             beforeSeparator = false;
@@ -53,9 +54,14 @@ export function parseWrapperArgs(args) {
             debug = true;
             continue;
         }
+        if (beforeSeparator && (arg === "--board" || arg.startsWith("--board="))) {
+            const value = arg.slice("--board=".length);
+            board = value ? { on: true, path: value } : { on: true };
+            continue;
+        }
         claudeArgs.push(arg);
     }
-    return { claudeArgs, debug };
+    return { claudeArgs, debug, board };
 }
 export const MEMTREE_LINK_PLACEMENTS = [
     "turn",

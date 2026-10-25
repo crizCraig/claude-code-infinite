@@ -12,6 +12,8 @@ export interface Config {
   autoUpdate?: boolean;
   /** false turns off client diagnostics (diagnostics.ts). */
   diagnostics?: boolean;
+  /** ccc-board checkout or its board_channel.py, for `ccc --board` (board-channel.ts). */
+  boardChannel?: string;
 }
 
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");

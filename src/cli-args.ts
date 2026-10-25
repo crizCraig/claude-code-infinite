@@ -1,7 +1,11 @@
+import type { BoardRequest } from "./board-channel.js";
+
 /** Wrapper-only command-line options consumed by `ccc` before Claude's `--`. */
 export interface WrapperArgs {
   claudeArgs: string[];
   debug: boolean;
+  /** `--board` / `--board=PATH`: the board's channel server (board-channel.ts). */
+  board: BoardRequest;
 }
 
 /** Whether Claude's own print mode was requested before its `--` separator. */
@@ -56,6 +60,7 @@ export function parseWrapperArgs(args: string[]): WrapperArgs {
   const claudeArgs: string[] = [];
   let beforeSeparator = true;
   let debug = false;
+  let board: BoardRequest = { on: false };
 
   for (const arg of args) {
     if (beforeSeparator && arg === "--") {
@@ -67,10 +72,15 @@ export function parseWrapperArgs(args: string[]): WrapperArgs {
       debug = true;
       continue;
     }
+    if (beforeSeparator && (arg === "--board" || arg.startsWith("--board="))) {
+      const value = arg.slice("--board=".length);
+      board = value ? { on: true, path: value } : { on: true };
+      continue;
+    }
     claudeArgs.push(arg);
   }
 
-  return { claudeArgs, debug };
+  return { claudeArgs, debug, board };
 }
 
 export type MemtreeLinkPlacement = "turn" | "message" | "stop" | "success" | "off";

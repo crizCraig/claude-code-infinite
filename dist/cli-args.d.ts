@@ -1,7 +1,10 @@
+import type { BoardRequest } from "./board-channel.js";
 /** Wrapper-only command-line options consumed by `ccc` before Claude's `--`. */
 export interface WrapperArgs {
     claudeArgs: string[];
     debug: boolean;
+    /** `--board` / `--board=PATH`: the board's channel server (board-channel.ts). */
+    board: BoardRequest;
 }
 /** Whether Claude's own print mode was requested before its `--` separator. */
 export declare function isPrintInvocation(args: string[]): boolean;
