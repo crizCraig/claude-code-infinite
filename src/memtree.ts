@@ -23,7 +23,7 @@ import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import { createRequire } from "node:module";
 import type { RequestLogSink } from "./reqlog.js";
 import { usageDashboardUrl } from "./usage-link.js";
-import { mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
+import { extendsHistory, mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
 import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
@@ -1294,7 +1294,11 @@ export class MemtreeClient {
         if (first !== undefined) this.compressFailureArming.delete(first);
       }
       this.compressFailureStatus.delete(cacheKey);
-      if (status !== undefined) this.compressFailureStatus.set(cacheKey, status);
+      // A body never sent (over the limit) is no answer of the server's: its 413 must not
+      // read as MemTree's refusal to fit the window, which lets the safety net truncate.
+      if (status !== undefined && err?.bodyLimit !== true) {
+        this.compressFailureStatus.set(cacheKey, status);
+      }
       if (this.compressFailureStatus.size > DEDUPE_CACHE_MAX) {
         const first = this.compressFailureStatus.keys().next().value;
         if (first !== undefined) this.compressFailureStatus.delete(first);
@@ -2049,20 +2053,4 @@ function scaledTimeout(baseMs: number, bytes: number): number {
 function indexLaneKey(sessionId: string | undefined, messages: Message[]): string {
   const first = messages.find((message) => message.role !== "system");
   return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
-}
-
-/**
- * Whether `newer` carries everything `older` does: every message of `older` after the
- * system prompt (whose billing line changes per call), unchanged and in place. About
- * 20 ms for a 25 MB history; each message is hashed once.
- */
-function extendsHistory(newer: Message[], older: Message[]): boolean {
-  const a = withoutSystem(newer);
-  const b = withoutSystem(older);
-  if (a.length < b.length) return false;
-  return b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
-}
-
-function withoutSystem(messages: Message[]): Message[] {
-  return messages.filter((message) => message.role !== "system");
 }

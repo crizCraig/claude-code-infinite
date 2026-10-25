@@ -20,6 +20,14 @@ export declare function prefixIdentity(messages: Message[], kind: PrefixIdentity
  * Prefixes stored before media-free hashes existed match exactly only.
  */
 export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined): boolean;
+/**
+ * Whether `newer` carries everything `older` does: every message of `older` after the
+ * system prompt (whose billing line changes per call), in place and unchanged apart from
+ * media Claude Code evicted since (prefixMessageMatches). Past its media caps every new
+ * screenshot evicts an old one, so an exact comparison would never hold there. About
+ * 20 ms for a 25 MB history; each message is hashed once.
+ */
+export declare function extendsHistory(newer: Message[], older: Message[]): boolean;
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
 export declare function mediaFreeMessageHash(message: Message): string;
 //# sourceMappingURL=route-identity.d.ts.map

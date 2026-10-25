@@ -57,6 +57,7 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
   budget, model = OPUS, oneMillion = true, compress, prepareDelayMs = 0, compressTimeoutMs,
   countHangs = () => false } = {}) {
   const forwards = [], calls = [], records = [], counts = [];
+  let aborts = 0;
   const upstream = await listen(async (req, res) => {
     const body = await readJson(req);
     if (req.url.includes('/count_tokens')) {
@@ -72,6 +73,8 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
       usage: { input_tokens: tokensOf(body), output_tokens: 1 } }));
   });
   const memory = await listen(async (req, res) => {
+    // A call ccc gave up on before its answer was written.
+    res.on('close', () => { if (!res.writableEnded) aborts++; });
     const body = await readJson(req);
     const reply = (status, value) => {
       res.writeHead(status, { 'content-type': 'application/json' });
@@ -106,14 +109,14 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     toolOutputs: new ToolOutputStore(path.join(outputsDir, 'tool-outputs')),
     countTokens: true, ...(budget !== undefined ? { budgetTokensOverride: budget } : {}),
     reqlog: { log: record => records.push(structuredClone(record)) } });
-  async function post(messages, { session = 'late-session', agent } = {}) {
+  async function post(messages, { session = 'late-session', agent, maxTokens = 32_000 } = {}) {
     const started = Date.now();
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-claude-code-session-id': session,
         ...(agent ? { 'x-claude-code-agent-id': agent } : {}),
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model, max_tokens: 32_000, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
     });
     const text = await response.text();
     return { status: response.status, ms: Date.now() - started, text,
@@ -128,7 +131,8 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
       body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: session, prompt }) });
   }
   return {
-    post, forwards, calls, records, counts, currentPage, command,
+    post, forwards, calls, records, counts, currentPage, command, drain: ms => proxy.drain(ms),
+    aborts: () => aborts,
     prepareCalls: () => calls.filter(c => c.prepare),
     blockingCalls: () => calls.filter(c => !c.prepare),
     close() {
@@ -465,9 +469,12 @@ test('replay: a 300k tool result too large even on the compressed prefix keeps i
     addRound(conv, 'huge', 300_000 * 4, { head, tail });
     const overflow = await h.post(conv);
     assert.equal(overflow.status, 200, 'sent, not refused');
-    assert.equal(overflow.record.compaction.prepared, 'too-large');
+    // Too large as it is; shortened, the prepared prefix carries the turn (it is smaller than
+    // the whole history) and becomes the session's prefix.
+    assert.equal(overflow.record.compaction.prepared, 'truncated');
     assert.equal(h.blockingCalls().length, 1, 'compression first: it cannot fit the result either');
     const sent = h.forwards.at(-1);
+    assert.match(sent.messages[0].content[0]?.text ?? sent.messages[0].content, /^memory m/);
     const result = sent.messages.at(-1).content[0].content;
     assert.ok(result.startsWith(head), 'the head word for word');
     assert.ok(result.endsWith(tail), 'the tail word for word');
@@ -481,13 +488,50 @@ test('replay: a 300k tool result too large even on the compressed prefix keeps i
     assert.ok(overflow.record.truncatedToolResult.omittedChars > 200_000);
 
     // The next turn (Claude Code reading the file, say) resends the whole
-    // result: it is shortened again, the same way, rather than refused.
+    // result: it rides the installed prefix and is shortened again, rather than refused.
     addRound(conv, 'read-back', 4_000);
     const next = await h.post(conv);
     assert.equal(next.status, 200, 'the turn after it is sent too');
     const again = h.forwards.at(-1).messages.find(m => Array.isArray(m.content) &&
       m.content[0]?.tool_use_id === 'huge')?.content[0].content;
-    assert.equal(again, result, 'shortened to the same bytes');
+    assert.match(JSON.stringify(h.forwards.at(-1).messages[0]), /memory m/, 'on the prefix');
+    assert.ok(again.startsWith(head) && again.endsWith(tail), 'head and tail kept again');
+    assert.match(again, /output truncated by MemTree to fit the context window/);
+  } finally { h.close(); }
+});
+
+test('a prepared prefix too large as it is carries the turn shortened when the history cannot', async () => {
+  // With a 95k reply reserved, the whole history shortened cannot fit the window, while the
+  // prepared prefix shortened fits at ~925k: it is sent, and becomes the session's prefix.
+  const h = await harness({ preparedTokens: 700_000, compress: body => body.prepare ? undefined
+    : { status: 413, body: { detail: 'Request exceeds the context window after compression' } } });
+  try {
+    const conv = session(880_000);
+    assert.equal((await h.post(conv, { maxTokens: 95_000 })).status, 200);
+    await until(() => h.prepareCalls().length === 1);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    addRound(conv, 'huge', 300_000 * 4, { head: 'HEAD\n', tail: '\nTAIL' });
+    const overflow = await h.post(conv, { maxTokens: 95_000 });
+    assert.equal(overflow.status, 200, 'sent, not refused');
+    assert.equal(overflow.record.compaction.prepared, 'truncated');
+    const sent = h.forwards.at(-1);
+    assert.match(JSON.stringify(sent.messages[0]), /memory m/);
+    assert.ok(tokensOf(sent) <= 960_000, `${tokensOf(sent)} tokens sent`);
+  } finally { h.close(); }
+});
+
+test('a compress body over the size limit, never sent, is no refusal: nothing is truncated', async () => {
+  // ccc skips a compress body over 30 MiB itself (memtree-body.ts) with a local 413; only
+  // MemTree's own 413 says compression cannot fit the request, which allows the safety net.
+  const h = await harness();
+  try {
+    const conv = [{ role: 'user', content: 'Summarize the dump.' }];
+    addRound(conv, 'dump', 31 * 1024 * 1024, { head: 'HEAD\n', tail: '\nTAIL' });
+    const turn = await h.post(conv);
+    assert.notEqual(turn.status, 200, 'refused, not shortened');
+    assert.equal(turn.record.truncatedToolResult, undefined);
+    assert.equal(turn.record.compress?.refused, undefined);
+    assert.equal(h.blockingCalls().length, 0, 'the body never reached MemTree');
   } finally { h.close(); }
 });
 
@@ -555,6 +599,71 @@ test('under the budget, one background call per conversation; the newest turn wa
     assert.equal(peak, 1, 'one at a time');
     assert.equal(background().length, 2, 'the first, then only the newest of those that waited');
     assert.equal(background()[1].messages.at(-1).content, 'q6');
+  } finally { release(); h.close(); }
+});
+
+test('a background compress lane survives Claude Code evicting the first message\'s image', async () => {
+  // Past its media caps Claude Code evicts the oldest image (here the first message's): the
+  // conversation and the waiting history stay the same, so calls still go one at a time.
+  let inFlight = 0, peak = 0, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const reply = (request) => ({ messages: request.messages, compressed: false,
+    model_budget_tokens: 100_000, usage: {} });
+  const h = await harness({ model: 'claude-sonnet-4-5', oneMillion: false, budget: 100_000,
+    compress: (request, calls) => {
+      if (request.compression_target_tokens !== -1) return { body: reply(request) };
+      inFlight++; peak = Math.max(peak, inFlight);
+      const first = calls.filter(c => c.compression_target_tokens === -1).length === 1;
+      return { waitFor: first ? gate : undefined, body: reply(request), done: () => inFlight-- };
+    } });
+  try {
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } };
+    const conv = [{ role: 'user', content: [{ type: 'text', text: 'q1' }, image] },
+      { role: 'assistant', content: 'a1' }, { role: 'user', content: `q2 ${'x'.repeat(40_000)}` }];
+    await h.post(conv);
+    const background = () => h.calls.filter(c => c.compression_target_tokens === -1);
+    conv.push({ role: 'assistant', content: 'a2' }, { role: 'user', content: 'q3' });
+    await h.post(conv);
+    await until(() => background().length === 1, 5_000);
+    conv[0] = { role: 'user', content: [{ type: 'text', text: 'q1' }] };
+    for (let i = 4; i <= 5; i++) {
+      conv.push({ role: 'assistant', content: `a${i - 1}` }, { role: 'user', content: `q${i}` });
+      assert.equal((await h.post(conv)).record.turnType, 'followup-under-budget');
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(background().length, 1, 'the evicted turns wait for the call in flight');
+    release();
+    await until(() => background().length === 2, 5_000);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(peak, 1, 'one at a time');
+    assert.equal(background().length, 2);
+    assert.equal(background()[1].messages.at(-1).content, 'q5');
+  } finally { release(); h.close(); }
+});
+
+test('shutdown stops background compresses: the one in flight is aborted, none waiting starts', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const reply = (request) => ({ messages: request.messages, compressed: false,
+    model_budget_tokens: 100_000, usage: {} });
+  const h = await harness({ model: 'claude-sonnet-4-5', oneMillion: false, budget: 100_000,
+    compress: (request) => request.compression_target_tokens === -1
+      ? { waitFor: gate, body: reply(request) } : { body: reply(request) } });
+  try {
+    const conv = [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      { role: 'user', content: `q2 ${'x'.repeat(40_000)}` }];
+    await h.post(conv);
+    const background = () => h.calls.filter(c => c.compression_target_tokens === -1);
+    for (let i = 3; i <= 4; i++) {
+      conv.push({ role: 'assistant', content: `a${i - 1}` }, { role: 'user', content: `q${i}` });
+      await h.post(conv);
+    }
+    await until(() => background().length === 1, 5_000);
+    assert.equal(await h.drain(1_000), true, 'nothing a request waits for is left');
+    await until(() => h.aborts() === 1, 2_000);
+    release();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(background().length, 1, 'the waiting call never starts after the drain');
   } finally { release(); h.close(); }
 });
 

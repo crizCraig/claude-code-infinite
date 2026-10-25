@@ -50,6 +50,20 @@ export function prefixMessageMatches(
     mediaFreeHash(message, kind) === mediaFree;
 }
 
+/**
+ * Whether `newer` carries everything `older` does: every message of `older` after the
+ * system prompt (whose billing line changes per call), in place and unchanged apart from
+ * media Claude Code evicted since (prefixMessageMatches). Past its media caps every new
+ * screenshot evicts an old one, so an exact comparison would never hold there. About
+ * 20 ms for a 25 MB history; each message is hashed once.
+ */
+export function extendsHistory(newer: Message[], older: Message[]): boolean {
+  const a = newer.filter((message) => message.role !== "system");
+  const b = older.filter((message) => message.role !== "system");
+  return a.length >= b.length && b.every((message, i) =>
+    prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message)));
+}
+
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
 export function mediaFreeMessageHash(message: Message): string {
   return mediaFreeHash(message, "route");

@@ -446,6 +446,11 @@ interface ProxyState {
     toolRecoveryCooldownUntil: number;
     /** Fired by drain after its grace period so every forwarding path can stop. */
     shutdownSignal: AbortSignal;
+    /**
+     * Fired as drain starts: background compress and prepare calls (not awaited by any
+     * request) stop, and none starts, so the exit drain is left to the final index.
+     */
+    backgroundSignal: AbortSignal;
     /** Test-only fault-injection seam; see ProxyOptions.routeInstallFault. */
     routeInstallFault?: () => void;
 }
@@ -604,6 +609,8 @@ declare function runBlockingCompression(args: {
      * request known over the window): use the long budget. See longCompressFor.
      */
     longBudget?: boolean;
+    /** Aborts the compress call; default state.shutdownSignal. */
+    signal?: AbortSignal;
 }): Promise<BlockingCompressionOutcome>;
 type BackgroundCompressArgs = Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & {
     linkSeq?: number;

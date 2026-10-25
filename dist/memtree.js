@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
-import { mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
+import { extendsHistory, mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
@@ -1011,8 +1011,11 @@ export class MemtreeClient {
                     this.compressFailureArming.delete(first);
             }
             this.compressFailureStatus.delete(cacheKey);
-            if (status !== undefined)
+            // A body never sent (over the limit) is no answer of the server's: its 413 must not
+            // read as MemTree's refusal to fit the window, which lets the safety net truncate.
+            if (status !== undefined && err?.bodyLimit !== true) {
                 this.compressFailureStatus.set(cacheKey, status);
+            }
             if (this.compressFailureStatus.size > DEDUPE_CACHE_MAX) {
                 const first = this.compressFailureStatus.keys().next().value;
                 if (first !== undefined)
@@ -1672,20 +1675,5 @@ function scaledTimeout(baseMs, bytes) {
 function indexLaneKey(sessionId, messages) {
     const first = messages.find((message) => message.role !== "system");
     return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
-}
-/**
- * Whether `newer` carries everything `older` does: every message of `older` after the
- * system prompt (whose billing line changes per call), unchanged and in place. About
- * 20 ms for a 25 MB history; each message is hashed once.
- */
-function extendsHistory(newer, older) {
-    const a = withoutSystem(newer);
-    const b = withoutSystem(older);
-    if (a.length < b.length)
-        return false;
-    return b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
-}
-function withoutSystem(messages) {
-    return messages.filter((message) => message.role !== "system");
 }
 //# sourceMappingURL=memtree.js.map

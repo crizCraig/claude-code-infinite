@@ -471,9 +471,10 @@ export interface CompactionRecord {
   /**
    * At the budget with a prepared prefix (prepared-compression.ts): "used"
    * (the turn rode it, no compress call); else why not ("stale": another
-   * window or budget; "mismatch": no longer this history; "too-large").
+   * window or budget; "mismatch": no longer this history; "too-large"; "truncated": too
+   * large, then sent with its newest tool result shortened, and installed).
    */
-  prepared?: "used" | "stale" | "mismatch" | "too-large";
+  prepared?: "used" | "stale" | "mismatch" | "too-large" | "truncated";
   /** How long the turn waited for its session's preparation still in flight. */
   preparedWaitMs?: number;
 }

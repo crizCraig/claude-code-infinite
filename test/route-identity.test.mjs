@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import {
-  prefixIdentity, prefixMessageMatches, routeMessageHash, stablePrefixMessageHash,
+  extendsHistory, prefixIdentity, prefixMessageMatches, routeMessageHash, stablePrefixMessageHash,
 } from "../dist/route-identity.js";
 
 test("route identity canonicalizes text, reminders and cache metadata symmetrically", () => {
@@ -109,4 +109,24 @@ test("a prefix still covers a message Claude Code evicted media from, never a re
     assert.ok(!prefixMessageMatches({ role: "user", content: [{ type: "text", text: "x" }, image("r")] },
       kind, twoId.originalPrefixHashes[0], twoId.originalMediaFreeHashes[0]), "media left: exact only");
   }
+});
+
+test("a newer history extends an older one across Claude Code's media eviction, not a replacement", () => {
+  // Past its media caps every new screenshot evicts an old one, so an older message changes on
+  // every round; a waiting background call must still count as covered by the newer one.
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const removed = { type: "text", text: "[media removed: request limit]" };
+  const tool = (parts) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: parts }] });
+  const system = (line) => ({ role: "system", content: line });
+  const older = [system("billing 1"), { role: "user", content: "task" }, tool([image("a")]),
+    { role: "assistant", content: "seen" }];
+  const evicted = [system("billing 2"), { role: "user", content: "task" }, tool([removed]),
+    { role: "assistant", content: "seen" }, { role: "user", content: "next" }];
+  assert.ok(extendsHistory(evicted, older), "eviction keeps the older history covered");
+  assert.ok(extendsHistory(older, older));
+  const replaced = evicted.map((m, i) => i === 2 ? tool([image("b")]) : m);
+  assert.ok(!extendsHistory(replaced, older), "a replaced image is new content");
+  assert.ok(!extendsHistory(older.slice(0, 3), older), "a shorter history covers nothing more");
+  const edited = evicted.map((m, i) => i === 1 ? { role: "user", content: "other task" } : m);
+  assert.ok(!extendsHistory(edited, older), "an edited message is new content");
 });

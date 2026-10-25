@@ -53,7 +53,8 @@ import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputR
   type CandidateMeasurement, type PlannedSize, type RequestCandidate, type SizingLimits }
   from "./request-sizing.js";
 import {
-  prefixIdentity, prefixMessageMatches, routeMessageHash, type PrefixIdentity,
+  extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, routeMessageHash,
+  type PrefixIdentity,
 } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions,
   prepareStartTokens, type Prepared } from "./prepared-compression.js";
@@ -592,6 +593,11 @@ interface ProxyState {
   toolRecoveryCooldownUntil: number;
   /** Fired by drain after its grace period so every forwarding path can stop. */
   shutdownSignal: AbortSignal;
+  /**
+   * Fired as drain starts: background compress and prepare calls (not awaited by any
+   * request) stop, and none starts, so the exit drain is left to the final index.
+   */
+  backgroundSignal: AbortSignal;
   /** Test-only fault-injection seam; see ProxyOptions.routeInstallFault. */
   routeInstallFault?: () => void;
 }
@@ -970,6 +976,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     res: http.ServerResponse;
   }>();
   const shutdownAbort = new AbortController();
+  const backgroundAbort = new AbortController();
   const state: ProxyState = {
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
@@ -997,6 +1004,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     toolRecoveryAttemptedLanes: new Map(),
     toolRecoveryCooldownUntil: 0,
     shutdownSignal: shutdownAbort.signal,
+    backgroundSignal: backgroundAbort.signal,
     routeInstallFault: opts.routeInstallFault,
     memtreePages: new Map(),
     memorySourcePages: new Map(),
@@ -1069,6 +1077,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       Number.isFinite(timeoutMs) && timeoutMs >= 0
         ? Math.floor(timeoutMs)
         : 5_000;
+    backgroundAbort.abort();
     const quiesced = (async () => {
       // Once close completes, every accepted request has entered the tracked
       // set.
@@ -4390,15 +4399,52 @@ async function adoptPreparedPrefix(args: {
   if (kind !== "used" || fit.kind !== "used") {
     // A preparation not adopted is never sent, not even as a fallback.
     if (fit.candidate) args.sizing.excludeFallback(fit.candidate);
+    if (kind === "too-large" && fit.candidate) {
+      notePreparedTruncationBase(args, entry, base, fit.candidate);
+    }
     return undefined;
   }
   args.compaction.estimatedTokens = fit.tokens;
   args.compaction.estimatedBytes = fit.routed.raw.length;
+  installPreparedPrefix(state, sessionId, entry);
+  return { prefix: entry.prefix, routed: fit.routed };
+}
+
+/** An adopted preparation becomes the session's stable prefix (and its page, persisted). */
+function installPreparedPrefix(
+  state: ProxyState, sessionId: string, entry: Prepared<StablePrefix>
+): void {
   boundedSet(state.stablePrefixes, sessionId, entry.prefix);
   state.compactNow.delete(sessionId);
   if (entry.source) notePreparedSource(state, sessionId, entry.source);
   persistStablePrefix(state, sessionId, entry.prefix);
-  return { prefix: entry.prefix, routed: fit.routed };
+}
+
+/**
+ * A prepared prefix too large for this turn (preparedFit "too-large") is never sent as it
+ * is, but the safety net may shorten its newest tool result (truncatedToFit). Delivered that
+ * way, it is installed as an adopted one would be, unless a prefix or `/memtree-compact`
+ * replaced it meanwhile.
+ */
+interface PreparedTruncationBase {
+  candidate: RequestCandidate;
+  /** The shortened request built on `candidate`, once truncatedToFit chose it. */
+  derived?: RequestCandidate;
+  install: () => void;
+}
+const preparedTruncationBases = new WeakMap<RequestSizing, PreparedTruncationBase>();
+
+function notePreparedTruncationBase(
+  args: Parameters<typeof adoptPreparedPrefix>[0], entry: Prepared<StablePrefix>,
+  base: StablePrefix | undefined, candidate: RequestCandidate,
+): void {
+  const { state, sessionId } = args;
+  preparedTruncationBases.set(args.sizing, { candidate, install: () => {
+    if (state.stablePrefixes.get(sessionId) !== base || state.compactNow.has(sessionId) ||
+        compactionMode(args.opts, state, sessionId).mode !== "auto") return;
+    args.compaction.prepared = "truncated";
+    installPreparedPrefix(state, sessionId, entry);
+  } });
 }
 
 /**
@@ -4487,6 +4533,7 @@ function maybePrepareCompression(args: {
   // user's own schedule, and a high one would leave nothing to prepare for.
   if (!compaction || compaction.mode !== "auto" || compaction.estimatedTokens === undefined ||
       compaction.targetTokens === undefined || state.keyInvalid() ||
+      state.backgroundSignal.aborted ||
       state.pausedDetail() !== null ||
       !preparesCompression(args.body.model, args.modelContextLimit)) return;
   const tokens = compaction.estimatedTokens;
@@ -4516,7 +4563,7 @@ async function prepareInBackground(args: Parameters<typeof maybePrepareCompressi
 }): Promise<Prepared<StablePrefix> | undefined> {
   const { opts, state, body, msgsForMemtree, modelContextLimit, sessionId } = args;
   const result = await opts.memtree.compress(args.hash, msgsForMemtree, modelContextLimit,
-    state.shutdownSignal, preparedCompressMeta(args));
+    state.backgroundSignal, preparedCompressMeta(args));
   noteServerBudget(state, body.model, modelContextLimit, result);
   if (!result) return undefined;
   state.prepared.noteServerAnswer(result.prepared === true);
@@ -5049,6 +5096,8 @@ async function runBlockingCompression(args: {
    * request known over the window): use the long budget. See longCompressFor.
    */
   longBudget?: boolean;
+  /** Aborts the compress call; default state.shutdownSignal. */
+  signal?: AbortSignal;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
@@ -5112,7 +5161,8 @@ async function runBlockingCompression(args: {
   const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS,
     Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
   const result = await Promise.race([
-    opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, state.shutdownSignal, compressMeta),
+    opts.memtree.compress(hash, msgsForMemtree, modelContextLimit,
+      args.signal ?? state.shutdownSignal, compressMeta),
     new Promise<null>((resolve) => { deadline = setTimeout(() => resolve(null), maximumWait); }),
   ]).finally(() => { if (deadline) clearTimeout(deadline); });
   const compressMs = Date.now() - compressStarted;
@@ -5161,6 +5211,7 @@ async function runBlockingCompression(args: {
  * session's page link. Its telemetry goes to a copy of the turn's record.
  */
 function compressInBackground(args: BackgroundCompressArgs): void {
+  if (args.state.backgroundSignal.aborted) return;
   const lanes = args.state.backgroundCompress;
   const lane = backgroundCompressLane(args);
   if (lane === undefined) {
@@ -5183,7 +5234,7 @@ function compressInBackground(args: BackgroundCompressArgs): void {
   lanes.set(lane, owner);
   void runBackgroundCompress(args).finally(() => {
     if (lanes.get(lane) === owner) lanes.delete(lane);
-    if (owner.waiting && !args.state.shutdownSignal.aborted) compressInBackground(owner.waiting);
+    if (owner.waiting) compressInBackground(owner.waiting);
   });
 }
 
@@ -5192,7 +5243,7 @@ type BackgroundCompressArgs =
 
 function runBackgroundCompress(args: BackgroundCompressArgs): Promise<void> {
   const { state, sessionId, linkSeq } = args;
-  return runBlockingCompression({ ...args, rec: { ...args.rec } })
+  return runBlockingCompression({ ...args, rec: { ...args.rec }, signal: state.backgroundSignal })
     .then((compression) => {
       noteMemtreeHealth(state, compression);
       if (linkSeq !== undefined) noteMemtreePage(state, linkSeq, sessionId, compression.result);
@@ -5200,20 +5251,16 @@ function runBackgroundCompress(args: BackgroundCompressArgs): Promise<void> {
     .catch(() => undefined);
 }
 
-/** A conversation for compressInBackground: session and first message; none without a session. */
+/**
+ * A conversation for compressInBackground: session and first message, media left out (Claude
+ * Code's media eviction keeps it, as indexLaneKey does); none without a session.
+ */
 function backgroundCompressLane(args: BackgroundCompressArgs): string | undefined {
   if (args.sessionId === undefined) return undefined;
   const first = args.msgsForMemtree.find((message) => message.role !== "system");
-  return JSON.stringify([args.sessionId, first ? routeMessageHash(first) : ""]);
+  return JSON.stringify([args.sessionId, first ? mediaFreeMessageHash(first) : ""]);
 }
 
-/** Whether `newer` holds every message of `older` after the system prompt, in place. */
-function extendsHistory(newer: Message[], older: Message[]): boolean {
-  const a = newer.filter((message) => message.role !== "system");
-  const b = older.filter((message) => message.role !== "system");
-  return a.length >= b.length &&
-    b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
-}
 
 /**
  * Shared final request shape for a validated compression result: lift any
@@ -6028,6 +6075,10 @@ async function selectForwardCandidate(args: {
     return undefined;
   }
   const { candidate, measurement } = selection;
+  const preparedBase = preparedTruncationBases.get(policy.sizing);
+  if (preparedBase?.derived !== undefined && preparedBase.derived === candidate) {
+    preparedBase.install();
+  }
   const changed = candidate !== preferred || intended !== args.preferredBody;
   if (changed) {
     policy.allowed.delete(args.preferredBody);
@@ -6070,11 +6121,14 @@ async function truncatedToFit(
   store: ToolOutputStore,
 ): Promise<{ candidate: RequestCandidate; measurement: CandidateMeasurement } | undefined> {
   if (!compressionSettled(rec)) return undefined;
+  const prepared = preparedTruncationBases.get(sizing);
   const rank = (item: RequestCandidate) => item.kind === "original" ? 1 : 0;
-  const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred)]
+  const bases = [preferred, ...sizing.fallbacks().filter((item) => item !== preferred),
+    ...(prepared && prepared.candidate !== preferred ? [prepared.candidate] : [])]
     .sort((a, b) => rank(a) - rank(b) || a.body.length - b.body.length);
   for (const base of bases) {
     const fitted = await truncateCandidate(rec, sizing, base, limits, store);
+    if (fitted && prepared && base === prepared.candidate) prepared.derived = fitted.candidate;
     if (fitted) return fitted;
   }
   return undefined;
