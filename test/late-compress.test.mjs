@@ -85,9 +85,12 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
     body.receivedAt = Date.now();
     const custom = compress?.(body, calls);
     if (custom) {
+      // `headersFirst`: 200 headers go out at once, the body only after `waitFor`.
+      if (custom.headersFirst) { res.writeHead(200, { 'content-type': 'application/json' }); res.flushHeaders(); }
       if (custom.waitFor) await custom.waitFor;
       if (custom.delayMs) await new Promise(resolve => setTimeout(resolve, custom.delayMs));
       custom.done?.();
+      if (custom.headersFirst) return res.end(JSON.stringify(custom.body));
       for (const [name, value] of Object.entries(custom.headers ?? {})) res.setHeader(name, value);
       return reply(custom.status ?? 200, custom.body);
     }
@@ -649,7 +652,7 @@ test('shutdown stops background compresses: the one in flight is aborted, none w
     model_budget_tokens: 100_000, usage: {} });
   const h = await harness({ model: 'claude-sonnet-4-5', oneMillion: false, budget: 100_000,
     compress: (request) => request.compression_target_tokens === -1
-      ? { waitFor: gate, body: reply(request) } : { body: reply(request) } });
+      ? { headersFirst: true, waitFor: gate, body: reply(request) } : { body: reply(request) } });
   try {
     const conv = [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
       { role: 'user', content: `q2 ${'x'.repeat(40_000)}` }];

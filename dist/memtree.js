@@ -1565,7 +1565,7 @@ export class MemtreeClient {
                     // Aborted by an exit drain that ran out: a known cut, not a server failure.
                     ...(!ok && this.drainCutting && controller.signal.aborted
                         ? { exitCut: true, finalIndex: opts.finalIndex === true }
-                        : !ok && status === undefined && opts.signal?.aborted ? { callerAborted: true } : {}),
+                        : !ok && opts.signal?.aborted && callerCut(status) ? { callerAborted: true } : {}),
                     // Present only when the request carried a model for server-side
                     // budget resolution — the client-visible half of the server's
                     // "/v1/context_memory budget" log line.
@@ -1661,6 +1661,13 @@ export function withFinalReply(messages, reply) {
     if (!reply || messages.at(-1)?.role === "assistant")
         return messages;
     return [...messages, reply];
+}
+/**
+ * Whether a failed call its caller aborted was cut by that abort: before any answer, or while
+ * a 2xx body was still being read. Any other status is the server's own answer.
+ */
+function callerCut(status) {
+    return status === undefined || (status >= 200 && status < 300);
 }
 /** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
 function scaledTimeout(baseMs, bytes) {
