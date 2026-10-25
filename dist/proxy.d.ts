@@ -453,6 +453,8 @@ interface MemoryRoute {
     sessionId: string;
     originalSystemHash: string;
     originalPrefixHashes: string[];
+    /** Media-free identities of the same messages (prefixMessageMatches); absent on old stores. */
+    originalMediaFreeHashes?: string[];
     compressedMessages: Message[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;
@@ -479,6 +481,8 @@ interface StablePrefix {
     sessionId: string;
     originalSystemHash: string;
     originalPrefixHashes: string[];
+    /** Media-free identities of the same messages (prefixMessageMatches); absent on old stores. */
+    originalMediaFreeHashes?: string[];
     compressedMessages: Message[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;

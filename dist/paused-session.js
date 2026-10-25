@@ -13,7 +13,7 @@
  * MemTree is off for this session, and how to turn it back on.
  */
 import spawn from "cross-spawn";
-import { claudeExitFields, createSignalShutdownHandler, exitCodeForChild, settleWithin, } from "./cli-lifecycle.js";
+import { claudeExitFields, createSignalShutdownHandler, exitCodeForChild, ignoreStreamErrors, onHangup, settleWithin, } from "./cli-lifecycle.js";
 import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { claudeMissingText, withClaudeOnPath } from "./claude-locate.js";
 import { recordError } from "./diagnostics.js";
@@ -113,15 +113,18 @@ function forwardSignals(child, exited, opts, exit) {
     });
     process.on("SIGINT", () => handle("SIGINT"));
     process.on("SIGTERM", () => handle("SIGTERM"));
-    if (process.platform === "win32") {
-        // Closing the console window (SIGHUP) gives ccc a few seconds, as in cli-main.ts.
-        // The update starts first: Windows may end ccc before Claude Code exits.
-        process.on("SIGHUP", () => {
-            opts.diagnostics.record("console_closed");
+    // A closed terminal (SIGHUP), as in cli-main.ts. On Windows the update starts first:
+    // Windows may end ccc before Claude Code exits.
+    onHangup(process, (kind) => {
+        opts.diagnostics.record("console_closed");
+        if (kind === "console-close") {
             opts.autoUpdate?.installOnExit((result) => opts.diagnostics.record("auto_update", { result }));
             handle("SIGTERM");
-        });
-    }
+            return;
+        }
+        ignoreStreamErrors([process.stdout, process.stderr]);
+        handle("SIGHUP");
+    }, Boolean(process.stdout.isTTY || process.stderr.isTTY));
 }
 let finishing = null;
 /** Once: start a pending Windows update, remove the banner, flush diagnostics, exit. */

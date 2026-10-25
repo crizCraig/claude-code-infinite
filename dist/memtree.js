@@ -20,17 +20,21 @@ import { createHash } from "node:crypto";
 import { prepareFinalMessages, readFinalReply } from "./final-index.js";
 import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
+import { mediaFreeMessageHash, routeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
+import { IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs, } from "./image-refs.js";
+import { planMemtreeBody } from "./memtree-body.js";
 import { stripCcSystemReminders, } from "./turns.js";
 export const CLIENT_NAME = "cc-infinite";
 /**
- * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Sent as `x-client-features` on every MemTree call. `near-window-budget`: ccc lifts
  * Claude Code's local refusal near the window (claude-env.ts) and compresses
  * mid-turn, so the server may give it the 900k budget on 1M-window models
- * (older ccc keeps 800k).
+ * (older ccc keeps 800k). `image-refs`: ccc reads the stored images an answer
+ * lists and sends those images as references afterwards (image-refs.ts).
  */
-export const CLIENT_FEATURES = "near-window-budget";
+export const CLIENT_FEATURES = `near-window-budget,${IMAGE_REFS_FEATURE}`;
 // Sent on every MemTree call so the server can detect/warn stale clients
 // (plan: "API versioning").
 export const CLIENT_VERSION = createRequire(import.meta.url)("../package.json").version;
@@ -764,8 +768,18 @@ export class MemtreeClient {
     indexedHashes = new Set();
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
     backgroundIndexes = new Map();
+    /** Conversations (indexLaneKey) with a background index call in flight. */
+    indexLanesBusy = new Set();
+    /** Per busy conversation, the newest index call waiting for the one in flight. */
+    indexLanesNext = new Map();
+    /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
+    finalIndexLanes = new Map();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
+    /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
+    drainCutting = false;
+    /** Images MemTree stores, sent as references instead of their bytes. */
+    imageRefs = new ImageRefs();
     /** Session → its main lane's latest conversation, for the final index. */
     mainConversations = new Map();
     /** Session → its final index waiting for the session to stay idle. */
@@ -1069,7 +1083,49 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexedHashes.delete(first);
         }
-        this.submitIndexOnly(messages, modelContextLimit, { sessionId, clientMeta, messageTimesFor });
+        this.enqueueIndex(indexLaneKey(sessionId, messages), { messages, modelContextLimit, opts: { sessionId, clientMeta, messageTimesFor } });
+    }
+    /**
+     * At most one background index call per conversation. Each call carries the whole
+     * history, so while one uploads only the newest waiting call is worth sending: a long
+     * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+     * the compress calls that share the link (long-session test, staging 2026-10-24). A
+     * waiting call is replaced only by one whose history extends it; otherwise it goes now.
+     */
+    enqueueIndex(lane, job) {
+        if (!this.indexLanesBusy.has(lane)) {
+            this.startLaneIndex(lane, job);
+            return;
+        }
+        const waiting = this.indexLanesNext.get(lane);
+        if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+            void this.submitIndexOnly(waiting.messages, waiting.modelContextLimit, waiting.opts);
+        }
+        this.indexLanesNext.set(lane, job);
+    }
+    startLaneIndex(lane, job) {
+        this.indexLanesBusy.add(lane);
+        void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
+            this.indexLanesBusy.delete(lane);
+            const next = this.indexLanesNext.get(lane);
+            this.indexLanesNext.delete(lane);
+            // At shutdown drainBackground has already sent (or dropped) what was waiting.
+            if (next && !this.backgroundClosing)
+                this.startLaneIndex(lane, next);
+        });
+    }
+    /**
+     * At shutdown: send every waiting call now, inside the drain, except one whose history
+     * the final index carries (a main session's, unless it was rewound since).
+     */
+    sendWaitingIndexes() {
+        for (const [lane, job] of this.indexLanesNext) {
+            const final = this.finalIndexLanes.get(lane);
+            if (!final || !extendsHistory(final, job.messages)) {
+                void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
+            }
+        }
+        this.indexLanesNext.clear();
     }
     /**
      * The main lane's latest conversation for a session, kept for its final
@@ -1119,8 +1175,13 @@ export class MemtreeClient {
             return;
         this.finalDrainDeadline ??= Date.now() + Math.max(0, timeoutMs);
         const recent = [...this.mainConversations.keys()].slice(-FINAL_INDEX_EXIT_SESSIONS).reverse();
-        for (const sessionId of recent)
+        for (const sessionId of recent) {
+            const conversation = this.mainConversations.get(sessionId);
+            if (conversation) {
+                this.finalIndexLanes.set(indexLaneKey(sessionId, conversation.messages), conversation.messages);
+            }
             this.fireFinalIndex(sessionId, true);
+        }
         for (const sessionId of this.pendingFinals.keys())
             this.cancelFinalIndex(sessionId);
     }
@@ -1151,7 +1212,7 @@ export class MemtreeClient {
     }
     async sendFinalIndex(sessionId, conversation, reader, signal) {
         const reply = await readFinalReply(reader, signal);
-        const prepared = await prepareFinalMessages(withFinalReply(conversation.messages, reply), signal);
+        const prepared = await prepareFinalMessages(withFinalReply(conversation.messages, reply), signal, (message) => this.imageRefs.referenceMessage(message));
         if (this.mainConversations.get(sessionId) !== conversation ||
             this.finalIndexed.get(sessionId) === prepared.key)
             return;
@@ -1161,7 +1222,7 @@ export class MemtreeClient {
         await this.callContextMemory(prepared.messages, conversation.modelContextLimit, {
             sessionId, clientMeta: conversation.clientMeta, messageTimes,
             indexOnly: true, finalIndex: true, signal, timeoutMs: INDEX_TIMEOUT_MS,
-            serializedMessages: prepared.serialized,
+            serializedMessages: prepared.serialized, serializedImageRefs: prepared.refs,
         });
     }
     submitIndexOnly(messages, modelContextLimit, opts) {
@@ -1193,7 +1254,7 @@ export class MemtreeClient {
             this.backgroundIndexes.delete(operation);
         });
         this.backgroundIndexes.set(operation, controller);
-        void operation;
+        return operation;
     }
     /**
      * Stop accepting background indexes and wait boundedly for those already in
@@ -1202,7 +1263,10 @@ export class MemtreeClient {
      * The boolean is true for a graceful drain and false when abort was needed.
      */
     async drainBackground(timeoutMs = 2_000) {
-        this.backgroundClosing = true;
+        if (!this.backgroundClosing) {
+            this.backgroundClosing = true;
+            this.sendWaitingIndexes();
+        }
         if (this.backgroundIndexes.size === 0)
             return true;
         const boundedMs = Number.isFinite(timeoutMs) && timeoutMs >= 0
@@ -1222,6 +1286,7 @@ export class MemtreeClient {
             clearTimeout(timer);
         if (completed)
             return true;
+        this.drainCutting = true;
         for (const controller of this.backgroundIndexes.values()) {
             controller.abort();
         }
@@ -1367,14 +1432,20 @@ export class MemtreeClient {
             // (within its image allowance) instead of naming them in placeholders.
             body.flatten_images = true;
         }
-        let payload;
-        if (opts.serializedMessages !== undefined) {
-            delete body.messages;
-            payload = JSON.stringify(body).slice(0, -1) + ',"messages":' + opts.serializedMessages + "}";
-        }
-        else {
-            payload = JSON.stringify(body);
-        }
+        // Stored images as references, and never a body over the HTTP/1 limit (memtree-body.ts).
+        const plan = (refs) => planMemtreeBody({
+            body, messages, indexOnly: opts.indexOnly === true,
+            serialized: refs && opts.serializedMessages !== undefined
+                ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
+            imageRefs: refs ? this.imageRefs : undefined,
+        });
+        const planned = plan(opts.imageRefs !== false);
+        if (planned.payload === undefined)
+            throw this.oversized(planned.limit, opts);
+        const payload = planned.payload;
+        // The answer named references it could not serve: sent again as its own call.
+        let resent = false;
+        let refusalText;
         opts.signal?.throwIfAborted();
         const started = Date.now();
         let status;
@@ -1393,29 +1464,25 @@ export class MemtreeClient {
         if (opts.signal?.aborted)
             abort();
         try {
-            const response = await fetch(`${this.baseUrl}/v1/context_memory`, {
-                method: "POST",
-                headers: {
-                    authorization: `Bearer ${this.apiKey}`,
-                    "content-type": "application/json",
-                    "x-client": CLIENT_NAME,
-                    "x-client-version": CLIENT_VERSION,
-                    "x-client-features": CLIENT_FEATURES,
-                    ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
-                    ...(opts.clientMeta && Object.keys(opts.clientMeta).length
-                        ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
-                        : {}),
-                    // Compress calls only: an index-only call returns no memory.
-                    ...(this.memtreeTools && !opts.indexOnly
-                        ? { "x-memtree-tools": this.memtreeTools }
-                        : {}),
-                },
-                body: payload,
-                signal: controller.signal,
-            });
+            const response = await this.postContextMemory(payload, opts, controller.signal);
             status = response.status;
+            if (planned.refs.length && !response.ok) {
+                refusalText = await readUnlessAborted(response, controller.signal);
+                if (this.refusedRefs(response.status, refusalText, planned.refs)) {
+                    // A new call with bytes: its own size and request-log record, within what is
+                    // left of this call's budget (a caller's deadline is never extended). Read when
+                    // its timer starts, after its body is built, and never clamped: a size-scaled
+                    // budget adds its allowance to what is left, however negative.
+                    resent = true;
+                    const budget = opts.timeoutMs;
+                    return await this.callContextMemory(messages, modelContextLimit, {
+                        ...opts, imageRefs: false,
+                        get timeoutMs() { return budget - (Date.now() - started); },
+                    });
+                }
+            }
             if (!response.ok) {
-                const text = await response.text().catch(() => "");
+                const text = refusalText ?? await response.text().catch(() => "");
                 if (response.status === 402) {
                     this.unpaidDetail = extract402Detail(text);
                     // Shared, cached and backed off: one request per hour at most while paused.
@@ -1427,6 +1494,7 @@ export class MemtreeClient {
                 throw Object.assign(new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`), { status: response.status });
             }
             const json = (await response.json());
+            this.imageRefs.noteAnswer(json);
             // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
             // true }` by contract: the server skips compression and returns no
             // messages. Only a compress call needs a non-empty conversation back.
@@ -1475,32 +1543,102 @@ export class MemtreeClient {
             // A background index call that failed otherwise (a timeout, a 413 on a big
             // body) is no news about payment; a compress call's answer always is.
             // A refused key is news from any call, like a 402.
-            const news = status === 402 || keyRefused || ok || !opts.indexOnly;
+            const news = !resent && (status === 402 || keyRefused || ok || !opts.indexOnly);
             if (news && (status !== undefined || !opts.signal?.aborted)) {
                 this.lastAnswerUnpaid = status === 402;
                 this.lastAnswerKeyInvalid = keyRefused;
             }
             // One JSONL line per MemTree call, success or failure; `status` stays
             // absent when the call never got a response (network error/timeout).
-            this.reqlog?.log({
-                kind: "memtree",
-                indexOnly: opts.indexOnly === true,
-                ms: Date.now() - started,
-                ok,
-                status,
-                requestBytes: Buffer.byteLength(payload),
-                // Present only when the request carried a model for server-side
-                // budget resolution — the client-visible half of the server's
-                // "/v1/context_memory budget" log line.
-                ...(opts.model && !opts.indexOnly ? { model: opts.model } : {}),
-                ...diagnostics,
-            });
+            if (!resent)
+                this.reqlog?.log({
+                    kind: "memtree",
+                    indexOnly: opts.indexOnly === true,
+                    ms: Date.now() - started,
+                    ok,
+                    status,
+                    requestBytes: Buffer.byteLength(payload),
+                    ...(planned.limit ? { bodyLimit: planned.limit } : {}),
+                    // Aborted by an exit drain that ran out: a known cut, not a server failure.
+                    ...(!ok && this.drainCutting && controller.signal.aborted
+                        ? { exitCut: true, finalIndex: opts.finalIndex === true } : {}),
+                    // Present only when the request carried a model for server-side
+                    // budget resolution — the client-visible half of the server's
+                    // "/v1/context_memory budget" log line.
+                    ...(opts.model && !opts.indexOnly ? { model: opts.model } : {}),
+                    ...diagnostics,
+                });
         }
+    }
+    /** One POST of a MemTree call's body. */
+    postContextMemory(payload, opts, signal) {
+        return fetch(`${this.baseUrl}/v1/context_memory`, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${this.apiKey}`,
+                "content-type": "application/json",
+                "x-client": CLIENT_NAME,
+                "x-client-version": CLIENT_VERSION,
+                "x-client-features": CLIENT_FEATURES,
+                ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
+                ...(opts.clientMeta && Object.keys(opts.clientMeta).length
+                    ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                    : {}),
+                // Compress calls only: an index-only call returns no memory.
+                ...(this.memtreeTools && !opts.indexOnly
+                    ? { "x-memtree-tools": this.memtreeTools }
+                    : {}),
+            },
+            body: payload,
+            signal,
+        });
+    }
+    /**
+     * Whether a failed answer to a call that sent references asks for their bytes: the
+     * server lacks some images (409: those are forgotten), or refuses references (400:
+     * this request's forgotten, or none ever again when the key may not send them).
+     */
+    refusedRefs(status, text, refs) {
+        const missing = status === MISSING_IMAGES_STATUS ? missingImageShas(text) : undefined;
+        const refused = refusesImageRefs(status, text);
+        if (missing !== undefined) {
+            this.imageRefs.forget(missing.length ? missing : refs);
+        }
+        else if (refused === "never") {
+            this.imageRefs.disable();
+        }
+        else if (refused === "this") {
+            this.imageRefs.forget(refs);
+        }
+        else {
+            return false;
+        }
+        this.log(`context_memory ${status} on image references: sending their bytes`);
+        return true;
+    }
+    /**
+     * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
+     * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
+     * error carries 413, the status the server's front end would have answered.
+     */
+    oversized(limit, opts) {
+        this.reqlog?.log({
+            kind: "memtree", indexOnly: opts.indexOnly === true, ms: 0, ok: false,
+            requestBytes: limit?.requestBytes ?? 0, ...(limit ? { bodyLimit: limit } : {}),
+        });
+        this.log(`context_memory body of ${limit?.requestBytes ?? "?"} bytes over the limit: not sent`);
+        return Object.assign(new Error("context_memory body over the size limit (not sent)"), { status: 413, bodyLimit: true });
     }
     log(msg) {
         if (this.debug)
             console.error(`[ccc proxy] ${msg}`);
     }
+}
+/** A failed answer's body; an abort while reading it is thrown, never read as "". */
+async function readUnlessAborted(response, signal) {
+    const text = await response.text().catch(() => "");
+    signal.throwIfAborted();
+    return text;
 }
 /** 402 bodies are FastAPI JSON: {"detail": "<human-readable payment text>"}. */
 function extract402Detail(bodyText) {
@@ -1525,5 +1663,29 @@ function scaledTimeout(baseMs, bytes) {
     if (!Number.isFinite(baseMs))
         return baseMs;
     return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * COMPRESS_TIMEOUT_MS_PER_KIB;
+}
+/**
+ * One conversation for background indexing: its session and its first message after the
+ * system prompt, media left out (Claude Code's media eviction keeps it). Subagents share
+ * the session id but not that message.
+ */
+function indexLaneKey(sessionId, messages) {
+    const first = messages.find((message) => message.role !== "system");
+    return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
+}
+/**
+ * Whether `newer` carries everything `older` does: every message of `older` after the
+ * system prompt (whose billing line changes per call), unchanged and in place. About
+ * 20 ms for a 25 MB history; each message is hashed once.
+ */
+function extendsHistory(newer, older) {
+    const a = withoutSystem(newer);
+    const b = withoutSystem(older);
+    if (a.length < b.length)
+        return false;
+    return b.every((message, i) => routeMessageHash(message) === routeMessageHash(a[i]));
+}
+function withoutSystem(messages) {
+    return messages.filter((message) => message.role !== "system");
 }
 //# sourceMappingURL=memtree.js.map

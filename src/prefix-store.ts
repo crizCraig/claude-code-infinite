@@ -31,6 +31,8 @@ import { getConfigDir } from "./config.js";
 export interface PersistedPrefix {
   originalSystemHash: string;
   originalPrefixHashes: string[];
+  /** Media-free identities of the same messages; absent in entries stored before them. */
+  originalMediaFreeHashes?: string[];
   compressedMessages: any[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -285,6 +287,10 @@ function isPrefix(p: PersistedPrefix): boolean {
   return isObject(p) && nonEmptyString(p.originalSystemHash) &&
     Array.isArray(p.originalPrefixHashes) && p.originalPrefixHashes.length > 0 &&
     p.originalPrefixHashes.every(nonEmptyString) &&
+    (p.originalMediaFreeHashes === undefined ||
+      (Array.isArray(p.originalMediaFreeHashes) &&
+        p.originalMediaFreeHashes.length === p.originalPrefixHashes.length &&
+        p.originalMediaFreeHashes.every(nonEmptyString))) &&
     Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
     p.compressedMessages.every(isMessage) &&
     typeof p.hasCompressedSystem === "boolean" &&

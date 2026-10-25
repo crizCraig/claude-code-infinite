@@ -23,12 +23,13 @@ import type { PaymentLinkCache } from "./payment-link.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 /**
- * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Sent as `x-client-features` on every MemTree call. `near-window-budget`: ccc lifts
  * Claude Code's local refusal near the window (claude-env.ts) and compresses
  * mid-turn, so the server may give it the 900k budget on 1M-window models
- * (older ccc keeps 800k).
+ * (older ccc keeps 800k). `image-refs`: ccc reads the stored images an answer
+ * lists and sends those images as references afterwards (image-refs.ts).
  */
-export declare const CLIENT_FEATURES = "near-window-budget";
+export declare const CLIENT_FEATURES = "near-window-budget,image-refs";
 export declare const CLIENT_VERSION: string;
 /**
  * Added to a compress call's budget per KiB of its upload: a large session's
@@ -338,8 +339,18 @@ export declare class MemtreeClient {
     private indexedHashes;
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
     private backgroundIndexes;
+    /** Conversations (indexLaneKey) with a background index call in flight. */
+    private readonly indexLanesBusy;
+    /** Per busy conversation, the newest index call waiting for the one in flight. */
+    private readonly indexLanesNext;
+    /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
+    private readonly finalIndexLanes;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
+    /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
+    private drainCutting;
+    /** Images MemTree stores, sent as references instead of their bytes. */
+    private readonly imageRefs;
     /** Session → its main lane's latest conversation, for the final index. */
     private readonly mainConversations;
     /** Session → its final index waiting for the session to stay idle. */
@@ -485,6 +496,20 @@ export declare class MemtreeClient {
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes): void;
     /**
+     * At most one background index call per conversation. Each call carries the whole
+     * history, so while one uploads only the newest waiting call is worth sending: a long
+     * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+     * the compress calls that share the link (long-session test, staging 2026-10-24). A
+     * waiting call is replaced only by one whose history extends it; otherwise it goes now.
+     */
+    private enqueueIndex;
+    private startLaneIndex;
+    /**
+     * At shutdown: send every waiting call now, inside the drain, except one whose history
+     * the final index carries (a main session's, unless it was rewound since).
+     */
+    private sendWaitingIndexes;
+    /**
      * The main lane's latest conversation for a session, kept for its final
      * index (scheduleFinalIndex). A new request also means the session did not
      * end at the last Stop: its pending final index is cancelled.
@@ -544,6 +569,20 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
+    /** One POST of a MemTree call's body. */
+    private postContextMemory;
+    /**
+     * Whether a failed answer to a call that sent references asks for their bytes: the
+     * server lacks some images (409: those are forgotten), or refuses references (400:
+     * this request's forgotten, or none ever again when the key may not send them).
+     */
+    private refusedRefs;
+    /**
+     * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
+     * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
+     * error carries 413, the status the server's front end would have answered.
+     */
+    private oversized;
     private log;
 }
 /** What noteMainConversation keeps: the last main-lane request as sent to MemTree. */

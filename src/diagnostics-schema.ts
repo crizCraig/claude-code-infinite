@@ -216,6 +216,11 @@ export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
                     request_kb: KB },
   memtree_error: { status: STATUS, index_only: bool, ms: MS, request_kb: KB },
   compress_timeout: { ms: MS, request_kb: KB },
+  /** An index call the exit drain aborted when its time ran out (not memtree_error). */
+  exit_index_cut: { final: bool, ms: MS, request_kb: KB },
+  /** A MemTree body over the HTTP/1 limit: sent with images dropped, or not sent. */
+  memtree_body_limit: { action: oneOf(["trimmed", "skipped"]), index_only: bool,
+                        request_kb: KB, images_dropped: integer(0, 100_000) },
   refusal: { status: STATUS, input_ktokens: KB, budget_ktokens: KB, attempt: integer(0, 1000) },
   paused_notice: { trigger: oneOf(["turn", "resume"]) },
   update_hint: { latest: VERSION },
