@@ -8,6 +8,8 @@ export interface Config {
     autoUpdate?: boolean;
     /** false turns off client diagnostics (diagnostics.ts). */
     diagnostics?: boolean;
+    /** ccc-board checkout or its board_channel.py, for `ccc --board` (board-channel.ts). */
+    boardChannel?: string;
 }
 export declare function getConfigDir(): string;
 export declare function loadConfig(): Config;

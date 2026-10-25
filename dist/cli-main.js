@@ -37,6 +37,7 @@ import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
+import { addBoardChannel } from "./board-channel.js";
 import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
@@ -634,6 +635,12 @@ async function main() {
             }
         }
     }
+    // `ccc --board` (board-channel.ts): the Command and Control board's channel
+    // server, so the board's messages arrive as user turns. Interactive only.
+    const boardChannel = addBoardChannel(childArgs, parsedArgs.board, {
+        interactive: interactiveUi, env: process.env, configPath: config.boardChannel,
+    });
+    childArgs = boardChannel.args;
     // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
     // native login and sends its own OAuth bearer to the local base URL.
     const claudeStartedAt = Date.now();
@@ -656,6 +663,7 @@ async function main() {
         autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
         noticePlugin?.close();
         memtreeMcpConfig?.close();
+        boardChannel.file?.close();
         // Stop new proxy work and give active handlers a bounded chance to
         // finalize their records. Background indexing is a separate log producer:
         // stop and drain it too before waiting for scheduled JSONL appends on

@@ -13,6 +13,7 @@ test("ccc wrapper flags are consumed only before --", () => {
     {
       claudeArgs: ["staging", "--", "--debug"],
       debug: true,
+      board: { on: false },
     }
   );
 });
@@ -21,8 +22,20 @@ test("unrecognized flags pass through to Claude untouched", () => {
   assert.deepEqual(parseWrapperArgs(["-p", "hello"]), {
     claudeArgs: ["-p", "hello"],
     debug: false,
+    board: { on: false },
   });
-  assert.deepEqual(parseWrapperArgs([]), { claudeArgs: [], debug: false });
+  assert.deepEqual(parseWrapperArgs([]), { claudeArgs: [], debug: false, board: { on: false } });
+});
+
+test("--board and --board=PATH are ccc's own, and only before --", () => {
+  assert.deepEqual(parseWrapperArgs(["staging", "--board"]), {
+    claudeArgs: ["staging"], debug: false, board: { on: true },
+  });
+  assert.deepEqual(parseWrapperArgs(["--board=/src/ccc-board", "fix it"]), {
+    claudeArgs: ["fix it"], debug: false, board: { on: true, path: "/src/ccc-board" },
+  });
+  assert.deepEqual(parseWrapperArgs(["--", "--board"]).board, { on: false });
+  assert.deepEqual(parseWrapperArgs(["--boardx"]).claudeArgs, ["--boardx"]);
 });
 
 test("Claude print flags are recognized only before --", () => {
