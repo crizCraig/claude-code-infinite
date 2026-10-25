@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.30](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.29...v1.0.30) (2026-10-25)
+
+
+### Features
+
+* compress at ~960k on a prepared prefix, send stored images as references, long-session fixes ([c13464e](https://github.com/crizCraig/claude-code-infinite/commit/c13464e1ef6da6bfa857518a16ba9080c7fe529e))
+
 ## [1.0.29](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.28...v1.0.29) (2026-10-23)
 
 
