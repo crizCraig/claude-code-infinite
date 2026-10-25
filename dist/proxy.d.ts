@@ -39,12 +39,19 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
-import { estimateRequestTokens } from "./request-sizing.js";
-import { MemtreeClient } from "./memtree.js";
-import { type FirstTreeIntro } from "./hooks.js";
+import { PromptAccounting } from "./prompt-accounting.js";
+import { RouteFallbackFailures } from "./route-fallback.js";
+import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
+import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
+import { PreparedCompressions } from "./prepared-compression.js";
+import type { ToolOutputStore } from "./tool-output-store.js";
+import { MemtreeClient, type CompressResult } from "./memtree.js";
+import { type Message } from "./turns.js";
+import { NoticeDeliveryQueue, type FirstTreeIntro } from "./hooks.js";
+import { PaymentNoticeThrottle } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
-import type { StablePrefixStore } from "./prefix-store.js";
+import type { PersistedEntry, StablePrefixStore } from "./prefix-store.js";
 import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
@@ -162,6 +169,12 @@ export interface ProxyOptions {
      */
     stablePrefixStore?: StablePrefixStore;
     /**
+     * Where a tool result shortened to fit the window (truncatedToFit) is saved
+     * whole, for the model to read with its Read tool. Omitted means no such
+     * shortening (tests); the CLI passes the store under ~/.claude-code-infinite.
+     */
+    toolOutputs?: ToolOutputStore;
+    /**
      * The session's newest completed tree, asked of the server, which the link
      * shown to the user points at (the compress page is only the tree the memory
      * came from, and can be days old). Omitted means the link is the compress
@@ -235,21 +248,293 @@ export interface RunningProxy {
     mainSessionId: () => string | undefined;
 }
 /**
+ * A MemTree page the server stamped on a main-conversation compress, with
+ * the completed index that turn was compressed against. The page shows that
+ * index until the request's own tree is built, so it is safe to link at once.
+ */
+interface MemtreePage {
+    sessionId?: string;
+    url: string;
+    /** `X-Polychat-Memtree-Index`: what the link is news about. */
+    index: string;
+    /**
+     * Whether the call behind the page actually compressed. False means the
+     * conversation fit the model's budget and went out whole; the trailer says
+     * so, since the link alone reads as "MemTree rewrote this turn".
+     */
+    compressed: boolean;
+    seq: number;
+}
+/** Per-server mutable state (one server per ccc process). */
+interface ProxyState {
+    /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
+    paymentNotice: PaymentNoticeThrottle;
+    /** Invalid-key (401/403) notice throttle, on the payment notice's interval. */
+    keyNotice: PaymentNoticeThrottle;
+    /** Whether MemTree's latest answer refused the key (MemtreeClient.keyInvalid). */
+    keyInvalid: () => boolean;
+    /** Where to get a new MemTree key (MemtreeClient.keyPageUrl). */
+    keyPageUrl: string;
+    /**
+     * Sessions shown the paused notice's near-the-window line: once per session,
+     * past the throttle, since /compact only works while the conversation fits.
+     */
+    pausedNearWindowWarned: Set<string>;
+    /** The queued near-window line, so a refusal can withdraw it undelivered. */
+    nearWindowNotice?: object;
+    /** The MemTree client's last 402 detail, or null while the key is paid. */
+    unpaidDetail: () => string | null;
+    /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
+    pausedDetail: () => string | null;
+    /** polychat's usage dashboard for the MemTree environment, if known. */
+    usageUrl: string | undefined;
+    /** ProxyOptions.sessionStartNotice. */
+    sessionStartNotice?: () => string | undefined;
+    /** ProxyOptions.promptSubmitNotice. */
+    promptSubmitNotice?: () => string | undefined;
+    /** ProxyOptions.projectTrees. */
+    projectTrees?: ProjectTreesHint;
+    /** ProxyOptions.diagnostics. */
+    diagnostics?: DiagnosticsRecorder;
+    notices: NoticeDeliveryQueue;
+    /** RunningProxy.mainSessionId. */
+    resumableMainSession?: string;
+    /** Hook state affects notices only, never routing. */
+    mainNoticePending: boolean;
+    mainPromptId?: string;
+    mainPromptText?: string;
+    mainPromptGeneration: number;
+    promptAccounting: PromptAccounting;
+    fallbackFailures: RouteFallbackFailures;
+    /** Suppress producer-side state changes while agent API traffic is active. */
+    activeSubagents: Set<string>;
+    /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
+    memoryRoutes: Map<string, MemoryRoute>;
+    /** Latest main route for validated away-summary forks, independent of hook events. */
+    lastMainRoute?: MemoryRoute;
+    /**
+     * Index coverage (MemTree `cached_tokens`) observed on the last compression
+     * this session displayed a notice for. Only a turn whose coverage GREW
+     * indexed newer messages; equal coverage means MemTree re-unfolded the same
+     * index behind the current question and appended this turn verbatim, which
+     * is not something to announce.
+     *
+     * Coverage, not the rendered memory text, is the signal: the server unfolds
+     * the index per question (expanding the sections relevant to it), so the
+     * memory message differs byte-wise on nearly every turn even when nothing
+     * new was indexed.
+     */
+    lastNoticedIndexCoverage?: {
+        sessionId?: string;
+        indexedTokens: number;
+    };
+    /**
+     * The newest MemTree page per session, linked from the success
+     * line once per new served index. `seq` orders calls by submission so a
+     * slow older call that settles after a newer one cannot roll the link back
+     * to a staler tree.
+     */
+    memtreePages: Map<string, MemtreePage>;
+    /**
+     * Per session, the page whose memory the prompt carries: set only when a
+     * main-lane compress answer's route is installed after a complete upstream
+     * response (the prefix later requests reuse), so `/memtree/current`
+     * (the MCP tools' "current" tree, where bare node ids resolve) never moves to
+     * a tree whose memory was rejected while an older prefix rides on. The link
+     * (memtreePages) still follows every answer.
+     */
+    memorySourcePages: Map<string, MemtreePage>;
+    /** Submission counter behind the pages' `seq`. */
+    memtreeCallSeq: number;
+    memtreeLinkStore?: MemtreeLinkStore;
+    stablePrefixStore?: StablePrefixStore;
+    /**
+     * Session → its persisted prefix as loaded (null: none, or already adopted
+     * or discarded), so the disk is read once per session. Bounded.
+     */
+    storedPrefixLookups: Map<string, PersistedEntry | null>;
+    /** MemtreeClient.storageIdentity: whose persisted prefixes this process may use. */
+    storageOwner?: string;
+    newestTrees?: NewestTreeLookup;
+    memtreeLinkPlacement: MemtreeLinkPlacement;
+    /**
+     * `/memtree-compact` targets by Claude Code session: every compression for
+     * that session asks the server for this whole-request size instead of the
+     * model-based budget, so it stays compressed while it would still fit.
+     */
+    /**
+     * Per-session `/memtree-compact` target; null means explicitly off, and
+     * undefined the automatic target (half the budget) even when
+     * `CCC_COMPACT_TARGET=off` made off the default.
+     */
+    compactTargets: Map<string, number | null | undefined>;
+    /** `CCC_COMPACT_TARGET=off`: sessions start with compaction off. */
+    defaultCompactOff: boolean;
+    /**
+     * Sessions that ran `/memtree-compact [N]` and have not compacted since:
+     * their next main human turn compresses whatever its size (reason
+     * "manual").
+     */
+    compactNow: Set<string>;
+    /**
+     * Each session's stable compressed prefix (edge compaction): the bytes of
+     * its last compaction, reused unchanged on every later main-thread request
+     * — human turns included — until prefix + newer turns reach the budget
+     * again or the messages it covers change. Unlike memoryRoutes it survives
+     * turn boundaries, which is what makes it a prompt-cache read on every
+     * human turn after the one that compacted. LRU-bounded.
+     */
+    stablePrefixes: Map<string, StablePrefix>;
+    /**
+     * Each session's prepared compressed prefix (prepared-compression.ts): made
+     * in the background once the main thread's request nears the budget, and
+     * installed as the stable prefix, with no compress call, on the turn that
+     * would cross it.
+     */
+    prepared: PreparedCompressions<StablePrefix>;
+    /** Each session's preparation still in flight (maybePrepareCompression). */
+    preparing: Map<string, Promise<void>>;
+    /**
+     * Conversations with an under-budget background compress in flight
+     * (compressInBackground), each with the newest call waiting for it, if any.
+     * An entry lives only while its call runs, so this holds no more than the calls.
+     */
+    backgroundCompress: Map<string, {
+        waiting?: BackgroundCompressArgs;
+    }>;
+    /**
+     * Model budgets the server reported (`model_budget_tokens`), keyed by
+     * model and context window (serverBudgetKey).
+     */
+    serverBudgets: Map<string, number>;
+    /**
+     * True once any compress response carried `model_budget_tokens`: the
+     * server understands `compression_threshold_tokens`, so it can make the
+     * over-budget decision itself. Until then the proxy decides from its own
+     * size estimate.
+     */
+    serverReportsBudget: boolean;
+    countTokensCooldowns: CountTokensCooldowns;
+    /**
+     * Per session and model (sessionSizeKey): Anthropic's reported size of the
+     * last main-thread request forwarded whole (no prefix), with its body bytes,
+     * to estimate the next one while the session is still passing through. The
+     * model is part of the key because the ratio is its tokenizer's: a Haiku
+     * side request on the main lane once replaced the Opus sample (2026-10-13).
+     */
+    passthroughSizes: Map<string, SizeSample>;
+    /**
+     * The same for requests other than the main thread's (subagents), keyed by
+     * laneSizeKey: the lane, the requester's own agent id and the model, so a
+     * helper sharing a subagent's lane (a web-search call reporting server tool
+     * results as input) cannot teach that subagent its ratio (2026-10-05).
+     */
+    laneSizes: Map<string, SizeSample>;
+    /** Process lifetime identity; hooks never advance it. */
+    mainRouteEpoch: number;
+    /** Monotonically orders asynchronous replacements within each request lane. */
+    mainRouteDecisionGeneration: number;
+    /** Live and committed lane generations. At most 128 lanes; evicted generations fail closed. */
+    routeDecisionsLive: Map<string, Set<number>>;
+    retiredRouteDecisionFloor: number;
+    /** At most 128 recovery attempts; failed attempts retry after growth or their deadline. */
+    toolRecoveryAttemptedLanes: Map<string, ToolRecoveryAttempt>;
+    /**
+     * Epoch-ms deadline until which tool-route miss recovery skips its blocking
+     * attempt, set when an attempt returns null. Zero means no cooldown.
+     */
+    toolRecoveryCooldownUntil: number;
+    /** Fired by drain after its grace period so every forwarding path can stop. */
+    shutdownSignal: AbortSignal;
+    /** Test-only fault-injection seam; see ProxyOptions.routeInstallFault. */
+    routeInstallFault?: () => void;
+}
+interface MemoryRoute {
+    sessionId: string;
+    originalSystemHash: string;
+    originalPrefixHashes: string[];
+    compressedMessages: Message[];
+    compressedSystem: unknown;
+    hasCompressedSystem: boolean;
+    routeEpoch: number;
+    /**
+     * The stable prefix this route's compressed messages start with, when the
+     * route came from a main-thread compaction or prefix ride. Tool turns that
+     * ride the route report their Anthropic usage to it (lastSize).
+     */
+    stablePrefix?: StablePrefix;
+    /**
+     * Newest reported size of a tool turn sent on this route, for a route with
+     * no stable prefix (subagent lanes; sessions with compaction off). The
+     * tool-turn budget check (planToolCompaction) starts from it.
+     */
+    lastSize?: SizeSample;
+}
+/**
+ * A session's stable compressed prefix (see ProxyState.stablePrefixes). The
+ * route fields mean what they mean on MemoryRoute: the hashes of the original
+ * messages the prefix stands for, and the compressed bytes sent instead.
+ */
+interface StablePrefix {
+    sessionId: string;
+    originalSystemHash: string;
+    originalPrefixHashes: string[];
+    compressedMessages: Message[];
+    compressedSystem: unknown;
+    hasCompressedSystem: boolean;
+    /** The compaction target this prefix was built with. */
+    targetTokens: number;
+    /** Whether that target was explicit (N / CCC_COMPACT_TARGET) or budget/2. */
+    explicitTarget: boolean;
+    /** Context window of the request that built it; a change recompresses. */
+    modelContextLimit: number;
+    /** Newest reported size of a request sent on this prefix. */
+    lastSize?: SizeSample;
+}
+/**
  * Budget fallback until the server reports `model_budget_tokens`, mirroring the
- * server's ccc policy (polychat index_budget.py): every Claude model compresses
- * near its window, NEAR_WINDOW_FALLBACK_RATIO of it but no later than Claude
- * Code's own auto-compact point (window - CLAUDE_CODE_AUTOCOMPACT_RESERVE_TOKENS)
- * and never below FALLBACK_BUDGET_WINDOW_RATIO: 900k of 1M, 167k of 200k; at
- * most a Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
- * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts a 1M
- * window at 967k, so MemTree compresses no earlier than ~70k before it would;
- * ccc lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
- * jumps past the budget reaches the proxy and is compressed here.
+ * server's ccc policy (polychat index_budget.py near_window_budget_tokens):
+ * every Claude model compresses near its window, at the window less the
+ * reply's room (COMPRESSION_RESERVE_TOKENS, 40k) and never below
+ * FALLBACK_BUDGET_WINDOW_RATIO of it: 960k of 1M, 160k of 200k; at most a
+ * Sonnet's usable-context ceiling (SONNET_CEILINGS). Other models get
+ * FALLBACK_BUDGET_WINDOW_RATIO. Plain Claude Code 2.1.302 auto-compacts at
+ * window - 33k (967k of 1M), so MemTree compresses just before it would; ccc
+ * lifts Claude Code's own 977k refusal (claude-env.ts) so a tool turn that
+ * jumps past the budget reaches the proxy and is compressed here, on a
+ * prepared prefix when there is one (prepared-compression.ts).
  */
 export declare const FALLBACK_BUDGET_WINDOW_RATIO = 0.8;
-export declare const NEAR_WINDOW_FALLBACK_RATIO = 0.9;
 /** The fallback whole-request budget for `model` on this window (see above). */
 export declare function fallbackBudgetTokens(model: unknown, modelContextLimit: number): number;
+interface ToolRecoveryAttempt {
+    retryDeadline?: number;
+    modelContextLimit: number;
+    inFlight: boolean;
+    /**
+     * Set when the attempt produced no prefix (failure, no-op, no gain, ...):
+     * the lane's next attempt this human turn waits until the estimate reaches
+     * this size, so a lane that cannot compress does not pay a blocking call on
+     * every tool turn (routeRecovery outcome "backoff").
+     */
+    retryAtTokens?: number;
+    /**
+     * Set when the attempt's reply showed no finished tree for the conversation
+     * (a no-op with no indexed tokens), or a reply whose index trails the
+     * conversation (indexLagEvidence). Until the
+     * tree catches up a compress call cannot shrink that history: the server
+     * keeps every unindexed message verbatim. The lane
+     * makes no compress call (routeRecovery outcome "awaiting-index") and
+     * instead checks, in the background and one at a time, whether that
+     * reply's MemTree page has finished building. A window overflow still
+     * attempts.
+     */
+    awaitingIndex?: {
+        pageId: string;
+        checking: boolean;
+        deadline: number;
+    };
+}
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
@@ -273,9 +558,62 @@ export declare function parseTokenCount(text: string): number | undefined;
  * never bytes/4, which reads base64 images as text.
  */
 declare function compressedResultExceedsWindow(body: Record<string, any>, rec: MessagesRecord, compressedRaw: Buffer, modelContextLimit: number, exactTokens?: number): boolean;
+interface BlockingCompressionOutcome {
+    result: CompressResult | null;
+    /** Current server-health evidence contributed by this blocking operation. */
+    liveHealth: "success" | "failure" | "none";
+}
+/**
+ * The blocking-compression step, shared by the main followup path and
+ * tool-route miss recovery: the compress call plus the `compress` telemetry
+ * record. Callers own downstream-close tracking (compression promises are
+ * hash-deduped and may serve another live retry, so a per-request disconnect
+ * signal must never feed compress()) and all decisions about the returned
+ * result: both `didMemtreeCompress(result)` and
+ * `checkCompressedHistory(result, msgsForMemtree).usable` must hold before
+ * the result may be forwarded or become a route.
+ */
+declare function runBlockingCompression(args: {
+    opts: ProxyOptions;
+    state: ProxyState;
+    body: Record<string, any>;
+    msgsForMemtree: Message[];
+    hash: string;
+    modelContextLimit: number;
+    rec: MessagesRecord;
+    sessionId: string | undefined;
+    /** The subagent this request belongs to: its transcript has the usage and times. */
+    agentId?: string;
+    clientMeta?: Record<string, string>;
+    sizing: RequestSizing;
+    inputCandidate?: RequestCandidate;
+    /**
+     * compression_target_tokens / compression_threshold_tokens for this call.
+     * Omitted: laneCompaction's (never a bare forcing target).
+     */
+    compaction?: {
+        target?: number;
+        threshold?: number;
+    };
+    /**
+     * Nothing else could be sent if this compress fails (no prefix to ride, raw
+     * request known over the window): use the long budget. See longCompressFor.
+     */
+    longBudget?: boolean;
+}): Promise<BlockingCompressionOutcome>;
+type BackgroundCompressArgs = Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & {
+    linkSeq?: number;
+};
+/**
+ * Run a delivery-time compression as the lane's in-flight operation, so a
+ * concurrent request of the lane neither starts its own (planning sees
+ * "in-flight") nor races it; the lane's own attempt state is kept.
+ */
+declare function holdingLane<T>(state: ProxyState, routeKey: string, run: () => Promise<T>): Promise<T>;
 /** Test seam. */
 export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
 export declare const __testCompressedResultExceedsWindow: typeof compressedResultExceedsWindow;
+export declare const __testHoldingLane: typeof holdingLane;
 export {};
 //# sourceMappingURL=proxy.d.ts.map

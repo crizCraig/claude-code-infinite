@@ -40,6 +40,13 @@ export const CLIENT_VERSION = createRequire(import.meta.url)("../package.json").
 // latency target. Override via CCC_COMPRESS_TIMEOUT_MS (read below).
 const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
 /**
+ * Added to a compress call's budget per KiB of its upload: a large session's
+ * body (20+ MB) takes seconds to send on a slow link before the server even
+ * starts, so a flat budget times out on size alone (2026-10-23: every tool
+ * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ */
+export const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+/**
  * The budget for a compress with nothing else to send: no compressed prefix to
  * ride and a raw request known not to fit the window (the first turn after
  * `--resume`). A timeout there can only end in a refusal, and a large
@@ -736,6 +743,7 @@ export class MemtreeClient {
     baseUrl;
     apiKey;
     compressTimeoutMs;
+    compressSuccessAt = 0;
     longCompressTimeoutMs;
     debug;
     reqlog;
@@ -775,6 +783,8 @@ export class MemtreeClient {
     lastAnswerKeyInvalid = false;
     /** Complete compression request key → whether its latest failure arms fuse. */
     compressFailureArming = new Map();
+    /** HTTP status of each key's latest failed compress (absent: no response). */
+    compressFailureStatus = new Map();
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -827,6 +837,18 @@ export class MemtreeClient {
      */
     get compressBudgetMs() {
         return this.compressTimeoutMs;
+    }
+    /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
+    compressBudgetForBytes(bytes) {
+        return scaledTimeout(this.compressBudgetMs, bytes);
+    }
+    /**
+     * When a compress call (not an index-only one) last got a live successful
+     * answer (epoch ms; 0: never). A compress timing out while others succeed
+     * is its size or a slow reply, not an outage.
+     */
+    get lastCompressSuccessAt() {
+        return this.compressSuccessAt;
     }
     /**
      * Non-secret identity of the MemTree backend and account this client uses:
@@ -919,6 +941,13 @@ export class MemtreeClient {
         return (this.compressFailureArming.get(this.compressKey(hash, modelContextLimit, meta)) ?? true);
     }
     /**
+     * The HTTP status of the latest failed compress of this request, sampled at
+     * its settle like lastCompressFailureArming; undefined when it got none.
+     */
+    lastCompressFailureStatus(hash, modelContextLimit, meta) {
+        return this.compressFailureStatus.get(this.compressKey(hash, modelContextLimit, meta));
+    }
+    /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
      * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -935,11 +964,15 @@ export class MemtreeClient {
         const inFlightKey = this.inFlightKey(hash, modelContextLimit, meta);
         const promise = this.callContextMemory(messages, modelContextLimit, {
             timeoutMs: meta?.timeoutMs ?? this.compressTimeoutMs,
+            // An explicit budget is the caller's deadline (a preparation's waiters,
+            // the proxy's own wait): kept as given so both end together.
+            scaleTimeout: meta?.timeoutMs === undefined,
             signal,
             model: meta?.model,
             tools: meta?.tools,
             compressionTargetTokens: meta?.compressionTargetTokens,
             compressionThresholdTokens: meta?.compressionThresholdTokens,
+            prepare: meta?.prepare,
             clientInputTokens: meta?.clientInputTokens,
             clientInputTokensExact: meta?.clientInputTokensExact,
             messageUsage: meta?.messageUsage,
@@ -962,6 +995,14 @@ export class MemtreeClient {
                 const first = this.compressFailureArming.keys().next().value;
                 if (first !== undefined)
                     this.compressFailureArming.delete(first);
+            }
+            this.compressFailureStatus.delete(cacheKey);
+            if (status !== undefined)
+                this.compressFailureStatus.set(cacheKey, status);
+            if (this.compressFailureStatus.size > DEDUPE_CACHE_MAX) {
+                const first = this.compressFailureStatus.keys().next().value;
+                if (first !== undefined)
+                    this.compressFailureStatus.delete(first);
             }
             // Don't cache failures — drop the entry so retries (e.g. Claude Code's
             // automatic retry of an identical request) hit the server again.
@@ -1216,6 +1257,7 @@ export class MemtreeClient {
             meta?.compressionTargetTokens ?? null,
             meta?.compressionThresholdTokens ?? null,
             meta?.clientInputTokens !== undefined && meta.clientInputTokensExact === true,
+            meta?.prepare === true,
         ];
     }
     /**
@@ -1300,6 +1342,8 @@ export class MemtreeClient {
             if (opts.compressionThresholdTokens !== undefined) {
                 body.compression_threshold_tokens = opts.compressionThresholdTokens;
             }
+            if (opts.prepare)
+                body.prepare = true;
             if (opts.clientInputTokens !== undefined) {
                 body.client_input_tokens = opts.clientInputTokens;
                 if (opts.clientInputTokensExact)
@@ -1339,7 +1383,11 @@ export class MemtreeClient {
         let diagnostics = {};
         const controller = new AbortController();
         const abort = () => controller.abort();
-        const timeout = setTimeout(abort, opts.timeoutMs);
+        // A default compress budget grows with what it uploads; an index call's,
+        // and any budget a caller set, is fixed.
+        const timeoutMs = opts.scaleTimeout && !opts.indexOnly
+            ? scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8")) : opts.timeoutMs;
+        const timeout = setTimeout(abort, timeoutMs);
         timeout.unref();
         opts.signal?.addEventListener("abort", abort, { once: true });
         if (opts.signal?.aborted)
@@ -1393,6 +1441,8 @@ export class MemtreeClient {
             const memtreeIndex = response.headers.get("x-polychat-memtree-index") ?? undefined;
             this.unpaidDetail = null; // a success proves the key is paid (again)
             ok = true;
+            if (!opts.indexOnly)
+                this.compressSuccessAt = Date.now();
             diagnostics = {
                 ...(memtreeUrl ? { memtreeUrl } : {}),
                 ...(memtreeIndex ? { memtreeIndex } : {}),
@@ -1469,5 +1519,11 @@ export function withFinalReply(messages, reply) {
     if (!reply || messages.at(-1)?.role === "assistant")
         return messages;
     return [...messages, reply];
+}
+/** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
+function scaledTimeout(baseMs, bytes) {
+    if (!Number.isFinite(baseMs))
+        return baseMs;
+    return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * COMPRESS_TIMEOUT_MS_PER_KIB;
 }
 //# sourceMappingURL=memtree.js.map

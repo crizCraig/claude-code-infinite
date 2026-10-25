@@ -36,6 +36,13 @@ export interface SizeSample {
     /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
     tokens: number;
     forwardedBytes: number;
+    /**
+     * The body's inline images: their base64 bytes (within forwardedBytes) and
+     * visual tokens (within tokens), so a later estimate scales only its text.
+     * Absent on a sample recorded without them: its images count as text.
+     */
+    imageBytes?: number;
+    imageTokens?: number;
 }
 /** Where a count call goes: the proxy's upstream. */
 export interface CountTokensUpstream {
@@ -94,7 +101,15 @@ export interface CountTokensSessionOptions {
 export interface CountTokensSession {
     count(body: Buffer): Promise<CountTokensResult>;
     peek(body: Buffer): CountTokensResult | undefined;
+    /**
+     * Count `body` again, once per request, after its count ran out of time
+     * (outcome "timeout" or "deadline"), with a fresh allowance for its size;
+     * undefined when it did not, or the retry was spent.
+     */
+    retry?(body: Buffer): Promise<CountTokensResult> | undefined;
 }
+/** Outcomes a retry may follow: the count ran out of time, not refused. */
+export declare const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome>;
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's

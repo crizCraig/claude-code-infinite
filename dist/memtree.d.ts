@@ -31,6 +31,13 @@ export declare const CLIENT_NAME = "cc-infinite";
 export declare const CLIENT_FEATURES = "near-window-budget";
 export declare const CLIENT_VERSION: string;
 /**
+ * Added to a compress call's budget per KiB of its upload: a large session's
+ * body (20+ MB) takes seconds to send on a slow link before the server even
+ * starts, so a flat budget times out on size alone (2026-10-23: every tool
+ * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ */
+export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+/**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
  * pauses spend the server's once-per-30-minutes final index mid-session.
@@ -82,6 +89,13 @@ export interface CompressRequestMeta {
      * proxy tells them apart).
      */
     compressionThresholdTokens?: number;
+    /**
+     * Server `prepare`: a compression asked for ahead of need (the proxy's
+     * prepared compression, prepared-compression.ts), compressed to
+     * `compressionTargetTokens` whatever its size and billed as the compression
+     * it replaces. Part of the cache key: it changes the server's answer.
+     */
+    prepare?: boolean;
     /**
      * Server `client_input_tokens`: the proxy's own estimate of the request's
      * input tokens, the one its fallback gate refuses over-budget input by.
@@ -145,6 +159,11 @@ export interface CompressResult {
      * back to the cached_tokens heuristic (see didMemtreeCompress).
      */
     compressed?: boolean;
+    /**
+     * True on the answer to a `prepare` call from a server that prepares (and
+     * bills a preparation as the compression it replaces); older servers omit it.
+     */
+    prepared?: boolean;
     /**
      * The model's whole-request budget the server computed (tokens), whatever
      * target the request set. Servers that predate it omit the field.
@@ -298,6 +317,7 @@ export declare class MemtreeClient {
     private baseUrl;
     private apiKey;
     private compressTimeoutMs;
+    private compressSuccessAt;
     private longCompressTimeoutMs;
     private debug;
     private reqlog;
@@ -337,6 +357,8 @@ export declare class MemtreeClient {
     private lastAnswerKeyInvalid;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
+    /** HTTP status of each key's latest failed compress (absent: no response). */
+    private compressFailureStatus;
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -372,6 +394,14 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
+    compressBudgetForBytes(bytes: number): number;
+    /**
+     * When a compress call (not an index-only one) last got a live successful
+     * answer (epoch ms; 0: never). A compress timing out while others succeed
+     * is its size or a slow reply, not an outage.
+     */
+    get lastCompressSuccessAt(): number;
     /**
      * Non-secret identity of the MemTree backend and account this client uses:
      * a hash over the origin and a hash of the key. Persisted state is valid only
@@ -421,6 +451,11 @@ export declare class MemtreeClient {
      * the fuse needs positive evidence of a responsive server.
      */
     lastCompressFailureArming(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): boolean;
+    /**
+     * The HTTP status of the latest failed compress of this request, sampled at
+     * its settle like lastCompressFailureArming; undefined when it got none.
+     */
+    lastCompressFailureStatus(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): number | undefined;
     /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.

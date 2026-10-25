@@ -22,6 +22,7 @@ import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
 import { StablePrefixStore } from "./prefix-store.js";
+import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
@@ -692,6 +693,8 @@ async function main() {
     // Each session's adopted compressed prefix, so a resumed session's first
     // turn rides it instead of blocking on a fresh compress.
     stablePrefixStore: new StablePrefixStore(),
+    // Full copies of tool results shortened to fit the window (the safety net).
+    toolOutputs: new ToolOutputStore(),
     // The link shown to the user follows the session's newest tree on the server.
     newestTrees: new NewestTreeLookup((path, signal) =>
       memtree.fetchMemTree(path, "application/json", signal)

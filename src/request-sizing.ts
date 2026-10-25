@@ -2,9 +2,10 @@
  * exact counts remain attached to immutable body bytes, and every candidate
  * shares the request's Count Tokens deadline and account cooldown. */
 import { createHash } from "node:crypto";
-import { exceedsRequestLimit, plausibleSample, shouldCountTokens,
+import { RETRYABLE_COUNT_OUTCOMES, exceedsRequestLimit, plausibleSample, shouldCountTokens,
   type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
+import { bodyImages, rememberImages, type ImageTotals } from "./image-tokens.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
 
@@ -60,8 +61,12 @@ export class RequestSizing {
     if (existing) return existing;
     const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
     const conservativeTokens = conservativeBodyTokens(body, this.model);
-    const candidate = Object.freeze({ key, body: Buffer.from(body), kind, sample: snapshot,
-      estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length),
+    const images = bodyImages(body, this.model);
+    const owned = Buffer.from(body);
+    // The same totals answer for the owned copy (reportedSample of the sent bytes).
+    rememberImages(owned, this.model, images);
+    const candidate = Object.freeze({ key, body: owned, kind, sample: snapshot,
+      estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length, images),
         conservativeTokens)),
       conservativeTokens });
     this.candidates.set(key, candidate);
@@ -71,6 +76,11 @@ export class RequestSizing {
   /** Eligibility belongs to route planning, not to a later byte-size guess. */
   excludeFallback(candidate: RequestCandidate): void {
     this.excludedFallbacks.add(candidate);
+  }
+
+  /** Every registered candidate planning has not excluded, in registration order. */
+  fallbacks(): RequestCandidate[] {
+    return [...this.candidates.values()].filter(item => !this.excludedFallbacks.has(item));
   }
 
   /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
@@ -148,6 +158,27 @@ export class RequestSizing {
       estimatedTokens: estimate, count };
   }
 
+  /**
+   * When counting ran out of time, count again (once per request, with a
+   * fresh allowance) the smallest candidate whose count timed out, and select
+   * it if it then fits: a slow count must not refuse a body that fits
+   * (2026-10-23: an ~850k request was refused after its count timed out).
+   */
+  async retryTimedOutCount(limits: SizingLimits): Promise<{
+    candidate: RequestCandidate; measurement: CandidateMeasurement;
+  } | undefined> {
+    if (!this.enabled || !this.counts.retry) return undefined;
+    const timedOut = this.fallbacks().filter((item) => !this.exceedsRequestLimit(item) &&
+      RETRYABLE_COUNT_OUTCOMES.has(this.counts.peek(item.body)?.outcome ?? "success"))
+      .sort((a, b) => a.body.length - b.body.length);
+    const smallest = timedOut[0];
+    if (!smallest) return undefined;
+    const count = await this.counts.retry(smallest.body);
+    if (count?.tokens === undefined) return undefined;
+    const measurement = await this.measure(smallest, limits);
+    return fitsMeasured(measurement, limits) ? { candidate: smallest, measurement } : undefined;
+  }
+
   /** The preferred body gets first chance; only validated registered candidates
    * are considered afterward. Exact overflow never degrades to a byte guess. */
   async select(preferred: RequestCandidate, limits: SizingLimits): Promise<{
@@ -211,12 +242,32 @@ function capByteEstimate(estimate: PlannedSize, conservativeTokens: number): Pla
   return { tokens: conservativeTokens, source: "bytes" };
 }
 
-/** One shared estimator for planner telemetry and request-local snapshots. */
-export function estimateRequestTokens(sample: SizeSample | undefined, bytes: number): PlannedSize {
-  if (!plausibleSample(sample)) return { tokens: approxTokensFromBytes(bytes), source: "bytes" };
-  const ratio = sample.tokens / sample.forwardedBytes;
-  const tokens = bytes <= sample.forwardedBytes ? Math.round(bytes * ratio) : sample.tokens +
-    Math.max(approxTokensFromBytes(bytes - sample.forwardedBytes),
-      Math.round((bytes - sample.forwardedBytes) * ratio));
-  return { tokens, source: "reported" };
+/**
+ * One shared estimator for planner telemetry and request-local snapshots.
+ * Inline images (`images`, and the sample's own) are not text: their base64
+ * bytes are left out of the scaling and their visual tokens added as they are.
+ * 2026-10-23: a 295k-character PNG (420 tokens) read as ~74k tokens of text
+ * put an ~850k request at 892k and it was refused.
+ */
+export function estimateRequestTokens(
+  sample: SizeSample | undefined, bytes: number, images: ImageTotals = NO_IMAGE_TOTALS,
+): PlannedSize {
+  const textBytes = Math.max(0, bytes - images.imageBytes);
+  if (!plausibleSample(sample)) {
+    return { tokens: approxTokensFromBytes(textBytes) + images.imageTokens, source: "bytes" };
+  }
+  // A sample recorded without its images may hold them as text: scale this
+  // body's images as text too (an over-estimate) rather than against it.
+  if (sample.imageBytes === undefined && images.imageBytes > 0) {
+    return estimateRequestTokens(sample, bytes);
+  }
+  const sampleBytes = Math.max(1, sample.forwardedBytes - (sample.imageBytes ?? 0));
+  const sampleTokens = Math.max(1, sample.tokens - (sample.imageTokens ?? 0));
+  const ratio = sampleTokens / sampleBytes;
+  const text = textBytes <= sampleBytes ? Math.round(textBytes * ratio) : sampleTokens +
+    Math.max(approxTokensFromBytes(textBytes - sampleBytes),
+      Math.round((textBytes - sampleBytes) * ratio));
+  return { tokens: text + images.imageTokens, source: "reported" };
 }
+
+const NO_IMAGE_TOTALS: ImageTotals = Object.freeze({ imageBytes: 0, imageTokens: 0 });
