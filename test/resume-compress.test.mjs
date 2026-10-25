@@ -21,6 +21,17 @@ const SLOW_MS = 500;
  * for a loaded machine (SLOW_MS was only ~60 ms above the 350 KB turn's short budget).
  */
 const STALLED_MS = LONG_MS - 500;
+
+/**
+ * The turn got the short budget: its compress call was given exactly the upload-scaled short
+ * budget (an intermediate one, say 2 s, would also time out against STALLED_MS) and timed
+ * out on it, so the turn went on without waiting for MemTree's answer.
+ */
+function assertShortBudget(h) {
+  assert.equal(h.budgets.at(-1), h.shortBudget(), "the upload-scaled short budget");
+  assert.ok(h.shortBudget() < STALLED_MS / 2, `short budget ${h.shortBudget()} ms`);
+  assert.equal(h.lastRecord().compress.timedOut, true);
+}
 const BIG = (tag, chars) => `${tag} ` + "x".repeat(chars);
 const user = (text) => ({ role: "user", content: [{ type: "text", text }] });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
@@ -83,6 +94,15 @@ async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
   const memory = await listen(memtreeHandler(h));
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k",
     compressTimeoutMs: SHORT_MS, longCompressTimeoutMs: LONG_MS });
+  // The budget each compress call was given (the proxy passes it as meta.timeoutMs).
+  h.budgets = [];
+  const compress = memtree.compress.bind(memtree);
+  memtree.compress = (hash, messages, limit, signal, meta) => {
+    h.budgets.push(meta?.timeoutMs);
+    return compress(hash, messages, limit, signal, meta);
+  };
+  /** The short budget for the last turn: the base plus 1 ms per KiB it uploaded. */
+  h.shortBudget = () => memtree.compressBudgetForBytes(h.lastRecord().requestBytes);
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
     budgetTokensOverride: 20_000, countTokens,
     reqlog: { log: (r) => h.records.push(structuredClone(r)) } });
@@ -137,7 +157,7 @@ test("control: a raw request that fits the window keeps the short budget and pas
       // ~75k tokens: over the 20k budget, inside the 200k window.
       const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 300_000))]);
       assert.equal(result.status, 200);
-      assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
+      assertShortBudget(h);
       const rec = h.lastRecord();
       assert.equal(rec.turnType, "followup-degraded");
       assert.equal(rec.compress.timedOut, true);
@@ -160,7 +180,7 @@ test("control: with an old prefix, a compress timeout still rides it", async () 
     conv.push(assistant("a3"), user(BIG("q4", 100_000)));
     const result = await h.post(conv);
     assert.equal(result.status, 200);
-    assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
+    assertShortBudget(h);
     const rec = h.lastRecord();
     assert.equal(rec.turnType, "followup-prefix");
     assert.equal(rec.compaction.keptPrefix, true);
@@ -219,7 +239,7 @@ test("a calibrated overflow keeps the short budget when delivery could still sen
       h.delayMs = STALLED_MS;
       const result = await h.post([user("q1"), assistant("a1"), user(BIG("q2", 350_000))]);
       assert.equal(result.status, 200);
-      assert.ok(result.ms < STALLED_MS, `short budget (took ${result.ms} ms)`);
+      assertShortBudget(h);
       const rec = h.lastRecord();
       assert.equal(rec.turnType, "followup-degraded");
       assert.equal(rec.compress.timedOut, true);
