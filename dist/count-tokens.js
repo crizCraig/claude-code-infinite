@@ -81,7 +81,12 @@ export function exceedsRequestLimit(bytes) {
 export function plausibleSample(sample) {
     if (!sample || !(sample.tokens > 0) || !(sample.forwardedBytes > 0))
         return false;
-    const ratio = sample.tokens / sample.forwardedBytes;
+    // Judged on its text: image bytes carry few tokens whatever their size.
+    const textBytes = sample.forwardedBytes - (sample.imageBytes ?? 0);
+    const textTokens = sample.tokens - (sample.imageTokens ?? 0);
+    if (!(textBytes > 0) || !(textTokens > 0))
+        return false;
+    const ratio = textTokens / textBytes;
     return ratio >= MIN_PLAUSIBLE_TOKENS_PER_BYTE && ratio <= MAX_PLAUSIBLE_TOKENS_PER_BYTE;
 }
 /**
@@ -134,6 +139,8 @@ export class CountTokensCooldowns {
         this.entries.set(key, now + cooldownDuration(result.retryAfter, now));
     }
 }
+/** Outcomes a retry may follow: the count ran out of time, not refused. */
+export const RETRYABLE_COUNT_OUTCOMES = new Set(["timeout", "deadline"]);
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's
@@ -146,8 +153,23 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
     const account = countAccountKey(options);
     const clock = new CountingClock();
     let allowance = 0;
+    let retried = false;
     return {
         peek: (body) => completed.get(bodyHash(body)),
+        retry: (body) => {
+            const key = bodyHash(body);
+            const prior = completed.get(key);
+            if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
+                options.signal?.aborted || cooldowns.active(account))
+                return undefined;
+            retried = true;
+            const timeoutMs = requestAllowance(options, body.length);
+            const attempt = clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
+                .then((result) => recordAttempt(options, cooldowns, account, result))
+                .then((result) => { completed.set(key, result); return result; });
+            pending.set(key, attempt);
+            return attempt;
+        },
         count: (body) => {
             const key = bodyHash(body);
             const existing = pending.get(key);

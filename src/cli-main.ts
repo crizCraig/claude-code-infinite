@@ -22,6 +22,7 @@ import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
 import { StablePrefixStore } from "./prefix-store.js";
+import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
@@ -91,7 +92,14 @@ import {
   createSignalShutdownHandler,
   claudeExitFields,
   exitCodeForChild,
+  closeBoundedMs,
+  CONSOLE_CLOSE_MARKS_MS,
+  HANGUP_MEMTREE_DRAIN_MS,
+  childExitMeansHangup,
+  ignoreStreamErrors,
+  onHangup,
   settleWithin,
+  shutdownMemtreeDrainMs,
   writeStdout,
 } from "./cli-lifecycle.js";
 import {
@@ -105,7 +113,9 @@ import {
   loadConfig,
 } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
-import { Diagnostics, DiagnosticsRequestSink, recordError } from "./diagnostics.js";
+import {
+  Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS,
+} from "./diagnostics.js";
 import {
   PACKAGE_DIR,
   detectInstallMethod,
@@ -146,7 +156,6 @@ const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
 const LOCAL_BASE_URL = "http://localhost:8080";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
-const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 /** Shutdown's wait for the child's exit and the resume hint's (asynchronous) write. */
 const SHUTDOWN_OUTPUT_FLUSH_MS = 1_000;
@@ -692,6 +701,8 @@ async function main() {
     // Each session's adopted compressed prefix, so a resumed session's first
     // turn rides it instead of blocking on a fresh compress.
     stablePrefixStore: new StablePrefixStore(),
+    // Full copies of tool results shortened to fit the window (the safety net).
+    toolOutputs: new ToolOutputStore(),
     // The link shown to the user follows the session's newest tree on the server.
     newestTrees: new NewestTreeLookup((path, signal) =>
       memtree.fetchMemTree(path, "application/json", signal)
@@ -803,6 +814,20 @@ async function main() {
   });
 
   let shuttingDown = false;
+  /** When the Windows console window was closed (SIGHUP): the exit drain counts from it. */
+  let consoleClosedAt: number | undefined;
+  /** When the terminal hung up (macOS, Linux SIGHUP). */
+  let terminalHungUp = false;
+  /**
+   * A terminal to hang up: under nohup neither stdout nor stderr is one. Without one
+   * (`ccc -p ... >out 2>&1`) SIGHUP keeps its default, as before: it ends ccc at once.
+   */
+  const hasTerminal = Boolean(process.stdout.isTTY || process.stderr.isTTY);
+  const markTerminalHungUp = (): void => {
+    if (terminalHungUp) return;
+    terminalHungUp = true;
+    ignoreStreamErrors([process.stdout, process.stderr]);
+  };
   // Settles once the child has exited and the resume hint (if any) is written,
   // or the child failed to start. Awaited (bounded) just before exiting, so a
   // signal whose cleanup finishes first still lets the hint print.
@@ -820,14 +845,23 @@ async function main() {
     // finalize their records. Background indexing is a separate log producer:
     // stop and drain it too before waiting for scheduled JSONL appends on
     // disk.
-    await proxy.drain(SHUTDOWN_PROXY_DRAIN_MS);
+    // After a console close every step ends by its mark (cli-lifecycle.ts).
+    const marks = CONSOLE_CLOSE_MARKS_MS;
+    await proxy.drain(closeBoundedMs(SHUTDOWN_PROXY_DRAIN_MS, consoleClosedAt, marks.proxyDrain));
     // A session ending now sends its final index at once (the idle timer
     // would never fire), inside the same bounded background drain.
-    memtree.flushFinalIndexes();
-    await memtree.drainBackground(SHUTDOWN_MEMTREE_DRAIN_MS);
+    const memtreeDrainMs = terminalHungUp
+      ? HANGUP_MEMTREE_DRAIN_MS
+      : shutdownMemtreeDrainMs(process.platform, consoleClosedAt);
+    memtree.flushFinalIndexes(memtreeDrainMs);
+    await memtree.drainBackground(memtreeDrainMs);
     // Before the final flushes, so a late child exit's diagnostics event is sent.
-    await settleWithin(childDone, SHUTDOWN_OUTPUT_FLUSH_MS);
-    await Promise.all([reqlog.flush(SHUTDOWN_LOG_FLUSH_MS), diagnostics.flush()]);
+    await settleWithin(childDone,
+      closeBoundedMs(SHUTDOWN_OUTPUT_FLUSH_MS, consoleClosedAt, marks.childWait));
+    await Promise.all([
+      reqlog.flush(closeBoundedMs(SHUTDOWN_LOG_FLUSH_MS, consoleClosedAt, marks.flush)),
+      diagnostics.flush(closeBoundedMs(SHUTDOWN_FLUSH_MS, consoleClosedAt, marks.flush)),
+    ]);
     process.exit(code);
   };
 
@@ -849,15 +883,21 @@ async function main() {
   });
   process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
   process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
-  if (process.platform === "win32") {
-    // Closing the console window (SIGHUP) gives ccc a few seconds: start the
-    // update first, since the drains in shutdown may not finish in time.
-    process.on("SIGHUP", () => {
-      diagnostics.record("console_closed");
+  onHangup(process, (kind) => {
+    diagnostics.record("console_closed");
+    if (kind === "console-close") {
+      // Windows ends ccc a few seconds after its console window closes: start the
+      // update first, since the drains in shutdown may not finish in time.
+      consoleClosedAt ??= Date.now();
       autoUpdate?.installOnExit((result) => diagnostics.record("auto_update", { result }));
       handleShutdownSignal("SIGTERM");
-    });
-  }
+      return;
+    }
+    // macOS, Linux: the terminal is gone, but nothing ends ccc, so the final index
+    // gets a longer drain than an ordinary exit.
+    markTerminalHungUp();
+    handleShutdownSignal("SIGHUP");
+  }, hasTerminal);
 
   // The background install starts once Claude Code is up; it outlives this
   // process if the session ends first.
@@ -879,6 +919,8 @@ async function main() {
   });
 
   child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    // Before anything is written: the hangup may reach Claude Code before ccc.
+    if (hasTerminal && childExitMeansHangup(process.platform, code, signal)) markTerminalHungUp();
     if (code !== 0) {
       diagnostics.record("claude_exit", claudeExitFields(code, signal, claudeStartedAt));
     }

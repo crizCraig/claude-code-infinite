@@ -58,4 +58,63 @@ export function settleWithin(pending, ms) {
         pending.then(() => { clearTimeout(timer); resolve(); }, () => { clearTimeout(timer); resolve(); });
     });
 }
+/** The exit drain's wait for MemTree calls in flight (the final index above all). */
+export const SHUTDOWN_MEMTREE_DRAIN_MS = 2_000;
+/** Windows: the final index of a large session needs longer than 2 s to upload. */
+export const WIN32_MEMTREE_DRAIN_MS = 4_000;
+/**
+ * Closing a Windows console window (SIGHUP) leaves ccc ~5 s before it is killed, and
+ * the final index was cut at 2 s on every close. From the close, each shutdown step
+ * ends by its mark here, so the diagnostics flush (exit_index_cut too) still fits.
+ */
+export const CONSOLE_CLOSE_MARKS_MS = {
+    proxyDrain: 1_000, memtreeDrain: 3_500, childWait: 3_750, flush: 4_500,
+};
+/**
+ * Calls `handler` on SIGHUP with the kind of close it means. On macOS and Linux only
+ * with a terminal to hang up (`terminal`: stdout or stderr is a TTY): under nohup, which
+ * points both away from the terminal, SIGHUP stays ignored as nohup asked. There a
+ * hangup can arrive more than once (the shell's, then the terminal's) and is one close:
+ * a repeat must not become the second signal that skips the final index.
+ */
+export function onHangup(proc, handler, terminal) {
+    if (proc.platform === "win32") {
+        proc.on("SIGHUP", () => handler("console-close"));
+        return;
+    }
+    if (!terminal)
+        return;
+    let hungUp = false;
+    proc.on("SIGHUP", () => {
+        if (hungUp)
+            return;
+        hungUp = true;
+        handler("terminal-hangup");
+    });
+}
+/** Claude Code ended by the same hangup (macOS, Linux), possibly before ccc saw it. */
+export function childExitMeansHangup(platform, code, signal) {
+    return platform !== "win32" && (signal === "SIGHUP" || code === exitCodeForSignal("SIGHUP"));
+}
+/** After a hangup, writes to the gone terminal fail (EIO, EPIPE): never fatal to the drain. */
+export function ignoreStreamErrors(streams) {
+    for (const stream of streams)
+        stream.on("error", () => { });
+}
+/**
+ * The exit drain's wait for MemTree calls after a terminal hangup (macOS, Linux): nobody
+ * waits for ccc then, and a large session's final index takes seconds to upload.
+ */
+export const HANGUP_MEMTREE_DRAIN_MS = 10_000;
+/** How long the exit drain may wait for MemTree calls, starting `now`. */
+export function shutdownMemtreeDrainMs(platform, consoleClosedAt, now = Date.now()) {
+    const base = platform === "win32" ? WIN32_MEMTREE_DRAIN_MS : SHUTDOWN_MEMTREE_DRAIN_MS;
+    return closeBoundedMs(base, consoleClosedAt, CONSOLE_CLOSE_MARKS_MS.memtreeDrain, now);
+}
+/** `ms`, or less when it would end past `markMs` after the console's close. */
+export function closeBoundedMs(ms, consoleClosedAt, markMs, now = Date.now()) {
+    if (consoleClosedAt === undefined)
+        return ms;
+    return Math.max(0, Math.min(ms, consoleClosedAt + markMs - now));
+}
 //# sourceMappingURL=cli-lifecycle.js.map

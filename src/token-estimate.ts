@@ -11,10 +11,12 @@
  * the server measures (JSON escapes and UTF-8 only add bytes), so dividing
  * bytes by a chars-per-token ratio errs high, never low.
  *
- * Base64 image data is not text: Anthropic resizes every image to at most
- * MAX_IMAGE_TOKENS however many bytes it takes (and a tiny, very compressible
- * PNG can still cost the maximum), so each image payload counts as the maximum.
+ * Base64 image data is not text: Anthropic charges an image by its pixel
+ * dimensions (ceil(w/28) * ceil(h/28) after its tier's downscale, at most
+ * MAX_IMAGE_TOKENS) however many bytes it takes, so each image counts its
+ * visual tokens read from its header (image-tokens.ts).
  */
+import { bodyImages } from "./image-tokens.js";
 
 /** Claude 4.7 and later (Opus 4.7+, Sonnet/Haiku 5+, Fable 5). */
 export const CLAUDE_4_7_PLUS_BYTES_PER_TOKEN = 1.9;
@@ -46,50 +48,10 @@ export function conservativeTokensFromBytes(bytes: number, model: string | undef
 }
 
 /** Tokens a request body may cost on `model`: its text at the family ratio,
- * each image content block (base64 or URL, in a message or a tool_result) at
- * one image's maximum.
- * A body that does not parse is all text, an over-estimate. */
+ * each inline image content block (in a message or a tool_result) at its
+ * visual tokens from its header (image-tokens.ts), the tier's maximum when
+ * unreadable or not inline. A body that does not parse is all text, an over-estimate. */
 export function conservativeBodyTokens(body: Buffer, model: string | undefined): number {
-  const { imageBytes, imageTokens } = imagePayloads(body);
+  const { imageBytes, imageTokens } = bodyImages(body, model);
   return conservativeTokensFromBytes(body.length - imageBytes, model) + imageTokens;
-}
-
-function imagePayloads(body: Buffer): { imageBytes: number; imageTokens: number } {
-  const totals = { imageBytes: 0, imageTokens: 0 };
-  // Most bodies carry no image: skip the parse.
-  if (!body.includes('"image"')) return totals;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body.toString("utf-8"));
-  } catch {
-    return totals;
-  }
-  const messages = (parsed as { messages?: unknown } | null)?.messages;
-  if (Array.isArray(messages)) {
-    for (const message of messages) {
-      const content = (message as { content?: unknown } | null)?.content;
-      if (Array.isArray(content)) countImageBlocks(content, totals);
-    }
-  }
-  return totals;
-}
-
-/** Count image blocks among content blocks: a message's content, and
- * recursively a tool_result's content. Image-shaped JSON anywhere else (tool
- * inputs, schemas, system, metadata) is ordinary text and stays counted as such. */
-function countImageBlocks(blocks: unknown[], totals: { imageBytes: number; imageTokens: number }): void {
-  for (const item of blocks) {
-    if (!item || typeof item !== "object") continue;
-    const block = item as Record<string, unknown>;
-    const source = block.source as Record<string, unknown> | undefined;
-    if (block.type === "image" && source && typeof source === "object") {
-      totals.imageTokens += MAX_IMAGE_TOKENS;
-      // Base64 is ASCII and never escaped by JSON, so its length is its byte count.
-      if (source.type === "base64" && typeof source.data === "string") {
-        totals.imageBytes += source.data.length;
-      }
-    } else if (block.type === "tool_result" && Array.isArray(block.content)) {
-      countImageBlocks(block.content, totals);
-    }
-  }
 }

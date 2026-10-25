@@ -76,6 +76,13 @@ export interface SizeSample {
   /** input_tokens + cache_read_input_tokens + cache_creation_input_tokens. */
   tokens: number;
   forwardedBytes: number;
+  /**
+   * The body's inline images: their base64 bytes (within forwardedBytes) and
+   * visual tokens (within tokens), so a later estimate scales only its text.
+   * Absent on a sample recorded without them: its images count as text.
+   */
+  imageBytes?: number;
+  imageTokens?: number;
 }
 
 /** Where a count call goes: the proxy's upstream. */
@@ -117,7 +124,11 @@ export function exceedsRequestLimit(bytes: number): boolean {
 /** Whether a sample's tokens-per-byte ratio can describe a request body. */
 export function plausibleSample(sample: SizeSample | undefined): sample is SizeSample {
   if (!sample || !(sample.tokens > 0) || !(sample.forwardedBytes > 0)) return false;
-  const ratio = sample.tokens / sample.forwardedBytes;
+  // Judged on its text: image bytes carry few tokens whatever their size.
+  const textBytes = sample.forwardedBytes - (sample.imageBytes ?? 0);
+  const textTokens = sample.tokens - (sample.imageTokens ?? 0);
+  if (!(textBytes > 0) || !(textTokens > 0)) return false;
+  const ratio = textTokens / textBytes;
   return ratio >= MIN_PLAUSIBLE_TOKENS_PER_BYTE && ratio <= MAX_PLAUSIBLE_TOKENS_PER_BYTE;
 }
 
@@ -181,7 +192,17 @@ export interface CountTokensSessionOptions {
 export interface CountTokensSession {
   count(body: Buffer): Promise<CountTokensResult>;
   peek(body: Buffer): CountTokensResult | undefined;
+  /**
+   * Count `body` again, once per request, after its count ran out of time
+   * (outcome "timeout" or "deadline"), with a fresh allowance for its size;
+   * undefined when it did not, or the retry was spent.
+   */
+  retry?(body: Buffer): Promise<CountTokensResult> | undefined;
 }
+
+/** Outcomes a retry may follow: the count ran out of time, not refused. */
+export const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
+  new Set(["timeout", "deadline"]);
 
 /**
  * Exact results belong to this request and body, never a shared sample slot.
@@ -198,8 +219,22 @@ export function createCountTokensSession(
   const account = countAccountKey(options);
   const clock = new CountingClock();
   let allowance = 0;
+  let retried = false;
   return {
     peek: (body) => completed.get(bodyHash(body)),
+    retry: (body) => {
+      const key = bodyHash(body);
+      const prior = completed.get(key);
+      if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
+          options.signal?.aborted || cooldowns.active(account)) return undefined;
+      retried = true;
+      const timeoutMs = requestAllowance(options, body.length);
+      const attempt = clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
+        .then((result) => recordAttempt(options, cooldowns, account, result))
+        .then((result) => { completed.set(key, result); return result; });
+      pending.set(key, attempt);
+      return attempt;
+    },
     count: (body) => {
       const key = bodyHash(body);
       const existing = pending.get(key);

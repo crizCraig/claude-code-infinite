@@ -23,13 +23,21 @@ import type { PaymentLinkCache } from "./payment-link.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 /**
- * Sent as `x-client-features` on compress calls. `near-window-budget`: ccc lifts
+ * Sent as `x-client-features` on every MemTree call. `near-window-budget`: ccc lifts
  * Claude Code's local refusal near the window (claude-env.ts) and compresses
  * mid-turn, so the server may give it the 900k budget on 1M-window models
- * (older ccc keeps 800k).
+ * (older ccc keeps 800k). `image-refs`: ccc reads the stored images an answer
+ * lists and sends those images as references afterwards (image-refs.ts).
  */
-export declare const CLIENT_FEATURES = "near-window-budget";
+export declare const CLIENT_FEATURES = "near-window-budget,image-refs";
 export declare const CLIENT_VERSION: string;
+/**
+ * Added to a compress call's budget per KiB of its upload: a large session's
+ * body (20+ MB) takes seconds to send on a slow link before the server even
+ * starts, so a flat budget times out on size alone (2026-10-23: every tool
+ * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ */
+export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
@@ -82,6 +90,13 @@ export interface CompressRequestMeta {
      * proxy tells them apart).
      */
     compressionThresholdTokens?: number;
+    /**
+     * Server `prepare`: a compression asked for ahead of need (the proxy's
+     * prepared compression, prepared-compression.ts), compressed to
+     * `compressionTargetTokens` whatever its size and billed as the compression
+     * it replaces. Part of the cache key: it changes the server's answer.
+     */
+    prepare?: boolean;
     /**
      * Server `client_input_tokens`: the proxy's own estimate of the request's
      * input tokens, the one its fallback gate refuses over-budget input by.
@@ -145,6 +160,11 @@ export interface CompressResult {
      * back to the cached_tokens heuristic (see didMemtreeCompress).
      */
     compressed?: boolean;
+    /**
+     * True on the answer to a `prepare` call from a server that prepares (and
+     * bills a preparation as the compression it replaces); older servers omit it.
+     */
+    prepared?: boolean;
     /**
      * The model's whole-request budget the server computed (tokens), whatever
      * target the request set. Servers that predate it omit the field.
@@ -298,6 +318,7 @@ export declare class MemtreeClient {
     private baseUrl;
     private apiKey;
     private compressTimeoutMs;
+    private compressSuccessAt;
     private longCompressTimeoutMs;
     private debug;
     private reqlog;
@@ -318,8 +339,18 @@ export declare class MemtreeClient {
     private indexedHashes;
     /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
     private backgroundIndexes;
+    /** Conversations (indexLaneKey) with a background index call in flight. */
+    private readonly indexLanesBusy;
+    /** Per busy conversation, the newest index call waiting for the one in flight. */
+    private readonly indexLanesNext;
+    /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
+    private readonly finalIndexLanes;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
+    /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
+    private drainCutting;
+    /** Images MemTree stores, sent as references instead of their bytes. */
+    private readonly imageRefs;
     /** Session → its main lane's latest conversation, for the final index. */
     private readonly mainConversations;
     /** Session → its final index waiting for the session to stay idle. */
@@ -337,6 +368,8 @@ export declare class MemtreeClient {
     private lastAnswerKeyInvalid;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
+    /** HTTP status of each key's latest failed compress (absent: no response). */
+    private compressFailureStatus;
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -372,6 +405,14 @@ export declare class MemtreeClient {
      * timeout rather than a fast server error.
      */
     get compressBudgetMs(): number;
+    /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
+    compressBudgetForBytes(bytes: number): number;
+    /**
+     * When a compress call (not an index-only one) last got a live successful
+     * answer (epoch ms; 0: never). A compress timing out while others succeed
+     * is its size or a slow reply, not an outage.
+     */
+    get lastCompressSuccessAt(): number;
     /**
      * Non-secret identity of the MemTree backend and account this client uses:
      * a hash over the origin and a hash of the key. Persisted state is valid only
@@ -422,6 +463,11 @@ export declare class MemtreeClient {
      */
     lastCompressFailureArming(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): boolean;
     /**
+     * The HTTP status of the latest failed compress of this request, sampled at
+     * its settle like lastCompressFailureArming; undefined when it got none.
+     */
+    lastCompressFailureStatus(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): number | undefined;
+    /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
      * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -449,6 +495,20 @@ export declare class MemtreeClient {
     indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes): void;
+    /**
+     * At most one background index call per conversation. Each call carries the whole
+     * history, so while one uploads only the newest waiting call is worth sending: a long
+     * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
+     * the compress calls that share the link (long-session test, staging 2026-10-24). A
+     * waiting call is replaced only by one whose history extends it; otherwise it goes now.
+     */
+    private enqueueIndex;
+    private startLaneIndex;
+    /**
+     * At shutdown: send every waiting call now, inside the drain, except one whose history
+     * the final index carries (a main session's, unless it was rewound since).
+     */
+    private sendWaitingIndexes;
     /**
      * The main lane's latest conversation for a session, kept for its final
      * index (scheduleFinalIndex). A new request also means the session did not
@@ -509,6 +569,20 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
+    /** One POST of a MemTree call's body. */
+    private postContextMemory;
+    /**
+     * Whether a failed answer to a call that sent references asks for their bytes: the
+     * server lacks some images (409: those are forgotten), or refuses references (400:
+     * this request's forgotten, or none ever again when the key may not send them).
+     */
+    private refusedRefs;
+    /**
+     * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
+     * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
+     * error carries 413, the status the server's front end would have answered.
+     */
+    private oversized;
     private log;
 }
 /** What noteMainConversation keeps: the last main-lane request as sent to MemTree. */

@@ -2,9 +2,14 @@
 import { createHash } from "node:crypto";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { stripCcSystemReminders } from "./turns.js";
-export async function prepareFinalMessages(messages, signal) {
+/**
+ * `serialized` is what is sent: each message as `reference` makes it (stored images as
+ * references, image-refs.ts), which `refs` lists; `messages` keeps the bytes.
+ */
+export async function prepareFinalMessages(messages, signal, reference = (value) => ({ value, refs: [] })) {
     const hash = createHash("sha256").update("[");
     const cleaned = [], retained = [], serialized = [];
+    const refs = [];
     for (let i = 0; i < messages.length; i++) {
         await yieldTurn(undefined, { signal });
         hash.update((i ? "," : "") + JSON.stringify(messages[i]));
@@ -12,12 +17,14 @@ export async function prepareFinalMessages(messages, signal) {
         if (message) {
             cleaned.push(message);
             retained.push(messages[i]);
-            serialized.push(JSON.stringify(message));
+            const sent = reference(message);
+            refs.push(...sent.refs);
+            serialized.push(JSON.stringify(sent.value));
         }
     }
     signal.throwIfAborted();
     return { messages: cleaned, retained, key: hash.update("]").digest("hex"),
-        serialized: `[${serialized.join(",")}]` };
+        serialized: `[${serialized.join(",")}]`, refs };
 }
 export async function readFinalReply(reader, signal) {
     await yieldTurn(undefined, { signal });

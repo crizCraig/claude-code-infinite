@@ -147,7 +147,9 @@ test('an uncalibrated byte estimate never exceeds the image-aware bound', () => 
   const candidate = sizing.register(body, 'ride', { tokens: 4_000, forwardedBytes: body.length });
   assert.equal(candidate.sample, undefined);
   assert.ok(candidate.conservativeTokens < 5_000);
-  assert.deepEqual(sizing.plan(candidate), { tokens: candidate.conservativeTokens, source: 'bytes' });
+  // Its text at bytes/4 plus the image's visual tokens, within the bound.
+  assert.equal(sizing.plan(candidate).source, 'bytes');
+  assert.ok(sizing.plan(candidate).tokens <= candidate.conservativeTokens);
   // Text: bytes/4 is below the bound, so it stays the estimate.
   const text = sizing.register(Buffer.from('x'.repeat(4_000)), 'original');
   assert.deepEqual(sizing.plan(text), { tokens: 1_000, source: 'bytes' });
