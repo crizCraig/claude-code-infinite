@@ -134,7 +134,8 @@ test("a resend after a slow 409 keeps the call's deadline", async () => {
     assert.ok(await first);
     // The 409 and then the resend each take 150 ms, against a 200 ms deadline.
     scripted.answers.push(
-      { delayMs: 150, status: 409, body: { detail: { message: "x", missing_image_sha256s: [sha(a)] } } },
+      { delayMs: 150, status: 409,
+        body: { detail: { message: "x", missing_image_sha256s: [sha(a)] } } },
       { delayMs: 150, status: 200, body: { messages, [STORED_IMAGES_FIELD]: [sha(a)] } });
     const next = [...messages, { role: "assistant", content: "x" }];
     const started = Date.now();

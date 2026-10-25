@@ -131,6 +131,8 @@ test("resume: no prefix and a raw request over the window gets the long compress
       const first = await h.post(resumed());
       assert.equal(first.status, 200, "forwarded compressed, not refused");
       assert.equal(h.compressCalls, 1);
+      // Not the short budget, which for a 1 MB upload (~1.1 s) would also outlast SLOW_MS.
+      assert.equal(h.budgets.at(-1), LONG_MS, "the long budget");
       assert.equal(h.forwarded.length, 1);
       assert.match(JSON.stringify(h.forwarded[0].messages), /memory 1 m/);
       assert.equal(h.lastRecord().turnType, "followup-compressed");

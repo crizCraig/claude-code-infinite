@@ -150,7 +150,8 @@ async function harness({ prepares = true, preparedTokens = 480_000, blockingDela
 /**
  * Every preparation a turn started (its record says `prepare: "prepare"`) has been answered
  * and handed back to the proxy: its MemTree record is logged, and the proxy's bookkeeping
- * after it (microtasks only) has run by the next macrotask.
+ * after it (microtasks only) has run by the next macrotask. It counts every non-index
+ * MemTree record, so it is only for a test that makes no blocking compress call.
  */
 async function preparationsSettled(h) {
   const count = kind => kind === 'messages'
@@ -244,6 +245,7 @@ test('replay: a 100k tool result landing at 940k rides the prepared prefix with 
     // no compress call reached MemTree, and no wait on a preparation in flight.
     assert.equal(h.blockingCalls().length, 0, 'no blocking compress call');
     assert.equal(overflow.record.compaction.preparedWaitMs, undefined, 'no wait on a preparation');
+    assert.equal(overflow.record.compress, undefined, 'no compress step, joined or cached');
     assert.equal(overflow.record.compaction.prepared, 'used');
     assert.equal(overflow.record.turnType, 'tool-prefix');
     const sent = h.forwards.at(-1);
