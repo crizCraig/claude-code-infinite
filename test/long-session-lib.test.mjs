@@ -165,7 +165,8 @@ function cleanRun() {
     requestBytes: 17_000_000, indexOnly: false, imageRefs: 200, base64Images: 4, ...extra });
   return {
     reqlog: [
-      { kind: "messages", turnType: "followup-degraded", upstreamStatus: 200 },
+      { kind: "messages", turnType: "followup-degraded", upstreamStatus: 200,
+        ts: new Date(3_000).toISOString(), compress: { ok: false, timedOut: false } },
       { kind: "messages", turnType: "followup-compressed", upstreamStatus: 200 },
       { kind: "messages", turnType: "tool-recompressed", upstreamStatus: 200 },
       { kind: "messages", turnType: "followup-prefix", upstreamStatus: 200 },
@@ -174,7 +175,7 @@ function cleanRun() {
     ],
     relay: [
       call({ compressed: true }), call({ compressed: true }), call({ compressed: false }),
-      call({ indexOnly: true }), call({ status: 503, ms: 0, injected: true }),
+      call({ indexOnly: true }), call({ status: 503, ms: 0, injected: true, at: 2_000 }),
       call({ prepare: true, status: 503, ms: 0, injected: true }), call({ prepare: true, ms: 40_000 }),
       call({ indexOnly: true, finalIndex: true, ms: 1_900, startedAt: 9_100 }),
       { kind: "diagnostics", events: [{ name: "console_closed", t: 9_000 },
@@ -183,6 +184,7 @@ function cleanRun() {
     mock: [{ kind: "messages", lane: "main", tokens: 905_000, status: 200 },
       { kind: "messages", lane: "main", step: "answer", tokens: 905_100, status: 200 }],
     run: { turns: 300, turnsDone: 300, injectCooldown: true, consoleClosed: true, closedAt: 9_000,
+      conversationBytes: 33_000_000,
       serverSession: { finalTurnIndexed: true, detail: "ok" } },
   };
 }
@@ -226,6 +228,25 @@ test("bodies: under 30 MiB with image refs; failing either names the check", () 
   const noRefs = cleanRun();
   for (const r of noRefs.relay) if (r.kind === "memtree") r.imageRefs = 0;
   assert.equal(status(noRefs), FAIL);
+  const small = cleanRun();
+  small.run.conversationBytes = 12_000_000;
+  assert.equal(status(small), FAIL, "a small conversation proves nothing about refs");
+});
+
+test("degraded turns: only the injected turn's record is excused", () => {
+  const name = "no degraded or timed-out compressions";
+  const status = (run) => evaluateRun(run).find((r) => r.name === name).status;
+  const other = cleanRun();
+  other.reqlog[0].ts = new Date(500_000).toISOString(); // long after the injection
+  assert.equal(status(other), FAIL);
+  const timedOut = cleanRun();
+  timedOut.reqlog.push({ kind: "messages", turnType: "followup-compressed", ts: new Date(4_000).toISOString(),
+    compress: { ok: true, timedOut: true } });
+  assert.equal(status(timedOut), FAIL);
+  const cut = cleanRun();
+  cut.relay.push({ kind: "memtree", path: "/v1/context_memory", indexOnly: true, error: "client closed", at: 9_500 });
+  const failed = evaluateRun(cut).find((r) => r.name === "no failed MemTree calls");
+  assert.equal(failed.status, PASS, "a call the shutdown cut is judged by the exit checks");
 });
 
 test("crossings need both paths; injected prepares are not the cooldown's failure", () => {

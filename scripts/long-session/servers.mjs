@@ -244,8 +244,9 @@ function describeMemtreeRequest(pathOnly, raw, startedAt) {
 
 /** Images a MemTree body carries as references and as base64 bytes. */
 function countImages(raw) {
-  return { imageRefs: occurrences(raw, `"${IMAGE_REF_PREFIX}`),
-    base64Images: occurrences(raw, '"type":"base64"') };
+  // A referenced image keeps its base64 source block; only its data changes.
+  const imageRefs = occurrences(raw, `"${IMAGE_REF_PREFIX}`);
+  return { imageRefs, base64Images: Math.max(0, occurrences(raw, '"type":"base64"') - imageRefs) };
 }
 
 function occurrences(buf, needle) {

@@ -8,13 +8,18 @@ import { deflateSync } from "node:zlib";
 export const CHARS_PER_TOKEN = 2.7;
 /** Per-message overhead tokens, like Anthropic's role/turn framing. */
 export const MESSAGE_OVERHEAD_TOKENS = 8;
-/** ccc's whole-request budget on a 1M-window Opus (proxy.ts fallbackBudgetTokens). */
+/**
+ * The budget assumed until MemTree reports one (its first answers carry model_budget_tokens,
+ * which ccc and the harness then both use; staging says 960k) and the mock MemTree's budget.
+ */
 export const BUDGET_TOKENS = 900_000;
 export const WINDOW_TOKENS = 1_000_000;
 /** Cloud Run's request limit over HTTP/1, which ccc's MemTree calls use. */
 export const HTTP1_EDGE_BYTES = 32 * 1024 * 1024;
 /** MemTree bodies must stay under this (image references keep them there). */
 export const MEMTREE_BODY_LIMIT_BYTES = 30 * 1024 * 1024;
+/** Claude Code's conversation must reach this for the body check to mean anything. */
+export const MIN_CONVERSATION_BYTES = 28_000_000;
 /** What a stored image's base64 becomes on a MemTree call (ccc image-refs.ts). */
 export const IMAGE_REF_PREFIX = "memtree-image:sha256:";
 /** ccc's ordinary compress timeout (memtree.ts DEFAULT_COMPRESS_TIMEOUT_MS). */
@@ -27,6 +32,9 @@ export const MAX_TEXT_FILES_PER_TURN = 3;
 export const MAX_IMAGES_PER_TURN = 4;
 /** Typical base64 size of one fixture image, for planning. */
 export const IMAGE_B64_BYTES = 105_000;
+
+/** How long after the injected 503 the degraded turn's record may be written. */
+const INJECTED_TURN_MS = 120_000;
 
 export const PASS = "PASS";
 export const FAIL = "FAIL";
@@ -321,8 +329,10 @@ export function planTurn({ turn, turns, forwardedTokens, conversationBytes, cros
   if (jump) wantTokens = Math.max(wantTokens, budget + JUMP_OVER_TOKENS - forwardedTokens);
   const maxChars = (jump ? MAX_JUMP_FILES : MAX_TEXT_FILES_PER_TURN) * MAX_TEXT_FILE_CHARS;
   const textChars = Math.min(maxChars, Math.round(wantTokens * CHARS_PER_TOKEN));
-  // Once only: a turn already over the budget (its compress failed) gets no second answer.
-  const answerTokens = phase === 0 && left <= 1 && under ? LONG_ANSWER_TOKENS : 0;
+  // Only once the reads reach the goal (a shrinking pace can leave them short: then the
+  // answer waits a turn), and once only: a turn already over the budget gets none.
+  const reached = forwardedTokens + textChars / CHARS_PER_TOKEN >= goalTokens - 2_000;
+  const answerTokens = phase === 0 && left <= 1 && under && reached ? LONG_ANSWER_TOKENS : 0;
   const late = turn > Math.round(turns * 0.9);
   const byteGoal = late ? edgeBytes : peakBytes;
   const byteTurn = late ? turns : Math.round(turns * 0.9);
@@ -400,7 +410,9 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
     `peak forwarded ${Math.round(peak / 1000)}k tokens (budget ${Math.round(budget / 1000)}k)`);
   checkBodies(calls, run, add);
 
-  const failedCalls = calls.filter((r) => !r.injected && r.status !== 200);
+  // Calls ccc's shutdown cut are judged by the exit checks below, not here.
+  const failedCalls = calls.filter((r) => !r.injected && r.status !== 200 &&
+    !(r.error === "client closed" && run.closedAt && r.at >= run.closedAt));
   add("no failed MemTree calls", failedCalls.length === 0, describeFailures(failedCalls));
   const over413 = [...calls, ...mock].filter((r) => r.status === 413);
   add("no 413 anywhere", over413.length === 0, over413.length ? describeFailures(over413) : "none");
@@ -428,9 +440,15 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
     `${readErrors} Read errors, ${missing} turns missing results`);
   const degraded = messages.filter((r) => r.turnType === "followup-degraded" || r.compress?.timedOut);
   // The injected outage degrades exactly one human turn, by design (a failed prepare call
-  // degrades nothing: that turn compresses by a blocking call instead).
-  add("no degraded or timed-out compressions", degraded.length === injected.length,
-    `${degraded.length} degraded (${injected.length} by the injected outage)`);
+  // degrades nothing: that turn compresses by a blocking call instead): the record of the
+  // human turn whose compress call failed, written once its answer finished.
+  const byInjection = (r) => r.turnType === "followup-degraded" && r.compress?.timedOut === false &&
+    injected.some((c) => r.ts && Date.parse(r.ts) >= c.at && Date.parse(r.ts) - c.at < INJECTED_TURN_MS);
+  const real = degraded.filter((r) => !byInjection(r));
+  add("no degraded or timed-out compressions", real.length === 0 &&
+    degraded.length - real.length === injected.length,
+    `${degraded.length} degraded (${degraded.length - real.length} by the injected outage, ` +
+    `${injected.length} injected)`);
 
   const latencies = compressCalls.filter((r) => !r.injected).map((r) => r.ms);
   const p95 = percentile(latencies, 95);
@@ -498,11 +516,14 @@ function checkBodies(calls, run, add) {
   const refs = withRefs.reduce((n, r) => n + r.imageRefs, 0);
   const conflicts = calls.filter((r) => r.status === 409).length;
   const bytes = largest?.requestBytes ?? 0;
+  // Vacuous unless the conversation itself got big.
+  const conversation = run.conversationBytes ?? 0;
   add("MemTree bodies stay under 30 MiB and image refs are used",
-    bytes < MEMTREE_BODY_LIMIT_BYTES && withRefs.length > 0,
+    bytes < MEMTREE_BODY_LIMIT_BYTES && withRefs.length > 0 && conversation >= MIN_CONVERSATION_BYTES,
     `largest MemTree call ${(bytes / 1e6).toFixed(1)} MB (${largest?.imageRefs ?? 0} refs, ` +
     `${largest?.base64Images ?? 0} images as bytes); ${refs} refs in ${withRefs.length}/${calls.length} ` +
-    `calls; ${conflicts} answered 409; conversation ~${((run.conversationBytes ?? 0) / 1e6).toFixed(1)} MB`);
+    `calls; ${conflicts} answered 409; conversation ~${(conversation / 1e6).toFixed(1)} MB ` +
+    `(needs ${MIN_CONVERSATION_BYTES / 1e6} MB)`);
 }
 
 function checkExitDiagnostics(diag, memtreeLogs, run, add) {
