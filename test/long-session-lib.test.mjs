@@ -170,7 +170,9 @@ function cleanRun() {
       { kind: "messages", turnType: "followup-compressed", upstreamStatus: 200 },
       { kind: "messages", turnType: "tool-recompressed", upstreamStatus: 200 },
       { kind: "messages", turnType: "followup-prefix", upstreamStatus: 200 },
-      { kind: "messages", turnType: "tool", upstreamStatus: 200, routeRecovery: { outcome: "cooldown" } },
+      { kind: "messages", turnType: "tool", upstreamStatus: 200, routeRecovery: { outcome: "cooldown" },
+        ts: new Date(3_500).toISOString() },
+      { kind: "messages", turnType: "tool", routeLane: "main", requestBytes: 33_000_000, upstreamStatus: 200 },
       { kind: "memtree", ok: true, ts: new Date(5_000).toISOString() },
     ],
     relay: [
@@ -184,7 +186,6 @@ function cleanRun() {
     mock: [{ kind: "messages", lane: "main", tokens: 905_000, status: 200 },
       { kind: "messages", lane: "main", step: "answer", tokens: 905_100, status: 200 }],
     run: { turns: 300, turnsDone: 300, injectCooldown: true, consoleClosed: true, closedAt: 9_000,
-      conversationBytes: 33_000_000,
       serverSession: { finalTurnIndexed: true, detail: "ok" } },
   };
 }
@@ -229,7 +230,7 @@ test("bodies: under 30 MiB with image refs; failing either names the check", () 
   for (const r of noRefs.relay) if (r.kind === "memtree") r.imageRefs = 0;
   assert.equal(status(noRefs), FAIL);
   const small = cleanRun();
-  small.run.conversationBytes = 12_000_000;
+  small.reqlog.find((r) => r.requestBytes).requestBytes = 12_000_000;
   assert.equal(status(small), FAIL, "a small conversation proves nothing about refs");
 });
 
@@ -259,6 +260,21 @@ test("crossings need both paths; injected prepares are not the cooldown's failur
   twoInjected.relay.push({ kind: "memtree", path: "/v1/context_memory", status: 503, injected: true });
   const cooldown = evaluateRun(twoInjected).find((r) => /cooldown/.test(r.name));
   assert.equal(cooldown.status, FAIL);
+  const elsewhere = cleanRun();
+  const cool = elsewhere.reqlog.find((r) => r.routeRecovery);
+  cool.routeLane = "agent";
+  assert.equal(evaluateRun(elsewhere).find((r) => /cooldown/.test(r.name)).status, FAIL,
+    "a cooldown on another lane is not the injected one");
+  cool.routeLane = "main";
+  cool.ts = new Date(1_000).toISOString();
+  assert.equal(evaluateRun(elsewhere).find((r) => /cooldown/.test(r.name)).status, FAIL,
+    "a cooldown before the injected failure is not its own");
+  const drained = cleanRun();
+  drained.reqlog.push({ kind: "memtree", ok: false, callerAborted: true, ts: new Date(9_600).toISOString() });
+  assert.equal(evaluateRun(drained).find((r) => /memtree_error at exit/.test(r.name)).status, PASS,
+    "a drained background call is no exit failure");
+  drained.reqlog.push({ kind: "memtree", ok: false, exitCut: true, finalIndex: true, ts: new Date(9_700).toISOString() });
+  assert.equal(evaluateRun(drained).find((r) => /memtree_error at exit/.test(r.name)).status, FAIL);
   const latency = evaluateRun(cleanRun()).find((r) => /latency/.test(r.name));
   assert.equal(latency.status, PASS, "a 40 s background prepare call is not a blocking compress");
 });

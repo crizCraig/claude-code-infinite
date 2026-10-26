@@ -408,7 +408,7 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
   const budget = run.budget ?? BUDGET_TOKENS;
   add("forwarded context reached the budget", peak >= budget * 0.97 && peak <= WINDOW_TOKENS,
     `peak forwarded ${Math.round(peak / 1000)}k tokens (budget ${Math.round(budget / 1000)}k)`);
-  checkBodies(calls, run, add);
+  checkBodies(calls, messages, add);
 
   // Calls ccc's shutdown cut are judged by the exit checks below, not here.
   const failedCalls = calls.filter((r) => !r.injected && r.status !== 200 &&
@@ -452,12 +452,16 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
 
   const latencies = compressCalls.filter((r) => !r.injected).map((r) => r.ms);
   const p95 = percentile(latencies, 95);
-  add("compress latency p95 under ccc's 15 s timeout", p95 !== undefined && p95 < COMPRESS_TIMEOUT_MS,
+  // A performance bar: ccc's ordinary compress timeout (calls near the budget get longer ones).
+  add("compress latency p95 under 15 s (ccc's ordinary compress timeout)", p95 !== undefined && p95 < COMPRESS_TIMEOUT_MS,
     p95 === undefined ? "no compress calls" :
       `p50 ${percentile(latencies, 50)} ms, p95 ${p95} ms, max ${Math.max(...latencies)} ms`);
 
   if (run.injectCooldown) {
-    const cooldown = messages.filter((r) => r.routeRecovery?.outcome === "cooldown").length;
+    // On the main thread, after the injected failure and within the cooldown it armed.
+    const cooldown = messages.filter((r) => r.routeRecovery?.outcome === "cooldown" &&
+      (r.routeLane ?? "main") === "main" && injected.length === 1 && r.ts &&
+      Date.parse(r.ts) >= injected[0].at && Date.parse(r.ts) - injected[0].at < INJECTED_TURN_MS).length;
     const preparesFailed = prepareCalls.filter((r) => r.injected).length;
     add("outage cooldown engaged after an injected failure", injected.length === 1 && cooldown > 0,
       `${injected.length} compress call failed (and ${preparesFailed} prepare calls before it), ` +
@@ -510,14 +514,15 @@ function adopted(record) {
  * but MemTree calls carry the images MemTree already stores as references, so its bodies
  * stay under MEMTREE_BODY_LIMIT_BYTES; and references must actually be used.
  */
-function checkBodies(calls, run, add) {
+function checkBodies(calls, messages, add) {
   const largest = calls.reduce((a, r) => ((r.requestBytes ?? 0) > (a?.requestBytes ?? 0) ? r : a), undefined);
   const withRefs = calls.filter((r) => (r.imageRefs ?? 0) > 0);
   const refs = withRefs.reduce((n, r) => n + r.imageRefs, 0);
   const conflicts = calls.filter((r) => r.status === 409).length;
   const bytes = largest?.requestBytes ?? 0;
-  // Vacuous unless the conversation itself got big.
-  const conversation = run.conversationBytes ?? 0;
+  // Vacuous unless the conversation itself got big: Claude Code's largest main-thread body.
+  const conversation = Math.max(0, ...messages.filter((r) => (r.routeLane ?? "main") === "main")
+    .map((r) => r.requestBytes ?? 0));
   add("MemTree bodies stay under 30 MiB and image refs are used",
     bytes < MEMTREE_BODY_LIMIT_BYTES && withRefs.length > 0 && conversation >= MIN_CONVERSATION_BYTES,
     `largest MemTree call ${(bytes / 1e6).toFixed(1)} MB (${largest?.imageRefs ?? 0} refs, ` +
@@ -538,8 +543,10 @@ function checkExitDiagnostics(diag, memtreeLogs, run, add) {
       : "Claude Code exited 0 (no claude_exit event)");
   const cutoff = closed?.t ?? run.closedAt ?? Infinity;
   const exitErrors = diag.filter((e) => e.name === "memtree_error" && (e.t ?? 0) >= cutoff);
+  // A background call the drain cancelled says nothing about MemTree (no memtree_error);
+  // a cut final index or index still counts.
   const exitLogFailures = memtreeLogs.filter((r) => !r.ok && r.ts && run.closedAt &&
-    Date.parse(r.ts) >= run.closedAt);
+    Date.parse(r.ts) >= run.closedAt && !(r.callerAborted && !r.exitCut));
   add("no memtree_error at exit", !exitErrors.length && !exitLogFailures.length,
     `${exitErrors.length} memtree_error events, ${exitLogFailures.length} failed calls in the log` +
     (exitErrors[0] ? ` (first: status ${exitErrors[0].status ?? "none"}, ${exitErrors[0].ms} ms)` : ""));

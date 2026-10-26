@@ -454,8 +454,7 @@ function evaluate(facts) {
     reqlog.map((r) => redactPublic(JSON.stringify(r), [KEY])).join("\n") + "\n");
   const relay = state.events.filter((e) => e.kind === "memtree" || e.kind === "diagnostics");
   const mock = state.events.filter((e) => e.kind === "messages" || e.kind === "count");
-  return evaluateRun({ reqlog, relay, mock, run: { ...facts, turns: TURNS, budget: state.budget,
-    conversationBytes: state.conversationBytes } });
+  return evaluateRun({ reqlog, relay, mock, run: { ...facts, turns: TURNS, budget: state.budget } });
 }
 
 function finish(rawResults, facts) {
