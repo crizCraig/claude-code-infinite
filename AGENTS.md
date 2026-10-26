@@ -37,7 +37,8 @@ tree ids: this repo's logs are public. Overview: polychat's docs/e2e_daily_check
 `.github/workflows/windows-long-session.yml` runs nightly on Windows: real Claude Code under
 this checkout's ccc in a ConPTY console for ~300 turns, a local mock Anthropic
 (`CCC_ANTHROPIC_UPSTREAM`, loopback only) and staging MemTree through a recording relay, past
-the budget twice and toward 30 MB+ bodies, then a console close (`scripts/long-session/`). Same
+the budget on a human turn and in a tool round, a ~30 MB+ conversation (image references keep
+MemTree's bodies under 30 MiB), then a console close (`scripts/long-session/`). Same
 `e2e` environment and key; branch runs (no key) use its mock MemTree. Develop it locally with
 `LS_CCC_CLI=dist/cli.js LS_TURNS=60 node scripts/long-session/run.mjs` (after `npm ci` in
 `scripts/long-session`).

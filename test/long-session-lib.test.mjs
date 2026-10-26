@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  BUDGET_TOKENS, FAIL, HTTP1_EDGE_BYTES, LONG_ANSWER_TOKENS, PASS, SKIP, countBodyTokens,
-  evaluateRun, followsConsoleClose, imageDimensions, imageTokensOf, parseTurnPrompt, percentile,
+  BUDGET_TOKENS, FAIL, HTTP1_EDGE_BYTES, LONG_ANSWER_TOKENS, PASS, PREPARE_START_RATIO, SKIP,
+  countBodyTokens, crossingPath, evaluateRun, followsConsoleClose, imageDimensions, imageTokensOf, parseTurnPrompt, percentile,
   planTurn, pngFixture, redactPublic, textFileContent, toolResultsIn, turnPrompt, uniqueJpeg,
 } from "../scripts/long-session/lib.mjs";
 
@@ -50,49 +50,74 @@ test("text files are unique per seed and about the size asked", () => {
   assert.notEqual(textFileContent(2, 40_000, "T1"), a);
 });
 
-test("the plan compresses twice by both paths and ends past the 32 MiB edge", () => {
-  const sim = simulate(300);
-  assert.equal(sim.crossings.length >= 2, true, JSON.stringify(sim.crossings));
-  const [first, second] = sim.crossings;
-  assert.equal(first.path, "human", "the first crossing lands on a human turn (long answer)");
-  assert.ok(first.turn > 90 && first.turn < 120, `first at ${first.turn}`);
-  assert.equal(second.path, "tool", "the second lands in a tool round");
-  assert.ok(second.turn > 190 && second.turn < 225, `second at ${second.turn}`);
-  assert.ok(sim.bytesAt270 > 27_000_000 && sim.bytesAt270 < HTTP1_EDGE_BYTES, `${sim.bytesAt270}`);
-  assert.ok(sim.finalBytes > HTTP1_EDGE_BYTES, `${sim.finalBytes}`);
-  assert.ok(sim.peakTokens <= 1_000_000, `${sim.peakTokens}`);
-});
+for (const [budget, turns] of [[960_000, 300], [900_000, 300], [960_000, 60]]) {
+  test(`the plan crosses by both paths, the second without a prepared prefix (${budget}, ${turns} turns)`, () => {
+    const sim = simulate(turns, budget);
+    assert.equal(sim.crossings.length, 2, JSON.stringify(sim.crossings));
+    const [first, second] = sim.crossings;
+    assert.equal(first.path, "human", "the first crossing lands on a human turn (long answer)");
+    assert.ok(first.turn > turns * 0.3 && first.turn < turns * 0.4, `first at ${first.turn}`);
+    assert.ok(first.prepared, "ccc had started preparing before the human-turn crossing");
+    assert.equal(second.path, "tool", "the second lands in a tool round");
+    assert.ok(second.turn > turns * 0.63 && second.turn < turns * 0.75, `second at ${second.turn}`);
+    assert.equal(second.prepared, false, "nothing was prepared before the jump");
+    if (turns === 300) {
+      assert.ok(sim.bytesAt270 > 27_000_000 && sim.bytesAt270 < HTTP1_EDGE_BYTES, `${sim.bytesAt270}`);
+      assert.ok(sim.finalBytes > HTTP1_EDGE_BYTES, `${sim.finalBytes}`);
+    }
+    // Every request over the budget stays clear of the window less Claude Code's 16k output floor.
+    assert.ok(sim.peakTokens <= 1_000_000 - 16_000, `${sim.peakTokens}`);
+  });
+}
 
-/** The plan against an idealized session: compressing halves the forwarded tokens. */
-function simulate(turns) {
+/**
+ * The plan against an idealized ccc: a request at the budget compresses (to half of it),
+ * and ccc prepares a prefix once a request reaches the prepare start.
+ */
+function simulate(turns, budget) {
   let tokens = 25_000;
   let bytes = 150_000;
-  let compressions = 0;
   let peakTokens = 0;
   let bytesAt270 = 0;
+  let prepared = false;
   const crossings = [];
-  for (let turn = 1; turn <= turns; turn++) {
-    if (tokens >= BUDGET_TOKENS) { // the human turn compresses
-      crossings.push({ turn, path: "human" });
-      compressions++;
-      tokens = BUDGET_TOKENS / 2;
+  const send = (path, turn) => {
+    peakTokens = Math.max(peakTokens, tokens);
+    if (tokens >= budget) {
+      crossings.push({ turn, path, prepared });
+      tokens = budget / 2;
+      prepared = false;
+    } else if (tokens >= budget * PREPARE_START_RATIO) {
+      prepared = true;
     }
-    const plan = planTurn({ turn, turns, forwardedTokens: tokens, conversationBytes: bytes, compressions });
+  };
+  for (let turn = 1; turn <= turns; turn++) {
+    const plan = planTurn({ turn, turns, forwardedTokens: tokens, conversationBytes: bytes,
+      crossings: crossings.length, budget });
+    tokens += 40; // the prompt
+    send("human", turn);
     const chars = plan.texts.reduce((a, b) => a + b, 0);
     tokens += Math.ceil(chars / 2.7) + plan.images * 300;
-    peakTokens = Math.max(peakTokens, tokens);
-    if (tokens >= BUDGET_TOKENS) { // the tool round compresses
-      crossings.push({ turn, path: "tool" });
-      compressions++;
-      tokens = BUDGET_TOKENS / 2;
-    }
+    send("tool", turn);
     tokens += plan.answerTokens || 30;
-    bytes += chars * 1.05 + plan.images * 105_000 + (plan.answerTokens || 30) * 2.7;
+    bytes += chars + plan.images * 105_000 + (plan.answerTokens || 30) * 2.7;
     if (turn === 270) bytesAt270 = bytes;
     if (plan.answerTokens) assert.equal(plan.answerTokens, LONG_ANSWER_TOKENS);
   }
   return { crossings, peakTokens, bytesAt270, finalBytes: bytes };
 }
+
+test("crossings: a blocking compress or a prepared prefix, main thread only", () => {
+  const rec = (turnType, prepared, routeLane) => ({ kind: "messages", turnType, routeLane,
+    ...(prepared ? { compaction: { prepared } } : {}) });
+  assert.equal(crossingPath(rec("followup-compressed")), "human");
+  assert.equal(crossingPath(rec("followup-prefix", "used", "main")), "human");
+  assert.equal(crossingPath(rec("followup-prefix")), undefined, "riding an old prefix is no crossing");
+  assert.equal(crossingPath(rec("tool-recompressed")), "tool");
+  assert.equal(crossingPath(rec("tool-prefix", "truncated")), "tool");
+  assert.equal(crossingPath(rec("tool-prefix", "stale")), undefined);
+  assert.equal(crossingPath(rec("tool-recompressed", undefined, "agent")), undefined);
+});
 
 test("percentile is nearest-rank", () => {
   assert.equal(percentile([], 95), undefined);
@@ -130,24 +155,27 @@ test("evaluateRun passes a clean run and names each failure", () => {
   bad.relay.find((r) => r.finalIndex).status = undefined;
   bad.relay.push({ kind: "diagnostics", events: [{ name: "memtree_error", t: 9_500, status: 0 }] });
   const names = evaluateRun(bad).filter((r) => r.status === FAIL).map((r) => r.name);
-  assert.deepEqual(names, ["no failed MemTree calls", "no 413 anywhere", "MemTree calls past 32 MiB succeed",
+  assert.deepEqual(names, ["MemTree bodies stay under 30 MiB and image refs are used",
+    "no failed MemTree calls", "no 413 anywhere", "MemTree calls past 32 MiB succeed",
     "final index sent and accepted after the close", "no memtree_error at exit"]);
 });
 
 function cleanRun() {
   const call = (extra) => ({ kind: "memtree", path: "/v1/context_memory", status: 200, ms: 1_200,
-    requestBytes: 29_000_000, indexOnly: false, ...extra });
+    requestBytes: 17_000_000, indexOnly: false, imageRefs: 200, base64Images: 4, ...extra });
   return {
     reqlog: [
       { kind: "messages", turnType: "followup-degraded", upstreamStatus: 200 },
       { kind: "messages", turnType: "followup-compressed", upstreamStatus: 200 },
       { kind: "messages", turnType: "tool-recompressed", upstreamStatus: 200 },
+      { kind: "messages", turnType: "followup-prefix", upstreamStatus: 200 },
       { kind: "messages", turnType: "tool", upstreamStatus: 200, routeRecovery: { outcome: "cooldown" } },
       { kind: "memtree", ok: true, ts: new Date(5_000).toISOString() },
     ],
     relay: [
       call({ compressed: true }), call({ compressed: true }), call({ compressed: false }),
       call({ indexOnly: true }), call({ status: 503, ms: 0, injected: true }),
+      call({ prepare: true, status: 503, ms: 0, injected: true }), call({ prepare: true, ms: 40_000 }),
       call({ indexOnly: true, finalIndex: true, ms: 1_900, startedAt: 9_100 }),
       { kind: "diagnostics", events: [{ name: "console_closed", t: 9_000 },
         { name: "claude_exit", code: 1, t: 9_400 }] },
@@ -186,6 +214,32 @@ test("tool results: structured for every id, or flattened with each text file's 
   assert.equal(check(flat("→ result (error): gone (tool_use_id=toolu_a)\n→ result: T9.0 x (tool_use_id=toolu_b)")).errors,
     1, "the error prefix belongs to its own entry");
   assert.deepEqual(toolResultsIn(body([]), "", [], prompt), { complete: false, seen: false, errors: 0 });
+});
+
+test("bodies: under 30 MiB with image refs; failing either names the check", () => {
+  const name = "MemTree bodies stay under 30 MiB and image refs are used";
+  const status = (run) => evaluateRun(run).find((r) => r.name === name).status;
+  assert.equal(status(cleanRun()), PASS);
+  const big = cleanRun();
+  big.relay[0].requestBytes = 31_500_000;
+  assert.equal(status(big), FAIL);
+  const noRefs = cleanRun();
+  for (const r of noRefs.relay) if (r.kind === "memtree") r.imageRefs = 0;
+  assert.equal(status(noRefs), FAIL);
+});
+
+test("crossings need both paths; injected prepares are not the cooldown's failure", () => {
+  const humanOnly = cleanRun();
+  humanOnly.reqlog = humanOnly.reqlog.filter((r) => r.turnType !== "tool-recompressed");
+  humanOnly.reqlog.push({ kind: "messages", turnType: "tool-prefix", compaction: { prepared: "stale" } });
+  const both = evaluateRun(humanOnly).find((r) => /both paths/.test(r.name));
+  assert.equal(both.status, FAIL);
+  const twoInjected = cleanRun();
+  twoInjected.relay.push({ kind: "memtree", path: "/v1/context_memory", status: 503, injected: true });
+  const cooldown = evaluateRun(twoInjected).find((r) => /cooldown/.test(r.name));
+  assert.equal(cooldown.status, FAIL);
+  const latency = evaluateRun(cleanRun()).find((r) => /latency/.test(r.name));
+  assert.equal(latency.status, PASS, "a 40 s background prepare call is not a blocking compress");
 });
 
 test("refusal details never carry the lane (it names the session)", () => {

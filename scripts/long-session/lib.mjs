@@ -13,6 +13,10 @@ export const BUDGET_TOKENS = 900_000;
 export const WINDOW_TOKENS = 1_000_000;
 /** Cloud Run's request limit over HTTP/1, which ccc's MemTree calls use. */
 export const HTTP1_EDGE_BYTES = 32 * 1024 * 1024;
+/** MemTree bodies must stay under this (image references keep them there). */
+export const MEMTREE_BODY_LIMIT_BYTES = 30 * 1024 * 1024;
+/** What a stored image's base64 becomes on a MemTree call (ccc image-refs.ts). */
+export const IMAGE_REF_PREFIX = "memtree-image:sha256:";
 /** ccc's ordinary compress timeout (memtree.ts DEFAULT_COMPRESS_TIMEOUT_MS). */
 export const COMPRESS_TIMEOUT_MS = 15_000;
 /** The diagnostics store's pairing window (polychat ccc_diagnostics_store.py). */
@@ -274,32 +278,51 @@ function flattenedResult(raw, id) {
 
 /** Tokens of the long answer that carries the first crossing into a human turn. */
 export const LONG_ANSWER_TOKENS = 24_000;
+/** The first crossing: tool rounds stop this far under the budget, then the long answer. */
+export const HUMAN_CROSSING_MARGIN_TOKENS = 15_000;
+/** ccc starts preparing a compressed prefix at this share of the trigger (prepared-compression.ts). */
+export const PREPARE_START_RATIO = 850 / 960;
+/** The second crossing: the session waits this far under the prepare start, then one tool round… */
+export const JUMP_FROM_MARGIN_TOKENS = 40_000;
+/** …lands this far over the budget (still clear of the window less Claude Code's output floor). */
+export const JUMP_OVER_TOKENS = 15_000;
+/** Text files the jump's tool round may read (each one Read of up to MAX_TEXT_FILE_CHARS). */
+export const MAX_JUMP_FILES = 10;
 
 /**
  * What turn `turn` of `turns` reads, steering two quantities:
- * - the tokens of the body forwarded upstream (`forwardedTokens`, after the turn's tool
- *   round), so MemTree compresses twice, by both paths: near 35% of the run the tool
- *   rounds stop just under the budget and a long answer carries the conversation over
- *   it, so the next human turn compresses (followup-compressed); near 70% a large tool
- *   round crosses it mid-turn (tool-recompressed);
- * - the bytes of Claude Code's whole conversation (`conversationBytes`), which every
- *   MemTree call carries in full, toward `peakBytes` by 90% of the run and past
- *   `edgeBytes` (Cloud Run's 32 MiB HTTP/1 limit) in the last turns.
+ * - the tokens of the body forwarded upstream (`forwardedTokens`, the newest main-thread
+ *   request; ccc counts exactly near the budget, so its size is ccc's), so the budget is
+ *   crossed once by each path. `crossings` (forwarded size dropping after a compression)
+ *   picks the phase:
+ *   0. near 35% of the run the tool rounds stop HUMAN_CROSSING_MARGIN_TOKENS under the
+ *      budget and a long answer carries the conversation over it, so the next human turn
+ *      is the one that compresses (followup-compressed, or the prefix ccc prepared from
+ *      850k on, followup-prefix);
+ *   1. the session then grows only to JUMP_FROM_MARGIN_TOKENS under the prepare start, so
+ *      no prefix is prepared, and near 70% one large tool round jumps over the budget:
+ *      the mid-turn blocking compress (tool-recompressed);
+ *   2. then it grows toward 97% of the budget by the end.
+ * - the bytes of Claude Code's whole conversation (`conversationBytes`, every file read
+ *   and answer), toward `peakBytes` by 90% of the run and past `edgeBytes` (Cloud Run's
+ *   32 MiB HTTP/1 limit) in the last turns, so MemTree's image references are what keep
+ *   its bodies small.
  */
-export function planTurn({ turn, turns, forwardedTokens, conversationBytes, compressions,
+export function planTurn({ turn, turns, forwardedTokens, conversationBytes, crossings,
   peakBytes = 30_000_000, edgeBytes = HTTP1_EDGE_BYTES + 1_500_000, budget = BUDGET_TOKENS }) {
-  const phase = Math.min(compressions, 2);
+  const phase = Math.min(crossings, 2);
   const goalTurn = Math.round(turns * [0.35, 0.7, 1.05][phase]);
-  // Past the budget but clear of the window (a 960k server budget leaves 40k).
-  const over = Math.min(budget + 40_000, (budget + WINDOW_TOKENS) / 2);
-  const goalTokens = [budget - 12_000, over, budget * 0.97][phase];
+  const jumpFrom = Math.floor(budget * PREPARE_START_RATIO) - JUMP_FROM_MARGIN_TOKENS;
+  const goalTokens = [budget - HUMAN_CROSSING_MARGIN_TOKENS, jumpFrom, budget * 0.97][phase];
   const left = Math.max(1, goalTurn - turn + 1);
+  const under = forwardedTokens < budget;
   let wantTokens = Math.max(1_500, (goalTokens - forwardedTokens) / left);
-  const jump = phase === 1 && left <= 1 && forwardedTokens < budget;
-  if (jump) wantTokens = Math.max(wantTokens, over - forwardedTokens);
-  const textChars = Math.min(MAX_TEXT_FILES_PER_TURN * MAX_TEXT_FILE_CHARS,
-    Math.round(wantTokens * CHARS_PER_TOKEN));
-  const answerTokens = phase === 0 && left <= 1 ? LONG_ANSWER_TOKENS : 0;
+  const jump = phase === 1 && left <= 1 && under;
+  if (jump) wantTokens = Math.max(wantTokens, budget + JUMP_OVER_TOKENS - forwardedTokens);
+  const maxChars = (jump ? MAX_JUMP_FILES : MAX_TEXT_FILES_PER_TURN) * MAX_TEXT_FILE_CHARS;
+  const textChars = Math.min(maxChars, Math.round(wantTokens * CHARS_PER_TOKEN));
+  // Once only: a turn already over the budget (its compress failed) gets no second answer.
+  const answerTokens = phase === 0 && left <= 1 && under ? LONG_ANSWER_TOKENS : 0;
   const late = turn > Math.round(turns * 0.9);
   const byteGoal = late ? edgeBytes : peakBytes;
   const byteTurn = late ? turns : Math.round(turns * 0.9);
@@ -310,7 +333,7 @@ export function planTurn({ turn, turns, forwardedTokens, conversationBytes, comp
 
 function splitChars(total) {
   if (total <= 0) return [];
-  const n = Math.min(MAX_TEXT_FILES_PER_TURN, Math.ceil(total / MAX_TEXT_FILE_CHARS));
+  const n = Math.ceil(total / MAX_TEXT_FILE_CHARS);
   return Array.from({ length: n }, () => Math.ceil(total / n));
 }
 
@@ -352,28 +375,30 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
   const add = (name, ok, detail) => results.push({ name, status: ok ? PASS : FAIL, detail });
   const skip = (name, detail) => results.push({ name, status: SKIP, detail });
   const calls = relay.filter((r) => r.kind === "memtree" && r.path === "/v1/context_memory");
-  const compressCalls = calls.filter((r) => !r.indexOnly);
-  const injected = calls.filter((r) => r.injected);
+  // Prepare calls (ccc's background compression ahead of the budget) are not crossings.
+  const compressCalls = calls.filter((r) => !r.indexOnly && !r.prepare);
+  const prepareCalls = calls.filter((r) => r.prepare);
+  const injected = compressCalls.filter((r) => r.injected);
   const messages = reqlog.filter((r) => r.kind === "messages");
   const memtreeLogs = reqlog.filter((r) => r.kind === "memtree");
 
   add("turns completed", run.turnsDone === run.turns,
     `${run.turnsDone}/${run.turns}${run.turnError ? ` (${run.turnError})` : ""}`);
-  const compressions = compressCalls.filter((r) => r.compressed === true && r.status === 200);
-  add("MemTree compressed at least twice", compressions.length >= 2,
-    `${compressions.length} compressions (${compressCalls.length} compress calls, ` +
-    `${calls.length - compressCalls.length} index calls)`);
-  const midTurn = messages.filter((r) => r.turnType === "tool-recompressed").length;
-  const humanTurn = messages.filter((r) => r.turnType === "followup-compressed").length;
-  add("compressions on both paths (human turn, mid-turn tool round)", humanTurn > 0 && midTurn > 0,
-    `followup-compressed ${humanTurn}, tool-recompressed ${midTurn}`);
+  const humanTurn = messages.filter((r) => crossingPath(r) === "human");
+  const midTurn = messages.filter((r) => crossingPath(r) === "tool");
+  add("MemTree compressed at least twice", humanTurn.length + midTurn.length >= 2,
+    `${humanTurn.length + midTurn.length} compressions (${compressCalls.length} compress calls, ` +
+    `${prepareCalls.length} prepare calls, ${calls.length - compressCalls.length - prepareCalls.length} ` +
+    "index calls)");
+  add("compressions on both paths (human turn, mid-turn tool round)",
+    humanTurn.length > 0 && midTurn.length > 0,
+    `human turn ${humanTurn.length} (${humanTurn.filter(adopted).length} on a prepared prefix), ` +
+    `tool round ${midTurn.length} (${midTurn.filter(adopted).length} on a prepared prefix)`);
   const peak = Math.max(0, ...mock.filter((r) => r.lane === "main").map((r) => r.tokens));
   const budget = run.budget ?? BUDGET_TOKENS;
   add("forwarded context reached the budget", peak >= budget * 0.97 && peak <= WINDOW_TOKENS,
     `peak forwarded ${Math.round(peak / 1000)}k tokens (budget ${Math.round(budget / 1000)}k)`);
-  const maxConversation = Math.max(0, ...calls.map((r) => r.requestBytes ?? 0));
-  add("conversation bodies reached ~30 MB", maxConversation >= 28_000_000,
-    `largest MemTree call ${(maxConversation / 1e6).toFixed(1)} MB`);
+  checkBodies(calls, run, add);
 
   const failedCalls = calls.filter((r) => !r.injected && r.status !== 200);
   add("no failed MemTree calls", failedCalls.length === 0, describeFailures(failedCalls));
@@ -402,7 +427,8 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
   add("every Read's result reached the model", !readErrors && !missing,
     `${readErrors} Read errors, ${missing} turns missing results`);
   const degraded = messages.filter((r) => r.turnType === "followup-degraded" || r.compress?.timedOut);
-  // The injected outage degrades exactly one human turn, by design.
+  // The injected outage degrades exactly one human turn, by design (a failed prepare call
+  // degrades nothing: that turn compresses by a blocking call instead).
   add("no degraded or timed-out compressions", degraded.length === injected.length,
     `${degraded.length} degraded (${injected.length} by the injected outage)`);
 
@@ -414,8 +440,10 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
 
   if (run.injectCooldown) {
     const cooldown = messages.filter((r) => r.routeRecovery?.outcome === "cooldown").length;
+    const preparesFailed = prepareCalls.filter((r) => r.injected).length;
     add("outage cooldown engaged after an injected failure", injected.length === 1 && cooldown > 0,
-      `${injected.length} injected, ${cooldown} tool turns skipped compress in the cooldown`);
+      `${injected.length} compress call failed (and ${preparesFailed} prepare calls before it), ` +
+      `${cooldown} tool turns skipped compress in the cooldown`);
   }
 
   add("console closed like a user (CTRL_CLOSE / SIGHUP)", run.consoleClosed === true,
@@ -441,6 +469,40 @@ export function evaluateRun({ reqlog, relay, mock, run }) {
     : (name, ok, detail) => (/console_closed|user close/.test(name) ? skip(name, `Windows only (${detail})`)
       : add(name, ok, detail)));
   return results;
+}
+
+/**
+ * Which path a ccc request record crossed the budget by, else undefined: a human turn or a
+ * tool round that compressed by a blocking call, or rode the prefix ccc prepared for it.
+ */
+export function crossingPath(record) {
+  if (record?.kind !== "messages" || (record.routeLane && record.routeLane !== "main")) return undefined;
+  const t = record.turnType;
+  if (t === "followup-compressed" || (t === "followup-prefix" && adopted(record))) return "human";
+  if (t === "tool-recompressed" || (t === "tool-prefix" && adopted(record))) return "tool";
+  return undefined;
+}
+
+function adopted(record) {
+  return ["used", "truncated"].includes(record.compaction?.prepared);
+}
+
+/**
+ * Claude Code's conversation passes ~30 MB (its own requests drop old images near there),
+ * but MemTree calls carry the images MemTree already stores as references, so its bodies
+ * stay under MEMTREE_BODY_LIMIT_BYTES; and references must actually be used.
+ */
+function checkBodies(calls, run, add) {
+  const largest = calls.reduce((a, r) => ((r.requestBytes ?? 0) > (a?.requestBytes ?? 0) ? r : a), undefined);
+  const withRefs = calls.filter((r) => (r.imageRefs ?? 0) > 0);
+  const refs = withRefs.reduce((n, r) => n + r.imageRefs, 0);
+  const conflicts = calls.filter((r) => r.status === 409).length;
+  const bytes = largest?.requestBytes ?? 0;
+  add("MemTree bodies stay under 30 MiB and image refs are used",
+    bytes < MEMTREE_BODY_LIMIT_BYTES && withRefs.length > 0,
+    `largest MemTree call ${(bytes / 1e6).toFixed(1)} MB (${largest?.imageRefs ?? 0} refs, ` +
+    `${largest?.base64Images ?? 0} images as bytes); ${refs} refs in ${withRefs.length}/${calls.length} ` +
+    `calls; ${conflicts} answered 409; conversation ~${((run.conversationBytes ?? 0) / 1e6).toFixed(1)} MB`);
 }
 
 function checkExitDiagnostics(diag, memtreeLogs, run, add) {

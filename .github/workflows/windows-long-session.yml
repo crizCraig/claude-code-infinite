@@ -1,10 +1,11 @@
 # Nightly long-session test on Windows: real Claude Code under this checkout's ccc in a real
 # console (ConPTY), ~300 typed turns whose tool rounds read large text files and PNG/JPEG
-# images, past ccc's budget at least twice and toward ~30 MB bodies (then past Cloud Run's
-# 32 MiB HTTP/1 limit), ended by closing the console. Anthropic is a local mock (no model
-# cost); MemTree is STAGING (about $1-2 of indexing a night). Harness and checks:
-# scripts/long-session/ (run.mjs header). Claude Code 2.1.310 drops old images from its own
-# requests near 30 MB, so the 32 MiB check reports SKIP unless a call does cross it.
+# images, across ccc's budget once on a human turn and once in a tool round, while Claude
+# Code's conversation passes ~30 MB and MemTree's image references keep its bodies under
+# 30 MiB; ended by closing the console. Anthropic is a local mock (no model cost); MemTree
+# is STAGING (about $1-2 of indexing a night). Harness and checks: scripts/long-session/
+# (run.mjs header). The 32 MiB check reports SKIP unless a MemTree call does cross it.
+# A failed run on main alerts like e2e-daily (polychat docs/e2e_daily_checks.md, "Alerts").
 #
 # Secrets: the `e2e` environment's MEMTREE_E2E_KEY (staging shares production's accounts;
 # MEMTREE_E2E_STAGING_KEY replaces it when set), readable from main only, like e2e-daily.
@@ -29,7 +30,7 @@ on:
         description: "Prompts to type"
         default: "300"
       inject_cooldown:
-        description: "Fail the first over-budget compress once, to exercise ccc's outage cooldown"
+        description: "Fail the first crossing's compress (and prepares) once, to exercise ccc's outage cooldown"
         type: boolean
         default: true
 

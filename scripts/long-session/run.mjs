@@ -2,9 +2,9 @@
 /**
  * A long ccc session the way a person has one: real Claude Code under ccc in a real console
  * (node-pty: ConPTY on Windows), ~300 typed prompts whose tool rounds read large text files
- * and PNG/JPEG images, until the conversation passes ccc's budget twice and its bodies
- * reach ~30 MB (then past Cloud Run's 32 MiB HTTP/1 limit), and then the console window is
- * closed. Anthropic is a local mock (servers.mjs, via CCC_ANTHROPIC_UPSTREAM); MemTree is
+ * and PNG/JPEG images, until the conversation has crossed ccc's budget on a human turn and
+ * in a tool round and Claude Code's conversation passes ~30 MB (MemTree's image references
+ * keep its bodies well under that), and then the console window is closed. Anthropic is a local mock (servers.mjs, via CCC_ANTHROPIC_UPSTREAM); MemTree is
  * staging, reached through a recording relay in ccc's `local` mode. Run by
  * .github/workflows/windows-long-session.yml; checks in lib.mjs evaluateRun.
  *
@@ -18,8 +18,9 @@
  *   LS_MAX_MINUTES        stop typing after this long, leaving time to close and check (40)
  *   LS_MODEL              Claude Code's --model (claude-opus-5-5, a native 1M window)
  *   LS_CCC_CLI            run `node <this cli.js>` instead of the installed `ccc`
- *   LS_INJECT_COOLDOWN    1 (default) fails the first over-budget human-turn compress once
- *                         (servers.mjs shouldInject), to exercise ccc's MemTree outage cooldown
+ *   LS_INJECT_COOLDOWN    1 (default) fails the prepare calls before the first crossing and
+ *                         its compress call once (servers.mjs shouldInject), to exercise ccc's
+ *                         MemTree outage cooldown
  *   LS_CLAUDE             Claude Code's binary (default ~/.local/bin/claude[.exe])
  *   LS_POSIX_CLOSE_SIGNAL off Windows, the signal that closes the console (SIGHUP)
  *   LS_ALLOW_ANY_KEY      1 skips the check that the key belongs to an e2e-test account
@@ -35,7 +36,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pty from "node-pty";
 import {
-  FAIL, PASS, evaluateRun, pngFixture, planTurn, redactPublic, summaryMarkdown, tailLines,
+  CHARS_PER_TOKEN, FAIL, crossingPath, PASS, evaluateRun, pngFixture, planTurn, redactPublic, summaryMarkdown, tailLines,
   textFileContent, turnPrompt, uniqueJpeg,
 } from "./lib.mjs";
 
@@ -56,6 +57,7 @@ const BASE = path.join(TMP, `ccc-long-session-${RUN_TAG}`);
 const HOME = path.join(BASE, "home");
 const PROJECT = path.join(BASE, `ls-project-${RUN_TAG}`);
 const CLAUDE_CONFIG_DIR = path.join(HOME, ".claude");
+const REQLOG_FILE = path.join(HOME, ".claude-code-infinite", "logs", "requests.jsonl");
 const DUMMY_ANTHROPIC_KEY = `sk-ant-api03-longsession-mock-${RUN_TAG}-${"x".repeat(40)}`;
 /** Per turn: the answer must arrive within this (a blocking compress can wait 10 min). */
 const TURN_TIMEOUT_MS = 12 * 60_000;
@@ -68,7 +70,7 @@ const SESSION_WAIT_MS = 8 * 60_000;
 /** Minutes kept at the end for closing, the server lookup and the summary. */
 const RESERVED_MINUTES = 10;
 
-const state = { events: [], forwardedTokens: 0, conversationBytes: 0, compressions: 0,
+const state = { events: [], forwardedTokens: 0, memtreeBytes: 0, conversationBytes: 0, crossings: 0,
   answers: new Map(), screen: "", screenTotal: 0, lastOutputAt: Date.now(), waiters: new Set() };
 const started = Date.now();
 
@@ -188,8 +190,7 @@ function onEvent(event) {
     if (event.step === "answer") state.answers.set(event.turn, event);
   }
   if (event.kind === "memtree" && event.path === "/v1/context_memory" && event.requestBytes) {
-    state.conversationBytes = Math.max(state.conversationBytes, event.requestBytes);
-    if (event.compressed === true) state.compressions++;
+    state.memtreeBytes = Math.max(state.memtreeBytes, event.requestBytes);
     // The server's budget for this model (staging may differ from ccc's 900k fallback).
     if (event.modelBudgetTokens > 0) state.budget = event.modelBudgetTokens;
   }
@@ -298,10 +299,13 @@ async function typeTurns(term) {
       log(`time budget reached after ${turn - 1} turns`);
       return { done: turn - 1, error: `stopped at the ${MAX_MINUTES - RESERVED_MINUTES} min typing budget` };
     }
+    // ccc's own record of the turns it compressed so far picks the plan's phase.
+    state.crossings = readJsonl(REQLOG_FILE).filter((r) => crossingPath(r) !== undefined).length;
     const plan = planTurn({ turn, turns: plannedTurns(turn, stopAt), forwardedTokens: state.forwardedTokens,
-      conversationBytes: state.conversationBytes, compressions: state.compressions,
+      conversationBytes: state.conversationBytes, crossings: state.crossings,
       ...(state.budget ? { budget: state.budget } : {}) });
     const files = writeTurnFiles(turn, plan, jpeg);
+    state.conversationBytes += plan.answerTokens * CHARS_PER_TOKEN;
     term.write(turnPrompt(RUN_TAG, turn, files, plan.answerTokens));
     await sleep(150);
     term.write("\r");
@@ -316,8 +320,8 @@ async function typeTurns(term) {
     await waitFor(() => Date.now() - state.lastOutputAt > QUIET_MS, 30_000);
     if (turn % 10 === 0 || plan.jump || plan.answerTokens) {
       log(`turn ${turn}: forwarded ${Math.round(state.forwardedTokens / 1000)}k tokens, ` +
-        `conversation ${(state.conversationBytes / 1e6).toFixed(1)} MB, ` +
-        `${state.compressions} compressions, ${elapsedMin()} min`);
+        `conversation ${(state.conversationBytes / 1e6).toFixed(1)} MB, largest MemTree call ` +
+        `${(state.memtreeBytes / 1e6).toFixed(1)} MB, ${state.crossings} crossings, ${elapsedMin()} min`);
     }
   }
   return { done: TURNS };
@@ -349,13 +353,18 @@ function writeTurnFiles(turn, plan, jpeg) {
   const names = [];
   plan.texts.forEach((chars, i) => {
     const name = `t${turn}-${i}.txt`;
-    fs.writeFileSync(path.join(PROJECT, name), textFileContent(turn * 101 + i, chars, `T${turn}.${i}`));
+    const text = textFileContent(turn * 101 + i, chars, `T${turn}.${i}`);
+    fs.writeFileSync(path.join(PROJECT, name), text);
+    state.conversationBytes += text.length;
     names.push(name);
   });
   for (let i = 0; i < plan.images; i++) {
     const usePng = (turn + i) % 2 === 0;
     const name = `i${turn}-${i}.${usePng ? "png" : "jpg"}`;
-    fs.writeFileSync(path.join(PROJECT, name), usePng ? pngFixture(turn * 31 + i) : uniqueJpeg(jpeg, `${RUN_TAG}-${turn}-${i}`));
+    const image = usePng ? pngFixture(turn * 31 + i) : uniqueJpeg(jpeg, `${RUN_TAG}-${turn}-${i}`);
+    fs.writeFileSync(path.join(PROJECT, name), image);
+    // As Claude Code sends it: base64.
+    state.conversationBytes += Math.ceil(image.length / 3) * 4;
     names.push(name);
   }
   return names;
@@ -437,13 +446,13 @@ async function serverSession(turnsDone) {
 }
 
 function evaluate(facts) {
-  const reqlogFile = path.join(HOME, ".claude-code-infinite", "logs", "requests.jsonl");
-  const reqlog = readJsonl(reqlogFile);
+  const reqlog = readJsonl(REQLOG_FILE);
   fs.writeFileSync(path.join(ARTIFACTS, "requests.redacted.jsonl"),
     reqlog.map((r) => redactPublic(JSON.stringify(r), [KEY])).join("\n") + "\n");
   const relay = state.events.filter((e) => e.kind === "memtree" || e.kind === "diagnostics");
   const mock = state.events.filter((e) => e.kind === "messages" || e.kind === "count");
-  return evaluateRun({ reqlog, relay, mock, run: { ...facts, turns: TURNS, budget: state.budget } });
+  return evaluateRun({ reqlog, relay, mock, run: { ...facts, turns: TURNS, budget: state.budget,
+    conversationBytes: state.conversationBytes } });
 }
 
 function finish(rawResults, facts) {
@@ -525,9 +534,12 @@ function screenTail() {
 }
 
 function stripAnsi(text) {
-  // Cursor-forward moves stand for spaces in Claude Code's rendering.
+  // Cursor-forward moves stand for spaces in Claude Code's rendering, and so (as one space)
+  // do its column moves (`?[24Gfor[28Gshortcuts`).
   // eslint-disable-next-line no-control-regex
-  return text.replace(/\x1b\[(\d*)C/g, (_, n) => " ".repeat(Math.min(Number(n || 1), 200))).replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Z0-9]|\x1b[=>78]/g, "");
+  return text.replace(/\x1b\[(\d*)C/g, (_, n) => " ".repeat(Math.min(Number(n || 1), 200)))
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[\d*G/g, " ").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Z0-9]|\x1b[=>78]/g, "");
 }
 
 function elapsedMin() {

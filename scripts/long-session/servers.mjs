@@ -18,16 +18,20 @@
 import { appendFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
-  BUDGET_TOKENS, CHARS_PER_TOKEN, WINDOW_TOKENS, bodyImages, countBodyTokens, parseTurnPrompt,
-  redactPublic, textFileContent, toolResultsIn,
+  BUDGET_TOKENS, CHARS_PER_TOKEN, IMAGE_REF_PREFIX, WINDOW_TOKENS, bodyImages, countBodyTokens,
+  parseTurnPrompt, redactPublic, textFileContent, toolResultsIn,
 } from "./lib.mjs";
 
 const config = JSON.parse(process.env.LS_SERVERS_CONFIG ?? "{}");
 const issuedTools = new Map(); // turn -> tool_use ids issued for it
 let injectedOnce = false;
+/** Compressions by compress calls (prepare calls not counted), and the server's budget. */
 let compressionsSeen = 0;
+let serverBudget;
+/** The mock MemTree's image store: sha256 of the bytes -> base64. */
+const mockImages = new Map();
 
 const upstream = await listen(http.createServer((req, res) => {
   handleUpstream(req, res).catch((err) => fail(res, err));
@@ -181,7 +185,7 @@ async function handleRelay(req, res) {
   const facts = describeMemtreeRequest(pathOnly, raw, started);
   if (facts.diagnostics) record({ kind: "diagnostics", events: facts.diagnostics });
   if (shouldInject(facts)) {
-    injectedOnce = true;
+    if (!facts.call.prepare) injectedOnce = true;
     record({ kind: "memtree", path: shownPath, ...facts.call, status: 503, ms: 0, injected: true });
     return sendJson(res, 503, { detail: "long-session test: injected MemTree outage" });
   }
@@ -233,32 +237,51 @@ function describeMemtreeRequest(pathOnly, raw, startedAt) {
   const last = Array.isArray(body.messages) ? body.messages.at(-1) : undefined;
   const toolTurn = Array.isArray(last?.content) && last.content.some((b) => b?.type === "tool_result");
   return { call: { requestBytes: raw.length, startedAt, indexOnly: body.index_only === true,
-    finalIndex: body.final_index === true, toolTurn, messages: body.messages?.length ?? 0,
-    clientInputTokens: body.client_input_tokens, threshold: body.compression_threshold_tokens } };
+    finalIndex: body.final_index === true, prepare: body.prepare === true, toolTurn,
+    messages: body.messages?.length ?? 0, clientInputTokens: body.client_input_tokens,
+    threshold: body.compression_threshold_tokens, ...countImages(raw) } };
+}
+
+/** Images a MemTree body carries as references and as base64 bytes. */
+function countImages(raw) {
+  return { imageRefs: occurrences(raw, `"${IMAGE_REF_PREFIX}`),
+    base64Images: occurrences(raw, '"type":"base64"') };
+}
+
+function occurrences(buf, needle) {
+  let n = 0;
+  for (let at = buf.indexOf(needle); at >= 0; at = buf.indexOf(needle, at + needle.length)) n++;
+  return n;
 }
 
 function describeMemtreeAnswer(pathOnly, status, answer) {
   if (pathOnly !== "/v1/context_memory" || status !== 200) return {};
   try {
     const json = JSON.parse(answer.toString("utf8"));
-    return { compressed: json.compressed, indexPending: json.index_pending === true,
-      modelBudgetTokens: json.model_budget_tokens, memoryStatus: json.memory_status };
+    if (json.model_budget_tokens > 0) serverBudget = json.model_budget_tokens;
+    return { compressed: json.compressed, prepared: json.prepared === true,
+      indexPending: json.index_pending === true, modelBudgetTokens: json.model_budget_tokens,
+      memoryStatus: json.memory_status, storedImages: json.memtree_image_sha256s?.length ?? 0 };
   } catch {
     return { unparsed: true };
   }
 }
 
 /**
- * The cooldown exercise: the first compress call over the budget, on a human turn, fails
- * once with a 503. That human turn goes out uncompressed (followup-degraded), the failure
- * arms ccc's MemTree outage cooldown, and the same turn's tool round, also over the budget,
- * skips its compress inside the cooldown (routeRecovery "cooldown"); the next human turn
- * compresses.
+ * The cooldown exercise, an outage over the first crossing: until a compress call has
+ * compressed, every prepare call fails with a 503 (so ccc has no prepared prefix to ride,
+ * and a failed prepare arms nothing), and the first compress call over the budget on a
+ * human turn fails once. That human turn goes out uncompressed (followup-degraded), the
+ * failure arms ccc's MemTree outage cooldown, and the same turn's tool round, also over
+ * the budget, skips its compress inside the cooldown (routeRecovery "cooldown"); the next
+ * human turn compresses by a blocking call.
  */
 function shouldInject(facts) {
   const call = facts.call;
-  return Boolean(config.injectCooldown && !injectedOnce && call && !call.indexOnly && !call.toolTurn &&
-    compressionsSeen === 0 && (call.clientInputTokens ?? 0) >= (call.threshold ?? BUDGET_TOKENS));
+  if (!config.injectCooldown || !call || call.indexOnly || compressionsSeen > 0) return false;
+  if (call.prepare) return true;
+  return !injectedOnce && !call.toolTurn &&
+    (call.clientInputTokens ?? 0) >= (call.threshold ?? serverBudget ?? BUDGET_TOKENS);
 }
 
 async function forward(req, raw, signal) {
@@ -292,16 +315,51 @@ function mockMemtree(req, pathOnly, raw) {
   if (pathOnly === "/v1/ccc/diagnostics") return json(200, { ok: true });
   if (pathOnly !== "/v1/context_memory" || req.method !== "POST") return json(404, { detail: "mock" });
   const body = JSON.parse(raw.toString("utf8"));
+  const missing = resolveImageRefs(body);
+  if (missing.length) return json(409, { detail: { missing_image_sha256s: missing } });
+  const stored = { memtree_image_sha256s: storeImages(body) };
   const usage = { prompt_tokens: 1000, completion_tokens: 0, indexed_tokens: 1000,
     prompt_tokens_details: { cached_tokens: 1000 } };
-  if (body.index_only) return json(200, { messages: [], usage, index_only: true });
+  if (body.index_only) return json(200, { messages: [], usage, index_only: true, ...stored });
   const threshold = body.compression_threshold_tokens ?? BUDGET_TOKENS;
   const tokens = body.client_input_tokens ?? 0;
-  if (tokens < threshold) {
+  if (!body.prepare && tokens < threshold) {
     return json(200, { compressed: false, messages: body.messages, usage,
-      model_budget_tokens: BUDGET_TOKENS });
+      model_budget_tokens: BUDGET_TOKENS, ...stored });
   }
-  return json(200, mockCompression(body, usage));
+  return json(200, { ...mockCompression(body, usage), ...stored,
+    ...(body.prepare ? { prepared: true } : {}) });
+}
+
+/** References put back as their bytes, like the server; the shas it does not store. */
+function resolveImageRefs(value, missing = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) resolveImageRefs(item, missing);
+  } else if (value && typeof value === "object") {
+    const data = value.type === "base64" ? value.data : undefined;
+    if (typeof data === "string" && data.startsWith(IMAGE_REF_PREFIX)) {
+      const sha = data.slice(IMAGE_REF_PREFIX.length);
+      if (mockImages.has(sha)) value.data = mockImages.get(sha);
+      else missing.push(sha);
+    }
+    for (const v of Object.values(value)) resolveImageRefs(v, missing);
+  }
+  return missing;
+}
+
+/** Stores the body's images; the shas of all of them (the answer's stored list). */
+function storeImages(value, shas = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) storeImages(item, shas);
+  } else if (value && typeof value === "object") {
+    if (value.type === "base64" && typeof value.data === "string") {
+      const sha = createHash("sha256").update(Buffer.from(value.data, "base64")).digest("hex");
+      mockImages.set(sha, value.data);
+      shas.push(sha);
+    }
+    for (const v of Object.values(value)) storeImages(v, shas);
+  }
+  return shas;
 }
 
 function mockCompression(body, usage) {
@@ -341,7 +399,7 @@ function blocksText(content) {
 
 function record(event) {
   const line = { at: Date.now(), ...event };
-  if (event.kind === "memtree" && event.compressed === true) compressionsSeen++;
+  if (event.kind === "memtree" && event.compressed === true && !event.prepare) compressionsSeen++;
   appendFileSync(config.eventsFile, JSON.stringify(line) + "\n");
   process.send?.({ type: "event", event: line });
 }
