@@ -33,7 +33,7 @@ import { resumesSession, runWithoutMemtree } from "./paused-session.js";
 import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
-import { compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
+import { anthropicUpstreamFromEnv, compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runLinkCommand } from "./link-command.js";
@@ -542,6 +542,8 @@ async function main() {
         ...(process.env.CCC_CAPTURE_DIR ? { captureDir: process.env.CCC_CAPTURE_DIR } : {}),
         // Test-only: a small budget so a cheap session crosses it in a few turns.
         budgetTokensOverride: budgetFromEnv(process.env.CCC_BUDGET_TOKENS),
+        // Test-only: a loopback mock in place of api.anthropic.com (scripts/long-session).
+        upstreamOrigin: upstreamFromEnv(process.env.CCC_ANTHROPIC_UPSTREAM),
         // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
         // link is shown while the placement is being tried out; see ProxyOptions.
         memtreeLinkPlacement,
@@ -889,6 +891,13 @@ function budgetFromEnv(raw) {
         return undefined;
     }
     return budget;
+}
+/** `CCC_ANTHROPIC_UPSTREAM`: a test-only loopback upstream, or undefined (see cli-args.ts). */
+function upstreamFromEnv(raw) {
+    const { value, warning } = anthropicUpstreamFromEnv(raw);
+    if (warning)
+        console.error(warning);
+    return value;
 }
 /** The update line a paused session's banner carries (the normal banner's, see notices.ts). */
 function pausedUpdateLine(autoUpdate) {

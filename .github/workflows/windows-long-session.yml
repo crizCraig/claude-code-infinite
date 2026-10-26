@@ -1,0 +1,124 @@
+# Nightly long-session test on Windows: real Claude Code under this checkout's ccc in a real
+# console (ConPTY), ~300 typed turns whose tool rounds read large text files and PNG/JPEG
+# images, past ccc's budget at least twice and toward ~30 MB bodies (then past Cloud Run's
+# 32 MiB HTTP/1 limit), ended by closing the console. Anthropic is a local mock (no model
+# cost); MemTree is STAGING (about $1-2 of indexing a night). Harness and checks:
+# scripts/long-session/ (run.mjs header). Claude Code 2.1.310 drops old images from its own
+# requests near 30 MB, so the 32 MiB check reports SKIP unless a call does cross it.
+#
+# Secrets: the `e2e` environment's MEMTREE_E2E_KEY (staging shares production's accounts;
+# MEMTREE_E2E_STAGING_KEY replaces it when set), readable from main only, like e2e-daily.
+# Runs from any other branch get no environment and no key: pick memtree=mock there (the
+# harness against a stand-in MemTree; the staging-only checks are skipped).
+#
+# Never runs on pull requests (this repo is public: forks must not reach the secrets), and
+# nothing it prints or uploads contains a key, an email, a session id or a MemTree link.
+name: Windows long session
+
+on:
+  schedule:
+    - cron: "41 10 * * *" # 03:41 Phoenix, clear of the 13:17 UTC e2e-daily
+  workflow_dispatch:
+    inputs:
+      memtree:
+        description: "MemTree the session uses (staging needs main's e2e environment)"
+        type: choice
+        options: [staging, mock]
+        default: staging
+      turns:
+        description: "Prompts to type"
+        default: "300"
+      inject_cooldown:
+        description: "Fail the first over-budget compress once, to exercise ccc's outage cooldown"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-long-session
+  cancel-in-progress: false
+
+jobs:
+  long-session:
+    name: long session (${{ inputs.memtree || (github.ref == 'refs/heads/main' && 'staging') || 'mock' }} MemTree)
+    runs-on: windows-latest
+    # Only main may use the e2e environment (its branch policy); elsewhere none, no key.
+    environment: ${{ github.ref == 'refs/heads/main' && 'e2e' || '' }}
+    timeout-minutes: 75
+    env:
+      LS_TARGET: ${{ inputs.memtree || (github.ref == 'refs/heads/main' && 'staging') || 'mock' }}
+      LS_TURNS: ${{ inputs.turns || '300' }}
+      LS_INJECT_COOLDOWN: ${{ (github.event_name == 'workflow_dispatch' && !inputs.inject_cooldown && '0') || '1' }}
+      LS_MAX_MINUTES: "40"
+      NO_COLOR: "1"
+    steps:
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scripts/long-session/package-lock.json
+
+      - name: Build and install this checkout's ccc globally (the npm shim, as users get it)
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+          npm pack --silent > "$RUNNER_TEMP/ccc-pack.txt"
+          npm install -g "./$(cat "$RUNNER_TEMP/ccc-pack.txt")"
+          ccc --version || true
+
+      - name: Install Claude Code (official installer, PowerShell)
+        shell: pwsh
+        run: irm https://claude.ai/install.ps1 | iex
+
+      - name: Install the harness (node-pty)
+        working-directory: scripts/long-session
+        run: npm ci --no-audit --no-fund
+
+      - name: Long session
+        timeout-minutes: 62 # 30 min typing, a 12 min last turn, the close, 8 min server wait
+        run: node scripts/long-session/run.mjs
+        env:
+          LS_ARTIFACTS_DIR: ${{ runner.temp }}/long-session
+          MEMTREE_E2E_KEY: ${{ (env.LS_TARGET == 'staging' && (secrets.MEMTREE_E2E_STAGING_KEY || secrets.MEMTREE_E2E_KEY)) || '' }}
+
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ccc-long-session-windows-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/long-session
+          retention-days: 14
+
+  alert:
+    needs: long-session
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    environment: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Email (and SMS gateway) alert
+        run: node scripts/e2e/notify.mjs
+        env:
+          E2E_RESEND_API_KEY: ${{ secrets.E2E_RESEND_API_KEY }}
+          E2E_ALERT_TO: ${{ secrets.E2E_ALERT_TO }}
+          E2E_ALERT_FROM: ${{ secrets.E2E_ALERT_FROM }}
+          E2E_ALERT_SUBJECT: "ccc Windows long session FAILED"
+          E2E_ALERT_BODY: "The nightly Windows long-session test failed. Checks in the run summary:"

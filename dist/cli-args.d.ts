@@ -48,5 +48,15 @@ export declare function compactTargetFromEnv(raw: string | undefined, parseToken
     value: number | null | undefined;
     warning?: string;
 };
+/**
+ * `CCC_ANTHROPIC_UPSTREAM` (test-only, e.g. "http://127.0.0.1:8123"): where the proxy sends
+ * Anthropic traffic instead of api.anthropic.com, for a local mock (scripts/long-session).
+ * Claude Code's credentials flow through to it, so only a loopback http(s) origin is taken;
+ * `value` is undefined when unset or refused, and `warning` explains a refused one.
+ */
+export declare function anthropicUpstreamFromEnv(raw: string | undefined): {
+    value: string | undefined;
+    warning?: string;
+};
 export {};
 //# sourceMappingURL=cli-args.d.ts.map

@@ -118,3 +118,35 @@ export function compactTargetFromEnv(
   }
   return { value: target };
 }
+
+/** Hosts `CCC_ANTHROPIC_UPSTREAM` may name: this machine only. */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
+
+/**
+ * `CCC_ANTHROPIC_UPSTREAM` (test-only, e.g. "http://127.0.0.1:8123"): where the proxy sends
+ * Anthropic traffic instead of api.anthropic.com, for a local mock (scripts/long-session).
+ * Claude Code's credentials flow through to it, so only a loopback http(s) origin is taken;
+ * `value` is undefined when unset or refused, and `warning` explains a refused one.
+ */
+export function anthropicUpstreamFromEnv(
+  raw: string | undefined
+): { value: string | undefined; warning?: string } {
+  if (!raw || !raw.trim()) return { value: undefined };
+  let url: URL | undefined;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    url = undefined;
+  }
+  const loopback = url !== undefined && /^https?:$/.test(url.protocol) &&
+    LOOPBACK_HOSTS.has(url.hostname) && !url.username && !url.password &&
+    (url.pathname === "/" || url.pathname === "");
+  if (!loopback) {
+    return {
+      value: undefined,
+      // Never echo the value: a refused one may carry credentials.
+      warning: "ccc: ignoring CCC_ANTHROPIC_UPSTREAM (only a loopback origin such as http://127.0.0.1:8123)",
+    };
+  }
+  return { value: url!.origin };
+}
