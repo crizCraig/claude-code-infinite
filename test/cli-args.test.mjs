@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  anthropicUpstreamFromEnv,
   compactTargetFromEnv,
   isPrintInvocation,
   memtreeLinkPlacementFromEnv,
@@ -68,5 +69,22 @@ test("--version / -v alone (optionally after local/staging) is a version request
   }
   for (const args of [[], ["-p", "--version"], ["--version", "-p", "x"], ["--", "--version"]]) {
     assert.equal(isVersionRequest(args), false, args.join(" "));
+  }
+});
+
+test("CCC_ANTHROPIC_UPSTREAM takes only a loopback origin", () => {
+  assert.deepEqual(anthropicUpstreamFromEnv(undefined), { value: undefined });
+  assert.deepEqual(anthropicUpstreamFromEnv("  "), { value: undefined });
+  assert.equal(anthropicUpstreamFromEnv("http://127.0.0.1:8123").value, "http://127.0.0.1:8123");
+  assert.equal(anthropicUpstreamFromEnv("http://localhost:9/").value, "http://localhost:9");
+  for (const refused of [
+    "https://api.example.com", "http://10.0.0.5:80", "ftp://127.0.0.1:21",
+    "http://127.0.0.1.example.com", "http://user:pw@127.0.0.1:1", "http://127.0.0.1:1/v1", "nope",
+    "http://[::1]:8123",
+  ]) {
+    const { value, warning } = anthropicUpstreamFromEnv(refused);
+    assert.equal(value, undefined, refused);
+    assert.match(warning, /ignoring CCC_ANTHROPIC_UPSTREAM/, refused);
+    assert.doesNotMatch(warning, /pw@|example|nope/, "the refused value is never echoed");
   }
 });

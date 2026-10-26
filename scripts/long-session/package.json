@@ -1,0 +1,9 @@
+{
+  "name": "ccc-long-session-test",
+  "private": true,
+  "description": "Harness for .github/workflows/windows-long-session.yml (not part of the ccc package)",
+  "type": "module",
+  "dependencies": {
+    "node-pty": "1.1.0"
+  }
+}
