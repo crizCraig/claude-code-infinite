@@ -318,6 +318,9 @@ async function typeTurns(term) {
       return { done: turn - 1, error: `turn ${turn}: ${why}` };
     }
     await waitFor(() => Date.now() - state.lastOutputAt > QUIET_MS, 30_000);
+    // The answer joins the next turn's request: the plan must count it now (a long answer
+    // that leaves the session under the budget would otherwise be planned again).
+    state.forwardedTokens += plan.answerTokens;
     if (turn % 10 === 0 || plan.jump || plan.answerTokens) {
       log(`turn ${turn}: forwarded ${Math.round(state.forwardedTokens / 1000)}k tokens, ` +
         `conversation ${(state.conversationBytes / 1e6).toFixed(1)} MB, largest MemTree call ` +
