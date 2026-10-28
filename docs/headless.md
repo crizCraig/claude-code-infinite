@@ -14,7 +14,8 @@ This guide is for ccc 1.0.23 and later. See [Older versions](#older-versions) fo
 ## 1. One-time setup (per person or machine)
 
 1. You need a **Claude Pro or Max subscription** (Claude Code logs in with it).
-2. Sign up at https://polychat.co and create a MemTree key. Use your own account and don't
+2. Then, sign up for MemTree at https://polychat.co (a separate account from your Claude one)
+   and create a MemTree key. Use your own account and don't
    share keys: every session on a key lands in that key's memory and search results.
 3. Install and run once in a terminal, so ccc stores your key and Claude Code logs in:
    ```bash
