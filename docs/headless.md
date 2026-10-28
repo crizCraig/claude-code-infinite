@@ -61,7 +61,7 @@ Rules of thumb:
   session, so two `ccc -p --resume "$sid"` calls running together both write to its transcript
   as sibling branches, and the next `--resume` continues only the branch that finished last.
   The other call's turn is dropped from the conversation without an error (it stays in the
-  file and in MemTree search, but the agent no longer sees it). If the second call starts while
+  transcript file, but the agent no longer sees it). If the second call starts while
   the first is mid tool call, Claude Code also writes a "[Tool call interrupted…]" result into
   the history, which the agent then reads. Queue calls per session id, or fork.
 - **Resume by id, not with `--continue`.** With `--continue`, Claude Code starts MCP servers
