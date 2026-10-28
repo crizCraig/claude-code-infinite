@@ -50,7 +50,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
-import { chmodSync, mkdirSync, promises as fsPromises, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
@@ -59,7 +59,7 @@ import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRA
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
-import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, TRANSCRIPT_SCAN_MAX_BYTES, keyInvalidModelContext, pausedModelContext } from "./model-context.js";
+import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText, subscribeUrlFromDetail } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
@@ -768,17 +768,20 @@ onMainStop) {
             // Claude Code's compaction dropped any MemTree notice from the transcript.
             if (parsed.source === "compact")
                 state.modelNotices.forget(parsed.session_id);
-            if (parsed.source === "resume")
-                await restoreModelNotices(state, parsed);
         }
         // Earlier trees in this project: asked now, so its wait overlaps the resume's.
         const contextPromise = projectTreesContext(state.projectTrees, parsed);
+        // A resumed or forked history may carry notices an earlier process gave.
+        const restored = parsed.agent_id === undefined &&
+            (parsed.source === "resume" || parsed.source === "fork")
+            ? restoreModelNotices(state, parsed) : Promise.resolve();
         // A resume waits briefly for the newest tree; a fresh session has none to wait for.
         if (parsed.agent_id === undefined && parsed.source === "resume") {
             await state.newestTrees?.settle(parsed.session_id);
         }
         const line = joinNoticeLines(resumeLinkLine(state, parsed), resumePaymentNotice(state, parsed), extraSessionStartLine(state.sessionStartNotice, parsed));
         const context = await contextPromise;
+        await restored;
         if (!line && !context) {
             res.writeHead(204);
             res.end();
@@ -2169,21 +2172,13 @@ function currentModelNotice(state) {
 /**
  * A resumed session's transcript may hold a notice from an earlier ccc process
  * (paused, then paid in between): start from it, so the change is announced.
- * A missing, unreadable or very large transcript starts from nothing. Never throws.
+ * A missing or unreadable transcript, or a scan past its time box, starts from
+ * nothing. Never throws.
  */
 async function restoreModelNotices(state, input) {
     if (!input.transcript_path)
         return;
-    try {
-        const stat = await fsPromises.stat(input.transcript_path);
-        if (stat.size > TRANSCRIPT_SCAN_MAX_BYTES)
-            return;
-        const text = await fsPromises.readFile(input.transcript_path, "utf-8");
-        state.modelNotices.restore(input.session_id, text);
-    }
-    catch {
-        // No transcript to read: nothing was told that we know of.
-    }
+    state.modelNotices.restore(input.session_id, await lastToldKindInFile(input.transcript_path));
 }
 /** UserPromptSubmit's answer: a line for the user, context for the model, or both. */
 function promptSubmitOutput(line, context) {

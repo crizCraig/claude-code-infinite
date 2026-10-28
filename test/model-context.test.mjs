@@ -21,6 +21,7 @@ import {
   ModelContextNotices,
   keyInvalidModelContext,
   lastToldKind,
+  lastToldKindInFile,
   pausedModelContext,
 } from "../dist/model-context.js";
 
@@ -113,11 +114,32 @@ test("a resumed transcript's last notice is restored; working again or none clea
     "compacted away: not in the model's context any more");
   assert.equal(lastToldKind([line(paused), boundary, line(key)].join("\n")), "key-invalid");
   const notices = new ModelContextNotices();
-  notices.restore("s", line(paused));
+  notices.restore("s", lastToldKind(line(paused)));
   assert.equal(notices.next("s", { kind: "paused", text: "P" }), undefined, "already told");
-  notices.restore("s", line(paused));
+  notices.restore("s", lastToldKind(line(paused)));
   assert.equal(notices.next("s", undefined), MEMTREE_ACTIVE_AGAIN_CONTEXT, "paid in between");
   assert.equal(notices.next("s", null), undefined, "unknown state is no news");
+});
+
+test("the resume scan reads the file backward, across chunk splits, within its budget", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ccc-model-context-"));
+  const file = path.join(dir, "t.jsonl");
+  const paused = JSON.stringify({ content: pausedModelContext(PAYMENT_DETAIL, null) });
+  const filler = JSON.stringify({ content: "🙂 later work ".repeat(50) });
+  try {
+    await fs.writeFile(file, [paused, filler, filler].join("\n"));
+    for (const chunk of [7, 16, 33, 1 << 20]) {
+      assert.equal(await lastToldKindInFile(file, 5_000, chunk), "paused", `chunk ${chunk}`);
+    }
+    await fs.writeFile(file, [paused, filler, JSON.stringify({ subtype: "compact_boundary" }),
+      filler].join("\n"));
+    assert.equal(await lastToldKindInFile(file, 5_000, 16), undefined, "compacted away");
+    assert.equal(await lastToldKindInFile(path.join(dir, "missing.jsonl")), undefined);
+    await fs.writeFile(file, [paused, filler].join("\n"));
+    assert.equal(await lastToldKindInFile(file, -1, 16), undefined, "out of time: nothing");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ------------------------------------------------------------------ /compact interception
@@ -303,14 +325,14 @@ test("proxy: an outage after a refused key is not announced as recovery, nor blo
   } finally { h.close(); }
 });
 
-test("proxy: a resume after paying elsewhere announces recovery from the transcript", async () => {
+for (const source of ["resume", "fork"]) test(`proxy: a ${source} after paying elsewhere announces recovery from the transcript`, async () => {
   const h = await harness();
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ccc-model-context-"));
   const transcript = path.join(dir, "session.jsonl");
   await fs.writeFile(transcript, JSON.stringify({ type: "attachment",
     content: pausedModelContext(PAYMENT_DETAIL, null) }) + "\n");
   try {
-    await hook(h, { hook_event_name: "SessionStart", source: "resume", transcript_path: transcript });
+    await hook(h, { hook_event_name: "SessionStart", source, transcript_path: transcript });
     h.paid = true;
     await turn(h);
     assert.equal(context(await submit(h, "p1")), MEMTREE_ACTIVE_AGAIN_CONTEXT);

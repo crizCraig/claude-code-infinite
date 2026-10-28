@@ -71,7 +71,7 @@ import {
   gunzipSync,
   inflateSync,
 } from "node:zlib";
-import { chmodSync, mkdirSync, promises as fsPromises, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import {
@@ -130,7 +130,7 @@ import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
 import { KEY_INVALID_KIND, type ModelNotice, ModelContextNotices, PAUSED_KIND,
-  TRANSCRIPT_SCAN_MAX_BYTES, keyInvalidModelContext, pausedModelContext } from "./model-context.js";
+  keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText,
   subscribeUrlFromDetail } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -1491,10 +1491,13 @@ async function handleNoticeHook(
       noteMainSessionStart(state, parsed.source, parsed.session_id);
       // Claude Code's compaction dropped any MemTree notice from the transcript.
       if (parsed.source === "compact") state.modelNotices.forget(parsed.session_id);
-      if (parsed.source === "resume") await restoreModelNotices(state, parsed);
     }
     // Earlier trees in this project: asked now, so its wait overlaps the resume's.
     const contextPromise = projectTreesContext(state.projectTrees, parsed);
+    // A resumed or forked history may carry notices an earlier process gave.
+    const restored = parsed.agent_id === undefined &&
+        (parsed.source === "resume" || parsed.source === "fork")
+      ? restoreModelNotices(state, parsed) : Promise.resolve();
     // A resume waits briefly for the newest tree; a fresh session has none to wait for.
     if (parsed.agent_id === undefined && parsed.source === "resume") {
       await state.newestTrees?.settle(parsed.session_id);
@@ -1505,6 +1508,7 @@ async function handleNoticeHook(
       extraSessionStartLine(state.sessionStartNotice, parsed)
     );
     const context = await contextPromise;
+    await restored;
     if (!line && !context) {
       res.writeHead(204);
       res.end();
@@ -3092,21 +3096,15 @@ function currentModelNotice(state: ProxyState): ModelNotice | undefined | null {
 /**
  * A resumed session's transcript may hold a notice from an earlier ccc process
  * (paused, then paid in between): start from it, so the change is announced.
- * A missing, unreadable or very large transcript starts from nothing. Never throws.
+ * A missing or unreadable transcript, or a scan past its time box, starts from
+ * nothing. Never throws.
  */
 async function restoreModelNotices(
   state: ProxyState,
   input: SessionStartHookInput
 ): Promise<void> {
   if (!input.transcript_path) return;
-  try {
-    const stat = await fsPromises.stat(input.transcript_path);
-    if (stat.size > TRANSCRIPT_SCAN_MAX_BYTES) return;
-    const text = await fsPromises.readFile(input.transcript_path, "utf-8");
-    state.modelNotices.restore(input.session_id, text);
-  } catch {
-    // No transcript to read: nothing was told that we know of.
-  }
+  state.modelNotices.restore(input.session_id, await lastToldKindInFile(input.transcript_path));
 }
 
 /** UserPromptSubmit's answer: a line for the user, context for the model, or both. */

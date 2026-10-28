@@ -16,6 +16,7 @@
  * (memtree-mcp.ts) already say context is MemTree's job, with the paused case
  * as the exception these notices announce.
  */
+import fs from "node:fs";
 import { sanitizeNoticeDetail } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE } from "./payment-gate.js";
 import { REASON_FREE_CREDIT_USED, REASON_PLAN_LIMIT } from "./payment-link.js";
@@ -23,10 +24,14 @@ export const SUPPORT_EMAIL = "support@polychat.co";
 const PAUSED_PREFIX = "ccc: MemTree is paused: ";
 const KEY_INVALID_PREFIX = "ccc: MemTree is off: ";
 const ACTIVE_AGAIN_PREFIX = "ccc: MemTree is working again";
-/** Larger transcripts are not searched on resume (a whole read; never on the turn path). */
-export const TRANSCRIPT_SCAN_MAX_BYTES = 256 * 1024 * 1024;
+/** A resume's transcript scan reads backward in chunks of this size, from the end. */
+const SCAN_CHUNK_BYTES = 4 * 1024 * 1024;
+/** Each chunk overlaps the next by this much, so a marker split between them is found. */
+const MARKER_OVERLAP_BYTES = 64;
+/** A scan that has not found a marker by then restores nothing. */
+export const TRANSCRIPT_SCAN_MS = 1_000;
 /** Told once MemTree answers again after a paused or refused-key notice. */
-export const MEMTREE_ACTIVE_AGAIN_CONTEXT = `${ACTIVE_AGAIN_PREFIX}; compression is back on, so the earlier paused notice ` +
+export const MEMTREE_ACTIVE_AGAIN_CONTEXT = `${ACTIVE_AGAIN_PREFIX}; compression is back on, so the earlier paused/off notice ` +
     "and its /compact fallback no longer apply.";
 /** The one line a blocked manual /compact shows (PreCompact hook reason). */
 export const COMPACT_BLOCKED_REASON = "MemTree already keeps this session within its budget; /compact would discard detail. " +
@@ -90,8 +95,7 @@ export class ModelContextNotices {
      * A resumed session: what its transcript last told the model (a notice
      * from an earlier ccc process), so a later change is announced.
      */
-    restore(sessionId, transcript) {
-        const kind = lastToldKind(transcript);
+    restore(sessionId, kind) {
         if (kind === undefined)
             this.told.delete(sessionId);
         else
@@ -130,17 +134,52 @@ const COMPACT_BOUNDARY = '"compact_boundary"';
  * The kind of the last notice in a transcript's live part (after its last
  * compaction), undefined when none or "working again".
  */
-export function lastToldKind(fullTranscript) {
-    const boundary = fullTranscript.lastIndexOf(COMPACT_BOUNDARY);
-    const transcript = boundary < 0 ? fullTranscript : fullTranscript.slice(boundary);
-    const last = Math.max(transcript.lastIndexOf(PAUSED_PREFIX), transcript.lastIndexOf(KEY_INVALID_PREFIX), transcript.lastIndexOf(ACTIVE_AGAIN_PREFIX));
-    if (last < 0)
+export function lastToldKind(transcript) {
+    return lastMarker(transcript)?.kind;
+}
+/**
+ * lastToldKind of a transcript file, read backward from its end until the
+ * last marker, so a long session's file is not read whole. Undefined when the
+ * file is missing or unreadable, or after `budgetMs`. Never throws.
+ */
+export async function lastToldKindInFile(file, budgetMs = TRANSCRIPT_SCAN_MS, chunkBytes = SCAN_CHUNK_BYTES) {
+    const deadline = Date.now() + budgetMs;
+    let handle;
+    try {
+        handle = await fs.promises.open(file, "r");
+        const size = (await handle.stat()).size;
+        for (let end = size; end > 0 && Date.now() < deadline;) {
+            const start = Math.max(0, end - chunkBytes);
+            const buffer = Buffer.alloc(Math.min(end + MARKER_OVERLAP_BYTES, size) - start);
+            await handle.read(buffer, 0, buffer.length, start);
+            // Markers are ASCII: latin1 keeps them intact wherever a chunk splits a character.
+            const marker = lastMarker(buffer.toString("latin1"));
+            if (marker !== undefined)
+                return marker.kind;
+            end = start;
+        }
         return undefined;
-    if (transcript.startsWith(PAUSED_PREFIX, last))
-        return PAUSED_KIND;
-    if (transcript.startsWith(KEY_INVALID_PREFIX, last))
-        return KEY_INVALID_KIND;
-    return undefined;
+    }
+    catch {
+        return undefined;
+    }
+    finally {
+        await handle?.close().catch(() => undefined);
+    }
+}
+/** The last marker in `text`: a notice's kind, or undefined for "working again" or a compaction. */
+function lastMarker(text) {
+    const markers = [
+        [PAUSED_PREFIX, PAUSED_KIND], [KEY_INVALID_PREFIX, KEY_INVALID_KIND],
+        [ACTIVE_AGAIN_PREFIX, undefined], [COMPACT_BOUNDARY, undefined],
+    ];
+    let found;
+    for (const [marker, kind] of markers) {
+        const at = text.lastIndexOf(marker);
+        if (at >= 0 && (found === undefined || at > found.at))
+            found = { at, kind };
+    }
+    return found && { kind: found.kind };
 }
 function pausedReasonText(reason) {
     if (reason === REASON_FREE_CREDIT_USED)

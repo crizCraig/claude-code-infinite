@@ -17,8 +17,8 @@
  * as the exception these notices announce.
  */
 export declare const SUPPORT_EMAIL = "support@polychat.co";
-/** Larger transcripts are not searched on resume (a whole read; never on the turn path). */
-export declare const TRANSCRIPT_SCAN_MAX_BYTES: number;
+/** A scan that has not found a marker by then restores nothing. */
+export declare const TRANSCRIPT_SCAN_MS = 1000;
 /** Told once MemTree answers again after a paused or refused-key notice. */
 export declare const MEMTREE_ACTIVE_AGAIN_CONTEXT: string;
 /** The one line a blocked manual /compact shows (PreCompact hook reason). */
@@ -53,7 +53,7 @@ export declare class ModelContextNotices {
      * A resumed session: what its transcript last told the model (a notice
      * from an earlier ccc process), so a later change is announced.
      */
-    restore(sessionId: string, transcript: string): void;
+    restore(sessionId: string, kind: string | undefined): void;
     /** The session's transcript lost its notices (Claude Code compacted it). */
     forget(sessionId: string): void;
     /**
@@ -66,5 +66,11 @@ export declare class ModelContextNotices {
  * The kind of the last notice in a transcript's live part (after its last
  * compaction), undefined when none or "working again".
  */
-export declare function lastToldKind(fullTranscript: string): string | undefined;
+export declare function lastToldKind(transcript: string): string | undefined;
+/**
+ * lastToldKind of a transcript file, read backward from its end until the
+ * last marker, so a long session's file is not read whole. Undefined when the
+ * file is missing or unreadable, or after `budgetMs`. Never throws.
+ */
+export declare function lastToldKindInFile(file: string, budgetMs?: number, chunkBytes?: number): Promise<string | undefined>;
 //# sourceMappingURL=model-context.d.ts.map
