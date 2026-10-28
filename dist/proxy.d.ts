@@ -289,6 +289,8 @@ interface ProxyState {
     pausedDetail: () => string | null;
     /** Why the key is paused, when the server said (MemtreeClient.pausedReason). */
     pausedReason: () => string | null;
+    /** Whether MemTree's latest answer was a success (MemtreeClient.answering). */
+    memtreeAnswering: () => boolean | undefined;
     /** What each session's model was told about MemTree's state; blocked /compacts. */
     modelNotices: ModelContextNotices;
     /** polychat's usage dashboard for the MemTree environment, if known. */

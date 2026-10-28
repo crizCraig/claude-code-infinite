@@ -1030,6 +1030,8 @@ export class MemtreeClient {
   private lastAnswerUnpaid = false;
   /** Whether the latest call that got an answer, or timed out, refused the key (key-page.ts). */
   private lastAnswerKeyInvalid = false;
+  /** Whether the latest such call succeeded; undefined before any answer. */
+  private lastAnswerOk: boolean | undefined;
   /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
   /** HTTP status of each key's latest failed compress (absent: no response). */
@@ -1079,6 +1081,14 @@ export class MemtreeClient {
    */
   get keyInvalid(): boolean {
     return this.lastAnswerKeyInvalid;
+  }
+
+  /**
+   * Whether MemTree's latest answer (or timeout) was a success: true, a
+   * failure: false, no answer yet: undefined. Positive evidence that it works.
+   */
+  get answering(): boolean | undefined {
+    return this.lastAnswerOk;
   }
 
   /** Where to get a new key for this client's environment (its base URL). */
@@ -1918,6 +1928,7 @@ export class MemtreeClient {
       if (news && (status !== undefined || !opts.signal?.aborted)) {
         this.lastAnswerUnpaid = status === 402;
         this.lastAnswerKeyInvalid = keyRefused;
+        this.lastAnswerOk = ok;
       }
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).

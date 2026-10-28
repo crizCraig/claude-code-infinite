@@ -17,6 +17,8 @@
  * as the exception these notices announce.
  */
 export declare const SUPPORT_EMAIL = "support@polychat.co";
+/** Larger transcripts are not searched on resume (a whole read; never on the turn path). */
+export declare const TRANSCRIPT_SCAN_MAX_BYTES: number;
 /** Told once MemTree answers again after a paused or refused-key notice. */
 export declare const MEMTREE_ACTIVE_AGAIN_CONTEXT: string;
 /** The one line a blocked manual /compact shows (PreCompact hook reason). */
@@ -27,7 +29,9 @@ export declare const COMPACT_CONFIRM_WINDOW_MS: number;
 export declare function pausedModelContext(detail: string, reason: string | null): string;
 /** The model's notice for a refused key (401/403). */
 export declare function keyInvalidModelContext(keyPageUrl: string): string;
-/** A notice for the model; `kind` says whether it is news ("paused", "key-invalid"). */
+export declare const PAUSED_KIND = "paused";
+export declare const KEY_INVALID_KIND = "key-invalid";
+/** A notice for the model; `kind` says whether it is news (PAUSED_KIND, KEY_INVALID_KIND). */
 export type ModelNotice = {
     kind: string;
     text: string;
@@ -40,10 +44,16 @@ export declare class ModelContextNotices {
     constructor(now?: () => number);
     /**
      * The notice to add to this session's prompt, given MemTree's current state
-     * (undefined: working), or undefined when its kind has not changed since the
-     * session was last told: a refreshed link alone is no news.
+     * (undefined: working; null: not known yet, so no news), or undefined when
+     * its kind has not changed since the session was last told: a refreshed
+     * link alone is no news.
      */
-    next(sessionId: string, current: ModelNotice | undefined): string | undefined;
+    next(sessionId: string, current: ModelNotice | undefined | null): string | undefined;
+    /**
+     * A resumed session: what its transcript last told the model (a notice
+     * from an earlier ccc process), so a later change is announced.
+     */
+    restore(sessionId: string, transcript: string): void;
     /** The session's transcript lost its notices (Claude Code compacted it). */
     forget(sessionId: string): void;
     /**
@@ -52,4 +62,6 @@ export declare class ModelContextNotices {
      */
     blockCompact(sessionId: string, memtreeWorking: boolean): string | undefined;
 }
+/** The kind of the last notice in a transcript, undefined when none or "working again". */
+export declare function lastToldKind(transcript: string): string | undefined;
 //# sourceMappingURL=model-context.d.ts.map

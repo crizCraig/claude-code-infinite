@@ -20,6 +20,7 @@ import {
   MEMTREE_ACTIVE_AGAIN_CONTEXT,
   ModelContextNotices,
   keyInvalidModelContext,
+  lastToldKind,
   pausedModelContext,
 } from "../dist/model-context.js";
 
@@ -98,6 +99,23 @@ test("each session is told once per change: paused, then working again, then not
   assert.equal(notices.next("s", paused), "PAUSED link-1", "after a compaction the notice is gone");
 });
 
+test("a resumed transcript's last notice is restored; working again or none clears it", () => {
+  const paused = pausedModelContext(PAYMENT_DETAIL, null);
+  const key = keyInvalidModelContext("https://k");
+  const line = (text) => JSON.stringify({ type: "attachment", content: text });
+  assert.equal(lastToldKind(""), undefined);
+  assert.equal(lastToldKind(line(paused)), "paused");
+  assert.equal(lastToldKind([line(paused), line(key)].join("\n")), "key-invalid");
+  assert.equal(lastToldKind([line(paused), line(MEMTREE_ACTIVE_AGAIN_CONTEXT)].join("\n")),
+    undefined);
+  const notices = new ModelContextNotices();
+  notices.restore("s", line(paused));
+  assert.equal(notices.next("s", { kind: "paused", text: "P" }), undefined, "already told");
+  notices.restore("s", line(paused));
+  assert.equal(notices.next("s", undefined), MEMTREE_ACTIVE_AGAIN_CONTEXT, "paid in between");
+  assert.equal(notices.next("s", null), undefined, "unknown state is no news");
+});
+
 // ------------------------------------------------------------------ /compact interception
 
 test("a manual /compact is blocked once with the MemTree note; again within the window runs", () => {
@@ -158,9 +176,9 @@ async function serve(handler) {
     close() { server.closeAllConnections(); server.close(); } };
 }
 
-/** MemTree answers 402 until `h.paid`, then passes the conversation through. */
+/** MemTree answers `h.status` if set, else 402 until `h.paid`, then passes the conversation through. */
 async function harness() {
-  const h = { paid: false };
+  const h = { paid: false, status: undefined };
   const upstream = await serve((req, res) => {
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ type: "message", role: "assistant",
@@ -169,6 +187,10 @@ async function harness() {
   const memory = await serve((req, res, raw) => {
     res.setHeader("content-type", "application/json");
     if (req.method === "GET") { res.statusCode = 202; return res.end("{}"); }
+    if (h.status) {
+      res.statusCode = h.status;
+      return res.end(JSON.stringify({ detail: h.status === 401 ? "Invalid API key" : "down" }));
+    }
     if (!h.paid) {
       res.statusCode = 402;
       return res.end(JSON.stringify({ detail: PAYMENT_DETAIL }));
@@ -194,10 +216,12 @@ async function turn(h) {
       messages: [{ role: "user", content: `hello ${h.turns++}` }] }),
   });
   await response.text();
-  for (let i = 0; i < 100 && (h.memtree.paymentRequiredDetail === null) !== h.paid; i++) {
+  const settled = () => h.status ? h.memtree.answering === false
+    : (h.memtree.paymentRequiredDetail === null) === h.paid;
+  for (let i = 0; i < 100 && !settled(); i++) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  assert.equal(h.memtree.paymentRequiredDetail === null, h.paid, "MemTree's answer arrived");
+  assert.ok(settled(), "MemTree's answer arrived");
 }
 
 async function hook(h, input) {
@@ -250,4 +274,45 @@ test("proxy: manual /compact is blocked while MemTree works, allowed while it's 
     assert.equal(await preCompact(h, { session_id: "fresh" }), null,
       "paused: Claude Code's /compact is the way on");
   } finally { h.close(); }
+});
+
+test("proxy: an outage after a refused key is not announced as recovery, nor blocks /compact", async () => {
+  const h = await harness();
+  try {
+    assert.equal(await preCompact(h), null, "no MemTree answer yet: /compact runs");
+    h.status = 401;
+    await turn(h);
+    assert.match(context(await submit(h, "p1")), /^ccc: MemTree is off: /);
+    h.status = 503;
+    // A compress call's failure is news (a background index's is not): it clears the flag.
+    const messages = [{ role: "user", content: "compress me" }];
+    await h.memtree.compress(MemtreeClient.hashMessages(messages), messages, 200_000)
+      .catch(() => undefined);
+    assert.equal(h.memtree.keyInvalid, false, "a 503 clears the refused-key flag");
+    assert.equal(h.memtree.answering, false);
+    assert.equal(context(await submit(h, "p2")), undefined, "no answer is no recovery");
+    assert.equal(await preCompact(h), null, "an outage: /compact runs");
+    h.status = undefined;
+    h.paid = true;
+    await turn(h);
+    assert.equal(context(await submit(h, "p3")), MEMTREE_ACTIVE_AGAIN_CONTEXT);
+  } finally { h.close(); }
+});
+
+test("proxy: a resume after paying elsewhere announces recovery from the transcript", async () => {
+  const h = await harness();
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ccc-model-context-"));
+  const transcript = path.join(dir, "session.jsonl");
+  await fs.writeFile(transcript, JSON.stringify({ type: "attachment",
+    content: pausedModelContext(PAYMENT_DETAIL, null) }) + "\n");
+  try {
+    await hook(h, { hook_event_name: "SessionStart", source: "resume", transcript_path: transcript });
+    h.paid = true;
+    await turn(h);
+    assert.equal(context(await submit(h, "p1")), MEMTREE_ACTIVE_AGAIN_CONTEXT);
+    assert.equal(context(await submit(h, "p2")), undefined);
+  } finally {
+    h.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

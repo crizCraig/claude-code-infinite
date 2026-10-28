@@ -574,6 +574,9 @@ export function parseNoticeHookInput(value) {
     if (input.hook_event_name === "SessionStart") {
         if (input.source !== undefined && typeof input.source !== "string")
             return null;
+        if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+            return null;
+        }
         return input;
     }
     if (input.hook_event_name === "UserPromptSubmit") {

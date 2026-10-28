@@ -22,9 +22,14 @@ import { FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE } from "./payment-gate.js"
 import { REASON_FREE_CREDIT_USED, REASON_PLAN_LIMIT } from "./payment-link.js";
 
 export const SUPPORT_EMAIL = "support@polychat.co";
+const PAUSED_PREFIX = "ccc: MemTree is paused: ";
+const KEY_INVALID_PREFIX = "ccc: MemTree is off: ";
+const ACTIVE_AGAIN_PREFIX = "ccc: MemTree is working again";
+/** Larger transcripts are not searched on resume (a whole read; never on the turn path). */
+export const TRANSCRIPT_SCAN_MAX_BYTES = 256 * 1024 * 1024;
 /** Told once MemTree answers again after a paused or refused-key notice. */
 export const MEMTREE_ACTIVE_AGAIN_CONTEXT =
-  "ccc: MemTree is working again; compression is back on, so the earlier paused notice " +
+  `${ACTIVE_AGAIN_PREFIX}; compression is back on, so the earlier paused notice ` +
   "and its /compact fallback no longer apply.";
 /** The one line a blocked manual /compact shows (PreCompact hook reason). */
 export const COMPACT_BLOCKED_REASON =
@@ -42,7 +47,7 @@ const PAUSED_FALLBACK =
 export function pausedModelContext(detail: string, reason: string | null): string {
   const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "", 160);
   return [
-    `ccc: MemTree is paused: ${pausedReasonText(reason)}.`,
+    `${PAUSED_PREFIX}${pausedReasonText(reason)}.`,
     account ? `(MemTree server: "${account}".)` : "",
     "This is MemTree's own billing at polychat.co, not Claude, the user's Claude plan or " +
       "Anthropic credits; Claude works normally.",
@@ -54,12 +59,15 @@ export function pausedModelContext(detail: string, reason: string | null): strin
 
 /** The model's notice for a refused key (401/403). */
 export function keyInvalidModelContext(keyPageUrl: string): string {
-  return "ccc: MemTree is off: the user's MemTree key was refused (revoked or mistyped); " +
+  return `${KEY_INVALID_PREFIX}the user's MemTree key was refused (revoked or mistyped); ` +
     `Claude itself is unaffected. Fix: get a new key at ${keyPageUrl} and run \`ccc\` in a ` +
     `terminal to paste it. ${PAUSED_FALLBACK}`;
 }
 
-/** A notice for the model; `kind` says whether it is news ("paused", "key-invalid"). */
+export const PAUSED_KIND = "paused";
+export const KEY_INVALID_KIND = "key-invalid";
+
+/** A notice for the model; `kind` says whether it is news (PAUSED_KIND, KEY_INVALID_KIND). */
 export type ModelNotice = { kind: string; text: string };
 
 /** Per-session record of what the model was told, and of blocked /compacts. */
@@ -71,10 +79,12 @@ export class ModelContextNotices {
 
   /**
    * The notice to add to this session's prompt, given MemTree's current state
-   * (undefined: working), or undefined when its kind has not changed since the
-   * session was last told: a refreshed link alone is no news.
+   * (undefined: working; null: not known yet, so no news), or undefined when
+   * its kind has not changed since the session was last told: a refreshed
+   * link alone is no news.
    */
-  next(sessionId: string, current: ModelNotice | undefined): string | undefined {
+  next(sessionId: string, current: ModelNotice | undefined | null): string | undefined {
+    if (current === null) return undefined;
     const last = this.told.get(sessionId);
     if (current === undefined) {
       if (last === undefined) return undefined;
@@ -84,6 +94,16 @@ export class ModelContextNotices {
     if (last === current.kind) return undefined;
     this.told.set(sessionId, current.kind);
     return current.text;
+  }
+
+  /**
+   * A resumed session: what its transcript last told the model (a notice
+   * from an earlier ccc process), so a later change is announced.
+   */
+  restore(sessionId: string, transcript: string): void {
+    const kind = lastToldKind(transcript);
+    if (kind === undefined) this.told.delete(sessionId);
+    else this.told.set(sessionId, kind);
   }
 
   /** The session's transcript lost its notices (Claude Code compacted it). */
@@ -113,6 +133,19 @@ export class ModelContextNotices {
  */
 function modelSubscribeUrl(detail: string): string {
   return SHORT_PAYMENT_URL_RE.exec(detail)?.[0] ?? FALLBACK_SUBSCRIBE_URL;
+}
+
+/** The kind of the last notice in a transcript, undefined when none or "working again". */
+export function lastToldKind(transcript: string): string | undefined {
+  const last = Math.max(
+    transcript.lastIndexOf(PAUSED_PREFIX),
+    transcript.lastIndexOf(KEY_INVALID_PREFIX),
+    transcript.lastIndexOf(ACTIVE_AGAIN_PREFIX)
+  );
+  if (last < 0) return undefined;
+  if (transcript.startsWith(PAUSED_PREFIX, last)) return PAUSED_KIND;
+  if (transcript.startsWith(KEY_INVALID_PREFIX, last)) return KEY_INVALID_KIND;
+  return undefined;
 }
 
 function pausedReasonText(reason: string | null): string {

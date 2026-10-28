@@ -50,7 +50,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, promises as fsPromises, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
@@ -59,7 +59,7 @@ import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRA
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
-import { ModelContextNotices, keyInvalidModelContext, pausedModelContext } from "./model-context.js";
+import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, TRANSCRIPT_SCAN_MAX_BYTES, keyInvalidModelContext, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText, subscribeUrlFromDetail } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
@@ -338,6 +338,7 @@ export function startProxy(opts) {
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         pausedDetail: () => opts.memtree.pausedDetail,
         pausedReason: () => opts.memtree.pausedReason,
+        memtreeAnswering: () => opts.memtree.answering,
         modelNotices: new ModelContextNotices(),
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
@@ -767,6 +768,8 @@ onMainStop) {
             // Claude Code's compaction dropped any MemTree notice from the transcript.
             if (parsed.source === "compact")
                 state.modelNotices.forget(parsed.session_id);
+            if (parsed.source === "resume")
+                await restoreModelNotices(state, parsed);
         }
         // Earlier trees in this project: asked now, so its wait overlaps the resume's.
         const contextPromise = projectTreesContext(state.projectTrees, parsed);
@@ -2142,19 +2145,45 @@ function promptSubmitLine(state) {
         return undefined;
     }
 }
-/** Whether MemTree is compressing: neither paused (402) nor refusing the key. */
+/**
+ * Whether MemTree is known to be compressing: its latest answer a success and
+ * no pause (402) remembered. Before any answer, or after an outage, it is not.
+ */
 function memtreeWorking(state) {
-    return state.unpaidDetail() === null && !state.keyInvalid();
+    return state.memtreeAnswering() === true && state.unpaidDetail() === null;
 }
-/** What the model should know about MemTree right now; undefined while it works. */
+/**
+ * What the model should know about MemTree right now: a notice, undefined
+ * when it is known to work, null when neither is known (no answer, an outage).
+ */
 function currentModelNotice(state) {
     if (state.keyInvalid()) {
-        return { kind: "key-invalid", text: keyInvalidModelContext(state.keyPageUrl) };
+        return { kind: KEY_INVALID_KIND, text: keyInvalidModelContext(state.keyPageUrl) };
     }
     const detail = state.unpaidDetail();
-    if (detail === null)
-        return undefined;
-    return { kind: "paused", text: pausedModelContext(detail, state.pausedReason()) };
+    if (detail !== null) {
+        return { kind: PAUSED_KIND, text: pausedModelContext(detail, state.pausedReason()) };
+    }
+    return memtreeWorking(state) ? undefined : null;
+}
+/**
+ * A resumed session's transcript may hold a notice from an earlier ccc process
+ * (paused, then paid in between): start from it, so the change is announced.
+ * A missing, unreadable or very large transcript starts from nothing. Never throws.
+ */
+async function restoreModelNotices(state, input) {
+    if (!input.transcript_path)
+        return;
+    try {
+        const stat = await fsPromises.stat(input.transcript_path);
+        if (stat.size > TRANSCRIPT_SCAN_MAX_BYTES)
+            return;
+        const text = await fsPromises.readFile(input.transcript_path, "utf-8");
+        state.modelNotices.restore(input.session_id, text);
+    }
+    catch {
+        // No transcript to read: nothing was told that we know of.
+    }
 }
 /** UserPromptSubmit's answer: a line for the user, context for the model, or both. */
 function promptSubmitOutput(line, context) {

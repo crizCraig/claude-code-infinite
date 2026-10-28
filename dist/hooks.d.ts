@@ -145,6 +145,8 @@ export interface SessionStartHookInput {
     session_id: string;
     /** "startup" | "resume" | "clear" | "compact" | "fork". */
     source?: string;
+    /** The session's JSONL transcript (model-context.ts reads its notices on resume). */
+    transcript_path?: string;
     agent_id?: string;
     prompt_id?: string;
 }

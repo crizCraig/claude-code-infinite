@@ -264,6 +264,8 @@ export interface SessionStartHookInput {
   session_id: string;
   /** "startup" | "resume" | "clear" | "compact" | "fork". */
   source?: string;
+  /** The session's JSONL transcript (model-context.ts reads its notices on resume). */
+  transcript_path?: string;
   agent_id?: string;
   prompt_id?: string;
 }
@@ -751,6 +753,9 @@ export function parseNoticeHookInput(value: unknown): NoticeHookInput | null {
   }
   if (input.hook_event_name === "SessionStart") {
     if (input.source !== undefined && typeof input.source !== "string") return null;
+    if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+      return null;
+    }
     return input as unknown as SessionStartHookInput;
   }
   if (input.hook_event_name === "UserPromptSubmit") {
