@@ -108,6 +108,10 @@ test("a resumed transcript's last notice is restored; working again or none clea
   assert.equal(lastToldKind([line(paused), line(key)].join("\n")), "key-invalid");
   assert.equal(lastToldKind([line(paused), line(MEMTREE_ACTIVE_AGAIN_CONTEXT)].join("\n")),
     undefined);
+  const boundary = JSON.stringify({ type: "system", subtype: "compact_boundary" });
+  assert.equal(lastToldKind([line(paused), boundary].join("\n")), undefined,
+    "compacted away: not in the model's context any more");
+  assert.equal(lastToldKind([line(paused), boundary, line(key)].join("\n")), "key-invalid");
   const notices = new ModelContextNotices();
   notices.restore("s", line(paused));
   assert.equal(notices.next("s", { kind: "paused", text: "P" }), undefined, "already told");
@@ -315,4 +319,17 @@ test("proxy: a resume after paying elsewhere announces recovery from the transcr
     h.close();
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+test("MemtreeClient.answering: a failed background index is no positive evidence", async () => {
+  const h = await harness();
+  try {
+    h.paid = true;
+    await turn(h);
+    assert.equal(h.memtree.answering, true);
+    h.status = 503;
+    await turn(h);
+    assert.equal(h.memtree.answering, false);
+    assert.equal(await preCompact(h), null, "an outage: /compact runs");
+  } finally { h.close(); }
 });

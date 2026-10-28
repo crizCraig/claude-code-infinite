@@ -135,8 +135,16 @@ function modelSubscribeUrl(detail: string): string {
   return SHORT_PAYMENT_URL_RE.exec(detail)?.[0] ?? FALLBACK_SUBSCRIBE_URL;
 }
 
-/** The kind of the last notice in a transcript, undefined when none or "working again". */
-export function lastToldKind(transcript: string): string | undefined {
+/** Claude Code's marker in a transcript: what precedes it is no longer in the model's context. */
+const COMPACT_BOUNDARY = '"compact_boundary"';
+
+/**
+ * The kind of the last notice in a transcript's live part (after its last
+ * compaction), undefined when none or "working again".
+ */
+export function lastToldKind(fullTranscript: string): string | undefined {
+  const boundary = fullTranscript.lastIndexOf(COMPACT_BOUNDARY);
+  const transcript = boundary < 0 ? fullTranscript : fullTranscript.slice(boundary);
   const last = Math.max(
     transcript.lastIndexOf(PAUSED_PREFIX),
     transcript.lastIndexOf(KEY_INVALID_PREFIX),

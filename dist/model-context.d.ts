@@ -62,6 +62,9 @@ export declare class ModelContextNotices {
      */
     blockCompact(sessionId: string, memtreeWorking: boolean): string | undefined;
 }
-/** The kind of the last notice in a transcript, undefined when none or "working again". */
-export declare function lastToldKind(transcript: string): string | undefined;
+/**
+ * The kind of the last notice in a transcript's live part (after its last
+ * compaction), undefined when none or "working again".
+ */
+export declare function lastToldKind(fullTranscript: string): string | undefined;
 //# sourceMappingURL=model-context.d.ts.map

@@ -1928,8 +1928,9 @@ export class MemtreeClient {
       if (news && (status !== undefined || !opts.signal?.aborted)) {
         this.lastAnswerUnpaid = status === 402;
         this.lastAnswerKeyInvalid = keyRefused;
-        this.lastAnswerOk = ok;
       }
+      // Availability, unlike payment, counts a failed background index too.
+      if (!resent && (status !== undefined || !opts.signal?.aborted)) this.lastAnswerOk = ok;
       // One JSONL line per MemTree call, success or failure; `status` stays
       // absent when the call never got a response (network error/timeout).
       if (!resent) this.reqlog?.log({
