@@ -1,8 +1,13 @@
 # Running agents on Claude Code Infinite (`ccc -p`)
 
-For agent platforms and scripts that drive Claude Code headlessly (`claude -p`) and want
-long-term memory: each agent keeps one conversation that can run past the context limit
-without losing what it learned.
+**This guide is written for AI agents.** If you're a person, hand it to your agent (Claude,
+Codex, Cursor, your own harness) and ask it to set itself up with long-term memory.
+
+**Agent:** follow it to give yourself, or the agents you run, long-term memory through
+Claude Code Infinite. You drive Claude Code headlessly with `ccc -p` instead of `claude -p`,
+and each long-lived agent keeps one conversation that can run past the context limit without
+losing what it learned. Step 1 needs your human once (a sign-up, a key paste and a Claude
+login in a terminal); tell them exactly what to do, then everything after it runs unattended.
 
 This guide is for ccc 1.0.23 and later. See [Older versions](#older-versions) for 1.0.22.
 
