@@ -270,6 +270,14 @@ export interface SessionStartHookInput {
   prompt_id?: string;
 }
 
+/**
+ * The proxy path of the PreCompact hook. Unlike the other hooks' path it
+ * carries no token: Claude Code prints this URL with a blocked or finished
+ * /compact. The proxy accepts only PreCompact on it, which can at most block
+ * one /compact.
+ */
+export const PRECOMPACT_HOOK_PATH = "/_ccc/hooks/precompact";
+
 /** Before Claude Code compacts; "manual" is a typed /compact (model-context.ts). */
 export interface PreCompactHookInput {
   hook_event_name: "PreCompact";
@@ -842,6 +850,9 @@ export function createSessionNoticePlugin(
   }
 
   const hook = { type: "http", url: hookUrl, timeout: 5 };
+  // Claude Code shows a PreCompact hook's URL to the user and records it in the
+  // transcript, so it gets a path without the token (it takes PreCompact only).
+  const compactHook = { type: "http", url: `${url.origin}${PRECOMPACT_HOOK_PATH}`, timeout: 5 };
   const hooks: Record<string, unknown> = {
     Stop: [{ hooks: [hook] }],
     UserPromptSubmit: [{ hooks: [hook] }],
@@ -852,7 +863,7 @@ export function createSessionNoticePlugin(
     hooks.MessageDisplay = [{ hooks: [hook] }];
   }
   if (opts.interceptCompact !== false) {
-    hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
+    hooks.PreCompact = [{ matcher: "manual", hooks: [compactHook] }];
   }
   if (opts.startupMessage) {
     hooks.SessionStart = [

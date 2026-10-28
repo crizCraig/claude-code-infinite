@@ -44,10 +44,13 @@ test("the MCP instructions say context is MemTree's job: no /compact, /clear or 
 
 // ------------------------------------------------------------------ notice texts
 
-test("paused context: MemTree not Claude, why, the account, the fix, and /compact as fallback", () => {
+test("paused context: MemTree not Claude, why, the fix, and /compact as fallback", () => {
   const text = pausedModelContext(PAYMENT_DETAIL, "free_credit_used");
   assert.match(text, /^ccc: MemTree is paused: the free MemTree credit is used up\./);
-  assert.ok(text.includes(`"${ACCOUNT_LINE}"`), "the server's account line, for a wrong-account case");
+  assert.ok(!text.includes("user@example.com"), "no email: the notice stays in the transcript");
+  assert.ok(!text.includes(ACCOUNT_LINE), "the server's text is not quoted");
+  const longFirst = pausedModelContext(`Pay at ${SUBSCRIBE_URL}\n\nMore.`, null);
+  assert.ok(!longFirst.includes("/payment?"), "a long link on the first line is not quoted either");
   assert.match(text, /not Claude, the user's Claude plan or Anthropic credits/);
   assert.ok(!text.includes(SUBSCRIBE_URL), "the long link carries the email");
   assert.match(text, /Fix: subscribe at https:\/\/polychat\.co\/pricing, /);
@@ -63,10 +66,10 @@ test("paused context: MemTree not Claude, why, the account, the fix, and /compac
   assert.match(pausedModelContext(PAYMENT_DETAIL, null), /paused: MemTree usage limit reached\./);
 });
 
-test("paused context strips controls from the server's account line", () => {
-  const text = pausedModelContext("Payment required\u001b[31m for x\n\nmore", null);
+test("paused context quotes none of the server's text (controls, email or links)", () => {
+  const text = pausedModelContext("Payment required\u001b[31m for a@b.co\n\nmore", null);
   assert.ok(!text.includes("\u001b"));
-  assert.ok(text.includes('"Payment required [31m for x"'), "first line only, controls blanked");
+  assert.ok(!text.includes("Payment required") && !text.includes("a@b.co"));
 });
 
 test("key-invalid context names MemTree's key and where to get a new one", () => {
@@ -174,7 +177,8 @@ test("PreCompact hook input parses; the plugin registers it for manual compactio
     const read = async (p) =>
       JSON.parse(await fs.readFile(path.join(p.dir, "hooks", "hooks.json"), "utf-8")).hooks;
     assert.deepEqual((await read(on)).PreCompact,
-      [{ matcher: "manual", hooks: [{ type: "http", url, timeout: 5 }] }]);
+      [{ matcher: "manual", hooks: [{ type: "http", timeout: 5,
+        url: "http://127.0.0.1:12345/_ccc/hooks/precompact" }] }], "no token in a printed URL");
     assert.equal((await read(off)).PreCompact, undefined);
     const relay = createSessionNoticePlugin(url, { tempRoot, resumeLink: true });
     try {
@@ -250,8 +254,8 @@ async function turn(h) {
   assert.ok(settled(), "MemTree's answer arrived");
 }
 
-async function hook(h, input) {
-  const res = await fetch(h.proxy.hookUrl, {
+async function hook(h, input, url = h.proxy.hookUrl) {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ session_id: SESSION, ...input }),
@@ -263,8 +267,32 @@ const submit = (h, promptId, extra = {}) =>
   hook(h, { hook_event_name: "UserPromptSubmit", prompt: "why am I blocked?",
     prompt_id: promptId, ...extra });
 const context = (body) => body?.hookSpecificOutput?.additionalContext;
+/** The token-free path the plugin registers for PreCompact (hooks.ts PRECOMPACT_HOOK_PATH). */
+const compactUrl = (h) => `http://127.0.0.1:${h.proxy.port}/_ccc/hooks/precompact`;
 const preCompact = (h, extra = {}) =>
-  hook(h, { hook_event_name: "PreCompact", trigger: "manual", custom_instructions: null, ...extra });
+  hook(h, { hook_event_name: "PreCompact", trigger: "manual", custom_instructions: null, ...extra },
+    compactUrl(h));
+
+test("proxy: the token-free PreCompact path takes PreCompact only", async () => {
+  const h = await harness();
+  try {
+    for (const input of [
+      { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p" },
+      { hook_event_name: "Stop" },
+      { hook_event_name: "SessionStart", source: "compact" },
+    ]) {
+      const res = await fetch(compactUrl(h), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: SESSION, ...input }),
+      });
+      assert.equal(res.status, 403, input.hook_event_name);
+    }
+    assert.equal(await preCompact(h), null, "PreCompact is answered (nothing known: runs)");
+  } finally {
+    await h.close();
+  }
+});
 
 test("proxy: a paused MemTree is told to Claude on the next prompt, once, then its recovery", async () => {
   const h = await harness();
@@ -274,7 +302,7 @@ test("proxy: a paused MemTree is told to Claude on the next prompt, once, then i
     const told = await submit(h, "p1");
     assert.equal(told.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(context(told), /^ccc: MemTree is paused: /);
-    assert.ok(context(told).includes(ACCOUNT_LINE));
+    assert.ok(!context(told).includes("user@example.com"), "no email in the transcript");
     assert.equal(context(await submit(h, "p2")), undefined, "once per change");
     assert.equal(context(await submit(h, "p3", { agent_id: "a1" })), undefined, "not subagents");
     await hook(h, { hook_event_name: "SessionStart", source: "compact" });

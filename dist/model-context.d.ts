@@ -25,7 +25,11 @@ export declare const MEMTREE_ACTIVE_AGAIN_CONTEXT: string;
 export declare const COMPACT_BLOCKED_REASON: string;
 /** A second manual /compact within this long of a blocked one runs. */
 export declare const COMPACT_CONFIRM_WINDOW_MS: number;
-/** The model's notice for a paused key (402): `detail` is the server's text. */
+/**
+ * The model's notice for a paused key (402): `detail` is the server's text.
+ * None of it is quoted: its first line names the account's email, and this
+ * text stays in the transcript (and MemTree's copy of it).
+ */
 export declare function pausedModelContext(detail: string, reason: string | null): string;
 /** The model's notice for a refused key (401/403). */
 export declare function keyInvalidModelContext(keyPageUrl: string): string;

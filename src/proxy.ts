@@ -122,7 +122,9 @@ import {
   isMemtreeViewCommand,
   sessionCommandArgs,
   parseNoticeHookInput,
+  PRECOMPACT_HOOK_PATH,
   type FirstTreeIntro,
+  type NoticeHookInput,
   type SessionStartHookInput,
   type SuccessLink,
 } from "./hooks.js";
@@ -1163,6 +1165,9 @@ async function handleRequest(
     res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));
     return;
   }
+  if (url.pathname === PRECOMPACT_HOOK_PATH) {
+    return handleNoticeHook(req, res, state, opts.reqlog, undefined, "PreCompact");
+  }
   if (url.pathname === hookPath) {
     return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) =>
       opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
@@ -1449,7 +1454,9 @@ async function handleNoticeHook(
   state: ProxyState,
   reqlog: RequestLogSink | undefined,
   /** A main-lane turn ended: the session may be over (its final index). */
-  onMainStop?: (sessionId: string | undefined) => void
+  onMainStop?: (sessionId: string | undefined) => void,
+  /** The only event this path takes (the token-free PreCompact path). */
+  onlyEvent?: NoticeHookInput["hook_event_name"]
 ): Promise<void> {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
@@ -1481,6 +1488,11 @@ async function handleNoticeHook(
   const parsed = parseNoticeHookInput(input);
   if (!parsed) {
     res.writeHead(400);
+    res.end();
+    return;
+  }
+  if (onlyEvent !== undefined && parsed.hook_event_name !== onlyEvent) {
+    res.writeHead(403);
     res.end();
     return;
   }
