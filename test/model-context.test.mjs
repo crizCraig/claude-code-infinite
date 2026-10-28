@@ -47,7 +47,13 @@ test("paused context: MemTree not Claude, why, the account, the fix, and /compac
   assert.match(text, /^ccc: MemTree is paused: the free MemTree credit is used up\./);
   assert.ok(text.includes(`"${ACCOUNT_LINE}"`), "the server's account line, for a wrong-account case");
   assert.match(text, /not Claude, the user's Claude plan or Anthropic credits/);
-  assert.ok(text.includes(SUBSCRIBE_URL));
+  assert.ok(!text.includes(SUBSCRIBE_URL), "the long link carries the email");
+  assert.match(text, /Fix: subscribe at https:\/\/polychat\.co\/pricing, /);
+  const short = "https://app.polychat.co/p/Ab3xY9Ab3xY9Ab";
+  assert.match(pausedModelContext(`${ACCOUNT_LINE}\n\nStarter: ${short}.`, null),
+    new RegExp(`Fix: subscribe at ${short}, `));
+  assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"), /Fix: upgrade at /);
+  assert.match(text, /fresh session \(\/clear\) or, while the conversation still fits, \/compact/);
   assert.match(text, /support@polychat\.co/);
   assert.match(text, /\/compact .* fallback/);
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"),
@@ -126,6 +132,12 @@ test("PreCompact hook input parses; the plugin registers it for manual compactio
     assert.deepEqual((await read(on)).PreCompact,
       [{ matcher: "manual", hooks: [{ type: "http", url, timeout: 5 }] }]);
     assert.equal((await read(off)).PreCompact, undefined);
+    const relay = createSessionNoticePlugin(url, { tempRoot, resumeLink: true });
+    try {
+      assert.ok((await read(relay)).SessionStart.some((entry) =>
+        entry.matcher.split("|").includes("compact")),
+        "a compaction reaches the proxy, so the notice is re-told after it");
+    } finally { relay.close(); }
   } finally {
     on.close();
     off.close();

@@ -17,7 +17,7 @@
  * as the exception these notices announce.
  */
 import { sanitizeNoticeDetail } from "./notices.js";
-import { subscribeUrlFromDetail } from "./payment-notice.js";
+import { FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE } from "./payment-gate.js";
 import { REASON_FREE_CREDIT_USED, REASON_PLAN_LIMIT } from "./payment-link.js";
 export const SUPPORT_EMAIL = "support@polychat.co";
 /** Told once MemTree answers again after a paused or refused-key notice. */
@@ -29,8 +29,8 @@ export const COMPACT_BLOCKED_REASON = "MemTree already keeps this session within
     "to use Claude Code's anyway.";
 /** A second manual /compact within this long of a blocked one runs. */
 export const COMPACT_CONFIRM_WINDOW_MS = 2 * 60 * 1000;
-const PAUSED_FALLBACK = "Until then nothing is compressed or indexed, so near the context limit /compact " +
-    "(Claude Code's own) or a fresh session is the fallback.";
+const PAUSED_FALLBACK = "Until then nothing is compressed or indexed, so near the context limit a fresh session " +
+    "(/clear) or, while the conversation still fits, /compact (Claude Code's own) is the fallback.";
 /** The model's notice for a paused key (402): `detail` is the server's text. */
 export function pausedModelContext(detail, reason) {
     const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "", 160);
@@ -39,8 +39,8 @@ export function pausedModelContext(detail, reason) {
         account ? `(MemTree server: "${account}".)` : "",
         "This is MemTree's own billing at polychat.co, not Claude, the user's Claude plan or " +
             "Anthropic credits; Claude works normally.",
-        `Fix: subscribe at ${subscribeUrlFromDetail(detail)}, or for credit questions email ` +
-            `${SUPPORT_EMAIL}.`,
+        `Fix: ${reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe"} at ${modelSubscribeUrl(detail)}, ` +
+            `or for credit questions email ${SUPPORT_EMAIL}.`,
         PAUSED_FALLBACK,
     ].filter(Boolean).join(" ");
 }
@@ -95,6 +95,13 @@ export class ModelContextNotices {
         this.compactBlockedAt.set(sessionId, this.now());
         return COMPACT_BLOCKED_REASON;
     }
+}
+/**
+ * The short checkout link, else the pricing page: the long `/payment?…` link
+ * carries the user's email, and this text stays in the transcript.
+ */
+function modelSubscribeUrl(detail) {
+    return SHORT_PAYMENT_URL_RE.exec(detail)?.[0] ?? FALLBACK_SUBSCRIBE_URL;
 }
 function pausedReasonText(reason) {
     if (reason === REASON_FREE_CREDIT_USED)

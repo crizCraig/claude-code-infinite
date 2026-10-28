@@ -652,8 +652,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             {
                 // Every session start that could already have a page. A fresh or
                 // cleared session has none yet, so in practice this answers resumes;
-                // compaction continues the same session and needs no line.
-                matcher: "startup|resume|clear|fork",
+                // a compaction needs no line, but it tells the proxy that the
+                // transcript lost its MemTree notices (model-context.ts).
+                matcher: "startup|resume|clear|compact|fork",
                 hooks: [
                     {
                         type: "command",
