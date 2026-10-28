@@ -48,8 +48,22 @@ You can also choose the id yourself: `ccc -p --session-id <uuid> "…"` for the 
 
 Rules of thumb:
 - **One session per long-lived agent.** Store the `session_id` with the agent.
-- **Never run two processes on the same session at once.** Both would append to the same
-  transcript. Queue each agent's calls.
+- **Run parallel work as subagents or forks.** Both are safe and are the recommended way to
+  do several things at once:
+  - *Subagents:* one session can run any number of subagents (the Agent/Task tool, in the
+    foreground or with `run_in_background`) in parallel. Each writes its own transcript under
+    `<session-id>/subagents/`, and MemTree indexes each one into its own tree (see section 3).
+  - *Forks:* `ccc -p --resume "$sid" --fork-session "…"` starts a new session with the full
+    history so far and returns a new `session_id`; the original is untouched. Run as many forks
+    at once as you like, then store and resume each fork's own id. MemTree reuses the shared
+    history's index, so a fork has its memory tree from its first call.
+- **Don't run two processes on the same session id at once.** Claude Code doesn't lock a
+  session, so two `ccc -p --resume "$sid"` calls running together both write to its transcript
+  as sibling branches, and the next `--resume` continues only the branch that finished last.
+  The other call's turn is dropped from the conversation without an error (it stays in the
+  file and in MemTree search, but the agent no longer sees it). If the second call starts while
+  the first is mid tool call, Claude Code also writes a "[Tool call interrupted…]" result into
+  the history, which the agent then reads. Queue calls per session id, or fork.
 - **Resume by id, not with `--continue`.** With `--continue`, Claude Code starts MCP servers
   before it switches to the continued session, so the memory tools can't open that session's own
   tree (`list` and searches across sessions still work).
@@ -81,6 +95,13 @@ Your own flags win:
   used. You don't need one, but if you write one, run ccc's server with
   `{"mcpServers": {"memtree": {"command": "ccc", "args": ["memtree-mcp"]}}}` and pre-allow
   the tools yourself with `--allowedTools`.
+
+**Subagents' work is searchable too.** A subagent's own steps (files it read, commands it
+ran) are in its own tree, not in its parent's: the parent's tree holds only what the subagent
+reported back. So search without `tree` to find them (hits name the parent's session id and the
+subagent's tree), not with `"tree": "current"`, which covers only the main conversation.
+`list` shows one entry per session, with subagents under their parent; each fork is its own
+session.
 
 The tools can read every session your MemTree key owns. If your platform runs agents for
 different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.
