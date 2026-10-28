@@ -115,6 +115,10 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "messages shown there, and everything after the memory message, stay word for word; the rest of the earlier " +
   "conversation survives only as summaries, which drop exact values, instructions, reasoning and dead ends. The detail " +
   "is not gone: these tools read it back.\n\n" +
+  "A nearly full context window is therefore expected and fine. Don't recommend /compact, /clear or a fresh " +
+  "session to free context: they discard what MemTree keeps (/ccc:memtree-compact compresses now if the " +
+  "user asks). The exception is a ccc notice that MemTree is paused or off: it is not compressing then, " +
+  "and that advice is the fallback.\n\n" +
   "So once you see that memory message: when your work depends on something from earlier in the session (what the " +
   "user asked for or ruled out, decisions and why they were made, findings, ids and paths, commands, what was tried " +
   "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +

@@ -249,7 +249,12 @@ async function armMainTurn(proxy, prompt = "typed prompt", promptId = "prompt-ma
       prompt_id: promptId,
     }),
   });
-  assert.equal(res.status, 204);
+  if (res.status === 204) return;
+  // Paused or refused key: the model is told (model-context.ts); the prompt is not blocked.
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.deepEqual(Object.keys(body), ["hookSpecificOutput"]);
+  assert.match(body.hookSpecificOutput.additionalContext, /^ccc: MemTree is (paused|off)/);
 }
 
 async function postHook(proxy, input) {

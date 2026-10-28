@@ -145,10 +145,20 @@ export interface SessionStartHookInput {
     session_id: string;
     /** "startup" | "resume" | "clear" | "compact" | "fork". */
     source?: string;
+    /** The session's JSONL transcript (model-context.ts reads its notices on resume). */
+    transcript_path?: string;
     agent_id?: string;
     prompt_id?: string;
 }
-export type NoticeHookInput = MessageDisplayHookInput | StopHookInput | UserPromptSubmitHookInput | SubagentLifecycleHookInput | SessionStartHookInput;
+/** Before Claude Code compacts; "manual" is a typed /compact (model-context.ts). */
+export interface PreCompactHookInput {
+    hook_event_name: "PreCompact";
+    session_id: string;
+    /** "manual" | "auto". */
+    trigger: string;
+    agent_id?: string;
+}
+export type NoticeHookInput = MessageDisplayHookInput | StopHookInput | UserPromptSubmitHookInput | SubagentLifecycleHookInput | SessionStartHookInput | PreCompactHookInput;
 export type MessageDisplayHookOutput = {
     hookSpecificOutput: {
         hookEventName: "MessageDisplay";
@@ -290,6 +300,12 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
      * script (run with this process's own Node) relays stdin to `hookUrl`.
      */
     resumeLink?: boolean;
+    /**
+     * Ask the proxy before a typed /compact (PreCompact, manual only), which
+     * answers it with a note while MemTree compresses (model-context.ts).
+     * Default on; off under CCC_AUTO_COMPACT=1, where Claude Code's own wins.
+     */
+    interceptCompact?: boolean;
 }): SessionNoticePlugin;
 /**
  * A plugin with only the SessionStart banner, for a session that runs without the

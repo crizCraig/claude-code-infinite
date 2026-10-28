@@ -221,6 +221,14 @@ kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
 
 `ccc` disables Claude Code's automatic conversation compaction for the Claude process it launches. MemTree manages the context sent to the model, so letting Claude Code independently summarize the full local transcript can compact a conversation MemTree already reduced. Manual `/compact` remains available.
 
+Manual `/compact` also asks once: while MemTree is compressing, the first `/compact` answers
+"MemTree already keeps this session within its budget; /compact would discard detail…" and
+suggests `/ccc:memtree-compact`; typing `/compact` again within two minutes runs Claude Code's
+own. While MemTree is paused or its key is refused, `/compact` runs at once, and under
+`CCC_AUTO_COMPACT=1` it is never intercepted. Claude itself is told the same: context is
+MemTree's job, so it won't suggest `/compact`, `/clear` or a fresh session to free context,
+and if MemTree is paused it is told why (MemTree's usage limit, not Claude's) and how to fix it.
+
 That includes idle compaction (Claude Code 2.1.286 and later), which summarizes a
 long conversation while you're away, just before the prompt cache expires
 ("Compacted while idle, before the prompt cache expired"). The

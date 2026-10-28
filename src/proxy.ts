@@ -129,6 +129,8 @@ import {
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
+import { KEY_INVALID_KIND, type ModelNotice, ModelContextNotices, PAUSED_KIND,
+  keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText,
   subscribeUrlFromDetail } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
@@ -437,6 +439,12 @@ interface ProxyState {
   unpaidDetail: () => string | null;
   /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
   pausedDetail: () => string | null;
+  /** Why the key is paused, when the server said (MemtreeClient.pausedReason). */
+  pausedReason: () => string | null;
+  /** Whether MemTree's latest answer was a success (MemtreeClient.answering). */
+  memtreeAnswering: () => boolean | undefined;
+  /** What each session's model was told about MemTree's state; blocked /compacts. */
+  modelNotices: ModelContextNotices;
   /** polychat's usage dashboard for the MemTree environment, if known. */
   usageUrl: string | undefined;
   /** ProxyOptions.sessionStartNotice. */
@@ -984,6 +992,9 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     pausedNearWindowWarned: new Set(),
     unpaidDetail: () => opts.memtree.paymentRequiredDetail,
     pausedDetail: () => opts.memtree.pausedDetail,
+    pausedReason: () => opts.memtree.pausedReason,
+    memtreeAnswering: () => opts.memtree.answering,
+    modelNotices: new ModelContextNotices(),
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
     promptSubmitNotice: opts.promptSubmitNotice,
@@ -1478,9 +1489,15 @@ async function handleNoticeHook(
     if (parsed.agent_id === undefined) {
       recordSessionStart(state, parsed.source);
       noteMainSessionStart(state, parsed.source, parsed.session_id);
+      // Claude Code's compaction dropped any MemTree notice from the transcript.
+      if (parsed.source === "compact") state.modelNotices.forget(parsed.session_id);
     }
     // Earlier trees in this project: asked now, so its wait overlaps the resume's.
     const contextPromise = projectTreesContext(state.projectTrees, parsed);
+    // A resumed or forked history may carry notices an earlier process gave.
+    const restored = parsed.agent_id === undefined &&
+        (parsed.source === "resume" || parsed.source === "fork")
+      ? restoreModelNotices(state, parsed) : Promise.resolve();
     // A resume waits briefly for the newest tree; a fresh session has none to wait for.
     if (parsed.agent_id === undefined && parsed.source === "resume") {
       await state.newestTrees?.settle(parsed.session_id);
@@ -1491,12 +1508,32 @@ async function handleNoticeHook(
       extraSessionStartLine(state.sessionStartNotice, parsed)
     );
     const context = await contextPromise;
+    await restored;
     if (!line && !context) {
       res.writeHead(204);
       res.end();
       return;
     }
     const body = Buffer.from(JSON.stringify(sessionStartOutput(line, context)), "utf-8");
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(body.length),
+      "cache-control": "no-store",
+    });
+    res.end(body);
+    return;
+  }
+  if (parsed.hook_event_name === "PreCompact") {
+    // A typed /compact while MemTree compresses: say why it isn't needed, once.
+    const reason = parsed.agent_id === undefined && parsed.trigger === "manual"
+      ? state.modelNotices.blockCompact(parsed.session_id, memtreeWorking(state))
+      : undefined;
+    if (reason === undefined) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    const body = Buffer.from(JSON.stringify({ decision: "block", reason }), "utf-8");
     res.writeHead(200, {
       "content-type": "application/json",
       "content-length": String(body.length),
@@ -1545,8 +1582,11 @@ async function handleNoticeHook(
       recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
     }
     const line = parsed.agent_id === undefined ? promptSubmitLine(state) : undefined;
-    if (line) {
-      const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+    const context = parsed.agent_id === undefined
+      ? state.modelNotices.next(parsed.session_id, currentModelNotice(state))
+      : undefined;
+    if (line || context) {
+      const body = Buffer.from(JSON.stringify(promptSubmitOutput(line, context)), "utf-8");
       res.writeHead(200, {
         "content-type": "application/json",
         "content-length": String(body.length),
@@ -3028,6 +3068,56 @@ function promptSubmitLine(state: ProxyState): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether MemTree is known to be compressing: its latest answer a success and
+ * no pause (402) remembered. Before any answer, or after an outage, it is not.
+ */
+function memtreeWorking(state: ProxyState): boolean {
+  return state.memtreeAnswering() === true && state.unpaidDetail() === null;
+}
+
+/**
+ * What the model should know about MemTree right now: a notice, undefined
+ * when it is known to work, null when neither is known (no answer, an outage).
+ */
+function currentModelNotice(state: ProxyState): ModelNotice | undefined | null {
+  if (state.keyInvalid()) {
+    return { kind: KEY_INVALID_KIND, text: keyInvalidModelContext(state.keyPageUrl) };
+  }
+  const detail = state.unpaidDetail();
+  if (detail !== null) {
+    return { kind: PAUSED_KIND, text: pausedModelContext(detail, state.pausedReason()) };
+  }
+  return memtreeWorking(state) ? undefined : null;
+}
+
+/**
+ * A resumed session's transcript may hold a notice from an earlier ccc process
+ * (paused, then paid in between): start from it, so the change is announced.
+ * A missing or unreadable transcript, or a scan past its time box, starts from
+ * nothing. Never throws.
+ */
+async function restoreModelNotices(
+  state: ProxyState,
+  input: SessionStartHookInput
+): Promise<void> {
+  if (!input.transcript_path) return;
+  state.modelNotices.restore(input.session_id, await lastToldKindInFile(input.transcript_path));
+}
+
+/** UserPromptSubmit's answer: a line for the user, context for the model, or both. */
+function promptSubmitOutput(
+  line: string | undefined,
+  context: string | undefined
+): Record<string, unknown> {
+  return {
+    ...(line ? { systemMessage: line } : {}),
+    ...(context
+      ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }
+      : {}),
+  };
 }
 
 /** The caller's extra SessionStart line; a throwing provider shows nothing. */

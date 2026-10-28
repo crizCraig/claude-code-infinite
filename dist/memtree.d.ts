@@ -366,6 +366,8 @@ export declare class MemtreeClient {
     private lastAnswerUnpaid;
     /** Whether the latest call that got an answer, or timed out, refused the key (key-page.ts). */
     private lastAnswerKeyInvalid;
+    /** Whether the latest such call succeeded; undefined before any answer. */
+    private lastAnswerOk;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
     /** HTTP status of each key's latest failed compress (absent: no response). */
@@ -383,6 +385,8 @@ export declare class MemtreeClient {
      * relies on this instead.
      */
     get pausedDetail(): string | null;
+    /** Why the key is paused (payment-link.ts REASON_*) while a fresh short link says, else null. */
+    get pausedReason(): string | null;
     /**
      * Wait at most `ms` for a short checkout link already being fetched, so a
      * notice about to be built from the 402 detail can show it. Never throws.
@@ -395,6 +399,11 @@ export declare class MemtreeClient {
      * key. Cleared by any later answer.
      */
     get keyInvalid(): boolean;
+    /**
+     * Whether MemTree's latest answer (or timeout) was a success: true, a
+     * failure: false, no answer yet: undefined. Positive evidence that it works.
+     */
+    get answering(): boolean | undefined;
     /** Where to get a new key for this client's environment (its base URL). */
     get keyPageUrl(): string;
     /** polychat's usage dashboard for this client's environment (its base URL). */

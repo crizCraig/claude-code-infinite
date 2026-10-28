@@ -264,8 +264,19 @@ export interface SessionStartHookInput {
   session_id: string;
   /** "startup" | "resume" | "clear" | "compact" | "fork". */
   source?: string;
+  /** The session's JSONL transcript (model-context.ts reads its notices on resume). */
+  transcript_path?: string;
   agent_id?: string;
   prompt_id?: string;
+}
+
+/** Before Claude Code compacts; "manual" is a typed /compact (model-context.ts). */
+export interface PreCompactHookInput {
+  hook_event_name: "PreCompact";
+  session_id: string;
+  /** "manual" | "auto". */
+  trigger: string;
+  agent_id?: string;
 }
 
 export type NoticeHookInput =
@@ -273,7 +284,8 @@ export type NoticeHookInput =
   | StopHookInput
   | UserPromptSubmitHookInput
   | SubagentLifecycleHookInput
-  | SessionStartHookInput;
+  | SessionStartHookInput
+  | PreCompactHookInput;
 
 export type MessageDisplayHookOutput = {
   hookSpecificOutput: {
@@ -741,11 +753,18 @@ export function parseNoticeHookInput(value: unknown): NoticeHookInput | null {
   }
   if (input.hook_event_name === "SessionStart") {
     if (input.source !== undefined && typeof input.source !== "string") return null;
+    if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+      return null;
+    }
     return input as unknown as SessionStartHookInput;
   }
   if (input.hook_event_name === "UserPromptSubmit") {
     if (typeof input.prompt !== "string") return null;
     return input as unknown as UserPromptSubmitHookInput;
+  }
+  if (input.hook_event_name === "PreCompact") {
+    if (typeof input.trigger !== "string") return null;
+    return input as unknown as PreCompactHookInput;
   }
   if (
     input.hook_event_name === "SubagentStart" ||
@@ -793,6 +812,12 @@ export function createSessionNoticePlugin(
      * script (run with this process's own Node) relays stdin to `hookUrl`.
      */
     resumeLink?: boolean;
+    /**
+     * Ask the proxy before a typed /compact (PreCompact, manual only), which
+     * answers it with a note while MemTree compresses (model-context.ts).
+     * Default on; off under CCC_AUTO_COMPACT=1, where Claude Code's own wins.
+     */
+    interceptCompact?: boolean;
   } = {}
 ): SessionNoticePlugin {
   const url = new URL(hookUrl);
@@ -826,6 +851,9 @@ export function createSessionNoticePlugin(
   if (opts.messageDisplay !== false) {
     hooks.MessageDisplay = [{ hooks: [hook] }];
   }
+  if (opts.interceptCompact !== false) {
+    hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
+  }
   if (opts.startupMessage) {
     hooks.SessionStart = [
       ...((hooks.SessionStart as unknown[] | undefined) ?? []),
@@ -841,8 +869,9 @@ export function createSessionNoticePlugin(
       {
         // Every session start that could already have a page. A fresh or
         // cleared session has none yet, so in practice this answers resumes;
-        // compaction continues the same session and needs no line.
-        matcher: "startup|resume|clear|fork",
+        // a compaction needs no line, but it tells the proxy that the
+        // transcript lost its MemTree notices (model-context.ts).
+        matcher: "startup|resume|clear|compact|fork",
         hooks: [
           {
             type: "command",

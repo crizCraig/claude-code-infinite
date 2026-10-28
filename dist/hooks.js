@@ -574,10 +574,18 @@ export function parseNoticeHookInput(value) {
     if (input.hook_event_name === "SessionStart") {
         if (input.source !== undefined && typeof input.source !== "string")
             return null;
+        if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
+            return null;
+        }
         return input;
     }
     if (input.hook_event_name === "UserPromptSubmit") {
         if (typeof input.prompt !== "string")
+            return null;
+        return input;
+    }
+    if (input.hook_event_name === "PreCompact") {
+        if (typeof input.trigger !== "string")
             return null;
         return input;
     }
@@ -630,6 +638,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     if (opts.messageDisplay !== false) {
         hooks.MessageDisplay = [{ hooks: [hook] }];
     }
+    if (opts.interceptCompact !== false) {
+        hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
+    }
     if (opts.startupMessage) {
         hooks.SessionStart = [
             ...(hooks.SessionStart ?? []),
@@ -644,8 +655,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             {
                 // Every session start that could already have a page. A fresh or
                 // cleared session has none yet, so in practice this answers resumes;
-                // compaction continues the same session and needs no line.
-                matcher: "startup|resume|clear|fork",
+                // a compaction needs no line, but it tells the proxy that the
+                // transcript lost its MemTree notices (model-context.ts).
+                matcher: "startup|resume|clear|compact|fork",
                 hooks: [
                     {
                         type: "command",

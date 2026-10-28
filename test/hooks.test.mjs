@@ -481,6 +481,7 @@ test("Stop-only compatibility plugin keeps arming/lifecycle hooks", async () => 
       "UserPromptSubmit",
       "SubagentStart",
       "SubagentStop",
+      "PreCompact",
     ]);
     assert.equal(config.hooks.MessageDisplay, undefined);
   } finally {

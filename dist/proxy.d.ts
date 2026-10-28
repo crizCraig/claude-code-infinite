@@ -48,6 +48,7 @@ import type { ToolOutputStore } from "./tool-output-store.js";
 import { MemtreeClient, type CompressResult } from "./memtree.js";
 import { type Message } from "./turns.js";
 import { NoticeDeliveryQueue, type FirstTreeIntro } from "./hooks.js";
+import { ModelContextNotices } from "./model-context.js";
 import { PaymentNoticeThrottle } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { type MemtreeLinkStore } from "./memtree-links.js";
@@ -286,6 +287,12 @@ interface ProxyState {
     unpaidDetail: () => string | null;
     /** The 402 detail only while MemTree's latest answer was that 402 (MemtreeClient.pausedDetail). */
     pausedDetail: () => string | null;
+    /** Why the key is paused, when the server said (MemtreeClient.pausedReason). */
+    pausedReason: () => string | null;
+    /** Whether MemTree's latest answer was a success (MemtreeClient.answering). */
+    memtreeAnswering: () => boolean | undefined;
+    /** What each session's model was told about MemTree's state; blocked /compacts. */
+    modelNotices: ModelContextNotices;
     /** polychat's usage dashboard for the MemTree environment, if known. */
     usageUrl: string | undefined;
     /** ProxyOptions.sessionStartNotice. */

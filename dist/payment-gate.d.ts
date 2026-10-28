@@ -45,6 +45,8 @@ export type PaymentStatus = {
     url: string | null;
 };
 export type PaymentChoice = "subscribe" | "continue" | "quit";
+/** The short checkout link (payment-link.ts) that ccc puts in place of the `/payment?…` one. */
+export declare const SHORT_PAYMENT_URL_RE: RegExp;
 /**
  * Parse a status body. Returns null when the body does not carry a boolean
  * `paid` (old server, wrong shape): the caller treats that as "unknown" and

@@ -65,7 +65,7 @@ export type PaymentChoice = "subscribe" | "continue" | "quit";
 
 const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
 /** The short checkout link (payment-link.ts) that ccc puts in place of the `/payment?…` one. */
-const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
+export const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
 // "we recommend 🌱 Starter plan for $5/month" → plan name + price.
 const RECOMMENDED_PLAN_RE = /recommend\s+(?:\S+\s+)?([A-Za-z][\w ]*?plan)\s+for\s+(\$[\d.]+\/month)/i;
 // No quotes, `$`, backticks or bare `%` (cmd.exe expands %VAR% when Windows opens it).
