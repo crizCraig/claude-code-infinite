@@ -18,7 +18,6 @@
  */
 
 import fs from "node:fs";
-import { sanitizeNoticeDetail } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE } from "./payment-gate.js";
 import { REASON_FREE_CREDIT_USED, REASON_PLAN_LIMIT } from "./payment-link.js";
 
@@ -48,12 +47,14 @@ const PAUSED_FALLBACK =
   "Until then nothing is compressed or indexed, so near the context limit a fresh session " +
   "(/clear) or, while the conversation still fits, /compact (Claude Code's own) is the fallback.";
 
-/** The model's notice for a paused key (402): `detail` is the server's text. */
+/**
+ * The model's notice for a paused key (402): `detail` is the server's text.
+ * None of it is quoted: its first line names the account's email, and this
+ * text stays in the transcript (and MemTree's copy of it).
+ */
 export function pausedModelContext(detail: string, reason: string | null): string {
-  const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "", 160);
   return [
     `${PAUSED_PREFIX}${pausedReasonText(reason)}.`,
-    account ? `(MemTree server: "${account}".)` : "",
     "This is MemTree's own billing at polychat.co, not Claude, the user's Claude plan or " +
       "Anthropic credits; Claude works normally.",
     `Fix: ${reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe"} at ${modelSubscribeUrl(detail)}, ` +

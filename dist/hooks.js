@@ -154,6 +154,13 @@ export function terminalSupportsHyperlinks(env = process.env, stream = process.s
     return false;
 }
 /**
+ * The proxy path of the PreCompact hook. Unlike the other hooks' path it
+ * carries no token: Claude Code prints this URL with a blocked or finished
+ * /compact. The proxy accepts only PreCompact on it, which can at most block
+ * one /compact.
+ */
+export const PRECOMPACT_HOOK_PATH = "/_ccc/hooks/precompact";
+/**
  * Single-session delivery queue. Claude Code serializes main-thread turns, so
  * one replaceable pending notice is sufficient. A new user request clears any
  * stale notice; tool-result requests deliberately do not.
@@ -629,6 +636,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
         fs.writeFileSync(path.join(commandsDir, `${name}.md`), source, { mode: 0o600 });
     }
     const hook = { type: "http", url: hookUrl, timeout: 5 };
+    // Claude Code shows a PreCompact hook's URL to the user and records it in the
+    // transcript, so it gets a path without the token (it takes PreCompact only).
+    const compactHook = { type: "http", url: `${url.origin}${PRECOMPACT_HOOK_PATH}`, timeout: 5 };
     const hooks = {
         Stop: [{ hooks: [hook] }],
         UserPromptSubmit: [{ hooks: [hook] }],
@@ -639,7 +649,7 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
         hooks.MessageDisplay = [{ hooks: [hook] }];
     }
     if (opts.interceptCompact !== false) {
-        hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
+        hooks.PreCompact = [{ matcher: "manual", hooks: [compactHook] }];
     }
     if (opts.startupMessage) {
         hooks.SessionStart = [

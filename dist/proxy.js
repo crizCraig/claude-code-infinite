@@ -55,7 +55,7 @@ import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
-import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, } from "./hooks.js";
+import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
@@ -493,6 +493,9 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));
         return;
     }
+    if (url.pathname === PRECOMPACT_HOOK_PATH) {
+        return handleNoticeHook(req, res, state, opts.reqlog, undefined, "PreCompact");
+    }
     if (url.pathname === hookPath) {
         return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
             ? opts.transcriptUsage.finalReplyAsync(sessionId, signal)
@@ -727,7 +730,9 @@ function noteMainSessionStart(state, source, sessionId) {
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(req, res, state, reqlog, 
 /** A main-lane turn ended: the session may be over (its final index). */
-onMainStop) {
+onMainStop, 
+/** The only event this path takes (the token-free PreCompact path). */
+onlyEvent) {
     if (req.method !== "POST") {
         res.writeHead(405, { allow: "POST" });
         res.end();
@@ -758,6 +763,11 @@ onMainStop) {
     const parsed = parseNoticeHookInput(input);
     if (!parsed) {
         res.writeHead(400);
+        res.end();
+        return;
+    }
+    if (onlyEvent !== undefined && parsed.hook_event_name !== onlyEvent) {
+        res.writeHead(403);
         res.end();
         return;
     }

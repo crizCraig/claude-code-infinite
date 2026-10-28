@@ -150,6 +150,13 @@ export interface SessionStartHookInput {
     agent_id?: string;
     prompt_id?: string;
 }
+/**
+ * The proxy path of the PreCompact hook. Unlike the other hooks' path it
+ * carries no token: Claude Code prints this URL with a blocked or finished
+ * /compact. The proxy accepts only PreCompact on it, which can at most block
+ * one /compact.
+ */
+export declare const PRECOMPACT_HOOK_PATH = "/_ccc/hooks/precompact";
 /** Before Claude Code compacts; "manual" is a typed /compact (model-context.ts). */
 export interface PreCompactHookInput {
     hook_event_name: "PreCompact";
