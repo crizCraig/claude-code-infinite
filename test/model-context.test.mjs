@@ -44,7 +44,7 @@ test("the MCP instructions say context is MemTree's job: no /compact, /clear or 
 
 // ------------------------------------------------------------------ notice texts
 
-test("paused context: MemTree not Claude, why, the account, the fix, and /compact as fallback", () => {
+test("paused context: MemTree not Claude, why, the fix, and /compact as fallback", () => {
   const text = pausedModelContext(PAYMENT_DETAIL, "free_credit_used");
   assert.match(text, /^ccc: MemTree is paused: the free MemTree credit is used up\./);
   assert.ok(!text.includes("user@example.com"), "no email: the notice stays in the transcript");

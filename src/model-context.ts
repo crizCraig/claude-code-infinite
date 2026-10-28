@@ -60,7 +60,7 @@ export function pausedModelContext(detail: string, reason: string | null): strin
     `Fix: ${reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe"} at ${modelSubscribeUrl(detail)}, ` +
       `or for credit questions email ${SUPPORT_EMAIL}.`,
     PAUSED_FALLBACK,
-  ].filter(Boolean).join(" ");
+  ].join(" ");
 }
 
 /** The model's notice for a refused key (401/403). */
