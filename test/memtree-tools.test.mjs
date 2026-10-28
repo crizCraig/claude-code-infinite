@@ -808,8 +808,9 @@ test("MCP instructions and search lead with when to use them, before any compres
   const search = MEMTREE_TOOLS.find((t) => t.name === "search");
   assert.match(search.description, /^Find what this conversation doesn't show: /);
   assert.match(search.description.split(". ")[0], /only summarizes.*other sessions/);
-  // Constant overhead: instructions + search description, measured 2026-10-18.
-  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_150,
+  // Constant overhead: instructions + search description, measured 2026-10-18, plus the
+  // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28.
+  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_500,
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
 

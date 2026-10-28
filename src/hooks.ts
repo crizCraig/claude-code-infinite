@@ -268,12 +268,22 @@ export interface SessionStartHookInput {
   prompt_id?: string;
 }
 
+/** Before Claude Code compacts; "manual" is a typed /compact (model-context.ts). */
+export interface PreCompactHookInput {
+  hook_event_name: "PreCompact";
+  session_id: string;
+  /** "manual" | "auto". */
+  trigger: string;
+  agent_id?: string;
+}
+
 export type NoticeHookInput =
   | MessageDisplayHookInput
   | StopHookInput
   | UserPromptSubmitHookInput
   | SubagentLifecycleHookInput
-  | SessionStartHookInput;
+  | SessionStartHookInput
+  | PreCompactHookInput;
 
 export type MessageDisplayHookOutput = {
   hookSpecificOutput: {
@@ -747,6 +757,10 @@ export function parseNoticeHookInput(value: unknown): NoticeHookInput | null {
     if (typeof input.prompt !== "string") return null;
     return input as unknown as UserPromptSubmitHookInput;
   }
+  if (input.hook_event_name === "PreCompact") {
+    if (typeof input.trigger !== "string") return null;
+    return input as unknown as PreCompactHookInput;
+  }
   if (
     input.hook_event_name === "SubagentStart" ||
     input.hook_event_name === "SubagentStop"
@@ -793,6 +807,12 @@ export function createSessionNoticePlugin(
      * script (run with this process's own Node) relays stdin to `hookUrl`.
      */
     resumeLink?: boolean;
+    /**
+     * Ask the proxy before a typed /compact (PreCompact, manual only), which
+     * answers it with a note while MemTree compresses (model-context.ts).
+     * Default on; off under CCC_AUTO_COMPACT=1, where Claude Code's own wins.
+     */
+    interceptCompact?: boolean;
   } = {}
 ): SessionNoticePlugin {
   const url = new URL(hookUrl);
@@ -825,6 +845,9 @@ export function createSessionNoticePlugin(
   };
   if (opts.messageDisplay !== false) {
     hooks.MessageDisplay = [{ hooks: [hook] }];
+  }
+  if (opts.interceptCompact !== false) {
+    hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
   }
   if (opts.startupMessage) {
     hooks.SessionStart = [

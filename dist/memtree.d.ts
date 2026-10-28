@@ -383,6 +383,8 @@ export declare class MemtreeClient {
      * relies on this instead.
      */
     get pausedDetail(): string | null;
+    /** Why the key is paused (payment-link.ts REASON_*) while a fresh short link says, else null. */
+    get pausedReason(): string | null;
     /**
      * Wait at most `ms` for a short checkout link already being fetched, so a
      * notice about to be built from the 402 detail can show it. Never throws.

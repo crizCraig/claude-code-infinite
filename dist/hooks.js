@@ -581,6 +581,11 @@ export function parseNoticeHookInput(value) {
             return null;
         return input;
     }
+    if (input.hook_event_name === "PreCompact") {
+        if (typeof input.trigger !== "string")
+            return null;
+        return input;
+    }
     if (input.hook_event_name === "SubagentStart" ||
         input.hook_event_name === "SubagentStop") {
         if (typeof input.agent_id !== "string" || input.agent_id.length === 0) {
@@ -629,6 +634,9 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     };
     if (opts.messageDisplay !== false) {
         hooks.MessageDisplay = [{ hooks: [hook] }];
+    }
+    if (opts.interceptCompact !== false) {
+        hooks.PreCompact = [{ matcher: "manual", hooks: [hook] }];
     }
     if (opts.startupMessage) {
         hooks.SessionStart = [

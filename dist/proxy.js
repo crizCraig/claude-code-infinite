@@ -59,6 +59,7 @@ import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRA
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
+import { ModelContextNotices, keyInvalidModelContext, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText, subscribeUrlFromDetail } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
@@ -336,6 +337,8 @@ export function startProxy(opts) {
         pausedNearWindowWarned: new Set(),
         unpaidDetail: () => opts.memtree.paymentRequiredDetail,
         pausedDetail: () => opts.memtree.pausedDetail,
+        pausedReason: () => opts.memtree.pausedReason,
+        modelNotices: new ModelContextNotices(),
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
         promptSubmitNotice: opts.promptSubmitNotice,
@@ -761,6 +764,9 @@ onMainStop) {
         if (parsed.agent_id === undefined) {
             recordSessionStart(state, parsed.source);
             noteMainSessionStart(state, parsed.source, parsed.session_id);
+            // Claude Code's compaction dropped any MemTree notice from the transcript.
+            if (parsed.source === "compact")
+                state.modelNotices.forget(parsed.session_id);
         }
         // Earlier trees in this project: asked now, so its wait overlaps the resume's.
         const contextPromise = projectTreesContext(state.projectTrees, parsed);
@@ -776,6 +782,25 @@ onMainStop) {
             return;
         }
         const body = Buffer.from(JSON.stringify(sessionStartOutput(line, context)), "utf-8");
+        res.writeHead(200, {
+            "content-type": "application/json",
+            "content-length": String(body.length),
+            "cache-control": "no-store",
+        });
+        res.end(body);
+        return;
+    }
+    if (parsed.hook_event_name === "PreCompact") {
+        // A typed /compact while MemTree compresses: say why it isn't needed, once.
+        const reason = parsed.agent_id === undefined && parsed.trigger === "manual"
+            ? state.modelNotices.blockCompact(parsed.session_id, memtreeWorking(state))
+            : undefined;
+        if (reason === undefined) {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        const body = Buffer.from(JSON.stringify({ decision: "block", reason }), "utf-8");
         res.writeHead(200, {
             "content-type": "application/json",
             "content-length": String(body.length),
@@ -822,8 +847,11 @@ onMainStop) {
             recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
         }
         const line = parsed.agent_id === undefined ? promptSubmitLine(state) : undefined;
-        if (line) {
-            const body = Buffer.from(JSON.stringify({ systemMessage: line }), "utf-8");
+        const context = parsed.agent_id === undefined
+            ? state.modelNotices.next(parsed.session_id, currentModelNotice(state))
+            : undefined;
+        if (line || context) {
+            const body = Buffer.from(JSON.stringify(promptSubmitOutput(line, context)), "utf-8");
             res.writeHead(200, {
                 "content-type": "application/json",
                 "content-length": String(body.length),
@@ -2113,6 +2141,29 @@ function promptSubmitLine(state) {
     catch {
         return undefined;
     }
+}
+/** Whether MemTree is compressing: neither paused (402) nor refusing the key. */
+function memtreeWorking(state) {
+    return state.unpaidDetail() === null && !state.keyInvalid();
+}
+/** What the model should know about MemTree right now; undefined while it works. */
+function currentModelNotice(state) {
+    if (state.keyInvalid()) {
+        return { kind: "key-invalid", text: keyInvalidModelContext(state.keyPageUrl) };
+    }
+    const detail = state.unpaidDetail();
+    if (detail === null)
+        return undefined;
+    return { kind: "paused", text: pausedModelContext(detail, state.pausedReason()) };
+}
+/** UserPromptSubmit's answer: a line for the user, context for the model, or both. */
+function promptSubmitOutput(line, context) {
+    return {
+        ...(line ? { systemMessage: line } : {}),
+        ...(context
+            ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }
+            : {}),
+    };
 }
 /** The caller's extra SessionStart line; a throwing provider shows nothing. */
 function extraSessionStartLine(provider, input) {

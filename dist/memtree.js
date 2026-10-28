@@ -816,6 +816,10 @@ export class MemtreeClient {
     get pausedDetail() {
         return this.lastAnswerUnpaid ? this.withShortLink(this.unpaidDetail) : null;
     }
+    /** Why the key is paused (payment-link.ts REASON_*) while a fresh short link says, else null. */
+    get pausedReason() {
+        return this.paymentLinks?.current()?.reason ?? null;
+    }
     /**
      * Wait at most `ms` for a short checkout link already being fetched, so a
      * notice about to be built from the 402 detail can show it. Never throws.

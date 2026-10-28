@@ -609,6 +609,8 @@ async function main() {
                 // Also carries the unpaid-key notice on resume, so it is on even
                 // when MemTree links are off (the proxy then answers links-free).
                 resumeLink: true,
+                // CCC_AUTO_COMPACT=1 hands compaction back to Claude Code: /compact runs as typed.
+                interceptCompact: process.env.CCC_AUTO_COMPACT !== "1",
             });
             // Global option must precede a user-supplied `--`, positional prompt, or
             // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
