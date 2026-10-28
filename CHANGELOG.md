@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.31](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.30...v1.0.31) (2026-10-28)
+
+
+### Bug Fixes
+
+* no email or hook token in the transcript ([#45](https://github.com/crizCraig/claude-code-infinite/issues/45)) ([d5eab2e](https://github.com/crizCraig/claude-code-infinite/commit/d5eab2e8f1862d8362229ba4610c9d21016d769b))
+* tell Claude that MemTree handles context, and when MemTree is paused ([#43](https://github.com/crizCraig/claude-code-infinite/issues/43)) ([622a6bc](https://github.com/crizCraig/claude-code-infinite/commit/622a6bcb1cd1518e5be0b099e1eefdb5c8c913db))
+
 ## [1.0.30](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.29...v1.0.30) (2026-10-25)
 
 
