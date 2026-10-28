@@ -17,7 +17,8 @@ This guide is for ccc 1.0.23 and later. See [Older versions](#older-versions) fo
 2. Then, sign up for MemTree at https://polychat.co (a separate account from your Claude one)
    and create a MemTree key. Use your own account and don't
    share keys: every session on a key lands in that key's memory and search results.
-3. Install and run once in a terminal, so ccc stores your key and Claude Code logs in:
+3. Install ccc and run it once in a terminal, so it saves your MemTree key and Claude Code
+   logs you in:
    ```bash
    npm install -g claude-code-infinite
    ccc            # paste your MemTree key when asked; log in to Claude if prompted; then /exit
