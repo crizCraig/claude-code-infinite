@@ -70,4 +70,23 @@ export declare class RouteFallbackFailures {
  * strike episode (attempt 0). Paying lets the very next request compress.
  */
 export declare function pausedRefusal(message: string): RouteFallbackError;
+/** Refusals of one lane further apart than this start a new streak. */
+export declare const SLOW_RETRY_WINDOW_MS: number;
+/** Consecutive refusals in a streak before the "slow to answer" notice. */
+export declare const SLOW_RETRY_NOTICE_AFTER = 2;
+/**
+ * Consecutive refusals per lane, for the notice that MemTree is slow to
+ * answer. One refusal says nothing to the user (Claude Code retries it, and
+ * the retry usually goes through); a repeat within SLOW_RETRY_WINDOW_MS
+ * does, once per streak. A delivery ends the streak.
+ */
+export declare class RefusalStreaks {
+    private readonly capacity;
+    private readonly windowMs;
+    private readonly lanes;
+    constructor(capacity?: number, windowMs?: number);
+    /** Note a refusal of `lane`; true the one time its streak should show the notice. */
+    refused(lane: string, now?: number): boolean;
+    delivered(lane: string): void;
+}
 //# sourceMappingURL=route-fallback.d.ts.map

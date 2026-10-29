@@ -37,6 +37,8 @@ export declare const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session"
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export declare const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn ran uncompressed";
+/** Repeated refusals of one lane while MemTree is slow (RefusalStreaks): Claude Code retries. */
+export declare const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
 export declare const PAYMENT_REQUIRED_NOTICE = "\u26A0 MemTree is off \u2014 payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export declare const SLOW_FIRST_TOKEN_NOTICE = "\u2728 Something special is happening \u2014 please wait\u2026";
 export declare const STARTUP_NOTICE = "\u221E MemTree \u00B7 Infinite Context Enabled \u221E";

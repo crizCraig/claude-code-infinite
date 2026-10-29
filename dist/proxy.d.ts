@@ -40,7 +40,7 @@
  */
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { RouteFallbackFailures } from "./route-fallback.js";
+import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
 import { PreparedCompressions } from "./prepared-compression.js";
@@ -313,6 +313,8 @@ interface ProxyState {
     mainPromptGeneration: number;
     promptAccounting: PromptAccounting;
     fallbackFailures: RouteFallbackFailures;
+    /** Consecutive refusals per lane, for the "slow to answer" notice. */
+    refusalStreaks: RefusalStreaks;
     /** Suppress producer-side state changes while agent API traffic is active. */
     activeSubagents: Set<string>;
     /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */

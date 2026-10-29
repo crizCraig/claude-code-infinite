@@ -104,8 +104,8 @@ export const TERMINALS = [
 export const TURN_TYPES = [
   "first-user", "tool", "tool-memory", "tool-prefix", "tool-recompressed",
   "followup-compressed", "followup-prefix", "followup-noop", "followup-empty-memory",
-  "followup-no-flatten", "followup-degraded", "fork-memory", "side-request", "foreign",
-  "followup-client-closed", "unparseable", "other",
+  "followup-no-flatten", "followup-degraded", "followup-refused", "fork-memory", "side-request",
+  "foreign", "followup-client-closed", "unparseable", "other",
 ] as const;
 
 export type DiagnosticsFields = Record<string, string | number | boolean>;

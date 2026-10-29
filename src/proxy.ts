@@ -41,7 +41,7 @@
 
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { INDEX_WAIT_RETRY_AFTER_SECONDS, RouteFallbackFailures, pausedRefusal }
+import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal }
   from "./route-fallback.js";
 import {
   createCountTokensSession,
@@ -105,6 +105,7 @@ import {
   compressedTotalsText,
   DEGRADED_NOTICE,
   NOT_COMPRESSED_NOTE,
+  SLOW_RETRY_NOTICE,
   recapLinkText,
   SseNoticeRewriter,
   stripNoticeBlocks,
@@ -467,6 +468,8 @@ interface ProxyState {
   mainPromptGeneration: number;
   promptAccounting: PromptAccounting;
   fallbackFailures: RouteFallbackFailures;
+  /** Consecutive refusals per lane, for the "slow to answer" notice. */
+  refusalStreaks: RefusalStreaks;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
   /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
@@ -1007,6 +1010,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     mainPromptGeneration: 0,
     promptAccounting: new PromptAccounting(),
     fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs),
+    refusalStreaks: new RefusalStreaks(),
     activeSubagents: new Set(),
     memoryRoutes: new Map(),
     mainRouteEpoch: 0,
@@ -1979,7 +1983,11 @@ async function handleMessages(
           lane: isAwaySummary ? "away" : requestRouteLane === "main" ? "main" : "other" },
         ...(target !== undefined ? { target } : {}) });
     },
-    delivered: () => { state.fallbackFailures.succeeded(requestRouteKey); toolForwarding.settle(true); },
+    delivered: () => {
+      state.fallbackFailures.succeeded(requestRouteKey);
+      state.refusalStreaks.delivered(requestRouteKey);
+      toolForwarding.settle(true);
+    },
   });
   const rawMsgsForMemtree = messagesWithSystem(messages, body.system);
   const msgsForMemtree = normalizeMessagesForMemtree(rawMsgsForMemtree);
@@ -2746,20 +2754,18 @@ async function handleMessages(
     } else if (mayQueueNotice && paymentDetail === null) {
       // Under the budget the whole request is what compression would have
       // sent: the turn is not degraded, so the failure stays in the logs.
-      const warn = () => {
+      // Delivery decides the rest (selectForwardCandidate): only a whole
+      // request actually sent warns. A refusal (Claude Code retries it) or a
+      // ride on a compressed prefix did not run uncompressed (2026-10-28).
+      const eager = compressionNeeded(rec.compaction);
+      // Delivery sizes the request again (an exact count, else a
+      // conservative bound): a planned fit it finds over the budget warns then.
+      if (!eager) rec.degradedNotice = "quiet-under-budget";
+      degradedNotices.set(rec, { eager, warn: () => {
+        if (state.mainPromptGeneration !== noticePromptGeneration) return;
         state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
         rec.degradedNotice = "shown";
-      };
-      if (compressionNeeded(rec.compaction)) {
-        warn();
-      } else {
-        // Delivery sizes the request again (an exact count, else a
-        // conservative bound): a turn it finds over the budget warns then.
-        rec.degradedNotice = "quiet-under-budget";
-        quietDegrades.set(rec, () => {
-          if (state.mainPromptGeneration === noticePromptGeneration) warn();
-        });
-      }
+      } });
     }
     return logged(
       forwardRaw(
@@ -3906,6 +3912,20 @@ function calibratedSizeExceedsWindow(
     (record.estimatedTokens ?? 0) + outputTokens > modelContextLimit);
 }
 
+/**
+ * Over the window (calibratedSizeExceedsWindow) only by the uncounted
+ * conservative bound: a calibrated estimate that fits the window with the
+ * full max_tokens says otherwise.
+ */
+function uncountedOnlyOverWindow(
+  record: CompactionRecord,
+  body: Record<string, any>,
+  modelContextLimit: number
+): boolean {
+  return record.uncountedOverWindow === true && record.sizeSource === "reported" &&
+    (record.estimatedTokens ?? 0) + bodyOutputReservation(body, false) <= modelContextLimit;
+}
+
 function calibratedSizeExceedsLimits(
   record: CompactionRecord,
   body: Record<string, any>,
@@ -4233,7 +4253,12 @@ async function planEdgeCompaction(args: {
     // image-aware bound), not bytes: a flatten that kept images is mostly
     // base64 that costs a fixed amount per image.
     const overWindow = calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
-    const fallback = overWindow ? undefined : { prefix, routed };
+    // Over the window only by the conservative bound of a ride whose planning
+    // count failed: delivery counts it again before sending it, so it stays
+    // the fallback a failed compress rides (2026-10-28: a 528k ride whose
+    // count timed out was dropped, and the failed compress refused the turn).
+    const fallback = overWindow && !uncountedOnlyOverWindow(compaction, body, modelContextLimit)
+      ? undefined : { prefix, routed };
     if (state.compactNow.has(sessionId)) return forced("manual", fallback);
     if (
       prefix.modelContextLimit !== modelContextLimit ||
@@ -6164,8 +6189,8 @@ async function selectForwardCandidate(args: {
     (args.rec.routeLane === "main" && args.opts.toolOutputs
       ? await truncatedToFit(args.rec, policy.sizing, target, args.limits, args.opts.toolOutputs)
       : undefined);
-  const quietDegrade = quietDegrades.get(args.rec);
-  quietDegrades.delete(args.rec);
+  const degraded = degradedNotices.get(args.rec);
+  degradedNotices.delete(args.rec);
   const lateInstall = lateRouteInstalls.get(args.rec);
   if (lateInstall && (!selection || selection.candidate !== target || target === preferred)) {
     lateRouteInstalls.delete(args.rec);
@@ -6191,14 +6216,18 @@ async function selectForwardCandidate(args: {
   if (args.rec.lateCountRecovery) args.rec.lateCountRecovery.outcome =
     changed && candidate.kind === "replacement" ? "compressed" : "forwarded";
   delete args.rec.overBudgetForward;
-  if (measurement.tokens > args.limits.budget ||
-      (measurement.source !== "exact" && candidate.kind === "original" &&
-        measurement.estimatedTokens > args.limits.budget)) {
+  const overBudget = measurement.tokens > args.limits.budget ||
+    (measurement.source !== "exact" && candidate.kind === "original" &&
+      measurement.estimatedTokens > args.limits.budget);
+  if (overBudget) {
     args.rec.overBudgetForward = { reason: measurement.source === "exact"
       ? "exact-count-fits-window" : measurement.source === "bytes"
         ? "bytes-fallback-fits-window" : "estimate-fits-window" };
     warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
-    quietDegrade?.();
+  }
+  // Uncompressed only when the whole history goes out, not a compressed ride.
+  if (degraded && candidate.kind === "original" && (degraded.eager || overBudget)) {
+    degraded.warn();
   }
   return changed ? candidate.body : intended;
 }
@@ -6392,6 +6421,10 @@ function refuseWholeRequest(
       { awaitingIndex: args.rec.indexBehind === true });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
+  // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
+  if (args.rec.turnType === "followup-degraded") args.rec.turnType = "followup-refused";
+  delete args.rec.degradedNotice;
+  if (unpaid === null && !keyInvalid) noteSlowRetry(args.state, args.rec, args.routeKey, failure);
   args.state.diagnostics?.record("refusal", {
     status: failure.status, attempt: failure.attempt,
     input_ktokens: Math.round(inputTokens / 1000), budget_ktokens: Math.round(budgetTokens / 1000),
@@ -6414,6 +6447,19 @@ function refuseWholeRequest(
   // The refusal named the key: it counts as the key notice on the user's screen.
   if (keyInvalid && args.rec.routeLane === "main") args.state.keyNotice.markShown();
   return false;
+}
+
+/**
+ * A repeated retryable refusal on the main thread: say once per streak that
+ * MemTree is slow and Claude Code is retrying, unless another notice waits.
+ */
+function noteSlowRetry(
+  state: ProxyState, rec: MessagesRecord, lane: string, failure: { status: number }
+): void {
+  if (!state.refusalStreaks.refused(lane)) return;
+  if (failure.status !== 503 || rec.routeLane !== "main" || state.notices.hasPending()) return;
+  state.notices.queueSuffix(SLOW_RETRY_NOTICE, undefined, state.mainPromptId);
+  rec.slowRetryNotice = true;
 }
 
 /**
@@ -6497,7 +6543,7 @@ function reachedBudget(compaction: CompactionRecord | undefined): boolean {
  * forced compaction (budget, window, `/memtree-compact`, a rebuilt prefix), a
  * size at or over the budget, or a size nobody measured. A planned fit is
  * provisional: delivery's own sizing can still find the turn over the budget
- * (quietDegrades), since a plan can undercount.
+ * (degradedNotices), since a plan can undercount.
  */
 function compressionNeeded(compaction: CompactionRecord | undefined): boolean {
   if (compaction === undefined || compaction.reason !== undefined) return true;
@@ -6506,10 +6552,11 @@ function compressionNeeded(compaction: CompactionRecord | undefined): boolean {
 }
 
 /**
- * A degraded turn whose plan fit the budget, so it queued no notice: the
- * notice to queue if delivery's sizing finds it over the budget after all.
+ * A degraded turn's notice, queued by delivery only when the whole request
+ * goes out: at once when planning said it needed compression (`eager`), else
+ * when delivery's sizing finds it over the budget after all.
  */
-const quietDegrades = new WeakMap<MessagesRecord, () => void>();
+const degradedNotices = new WeakMap<MessagesRecord, { eager: boolean; warn: () => void }>();
 
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap<MessagesRecord, object>();
