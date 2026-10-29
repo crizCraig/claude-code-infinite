@@ -11,6 +11,7 @@
  */
 
 import { spawn as spawnPlain } from "node:child_process";
+import * as os from "node:os";
 import * as path from "node:path";
 import spawn from "cross-spawn";
 import type { ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
@@ -63,7 +64,7 @@ export function probeAnswersForSession(args: readonly string[]): boolean {
     SESSION_AUTH_OPTIONS.some((option) => arg === option || arg.startsWith(`${option}=`)));
 }
 
-/** The probe for a session it can't answer for: the config files decide, nothing blocks. */
+/** The probe for a session it can't answer for: no sign-in guess (sign-in-notice.ts). */
 export function skippedProbe(): AuthProbe {
   return { result: "skipped", ms: 0 };
 }
@@ -86,11 +87,12 @@ export function probeClaudeAuthStatus(
       resolve({ result, ms: Math.max(0, now() - started), ...(status ? { status } : {}) });
     };
     const child = startProbe(command, opts);
-    // Detached on POSIX, so the terminal's Ctrl+C no longer reaches it: ccc exiting early
-    // (a quit at the key prompt) takes a still-running probe with it.
+    // Detached on POSIX, so the terminal's signals no longer reach it: ccc exiting early
+    // (process.exit, or SIGINT/SIGTERM/SIGHUP outside a raw-mode prompt) takes it along.
+    // Windows: not detached, so the console's events reach it anyway; no signal hooks.
     const onExit = (): void => { if (child) killTree(child); };
     process.once("exit", onExit);
-    const stopSignals = killOnSignals(onExit);
+    const stopSignals = process.platform === "win32" ? () => {} : killOnSignals(onExit);
     const timer = setTimeout(() => {
       finish("timeout");
       if (child) killTree(child);
@@ -161,7 +163,9 @@ function killOnSignals(kill: () => void): () => void {
     const handler = (): void => {
       kill();
       stop();
-      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+      // Exit as the signal would (128 + its number), but through process.exit, which
+      // restores a raw-mode terminal (a readline prompt); re-raising it would not.
+      if (process.listenerCount(signal) === 0) process.exit(128 + os.constants.signals[signal]);
     };
     process.once(signal, handler);
     return [signal, handler] as const;

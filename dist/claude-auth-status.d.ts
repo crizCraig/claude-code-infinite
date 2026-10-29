@@ -41,7 +41,7 @@ export interface ProbeOptions {
 }
 /** False when the session's own options may sign it in differently than the probe sees. */
 export declare function probeAnswersForSession(args: readonly string[]): boolean;
-/** The probe for a session it can't answer for: the config files decide, nothing blocks. */
+/** The probe for a session it can't answer for: no sign-in guess (sign-in-notice.ts). */
 export declare function skippedProbe(): AuthProbe;
 /** Run `claude auth status --json`; never throws or rejects, and is bounded by timeoutMs. */
 export declare function probeClaudeAuthStatus(command: string, opts?: ProbeOptions): Promise<AuthProbe>;

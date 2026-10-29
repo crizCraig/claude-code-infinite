@@ -125,6 +125,12 @@ test("a skipped probe: no sign-in guess from the config files, credit advice kep
   assert.equal(signInNotice(input(skipped, { override, fallback: { auth: "subscription",
     plan: "pro", subscriptionLogin: true } })), undefined);
   assert.equal(signInNotice(input(skipped, { creditRefused: true })).kind, "credit_reminder");
+  // Codex r3 P2: nor does the credit reminder name a key source from the config files.
+  const reminder = signInNotice(input(skipped, { creditRefused: true,
+    override: { source: "apiKeyHelper", asks: false } }));
+  assert.equal(reminder.kind, "credit_reminder");
+  assert.deepEqual(reminder.lines, signInNotice(input(skipped, { creditRefused: true })).lines);
+  assert.doesNotMatch(reminder.lines.join(" "), /settings\.json|apiKeyHelper/);
 });
 
 test("colour wraps each line", () => {

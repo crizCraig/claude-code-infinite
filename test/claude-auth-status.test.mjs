@@ -4,7 +4,7 @@
 // at all, which the config files cannot tell apart from "can't tell".
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -177,12 +177,15 @@ test("the schema's probe results match the module's", () => {
 // Review r2 P3: a detached probe no longer gets the terminal's Ctrl+C, so ccc exiting
 // while it runs must kill it; the exit hook is gone once the probe is done.
 test("the probe holds an exit hook only while it runs", async () => {
-  const before = process.listenerCount("exit");
+  const events = ["exit", "SIGINT", "SIGTERM", "SIGHUP"];
+  const counts = () => events.map((e) => process.listenerCount(e));
+  const before = counts();
   const fake = fakeClaude(JSON.stringify(SIGNED_OUT), 1, 100);
   const running = probeClaudeAuthStatus(fake.command, { leadingArgs: fake.leadingArgs, env: {} });
-  assert.equal(process.listenerCount("exit"), before + 1);
+  const signals = process.platform === "win32" ? 0 : 1;
+  assert.deepEqual(counts(), before.map((n, i) => n + (i === 0 ? 1 : signals)));
   assert.equal((await running).result, "ok");
-  assert.equal(process.listenerCount("exit"), before);
+  assert.deepEqual(counts(), before);
 });
 
 // Codex r2 P2: ccc exiting, or killed by a signal, while the probe still runs must not
@@ -209,9 +212,11 @@ for (const how of ["exit", "SIGTERM"]) {
     const gone = new Promise((r) => ccc.on("exit", (code, signal) => r({ code, signal })));
     if (how === "exit") ccc.send("go"); else ccc.kill("SIGTERM");
     const ended = await gone;
-    if (how === "SIGTERM") assert.equal(ended.signal, "SIGTERM");
+    // Codex r3 P2: exits 128 + 15 through process.exit, which restores a raw terminal.
+    if (how === "SIGTERM") assert.equal(ended.code, 143);
     const until = Date.now() + 3000;
     while (alive(probePid) && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
     assert.equal(alive(probePid), false, "probe outlived ccc");
+    rmSync(dir, { recursive: true, force: true });
   });
 }

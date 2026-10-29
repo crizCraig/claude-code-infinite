@@ -10,6 +10,7 @@
  * every other field are never parsed out or kept.
  */
 import { spawn as spawnPlain } from "node:child_process";
+import * as os from "node:os";
 import * as path from "node:path";
 import spawn from "cross-spawn";
 import { planFrom } from "./claude-auth.js";
@@ -31,7 +32,7 @@ const SESSION_AUTH_OPTIONS = ["--settings", "--setting-sources", "--bare"];
 export function probeAnswersForSession(args) {
     return !args.some((arg) => SESSION_AUTH_OPTIONS.some((option) => arg === option || arg.startsWith(`${option}=`)));
 }
-/** The probe for a session it can't answer for: the config files decide, nothing blocks. */
+/** The probe for a session it can't answer for: no sign-in guess (sign-in-notice.ts). */
 export function skippedProbe() {
     return { result: "skipped", ms: 0 };
 }
@@ -52,12 +53,13 @@ export function probeClaudeAuthStatus(command, opts = {}) {
             resolve({ result, ms: Math.max(0, now() - started), ...(status ? { status } : {}) });
         };
         const child = startProbe(command, opts);
-        // Detached on POSIX, so the terminal's Ctrl+C no longer reaches it: ccc exiting early
-        // (a quit at the key prompt) takes a still-running probe with it.
+        // Detached on POSIX, so the terminal's signals no longer reach it: ccc exiting early
+        // (process.exit, or SIGINT/SIGTERM/SIGHUP outside a raw-mode prompt) takes it along.
+        // Windows: not detached, so the console's events reach it anyway; no signal hooks.
         const onExit = () => { if (child)
             killTree(child); };
         process.once("exit", onExit);
-        const stopSignals = killOnSignals(onExit);
+        const stopSignals = process.platform === "win32" ? () => { } : killOnSignals(onExit);
         const timer = setTimeout(() => {
             finish("timeout");
             if (child)
@@ -126,8 +128,10 @@ function killOnSignals(kill) {
         const handler = () => {
             kill();
             stop();
+            // Exit as the signal would (128 + its number), but through process.exit, which
+            // restores a raw-mode terminal (a readline prompt); re-raising it would not.
             if (process.listenerCount(signal) === 0)
-                process.kill(process.pid, signal);
+                process.exit(128 + os.constants.signals[signal]);
         };
         process.once(signal, handler);
         return [signal, handler];

@@ -112,11 +112,13 @@ site's install command gives you, and note that version.
 
 Start from zero:
 
-1. `npm uninstall -g claude-code-infinite`, then rename the folder
-   `%USERPROFILE%\.claude-code-infinite` to `.claude-code-infinite.old` (Craig's earlier
+1. In Command Prompt: `npm uninstall -g claude-code-infinite`, then
+   `ren "%USERPROFILE%\.claude-code-infinite" .claude-code-infinite.old` (Craig's earlier
    test key is in it: don't send it).
 2. Sign Claude Code out (`claude`, `/logout`, `/exit`). If you're willing, uninstall Claude
-   Code too, so you see ccc's install offer.
+   Code too, so you see ccc's install offer: `npm uninstall -g @anthropic-ai/claude-code`
+   if `where claude` showed an `npm` folder; if it showed `.local\bin\claude.exe`
+   (Anthropic's installer), rename that file to `claude.exe.old`.
 3. Use an email that has no polychat.co account yet (Craig can delete the test account
    afterwards), or ask Craig to reset yours.
 
@@ -128,8 +130,8 @@ Then go step by step, as if you had only heard of MemTree:
 | 2 | Sign up at polychat.co (the site's sign-up link). |
 | 3 | Find the MemTree key page and your key. |
 | 4 | Find and run the install command the site gives you. |
-| 5 | Run `ccc` for the first time and paste the key. |
-| 6 | Claude Code: install (if ccc offers) and sign in with your Claude account. |
+| 5 | Run `ccc` for the first time: install Claude Code if ccc offers, then paste the key. |
+| 6 | Sign Claude Code in with your Claude account. |
 | 7 | Send your first message and get an answer. |
 | 8 | Find your first MemTree link (ccc shows one; `/memtree-view` prints it) and open it. |
 

@@ -82,7 +82,10 @@ export function signInNotice(input: SignInNoticeInput): SignInNotice | undefined
   if (CLOUD_AUTH.includes(auth)) return undefined;
   const plan = PAID_PLANS.includes(status?.plan ?? "unknown") ? status!.plan : input.fallback.plan;
   if (needsCreditReminder({ refused: input.creditRefused, plan }) && auth !== "none") {
-    const source = input.override?.asks ? undefined : input.override?.source;
+    // A skipped probe (--settings, --setting-sources, --bare): the key's source as read
+    // from the config files may not be this session's, so it isn't named.
+    const skipped = input.probe.result === "skipped";
+    const source = input.override?.asks || skipped ? undefined : input.override?.source;
     return notice("credit_reminder", [yellow(creditReminderText(source), input.color)]);
   }
   if (status && status.auth !== "unknown") {
