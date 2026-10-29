@@ -23,13 +23,14 @@ import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
-import { createSessionNoticePlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
+import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, updateNoticeText, } from "./notices.js";
 import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
+import { SubagentMemoryHint } from "./subagent-hint.js";
 import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
@@ -572,6 +573,10 @@ async function main() {
         fetchJson: (pathAndQuery, signal) => memtree.fetchMemTree(pathAndQuery, "application/json", signal),
     });
     projectTrees?.prefetch();
+    // A subagent is told whose memory to search (subagent-hint.ts) when the
+    // session has the `search` tool the hint names.
+    const subagentHint = memtreeMcpPlan.tools.includes("search")
+        ? new SubagentMemoryHint() : undefined;
     const nativeOneMillionContext = claudeNativeOneMillionContextEnabled(process.env);
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
     const memtreeLinkStore = new MemtreeLinkStore();
@@ -625,6 +630,7 @@ async function main() {
         sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
         promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
         projectTrees,
+        subagentHint,
     });
     // One unobtrusive (dim) line so users can find the log during an incident.
     console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
@@ -656,7 +662,8 @@ async function main() {
     // --plugin-dir composes with user hooks/settings; adding another --settings
     // would not, because Claude keeps only its final --settings occurrence.
     // Print/non-TTY calls are programmatic interfaces: omit all UI hooks so their
-    // stdout/events remain byte-for-byte vanilla.
+    // stdout stays Claude Code's own; they get only the subagent hooks, which
+    // print nothing (the plugin is listed in a stream-json `init` event).
     let noticePlugin = null;
     let childArgs = [...claudeArgs];
     if (interactiveUi) {
@@ -682,6 +689,17 @@ async function main() {
             }
         }
     }
+    else if (subagentHint) {
+        // Print/non-TTY: no display hooks, but subagents still get the memory hint.
+        try {
+            noticePlugin = createSubagentHookPlugin(proxy.hookUrl);
+            childArgs = withSessionNoticePluginArgs(childArgs, noticePlugin.dir);
+        }
+        catch (err) {
+            if (isDebugMode)
+                console.error(`[DEBUG] Subagent hook plugin disabled: ${String(err)}`);
+        }
+    }
     let memtreeMcpConfig = null;
     if (memtreeMcpPlan.register) {
         try {
@@ -693,6 +711,7 @@ async function main() {
             // tools the session lacks (ccc registers only when the caller has none).
             memtree.setMemtreeTools(undefined);
             projectTrees?.disable();
+            subagentHint?.disable();
             if (isDebugMode) {
                 console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
             }

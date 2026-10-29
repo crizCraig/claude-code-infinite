@@ -27,6 +27,7 @@ import { NewestTreeLookup } from "./memtree-newest.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
   createSessionNoticePlugin,
+  createSubagentHookPlugin,
   supportsMessageDisplay,
   terminalSupportsColor,
   withSessionNoticePluginArgs,
@@ -53,6 +54,7 @@ import {
 } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
+import { SubagentMemoryHint } from "./subagent-hint.js";
 import {
   KEY_PAGE_URL,
   LOCAL_KEY_PAGE_URL,
@@ -742,6 +744,10 @@ async function main() {
       memtree.fetchMemTree(pathAndQuery, "application/json", signal),
   });
   projectTrees?.prefetch();
+  // A subagent is told whose memory to search (subagent-hint.ts) when the
+  // session has the `search` tool the hint names.
+  const subagentHint = memtreeMcpPlan.tools.includes("search")
+    ? new SubagentMemoryHint() : undefined;
   const nativeOneMillionContext =
     claudeNativeOneMillionContextEnabled(process.env);
   const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
@@ -798,6 +804,7 @@ async function main() {
     sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     projectTrees,
+    subagentHint,
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
@@ -838,7 +845,8 @@ async function main() {
   // --plugin-dir composes with user hooks/settings; adding another --settings
   // would not, because Claude keeps only its final --settings occurrence.
   // Print/non-TTY calls are programmatic interfaces: omit all UI hooks so their
-  // stdout/events remain byte-for-byte vanilla.
+  // stdout stays Claude Code's own; they get only the subagent hooks, which
+  // print nothing (the plugin is listed in a stream-json `init` event).
   let noticePlugin: SessionNoticePlugin | null = null;
   let childArgs = [...claudeArgs];
   if (interactiveUi) {
@@ -866,6 +874,14 @@ async function main() {
         console.error(`[DEBUG] Notice plugin disabled: ${String(err)}`);
       }
     }
+  } else if (subagentHint) {
+    // Print/non-TTY: no display hooks, but subagents still get the memory hint.
+    try {
+      noticePlugin = createSubagentHookPlugin(proxy.hookUrl);
+      childArgs = withSessionNoticePluginArgs(childArgs, noticePlugin.dir);
+    } catch (err) {
+      if (isDebugMode) console.error(`[DEBUG] Subagent hook plugin disabled: ${String(err)}`);
+    }
   }
 
   let memtreeMcpConfig: MemtreeMcpConfigFile | null = null;
@@ -878,6 +894,7 @@ async function main() {
       // tools the session lacks (ccc registers only when the caller has none).
       memtree.setMemtreeTools(undefined);
       projectTrees?.disable();
+      subagentHint?.disable();
       if (isDebugMode) {
         console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
       }

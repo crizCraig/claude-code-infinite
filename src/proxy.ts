@@ -154,6 +154,11 @@ import type { MessageTimes, TranscriptUsageSource } from "./transcript-usage.js"
 import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import type { ProjectTreesHint } from "./project-trees.js";
+import {
+  subagentMemoryHintText,
+  subagentStartOutput,
+  type SubagentMemoryHint,
+} from "./subagent-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
@@ -357,6 +362,12 @@ export interface ProxyOptions {
    */
   projectTrees?: ProjectTreesHint;
   /**
+   * Whether a subagent's SubagentStart is answered with its parent's memory
+   * hint (subagent-hint.ts): set when the session has the memtree `search`
+   * tool. Omitted means never.
+   */
+  subagentHint?: SubagentMemoryHint;
+  /**
    * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
    * and refusals, as allowlisted enums and numbers. Never content.
    */
@@ -456,6 +467,8 @@ interface ProxyState {
   promptSubmitNotice?: () => string | undefined;
   /** ProxyOptions.projectTrees. */
   projectTrees?: ProjectTreesHint;
+  /** ProxyOptions.subagentHint. */
+  subagentHint?: SubagentMemoryHint;
   /** ProxyOptions.diagnostics. */
   diagnostics?: DiagnosticsRecorder;
   notices: NoticeDeliveryQueue;
@@ -1004,6 +1017,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     sessionStartNotice: opts.sessionStartNotice,
     promptSubmitNotice: opts.promptSubmitNotice,
     projectTrees: opts.projectTrees,
+    subagentHint: opts.subagentHint,
     diagnostics: opts.diagnostics,
     notices: new NoticeDeliveryQueue(),
     mainNoticePending: false,
@@ -1617,8 +1631,19 @@ async function handleNoticeHook(
   }
   if (parsed.hook_event_name === "SubagentStart") {
     state.activeSubagents.add(parsed.agent_id);
-    res.writeHead(204);
-    res.end();
+    const hint = await subagentHintContext(state, parsed.session_id);
+    if (hint === undefined) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    const body = Buffer.from(JSON.stringify(subagentStartOutput(hint)), "utf-8");
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(body.length),
+      "cache-control": "no-store",
+    });
+    res.end(body);
     return;
   }
   if (parsed.hook_event_name === "SubagentStop") {
@@ -3167,6 +3192,27 @@ async function projectTreesContext(
   if (!hint || input.agent_id !== undefined || input.source === "compact") return undefined;
   try {
     return await hint.contextFor(input.session_id);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The parent's memory hint for a starting subagent: only while MemTree works
+ * and the session has the tools, naming the parent's newest tree (a bounded
+ * wait when no answer is cached). Undefined otherwise; never throws.
+ */
+async function subagentHintContext(
+  state: ProxyState,
+  sessionId: string
+): Promise<string | undefined> {
+  if (!state.subagentHint?.enabled || !memtreeWorking(state)) return undefined;
+  try {
+    // A cached tree will do (peek refreshes it in the background); wait only for none.
+    const tree = state.newestTrees?.peek(sessionId) ?? await state.newestTrees?.settle(sessionId);
+    // MemTree may have paused or failed while the lookup was on its way.
+    if (!tree || !state.subagentHint.enabled || !memtreeWorking(state)) return undefined;
+    return subagentMemoryHintText(sessionId, tree.key);
   } catch {
     return undefined;
   }

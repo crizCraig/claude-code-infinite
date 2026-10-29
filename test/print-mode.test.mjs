@@ -66,7 +66,10 @@ function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } =
       .replace("authStatus.loggedIn", String(authStatus.loggedIn))] : []),
     "const cfg = args.find((a) => a.startsWith('--mcp-config='));",
     "const servers = cfg ? Object.keys(JSON.parse(fs.readFileSync(cfg.slice(13), 'utf8')).mcpServers) : [];",
-    "process.stdout.write(JSON.stringify({ type: 'result', args, servers }) + '\\n');",
+    "const pd = args.indexOf('--plugin-dir');",
+    "const hooks = pd < 0 ? null : Object.keys(JSON.parse(fs.readFileSync(",
+    "  args[pd + 1] + '/hooks/hooks.json', 'utf8')).hooks);",
+    "process.stdout.write(JSON.stringify({ type: 'result', args, servers, hooks }) + '\\n');",
   ].join("\n"));
   if (process.platform === "win32") {
     fs.writeFileSync(path.join(bin, "claude.cmd"), `@"${process.execPath}" "%~dp0claude.mjs" %*\r\n`);
@@ -120,8 +123,11 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.match(result.args[0], /^--mcp-config=/);
   assert.equal(result.args[1],
     "--allowedTools=mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines,mcp__memtree__list");
-  assert.deepEqual(result.args.slice(2), ["-p", "--output-format", "json", "--", "hi"]);
+  assert.equal(result.args[2], "--plugin-dir");
+  assert.deepEqual(result.args.slice(4), ["-p", "--output-format", "json", "--", "hi"]);
   assert.deepEqual(result.servers, ["memtree"]);
+  assert.deepEqual(result.hooks, ["SubagentStart", "SubagentStop"],
+    "only the subagent hooks: a subagent is told whose memory to search");
   // The banner and notices still reach a human, on stderr and uncoloured.
   assert.match(stderr, /Claude Code Infinite/);
   assert.match(stderr, /LOCAL MODE/);

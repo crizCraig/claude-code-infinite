@@ -30,6 +30,13 @@ export declare const MEMTREE_MCP_INSTRUCTIONS: string;
 export declare const MEMTREE_TOOL_META: {
     readonly "anthropic/alwaysLoad": true;
 };
+/**
+ * Said in `search`'s description, the one text a resumed session gets fresh:
+ * Claude Code keeps a session's MCP instructions and deferred-tools list as
+ * first announced, and never takes a name off that list once the tool is
+ * loaded, so a session begun before alwaysLoad still lists these as deferred.
+ */
+export declare const MEMTREE_LOADED_NOTE: string;
 export declare const MEMTREE_TOOLS: ({
     _meta: {
         readonly "anthropic/alwaysLoad": true;
