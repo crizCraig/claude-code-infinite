@@ -4,13 +4,15 @@
 // at all, which the config files cannot tell apart from "can't tell".
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AUTH_PROBE_RESULTS,
   parseAuthStatus,
+  probeAnswersForSession,
   probeClaudeAuthStatus,
+  skippedProbe,
 } from "../dist/claude-auth-status.js";
 import { AUTH_PROBE_RESULTS as SCHEMA_RESULTS } from "../dist/diagnostics-schema.js";
 
@@ -122,6 +124,50 @@ test("the probe: an old Claude Code without `auth`, a hang, a missing command", 
   assert.equal(timedOut.status, undefined);
   const missing = await probeClaudeAuthStatus(join(tmpdir(), "no-such-claude-xyz"));
   assert.ok(["failed", "unsupported"].includes(missing.result), missing.result);
+});
+
+// Codex r1 P2: a timed-out probe must not outlive ccc's wait, nor leave a child behind
+// (on Windows a .cmd shim runs cmd.exe, whose node child a plain kill would miss).
+test("the probe: a timeout kills the whole process tree, SIGTERM ignored", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-stubborn-claude-"));
+  const pids = join(dir, "pids.txt");
+  const child = join(dir, "child.mjs");
+  writeFileSync(child, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);");
+  const script = join(dir, "claude.mjs");
+  writeFileSync(script, [
+    `import { spawn } from "node:child_process";`,
+    `import { writeFileSync } from "node:fs";`,
+    `process.on("SIGTERM", () => {});`,
+    `const c = spawn(process.execPath, [${JSON.stringify(child)}], { stdio: "ignore" });`,
+    `writeFileSync(${JSON.stringify(pids)}, process.pid + " " + c.pid);`,
+    `setInterval(() => {}, 1000);`,
+  ].join("\n"));
+  const probe = await probeClaudeAuthStatus(process.execPath,
+    { leadingArgs: [script], timeoutMs: 1500 });
+  assert.equal(probe.result, "timeout");
+  const [parent, grandchild] = readFileSync(pids, "utf8").split(" ").map(Number);
+  const deadline = Date.now() + 5000;
+  while ((alive(parent) || alive(grandchild)) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(alive(parent), false, "probe process still running");
+  assert.equal(alive(grandchild), false, "probe's child still running");
+});
+
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// Codex r1 P2: `claude auth status` takes no --settings, so a session given its own
+// settings (an apiKeyHelper, say) or --bare may be signed in differently than it says.
+test("the probe is not asked when the session's options change how it signs in", () => {
+  assert.equal(probeAnswersForSession([]), true);
+  assert.equal(probeAnswersForSession(["--resume", "abc", "-p", "hi"]), true);
+  for (const args of [["--settings", "s.json"], ["--settings={\"apiKeyHelper\":\"x\"}"],
+    ["--setting-sources", "user"], ["--bare", "-p", "hi"]]) {
+    assert.equal(probeAnswersForSession(args), false, args.join(" "));
+  }
+  assert.deepEqual(skippedProbe(), { result: "skipped", ms: 0 });
 });
 
 test("the schema's probe results match the module's", () => {

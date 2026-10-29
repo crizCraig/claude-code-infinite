@@ -74,7 +74,9 @@ export const CLAUDE_AUTH_TYPES = [
   "subscription", "api_key", "bedrock", "vertex", "foundry", "none", "unknown",
 ] as const;
 /** claude-auth-status.ts AUTH_PROBE_RESULTS and sign-in-notice.ts SIGN_IN_WARNING_KINDS. */
-export const AUTH_PROBE_RESULTS = ["ok", "failed", "timeout", "unsupported"] as const;
+export const AUTH_PROBE_RESULTS = [
+  "ok", "failed", "timeout", "unsupported", "skipped",
+] as const;
 export const SIGN_IN_WARNING_KINDS = [
   "not_signed_in", "api_billing", "unknown", "credit_reminder", "key_override",
 ] as const;

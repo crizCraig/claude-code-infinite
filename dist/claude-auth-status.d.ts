@@ -10,8 +10,11 @@
  * every other field are never parsed out or kept.
  */
 import type { ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
-/** How the probe went: answered, ran but said nothing usable, too slow, or no such command. */
-export declare const AUTH_PROBE_RESULTS: readonly ["ok", "failed", "timeout", "unsupported"];
+/**
+ * How the probe went: answered, ran but said nothing usable, too slow, no such
+ * command, or not asked (the session's options change its sign-in).
+ */
+export declare const AUTH_PROBE_RESULTS: readonly ["ok", "failed", "timeout", "unsupported", "skipped"];
 export type AuthProbeResult = (typeof AUTH_PROBE_RESULTS)[number];
 /** A slow Windows npm shim starts node twice; Claude Code itself answers in ~0.1 s. */
 export declare const AUTH_PROBE_TIMEOUT_MS = 5000;
@@ -36,6 +39,10 @@ export interface ProbeOptions {
     timeoutMs?: number;
     now?: () => number;
 }
+/** False when the session's own options may sign it in differently than the probe sees. */
+export declare function probeAnswersForSession(args: readonly string[]): boolean;
+/** The probe for a session it can't answer for: the config files decide, nothing blocks. */
+export declare function skippedProbe(): AuthProbe;
 /** Run `claude auth status --json`; never throws or rejects, and is bounded by timeoutMs. */
 export declare function probeClaudeAuthStatus(command: string, opts?: ProbeOptions): Promise<AuthProbe>;
 /** The sign-in from `claude auth status --json` output, or undefined when it is not that. */

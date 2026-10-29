@@ -10,17 +10,28 @@
  * every other field are never parsed out or kept.
  */
 
+import { spawn as spawnPlain } from "node:child_process";
+import * as path from "node:path";
 import spawn from "cross-spawn";
 import type { ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
 import { planFrom } from "./claude-auth.js";
 
-/** How the probe went: answered, ran but said nothing usable, too slow, or no such command. */
-export const AUTH_PROBE_RESULTS = ["ok", "failed", "timeout", "unsupported"] as const;
+/**
+ * How the probe went: answered, ran but said nothing usable, too slow, no such
+ * command, or not asked (the session's options change its sign-in).
+ */
+export const AUTH_PROBE_RESULTS = ["ok", "failed", "timeout", "unsupported", "skipped"] as const;
 export type AuthProbeResult = (typeof AUTH_PROBE_RESULTS)[number];
 
 /** A slow Windows npm shim starts node twice; Claude Code itself answers in ~0.1 s. */
 export const AUTH_PROBE_TIMEOUT_MS = 5000;
 const MAX_OUTPUT = 64 * 1024;
+/**
+ * Session options that change which credentials Claude Code uses (an
+ * apiKeyHelper in --settings, --bare's key-only sign-in). `claude auth status`
+ * takes none of them, so its answer would not be this session's.
+ */
+const SESSION_AUTH_OPTIONS = ["--settings", "--setting-sources", "--bare"] as const;
 
 export interface ClaudeAuthStatus {
   /** "none": Claude Code says nobody is signed in. */
@@ -46,6 +57,17 @@ export interface ProbeOptions {
   now?: () => number;
 }
 
+/** False when the session's own options may sign it in differently than the probe sees. */
+export function probeAnswersForSession(args: readonly string[]): boolean {
+  return !args.some((arg) =>
+    SESSION_AUTH_OPTIONS.some((option) => arg === option || arg.startsWith(`${option}=`)));
+}
+
+/** The probe for a session it can't answer for: the config files decide, nothing blocks. */
+export function skippedProbe(): AuthProbe {
+  return { result: "skipped", ms: 0 };
+}
+
 /** Run `claude auth status --json`; never throws or rejects, and is bounded by timeoutMs. */
 export function probeClaudeAuthStatus(
   command: string, opts: ProbeOptions = {}
@@ -64,7 +86,7 @@ export function probeClaudeAuthStatus(
     const child = startProbe(command, opts);
     const timer = setTimeout(() => {
       finish("timeout");
-      child?.kill();
+      if (child) killTree(child);
     }, opts.timeoutMs ?? AUTH_PROBE_TIMEOUT_MS);
     if (!child) return finish("failed");
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -113,9 +135,32 @@ function startProbe(command: string, opts: ProbeOptions): ReturnType<typeof spaw
       env: opts.env ?? process.env,
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
+      // Its own process group on POSIX, so a timeout can kill it and its children.
+      detached: process.platform !== "win32",
     });
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Kill a timed-out probe and everything it started, never throwing. Windows:
+ * taskkill /T /F (a .cmd shim runs cmd.exe, then node). POSIX: SIGKILL to its
+ * process group, then to the process itself in case the group is gone.
+ */
+function killTree(child: ReturnType<typeof spawn>): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  try {
+    if (process.platform === "win32") {
+      const root = process.env.SystemRoot ?? "C:\\Windows";
+      spawnPlain(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"],
+        { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
+      return;
+    }
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
   }
 }
 

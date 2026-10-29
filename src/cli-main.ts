@@ -151,7 +151,12 @@ import {
   type PlanWarningInput,
   writeSeenClaudeAuth,
 } from "./claude-plan-warning.js";
-import { probeClaudeAuthStatus, type AuthProbe } from "./claude-auth-status.js";
+import {
+  probeAnswersForSession,
+  probeClaudeAuthStatus,
+  skippedProbe,
+  type AuthProbe,
+} from "./claude-auth-status.js";
 import { presentSignInNotice, signInNotice, SignInTracker } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
 
@@ -571,7 +576,10 @@ async function main() {
   // Claude Code's own answer to "signed in?" (sign-in-notice.ts), run while
   // the key is checked; awaited (bounded) just before the sign-in message.
   // Not for --version/--help-style runs, which start no session and show no message.
-  const authProbe = isInfoOnlyRun(claudeArgs) ? null : probeClaudeAuthStatus(claude.command);
+  // Not asked either when the session's options (--settings, --bare) change its sign-in.
+  const authProbe = isInfoOnlyRun(claudeArgs) ? null
+    : probeAnswersForSession(claudeArgs) ? probeClaudeAuthStatus(claude.command)
+    : Promise.resolve(skippedProbe());
   if (isDebugMode) console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
 
   if (!polychatApiKey) {
