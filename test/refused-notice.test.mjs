@@ -117,13 +117,15 @@ test("a prefix over the window only by its uncounted bound stays the failed comp
  * is what the whole history counts at; `compress2` answers the turn's compress.
  */
 async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, compress2,
-  memtreeOptions, rideCount = HANG } = {}) {
+  memtreeOptions, rideCount = HANG, rideAlwaysHangs = false } = {}) {
   let hangNext = 0;
+  let hangRides = false;
   let compressions = 0;
   const hasMemory = (body) => JSON.stringify(body.messages).includes("memory m");
   const h = await harness({
     memtreeOptions,
-    count: (body) => hangNext-- > 0 ? rideCount
+    count: (body) => (hangRides && hasMemory(body)) || hangNext-- > 0
+      ? rideCount
       : { input_tokens: hasMemory(body) ? 60_000 : originalTokens },
     usage: (body) => hasMemory(body) ? 60_000 : originalTokens,
     compress: (body) => ++compressions === 1 ? compressedReply(450_000) : compress2(body),
@@ -132,6 +134,7 @@ async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, c
   assert.equal(await h.post(original), 200);
   assert.equal(h.lastRecord().turnType, "followup-compressed");
   hangNext = 1;
+  hangRides = rideAlwaysHangs;
   await h.armMainTurn("next question");
   const next = [...original, { role: "assistant", content: "next answer" },
     { role: "user", content: "next question" }];
@@ -148,6 +151,19 @@ test("an uncounted prefix whose count failed (not timed out) is not kept as the 
     assert.equal(rec.compaction.keptPrefix, undefined);
     assert.equal(status, 503);
     assert.equal(rec.turnType, "followup-refused");
+  } finally {
+    h.close();
+  }
+});
+
+test("a failed compress's ride whose retried count also times out is refused as followup-refused", async () => {
+  const { h, status, rec } = await prefixTurn({ rideAlwaysHangs: true, compress2: FAIL });
+  try {
+    assert.equal(status, 503);
+    assert.equal(rec.turnType, "followup-refused");
+    assert.equal(rec.compaction.keptPrefix, undefined);
+    assert.equal(rec.degradedNotice, undefined);
+    assert.equal((await h.display()).status, 204);
   } finally {
     h.close();
   }

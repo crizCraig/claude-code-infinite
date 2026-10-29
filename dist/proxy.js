@@ -982,6 +982,8 @@ async function handleMessages(req, res, opts, upstream, state) {
         requestBytes: rawBody.length,
         claudeAuth: claudeAuthFromHeaders(req.headers),
     };
+    // The prompt this request was made for, before any await (Codex r2 P2).
+    noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
     const logged = async (forward) => {
         try {
             await forward;
@@ -1190,7 +1192,6 @@ async function handleMessages(req, res, opts, upstream, state) {
         state.activeSubagents.size === 0;
     const noticePromptId = state.mainPromptId;
     const noticePromptGeneration = state.mainPromptGeneration;
-    noticeContexts.set(rec, { promptId: noticePromptId, generation: noticePromptGeneration });
     requestSendPolicies.set(req, {
         original: rawBody,
         failedRebuild: false,
@@ -1878,7 +1879,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (!eager)
                 rec.degradedNotice = "quiet-under-budget";
             degradedNotices.set(rec, { eager, warn: () => {
-                    if (state.mainPromptGeneration !== noticePromptGeneration)
+                    // A 402 or refused key meanwhile keeps its own, actionable notice (Codex r2 P2).
+                    if (state.mainPromptGeneration !== noticePromptGeneration ||
+                        opts.memtree.paymentRequiredDetail !== null || state.keyInvalid())
                         return;
                     state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
                     rec.degradedNotice = "shown";
@@ -4817,8 +4820,13 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
-    if (args.rec.turnType === "followup-degraded")
+    // A failed compress's ride that could not be sent either (review r2 P3).
+    const refusedRide = args.rec.turnType === "followup-prefix" &&
+        args.rec.compaction?.keptPrefix === true;
+    if (args.rec.turnType === "followup-degraded" || refusedRide) {
         args.rec.turnType = "followup-refused";
+        delete args.rec.compaction?.keptPrefix;
+    }
     delete args.rec.degradedNotice;
     if (unpaid === null && !keyInvalid)
         noteSlowRetry(args, failure);
