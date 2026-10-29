@@ -1190,6 +1190,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         state.activeSubagents.size === 0;
     const noticePromptId = state.mainPromptId;
     const noticePromptGeneration = state.mainPromptGeneration;
+    noticeContexts.set(rec, { promptId: noticePromptId, generation: noticePromptGeneration });
     requestSendPolicies.set(req, {
         original: rawBody,
         failedRebuild: false,
@@ -1814,7 +1815,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     : {}),
             // Riding the old prefix, or sending a raw request that fits, keeps the
             // short budget; with neither, a timeout could only end in a refusal.
-            longBudget: !(edge?.kind === "compress" && edge.fallback) &&
+            longBudget: !(edge?.kind === "compress" && edge.fallback && !edge.fallback.uncounted) &&
                 await wholeRequestRefused(requestSizing, forwardCandidate, sizingLimits()),
         });
     }
@@ -1863,6 +1864,26 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Each forwarder installs its own close listener synchronously, so this is
     // an event-loop-atomic handoff of downstream-close ownership.
     if (!result) {
+        const paymentDetail = opts.memtree.paymentRequiredDetail;
+        const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
+        if (mayQueueNotice && paymentDetail === null && !state.keyInvalid()) {
+            // Under the budget the whole request is what compression would have
+            // sent: the turn is not degraded, so the failure stays in the logs.
+            // Delivery decides the rest (selectForwardCandidate): only a whole
+            // history actually sent warns. A refusal (Claude Code retries it) or a
+            // ride on a compressed prefix did not run uncompressed (2026-10-28).
+            const eager = compressionNeeded(rec.compaction);
+            // Delivery sizes the request again (an exact count, else a
+            // conservative bound): a planned fit it finds over the budget warns then.
+            if (!eager)
+                rec.degradedNotice = "quiet-under-budget";
+            degradedNotices.set(rec, { eager, warn: () => {
+                    if (state.mainPromptGeneration !== noticePromptGeneration)
+                        return;
+                    state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
+                    rec.degradedNotice = "shown";
+                } });
+        }
         const kept = rideOldPrefix(false);
         if (kept)
             return kept;
@@ -1877,8 +1898,6 @@ async function handleMessages(req, res, opts, upstream, state) {
         releaseForOriginalFallback();
         sendingWhole();
         capture(opts, "anthropic-request", forwardBody);
-        const paymentDetail = opts.memtree.paymentRequiredDetail;
-        const mayQueueNotice = displayForThisTurn && state.mainPromptGeneration === noticePromptGeneration;
         const overBudget = reachedBudget(rec.compaction);
         if (state.keyInvalid()) {
             // A refused key (401/403) says why MemTree is off and how to fix it;
@@ -1901,24 +1920,6 @@ async function handleMessages(req, res, opts, upstream, state) {
             pausedNotices.set(rec, handle);
             if (overBudget)
                 state.nearWindowNotice = handle;
-        }
-        else if (mayQueueNotice && paymentDetail === null) {
-            // Under the budget the whole request is what compression would have
-            // sent: the turn is not degraded, so the failure stays in the logs.
-            // Delivery decides the rest (selectForwardCandidate): only a whole
-            // request actually sent warns. A refusal (Claude Code retries it) or a
-            // ride on a compressed prefix did not run uncompressed (2026-10-28).
-            const eager = compressionNeeded(rec.compaction);
-            // Delivery sizes the request again (an exact count, else a
-            // conservative bound): a planned fit it finds over the budget warns then.
-            if (!eager)
-                rec.degradedNotice = "quiet-under-budget";
-            degradedNotices.set(rec, { eager, warn: () => {
-                    if (state.mainPromptGeneration !== noticePromptGeneration)
-                        return;
-                    state.notices.queueSuffix(DEGRADED_NOTICE, undefined, noticePromptId);
-                    rec.degradedNotice = "shown";
-                } });
         }
         return logged(forwardRaw(req, res, forwardBody, opts, upstream, state.shutdownSignal, rec).then((delivered) => {
             noteWholeSize();
@@ -3063,11 +3064,13 @@ async function planEdgeCompaction(args) {
         // base64 that costs a fixed amount per image.
         const overWindow = calibratedSizeExceedsWindow(compaction, body, modelContextLimit);
         // Over the window only by the conservative bound of a ride whose planning
-        // count failed: delivery counts it again before sending it, so it stays
+        // count timed out: delivery counts it again before sending it, so it stays
         // the fallback a failed compress rides (2026-10-28: a 528k ride whose
         // count timed out was dropped, and the failed compress refused the turn).
-        const fallback = overWindow && !uncountedOnlyOverWindow(compaction, body, modelContextLimit)
-            ? undefined : { prefix, routed };
+        const uncounted = overWindow && uncountedOnlyOverWindow(compaction, body, modelContextLimit) &&
+            args.sizing.canRetryCount(prefixCandidate);
+        const fallback = overWindow && !uncounted
+            ? undefined : { prefix, routed, ...(uncounted ? { uncounted: true } : {}) };
         if (state.compactNow.has(sessionId))
             return forced("manual", fallback);
         if (prefix.modelContextLimit !== modelContextLimit ||
@@ -4621,9 +4624,20 @@ async function selectForwardCandidate(args) {
                 ? "bytes-fallback-fits-window" : "estimate-fits-window" };
         warnPausedNearWindow(args.state, args.rec, requestSessionId(args.req));
     }
-    // Uncompressed only when the whole history goes out, not a compressed ride.
-    if (degraded && candidate.kind === "original" && (degraded.eager || overBudget)) {
-        degraded.warn();
+    // Uncompressed only when the whole history goes out (or a truncation of
+    // it), not a compressed ride.
+    const whole = candidate.kind === "original" || wholeHistoryCandidates.has(candidate);
+    if (degraded && whole) {
+        // A failed compress's ride that delivery could not send went out whole.
+        if (args.rec.turnType === "followup-prefix") {
+            args.rec.turnType = "followup-degraded";
+            delete args.rec.compaction?.keptPrefix;
+        }
+        if (degraded.eager || overBudget)
+            degraded.warn();
+    }
+    else if (degraded) {
+        delete args.rec.degradedNotice;
     }
     return changed ? candidate.body : intended;
 }
@@ -4691,6 +4705,9 @@ async function truncateCandidate(rec, sizing, base, limits, store) {
         if (!plan)
             return undefined;
         const candidate = sizing.register(Buffer.from(JSON.stringify(plan.body), "utf-8"), "replacement");
+        if (base.kind === "original" || wholeHistoryCandidates.has(base)) {
+            wholeHistoryCandidates.add(candidate);
+        }
         const measurement = await sizing.measure(candidate, limits);
         if (fitsMeasured(measurement, limits) && measurement.tokens <= goal) {
             rec.truncatedToolResult = { originalChars: plan.originalChars,
@@ -4804,7 +4821,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         args.rec.turnType = "followup-refused";
     delete args.rec.degradedNotice;
     if (unpaid === null && !keyInvalid)
-        noteSlowRetry(args.state, args.rec, args.routeKey, failure);
+        noteSlowRetry(args, failure);
     args.state.diagnostics?.record("refusal", {
         status: failure.status, attempt: failure.attempt,
         input_ktokens: Math.round(inputTokens / 1000), budget_ktokens: Math.round(budgetTokens / 1000),
@@ -4835,12 +4852,18 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
  * A repeated retryable refusal on the main thread: say once per streak that
  * MemTree is slow and Claude Code is retrying, unless another notice waits.
  */
-function noteSlowRetry(state, rec, lane, failure) {
-    if (!state.refusalStreaks.refused(lane))
+function noteSlowRetry(args, failure) {
+    const { state, rec } = args;
+    const prompt = noticeContexts.get(rec);
+    // Not for a stale prompt or a closed response, nor an index wait (its 503
+    // says why), nor a final refusal (its own message shows).
+    const canShow = failure.status === 503 && rec.routeLane === "main" &&
+        rec.indexBehind !== true && prompt !== undefined &&
+        prompt.generation === state.mainPromptGeneration && !args.res.destroyed &&
+        !state.notices.hasPending();
+    if (!state.refusalStreaks.refused(args.routeKey, Date.now(), canShow))
         return;
-    if (failure.status !== 503 || rec.routeLane !== "main" || state.notices.hasPending())
-        return;
-    state.notices.queueSuffix(SLOW_RETRY_NOTICE, undefined, state.mainPromptId);
+    state.notices.queueSuffix(SLOW_RETRY_NOTICE, undefined, prompt.promptId);
     rec.slowRetryNotice = true;
 }
 /**
@@ -4933,6 +4956,10 @@ function compressionNeeded(compaction) {
  * when delivery's sizing finds it over the budget after all.
  */
 const degradedNotices = new WeakMap();
+/** Truncations (truncatedToFit) of the whole history: they still run uncompressed. */
+const wholeHistoryCandidates = new WeakSet();
+/** The prompt a request was made for, for notices its refusal may queue. */
+const noticeContexts = new WeakMap();
 /** The paused notice a degraded request queued, until it is refused or settles. */
 const pausedNotices = new WeakMap();
 const changedDeliveryRecords = new WeakSet();

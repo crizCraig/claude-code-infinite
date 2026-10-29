@@ -59,6 +59,11 @@ export class RequestSizing {
         return this.enabled && this.counts.peek(candidate.body) === undefined &&
             !this.exceedsRequestLimit(candidate);
     }
+    /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
+    canRetryCount(candidate) {
+        return this.enabled && this.counts.retry !== undefined && !this.exceedsRequestLimit(candidate) &&
+            RETRYABLE_COUNT_OUTCOMES.has(this.counts.peek(candidate.body)?.outcome ?? "success");
+    }
     /** Whether Anthropic would refuse this body's size (413) before reading it. */
     exceedsRequestLimit(candidate) {
         return exceedsRequestLimit(candidate.body.length);

@@ -150,8 +150,12 @@ export class RefusalStreaks {
         this.capacity = capacity;
         this.windowMs = windowMs;
     }
-    /** Note a refusal of `lane`; true the one time its streak should show the notice. */
-    refused(lane, now = Date.now()) {
+    /**
+     * Note a refusal of `lane`; true the one time its streak should show the
+     * notice. A refusal that cannot show it (`canNotice` false) still counts
+     * and leaves the notice to a later one of the streak.
+     */
+    refused(lane, now = Date.now(), canNotice = true) {
         const prior = this.lanes.get(lane);
         const streak = prior && now - prior.at <= this.windowMs
             ? prior : { count: 0, at: now, noticed: false };
@@ -163,7 +167,7 @@ export class RefusalStreaks {
                 this.lanes.delete(this.lanes.keys().next().value);
             this.lanes.set(lane, streak);
         }
-        if (streak.noticed || streak.count < SLOW_RETRY_NOTICE_AFTER)
+        if (!canNotice || streak.noticed || streak.count < SLOW_RETRY_NOTICE_AFTER)
             return false;
         streak.noticed = true;
         return true;

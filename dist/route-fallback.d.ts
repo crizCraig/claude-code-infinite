@@ -85,8 +85,12 @@ export declare class RefusalStreaks {
     private readonly windowMs;
     private readonly lanes;
     constructor(capacity?: number, windowMs?: number);
-    /** Note a refusal of `lane`; true the one time its streak should show the notice. */
-    refused(lane: string, now?: number): boolean;
+    /**
+     * Note a refusal of `lane`; true the one time its streak should show the
+     * notice. A refusal that cannot show it (`canNotice` false) still counts
+     * and leaves the notice to a later one of the streak.
+     */
+    refused(lane: string, now?: number, canNotice?: boolean): boolean;
     delivered(lane: string): void;
 }
 //# sourceMappingURL=route-fallback.d.ts.map

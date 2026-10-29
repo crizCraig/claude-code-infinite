@@ -7,12 +7,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 import { DEGRADED_NOTICE, SLOW_RETRY_NOTICE } from "../dist/notices.js";
 import { RefusalStreaks, SLOW_RETRY_WINDOW_MS } from "../dist/route-fallback.js";
+import { ToolOutputStore } from "../dist/tool-output-store.js";
 
 const HANG = Symbol("hang");
+/** A count answered 500: failed, not timed out, so delivery does not retry it. */
+const COUNT_ERROR = Symbol("count error");
 const SESSION = "session-1";
 
 test("a refused degraded turn shows no degraded notice and is followup-refused", async () => {
@@ -104,6 +110,112 @@ test("a prefix over the window only by its uncounted bound stays the failed comp
   }
 });
 
+/**
+ * The incident's shape: a compressed prefix (~450 KB: ~237k by the 1.9
+ * bytes/token bound, over claude-x's 200k window) that counts at 60k, then a
+ * human turn on it whose first count (the ride's) hangs. `originalTokens`
+ * is what the whole history counts at; `compress2` answers the turn's compress.
+ */
+async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, compress2,
+  memtreeOptions, rideCount = HANG } = {}) {
+  let hangNext = 0;
+  let compressions = 0;
+  const hasMemory = (body) => JSON.stringify(body.messages).includes("memory m");
+  const h = await harness({
+    memtreeOptions,
+    count: (body) => hangNext-- > 0 ? rideCount
+      : { input_tokens: hasMemory(body) ? 60_000 : originalTokens },
+    usage: (body) => hasMemory(body) ? 60_000 : originalTokens,
+    compress: (body) => ++compressions === 1 ? compressedReply(450_000) : compress2(body),
+  });
+  const original = followup("x".repeat(originalChars), "first task");
+  assert.equal(await h.post(original), 200);
+  assert.equal(h.lastRecord().turnType, "followup-compressed");
+  hangNext = 1;
+  await h.armMainTurn("next question");
+  const next = [...original, { role: "assistant", content: "next answer" },
+    { role: "user", content: "next question" }];
+  return { h, status: await h.post(next), rec: h.lastRecord(), compressions: () => compressions };
+}
+
+const FAIL = () => ({ status: 500, body: { detail: "boom" } });
+
+test("an uncounted prefix whose count failed (not timed out) is not kept as the fallback", async () => {
+  // Delivery does not retry a failed count: its bound alone could never admit it.
+  const { h, status, rec } = await prefixTurn({ rideCount: COUNT_ERROR, compress2: FAIL });
+  try {
+    assert.equal(rec.compaction.uncountedOverWindow, true, JSON.stringify(rec.compaction));
+    assert.equal(rec.compaction.keptPrefix, undefined);
+    assert.equal(status, 503);
+    assert.equal(rec.turnType, "followup-refused");
+  } finally {
+    h.close();
+  }
+});
+
+test("an uncounted fallback keeps the long compress budget when the whole history cannot fit", async () => {
+  // Short budget: 50 ms + 1 ms/KiB (~1.1 s here); long: 8 s. The answer takes 2.5 s.
+  const { h, status, rec } = await prefixTurn({
+    memtreeOptions: { compressTimeoutMs: 50, longCompressTimeoutMs: 8_000 },
+    compress2: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      return compressedReply(5_000);
+    },
+  });
+  try {
+    assert.equal(status, 200);
+    assert.equal(rec.compress.ok, true, JSON.stringify(rec.compress));
+    assert.equal(rec.turnType, "followup-compressed");
+  } finally {
+    h.close();
+  }
+});
+
+test("a failed compress's ride that delivery cannot send, sent whole instead, warns", async () => {
+  // The whole history counts at 150k: over the 100k budget, inside the window.
+  const { h, status, rec } = await prefixTurn({ originalTokens: 150_000,
+    originalChars: 1_400_000, compress2: FAIL });
+  try {
+    assert.equal(status, 200);
+    assert.equal(rec.turnType, "followup-degraded");
+    assert.equal(rec.compaction.keptPrefix, undefined);
+    assert.equal(rec.degradedNotice, "shown");
+    assert.doesNotMatch(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+    const shown = await h.display();
+    assert.ok(shown.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
+  } finally {
+    h.close();
+  }
+});
+
+test("the whole history sent with its tool result truncated still warns (MemTree 413)", async () => {
+  const outputs = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-refused-notice-"));
+  const quarter = (body) => Math.floor(JSON.stringify(body).length / 4);
+  const h = await harness({ count: (body) => ({ input_tokens: quarter(body) }), usage: quarter,
+    toolOutputs: new ToolOutputStore(outputs),
+    compress: () => ({ status: 413,
+      body: { detail: "Request exceeds the context window after compression" } }) });
+  try {
+    await h.armMainTurn("next question");
+    assert.equal(await h.post([
+      { role: "user", content: "first question" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1",
+        content: "line\n".repeat(200_000) }] },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "next question" },
+    ]), 200);
+    const rec = h.lastRecord();
+    assert.ok(rec.truncatedToolResult, JSON.stringify(rec));
+    assert.equal(rec.degradedNotice, "shown");
+    const shown = await h.display();
+    assert.ok(shown.body.hookSpecificOutput.displayContent.includes(DEGRADED_NOTICE));
+  } finally {
+    h.close();
+    fs.rmSync(outputs, { recursive: true, force: true });
+  }
+});
+
 test("refusal streaks: notice on the second within the window, once, reset by delivery", () => {
   const streaks = new RefusalStreaks();
   assert.equal(streaks.refused("a", 0), false);
@@ -114,6 +226,10 @@ test("refusal streaks: notice on the second within the window, once, reset by de
   assert.equal(streaks.refused("a", 3_000), false);
   assert.equal(streaks.refused("a", 3_000 + SLOW_RETRY_WINDOW_MS + 1), false, "too far apart");
   assert.equal(streaks.refused("a", 4_000 + SLOW_RETRY_WINDOW_MS), true);
+  const held = new RefusalStreaks();
+  held.refused("c", 0);
+  assert.equal(held.refused("c", 1, false), false, "another notice is pending");
+  assert.equal(held.refused("c", 2), true, "left for a later refusal of the streak");
   const none = new RefusalStreaks(0);
   assert.equal(none.refused("a", 0), false);
   assert.equal(none.refused("a", 1), false, "no capacity keeps no streak");
@@ -149,13 +265,18 @@ function readJson(req) {
 }
 
 /** Anthropic (messages + count_tokens), MemTree and a proxy; counting on when `count` is given. */
-async function harness({ count, usage = () => 1_000, compress, budget = 100_000 } = {}) {
+async function harness({ count, usage = () => 1_000, compress, budget = 100_000,
+  memtreeOptions = {}, countTokens = count !== undefined, toolOutputs } = {}) {
   const forwards = [], records = [];
   const upstream = await listen(async (req, res) => {
     const body = await readJson(req);
     if (req.url.includes("/count_tokens")) {
-      const result = count(body);
+      const result = await count(body);
       if (result === HANG) return;
+      if (result === COUNT_ERROR) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ type: "error", error: { type: "api_error" } }));
+      }
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify(result));
     }
@@ -171,9 +292,9 @@ async function harness({ count, usage = () => 1_000, compress, budget = 100_000 
     res.writeHead(custom?.status ?? 200, { "content-type": "application/json" });
     res.end(JSON.stringify(custom?.body ?? { messages: body.messages, index_only: true }));
   });
-  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k" });
+  const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k", ...memtreeOptions });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
-    budgetTokensOverride: budget, countTokens: count !== undefined,
+    budgetTokensOverride: budget, countTokens, toolOutputs,
     reqlog: { log: (record) => records.push(structuredClone(record)) } });
   const hook = async (input) => {
     const res = await fetch(proxy.hookUrl, { method: "POST",
