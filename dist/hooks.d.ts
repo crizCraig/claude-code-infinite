@@ -322,6 +322,16 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
 export declare function createStartupBannerPlugin(startupMessage: string, opts?: {
     tempRoot?: string;
 }): SessionNoticePlugin;
+/**
+ * A plugin with only the subagent hooks, for print (`-p`) / non-TTY sessions,
+ * which get none of the display hooks: SubagentStart, which the proxy answers
+ * with the parent's memory hint (subagent-hint.ts), and SubagentStop, which
+ * retires what SubagentStart recorded. Neither writes to stdout, so `-p` output
+ * changes only by this plugin's entry in a stream-json `init` event.
+ */
+export declare function createSubagentHookPlugin(hookUrl: string, opts?: {
+    tempRoot?: string;
+}): SessionNoticePlugin;
 /** Return true only for known Claude versions that support MessageDisplay. */
 export declare function supportsMessageDisplay(versionOutput: string): boolean;
 export {};

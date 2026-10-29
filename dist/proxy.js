@@ -64,6 +64,7 @@ import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paym
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
+import { subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
@@ -344,6 +345,7 @@ export function startProxy(opts) {
         sessionStartNotice: opts.sessionStartNotice,
         promptSubmitNotice: opts.promptSubmitNotice,
         projectTrees: opts.projectTrees,
+        subagentHint: opts.subagentHint,
         diagnostics: opts.diagnostics,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
@@ -883,8 +885,19 @@ onlyEvent) {
     }
     if (parsed.hook_event_name === "SubagentStart") {
         state.activeSubagents.add(parsed.agent_id);
-        res.writeHead(204);
-        res.end();
+        const hint = await subagentHintContext(state, parsed.session_id);
+        if (hint === undefined) {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        const body = Buffer.from(JSON.stringify(subagentStartOutput(hint)), "utf-8");
+        res.writeHead(200, {
+            "content-type": "application/json",
+            "content-length": String(body.length),
+            "cache-control": "no-store",
+        });
+        res.end(body);
         return;
     }
     if (parsed.hook_event_name === "SubagentStop") {
@@ -2226,6 +2239,22 @@ async function projectTreesContext(hint, input) {
         return undefined;
     try {
         return await hint.contextFor(input.session_id);
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The parent's memory hint for a starting subagent: only while MemTree works
+ * and the session has the tools, naming the parent's newest tree (a bounded
+ * wait when no answer is cached). Undefined otherwise; never throws.
+ */
+async function subagentHintContext(state, sessionId) {
+    if (!state.subagentHint?.enabled || !memtreeWorking(state))
+        return undefined;
+    try {
+        const tree = await state.newestTrees?.settle(sessionId);
+        return tree ? subagentMemoryHintText(sessionId, tree.key) : undefined;
     }
     catch {
         return undefined;

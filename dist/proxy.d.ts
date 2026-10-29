@@ -57,6 +57,7 @@ import type { NewestTreeLookup } from "./memtree-newest.js";
 import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
+import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
@@ -211,6 +212,12 @@ export interface ProxyOptions {
      */
     projectTrees?: ProjectTreesHint;
     /**
+     * Whether a subagent's SubagentStart is answered with its parent's memory
+     * hint (subagent-hint.ts): set when the session has the memtree `search`
+     * tool. Omitted means never.
+     */
+    subagentHint?: SubagentMemoryHint;
+    /**
      * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
      * and refusals, as allowlisted enums and numbers. Never content.
      */
@@ -301,6 +308,8 @@ interface ProxyState {
     promptSubmitNotice?: () => string | undefined;
     /** ProxyOptions.projectTrees. */
     projectTrees?: ProjectTreesHint;
+    /** ProxyOptions.subagentHint. */
+    subagentHint?: SubagentMemoryHint;
     /** ProxyOptions.diagnostics. */
     diagnostics?: DiagnosticsRecorder;
     notices: NoticeDeliveryQueue;

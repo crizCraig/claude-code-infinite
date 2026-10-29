@@ -110,6 +110,14 @@ const TREE_DESC = "A tree reference from list or search (keep its style and own/
  * recall probe, `ccc memtree-mcp`).
  */
 export const MEMTREE_TOOL_META = { "anthropic/alwaysLoad": true };
+/**
+ * Said in `search`'s description, the one text a resumed session gets fresh:
+ * Claude Code keeps a session's MCP instructions and deferred-tools list as
+ * first announced, and never takes a name off that list once the tool is
+ * loaded, so a session begun before alwaysLoad still lists these as deferred.
+ */
+export const MEMTREE_LOADED_NOTE = "It and the other memtree tools are loaded up front: call them directly, with no ToolSearch " +
+    "step, even where an older deferred-tools list in the conversation names them.";
 export const MEMTREE_TOOLS = [
     {
         name: "search",
@@ -121,7 +129,10 @@ export const MEMTREE_TOOLS = [
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
             "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
             "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
-            "Results show when the messages were written (per transcript block).",
+            "Results show when the messages were written (per transcript block). " +
+            // Live on every request, unlike the server instructions and Claude Code's
+            // deferred-tools list, which a resumed session keeps from its first day.
+            MEMTREE_LOADED_NOTE,
         inputSchema: {
             type: "object",
             properties: {

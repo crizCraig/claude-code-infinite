@@ -716,6 +716,37 @@ export function createStartupBannerPlugin(startupMessage, opts = {}) {
     };
 }
 /**
+ * A plugin with only the subagent hooks, for print (`-p`) / non-TTY sessions,
+ * which get none of the display hooks: SubagentStart, which the proxy answers
+ * with the parent's memory hint (subagent-hint.ts), and SubagentStop, which
+ * retires what SubagentStart recorded. Neither writes to stdout, so `-p` output
+ * changes only by this plugin's entry in a stream-json `init` event.
+ */
+export function createSubagentHookPlugin(hookUrl, opts = {}) {
+    const url = new URL(hookUrl);
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") {
+        throw new Error("notice hook URL must use randomized localhost HTTP endpoint");
+    }
+    const dir = fs.mkdtempSync(path.join(opts.tempRoot ?? os.tmpdir(), "ccc-notice-plugin-"));
+    fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "hooks"), { recursive: true });
+    const hook = { type: "http", url: hookUrl, timeout: 5 };
+    writePluginFiles(dir, {
+        SubagentStart: [{ hooks: [hook] }],
+        SubagentStop: [{ hooks: [hook] }],
+    });
+    let closed = false;
+    return {
+        dir,
+        close() {
+            if (closed)
+                return;
+            closed = true;
+            fs.rmSync(dir, { recursive: true, force: true });
+        },
+    };
+}
+/**
  * SessionStart accepts only `command`/`mcp_tool` hooks, never `http`, so the
  * banner is baked into a static file the command simply cats. It must NOT be
  * `echo`'d: sh and zsh expand backslash escapes, turning the JSON's \n into a
