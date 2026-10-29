@@ -141,15 +141,23 @@ import {
   claudeSubscriptionLogin,
   creditNoticeText,
   envApiKeySet,
+  type ApiKeyOverride,
 } from "./claude-auth.js";
 import {
   CreditRefusalMemory,
   creditAdviceApplies,
   isInfoOnlyRun,
-  printStartupSignInLines,
   readSeenClaudeAuth,
+  type PlanWarningInput,
   writeSeenClaudeAuth,
 } from "./claude-plan-warning.js";
+import {
+  probeAnswersForSession,
+  probeClaudeAuthStatus,
+  skippedProbe,
+  type AuthProbe,
+} from "./claude-auth-status.js";
+import { presentSignInNotice, signInNotice, SignInTracker } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -360,6 +368,66 @@ function askLine(question: string): Promise<string> {
   });
 }
 
+interface SignInContext {
+  claudeSignIn: PlanWarningInput;
+  creditRefused: boolean;
+  override: ApiKeyOverride | undefined;
+  interactive: boolean;
+  diagnostics: Diagnostics;
+  tracker: SignInTracker;
+}
+
+/**
+ * Record what `claude auth status` said, then show the sign-in message when one
+ * applies (sign-in-notice.ts). Exits when the user quits at its Enter prompt.
+ * Returns the line to repeat inside Claude Code, if any.
+ */
+async function showSignInNotice(
+  probe: AuthProbe, applies: boolean, ctx: SignInContext
+): Promise<string | undefined> {
+  ctx.diagnostics.record("claude_auth_probe", { result: probe.result, ms: probe.ms });
+  const status = probe.status;
+  if (status && status.auth !== "unknown") {
+    const plan = status.plan !== "unknown" ? status.plan : ctx.claudeSignIn.plan;
+    ctx.diagnostics.setContext({ claude_auth: status.auth, claude_plan: plan });
+    ctx.tracker.started(status.auth);
+  }
+  if (!applies) return undefined;
+  const notice = signInNotice({
+    probe, fallback: ctx.claudeSignIn, creditRefused: ctx.creditRefused,
+    override: ctx.override, color: process.stderr.isTTY === true && terminalSupportsColor(),
+  });
+  if (!notice) return undefined;
+  const auth = status && status.auth !== "unknown"
+    ? status.auth : ctx.claudeSignIn.seen ?? ctx.claudeSignIn.auth;
+  const go = await presentSignInNotice(notice, {
+    // The prompt is on stderr: never wait where it can't be seen (`ccc 2>log`).
+    interactive: ctx.interactive && process.stderr.isTTY === true, auth, tracker: ctx.tracker,
+    record: (name, fields) => ctx.diagnostics.record(name, fields),
+  });
+  if (!go) {
+    await ctx.diagnostics.flush();
+    process.exit(0);
+  }
+  return notice.sessionLine;
+}
+
+/** The SessionStart extra line: the update notice and the sign-in line, each once. */
+function sessionStartLines(
+  autoUpdate: AutoUpdateSetup | null, signIn: { text?: string }
+): (() => string | undefined) | undefined {
+  return () => {
+    const lines = [autoUpdate?.notices.sessionStartLine()];
+    if (signIn.text) {
+      const color = terminalSupportsColor();
+      lines.push(color ? `\x1b[33m${signIn.text}\x1b[39m` : signIn.text);
+      signIn.text = undefined;
+    }
+    const shown = lines.filter((l): l is string => typeof l === "string");
+    return shown.length ? shown.join("\n") : undefined;
+  };
+}
+
 function printBanner() {
   console.log(
     `\n\x1b[38;5;209m∞\x1b[0m \x1b[1;38;5;209mClaude Code Infinite\x1b[0m \x1b[38;5;209m∞\x1b[0m \x1b[38;5;48mfrom \x1b]8;;https://MemTree.dev\x1b\\MemTree\x1b]8;;\x1b\\\x1b[0m\n`
@@ -505,6 +573,13 @@ async function main() {
     await diagnostics.flush();
     process.exit(1);
   }
+  // Claude Code's own answer to "signed in?" (sign-in-notice.ts), run while
+  // the key is checked; awaited (bounded) just before the sign-in message.
+  // Not for --version/--help-style runs, which start no session and show no message.
+  // Not asked either when the session's options (--settings, --bare) change its sign-in.
+  const authProbe = isInfoOnlyRun(claudeArgs) ? null
+    : probeAnswersForSession(claudeArgs) ? probeClaudeAuthStatus(claude.command)
+    : Promise.resolve(skippedProbe());
   if (isDebugMode) console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
 
   if (!polychatApiKey) {
@@ -618,6 +693,11 @@ async function main() {
   // A refusal is also remembered for the next launch's startup line, until
   // Anthropic answers a request (claude-plan-warning.ts CREDIT_REFUSED_FILE).
   const creditMemory = new CreditRefusalMemory(getConfigDir());
+  // The API-billing message again inside Claude Code, at its first SessionStart.
+  const signInSessionLine: { text?: string } = {};
+  // A sign-in completed after ccc's warning, between launches or mid-session.
+  const signInTracker = new SignInTracker(getConfigDir(),
+    (event) => diagnostics.record("sign_in_completed", { ...event }));
   const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
     if (!creditAdviceApplies(auth, claudeSignIn.plan)) return;
     creditTooLow = true;
@@ -626,10 +706,11 @@ async function main() {
     // The next launch's no-plan line goes by what Claude Code really sent.
     if (auth !== claudeSignIn.seen) writeSeenClaudeAuth(getConfigDir(), auth);
     claudeSignIn.seen = auth;
+    signInTracker.requestAuth(auth);
   }, () => creditMemory.answered(), (info, startedAt) => {
     if (!info) rateLimits.answered(startedAt);
     else if (rateLimits.observe(info) && !interactiveUi) console.error(rateLimitNoticeText(info));
-  });
+  }, () => signInTracker.sinceWarningMs());
 
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
   // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
@@ -714,25 +795,21 @@ async function main() {
     projectMeta,
     // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
     // install) on a later SessionStart of this session, once.
-    sessionStartNotice: autoUpdate ? () => autoUpdate.notices.sessionStartLine() : undefined,
+    sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     projectTrees,
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
   console.log(`\x1b[2mRequest log: ${reqlog.path}\x1b[0m\n`);
-  // On an API key or not signed in: one line before the first prompt (stderr).
-  const stderrColor = process.stderr.isTTY === true && terminalSupportsColor();
-  // An earlier session's credit refusal (its advice, in place of the no-plan
-  // line), else the no-plan line; then a subscriber whose env or settings make
-  // Claude Code bill an API key instead.
+  // Not signed in, API billing or an earlier credit refusal: said before the
+  // first prompt (stderr), and when not signed in, held until Enter so it is read.
   // Not right after ccc installed Claude Code: it has just said Claude Code asks to sign in.
-  if (found && !isInfoOnlyRun(claudeArgs) && printStartupSignInLines({
-    refused: creditMemory.refusedAtStart, plan: claudeSignIn.plan, signIn: claudeSignIn,
-    override: keyOverride, color: stderrColor,
-  })) {
-    diagnostics.record("no_plan_warning", { auth: claudeSignIn.seen ?? claudeSignIn.auth });
-  }
+  const probe = await authProbe;
+  if (probe) signInSessionLine.text = await showSignInNotice(probe, found !== undefined, {
+    claudeSignIn, creditRefused: creditMemory.refusedAtStart, override: keyOverride,
+    interactive: interactiveUi, diagnostics, tracker: signInTracker,
+  });
   reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
   // The first request after a resume must count the whole session's thinking.
   const resumedSession = resumeSessionId(claudeArgs);

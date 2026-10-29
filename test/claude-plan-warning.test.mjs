@@ -8,9 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
-  NO_PLAN_TEXT,
   needsPlanWarning,
-  noPlanWarningText,
   readSeenClaudeAuth,
   writeSeenClaudeAuth,
 } from "../dist/claude-plan-warning.js";
@@ -18,20 +16,10 @@ import { claudeAuthFromConfig, creditNoticeText } from "../dist/claude-auth.js";
 import { Diagnostics, DiagnosticsRequestSink } from "../dist/diagnostics.js";
 import { sanitizeEvent } from "../dist/diagnostics-schema.js";
 
-const EXPECTED =
-  "ccc needs Claude Code signed in with a Claude Pro or Max plan (run `claude`, then `/login`). " +
-  "With an API key you pay Anthropic per token, and a key with no credit won't work.";
-
-test("the line is the agreed text, one line", () => {
-  assert.equal(NO_PLAN_TEXT, EXPECTED);
-  assert.equal(noPlanWarningText(false), EXPECTED);
-  assert.match(noPlanWarningText(true), /^\x1b\[33m.*\x1b\[39m$/);
-  assert.doesNotMatch(NO_PLAN_TEXT, /\n/);
-});
-
 test("credit_balance_too_low gets the plan advice, with the Console sign-in named", () => {
-  assert.match(creditNoticeText(false), /Pro or Max plan.*\/logout.*\/login/);
-  assert.match(creditNoticeText(false), /Anthropic Console account/);
+  assert.match(creditNoticeText(false), /Pro or Max.*\/login.*Claude account with subscription/);
+  assert.match(creditNoticeText(false), /a Console sign-in, an API key/);
+  assert.match(creditNoticeText(false), /Your MemTree credit covers MemTree, not Claude itself/);
 });
 
 test("warns on an API key or no sign-in, unless a paid plan is recorded", () => {
@@ -158,22 +146,11 @@ test("the tee reports each request's sign-in type, and a credit refusal as an AP
 test("diagnostics: the warning is recorded by sign-in type only", () => {
   assert.deepEqual(sanitizeEvent("no_plan_warning", { auth: "api_key" }, 5),
     { name: "no_plan_warning", t: 5, auth: "api_key" });
+  assert.deepEqual(sanitizeEvent("no_plan_warning",
+    { auth: "none", kind: "not_signed_in", waited_ms: 4200 }, 5),
+  { name: "no_plan_warning", t: 5, auth: "none", kind: "not_signed_in", waited_ms: 4200 });
   assert.deepEqual(sanitizeEvent("no_plan_warning", { auth: "sk-ant-api03-x" }, 5),
     { name: "no_plan_warning", t: 5 });
-});
-
-test("print mode: the warning goes to stderr, stdout stays Claude's", () => {
-  const script = [
-    "import { printNoPlanWarning } from './dist/claude-plan-warning.js';",
-    "printNoPlanWarning({ auth: 'api_key', plan: 'unknown' }, false);",
-    "printNoPlanWarning({ auth: 'subscription', plan: 'max' }, false);",
-  ].join("\n");
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    encoding: "utf8", cwd: new URL("..", import.meta.url),
-  });
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, "");
-  assert.equal(r.stderr, `${EXPECTED}\n`);
 });
 
 test("the exit credit advice is for every sign-in type without a paid tier", async () => {
@@ -235,25 +212,6 @@ test("the tee reports a request Anthropic answered, so a stale refusal can be fo
   assert.equal(ok.length, 1);
 });
 
-test("print mode: the credit reminder goes to stderr with the plan advice", () => {
-  const script = [
-    "import { printStartupSignInLines } from './dist/claude-plan-warning.js';",
-    "const signIn = { auth: 'subscription', plan: 'unknown' };",
-    "printStartupSignInLines({ refused: true, plan: 'unknown', signIn, color: false });",
-    "printStartupSignInLines({ refused: true, plan: 'pro', signIn, color: false });",
-    "printStartupSignInLines({ refused: false, plan: 'unknown', signIn, color: false });",
-  ].join("\n");
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    encoding: "utf8", cwd: new URL("..", import.meta.url),
-  });
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, "");
-  const lines = r.stderr.trimEnd().split("\n");
-  assert.equal(lines.length, 1, r.stderr);
-  assert.match(lines[0], /^Last time, Anthropic refused/);
-  assert.match(lines[0], /Pro or Max plan.*\/logout.*\/login/);
-});
-
 test("a side request's 2xx does not count as the sign-in working again", () => {
   const dir = mkdtempSync(join(tmpdir(), "ccc-tee-side-"));
   const diagnostics = new Diagnostics({
@@ -283,38 +241,4 @@ test("two sessions sharing the marker: each refusal writes it, each success remo
   a.refused(); // A is refused again after B removed the marker
   assert.equal(creditRefusedOnFile(dir), true);
   assert.equal(new CreditRefusalMemory(dir).refusedAtStart, true);
-});
-
-test("the credit reminder replaces the API-key override line, which says the same", async () => {
-  const { startupSignInLines } = await import("../dist/claude-plan-warning.js");
-  const override = { source: "ANTHROPIC_AUTH_TOKEN", asks: false };
-  const reminded = startupSignInLines({
-    refused: true, plan: "unknown", signIn: { auth: "subscription", plan: "unknown",
-      subscriptionLogin: true }, override, color: false,
-  });
-  assert.equal(reminded.lines.length, 1);
-  assert.match(reminded.lines[0], /^Last time, Anthropic refused.*ANTHROPIC_AUTH_TOKEN is set/);
-  assert.equal(reminded.warned, true);
-  const plain = startupSignInLines({
-    refused: false, plan: "unknown", signIn: { auth: "subscription", plan: "unknown",
-      subscriptionLogin: true }, override, color: false,
-  });
-  assert.equal(plain.lines.length, 1);
-  assert.match(plain.lines[0], /^ANTHROPIC_AUTH_TOKEN is set/);
-  assert.equal(plain.warned, false, "the override line is not a no-plan warning");
-  const noPlan = startupSignInLines({
-    refused: false, plan: "unknown", signIn: { auth: "api_key", plan: "unknown" },
-    override: undefined, color: false,
-  });
-  assert.deepEqual(noPlan, { lines: [NO_PLAN_TEXT], warned: true });
-});
-
-test("a remembered refusal is not repeated once Claude Code runs on a cloud provider", async () => {
-  const { startupSignInLines } = await import("../dist/claude-plan-warning.js");
-  for (const auth of ["bedrock", "vertex", "foundry"]) {
-    assert.deepEqual(startupSignInLines({
-      refused: true, plan: "unknown", signIn: { auth, plan: "unknown" },
-      override: undefined, color: false,
-    }), { lines: [], warned: false }, auth);
-  }
 });

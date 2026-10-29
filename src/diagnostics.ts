@@ -243,7 +243,10 @@ export class DiagnosticsRequestSink implements RequestLogSink {
      * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
      * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
-    private readonly onMainTurnAnswer?: (rateLimit: RateLimitInfo | null, startedAt: number) => void
+    private readonly onMainTurnAnswer?:
+      (rateLimit: RateLimitInfo | null, startedAt: number) => void,
+    /** Milliseconds since this launch's sign-in warning (sign-in-notice.ts), if one was shown. */
+    private readonly sinceWarningMs?: () => number | undefined
   ) {}
 
   log(record: RequestRecord): void {
@@ -278,7 +281,9 @@ export class DiagnosticsRequestSink implements RequestLogSink {
     };
     if (!this.firstRequest) {
       this.firstRequest = true;
-      this.diagnostics.record("first_request", fields);
+      const since = this.sinceWarningMs?.();
+      this.diagnostics.record("first_request",
+        since === undefined ? fields : { ...fields, since_warning_ms: since });
     }
     const human = rec.client?.turnOrigin === "human";
     if (!this.firstTurn && human) {

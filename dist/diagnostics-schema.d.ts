@@ -26,7 +26,10 @@ export declare const ERROR_CODES: readonly ["startup_failed", "spawn_failed", "p
 export type DiagnosticsErrorCode = (typeof ERROR_CODES)[number];
 export declare const INSTALL_METHODS: readonly ["npm-global", "npm-link", "git-checkout", "npx", "local", "pnpm", "yarn", "bun", "volta", "not-writable", "root", "unsupported-platform", "unknown"];
 /** claude-auth.ts and claude-locate.ts (kept here so the schema has no imports). */
-export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "unknown"];
+export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "none", "unknown"];
+/** claude-auth-status.ts AUTH_PROBE_RESULTS and sign-in-notice.ts SIGN_IN_WARNING_KINDS. */
+export declare const AUTH_PROBE_RESULTS: readonly ["ok", "failed", "timeout", "unsupported", "skipped"];
+export declare const SIGN_IN_WARNING_KINDS: readonly ["not_signed_in", "api_billing", "unknown", "credit_reminder", "key_override"];
 export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown"];
 export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
 /** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */

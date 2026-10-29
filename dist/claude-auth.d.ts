@@ -12,7 +12,8 @@
  * `x-api-key` or `sk-ant-api…` bearer is an API key. Only that classification
  * leaves this module.
  */
-export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "unknown"];
+/** "none": Claude Code says nobody is signed in (claude-auth-status.ts); "unknown": can't tell. */
+export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "bedrock", "vertex", "foundry", "none", "unknown"];
 export type ClaudeAuthType = (typeof CLAUDE_AUTH_TYPES)[number];
 /** A Claude.ai plan tier, by name only. */
 export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown"];

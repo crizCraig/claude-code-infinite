@@ -111,6 +111,8 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
      * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
     private readonly onMainTurnAnswer?;
+    /** Milliseconds since this launch's sign-in warning (sign-in-notice.ts), if one was shown. */
+    private readonly sinceWarningMs?;
     private firstRequest;
     private firstTurn;
     private firstAnswer;
@@ -125,7 +127,9 @@ export declare class DiagnosticsRequestSink implements RequestLogSink {
      * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
      * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
-    onMainTurnAnswer?: ((rateLimit: RateLimitInfo | null, startedAt: number) => void) | undefined);
+    onMainTurnAnswer?: ((rateLimit: RateLimitInfo | null, startedAt: number) => void) | undefined, 
+    /** Milliseconds since this launch's sign-in warning (sign-in-notice.ts), if one was shown. */
+    sinceWarningMs?: (() => number | undefined) | undefined);
     log(record: RequestRecord): void;
     private observe;
     private observeMessages;
