@@ -197,6 +197,7 @@ export class DiagnosticsRequestSink {
     onClaudeAuth;
     onUpstreamOk;
     onMainTurnAnswer;
+    sinceWarningMs;
     firstRequest = false;
     firstTurn = false;
     firstAnswer = false;
@@ -211,13 +212,16 @@ export class DiagnosticsRequestSink {
      * A main-conversation turn's answer (mainTurn): its 429/529 (rate-limit.ts), or
      * null for a 2xx; `startedAt` (epoch ms) is when that request reached ccc.
      */
-    onMainTurnAnswer) {
+    onMainTurnAnswer, 
+    /** Milliseconds since this launch's sign-in warning (sign-in-notice.ts), if one was shown. */
+    sinceWarningMs) {
         this.inner = inner;
         this.diagnostics = diagnostics;
         this.onCreditBalanceTooLow = onCreditBalanceTooLow;
         this.onClaudeAuth = onClaudeAuth;
         this.onUpstreamOk = onUpstreamOk;
         this.onMainTurnAnswer = onMainTurnAnswer;
+        this.sinceWarningMs = sinceWarningMs;
     }
     log(record) {
         this.inner?.log(record);
@@ -254,7 +258,8 @@ export class DiagnosticsRequestSink {
         };
         if (!this.firstRequest) {
             this.firstRequest = true;
-            this.diagnostics.record("first_request", fields);
+            const since = this.sinceWarningMs?.();
+            this.diagnostics.record("first_request", since === undefined ? fields : { ...fields, since_warning_ms: since });
         }
         const human = rec.client?.turnOrigin === "human";
         if (!this.firstTurn && human) {

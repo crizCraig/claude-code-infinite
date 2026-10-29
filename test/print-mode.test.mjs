@@ -50,7 +50,7 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth } = {}) {
+function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
@@ -60,6 +60,10 @@ function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth } = {}) {
     "import fs from 'node:fs';",
     "const args = process.argv.slice(2);",
     "if (args[0] === '--version') { console.log('2.1.302 (Claude Code)'); process.exit(0); }",
+    // `claude auth status --json` (claude-auth-status.ts): the given answer, else the argv line.
+    ...(authStatus ? [`if (args[0] === 'auth') { console.log(${JSON.stringify(
+      JSON.stringify(authStatus))}); process.exit(authStatus.loggedIn ? 0 : 1); }`
+      .replace("authStatus.loggedIn", String(authStatus.loggedIn))] : []),
     "const cfg = args.find((a) => a.startsWith('--mcp-config='));",
     "const servers = cfg ? Object.keys(JSON.parse(fs.readFileSync(cfg.slice(13), 'utf8')).mcpServers) : [];",
     "process.stdout.write(JSON.stringify({ type: 'result', args, servers }) + '\\n');",
@@ -138,7 +142,7 @@ test("ccc -p with no saved key and no terminal: fails on stderr, never prompts o
   assert.match(stderr, /run `ccc` in a terminal/);
 });
 
-const NO_PLAN = /^ccc needs Claude Code signed in with a Claude Pro or Max plan \(run `claude`, then `\/login`\)\. With an API key you pay Anthropic per token, and a key with no credit won't work\.$/m;
+const NO_PLAN = /^Claude Code is signed in for API billing \(an Anthropic Console account\), so Claude bills that account per token, not a Claude plan\. Your MemTree credit covers MemTree, not Claude itself\. To use Claude Pro or Max instead, run \/login in Claude Code and choose "Claude account with subscription"\.$/m;
 
 test("ccc -p not signed in to a plan: the no-plan line on stderr, stdout still Claude's alone", { timeout: 30_000 }, async () => {
   const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, {
@@ -150,22 +154,43 @@ test("ccc -p not signed in to a plan: the no-plan line on stderr, stdout still C
   assert.doesNotMatch(stdout, /Pro or Max/);
 });
 
+test("ccc -p, Claude Code says nobody is signed in: the sign-in message, no wait", { timeout: 30_000 }, async () => {
+  const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, {
+    authStatus: { loggedIn: false, authMethod: "none", apiProvider: "firstParty" },
+  });
+  assert.equal(code, 0, stderr);
+  assert.match(stderr, /^Claude Code isn't signed in to a Claude plan yet\. ccc needs Claude Pro or Max\.$/m);
+  assert.match(stderr, /^ {2}- Don't have one\? Get Pro at https:\/\/claude\.ai\/upgrade, then run \/login\.$/m);
+  assert.match(stderr, /^Your MemTree credit covers MemTree, not Claude itself\.$/m);
+  assert.doesNotMatch(stderr, /Press Enter/, "a print run never waits");
+  assert.deepEqual(JSON.parse(stdout.trim()).args.slice(-2), ["-p", "hi"]);
+});
+
+test("ccc -p, Claude Code says Max even though the config files are silent: nothing said", { timeout: 30_000 }, async () => {
+  const { code, stderr } = await runCcc(["-p", "hi"], {}, {
+    authStatus: { loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty",
+      email: "a@b.c", subscriptionType: "max" },
+  });
+  assert.equal(code, 0, stderr);
+  assert.doesNotMatch(stderr, /Pro or Max|signed in/);
+});
+
 test("ccc -p on a Claude subscription: no no-plan line", { timeout: 30_000 }, async () => {
   const { code, stderr } = await runCcc(["-p", "hi"], {}, {
     claudeJson: { oauthAccount: { emailAddress: "a@b.c" }, organizationType: "claude_max" },
   });
   assert.equal(code, 0, stderr);
-  assert.doesNotMatch(stderr, /Pro or Max plan/);
+  assert.doesNotMatch(stderr, /Pro or Max/);
 });
 
 test("ccc -p: the sign-in Claude Code last sent through ccc decides when the config is silent", { timeout: 30_000 }, async () => {
   const quiet = await runCcc(["-p", "hi"], {}, { seenAuth: "subscription" });
   assert.equal(quiet.code, 0, quiet.stderr);
-  assert.doesNotMatch(quiet.stderr, /Pro or Max plan/);
+  assert.doesNotMatch(quiet.stderr, /Pro or Max/);
   const max = await runCcc(["-p", "hi"], {}, {
     seenAuth: "api_key", claudeJson: { oauthAccount: { x: 1 }, organizationType: "claude_max" },
   });
-  assert.doesNotMatch(max.stderr, /Pro or Max plan/, "a /login to Max since then wins");
+  assert.doesNotMatch(max.stderr, /Pro or Max/, "a /login to Max since then wins");
   const key = await runCcc(["-p", "hi"], {}, { seenAuth: "api_key" });
   assert.match(key.stderr, NO_PLAN);
 });

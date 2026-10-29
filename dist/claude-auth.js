@@ -16,8 +16,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { creditAdviceText } from "./claude-plan-warning.js";
+/** "none": Claude Code says nobody is signed in (claude-auth-status.ts); "unknown": can't tell. */
 export const CLAUDE_AUTH_TYPES = [
-    "subscription", "api_key", "bedrock", "vertex", "foundry", "unknown",
+    "subscription", "api_key", "bedrock", "vertex", "foundry", "none", "unknown",
 ];
 /** A Claude.ai plan tier, by name only. */
 export const CLAUDE_PLANS = [

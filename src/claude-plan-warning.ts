@@ -1,13 +1,14 @@
 /**
- * The "no Claude plan" line. ccc runs the user's own Claude Code, so it only
- * works well signed in with a Claude Pro or Max plan; on an API key every token
- * is billed by Anthropic, and a key with no credit is refused outright
- * (credit_balance_too_low, the most common first-prompt failure). The line is
- * printed once before Claude Code starts when its sign-in is an API key or
- * missing, and never for a subscription. When ANTHROPIC_AUTH_TOKEN,
- * ANTHROPIC_API_KEY or an apiKeyHelper beats a Claude.ai login on file, a
- * line says so instead. A credit refusal gets the plan advice as ccc exits,
- * whatever the sign-in (claude-auth.ts creditNoticeText).
+ * The "no Claude plan" decision from config files, and the credit-refusal
+ * advice. ccc runs the user's own Claude Code, so it only works well signed in
+ * with a Claude Pro or Max plan; on an API key every token is billed by
+ * Anthropic, and a key with no credit is refused outright
+ * (credit_balance_too_low, the most common first-prompt failure). What is said
+ * before Claude Code starts is sign-in-notice.ts's; this module is its
+ * fallback when Claude Code cannot be asked (needsPlanWarning). When
+ * ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY or an apiKeyHelper beats a Claude.ai
+ * login on file, apiKeyOverrideText says so. A credit refusal gets the plan
+ * advice as ccc exits, whatever the sign-in (claude-auth.ts creditNoticeText).
  *
  * A credit refusal is also remembered (CREDIT_REFUSED_FILE, a bare marker) until
  * Anthropic answers a request or a paid tier is on record, so the next launch
@@ -23,10 +24,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ApiKeyOverride, ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
 
-export const NO_PLAN_TEXT =
-  "ccc needs Claude Code signed in with a Claude Pro or Max plan (run `claude`, then `/login`). " +
-  "With an API key you pay Anthropic per token, and a key with no credit won't work.";
-
 /**
  * What a credit refusal means: the sign-in bills prepaid credit (an API key, or
  * Claude Code's keyless "Anthropic Console account" sign-in, which sends an
@@ -34,13 +31,14 @@ export const NO_PLAN_TEXT =
  * balance is empty.
  */
 const CREDIT_ADVICE =
-  "Claude Code is billing an API key, an Anthropic Console account or a Claude account " +
-  "without a paid plan. ccc needs a Pro or Max plan: run `claude`, `/logout`, then `/login` " +
-  "and choose \"Claude account with subscription\".";
+  "Claude Code is billing an Anthropic API account (a Console sign-in, an API key, or a " +
+  "Claude account without Pro or Max), and it has no credit left. Your MemTree credit covers " +
+  "MemTree, not Claude itself. To use Claude Pro or Max instead, run /login in Claude Code and " +
+  "choose \"Claude account with subscription\" (no plan yet? https://claude.ai/upgrade).";
 const CREDIT_TEXT =
   `Anthropic refused Claude Code's request: credit balance too low. ${CREDIT_ADVICE}`;
 const CREDIT_ENV_HINT =
-  " If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it beats `/login`.";
+  " If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it beats /login.";
 
 /** The file in ccc's config directory holding the last sign-in type Claude Code sent. */
 export const SEEN_AUTH_FILE = "claude-auth-seen";
@@ -49,7 +47,9 @@ export const CREDIT_REFUSED_FILE = "claude-credit-refused";
 const CREDIT_REMINDER_LEAD = "Last time, Anthropic refused Claude Code's requests: credit " +
   "balance too low. ";
 
-const PAID_PLANS: readonly ClaudePlan[] = ["pro", "max", "max_5x", "max_20x", "team", "enterprise"];
+export const PAID_PLANS: readonly ClaudePlan[] = [
+  "pro", "max", "max_5x", "max_20x", "team", "enterprise",
+];
 const SEEN_TYPES: readonly ClaudeAuthType[] = ["subscription", "api_key"];
 const CLOUD_AUTH: readonly ClaudeAuthType[] = ["bedrock", "vertex", "foundry"];
 
@@ -110,18 +110,6 @@ export function creditAdviceText(color: boolean, source?: ApiKeySource): string 
   return color ? `\x1b[33m${text}\x1b[39m` : text;
 }
 
-/**
- * The line when an API key beats a Claude.ai login that is on file (stderr,
- * like the no-plan line). Returns whether it was printed.
- */
-export function printApiKeyOverrideWarning(
-  override: ApiKeyOverride | undefined, subscriptionLogin: boolean, color: boolean
-): boolean {
-  if (!override || !subscriptionLogin) return false;
-  process.stderr.write(`${apiKeyOverrideText(override, color)}\n`);
-  return true;
-}
-
 export function apiKeyOverrideText(override: ApiKeyOverride, color: boolean): string {
   const text = override.source === "apiKeyHelper"
     ? "Claude Code's settings set an apiKeyHelper, so Claude Code bills that API key instead " +
@@ -136,11 +124,11 @@ export function apiKeyOverrideText(override: ApiKeyOverride, color: boolean): st
 
 function creditSourceHint(source: ApiKeySource | undefined): string {
   if (source === "apiKeyHelper") {
-    return " Claude Code's settings set an apiKeyHelper, and it beats `/login`: remove it " +
+    return " Claude Code's settings set an apiKeyHelper, and it beats /login: remove it " +
       "from settings.json.";
   }
   if (source) {
-    return ` ${source} is set, and it beats \`/login\`: unset it (or run \`ccc\` without it).`;
+    return ` ${source} is set, and it beats /login: unset it (or run \`ccc\` without it).`;
   }
   return CREDIT_ENV_HINT;
 }
@@ -155,47 +143,6 @@ export interface CreditReminderInput {
 /** True when an earlier session was refused for credit and no paid tier is on record yet. */
 export function needsCreditReminder(input: CreditReminderInput): boolean {
   return input.refused && !PAID_PLANS.includes(input.plan);
-}
-
-export interface StartupSignInInput extends CreditReminderInput {
-  signIn: PlanWarningInput;
-  /** An API key that beats the user's `/login` (claude-auth.ts apiKeyOverride). */
-  override: ApiKeyOverride | undefined;
-  color: boolean;
-}
-
-/**
- * The sign-in lines before Claude Code starts: a remembered credit refusal's
- * advice (naming the overriding key, so the override line would repeat it),
- * else the no-plan line, plus the override line. `warned` is whether a
- * no-plan or credit line is among them.
- */
-export function startupSignInLines(
-  input: StartupSignInInput
-): { lines: string[]; warned: boolean } {
-  const { override, color } = input;
-  // Bedrock, Vertex and Foundry bill elsewhere: an Anthropic refusal no longer applies.
-  if (CLOUD_AUTH.includes(input.signIn.auth)) return { lines: [], warned: false };
-  if (needsCreditReminder(input)) {
-    // A key the user may decline at Claude Code's question isn't named (as at exit).
-    const source = override?.asks ? undefined : override?.source;
-    const text = `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
-    return { lines: [color ? `\x1b[33m${text}\x1b[39m` : text], warned: true };
-  }
-  const lines: string[] = [];
-  const warned = needsPlanWarning(input.signIn);
-  if (warned) lines.push(noPlanWarningText(color));
-  if (override && input.signIn.subscriptionLogin === true) {
-    lines.push(apiKeyOverrideText(override, color));
-  }
-  return { lines, warned };
-}
-
-/** startupSignInLines on stderr (stdout stays Claude Code's); returns `warned`. */
-export function printStartupSignInLines(input: StartupSignInInput): boolean {
-  const { lines, warned } = startupSignInLines(input);
-  for (const line of lines) process.stderr.write(`${line}\n`);
-  return warned;
 }
 
 /**
@@ -218,21 +165,6 @@ export class CreditRefusalMemory {
   answered(): void {
     if (creditRefusedOnFile(this.configDir)) clearCreditRefused(this.configDir);
   }
-}
-
-export function noPlanWarningText(color: boolean): string {
-  return color ? `\x1b[33m${NO_PLAN_TEXT}\x1b[39m` : NO_PLAN_TEXT;
-}
-
-/**
- * The line on stderr when it applies: stdout stays Claude Code's in print
- * runs, and in a terminal stderr shows above the session just the same.
- * Returns whether it was printed.
- */
-export function printNoPlanWarning(input: PlanWarningInput, color: boolean): boolean {
-  if (!needsPlanWarning(input)) return false;
-  process.stderr.write(`${noPlanWarningText(color)}\n`);
-  return true;
 }
 
 /** The last sign-in type Claude Code's requests showed, or undefined. */
@@ -276,6 +208,11 @@ export function clearCreditRefused(configDir: string): void {
 
 export function creditRefusedOnFile(configDir: string): boolean {
   return fs.existsSync(path.join(configDir, CREDIT_REFUSED_FILE));
+}
+
+/** Before the first prompt: an earlier session's credit refusal and its advice (uncoloured). */
+export function creditReminderText(source: ApiKeySource | undefined): string {
+  return `${CREDIT_REMINDER_LEAD}${creditAdviceBody(source)}`;
 }
 
 /** The credit advice after its "Anthropic refused…" sentence, with the source hint. */

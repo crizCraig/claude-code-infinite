@@ -91,24 +91,6 @@ test("interactive: ANTHROPIC_API_KEY is used once approved, asked when new, not 
     { source: "ANTHROPIC_AUTH_TOKEN", asks: false });
 });
 
-test("the line is printed only when a Claude.ai login is on file too", () => {
-  const script = [
-    "import { printApiKeyOverrideWarning } from './dist/claude-plan-warning.js';",
-    "const o = { source: 'ANTHROPIC_API_KEY', asks: false };",
-    "const out = (v) => process.stdout.write(`${v}\\n`);",
-    "out(printApiKeyOverrideWarning(o, false, false));",
-    "out(printApiKeyOverrideWarning(undefined, true, false));",
-    "out(printApiKeyOverrideWarning(o, true, false));",
-  ].join("\n");
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    encoding: "utf8", cwd: new URL("..", import.meta.url),
-  });
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, "false\nfalse\ntrue\n", "stdout stays Claude Code's in print runs");
-  assert.equal(r.stderr, `${apiKeyOverrideText({ source: "ANTHROPIC_API_KEY", asks: false },
-    false)}\n`);
-});
-
 test("credit balance too low: the plan advice for every sign-in type", () => {
   for (const auth of ["api_key", "subscription", "unknown", undefined]) {
     assert.equal(creditAdviceApplies(auth, "unknown"), true, String(auth));
@@ -123,23 +105,20 @@ test("credit balance too low: the plan advice for every sign-in type", () => {
 
 test("credit advice: Console sign-in, the plan login, and the env variable case", () => {
   const generic = creditNoticeText(false);
-  assert.equal(generic,
+  const lead =
     "Anthropic refused Claude Code's request: credit balance too low. Claude Code is billing " +
-    "an API key, an Anthropic Console account or a Claude account without a paid plan. ccc " +
-    "needs a Pro or Max plan: run `claude`, `/logout`, then `/login` and choose \"Claude " +
-    "account with subscription\". If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it too: it " +
-    "beats `/login`.");
+    "an Anthropic API account (a Console sign-in, an API key, or a Claude account without Pro " +
+    "or Max), and it has no credit left. Your MemTree credit covers MemTree, not Claude itself. " +
+    "To use Claude Pro or Max instead, run /login in Claude Code and choose \"Claude account " +
+    "with subscription\" (no plan yet? https://claude.ai/upgrade).";
+  assert.equal(generic, `${lead} If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set, unset it ` +
+    "too: it beats /login.");
   assert.equal(creditNoticeText(false, "ANTHROPIC_API_KEY"),
-    "Anthropic refused Claude Code's request: credit balance too low. Claude Code is billing " +
-    "an API key, an Anthropic Console account or a Claude account without a paid plan. ccc " +
-    "needs a Pro or Max plan: run `claude`, `/logout`, then `/login` and choose \"Claude " +
-    "account with subscription\". ANTHROPIC_API_KEY is set, and it beats `/login`: unset it (or run `ccc` " +
-    "without it).");
+    `${lead} ANTHROPIC_API_KEY is set, and it beats /login: unset it (or run \`ccc\` without it).`);
   assert.match(creditNoticeText(false, "apiKeyHelper"), /settings set an apiKeyHelper.*remove/);
   assert.match(creditNoticeText(true), /^\x1b\[33m.*\x1b\[39m$/);
   assert.doesNotMatch(generic, /\n/);
 });
-
 test("diagnostics: env_api_key_set is a boolean, from the variables' names only", () => {
   assert.equal(envApiKeySet({ ANTHROPIC_API_KEY: KEY }), true);
   assert.equal(envApiKeySet({ ANTHROPIC_AUTH_TOKEN: "t" }), true);

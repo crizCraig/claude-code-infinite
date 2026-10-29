@@ -1,0 +1,72 @@
+# ccc's sign-in check against a REAL, freshly installed Claude Code on every OS:
+# `claude auth status --json` (src/claude-auth-status.ts) with (a) no sign-in, (b) an
+# API key in the environment, (c) a fake Claude subscription in .credentials.json.
+# Each state uses its own empty CLAUDE_CONFIG_DIR. No secrets; diagnostics off.
+name: Sign-in check e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/claude-auth.ts
+      - src/claude-auth-status.ts
+      - src/sign-in-notice.ts
+      - test/claude-auth-status-e2e.test.mjs
+      - .github/workflows/sign-in-check-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-in-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: sign-in check / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    env:
+      CCC_NO_DIAGNOSTICS: "1"
+    steps:
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # Anthropic's official installers (what ccc's install offer runs).
+      - name: Install Claude Code (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://claude.ai/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install Claude Code (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: claude --version
+
+      - name: Probe each sign-in state
+        run: node --test test/claude-auth-status-e2e.test.mjs
+        env:
+          CCC_E2E_CLAUDE: "1"

@@ -71,7 +71,12 @@ export const INSTALL_METHODS = [
 
 /** claude-auth.ts and claude-locate.ts (kept here so the schema has no imports). */
 export const CLAUDE_AUTH_TYPES = [
-  "subscription", "api_key", "bedrock", "vertex", "foundry", "unknown",
+  "subscription", "api_key", "bedrock", "vertex", "foundry", "none", "unknown",
+] as const;
+/** claude-auth-status.ts AUTH_PROBE_RESULTS and sign-in-notice.ts SIGN_IN_WARNING_KINDS. */
+export const AUTH_PROBE_RESULTS = ["ok", "failed", "timeout", "unsupported"] as const;
+export const SIGN_IN_WARNING_KINDS = [
+  "not_signed_in", "api_billing", "unknown", "credit_reminder", "key_override",
 ] as const;
 export const CLAUDE_PLANS = [
   "free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown",
@@ -205,8 +210,9 @@ export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
   key_status: { result: oneOf(["ok", "invalid", "payment_required", "unknown"]), status: STATUS },
   payment_gate: { choice: oneOf(["subscribe", "continue", "quit", "paid", "still_unpaid"]) },
   session_start: { source: oneOf(["startup", "resume", "clear", "compact", "other"]) },
+  /** since_warning_ms: from this launch's sign-in warning, when one was shown. */
   first_request: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
-                   request_kb: KB },
+                   request_kb: KB, since_warning_ms: MS },
   first_turn: { status: STATUS, turn_type: oneOf(TURN_TYPES), ttfb_ms: MS, total_ms: MS,
                 request_kb: KB },
   /** The first human turn Anthropic answered with a 2xx (first_turn is the first attempt). */
@@ -243,8 +249,20 @@ export const EVENT_FIELDS: Record<string, Record<string, Validator>> = {
   rate_limit: { kind: oneOf(RATE_LIMIT_KINDS), status: STATUS },
   /** Windows: ccc got SIGHUP, i.e. its console window was closed (Claude Code then exits 129). */
   console_closed: {},
-  /** The "no Claude plan" line was shown (claude-plan-warning.ts), by sign-in type. */
-  no_plan_warning: { auth: oneOf(CLAUDE_AUTH_TYPES) },
+  /**
+   * A sign-in warning was shown (sign-in-notice.ts): by sign-in type, which message, and
+   * how long ccc waited for Enter (not signed in, in a terminal).
+   */
+  no_plan_warning: { auth: oneOf(CLAUDE_AUTH_TYPES), kind: oneOf(SIGN_IN_WARNING_KINDS),
+                     waited_ms: MS },
+  /** `claude auth status --json` at launch (claude-auth-status.ts): how it went. */
+  claude_auth_probe: { result: oneOf(AUTH_PROBE_RESULTS), ms: MS },
+  /**
+   * Claude Code went from not signed in (or API billing, or unknown) to a Claude login:
+   * seen at a later launch or by a request's auth header; ms since ccc's warning.
+   */
+  sign_in_completed: { from: oneOf(CLAUDE_AUTH_TYPES), auth: oneOf(CLAUDE_AUTH_TYPES),
+                       where: oneOf(["between_starts", "mid_session"]), since_warning_ms: MS },
   error: { code: oneOf(ERROR_CODES), errno: oneOf(ERRNOS),
            error_name: oneOf(ERROR_NAMES) },
 };
