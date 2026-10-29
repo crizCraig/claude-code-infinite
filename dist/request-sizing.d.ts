@@ -57,6 +57,8 @@ export declare class RequestSizing {
     /** Whether this body could still get an exact count: counting is on and
      * no attempt for these bytes has completed (a failed one is reused). */
     canCount(candidate: RequestCandidate): boolean;
+    /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
+    canRetryCount(candidate: RequestCandidate): boolean;
     /** Whether Anthropic would refuse this body's size (413) before reading it. */
     exceedsRequestLimit(candidate: RequestCandidate): boolean;
     /** Whether the conservative bound alone admits this body under `limits`. */

@@ -56,6 +56,8 @@ export const NOT_COMPRESSED_NOTE = "/memtree-compact to compact session";
 /** @deprecated Present only to recognize old notice copy in callers/tests. */
 export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE = "⚠ MemTree degraded — this turn ran uncompressed";
+/** Repeated refusals of one lane while MemTree is slow (RefusalStreaks): Claude Code retries. */
+export const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
 export const PAYMENT_REQUIRED_NOTICE = "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export const SLOW_FIRST_TOKEN_NOTICE = "✨ Something special is happening — please wait…";
 export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";

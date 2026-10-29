@@ -61,6 +61,11 @@ export type TurnType = "first-user" | "tool"
  */
  | "followup-no-flatten" | "followup-degraded"
 /**
+ * A degraded turn ccc refused instead of forwarding (forwardedBytes 0): its
+ * whole history did not fit, so Claude Code retries it (route-fallback.ts).
+ */
+ | "followup-refused"
+/**
  * A fork of the main conversation (the away recap) rode the main thread's
  * last compressed prefix: same bytes the main thread sent, so Anthropic's
  * prompt cache hits, and no MemTree call was made.
@@ -135,10 +140,14 @@ export interface MessagesRecord {
     approxInputTokens?: number;
     /**
      * A failed compress on a visible turn: "shown" queued the degraded notice
-     * (the turn needed compression); "quiet-under-budget" did not, because the
-     * turn fit its budget and went out exactly as MemTree would have sent it.
+     * (the turn needed compression and its whole history went out);
+     * "quiet-under-budget" did not, because the turn fit its budget and went out
+     * exactly as MemTree would have sent it. Neither on a refused turn
+     * (followup-refused) or one delivery sent on a compressed ride.
      */
     degradedNotice?: "shown" | "quiet-under-budget";
+    /** This refusal queued the "MemTree is slow to answer; retrying" notice. */
+    slowRetryNotice?: true;
     /** Present when a blocking MemTree compress was attempted for this turn. */
     compress?: {
         /** Overall wall time of the compress step (all concurrent legs). */

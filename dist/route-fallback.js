@@ -132,4 +132,48 @@ function refusal(attempt) {
         },
     };
 }
+/** Refusals of one lane further apart than this start a new streak. */
+export const SLOW_RETRY_WINDOW_MS = 5 * 60_000;
+/** Consecutive refusals in a streak before the "slow to answer" notice. */
+export const SLOW_RETRY_NOTICE_AFTER = 2;
+/**
+ * Consecutive refusals per lane, for the notice that MemTree is slow to
+ * answer. One refusal says nothing to the user (Claude Code retries it, and
+ * the retry usually goes through); a repeat within SLOW_RETRY_WINDOW_MS
+ * does, once per streak. A delivery ends the streak.
+ */
+export class RefusalStreaks {
+    capacity;
+    windowMs;
+    lanes = new Map();
+    constructor(capacity = 128, windowMs = SLOW_RETRY_WINDOW_MS) {
+        this.capacity = capacity;
+        this.windowMs = windowMs;
+    }
+    /**
+     * Note a refusal of `lane`; true the one time its streak should show the
+     * notice. A refusal that cannot show it (`canNotice` false) still counts
+     * and leaves the notice to a later one of the streak.
+     */
+    refused(lane, now = Date.now(), canNotice = true) {
+        const prior = this.lanes.get(lane);
+        const streak = prior && now - prior.at <= this.windowMs
+            ? prior : { count: 0, at: now, noticed: false };
+        streak.count += 1;
+        streak.at = now;
+        this.lanes.delete(lane);
+        if (this.capacity > 0) {
+            while (this.lanes.size >= this.capacity)
+                this.lanes.delete(this.lanes.keys().next().value);
+            this.lanes.set(lane, streak);
+        }
+        if (!canNotice || streak.noticed || streak.count < SLOW_RETRY_NOTICE_AFTER)
+            return false;
+        streak.noticed = true;
+        return true;
+    }
+    delivered(lane) {
+        this.lanes.delete(lane);
+    }
+}
 //# sourceMappingURL=route-fallback.js.map

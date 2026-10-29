@@ -40,7 +40,7 @@ export declare const AUTO_UPDATE_RESULTS: readonly ["started", "locked", "not-pl
 /** auto-update.ts SKIP_CODES. */
 export declare const AUTO_UPDATE_REASONS: readonly ["disabled", "not-release", "linked-install", "install-method", "backoff", "max-attempts", "lock-held"];
 export declare const TERMINALS: readonly ["Apple_Terminal", "iTerm.app", "vscode", "WezTerm", "ghostty", "WarpTerminal", "tmux", "Hyper", "Tabby", "alacritty", "kitty", "cursor", "zed", "JetBrains-JediTerm", "rio", "Windows_Terminal", "mintty", "konsole", "gnome-terminal", "none", "other"];
-export declare const TURN_TYPES: readonly ["first-user", "tool", "tool-memory", "tool-prefix", "tool-recompressed", "followup-compressed", "followup-prefix", "followup-noop", "followup-empty-memory", "followup-no-flatten", "followup-degraded", "fork-memory", "side-request", "foreign", "followup-client-closed", "unparseable", "other"];
+export declare const TURN_TYPES: readonly ["first-user", "tool", "tool-memory", "tool-prefix", "tool-recompressed", "followup-compressed", "followup-prefix", "followup-noop", "followup-empty-memory", "followup-no-flatten", "followup-degraded", "followup-refused", "fork-memory", "side-request", "foreign", "followup-client-closed", "unparseable", "other"];
 export type DiagnosticsFields = Record<string, string | number | boolean>;
 export interface DiagnosticsEvent extends DiagnosticsFields {
     name: string;
