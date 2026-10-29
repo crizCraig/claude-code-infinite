@@ -6,7 +6,7 @@
 // keychain, so (c) is only asserted off macOS).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { locateClaude } from "../dist/claude-locate.js";
@@ -28,11 +28,12 @@ function freshEnv(extra = {}) {
   return { dir, env: { ...env, CLAUDE_CONFIG_DIR: dir, ...extra } };
 }
 
-async function probe(env) {
+async function probe(env, command) {
   const claude = locateClaude({ env: process.env });
   assert.ok(claude, "Claude Code is installed");
   // A cold first start on a Windows runner can be slow.
-  const result = await probeClaudeAuthStatus(claude.command, { env, timeoutMs: 60_000 });
+  const result = await probeClaudeAuthStatus(command ?? claude.command,
+    { env, timeoutMs: 60_000 });
   console.log(`probe (${claude.source}): ${JSON.stringify(result)}`);
   return result;
 }
@@ -88,4 +89,74 @@ test("(c) a Claude subscription in .credentials.json (Linux and Windows)",
     const notice = signInNotice({ probe: result, fallback: fallbackFor(env), creditRefused: false,
       override: undefined, color: false });
     assert.equal(notice, undefined);
+  });
+
+const FAKE_PLAN = () => JSON.stringify({ claudeAiOauth: {
+  accessToken: "sk-ant-oat01-e2e-fake", refreshToken: "sk-ant-ort01-e2e-fake",
+  expiresAt: Date.now() + 365 * 24 * 3600 * 1000,
+  scopes: ["user:inference", "user:profile", "user:sessions:claude_code"],
+  subscriptionType: "pro",
+} });
+
+// Several Windows users who never got past the warning had Cyrillic or Portuguese names
+// (C:\Users\Максим...). Both checks must read a home folder named like that.
+test("(d) a non-ASCII home folder (HOME and USERPROFILE), no CLAUDE_CONFIG_DIR",
+  { skip: !enabled }, async () => {
+    const home = join(mkdtempSync(join(tmpdir(), "ccc-e2e-home-")), "Максим João");
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const { env } = freshEnv({ HOME: home, USERPROFILE: home });
+    delete env.CLAUDE_CONFIG_DIR;
+    const signedOut = await probe(env);
+    assert.equal(signedOut.result, "ok");
+    assert.equal(signedOut.status.auth, "none");
+    writeFileSync(join(home, ".claude", ".credentials.json"), FAKE_PLAN());
+    assert.equal(claudeSubscriptionLogin({ env, homedir: home }), true);
+    const signedIn = await probe(env);
+    assert.equal(signedIn.result, "ok");
+    if (process.platform === "darwin") return; // the keychain on macOS
+    assert.equal(signedIn.status.auth, "subscription");
+    assert.equal(signedIn.status.plan, "pro");
+  });
+
+test("(e) Claude Code itself under a non-ASCII folder, run by full path",
+  { skip: !enabled }, async () => {
+    const claude = locateClaude({ env: process.env });
+    assert.ok(claude);
+    const found = claude.dir ? join(claude.dir, claude.command.split(/[\\/]/).pop())
+      : claude.command;
+    const real = realpathSync(claude.command === "claude" ? whichClaude() : found);
+    const dir = join(mkdtempSync(join(tmpdir(), "ccc-e2e-bin-")), "Программы Ação");
+    mkdirSync(dir, { recursive: true });
+    const copy = join(dir, real.split(/[\\/]/).pop());
+    copyFileSync(real, copy);
+    if (process.platform !== "win32") (await import("node:fs")).chmodSync(copy, 0o755);
+    const { env } = freshEnv();
+    const result = await probe(env, copy);
+    assert.equal(result.result, "ok");
+    assert.equal(result.status.auth, "none");
+  });
+
+function whichClaude() {
+  const exts = process.platform === "win32" ? [".exe"] : [""];
+  for (const dir of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) {
+    for (const ext of exts) {
+      const file = join(dir, `claude${ext}`);
+      try {
+        if (realpathSync(file)) return file;
+      } catch {
+        // not here
+      }
+    }
+  }
+  throw new Error("no native claude binary on PATH");
+}
+
+// npm's claude.cmd shim (cmd.exe) in a non-ASCII prefix: how cross-spawn runs a .cmd.
+const shim = process.env.CCC_E2E_CLAUDE_SHIM;
+test("(f) Windows: npm's claude.cmd shim in a non-ASCII folder", { skip: !enabled || !shim },
+  async () => {
+    const { env } = freshEnv();
+    const result = await probe(env, shim);
+    assert.equal(result.result, "ok");
+    assert.equal(result.status.auth, "none");
   });

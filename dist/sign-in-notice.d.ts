@@ -49,7 +49,7 @@ export declare function signInNotice(input: SignInNoticeInput): SignInNotice | u
 /** The lines on stderr (stdout stays Claude Code's in print runs). */
 export declare function printSignInNotice(notice: SignInNotice): void;
 export interface PresentOptions {
-    /** A terminal on both ends that Claude Code's TUI will take over. */
+    /** A terminal on both ends that Claude Code's TUI will take over, stderr included. */
     interactive: boolean;
     /** The sign-in type for the diagnostics event. */
     auth: ClaudeAuthType;
@@ -113,4 +113,6 @@ export declare class SignInTracker {
 }
 /** The API-billing message, naming the env variable or setting when one is known. */
 export declare function apiBillingText(source: ApiKeySource | undefined, asks: boolean): string;
+/** A claude.ai account on the free plan: Claude Code bills it like an API account. */
+export declare const FREE_PLAN_TEXT: string;
 //# sourceMappingURL=sign-in-notice.d.ts.map

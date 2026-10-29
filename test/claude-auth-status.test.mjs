@@ -55,8 +55,20 @@ test("API keys: env, apiKeyHelper and the Console sign-in", () => {
 test("an OAuth token from the environment: setup-token is a plan, ANTHROPIC_AUTH_TOKEN a key", () => {
   const out = JSON.stringify({ loggedIn: true, authMethod: "oauth_token", apiProvider: "firstParty" });
   assert.equal(parseAuthStatus(out, { CLAUDE_CODE_OAUTH_TOKEN: "t" }).auth, "subscription");
+  // A host-provided token, a token file or a profile login: no env variable, still a login.
+  assert.equal(parseAuthStatus(out, {}).auth, "subscription");
+  // ANTHROPIC_AUTH_TOKEN wins in Claude Code even beside a setup-token.
+  assert.equal(parseAuthStatus(out, { ANTHROPIC_AUTH_TOKEN: "t", CLAUDE_CODE_OAUTH_TOKEN: "u" })
+    .auth, "api_key");
   assert.deepEqual(parseAuthStatus(out, { ANTHROPIC_AUTH_TOKEN: "t" }),
     { auth: "api_key", plan: "unknown", console: false, keySource: "ANTHROPIC_AUTH_TOKEN" });
+});
+
+test("non-ASCII paths, a notice line before the JSON, and replacement characters", () => {
+  const out = "Claude Code has switched from npm to the native installer.\n" + JSON.stringify({
+    ...SIGNED_OUT, configDirectory: "C:\\Users\\Максим João\\.claude",
+    projectsDirectory: "C:\\Users\\M\uFFFD\uFFFDsim\\.claude\\projects" });
+  assert.equal(parseAuthStatus(out, {}).auth, "none");
 });
 
 test("cloud providers, unknown methods and non-JSON", () => {
@@ -67,6 +79,9 @@ test("cloud providers, unknown methods and non-JSON", () => {
   assert.equal(parseAuthStatus(JSON.stringify(
     { loggedIn: true, authMethod: "something_new", apiProvider: "firstParty" }), {}).auth,
   "unknown");
+  // A signed-out cloud gateway is not "no Claude plan".
+  assert.equal(parseAuthStatus(JSON.stringify(
+    { loggedIn: false, authMethod: "none", apiProvider: "gateway" }), {}).auth, "unknown");
   assert.equal(parseAuthStatus("error: unknown command 'auth'", {}), undefined);
   assert.equal(parseAuthStatus("{ not json", {}), undefined);
   assert.equal(parseAuthStatus(JSON.stringify({ loggedIn: "yes" }), {}), undefined);

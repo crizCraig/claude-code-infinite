@@ -72,7 +72,10 @@ test("API billing is said without blocking, and repeated inside Claude Code", ()
   assert.match(asks.lines[0], /if Claude Code asks whether to use it, Yes bills.*answer No/);
   assert.match(apiBillingText("apiKeyHelper", false), /remove apiKeyHelper from settings\.json/);
   // A free Claude account bills like an API account.
-  assert.equal(signInNotice(input(ok("subscription", "free"))).kind, "api_billing");
+  const free = signInNotice(input(ok("subscription", "free")));
+  assert.equal(free.kind, "api_billing");
+  assert.match(free.lines[0], /Claude account without Pro or Max.*claude\.ai\/upgrade/);
+  assert.doesNotMatch(free.lines[0], /Console/);
 });
 
 test("a key that beats a Claude login on file gets the override line, not API billing", () => {
@@ -229,6 +232,46 @@ test("signed in during the session: the first request's sign-in reports it", () 
     undefined);
 });
 
+test("from unknown (Claude Code couldn't be asked) nothing is reported; warnedAt survives", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-signin-unknown-"));
+  let t = 1000;
+  const events = [];
+  const a = new SignInTracker(dir, (e) => events.push(e), () => t);
+  a.warned(); // no probe answer: state "unknown"
+  a.requestAuth("subscription");
+  assert.deepEqual(events, [], "a subscriber whose probe failed did not just sign in");
+  const dir2 = mkdtempSync(join(tmpdir(), "ccc-signin-keep-"));
+  const b = new SignInTracker(dir2, (e) => events.push(e), () => t);
+  b.started("none");
+  b.warned();
+  b.requestAuth("api_key"); // reported (from none), and the warning time is kept
+  assert.equal(readSignInState(dir2).warnedAt, 1000);
+  t = 9000;
+  new SignInTracker(dir2, (e) => events.push(e), () => t).started("subscription");
+  // A new process: the later switch from API billing to a plan is its own report, timed.
+  assert.deepEqual(events.map((e) => [e.where, e.from, e.since_warning_ms]),
+    [["mid_session", "none", 0], ["between_starts", "api_key", 8000]]);
+  assert.equal(readSignInState(dir2).warnedAt, undefined);
+});
+
+test("a key that beats a plan login is printed but not recorded as a sign-in warning", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-override-"));
+  const events = [];
+  const notice = signInNotice(input(ok("api_key", "unknown", { keySource: "ANTHROPIC_AUTH_TOKEN" }),
+    { override: { source: "ANTHROPIC_AUTH_TOKEN", asks: false },
+      fallback: { auth: "api_key", plan: "unknown", subscriptionLogin: true } }));
+  const write = process.stderr.write;
+  process.stderr.write = () => true;
+  try {
+    assert.equal(await presentSignInNotice(notice, { interactive: true, auth: "api_key",
+      record: (n) => events.push(n), tracker: new SignInTracker(dir, () => {}) }), true);
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.deepEqual(events, []);
+  assert.equal(readSignInState(dir), undefined);
+});
+
 test("the state file holds a type name and a time only, and bad files are ignored", () => {
   const dir = mkdtempSync(join(tmpdir(), "ccc-signin-file-"));
   const tracker = new SignInTracker(dir, () => {}, () => 42);
@@ -237,6 +280,8 @@ test("the state file holds a type name and a time only, and bad files are ignore
   assert.deepEqual(JSON.parse(readFileSync(join(dir, SIGN_IN_STATE_FILE), "utf8")),
     { auth: "api_key", warnedAt: 42 });
   writeFileSync(join(dir, SIGN_IN_STATE_FILE), "not json");
+  assert.equal(readSignInState(dir), undefined);
+  writeFileSync(join(dir, SIGN_IN_STATE_FILE), '{"auth":"sk-ant-oat01-x"}');
   assert.equal(readSignInState(dir), undefined);
   new SignInTracker(join(dir, "no", "such"), () => {}).started("none"); // never throws
 });

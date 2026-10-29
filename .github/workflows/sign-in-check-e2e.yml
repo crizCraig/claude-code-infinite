@@ -1,6 +1,8 @@
 # ccc's sign-in check against a REAL, freshly installed Claude Code on every OS:
 # `claude auth status --json` (src/claude-auth-status.ts) with (a) no sign-in, (b) an
-# API key in the environment, (c) a fake Claude subscription in .credentials.json.
+# API key in the environment, (c) a fake Claude subscription in .credentials.json, plus
+# non-ASCII home and install folders (and npm's .cmd shim on Windows). Code paths only: a
+# runner has no real browser sign-in to a Claude account.
 # Each state uses its own empty CLAUDE_CONFIG_DIR. No secrets; diagnostics off.
 name: Sign-in check e2e
 
@@ -65,6 +67,15 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - run: claude --version
+
+      # Windows also gets npm's claude.cmd shim under a Cyrillic/Portuguese folder.
+      - name: Install Claude Code's npm shim in a non-ASCII prefix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "Пакеты João"
+          npm install -g @anthropic-ai/claude-code --prefix "$prefix"
+          "CCC_E2E_CLAUDE_SHIM=$(Join-Path $prefix 'claude.cmd')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Probe each sign-in state
         run: node --test test/claude-auth-status-e2e.test.mjs

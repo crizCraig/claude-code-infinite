@@ -57,13 +57,16 @@ export function parseAuthStatus(stdout, env = process.env) {
     const keySource = apiKeySource(json.apiKeySource);
     const consoleLogin = json.apiKeySource === "/login managed key";
     const base = { console: consoleLogin, ...(keySource ? { keySource } : {}) };
-    if (!json.loggedIn)
-        return { auth: "none", plan: "unknown", ...base };
+    // A signed-out cloud gateway is not "no Claude plan": ccc can't tell, so it doesn't say.
+    if (!json.loggedIn) {
+        return json.apiProvider === "firstParty" || json.apiProvider === undefined
+            ? { auth: "none", plan: "unknown", ...base } : { auth: "unknown", plan: "unknown", ...base };
+    }
     const cloud = cloudProvider(json.apiProvider);
     if (cloud)
         return { auth: cloud, plan: "unknown", ...base };
-    if (json.authMethod === "oauth_token" && !nonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN)) {
-        // ANTHROPIC_AUTH_TOKEN: a bearer key, billed like one.
+    if (json.authMethod === "oauth_token" && nonEmpty(env.ANTHROPIC_AUTH_TOKEN)) {
+        // ANTHROPIC_AUTH_TOKEN wins over every other token in Claude Code: a bearer key.
         return { auth: "api_key", plan: "unknown", ...base, keySource: "ANTHROPIC_AUTH_TOKEN" };
     }
     return { ...authFromMethod(json.authMethod, json.subscriptionType), ...base };
@@ -91,7 +94,7 @@ function authFromMethod(method, subscriptionType) {
     const type = typeof subscriptionType === "string" ? subscriptionType : undefined;
     if (method === "claude.ai")
         return { auth: "subscription", plan: planFrom(type, undefined) };
-    // CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`), which only a Claude plan can make.
+    // setup-token, a host-provided token, a token file or a profile login: a Claude login.
     if (method === "oauth_token")
         return { auth: "subscription", plan: "unknown" };
     if (method === "api_key" || method === "api_key_helper") {

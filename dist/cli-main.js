@@ -258,7 +258,8 @@ async function showSignInNotice(probe, applies, ctx) {
     const auth = status && status.auth !== "unknown"
         ? status.auth : ctx.claudeSignIn.seen ?? ctx.claudeSignIn.auth;
     const go = await presentSignInNotice(notice, {
-        interactive: ctx.interactive, auth, tracker: ctx.tracker,
+        // The prompt is on stderr: never wait where it can't be seen (`ccc 2>log`).
+        interactive: ctx.interactive && process.stderr.isTTY === true, auth, tracker: ctx.tracker,
         record: (name, fields) => ctx.diagnostics.record(name, fields),
     });
     if (!go) {
@@ -409,7 +410,8 @@ async function main() {
     }
     // Claude Code's own answer to "signed in?" (sign-in-notice.ts), run while
     // the key is checked; awaited (bounded) just before the sign-in message.
-    const authProbe = probeClaudeAuthStatus(claude.command);
+    // Not for --version/--help-style runs, which start no session and show no message.
+    const authProbe = isInfoOnlyRun(claudeArgs) ? null : probeClaudeAuthStatus(claude.command);
     if (isDebugMode)
         console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
     if (!polychatApiKey) {
@@ -627,11 +629,11 @@ async function main() {
     // first prompt (stderr), and when not signed in, held until Enter so it is read.
     // Not right after ccc installed Claude Code: it has just said Claude Code asks to sign in.
     const probe = await authProbe;
-    signInSessionLine.text = await showSignInNotice(probe, found !== undefined
-        && !isInfoOnlyRun(claudeArgs), {
-        claudeSignIn, creditRefused: creditMemory.refusedAtStart, override: keyOverride,
-        interactive: interactiveUi, diagnostics, tracker: signInTracker,
-    });
+    if (probe)
+        signInSessionLine.text = await showSignInNotice(probe, found !== undefined, {
+            claudeSignIn, creditRefused: creditMemory.refusedAtStart, override: keyOverride,
+            interactive: interactiveUi, diagnostics, tracker: signInTracker,
+        });
     reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
     // The first request after a resume must count the whole session's thinking.
     const resumedSession = resumeSessionId(claudeArgs);

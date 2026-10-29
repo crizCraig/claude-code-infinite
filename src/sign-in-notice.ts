@@ -21,6 +21,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import type { AuthProbe } from "./claude-auth-status.js";
 import type { ApiKeyOverride, ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
+import { CLAUDE_AUTH_TYPES } from "./claude-auth.js";
 import {
   apiKeyOverrideText,
   creditReminderText,
@@ -96,7 +97,7 @@ export function printSignInNotice(notice: SignInNotice): void {
 }
 
 export interface PresentOptions {
-  /** A terminal on both ends that Claude Code's TUI will take over. */
+  /** A terminal on both ends that Claude Code's TUI will take over, stderr included. */
   interactive: boolean;
   /** The sign-in type for the diagnostics event. */
   auth: ClaudeAuthType;
@@ -113,6 +114,8 @@ export async function presentSignInNotice(
   notice: SignInNotice, opts: PresentOptions
 ): Promise<boolean> {
   printSignInNotice(notice);
+  // A subscriber whose key beats their login has a plan: not a sign-in warning (as before).
+  if (notice.kind === "key_override") return true;
   opts.tracker.warned();
   const waited = notice.pause && opts.interactive
     ? await (opts.wait ?? (() => waitForEnter(process.stdin, process.stderr)))()
@@ -157,6 +160,7 @@ export function readSignInState(configDir: string): SignInState | undefined {
     const raw = JSON.parse(fs.readFileSync(path.join(configDir, SIGN_IN_STATE_FILE), "utf8"));
     if (typeof raw?.auth !== "string") return undefined;
     const warnedAt = Number.isFinite(raw.warnedAt) ? { warnedAt: raw.warnedAt as number } : {};
+    if (!(CLAUDE_AUTH_TYPES as readonly string[]).includes(raw.auth)) return undefined;
     return { auth: raw.auth as ClaudeAuthType, ...warnedAt };
   } catch {
     return undefined;
@@ -201,7 +205,8 @@ export class SignInTracker {
   /** Claude Code's answer at launch (probe ok only): compares with the last launch's. */
   started(auth: ClaudeAuthType): void {
     const before = this.state;
-    if (before && signedInToPlan(before.auth, auth)) {
+    // From "unknown" (Claude Code couldn't be asked) is no evidence of a new sign-in.
+    if (before && before.auth !== "unknown" && signedInToPlan(before.auth, auth)) {
       this.emit(before.auth, auth, "between_starts", before.warnedAt);
     }
     this.save({ auth, ...(auth !== "subscription" && before?.warnedAt
@@ -218,10 +223,12 @@ export class SignInTracker {
   requestAuth(auth: ClaudeAuthType): void {
     const before = this.state?.auth;
     if (before === undefined || before === auth) return;
-    if (signedInToPlan(before, auth) || before === "none") {
+    if (before !== "unknown" && (signedInToPlan(before, auth) || before === "none")) {
       this.emit(before, auth, "mid_session", this.warnedAt ?? this.state?.warnedAt);
     }
-    this.save({ auth });
+    const keep = auth !== "subscription" && this.state?.warnedAt !== undefined
+      ? { warnedAt: this.state.warnedAt } : {};
+    this.save({ auth, ...keep });
   }
 
   /** Milliseconds since this process's warning, or undefined when none was shown. */
@@ -262,7 +269,7 @@ function noticeFromStatus(
     const asks = input.override?.source === source && input.override?.asks === true;
     return apiBilling(source ?? input.override?.source, asks, input.color);
   }
-  if (auth === "subscription" && plan === "free") return apiBilling(undefined, false, input.color);
+  if (auth === "subscription" && plan === "free") return freePlan(input.color);
   return undefined;
 }
 
@@ -311,6 +318,15 @@ export function apiBillingText(source: ApiKeySource | undefined, asks: boolean):
   }
   return "Claude Code is signed in for API billing (an Anthropic Console account), so Claude " +
     `bills that account per token, not a Claude plan. ${MEMTREE_CREDIT_LINE} ${SWITCH_TO_PLAN}`;
+}
+
+/** A claude.ai account on the free plan: Claude Code bills it like an API account. */
+export const FREE_PLAN_TEXT =
+  "Claude Code is signed in to a Claude account without Pro or Max, so Claude bills its " +
+  `usage separately, not a plan. ${MEMTREE_CREDIT_LINE} Get Pro at ${PLAN_URL}, then run /login.`;
+
+function freePlan(color: boolean): SignInNotice {
+  return { ...notice("api_billing", [yellow(FREE_PLAN_TEXT, color)]), sessionLine: FREE_PLAN_TEXT };
 }
 
 function notice(kind: SignInWarningKind, lines: string[]): SignInNotice {
