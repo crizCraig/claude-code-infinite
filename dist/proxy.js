@@ -2253,8 +2253,12 @@ async function subagentHintContext(state, sessionId) {
     if (!state.subagentHint?.enabled || !memtreeWorking(state))
         return undefined;
     try {
-        const tree = await state.newestTrees?.settle(sessionId);
-        return tree ? subagentMemoryHintText(sessionId, tree.key) : undefined;
+        // A cached tree will do (peek refreshes it in the background); wait only for none.
+        const tree = state.newestTrees?.peek(sessionId) ?? await state.newestTrees?.settle(sessionId);
+        // MemTree may have paused or failed while the lookup was on its way.
+        if (!tree || !state.subagentHint.enabled || !memtreeWorking(state))
+            return undefined;
+        return subagentMemoryHintText(sessionId, tree.key);
     }
     catch {
         return undefined;

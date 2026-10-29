@@ -16,8 +16,9 @@
  * little to re-derive.
  */
 
-/** Claude Code session ids, and the server's tree refs (`<uuid>-v1-own`). */
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+import { SESSION_ID } from "./memtree-newest.js";
+
+/** The server's tree refs (`<uuid>-v1-own`). */
 const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
 
 /**

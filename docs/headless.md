@@ -108,7 +108,8 @@ SubagentStart hook with one short line for the new subagent: the parent's sessio
 tree, and to search that tree before re-deriving the parent's decisions, findings or commands.
 The memtree tools are loaded up front in subagents and resumed sessions alike (no ToolSearch
 step). In `-p` runs this hook comes from a small session plugin, so a stream-json `init` event
-lists a plugin named `ccc`; stdout is otherwise unchanged.
+lists a plugin named `ccc` (and `--include-hook-events` shows its hook events); stdout is
+otherwise unchanged.
 
 The tools can read every session your MemTree key owns. If your platform runs agents for
 different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.

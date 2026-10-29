@@ -15,8 +15,8 @@
  * when the server named the parent's newest tree: a parent without one has
  * little to re-derive.
  */
-/** Claude Code session ids, and the server's tree refs (`<uuid>-v1-own`). */
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+import { SESSION_ID } from "./memtree-newest.js";
+/** The server's tree refs (`<uuid>-v1-own`). */
 const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
 /**
  * Whether subagents get the hint: on while the session has the memtree

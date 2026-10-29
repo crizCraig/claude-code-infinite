@@ -95,7 +95,7 @@ async function serve(handler) {
 }
 
 /** MemTree answers `h.status` (402: paused) or passes the conversation through. */
-async function harness({ hint = new SubagentMemoryHint(), tree = true } = {}) {
+async function harness({ hint = new SubagentMemoryHint(), tree = true, lookupGate } = {}) {
   const h = { status: undefined, asked: 0 };
   const upstream = await serve((req, res) => {
     res.setHeader("content-type", "application/json");
@@ -116,6 +116,7 @@ async function harness({ hint = new SubagentMemoryHint(), tree = true } = {}) {
   const memtree = new MemtreeClient({ baseUrl: memory.url, apiKey: "offline" });
   const newestTrees = new NewestTreeLookup(async () => {
     h.asked++;
+    if (lookupGate) await lookupGate;
     const latest = tree ? { request_id: REQUEST_ID, ref: REF,
       links: { url: `https://app.polychat.co/m/${REF}` } } : null;
     return { status: 200, body: Buffer.from(JSON.stringify({
@@ -192,4 +193,28 @@ test("proxy: no hint while MemTree is paused, without a parent tree, or without 
     gate.disable();
     assert.equal(await subagentStart(withdrawn), null, "the MCP server failed to register");
   } finally { withdrawn.close(); }
+});
+
+test("proxy: MemTree pausing while the tree lookup is on its way means no hint", async () => {
+  let release;
+  const lookupGate = new Promise((resolve) => { release = resolve; });
+  const h = await harness({ lookupGate });
+  try {
+    await turn(h);
+    const pending = subagentStart(h);
+    h.status = 402;
+    await turn(h, false);
+    release();
+    assert.equal(await pending, null, "paused by the time the tree was named");
+  } finally { h.close(); }
+});
+
+test("proxy: a tree lookup that never answers delays a subagent start at most ~2.5 s", async () => {
+  const h = await harness({ lookupGate: new Promise(() => {}) });
+  try {
+    await turn(h);
+    const started = Date.now();
+    assert.equal(await subagentStart(h), null);
+    assert.ok(Date.now() - started < 4_000, "well within Claude Code's 5 s hook timeout");
+  } finally { h.close(); }
 });
