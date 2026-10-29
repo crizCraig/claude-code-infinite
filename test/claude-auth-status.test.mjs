@@ -4,7 +4,7 @@
 // at all, which the config files cannot tell apart from "can't tell".
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -173,3 +173,45 @@ test("the probe is not asked when the session's options change how it signs in",
 test("the schema's probe results match the module's", () => {
   assert.deepEqual([...SCHEMA_RESULTS], [...AUTH_PROBE_RESULTS]);
 });
+
+// Review r2 P3: a detached probe no longer gets the terminal's Ctrl+C, so ccc exiting
+// while it runs must kill it; the exit hook is gone once the probe is done.
+test("the probe holds an exit hook only while it runs", async () => {
+  const before = process.listenerCount("exit");
+  const fake = fakeClaude(JSON.stringify(SIGNED_OUT), 1, 100);
+  const running = probeClaudeAuthStatus(fake.command, { leadingArgs: fake.leadingArgs, env: {} });
+  assert.equal(process.listenerCount("exit"), before + 1);
+  assert.equal((await running).result, "ok");
+  assert.equal(process.listenerCount("exit"), before);
+});
+
+// Codex r2 P2: ccc exiting, or killed by a signal, while the probe still runs must not
+// leave the (detached, so out of the terminal's reach) probe behind.
+for (const how of ["exit", "SIGTERM"]) {
+  test(`the probe dies with ccc (${how})`, { skip: process.platform === "win32" }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccc-probe-owner-"));
+    const pidFile = join(dir, "probe.pid");
+    const fakeScript = join(dir, "claude.mjs");
+    writeFileSync(fakeScript, `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+      `setInterval(() => {}, 1000);`);
+    const owner = join(dir, "owner.mjs");
+    const mod = new URL("../dist/claude-auth-status.js", import.meta.url).href;
+    writeFileSync(owner, `import { probeClaudeAuthStatus } from ${JSON.stringify(mod)};\n` +
+      `probeClaudeAuthStatus(process.execPath, { leadingArgs: [${JSON.stringify(fakeScript)}],` +
+      ` timeoutMs: 60000 });\n` +
+      `process.on("message", () => ${how === "exit" ? "process.exit(3)" : "{}"});\n`);
+    const { fork } = await import("node:child_process");
+    const ccc = fork(owner, [], { stdio: "ignore" });
+    const deadline = Date.now() + 5000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    const probePid = Number(readFileSync(pidFile, "utf8"));
+    const gone = new Promise((r) => ccc.on("exit", (code, signal) => r({ code, signal })));
+    if (how === "exit") ccc.send("go"); else ccc.kill("SIGTERM");
+    const ended = await gone;
+    if (how === "SIGTERM") assert.equal(ended.signal, "SIGTERM");
+    const until = Date.now() + 3000;
+    while (alive(probePid) && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(alive(probePid), false, "probe outlived ccc");
+  });
+}

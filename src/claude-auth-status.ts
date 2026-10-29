@@ -81,9 +81,16 @@ export function probeClaudeAuthStatus(
       if (done) return;
       done = true;
       clearTimeout(timer);
+      process.removeListener("exit", onExit);
+      stopSignals();
       resolve({ result, ms: Math.max(0, now() - started), ...(status ? { status } : {}) });
     };
     const child = startProbe(command, opts);
+    // Detached on POSIX, so the terminal's Ctrl+C no longer reaches it: ccc exiting early
+    // (a quit at the key prompt) takes a still-running probe with it.
+    const onExit = (): void => { if (child) killTree(child); };
+    process.once("exit", onExit);
+    const stopSignals = killOnSignals(onExit);
     const timer = setTimeout(() => {
       finish("timeout");
       if (child) killTree(child);
@@ -141,6 +148,28 @@ function startProbe(command: string, opts: ProbeOptions): ReturnType<typeof spaw
   } catch {
     return undefined;
   }
+}
+
+const FATAL_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
+/**
+ * While the probe runs: on a fatal signal, kill it, then let the signal act as it
+ * would have (re-raised when no other handler of ccc's takes it). Returns the undo.
+ */
+function killOnSignals(kill: () => void): () => void {
+  const handlers = FATAL_SIGNALS.map((signal) => {
+    const handler = (): void => {
+      kill();
+      stop();
+      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+    };
+    process.once(signal, handler);
+    return [signal, handler] as const;
+  });
+  const stop = (): void => {
+    for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+  };
+  return stop;
 }
 
 /**

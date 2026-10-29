@@ -5,17 +5,21 @@ account. It checks what CI can't: GitHub's `windows-latest` runner is Windows Se
 browser sign-in and no Claude desktop app, so CI covers the code paths only, never a real
 Claude account sign-in.
 
-Two rounds, about 30 minutes each:
+Two rounds, about 30 minutes each, plus a ~30-minute new-user walkthrough:
 
 - **Round 1** reproduces the bug on ccc **1.0.31**: new Windows users are warned
   `unknown`, then never send a message.
 - **Round 2** checks the fixed build (1.0.32 or later, or the GitHub build Craig names).
+- **Part 3** goes through the whole setup as a brand-new user and critiques it.
 
 Never send passwords, your email address, API keys, MemTree keys, or the files
 `requests.jsonl` / `requests.jsonl.1` (they hold your project paths). Crop or blur your email
 and name in every screenshot.
 
 ## Setup (note each answer for the report)
+
+Run the commands in this section in **Command Prompt** (Start menu: "cmd"), even if you
+use another terminal later: PowerShell reads `%USERPROFILE%` and `where` differently.
 
 1. Windows edition and build: Settings > System > About ("Edition", "OS build").
 2. Windows display language: Settings > Time & language > Language (e.g. Arabic, English).
@@ -58,7 +62,8 @@ type `/logout`, then `/exit`.
 1. Sign Claude Code out (`claude`, `/logout`, `/exit`).
 2. Install the build Craig names, e.g. `npm install -g claude-code-infinite@1.0.32`, or
    from GitHub: `npm install -g github:crizCraig/claude-code-infinite#<commit>`.
-   `ccc --version` must say 1.0.32 or later.
+   `ccc --version` must say 1.0.32 or later (a GitHub build may still say 1.0.31: then
+   check with Craig that you installed the commit he named).
 
 ### Test A: not signed in
 
@@ -98,6 +103,47 @@ wait. **Screenshot.** Then `/login` back to your Claude account.
 
 Repeat Test C step 1 in **Command Prompt** and in **PowerShell** (not Windows Terminal).
 Screenshot each.
+
+## Part 3: the whole setup as a new user (about 30 minutes)
+
+Craig wants your honest critique of the first-run experience, not only the sign-in bug.
+Do it once the fixed version is published (1.0.32 or later), or with whatever version the
+site's install command gives you, and note that version.
+
+Start from zero:
+
+1. `npm uninstall -g claude-code-infinite`, then rename the folder
+   `%USERPROFILE%\.claude-code-infinite` to `.claude-code-infinite.old` (Craig's earlier
+   test key is in it: don't send it).
+2. Sign Claude Code out (`claude`, `/logout`, `/exit`). If you're willing, uninstall Claude
+   Code too, so you see ccc's install offer.
+3. Use an email that has no polychat.co account yet (Craig can delete the test account
+   afterwards), or ask Craig to reset yours.
+
+Then go step by step, as if you had only heard of MemTree:
+
+| Step | What to do |
+|---|---|
+| 1 | Open https://memtree.dev and find how to start. |
+| 2 | Sign up at polychat.co (the site's sign-up link). |
+| 3 | Find the MemTree key page and your key. |
+| 4 | Find and run the install command the site gives you. |
+| 5 | Run `ccc` for the first time and paste the key. |
+| 6 | Claude Code: install (if ccc offers) and sign in with your Claude account. |
+| 7 | Send your first message and get an answer. |
+| 8 | Find your first MemTree link (ccc shows one; `/memtree-view` prints it) and open it. |
+
+For **each step**, note (one or two lines is fine) and screenshot:
+
+- what was **confusing** (wording, where to click, what to do next);
+- what was **slow** (rough seconds or minutes);
+- what was **missing** (information you had to guess);
+- what was **broken** (errors, wrong text, a page that didn't load).
+
+Finish with your **top 3 suggested improvements**: wording to change, steps that could
+be removed or automated, and anything Windows-specific (PowerShell vs Command Prompt,
+paths, antivirus or SmartScreen prompts, the browser not opening, copy and paste in the
+terminal).
 
 ## Sign-in bug, or a credit problem?
 

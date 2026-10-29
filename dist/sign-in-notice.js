@@ -53,6 +53,10 @@ export function signInNotice(input) {
     if (status && status.auth !== "unknown") {
         return noticeFromStatus(status.auth, status.plan, status.keySource, input);
     }
+    // --settings, --setting-sources or --bare: the session doesn't read the config files
+    // the way the fallback does, so it has nothing reliable to say.
+    if (input.probe.result === "skipped")
+        return undefined;
     return noticeFromConfig(input);
 }
 /** The lines on stderr (stdout stays Claude Code's in print runs). */

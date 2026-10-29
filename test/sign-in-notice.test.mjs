@@ -113,6 +113,20 @@ test("Claude Code could not be asked: the config files decide, and nothing block
   assert.equal(signInNotice(input(ok("unknown"))).kind, "unknown");
 });
 
+// Codex r2 P2: with --settings, --setting-sources or --bare the probe is skipped, and the
+// config files can't be read the way that session reads them either: say nothing but a
+// remembered credit refusal (which Anthropic itself gave).
+test("a skipped probe: no sign-in guess from the config files, credit advice kept", () => {
+  const skipped = { result: "skipped", ms: 0 };
+  assert.equal(signInNotice(input(skipped)), undefined);
+  assert.equal(signInNotice(input(skipped, { fallback: { auth: "api_key", plan: "unknown" } })),
+    undefined);
+  const override = { source: "ANTHROPIC_API_KEY", asks: false };
+  assert.equal(signInNotice(input(skipped, { override, fallback: { auth: "subscription",
+    plan: "pro", subscriptionLogin: true } })), undefined);
+  assert.equal(signInNotice(input(skipped, { creditRefused: true })).kind, "credit_reminder");
+});
+
 test("colour wraps each line", () => {
   const notice = signInNotice(input(ok("none"), { color: true }));
   for (const line of notice.lines) assert.match(line, /^\x1b\[33m.*\x1b\[39m$/);
