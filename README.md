@@ -15,6 +15,51 @@ Infinite context for Claude Code: memory for long-running agents. Claude Code In
 [MemTree](https://memtree.dev) so their history can be easily searched, navigated, and understood,
 by you and by Claude, within a session and across all of them.
 
+## Requirements
+
+* **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
+  with Claude Pro or Max** ([don't have it in your terminal yet?](#setup))
+* [node.js 20.3 or newer](https://nodejs.org/en/download/)
+
+<sub>Also works with an Anthropic API key that has credit, but that's far costlier than Pro or Max.</sub>
+
+## Setup
+
+1. Install Claude Code Infinite (Node ≥ 20.3; no git needed)
+  ```bash
+  npm install -g claude-code-infinite
+  ```
+2. Run it from your project folder
+  ```bash
+  ccc
+  ```
+
+This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
+
+Needs [Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in with
+Claude Pro or Max.
+
+<details>
+<summary>Don't have Claude Code in your terminal yet?</summary>
+
+```powershell
+# Windows PowerShell
+irm https://claude.ai/install.ps1 | iex
+```
+```bash
+# macOS / Linux
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+Or just run `ccc`: when Claude Code isn't installed it offers to install it for you (with the
+same official command) and starts it, and Claude Code asks you to sign in. The Claude desktop
+app isn't enough: `ccc` needs the `claude` command in your terminal
+([help](#claude-code-isnt-installed)).
+
+</details>
+
+## What it does
+
 While Claude works, MemTree summarizes each new batch of messages in the background and files it
 under a topic. Each topic gets its own summary, and the whole session gets one at the top. When a
 session outgrows the context window, Claude works from these summaries plus your most recent
@@ -37,9 +82,6 @@ The magic starts past the context limit. Keep one session going for days and it 
 work: your priorities, the nuances of your projects, your company and your environment. Where
 `/compact` would wipe that detail, MemTree keeps it, so the thread becomes an expert in you. Let it
 orchestrate dozens of subagents on your behalf.
-
-> [!IMPORTANT]
-> Needs [Claude Code in your terminal](#setup), signed in with Claude Pro or Max.
 
 ## Search across sessions
 
@@ -129,49 +171,6 @@ MemTree's lookup tools, which plain Claude Code doesn't have. There is no full-c
 the history doesn't fit. Grading used a fixed rubric (coverage 30, fix quality 30, fidelity to the
 session's decisions 15, report accuracy 20, process 5); the harness and the answer key stay
 private because they come from a private codebase.
-
-## Requirements
-
-* **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
-  with Claude Pro or Max** ([don't have it yet?](#setup))
-* [node.js 20.3 or newer](https://nodejs.org/en/download/)
-
-<sub>Also works with an Anthropic API key that has credit, but that's far costlier than Pro or Max.</sub>
-
-## Setup
-
-1. Install Claude Code Infinite (Node ≥ 20.3; no git needed)
-  ```bash
-  npm install -g claude-code-infinite
-  ```
-2. Run it from your project folder
-  ```bash
-  ccc
-  ```
-
-This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
-
-Needs [Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in with
-Claude Pro or Max.
-
-<details>
-<summary>Don't have Claude Code yet?</summary>
-
-```powershell
-# Windows PowerShell
-irm https://claude.ai/install.ps1 | iex
-```
-```bash
-# macOS / Linux
-curl -fsSL https://claude.ai/install.sh | bash
-```
-
-Or just run `ccc`: when Claude Code isn't installed it offers to install it for you (with the
-same official command) and starts it, and Claude Code asks you to sign in. The Claude desktop
-app isn't enough: `ccc` needs the `claude` command in your terminal
-([help](#claude-code-isnt-installed)).
-
-</details>
 
 ## Environments
 
