@@ -23,7 +23,9 @@
  * (seen on staging: the compressed request held neither), are out of view,
  * while Claude Code still holds them and would not add the copy again. Then a
  * resume adds a line naming the time, which makes the text new to Claude Code:
- * given again, once per resume, even to a session begun on this version.
+ * given again, once per resume, even to a session begun on this version. So
+ * does a session ccc knows no page for (one too young for a tree, a fork's new
+ * id, an evicted link store), unless its transcript announced the current text.
  *
  * Left out of an uncompressed session whose transcript already announced the
  * current instructions (begun on this version), when MemTree is not working
@@ -34,18 +36,21 @@
  */
 import fs from "node:fs";
 import { MEMTREE_MCP_INSTRUCTIONS, MEMTREE_TOOL_NAMES } from "./memtree-mcp.js";
+export { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
 export const RESUME_GUIDANCE_PREFIX = "ccc: current MemTree guidance (replaces any earlier MemTree instructions in this " +
     "conversation; its tools are mcp__memtree__*):";
 export const RESUME_GUIDANCE = `${RESUME_GUIDANCE_PREFIX}\n\n${MEMTREE_MCP_INSTRUCTIONS}`;
-/** The guidance hook's path: the notice hook's secret path plus this. */
-export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 /**
  * How Claude Code's transcript holds the server's current instructions: the
  * JSON string body of the announced block (`## memtree\n…`). The guidance
- * above never contains it (no `## memtree` heading), so only a native
- * announcement of this version matches.
+ * above never contains it (no `## memtree` heading), and a match counts only
+ * on an `mcp_instructions_delta` line (ANNOUNCEMENT_MARKER before it on the
+ * line), not in a tool result or a paste that quotes it.
  */
 export const ANNOUNCED_INSTRUCTIONS_NEEDLE = JSON.stringify(`## memtree\n${MEMTREE_MCP_INSTRUCTIONS}`).slice(1, -1);
+/** An announcement line's marker is at most this far before its block. */
+const LINE_CONTEXT_BYTES = 64 * 1024;
+const ANNOUNCEMENT_MARKER = Buffer.from('"type":"mcp_instructions_delta"', "utf-8");
 /** A session's first announcement is near the start: read this much of it first. */
 const HEAD_BYTES = 8 * 1024 * 1024;
 /** Then read backward from the end in chunks of this size. */
@@ -82,21 +87,24 @@ export class ResumeGuidance {
         if (!this.enabled || !state.working())
             return undefined;
         // Compressed: any earlier announcement, native or ours, may be out of view.
-        if (state.compressed())
+        if (state.compressed() === true)
             return resumeGuidanceAgain(this.now());
         const path = input.transcript_path;
         if (path && (await fileContains(path, ANNOUNCED_INSTRUCTIONS_NEEDLE, this.scanMs))) {
             return undefined;
         }
         // MemTree may have paused or failed while the transcript was read.
-        return this.enabled && state.working() ? RESUME_GUIDANCE : undefined;
+        if (!this.enabled || !state.working())
+            return undefined;
+        // No page known (a young session, a fork's new id, a lost link store): it
+        // may be compressed, and Claude Code would drop an identical earlier copy.
+        return state.compressed() === false ? RESUME_GUIDANCE : resumeGuidanceAgain(this.now());
     }
 }
 /** The guidance for a compressed session: new to Claude Code at each resume. */
 export function resumeGuidanceAgain(at) {
-    const minute = `${at.toISOString().slice(0, 16)}Z`;
-    return `${RESUME_GUIDANCE}\n\n(Given again at the resume of ${minute}: MemTree has ` +
-        "compressed this conversation, so an earlier copy may be out of view.)";
+    return `${RESUME_GUIDANCE}\n\n(Given again at the resume of ${at.toISOString()}: ` +
+        "MemTree may have compressed this conversation, so an earlier copy may be out of view.)";
 }
 /** The gate for this run, or undefined (see ResumeGuidance). */
 export function resumeGuidanceFor(s) {
@@ -107,23 +115,40 @@ export function resumeGuidanceFor(s) {
     return new ResumeGuidance();
 }
 /**
- * Whether `file` contains `needle`: its head first, then backward from the
- * end, until `budgetMs` runs out. False when unknown (unreadable, too slow).
+ * Whether `file` holds an announcement of `needle`: its head first, then
+ * backward from the end. Answers within `budgetMs` whatever the filesystem
+ * does (a stalled open or read is left to finish on its own): false when
+ * unknown (unreadable, not a regular file, too slow).
  */
-export async function fileContains(file, needle, budgetMs, headBytes = HEAD_BYTES, chunkBytes = SCAN_CHUNK_BYTES) {
+export function fileContains(file, needle, budgetMs, headBytes = HEAD_BYTES, chunkBytes = SCAN_CHUNK_BYTES) {
+    return withinDeadline(scanFile(file, needle, budgetMs, headBytes, chunkBytes), budgetMs, false);
+}
+/** `work`'s answer, or `fallback` once `ms` pass first; never rejects. */
+export function withinDeadline(work, ms, fallback) {
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(fallback), ms);
+        work.then(resolve, () => resolve(fallback)).finally(() => clearTimeout(timer));
+    });
+}
+async function scanFile(file, needle, budgetMs, headBytes, chunkBytes) {
     const deadline = Date.now() + budgetMs;
     const target = Buffer.from(needle, "utf-8");
     let handle;
     try {
         handle = await fs.promises.open(file, "r");
-        const size = (await handle.stat()).size;
+        const stat = await handle.stat();
+        if (!stat.isFile())
+            return false;
+        const size = stat.size;
         const head = Math.min(size, headBytes);
         if (await rangeContains(handle, 0, Math.min(size, head + target.length), target))
             return true;
         for (let end = size; end > head && Date.now() < deadline;) {
             const start = Math.max(head, end - chunkBytes);
             // Overlap the next (earlier) chunk so a match split between them is found.
-            if (await rangeContains(handle, start, Math.min(end + target.length, size), target)) {
+            // Read a little before the chunk too, so the match's line (and its marker) is in view.
+            const from = Math.max(0, start - LINE_CONTEXT_BYTES);
+            if (await rangeContains(handle, from, Math.min(end + target.length, size), target)) {
                 return true;
             }
             end = start;
@@ -142,6 +167,16 @@ async function rangeContains(handle, start, end, target) {
         return false;
     const buffer = Buffer.alloc(end - start);
     await handle.read(buffer, 0, buffer.length, start);
-    return buffer.includes(target);
+    for (let at = buffer.indexOf(target); at >= 0; at = buffer.indexOf(target, at + 1)) {
+        if (onAnnouncementLine(buffer, at))
+            return true;
+    }
+    return false;
+}
+/** Whether the line holding `at` names an mcp_instructions_delta before it. */
+function onAnnouncementLine(buffer, at) {
+    const lineStart = buffer.lastIndexOf(0x0a, at) + 1;
+    const marker = buffer.indexOf(ANNOUNCEMENT_MARKER, lineStart);
+    return marker >= 0 && marker < at;
 }
 //# sourceMappingURL=resume-guidance.js.map

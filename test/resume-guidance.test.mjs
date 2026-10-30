@@ -23,6 +23,7 @@ import {
   RESUME_GUIDANCE_PREFIX,
   ResumeGuidance,
   fileContains,
+  withinDeadline,
   resumeGuidanceAgain,
   resumeGuidanceFor,
 } from "../dist/resume-guidance.js";
@@ -68,12 +69,33 @@ test("the guidance is the current instructions behind a line saying they replace
   assert.ok(RESUME_GUIDANCE.length < 4_000, `${RESUME_GUIDANCE.length} characters`);
 });
 
-test("a compressed session's guidance names the resume's minute, so Claude Code adds it again", () => {
+test("a compressed session's guidance names the resume's time, so Claude Code adds it again", () => {
   const at = new Date("2026-10-30T18:58:31.825Z");
   assert.equal(resumeGuidanceAgain(at), `${RESUME_GUIDANCE}\n\n(Given again at the resume of ` +
-    "2026-10-30T18:58Z: MemTree has compressed this conversation, so an earlier copy may be " +
-    "out of view.)");
-  assert.notEqual(resumeGuidanceAgain(new Date("2026-10-30T19:58:00Z")), resumeGuidanceAgain(at));
+    "2026-10-30T18:58:31.825Z: MemTree may have compressed this conversation, so an earlier " +
+    "copy may be out of view.)");
+  assert.notEqual(resumeGuidanceAgain(new Date("2026-10-30T18:58:59.000Z")), resumeGuidanceAgain(at),
+    "two resumes in one minute are still two texts");
+});
+
+test("only an mcp_instructions_delta line counts as an announcement, not a quote of one", async () => {
+  const block = JSON.stringify(`## memtree\n${MEMTREE_MCP_INSTRUCTIONS}`);
+  const quoted = transcript([JSON.stringify({ type: "user", message: { role: "user",
+    content: [{ type: "tool_result", content: `## memtree\n${MEMTREE_MCP_INSTRUCTIONS}` }] } })]);
+  const real = transcript([USER_LINE, announcement(MEMTREE_MCP_INSTRUCTIONS)]);
+  try {
+    assert.ok(fs.readFileSync(quoted.file, "utf8").includes(block.slice(1, -1)));
+    assert.equal(await fileContains(quoted.file, ANNOUNCED_INSTRUCTIONS_NEEDLE, 1_000), false);
+    assert.equal(await fileContains(real.file, ANNOUNCED_INSTRUCTIONS_NEEDLE, 1_000), true);
+  } finally { quoted.cleanup(); real.cleanup(); }
+});
+
+test("withinDeadline answers by its deadline even when the work never settles", async () => {
+  const started = Date.now();
+  assert.equal(await withinDeadline(new Promise(() => {}), 50, "late"), "late");
+  assert.ok(Date.now() - started < 1_000);
+  assert.equal(await withinDeadline(Promise.resolve("done"), 1_000, "late"), "done");
+  assert.equal(await withinDeadline(Promise.reject(new Error("x")), 1_000, "late"), "late");
 });
 
 test("the needle matches Claude Code's transcript line for the current instructions only", () => {
@@ -98,9 +120,10 @@ test("fileContains finds the needle in the head, the tail, and across a chunk bo
   const file = path.join(dir, "t.jsonl");
   try {
     const filler = "x".repeat(1000);
-    for (const at of [0, 10, 95, 300, 990, 1990]) {
+    for (const at of [40, 95, 97, 100, 300, 990, 1990, 1994]) {
       fs.writeFileSync(file, filler + filler);
       const fd = fs.openSync(file, "r+");
+      fs.writeSync(fd, '"type":"mcp_instructions_delta"', 0);
       fs.writeSync(fd, "NEEDLE", at);
       fs.closeSync(fd);
       // 100-byte head, then 64-byte chunks from the end: every split is covered.
@@ -109,7 +132,7 @@ test("fileContains finds the needle in the head, the tail, and across a chunk bo
     fs.writeFileSync(file, filler);
     assert.equal(await fileContains(file, "NEEDLE", 1_000, 100, 64), false);
     assert.equal(await fileContains(path.join(dir, "missing"), "NEEDLE", 1_000), false);
-    fs.writeFileSync(file, filler + "NEEDLE");
+    fs.writeFileSync(file, '"type":"mcp_instructions_delta"' + filler + "NEEDLE");
     assert.equal(await fileContains(file, "NEEDLE", 0, 100, 64), false,
       "past its time box the scan gives up: the guidance is given");
   } finally {
@@ -131,7 +154,17 @@ async function serve(handler) {
 }
 
 /** MemTree answers `h.status` (402: paused, 500: failing) or passes the conversation through. */
-async function harness({ guidance = new ResumeGuidance(), projectTrees, linkStore } = {}) {
+/** A link store naming SESSION's latest page uncompressed (`compressed` to change it). */
+function links(compressed = false) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-guidance-links-"));
+  const store = new MemtreeLinkStore(path.join(dir, "links.json"));
+  store.put(SESSION, { url: "https://app.polychat.co/m/abc", index: "i1", compressed });
+  store.cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
+  return store;
+}
+
+/** `linkStore: null`: ccc knows no page for the session. */
+async function harness({ guidance = new ResumeGuidance(), projectTrees, linkStore = links() } = {}) {
   const h = { status: undefined, turns: 0 };
   const upstream = await serve((req, res) => {
     res.setHeader("content-type", "application/json");
@@ -156,7 +189,7 @@ async function harness({ guidance = new ResumeGuidance(), projectTrees, linkStor
     ...(projectTrees ? { projectTrees } : {}),
     ...(linkStore ? { memtreeLinkStore: linkStore } : {}),
   });
-  h.close = () => { h.proxy.close(); upstream.close(); memory.close(); };
+  h.close = () => { h.proxy.close(); upstream.close(); memory.close(); linkStore?.cleanup?.(); };
   return h;
 }
 
@@ -201,6 +234,10 @@ test("proxy: a resume whose transcript has the older instructions gets the guida
       "every resume, word for word (cached)");
     assert.equal(context(await sessionStart(h, { source: "fork", transcript_path: old.file })),
       RESUME_GUIDANCE, "a fork carries the same history");
+    const forked = context(await sessionStart(h, { source: "fork",
+      session_id: "0f2a1c3e-8a6b-4c1d-9e2f-3a4b5c6d7e8f", transcript_path: old.file }));
+    assert.match(forked, /\(Given again at the resume of /,
+      "a fork's new id has no page: maybe compressed, so new to Claude Code");
     assert.equal(context(await sessionStart(h)), RESUME_GUIDANCE, "no transcript path: given");
     await turn(h, () => h.memtree.answering === true);
     assert.equal(context(await sessionStart(h, { transcript_path: old.file })), RESUME_GUIDANCE,
@@ -282,20 +319,46 @@ test("proxy: the guidance is its own hook's only context; the notice hook keeps 
 });
 
 test("proxy: a session MemTree compressed gets the guidance again, at every resume", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-guidance-links-"));
-  const linkStore = new MemtreeLinkStore(path.join(dir, "links.json"));
-  linkStore.put(SESSION, { url: "https://app.polychat.co/m/abc", index: "i1", compressed: true });
-  const h = await harness({ linkStore });
+  const h = await harness({ linkStore: links(true) });
   try {
     const text = context(await sessionStart(h));
     assert.ok(text.startsWith(`${RESUME_GUIDANCE}\n\n(Given again at the resume of `), text);
-    assert.match(text, /MemTree has compressed this conversation/);
+    assert.match(text, /MemTree may have compressed this conversation/);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.notEqual(context(await sessionStart(h)), text, "each resume is new to Claude Code");
     const current = transcript([announcement(MEMTREE_MCP_INSTRUCTIONS)]);
     try {
       assert.match(context(await sessionStart(h, { transcript_path: current.file })),
         /Given again/, "compressed: Claude Code's own announcement is out of view too");
     } finally { current.cleanup(); }
-  } finally { h.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally { h.close(); }
+  const unknown = await harness({ linkStore: null });
+  try {
+    assert.match(context(await sessionStart(unknown)), /Given again/,
+      "no page known (evicted or unreadable link store): treated as maybe compressed");
+    const current = transcript([announcement(MEMTREE_MCP_INSTRUCTIONS)]);
+    try {
+      assert.equal(await sessionStart(unknown, { transcript_path: current.file }), null,
+        "but a young session begun on this version needs none");
+    } finally { current.cleanup(); }
+  } finally { unknown.close(); }
+});
+
+test("proxy: the guidance hook drops a body past its limit, streamed or declared", async () => {
+  const h = await harness();
+  try {
+    const big = JSON.stringify({ session_id: SESSION, hook_event_name: "SessionStart",
+      source: "resume", pad: "x".repeat(70 * 1024) });
+    const url = `${h.proxy.hookUrl}${RESUME_GUIDANCE_HOOK_SUFFIX}`;
+    const declared = await fetch(url, { method: "POST", body: big,
+      headers: { "content-type": "application/json" } });
+    assert.equal(declared.status, 204);
+    const stream = new ReadableStream({ start(c) {
+      c.enqueue(new TextEncoder().encode(big)); c.close(); } });
+    const chunked = await fetch(url, { method: "POST", body: stream, duplex: "half",
+      headers: { "content-type": "application/json" } });
+    assert.equal(chunked.status, 204, "no content-length: counted as it streams");
+  } finally { h.close(); }
 });
 
 test("the session plugin runs the guidance as its own SessionStart hook, on resume and fork", () => {

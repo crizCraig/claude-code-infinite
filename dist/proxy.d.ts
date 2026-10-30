@@ -58,7 +58,7 @@ import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
-import { type ResumeGuidance } from "./resume-guidance.js";
+import type { ResumeGuidance } from "./resume-guidance.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {

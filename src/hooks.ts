@@ -11,7 +11,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RESUME_GUIDANCE_HOOK_SUFFIX } from "./resume-guidance.js";
+
+/** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
+export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */

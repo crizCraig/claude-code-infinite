@@ -159,7 +159,8 @@ import {
   subagentStartOutput,
   type SubagentMemoryHint,
 } from "./subagent-hint.js";
-import { RESUME_GUIDANCE_HOOK_SUFFIX, type ResumeGuidance } from "./resume-guidance.js";
+import type { ResumeGuidance } from "./resume-guidance.js";
+import { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
@@ -179,6 +180,8 @@ import {
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
+/** A hook body still arriving after this is dropped (the hook itself waits 5 s). */
+const HOOK_BODY_TIMEOUT_MS = 3_000;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
 // timeout budget), suppress the blocking attempt for this long, across every
 // lane. A lane's own growth backoff alone would let each over-budget tool turn
@@ -1488,13 +1491,11 @@ async function handleResumeGuidanceHook(
   res: http.ServerResponse,
   state: ProxyState
 ): Promise<void> {
-  const declaredLength = Number(req.headers["content-length"] ?? 0);
-  const tooLong = !Number.isFinite(declaredLength) || declaredLength > HOOK_BODY_LIMIT;
-  if (tooLong) req.resume();
-  const raw = req.method === "POST" && !tooLong ? await readBody(req) : Buffer.alloc(0);
+  const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
+  if (req.method !== "POST") req.resume();
   let input: NoticeHookInput | null = null;
   try {
-    if (raw.length > 0 && raw.length <= HOOK_BODY_LIMIT) {
+    if (raw !== undefined && raw.length > 0) {
       input = parseNoticeHookInput(JSON.parse(raw.toString("utf-8")));
     }
   } catch {
@@ -3277,7 +3278,7 @@ async function resumeGuidanceContext(
   try {
     return await state.resumeGuidance?.contextFor(input, {
       working: () => resumeMemtreeWorking(state),
-      compressed: () => currentMemtreePage(state, input.session_id)?.compressed === true,
+      compressed: () => currentMemtreePage(state, input.session_id)?.compressed,
     });
   } catch {
     return undefined;
@@ -7442,6 +7443,34 @@ function capture(opts: ProxyOptions, kind: string, body: Buffer): void {
   } catch {
     // diagnostics only — never break the proxy path
   }
+}
+
+/**
+ * The body, or undefined once it passes `limit` bytes (declared or streamed)
+ * or takes longer than HOOK_BODY_TIMEOUT_MS: the rest is drained unkept.
+ */
+function readBodyWithin(req: http.IncomingMessage, limit: number): Promise<Buffer | undefined> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (body: Buffer | undefined) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (body === undefined) { chunks.length = 0; req.removeAllListeners("data"); req.resume(); }
+      resolve(body);
+    };
+    const timer = setTimeout(() => finish(undefined), HOOK_BODY_TIMEOUT_MS);
+    if (Number(req.headers["content-length"] ?? 0) > limit) return finish(undefined);
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) finish(undefined);
+      else chunks.push(chunk);
+    });
+    req.on("end", () => finish(Buffer.concat(chunks)));
+    req.on("error", () => finish(undefined));
+  });
 }
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {

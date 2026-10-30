@@ -7,6 +7,8 @@
  * rendered delta. Stop's top-level systemMessage is the fallback for turns
  * that never render text (for example, a tool-only response).
  */
+/** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
+export declare const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export declare const TRAILER_LABEL = "\u2022 MemTree \u00B7";
