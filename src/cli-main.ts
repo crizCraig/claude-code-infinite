@@ -55,6 +55,7 @@ import {
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
 import { SubagentMemoryHint } from "./subagent-hint.js";
+import { resumeGuidanceFor } from "./resume-guidance.js";
 import {
   KEY_PAGE_URL,
   LOCAL_KEY_PAGE_URL,
@@ -748,6 +749,13 @@ async function main() {
   // session has the `search` tool the hint names.
   const subagentHint = memtreeMcpPlan.tools.includes("search")
     ? new SubagentMemoryHint() : undefined;
+  // A resumed session is given the current MemTree guidance (resume-guidance.ts):
+  // Claude Code keeps the server instructions it first announced.
+  const resumeGuidance = resumeGuidanceFor({
+    interactive: interactiveUi,
+    memtreeOff: memtreeOff || checked.check === "invalid",
+    tools: memtreeMcpPlan.tools,
+  });
   const nativeOneMillionContext =
     claudeNativeOneMillionContextEnabled(process.env);
   const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
@@ -805,6 +813,7 @@ async function main() {
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     projectTrees,
     subagentHint,
+    resumeGuidance,
   });
 
   // One unobtrusive (dim) line so users can find the log during an incident.
@@ -861,6 +870,7 @@ async function main() {
         // Also carries the unpaid-key notice on resume, so it is on even
         // when MemTree links are off (the proxy then answers links-free).
         resumeLink: true,
+        resumeGuidance: resumeGuidance !== undefined,
         // CCC_AUTO_COMPACT=1 hands compaction back to Claude Code: /compact runs as typed.
         interceptCompact: process.env.CCC_AUTO_COMPACT !== "1",
       });
@@ -895,6 +905,7 @@ async function main() {
       memtree.setMemtreeTools(undefined);
       projectTrees?.disable();
       subagentHint?.disable();
+      resumeGuidance?.disable();
       if (isDebugMode) {
         console.error(`[DEBUG] MemTree MCP server disabled: ${String(err)}`);
       }

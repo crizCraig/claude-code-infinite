@@ -308,6 +308,11 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
      */
     resumeLink?: boolean;
     /**
+     * A resume's current MemTree guidance (resume-guidance.ts), from a
+     * SessionStart hook of its own: the same relay, to the guidance path.
+     */
+    resumeGuidance?: boolean;
+    /**
      * Ask the proxy before a typed /compact (PreCompact, manual only), which
      * answers it with a note while MemTree compresses (model-context.ts).
      * Default on; off under CCC_AUTO_COMPACT=1, where Claude Code's own wins.

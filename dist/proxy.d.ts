@@ -58,6 +58,7 @@ import type { TranscriptUsageSource } from "./transcript-usage.js";
 import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
+import { type ResumeGuidance } from "./resume-guidance.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
@@ -218,6 +219,12 @@ export interface ProxyOptions {
      */
     subagentHint?: SubagentMemoryHint;
     /**
+     * Whether a resumed main session's SessionStart is given the current MemTree
+     * guidance (resume-guidance.ts): interactive runs with the memtree tools.
+     * Omitted means never.
+     */
+    resumeGuidance?: ResumeGuidance;
+    /**
      * Client diagnostics (diagnostics.ts): session starts, paused notices shown,
      * and refusals, as allowlisted enums and numbers. Never content.
      */
@@ -310,6 +317,8 @@ interface ProxyState {
     projectTrees?: ProjectTreesHint;
     /** ProxyOptions.subagentHint. */
     subagentHint?: SubagentMemoryHint;
+    /** ProxyOptions.resumeGuidance. */
+    resumeGuidance?: ResumeGuidance;
     /** ProxyOptions.diagnostics. */
     diagnostics?: DiagnosticsRecorder;
     notices: NoticeDeliveryQueue;
