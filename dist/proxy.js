@@ -65,6 +65,7 @@ import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
+import { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
@@ -72,6 +73,8 @@ import { rateLimitFromResponse } from "./rate-limit.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
+/** A hook body still arriving after this is dropped (the hook itself waits 5 s). */
+const HOOK_BODY_TIMEOUT_MS = 3_000;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
 // timeout budget), suppress the blocking attempt for this long, across every
 // lane. A lane's own growth backoff alone would let each over-budget tool turn
@@ -346,6 +349,7 @@ export function startProxy(opts) {
         promptSubmitNotice: opts.promptSubmitNotice,
         projectTrees: opts.projectTrees,
         subagentHint: opts.subagentHint,
+        resumeGuidance: opts.resumeGuidance,
         diagnostics: opts.diagnostics,
         notices: new NoticeDeliveryQueue(),
         mainNoticePending: false,
@@ -498,6 +502,9 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
     }
     if (url.pathname === PRECOMPACT_HOOK_PATH) {
         return handleNoticeHook(req, res, state, opts.reqlog, undefined, "PreCompact");
+    }
+    if (url.pathname === `${hookPath}${RESUME_GUIDANCE_HOOK_SUFFIX}`) {
+        return handleResumeGuidanceHook(req, res, state);
     }
     if (url.pathname === hookPath) {
         return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
@@ -729,6 +736,39 @@ function noteMainSessionStart(state, source, sessionId) {
     else if (source === "startup" || source === "clear") {
         state.resumableMainSession = undefined;
     }
+}
+/**
+ * SessionStart on its own hook (resume-guidance.ts): only the current MemTree
+ * guidance, so Claude Code sees it as one context of its own and adds an
+ * identical one only once. Never fails the hook: anything unexpected is 204.
+ */
+async function handleResumeGuidanceHook(req, res, state) {
+    const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
+    if (req.method !== "POST")
+        req.resume();
+    let input = null;
+    try {
+        if (raw !== undefined && raw.length > 0) {
+            input = parseNoticeHookInput(JSON.parse(raw.toString("utf-8")));
+        }
+    }
+    catch {
+        input = null;
+    }
+    const context = input?.hook_event_name === "SessionStart"
+        ? await resumeGuidanceContext(state, input) : undefined;
+    if (!context) {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    const body = Buffer.from(JSON.stringify(sessionStartOutput(undefined, context)), "utf-8");
+    res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+    });
+    res.end(body);
 }
 /** Serve only validated Claude hook POSTs on the randomized localhost path. */
 async function handleNoticeHook(req, res, state, reqlog, 
@@ -2263,6 +2303,28 @@ async function subagentHintContext(state, sessionId) {
     catch {
         return undefined;
     }
+}
+/** The current MemTree guidance for a resumed main session (resume-guidance.ts). */
+async function resumeGuidanceContext(state, input) {
+    try {
+        return await state.resumeGuidance?.contextFor(input, {
+            working: () => resumeMemtreeWorking(state),
+            compressed: () => currentMemtreePage(state, input.session_id)?.compressed,
+        });
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Whether MemTree works as a session resumes: not paused, key not refused,
+ * and its latest answer, if any, a success. A new `ccc --resume` process has
+ * no answer yet; its startup key check already turned a refused or unpaid
+ * key into no guidance (resumeGuidanceFor).
+ */
+function resumeMemtreeWorking(state) {
+    return state.memtreeAnswering() !== false && state.unpaidDetail() === null &&
+        !state.keyInvalid();
 }
 /**
  * The SessionStart hook's answer: the banner line for the user
@@ -5687,6 +5749,41 @@ function capture(opts, kind, body) {
     catch {
         // diagnostics only — never break the proxy path
     }
+}
+/**
+ * The body, or undefined once it passes `limit` bytes (declared or streamed)
+ * or takes longer than HOOK_BODY_TIMEOUT_MS: the rest is drained unkept.
+ */
+function readBodyWithin(req, limit) {
+    return new Promise((resolve) => {
+        const chunks = [];
+        let size = 0;
+        let done = false;
+        const finish = (body) => {
+            if (done)
+                return;
+            done = true;
+            clearTimeout(timer);
+            if (body === undefined) {
+                chunks.length = 0;
+                req.removeAllListeners("data");
+                req.resume();
+            }
+            resolve(body);
+        };
+        const timer = setTimeout(() => finish(undefined), HOOK_BODY_TIMEOUT_MS);
+        if (Number(req.headers["content-length"] ?? 0) > limit)
+            return finish(undefined);
+        req.on("data", (chunk) => {
+            size += chunk.length;
+            if (size > limit)
+                finish(undefined);
+            else
+                chunks.push(chunk);
+        });
+        req.on("end", () => finish(Buffer.concat(chunks)));
+        req.on("error", () => finish(undefined));
+    });
 }
 function readBody(req) {
     return readAll(req);

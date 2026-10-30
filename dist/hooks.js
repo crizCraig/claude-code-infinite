@@ -10,6 +10,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+/** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
+export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export const TRAILER_LABEL = "• MemTree ·";
@@ -657,9 +659,11 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
             startupBannerHook(hooksDir, opts.startupMessage),
         ];
     }
-    if (opts.resumeLink) {
-        const relay = path.join(hooksDir, RESUME_RELAY_FILE);
+    const relay = path.join(hooksDir, RESUME_RELAY_FILE);
+    if (opts.resumeLink || opts.resumeGuidance) {
         fs.writeFileSync(relay, RESUME_RELAY_SOURCE, { mode: 0o600 });
+    }
+    if (opts.resumeLink) {
         hooks.SessionStart = [
             ...(hooks.SessionStart ?? []),
             {
@@ -672,6 +676,24 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
                     {
                         type: "command",
                         command: [process.execPath, relay, hookUrl]
+                            .map(singleQuoteForShell)
+                            .join(" "),
+                        timeout: 5,
+                    },
+                ],
+            },
+        ];
+    }
+    if (opts.resumeGuidance) {
+        hooks.SessionStart = [
+            ...(hooks.SessionStart ?? []),
+            {
+                // Only a resumed history can hold older MemTree instructions.
+                matcher: "resume|fork",
+                hooks: [
+                    {
+                        type: "command",
+                        command: [process.execPath, relay, `${hookUrl}${RESUME_GUIDANCE_HOOK_SUFFIX}`]
                             .map(singleQuoteForShell)
                             .join(" "),
                         timeout: 5,

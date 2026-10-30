@@ -7,6 +7,8 @@
  * rendered delta. Stop's top-level systemMessage is the fallback for turns
  * that never render text (for example, a tool-only response).
  */
+/** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
+export declare const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export declare const TRAILER_LABEL = "\u2022 MemTree \u00B7";
@@ -307,6 +309,11 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
      * script (run with this process's own Node) relays stdin to `hookUrl`.
      */
     resumeLink?: boolean;
+    /**
+     * A resume's current MemTree guidance (resume-guidance.ts), from a
+     * SessionStart hook of its own: the same relay, to the guidance path.
+     */
+    resumeGuidance?: boolean;
     /**
      * Ask the proxy before a typed /compact (PreCompact, manual only), which
      * answers it with a note while MemTree compresses (model-context.ts).
