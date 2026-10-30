@@ -136,8 +136,9 @@ test("fileContains finds the needle in the head, the tail, and across a chunk bo
     assert.equal(await fileContains(file, "NEEDLE", 0, 100, 64), false,
       "past its time box the scan gives up: the guidance is given");
   } finally {
-    // The abandoned scan may still hold the file open (Windows refuses the rmdir).
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    // The abandoned scan may still hold the file open (Windows refuses the rmdir)
+    // until its `finally` closes it: retry asynchronously so that close can run.
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 });
 
