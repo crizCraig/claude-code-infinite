@@ -18,7 +18,7 @@ by you and by Claude, within a session and across all of them.
 ## Requirements
 
 * **[Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in
-  with Claude Pro or Max** ([don't have it in your terminal yet?](#setup))
+  with Claude Pro or Max**
 * [node.js 20.3 or newer](https://nodejs.org/en/download/)
 
 <sub>Also works with an Anthropic API key that has credit, but that's far costlier than Pro or Max.</sub>
