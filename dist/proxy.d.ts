@@ -592,10 +592,16 @@ export declare const SUBAGENT_VIEW_NOTE = "(main session's page; subagent pages 
 export declare const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main session only.";
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
+/**
+ * How a kept subagent index goes: "flush" (replaced or evicted while it runs: past the
+ * client's text minimum) or "final" (it ended: final_index, which the server allows once
+ * per conversation per 30 minutes).
+ */
+type DeferredSend = "flush" | "final";
 /** A subagent's kept index call and the history it carries. */
 interface DeferredIndex {
     messages: Message[];
-    send: (force: boolean) => void;
+    send: (mode?: DeferredSend) => void;
 }
 /**
  * A main-thread compaction at the automatic target (a turn at the budget): what its

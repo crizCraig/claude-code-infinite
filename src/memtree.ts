@@ -982,7 +982,7 @@ interface QueuedIndex {
     sessionId?: string;
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
-    /** A forced call (a subagent's end): the server indexes its tail below its minimum. */
+    /** A subagent's end: the server indexes its tail below its own minimum. */
     finalIndex?: boolean;
   };
 }
@@ -1410,20 +1410,22 @@ export class MemtreeClient {
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes,
     /**
-     * `force`: send even under INDEX_MIN_NEW_CHARS of new text, flagged final_index so the
-     * server indexes the tail under its own minimum too (a subagent's end).
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text. `finalIndex` (implies it):
+     * flagged final_index, so the server indexes the tail under its own minimum too; the
+     * server allows one per conversation per 30 minutes, so only at a subagent's end.
      */
-    options: { force?: boolean } = {}
+    options: { force?: boolean; finalIndex?: boolean } = {}
   ): void {
     if (this.backgroundClosing) return;
     // A final call is its own entry: the same history sent per turn may have left a tail.
-    const indexKey = JSON.stringify([sessionId ?? null, hash, ...(options.force ? ["final"] : [])]);
+    const final = options.finalIndex === true;
+    const indexKey = JSON.stringify([sessionId ?? null, hash, ...(final ? ["final"] : [])]);
     if (this.indexedHashes.has(indexKey)) return;
     const lane = indexLaneKey(sessionId, messages);
     const job: QueuedIndex = { messages, modelContextLimit,
-      opts: { sessionId, clientMeta, messageTimesFor, ...(options.force ? { finalIndex: true } : {}) } };
+      opts: { sessionId, clientMeta, messageTimesFor, ...(final ? { finalIndex: true } : {}) } };
     // Held back is not sent: a later (or forced) call of the same history still goes.
-    if (!options.force && this.tooLittleNewText(lane, job)) return;
+    if (!options.force && !final && this.tooLittleNewText(lane, job)) return;
     this.indexedHashes.add(indexKey);
     if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
       const first = this.indexedHashes.values().next().value;
@@ -1451,7 +1453,7 @@ export class MemtreeClient {
     // Not replaced when the new one does not carry it whole: another branch, media Claude
     // Code evicted since (never uploaded otherwise), or a final call.
     if (waiting && (!extendsHistory(job.messages, waiting.messages) ||
-        mediaCount(waiting.messages) > mediaCount(job.messages) ||
+        losesMedia(waiting.messages, job.messages) ||
         (waiting.opts.finalIndex && !job.opts.finalIndex))) {
       void this.sendLaneIndex(lane, waiting);
     }
@@ -2262,16 +2264,35 @@ export function messagesTextChars(messages: Message[]): number {
 
 /** Whether `messages` hold an image or document block (at any depth). */
 function carriesMedia(value: unknown): boolean {
-  return mediaCount(value) > 0;
+  return mediaKeys(value).size > 0;
 }
 
-/** Image and document blocks in `value` (messages or content), at any depth. */
-export function mediaCount(value: unknown): number {
-  if (Array.isArray(value)) return value.reduce((n: number, item) => n + mediaCount(item), 0);
-  if (!value || typeof value !== "object") return 0;
+/**
+ * Whether `older` holds an image or document `newer` does not (Claude Code evicted it):
+ * replacing `older` by `newer` would leave it never uploaded.
+ */
+export function losesMedia(older: Message[], newer: Message[]): boolean {
+  const kept = mediaKeys(older);
+  if (kept.size === 0) return false;
+  const now = mediaKeys(newer);
+  for (const key of kept) if (!now.has(key)) return true;
+  return false;
+}
+
+/** A digest of each image and document block's source in `value`, at any depth. */
+function mediaKeys(value: unknown, keys = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) mediaKeys(item, keys);
+    return keys;
+  }
+  if (!value || typeof value !== "object") return keys;
   const block = value as Record<string, unknown>;
-  if (block.type === "image" || block.type === "document") return 1;
-  return Array.isArray(block.content) ? mediaCount(block.content) : 0;
+  if (block.type === "image" || block.type === "document") {
+    keys.add(createHash("sha256").update(JSON.stringify(block.source ?? block)).digest("hex"));
+  } else if (Array.isArray(block.content)) {
+    mediaKeys(block.content, keys);
+  }
+  return keys;
 }
 
 function contentTextChars(value: unknown): number {

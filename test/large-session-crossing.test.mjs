@@ -355,9 +355,11 @@ test('a subagent rewound before it ends: the kept history it no longer extends i
     assert.equal((await h.post(rewound, { agent: 'agent-9' })).status, 200);
     await until(() => h.indexCalls.length === 1);
     assert.equal(h.indexCalls[0].messages, conv.length, 'the earlier branch, not lost');
+    assert.equal(h.indexCalls[0].final, false, 'a flush, not its end: final_index is kept for that');
     await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-9' });
     await until(() => h.indexCalls.length === 2);
     assert.equal(h.indexCalls[1].messages, rewound.length);
+    assert.equal(h.indexCalls[1].final, true);
   } finally { h.close(); }
 });
 
@@ -376,7 +378,10 @@ test('a deferred subagent history whose image Claude Code then evicted is sent b
     // Claude Code evicts the image; the subagent goes on.
     const evicted = structuredClone(conv);
     evicted.at(-1).content[0].content = [{ type: 'text', text: 'screen' }];
-    addRound(evicted, 'i1', 2_000);
+    // ...and a new screenshot arrives: as many images as before, but not the same one.
+    evicted.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'shot2', name: 'Screenshot', input: {} }] });
+    evicted.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot2', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoNEW' } }] }] });
     assert.equal((await h.post(evicted, { agent: 'agent-5' })).status, 200);
     await until(() => h.indexCalls.length === 1);
     assert.equal(h.indexCalls[0].messages, conv.length, 'the history that still had its image');

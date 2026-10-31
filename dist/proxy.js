@@ -52,7 +52,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, mediaCount, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, losesMedia, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, SLOW_RETRY_NOTICE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
@@ -3518,16 +3518,16 @@ const DEFERRED_AGENT_INDEX_MAX = 64;
  */
 function indexTurn(args) {
     const { opts, state, req, sessionId } = args;
-    const send = (force) => opts.memtree.indexInBackground(args.hash, args.msgsForMemtree, args.modelContextLimit, sessionId, args.clientMeta, transcriptTimesFor(opts, sessionId, agentAttributionId(req)), force ? { force } : {});
+    const send = (mode) => opts.memtree.indexInBackground(args.hash, args.msgsForMemtree, args.modelContextLimit, sessionId, args.clientMeta, transcriptTimesFor(opts, sessionId, agentAttributionId(req)), mode === "final" ? { finalIndex: true } : mode === "flush" ? { force: true } : {});
     // Only a request with its own agent id (the one SubagentStop names) waits for its end; one
     // attributed by its parent's id only is indexed per turn as before.
     const agentId = firstNonEmptyHeader(req, "x-claude-code-agent-id");
     if (agentId === undefined || sessionId === undefined)
-        return send(false);
+        return send();
     const compaction = args.rec.compaction;
     if (compaction?.estimatedTokens !== undefined &&
         compaction.estimatedTokens >= compaction.budgetTokens * AGENT_PER_TURN_INDEX_SHARE) {
-        send(false);
+        send();
         // Kept too: its last turns under the text minimum still go at its end (forced).
         keepDeferredIndex(state, deferredIndexKey(agentId, args.msgsForMemtree), { messages: args.msgsForMemtree, send });
         return;
@@ -3542,15 +3542,15 @@ function keepDeferredIndex(state, key, entry) {
     // A rewind or another branch: the kept history is not part of this one, so it goes now.
     // So does one holding media Claude Code has evicted since (never uploaded otherwise).
     if (kept && (!extendsHistory(entry.messages, kept.messages) ||
-        mediaCount(kept.messages) > mediaCount(entry.messages)))
-        sendDeferredIndex(state, key);
+        losesMedia(kept.messages, entry.messages)))
+        sendDeferredIndex(state, key, "flush");
     state.deferredAgentIndexes.delete(key);
     state.deferredAgentIndexes.set(key, entry);
     while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
         const oldest = state.deferredAgentIndexes.keys().next().value;
         if (oldest === undefined)
             break;
-        sendDeferredIndex(state, oldest);
+        sendDeferredIndex(state, oldest, "flush");
     }
 }
 /** A deferred index's key: the agent id and its conversation's first message. */
@@ -3562,18 +3562,18 @@ function deferredIndexKey(agentId, messages) {
 function sendDeferredAgentIndex(state, agentId) {
     for (const key of [...state.deferredAgentIndexes.keys()]) {
         if (JSON.parse(key)[0] === agentId)
-            sendDeferredIndex(state, key);
+            sendDeferredIndex(state, key, "final");
     }
 }
-function sendDeferredIndex(state, key) {
+function sendDeferredIndex(state, key, mode) {
     const kept = state.deferredAgentIndexes.get(key);
     state.deferredAgentIndexes.delete(key);
-    kept?.send(true);
+    kept?.send(mode);
 }
 /** At exit: every subagent's kept index calls. */
 function sendDeferredAgentIndexes(state) {
     for (const key of [...state.deferredAgentIndexes.keys()])
-        sendDeferredIndex(state, key);
+        sendDeferredIndex(state, key, "final");
 }
 /** The background prepare call and the prefix it yields (maybePrepareCompression). */
 async function prepareInBackground(args) {

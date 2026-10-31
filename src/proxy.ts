@@ -79,8 +79,8 @@ import {
   checkCompressedHistory,
   didMemtreeCompress,
   indexLagEvidence,
+  losesMedia,
   MemtreeClient,
-  mediaCount,
   modelBudgetTokens,
   normalizeMessagesForMemtree,
   serverFlattenedMessages,
@@ -4870,17 +4870,18 @@ function indexTurn(args: {
   sessionId: string | undefined; clientMeta?: Record<string, string>;
 }): void {
   const { opts, state, req, sessionId } = args;
-  const send = (force: boolean) => opts.memtree.indexInBackground(args.hash, args.msgsForMemtree,
-    args.modelContextLimit, sessionId, args.clientMeta,
-    transcriptTimesFor(opts, sessionId, agentAttributionId(req)), force ? { force } : {});
+  const send = (mode?: DeferredSend) => opts.memtree.indexInBackground(args.hash,
+    args.msgsForMemtree, args.modelContextLimit, sessionId, args.clientMeta,
+    transcriptTimesFor(opts, sessionId, agentAttributionId(req)),
+    mode === "final" ? { finalIndex: true } : mode === "flush" ? { force: true } : {});
   // Only a request with its own agent id (the one SubagentStop names) waits for its end; one
   // attributed by its parent's id only is indexed per turn as before.
   const agentId = firstNonEmptyHeader(req, "x-claude-code-agent-id");
-  if (agentId === undefined || sessionId === undefined) return send(false);
+  if (agentId === undefined || sessionId === undefined) return send();
   const compaction = args.rec.compaction;
   if (compaction?.estimatedTokens !== undefined &&
       compaction.estimatedTokens >= compaction.budgetTokens * AGENT_PER_TURN_INDEX_SHARE) {
-    send(false);
+    send();
     // Kept too: its last turns under the text minimum still go at its end (forced).
     keepDeferredIndex(state, deferredIndexKey(agentId, args.msgsForMemtree),
       { messages: args.msgsForMemtree, send });
@@ -4898,20 +4899,27 @@ function keepDeferredIndex(state: ProxyState, key: string, entry: DeferredIndex)
   // A rewind or another branch: the kept history is not part of this one, so it goes now.
   // So does one holding media Claude Code has evicted since (never uploaded otherwise).
   if (kept && (!extendsHistory(entry.messages, kept.messages) ||
-      mediaCount(kept.messages) > mediaCount(entry.messages))) sendDeferredIndex(state, key);
+      losesMedia(kept.messages, entry.messages))) sendDeferredIndex(state, key, "flush");
   state.deferredAgentIndexes.delete(key);
   state.deferredAgentIndexes.set(key, entry);
   while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
     const oldest = state.deferredAgentIndexes.keys().next().value;
     if (oldest === undefined) break;
-    sendDeferredIndex(state, oldest);
+    sendDeferredIndex(state, oldest, "flush");
   }
 }
+
+/**
+ * How a kept subagent index goes: "flush" (replaced or evicted while it runs: past the
+ * client's text minimum) or "final" (it ended: final_index, which the server allows once
+ * per conversation per 30 minutes).
+ */
+type DeferredSend = "flush" | "final";
 
 /** A subagent's kept index call and the history it carries. */
 interface DeferredIndex {
   messages: Message[];
-  send: (force: boolean) => void;
+  send: (mode?: DeferredSend) => void;
 }
 
 /** A deferred index's key: the agent id and its conversation's first message. */
@@ -4923,19 +4931,19 @@ function deferredIndexKey(agentId: string, messages: Message[]): string {
 /** A subagent ended: send each of its conversations' kept index call, whatever its size. */
 function sendDeferredAgentIndex(state: ProxyState, agentId: string): void {
   for (const key of [...state.deferredAgentIndexes.keys()]) {
-    if ((JSON.parse(key) as [string, string])[0] === agentId) sendDeferredIndex(state, key);
+    if ((JSON.parse(key) as [string, string])[0] === agentId) sendDeferredIndex(state, key, "final");
   }
 }
 
-function sendDeferredIndex(state: ProxyState, key: string): void {
+function sendDeferredIndex(state: ProxyState, key: string, mode: DeferredSend): void {
   const kept = state.deferredAgentIndexes.get(key);
   state.deferredAgentIndexes.delete(key);
-  kept?.send(true);
+  kept?.send(mode);
 }
 
 /** At exit: every subagent's kept index calls. */
 function sendDeferredAgentIndexes(state: ProxyState): void {
-  for (const key of [...state.deferredAgentIndexes.keys()]) sendDeferredIndex(state, key);
+  for (const key of [...state.deferredAgentIndexes.keys()]) sendDeferredIndex(state, key, "final");
 }
 
 /** The background prepare call and the prefix it yields (maybePrepareCompression). */

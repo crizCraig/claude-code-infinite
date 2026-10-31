@@ -754,7 +754,9 @@ test("a waiting index call whose image the next one lost (evicted) is sent, not 
       { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" } }] }];
     send(shot); // waits
     const evicted = [root, { role: "assistant", content: "look" }, { role: "user", content: [
-      { type: "text", text: "screen" }] }, { role: "assistant", content: "y".repeat(40_000) }];
+      { type: "text", text: "screen" }] }, { role: "assistant", content: "y".repeat(40_000) },
+      { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png",
+        data: "iVBORw0KGgoNEW" } }] }]; // a new image: as many as before, not the same one
     send(evicted);
     assert.equal(await client.drainBackground(3_000), true);
     await waitFor(() => calls.length === 3);

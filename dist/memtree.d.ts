@@ -526,11 +526,13 @@ export declare class MemtreeClient {
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes, 
     /**
-     * `force`: send even under INDEX_MIN_NEW_CHARS of new text, flagged final_index so the
-     * server indexes the tail under its own minimum too (a subagent's end).
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text. `finalIndex` (implies it):
+     * flagged final_index, so the server indexes the tail under its own minimum too; the
+     * server allows one per conversation per 30 minutes, so only at a subagent's end.
      */
     options?: {
         force?: boolean;
+        finalIndex?: boolean;
     }): void;
     /**
      * At most one background index call per conversation. Each call carries the whole
@@ -669,6 +671,9 @@ export declare function isDroppedConnection(err: unknown): boolean;
  * results; images and documents (base64) count nothing. For INDEX_MIN_NEW_CHARS only.
  */
 export declare function messagesTextChars(messages: Message[]): number;
-/** Image and document blocks in `value` (messages or content), at any depth. */
-export declare function mediaCount(value: unknown): number;
+/**
+ * Whether `older` holds an image or document `newer` does not (Claude Code evicted it):
+ * replacing `older` by `newer` would leave it never uploaded.
+ */
+export declare function losesMedia(older: Message[], newer: Message[]): boolean;
 //# sourceMappingURL=memtree.d.ts.map
