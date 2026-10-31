@@ -658,19 +658,31 @@ test("text size counts text, tool inputs and results, not images", () => {
   ]), 3 + 2 + 1 + JSON.stringify({ p: 1 }).length + 2);
 });
 
-test("a compress whose connection dropped is sent once more; an index-only call is not", async () => {
-  // 2026-10-28: a Wi-Fi switch cut a 24 MB compress upload (EHOSTUNREACH after 89 s).
-  let compressCalls = 0, indexCalls = 0;
+test("a compress whose upload dropped is sent once more; never once its body was sent", async () => {
+  // 2026-10-28: a Wi-Fi switch cut a 24 MB compress upload (EHOSTUNREACH after 89 s, ~1 MB
+  // sent). A drop after the whole body went may be MemTree already compressing (and billing)
+  // it: no second call then.
+  let mode = "mid-upload", compressCalls = 0, indexCalls = 0;
   const server = http.createServer((req, res) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let dropped = false;
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+      if (mode === "mid-upload" && compressCalls === 0 && !dropped && !req.headers["x-index"]) {
+        dropped = true;
+        compressCalls++;
+        req.socket.destroy();
+      }
+    });
     req.on("end", () => {
+      if (dropped) return;
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       if (body.index_only) {
         indexCalls++;
         return req.socket.destroy();
       }
-      if (++compressCalls === 1) return req.socket.destroy();
+      compressCalls++;
+      if (mode === "after-body") return req.socket.destroy();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(RESULT));
     });
@@ -679,15 +691,71 @@ test("a compress whose connection dropped is sent once more; an index-only call 
   try {
     const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
       apiKey: "k" });
-    const result = await client.compress(HASH, MESSAGES, 1_000_000, undefined, {});
+    // Over 1 MB, so it is streamed and the drop lands before its end.
+    const big = [{ role: "user", content: "x".repeat(3_000_000) }];
+    const result = await client.compress(MemtreeClient.hashMessages(big), big, 1_000_000,
+      undefined, {});
     assert.ok(result, "answered on the second attempt");
     assert.equal(compressCalls, 2);
+
+    mode = "after-body";
+    compressCalls = 0;
+    const other = [{ role: "user", content: "y".repeat(3_000_000) }];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(other), other, 1_000_000,
+      undefined, {}), null);
+    assert.equal(compressCalls, 1, "the whole body was sent: not sent again");
+
     client.indexInBackground(HASH, MESSAGES, 1_000_000, "s");
     assert.equal(await client.drainBackground(2_000), true);
     assert.equal(indexCalls, 1);
     assert.equal(isDroppedConnection(Object.assign(new TypeError("fetch failed"),
       { cause: { code: "EHOSTUNREACH" } })), true);
     assert.equal(isDroppedConnection(new Error("context_memory 500: boom")), false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a failed index upload is no baseline; a held-back history can still be forced", async () => {
+  let fail = true;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      calls.push(body.messages.length);
+      if (fail) { res.writeHead(500); return res.end("boom"); }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ messages: [], index_only: true }));
+    });
+  });
+  const calls = [];
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const conv = [{ role: "user", content: "x".repeat(40_000) }];
+    const send = (options) => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s",
+        undefined, undefined, options);
+    };
+    send();
+    await waitFor(() => calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fail = false;
+    conv.push({ role: "assistant", content: "a" }, { role: "user", content: "b" });
+    send(); // ~2 characters more than the failed upload: sent, since that one never arrived
+    await waitFor(() => calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    conv.push({ role: "assistant", content: "c" }, { role: "user", content: "d" });
+    send(); // held back: under the minimum over the one that arrived
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(calls.length, 2);
+    send({ force: true }); // the same history, forced (a subagent's end): it goes
+    await waitFor(() => calls.length === 3);
+    assert.equal(calls[2], conv.length);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

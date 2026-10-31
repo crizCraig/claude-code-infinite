@@ -539,6 +539,12 @@ export declare class MemtreeClient {
      */
     private enqueueIndex;
     /**
+     * Send `job` as its conversation's newest upload (the INDEX_MIN_NEW_CHARS baseline); if
+     * it fails, the baseline goes back to what it was, so the next turn is not held back by
+     * an upload the server never got.
+     */
+    private sendLaneIndex;
+    /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
      * last sent (or has waiting to send): the server's index minimum would only ack it.
      */
@@ -613,12 +619,18 @@ export declare class MemtreeClient {
     private callContextMemory;
     /**
      * A compress or prepare call's POST, sent once more (within the same budget) when its
-     * connection dropped before any answer: a Wi-Fi switch cut a 24 MB upload with
-     * EHOSTUNREACH after 89 s (2026-10-28) and the turn went without memory. Index-only
-     * calls are not retried: the next turn sends their history again.
+     * connection dropped while the body was still uploading: a Wi-Fi switch cut a 24 MB
+     * upload with EHOSTUNREACH after 89 s, ~1 MB sent (2026-10-28), and the turn went without
+     * memory. Only before the whole body was handed over: after that MemTree may already be
+     * compressing (and billing) it, and a second call would be a second compression.
+     * Index-only calls are not retried: the next turn sends their history again.
      */
     private postRetryingDrop;
-    /** One POST of a MemTree call's body. */
+    /**
+     * One POST of a MemTree call's body. With `upload`, a body of STREAMED_UPLOAD_MIN_BYTES
+     * or more goes as a stream and `upload.done` turns true once its last byte was handed
+     * over (a smaller one counts as handed over at once).
+     */
     private postContextMemory;
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the

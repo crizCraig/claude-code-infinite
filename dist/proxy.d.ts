@@ -336,7 +336,7 @@ interface ProxyState {
     /** Suppress producer-side state changes while agent API traffic is active. */
     activeSubagents: Set<string>;
     /**
-     * Per subagent (agent id), its newest index call not yet sent: a subagent is indexed
+     * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
      * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
      * budget (indexTurn).
      */
@@ -609,6 +609,8 @@ interface CarryOver {
     targetTokens: number;
     explicitTarget: false;
     linkSeq?: number;
+    /** The session's stable prefix when the call started: a different one at its end wins. */
+    base: StablePrefix | undefined;
 }
 /**
  * Whether a forwarded compressed body still overflows the window: its exact

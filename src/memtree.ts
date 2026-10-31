@@ -983,8 +983,6 @@ interface QueuedIndex {
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
   };
-  /** Sent even under INDEX_MIN_NEW_CHARS of new text (a subagent's one index at its end). */
-  force?: boolean;
 }
 
 /** The history a conversation's last index call carried, and its text size. */
@@ -1023,7 +1021,7 @@ export class MemtreeClient {
   /** Message hashes already submitted for background indexing. */
   private indexedHashes = new Set<string>();
   /** In-flight index-only calls, tracked so shutdown cannot outrun their logs. */
-  private backgroundIndexes = new Map<Promise<void>, AbortController>();
+  private backgroundIndexes = new Map<Promise<unknown>, AbortController>();
   /** Conversations (indexLaneKey) with a background index call in flight. */
   private readonly indexLanesBusy = new Set<string>();
   /** Per busy conversation, the newest index call waiting for the one in flight. */
@@ -1413,13 +1411,17 @@ export class MemtreeClient {
     if (this.backgroundClosing) return;
     const indexKey = JSON.stringify([sessionId ?? null, hash]);
     if (this.indexedHashes.has(indexKey)) return;
+    const lane = indexLaneKey(sessionId, messages);
+    const job: QueuedIndex = { messages, modelContextLimit,
+      opts: { sessionId, clientMeta, messageTimesFor } };
+    // Held back is not sent: a later (or forced) call of the same history still goes.
+    if (!options.force && this.tooLittleNewText(lane, job)) return;
     this.indexedHashes.add(indexKey);
     if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
       const first = this.indexedHashes.values().next().value;
       if (first !== undefined) this.indexedHashes.delete(first);
     }
-    this.enqueueIndex(indexLaneKey(sessionId, messages), { messages, modelContextLimit,
-      opts: { sessionId, clientMeta, messageTimesFor }, ...(options.force ? { force: true } : {}) });
+    this.enqueueIndex(lane, job);
   }
 
   /**
@@ -1433,26 +1435,41 @@ export class MemtreeClient {
    * 23 MB session's index uploads, ~1 GB per 40 minutes).
    */
   private enqueueIndex(lane: string, job: QueuedIndex): void {
-    const waiting = this.indexLanesNext.get(lane);
-    if (!job.force && this.tooLittleNewText(lane, job, waiting)) return;
     if (!this.indexLanesBusy.has(lane)) {
       this.startLaneIndex(lane, job);
       return;
     }
+    const waiting = this.indexLanesNext.get(lane);
     if (waiting && !extendsHistory(job.messages, waiting.messages)) {
-      this.noteIndexSent(lane, waiting.messages);
-      void this.submitIndexOnly(waiting.messages, waiting.modelContextLimit, waiting.opts);
+      void this.sendLaneIndex(lane, waiting);
     }
     this.indexLanesNext.set(lane, job);
+  }
+
+  /**
+   * Send `job` as its conversation's newest upload (the INDEX_MIN_NEW_CHARS baseline); if
+   * it fails, the baseline goes back to what it was, so the next turn is not held back by
+   * an upload the server never got.
+   */
+  private sendLaneIndex(lane: string, job: QueuedIndex): Promise<boolean> {
+    const previous = this.indexLanesSent.get(lane);
+    const sent = this.noteIndexSent(lane, job.messages);
+    return this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).then((ok) => {
+      if (!ok && this.indexLanesSent.get(lane) === sent) {
+        this.indexLanesSent.delete(lane);
+        if (previous) this.indexLanesSent.set(lane, previous);
+      }
+      return ok;
+    });
   }
 
   /**
    * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
    * last sent (or has waiting to send): the server's index minimum would only ack it.
    */
-  private tooLittleNewText(lane: string, job: QueuedIndex, waiting: QueuedIndex | undefined): boolean {
+  private tooLittleNewText(lane: string, job: QueuedIndex): boolean {
     // A waiting call is replaced by this one anyway: it is never held back.
-    if (waiting) return false;
+    if (this.indexLanesNext.has(lane)) return false;
     const sent = this.indexLanesSent.get(lane);
     if (this.indexMinNewChars <= 0 || !sent || !extendsHistory(job.messages, sent.messages)) {
       return false;
@@ -1461,19 +1478,20 @@ export class MemtreeClient {
   }
 
   /** Record the history an index call of `lane` is about to carry. */
-  private noteIndexSent(lane: string, messages: Message[]): void {
+  private noteIndexSent(lane: string, messages: Message[]): SentIndex {
+    const sent = { messages, chars: messagesTextChars(messages) };
     this.indexLanesSent.delete(lane);
-    this.indexLanesSent.set(lane, { messages, chars: messagesTextChars(messages) });
+    this.indexLanesSent.set(lane, sent);
     if (this.indexLanesSent.size > DEDUPE_CACHE_MAX) {
       const first = this.indexLanesSent.keys().next().value;
       if (first !== undefined) this.indexLanesSent.delete(first);
     }
+    return sent;
   }
 
   private startLaneIndex(lane: string, job: QueuedIndex): void {
     this.indexLanesBusy.add(lane);
-    this.noteIndexSent(lane, job.messages);
-    void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
+    void this.sendLaneIndex(lane, job).finally(() => {
       this.indexLanesBusy.delete(lane);
       const next = this.indexLanesNext.get(lane);
       this.indexLanesNext.delete(lane);
@@ -1605,7 +1623,7 @@ export class MemtreeClient {
       messageTimesFor?: (messages: Message[]) => MessageTimes;
       finalIndex?: boolean;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
     const stripped: Message[] = [];
     const retained: Message[] = [];
     for (const message of messages) {
@@ -1628,9 +1646,10 @@ export class MemtreeClient {
       clientMeta: opts.clientMeta,
     })
       .then(
-        () => undefined,
+        () => true,
         (err) => {
           this.log(`background indexing failed (ignored): ${err?.message ?? err}`);
+          return false;
         }
       )
       .finally(() => {
@@ -2019,35 +2038,47 @@ export class MemtreeClient {
 
   /**
    * A compress or prepare call's POST, sent once more (within the same budget) when its
-   * connection dropped before any answer: a Wi-Fi switch cut a 24 MB upload with
-   * EHOSTUNREACH after 89 s (2026-10-28) and the turn went without memory. Index-only
-   * calls are not retried: the next turn sends their history again.
+   * connection dropped while the body was still uploading: a Wi-Fi switch cut a 24 MB
+   * upload with EHOSTUNREACH after 89 s, ~1 MB sent (2026-10-28), and the turn went without
+   * memory. Only before the whole body was handed over: after that MemTree may already be
+   * compressing (and billing) it, and a second call would be a second compression.
+   * Index-only calls are not retried: the next turn sends their history again.
    */
   private async postRetryingDrop(
     payload: string,
     opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
     signal: AbortSignal
   ): Promise<Response> {
+    const upload = { done: false };
     try {
-      return await this.postContextMemory(payload, opts, signal);
+      return await this.postContextMemory(payload, opts, signal, opts.indexOnly ? undefined : upload);
     } catch (err) {
-      if (opts.indexOnly || signal.aborted || !isDroppedConnection(err)) throw err;
-      this.log(`context_memory connection dropped (${droppedCode(err)}); retrying once`);
+      if (opts.indexOnly || upload.done || signal.aborted || !isDroppedConnection(err)) throw err;
+      this.log(`context_memory upload dropped (${droppedCode(err)}); retrying once`);
       return await this.postContextMemory(payload, opts, signal);
     }
   }
 
-  /** One POST of a MemTree call's body. */
+  /**
+   * One POST of a MemTree call's body. With `upload`, a body of STREAMED_UPLOAD_MIN_BYTES
+   * or more goes as a stream and `upload.done` turns true once its last byte was handed
+   * over (a smaller one counts as handed over at once).
+   */
   private postContextMemory(
     payload: string,
     opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
-    signal: AbortSignal
+    signal: AbortSignal,
+    upload?: { done: boolean }
   ): Promise<Response> {
+    const bytes = Buffer.from(payload, "utf-8");
+    const streamed = upload !== undefined && bytes.length >= STREAMED_UPLOAD_MIN_BYTES;
+    if (upload && !streamed) upload.done = true;
     return fetch(`${this.baseUrl}/v1/context_memory`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.apiKey}`,
         "content-type": "application/json",
+        ...(streamed ? { "content-length": String(bytes.length) } : {}),
         "x-client": CLIENT_NAME,
         "x-client-version": CLIENT_VERSION,
         "x-client-features": CLIENT_FEATURES,
@@ -2060,9 +2091,10 @@ export class MemtreeClient {
           ? { "x-memtree-tools": this.memtreeTools }
           : {}),
       },
-      body: payload,
+      body: streamed ? uploadStream(bytes, upload!) : payload,
+      ...(streamed ? { duplex: "half" } : {}),
       signal,
-    });
+    } as RequestInit);
   }
 
   /**
@@ -2151,8 +2183,29 @@ function callerCut(status: number | undefined): boolean {
 /** Connection-level failures a compress call is retried once after (postRetryingDrop). */
 const DROPPED_CONNECTION_CODES: ReadonlySet<string> = new Set([
   "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN", "EPIPE", "ECONNABORTED",
-  "ETIMEDOUT", "EAI_AGAIN", "UND_ERR_SOCKET",
+  "ETIMEDOUT", "EAI_AGAIN", "UND_ERR_SOCKET", "ECONNREFUSED",
 ]);
+/** Bodies from this size are streamed, so a drop can be told to come before their end. */
+const STREAMED_UPLOAD_MIN_BYTES = 1024 * 1024;
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
+
+/** `bytes` as a stream that sets `upload.done` once its last chunk was taken. */
+function uploadStream(bytes: Buffer, upload: { done: boolean }): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.length) {
+        upload.done = true;
+        controller.close();
+        return;
+      }
+      const end = Math.min(bytes.length, offset + UPLOAD_CHUNK_BYTES);
+      controller.enqueue(bytes.subarray(offset, end));
+      offset = end;
+      if (offset >= bytes.length) upload.done = true;
+    },
+  });
+}
 
 /** Whether a failed fetch lost its connection (the error's or its cause's code). */
 export function isDroppedConnection(err: unknown): boolean {
@@ -2197,7 +2250,9 @@ function contentTextChars(value: unknown): number {
 /** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
 function scaledTimeout(baseMs: number, bytes: number, perKiB: number): number {
   if (!Number.isFinite(baseMs)) return baseMs;
-  return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * perKiB;
+  // Whole milliseconds: timers truncate a fractional delay, and a call that ran its whole
+  // budget must not measure as shorter than it (the proxy's timedOut check).
+  return baseMs + Math.ceil(Math.ceil(Math.max(0, bytes) / 1024) * perKiB);
 }
 
 /**

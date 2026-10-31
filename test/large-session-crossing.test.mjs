@@ -27,8 +27,8 @@ function readJson(req) {
   });
 }
 
-function compressedReply(tokens, { prepared = false } = {}) {
-  const messages = [{ role: 'user', content: `memory ${'m'.repeat(tokens * 4)}` }];
+function compressedReply(tokens, { prepared = false, n = 0 } = {}) {
+  const messages = [{ role: 'user', content: `memory#${n} ${'m'.repeat(tokens * 4)}` }];
   return { messages, flattened_messages: messages, compressed: true, model_budget_tokens: 960_000,
     usage: { prompt_tokens: 900_000, completion_tokens: tokens,
       prompt_tokens_details: { cached_tokens: 900_000 }, indexed_tokens: 900_000 },
@@ -69,7 +69,8 @@ async function harness({ compressMs = 0, prepareMs = compressMs, compressTimeout
     call.answeredAt = Date.now();
     if (res.destroyed) return;
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(compressedReply(480_000, { prepared: body.prepare && prepares })));
+    res.end(JSON.stringify(compressedReply(480_000, { prepared: body.prepare && prepares,
+      n: calls.indexOf(call) + 1 })));
   });
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: 'mock-secret',
     reqlog: { log: record => records.push(structuredClone(record)) },
@@ -78,11 +79,12 @@ async function harness({ compressMs = 0, prepareMs = compressMs, compressTimeout
     ...(perKiB !== undefined ? { compressTimeoutMsPerKiB: perKiB } : {}) });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, countTokens: true,
     reqlog: { log: record => records.push(structuredClone(record)) } });
-  async function post(messages, { signal, agent } = {}) {
+  async function post(messages, { signal, agent, parentAgent } = {}) {
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST', signal,
       headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'big-session',
-        'anthropic-beta': 'context-1m-2025-08-07', ...(agent ? { 'x-claude-code-agent-id': agent } : {}) },
+        'anthropic-beta': 'context-1m-2025-08-07', ...(agent ? { 'x-claude-code-agent-id': agent } : {}),
+        ...(parentAgent ? { 'x-claude-code-parent-agent-id': parentAgent } : {}) },
       body: JSON.stringify({ model: OPUS, max_tokens: 32_000, messages }),
     });
     await response.text();
@@ -150,7 +152,7 @@ test('a session riding its stable prefix prepares from ~850k and crosses 960k on
       const first = await h.post(conv);
       assert.equal(first.status, 200);
       assert.equal(h.blocking().length, 1);
-      assert.match(JSON.stringify(first.sent.messages[0]), /memory m/);
+      assert.match(JSON.stringify(first.sent.messages[0]).slice(0, 60), /memory#\d+ m/);
       // Ride it up past ~850k: a background preparation starts there.
       await rideTo(h, conv, 870_000);
       await until(() => h.preparing().length >= 1);
@@ -275,5 +277,58 @@ test('a subagent is indexed once when it ends, per turn only past half its budge
     const before = h.indexCalls.length;
     await h.drain(2_000);
     await until(() => h.indexCalls.length === before + 1);
+  } finally { h.close(); }
+});
+
+test('subagent deferral: per conversation of an agent, and never for a parent-id-only request', async () => {
+  const h = await harness();
+  try {
+    const own = [{ role: 'user', content: 'You are implementing Phase 3.' }];
+    const side = [{ role: 'user', content: 'Summarize this file for the subagent.' }];
+    addRound(own, 'o0', 20_000 * 4);
+    addRound(side, 's0', 20_000 * 4);
+    assert.equal((await h.post(own, { agent: 'agent-7' })).status, 200);
+    assert.equal((await h.post(side, { agent: 'agent-7' })).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(h.indexCalls.length, 0);
+    await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-7' });
+    await until(() => h.indexCalls.length === 2);
+    assert.deepEqual(h.indexCalls.map(c => c.messages).sort(), [own.length, side.length].sort(),
+      'both of its conversations, not only the newest');
+    // Attributed by its parent's id only: indexed per turn, as before.
+    const helper = [{ role: 'user', content: 'A helper request.' }];
+    addRound(helper, 'p0', 20_000 * 4);
+    assert.equal((await h.post(helper, { parentAgent: 'agent-8' })).status, 200);
+    await until(() => h.indexCalls.length === 3);
+  } finally { h.close(); }
+});
+
+test('an abandoned crossing whose prefix another turn replaced meanwhile is not ridden', async () => {
+  let arrived = 0;
+  // Call 2 (the abandoned crossing) takes 1.5 s; call 3 (the next crossing) answers at once.
+  const h = await harness({ compressMs: n => { arrived = n; return n === 2 ? 1_500 : 0; },
+    compressTimeoutMs: 5_000, perKiB: 0 });
+  try {
+    const conv = await stablePrefixAt820k(h);
+    addRound(conv, 'jump', 142_000 * 4);
+    const controller = new AbortController();
+    const abandoned = h.post(conv, { signal: controller.signal }).catch(err => err);
+    await until(() => arrived === 2);
+    controller.abort();
+    await abandoned;
+    // The user's next message crosses too, compresses (call 3) and installs its prefix.
+    conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] },
+      { role: 'user', content: 'Carry on.' });
+    const replaced = await h.post(conv);
+    assert.equal(replaced.status, 200, JSON.stringify(replaced.record));
+    assert.match(JSON.stringify(replaced.sent.messages[0]).slice(0, 60), /memory#3 /);
+    await until(() => h.blocking()[1]?.answeredAt !== undefined);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    addRound(conv, 'next', 2_000);
+    const next = await h.post(conv);
+    assert.equal(next.status, 200);
+    assert.equal(next.record.compaction.prepared, undefined, JSON.stringify(next.record.compaction));
+    assert.match(JSON.stringify(next.sent.messages[0]).slice(0, 60), /memory#3 /,
+      'the newer prefix, not call 2');
   } finally { h.close(); }
 });

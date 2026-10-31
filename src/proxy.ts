@@ -501,7 +501,7 @@ interface ProxyState {
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
   /**
-   * Per subagent (agent id), its newest index call not yet sent: a subagent is indexed
+   * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
    * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
    * budget (indexTurn).
    */
@@ -1161,6 +1161,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     shutdownAbort.abort();
     for (const accepted of acceptedRequests) cancelAcceptedRequest(accepted);
     await quiesced;
+    sendDeferredAgentIndexes(state);
     return false;
   };
 
@@ -2737,7 +2738,8 @@ async function handleMessages(
   const linkSeq =
     isMainRequest && !isAwaySummary ? nextMemtreeCallSeq(state) : undefined;
   const edgeCarry = edge?.kind === "compress" && !isAwaySummary
-    ? carryFor({ isMainRequest, sessionId, body, messages, msgsForMemtree, modelContextLimit, rec,
+    ? carryFor({ state, isMainRequest, sessionId, body, messages, msgsForMemtree,
+      modelContextLimit, rec,
       targetTokens: edge.targetTokens, explicitTarget: edge.explicitTarget, linkSeq })
     : undefined;
   let compression: BlockingCompressionOutcome;
@@ -4869,38 +4871,53 @@ function indexTurn(args: {
   sessionId: string | undefined; clientMeta?: Record<string, string>;
 }): void {
   const { opts, state, req, sessionId } = args;
-  const agentId = agentAttributionId(req);
   const send = (force: boolean) => opts.memtree.indexInBackground(args.hash, args.msgsForMemtree,
     args.modelContextLimit, sessionId, args.clientMeta,
-    transcriptTimesFor(opts, sessionId, agentId), force ? { force } : {});
+    transcriptTimesFor(opts, sessionId, agentAttributionId(req)), force ? { force } : {});
+  // Only a request with its own agent id (the one SubagentStop names) waits for its end; one
+  // attributed by its parent's id only is indexed per turn as before.
+  const agentId = firstNonEmptyHeader(req, "x-claude-code-agent-id");
   if (agentId === undefined || sessionId === undefined) return send(false);
   const compaction = args.rec.compaction;
   if (compaction?.estimatedTokens !== undefined &&
       compaction.estimatedTokens >= compaction.budgetTokens * AGENT_PER_TURN_INDEX_SHARE) {
-    state.deferredAgentIndexes.delete(agentId);
+    state.deferredAgentIndexes.delete(deferredIndexKey(agentId, args.msgsForMemtree));
     return send(false);
   }
-  state.deferredAgentIndexes.delete(agentId);
-  state.deferredAgentIndexes.set(agentId, send);
+  // Per agent and conversation: a side request made under the subagent's (or its parent's)
+  // id is another conversation and must not replace the subagent's own.
+  const key = deferredIndexKey(agentId, args.msgsForMemtree);
+  state.deferredAgentIndexes.delete(key);
+  state.deferredAgentIndexes.set(key, send);
   while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
     const oldest = state.deferredAgentIndexes.keys().next().value;
     if (oldest === undefined) break;
-    sendDeferredAgentIndex(state, oldest);
+    sendDeferredIndex(state, oldest);
   }
 }
 
-/** A subagent ended (or is evicted): send its kept index call, whatever its size. */
+/** A deferred index's key: the agent id and its conversation's first message. */
+function deferredIndexKey(agentId: string, messages: Message[]): string {
+  const first = messages.find((message) => message.role !== "system");
+  return JSON.stringify([agentId, first ? mediaFreeMessageHash(first) : ""]);
+}
+
+/** A subagent ended: send each of its conversations' kept index call, whatever its size. */
 function sendDeferredAgentIndex(state: ProxyState, agentId: string): void {
-  const send = state.deferredAgentIndexes.get(agentId);
-  state.deferredAgentIndexes.delete(agentId);
+  for (const key of [...state.deferredAgentIndexes.keys()]) {
+    if ((JSON.parse(key) as [string, string])[0] === agentId) sendDeferredIndex(state, key);
+  }
+}
+
+function sendDeferredIndex(state: ProxyState, key: string): void {
+  const send = state.deferredAgentIndexes.get(key);
+  state.deferredAgentIndexes.delete(key);
   send?.(true);
 }
 
-/** At exit: every subagent's kept index call. */
+/** At exit: every subagent's kept index calls. */
 function sendDeferredAgentIndexes(state: ProxyState): void {
-  for (const agentId of [...state.deferredAgentIndexes.keys()]) {
-    sendDeferredAgentIndex(state, agentId);
-  }
+  for (const key of [...state.deferredAgentIndexes.keys()]) sendDeferredIndex(state, key);
 }
 
 /** The background prepare call and the prefix it yields (maybePrepareCompression). */
@@ -4964,25 +4981,33 @@ interface CarryOver {
   targetTokens: number;
   explicitTarget: false;
   linkSeq?: number;
+  /** The session's stable prefix when the call started: a different one at its end wins. */
+  base: StablePrefix | undefined;
 }
 
 /** A main-thread compaction's CarryOver, when its plan has the automatic target. */
 function carryFor(args: {
-  isMainRequest: boolean; sessionId: string | undefined; body: Record<string, any>;
+  state: ProxyState; isMainRequest: boolean; sessionId: string | undefined; body: Record<string, any>;
   messages: Message[]; msgsForMemtree: Message[]; modelContextLimit: number;
   rec: MessagesRecord; targetTokens: number | undefined; explicitTarget: boolean | undefined;
   linkSeq?: number;
 }): CarryOver | undefined {
   const compaction = args.rec.compaction;
-  // Where prepared prefixes exist (preparesCompression): the turn after rides it.
+  // Where prepared prefixes exist (preparesCompression): the turn after rides it. Not a
+  // /memtree-compact (adoption refuses it) nor beside a preparation (the carry would be
+  // refused, its call left running for nothing).
   if (!args.isMainRequest || args.sessionId === undefined || args.explicitTarget !== false ||
       args.targetTokens === undefined || compaction?.mode !== "auto" ||
+      compaction.reason === "manual" || args.state.compactNow.has(args.sessionId) ||
+      args.state.preparing.has(args.sessionId) || args.state.prepared.isInFlight(args.sessionId) ||
+      args.state.backgroundSignal.aborted ||
       !preparesCompression(args.body.model, args.modelContextLimit)) return undefined;
   return { body: args.body, messages: args.messages, msgsForMemtree: args.msgsForMemtree,
     sessionId: args.sessionId, modelContextLimit: args.modelContextLimit,
     tokens: compaction.estimatedTokens ?? 0, triggerTokens: compaction.budgetTokens,
     targetTokens: args.targetTokens, explicitTarget: false,
-    ...(args.linkSeq !== undefined ? { linkSeq: args.linkSeq } : {}) };
+    ...(args.linkSeq !== undefined ? { linkSeq: args.linkSeq } : {}),
+    base: args.state.stablePrefixes.get(args.sessionId) };
 }
 
 /**
@@ -4996,13 +5021,16 @@ function carryFor(args: {
 function carryOverCompression(
   state: ProxyState, carry: CarryOver, pending: Promise<CompressResult | null>
 ): boolean {
-  const { sessionId } = carry;
+  const { sessionId, base } = carry;
+  // A prefix installed since the call started (another turn's) supersedes it already.
   if (state.backgroundSignal.aborted || state.preparing.has(sessionId) ||
+      state.stablePrefixes.get(sessionId) !== base ||
       !state.prepared.begin(sessionId, carry.tokens, carry.triggerTokens)) return false;
-  const base = state.stablePrefixes.get(sessionId);
   const done: Promise<void> = pending
     .then((result) => {
-      noteMemtreeHealth(state, { result, liveHealth: result ? "success" : "failure" });
+      // A late answer clears the cooldown; a late failure is no new outage evidence (a
+      // refusal or a slow server's timeout must not arm it, as runBlockingCompression).
+      if (result) noteMemtreeHealth(state, { result, liveHealth: "success" });
       return result ? preparedFromResult(carry, result) : undefined;
     })
     .catch(() => undefined)
@@ -5907,7 +5935,8 @@ async function recoverToolRouteMiss(args: {
   };
   res.once("close", markDownstreamClosed);
   const linkSeq = isMainRequest ? nextMemtreeCallSeq(state) : undefined;
-  const toolCarry = stable ? carryFor({ isMainRequest, sessionId, body, messages, msgsForMemtree,
+  const toolCarry = stable ? carryFor({ state, isMainRequest, sessionId, body, messages,
+    msgsForMemtree,
     modelContextLimit, rec, targetTokens: stable.targetTokens, explicitTarget: stable.explicitTarget,
     linkSeq }) : undefined;
   let compression: BlockingCompressionOutcome;
