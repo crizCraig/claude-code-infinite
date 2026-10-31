@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.33](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.32...v1.0.33) (2026-10-31)
+
+
+### Bug Fixes
+
+* /memtree-view opens the session's MemTree page and shows one link ([#57](https://github.com/crizCraig/claude-code-infinite/issues/57)) ([aa919ce](https://github.com/crizCraig/claude-code-infinite/commit/aa919ce89e8c8d75a16532328f820b26b43dac0d))
+* a prompt never compresses beside the crossing it interrupted ([#58](https://github.com/crizCraig/claude-code-infinite/issues/58)) ([f3c52ad](https://github.com/crizCraig/claude-code-infinite/commit/f3c52adf95f16894296bacdbce2a154f3cc83900))
+* concurrent turns share one carried compression; shutdown keeps a held history's media ([#56](https://github.com/crizCraig/claude-code-infinite/issues/56)) ([167b41a](https://github.com/crizCraig/claude-code-infinite/commit/167b41a6e42ce4ad578c777382ce988bf995d7f4))
+* large sessions cross the budget without refusals; fewer index uploads ([#54](https://github.com/crizCraig/claude-code-infinite/issues/54)) ([b812b7a](https://github.com/crizCraig/claude-code-infinite/commit/b812b7a8944117fbfef356b06e9aac859ca156ba))
+
 ## [1.0.32](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.31...v1.0.32) (2026-10-31)
 
 
