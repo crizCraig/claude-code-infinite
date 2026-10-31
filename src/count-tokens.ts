@@ -193,16 +193,20 @@ export interface CountTokensSession {
   count(body: Buffer): Promise<CountTokensResult>;
   peek(body: Buffer): CountTokensResult | undefined;
   /**
-   * Count `body` again, once per request, after its count ran out of time
-   * (outcome "timeout" or "deadline"), with a fresh allowance for its size;
+   * Count `body` again, once per request, after its count ran out of time or lost its
+   * connection (RETRYABLE_COUNT_OUTCOMES), with a fresh allowance for its size;
    * undefined when it did not, or the retry was spent.
    */
   retry?(body: Buffer): Promise<CountTokensResult> | undefined;
 }
 
-/** Outcomes a retry may follow: the count ran out of time, not refused. */
+/**
+ * Outcomes a retry may follow: the count ran out of time or lost its connection, not
+ * refused. A dropped connection says nothing about the body, like a timeout: a ride whose
+ * count dropped stays the fallback a failed compress sends (2026-10-28, a Wi-Fi switch).
+ */
 export const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
-  new Set(["timeout", "deadline"]);
+  new Set(["timeout", "deadline", "network-error"]);
 
 /**
  * Exact results belong to this request and body, never a shared sample slot.

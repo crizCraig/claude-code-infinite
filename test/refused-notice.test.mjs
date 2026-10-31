@@ -19,6 +19,8 @@ import { ToolOutputStore } from "../dist/tool-output-store.js";
 const HANG = Symbol("hang");
 /** A count answered 500: failed, not timed out, so delivery does not retry it. */
 const COUNT_ERROR = Symbol("count error");
+/** A count whose connection dropped (a network error): retried like a timeout. */
+const COUNT_DROP = Symbol("count drop");
 const SESSION = "session-1";
 
 test("a refused degraded turn shows no degraded notice and is followup-refused", async () => {
@@ -156,6 +158,20 @@ test("an uncounted prefix whose count failed (not timed out) is not kept as the 
   }
 });
 
+test("an uncounted prefix whose count lost its connection stays the failed compress's fallback", async () => {
+  // Like a timeout, a dropped connection says nothing about the body: delivery counts it again.
+  const { h, status, rec } = await prefixTurn({ rideCount: COUNT_DROP, compress2: FAIL });
+  try {
+    assert.equal(rec.compaction.uncountedOverWindow, true, JSON.stringify(rec.compaction));
+    assert.equal(status, 200);
+    assert.equal(rec.compaction.keptPrefix, true);
+    assert.equal(rec.turnType, "followup-prefix");
+    assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+  } finally {
+    h.close();
+  }
+});
+
 test("a failed compress's ride whose retried count also times out is refused as followup-refused", async () => {
   const { h, status, rec } = await prefixTurn({ rideAlwaysHangs: true, compress2: FAIL });
   try {
@@ -170,7 +186,7 @@ test("a failed compress's ride whose retried count also times out is refused as 
 });
 
 test("an uncounted fallback keeps the long compress budget when the whole history cannot fit", async () => {
-  // Short budget: 50 ms + 1 ms/KiB (~1.1 s here); long: 8 s. The answer takes 2.5 s.
+  // Short budget: 50 ms + 2.5 ms/KiB (~1.5 s here); long: 8 s. The answer takes 2.5 s.
   const { h, status, rec } = await prefixTurn({
     memtreeOptions: { compressTimeoutMs: 50, longCompressTimeoutMs: 8_000 },
     compress2: async () => {
@@ -289,6 +305,7 @@ async function harness({ count, usage = () => 1_000, compress, budget = 100_000,
     if (req.url.includes("/count_tokens")) {
       const result = await count(body);
       if (result === HANG) return;
+      if (result === COUNT_DROP) return req.socket.destroy();
       if (result === COUNT_ERROR) {
         res.writeHead(500, { "content-type": "application/json" });
         return res.end(JSON.stringify({ type: "error", error: { type: "api_error" } }));

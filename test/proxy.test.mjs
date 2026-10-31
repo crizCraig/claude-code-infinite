@@ -7883,17 +7883,19 @@ test("a failed recovery releases its reservation; the in-flight followup still i
     await waitFor(() => arrived.AAA);
     const recovery = postMessages(proxy.port, largeToolTurn("BBB"), SESSION);
     await waitFor(() => arrived.BBB);
-    // A third miss while the recovery is in flight gets no attempt at all:
-    // the lane is already compressing, so it never reaches the mock.
-    await postMessages(proxy.port, largeToolTurn("CCC"), SESSION);
-    assert.equal(
-      messageRecords(records).at(-1).routeRecovery.outcome,
-      "in-flight"
-    );
+    // A third miss while the recovery is in flight starts no compress beside it: over
+    // the window with nothing to ride, it waits for the lane (instead of going without
+    // and being refused), then plans again.
+    const third = postMessages(proxy.port, largeToolTurn("CCC"), SESSION);
+    await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(arrived.CCC, false, "the in-flight miss sent no compress");
 
     gates.BBB.resolve();
     await recovery;
+    gates.CCC.resolve();
+    await third;
+    const waited = messageRecords(records).find((r) => r.laneWaitMs !== undefined);
+    assert.ok(waited, "the third miss waited for the lane");
     const failed = messageRecords(records).find(
       (r) => r.routeRecovery && r.routeRecovery.outcome === "failed"
     );
@@ -10263,6 +10265,8 @@ test("a subagent's MemTree calls are timed from that subagent's transcript", asy
   try {
     await postMessages(proxy.port, base, agent);
     await postMessages(proxy.port, extendToolLoop(base, "t1"), agent);
+    // A subagent this small is indexed once, when it ends.
+    await postHook(proxy, { hook_event_name: "SubagentStop", agent_id: "agent-9" });
     await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
     const session = SESSION["x-claude-code-session-id"];
     assert.ok(asked.length >= 2, JSON.stringify(asked));

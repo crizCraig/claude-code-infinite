@@ -36,8 +36,19 @@ export declare const CLIENT_VERSION: string;
  * body (20+ MB) takes seconds to send on a slow link before the server even
  * starts, so a flat budget times out on size alone (2026-10-23: every tool
  * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ * Measured from ccc's request logs, 2026-10-23..30: compress calls of 21-27 MB
+ * answered in 10-53 s (median ~19 s); at 1 ms/KiB a 26 MB call had ~41 s and lost
+ * to the 53 s ones, refusing a session for ten minutes (2026-10-30). 2.5 ms/KiB
+ * gives a 26 MB call ~79 s, 1.5x the slowest seen.
  */
-export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 2.5;
+/**
+ * New text (characters) a conversation's history must gain over its last index upload
+ * before the next one is sent: about the server's 10k-token index minimum
+ * (polychat MIN_TOKENS_TO_INDEX) at ~3 characters a token. Under it the server only
+ * acknowledges the upload.
+ */
+export declare const INDEX_MIN_NEW_CHARS = 30000;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
@@ -52,6 +63,10 @@ export interface MemtreeOptions {
     compressTimeoutMs?: number;
     /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
     longCompressTimeoutMs?: number;
+    /** New text an index upload waits for (INDEX_MIN_NEW_CHARS); tests set 0. */
+    indexMinNewChars?: number;
+    /** Added to a compress budget per KiB uploaded (COMPRESS_TIMEOUT_MS_PER_KIB); tests set 0. */
+    compressTimeoutMsPerKiB?: number;
     debug?: boolean;
     /** Always-on JSONL diagnostics; every MemTree call logs one line. */
     reqlog?: RequestLogSink;
@@ -345,6 +360,17 @@ export declare class MemtreeClient {
     private readonly indexLanesNext;
     /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
     private readonly finalIndexLanes;
+    private readonly indexMinNewChars;
+    private readonly compressTimeoutMsPerKiB;
+    /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
+    private readonly indexLanesSent;
+    /**
+     * Per conversation, the newest history held back by INDEX_MIN_NEW_CHARS: sent before a
+     * call that does not carry it whole (a rewind, evicted media) replaces it.
+     */
+    private readonly indexLanesHeld;
+    /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
+    private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -503,15 +529,47 @@ export declare class MemtreeClient {
      */
     indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
     /** Times for retained original messages, in the positions actually sent. */
-    messageTimesFor?: (messages: Message[]) => MessageTimes): void;
+    messageTimesFor?: (messages: Message[]) => MessageTimes, 
+    /**
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text. `finalIndex` (implies it):
+     * flagged final_index, so the server indexes the tail under its own minimum too; the
+     * server allows one per conversation per 30 minutes, so only at a subagent's end.
+     */
+    options?: {
+        force?: boolean;
+        finalIndex?: boolean;
+    }): void;
     /**
      * At most one background index call per conversation. Each call carries the whole
      * history, so while one uploads only the newest waiting call is worth sending: a long
      * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
      * the compress calls that share the link (long-session test, staging 2026-10-24). A
      * waiting call is replaced only by one whose history extends it; otherwise it goes now.
+     * A call whose history extends the last one sent by less than INDEX_MIN_NEW_CHARS of
+     * text is not sent at all: the server only acknowledges it (2026-10-30: 3 in 4 of a
+     * 23 MB session's index uploads, ~1 GB per 40 minutes).
      */
     private enqueueIndex;
+    /**
+     * Send `job` as its conversation's newest upload: the INDEX_MIN_NEW_CHARS baseline while
+     * it is in flight, and once it succeeded. A failed one is never a baseline, so the next
+     * turn is not held back by an upload the server never got.
+     */
+    private sendLaneIndex;
+    /**
+     * Before `job` goes or is held: the lane's held-back history is sent if `job` does not
+     * carry it whole (origin/main sent every turn, so a rewind must not lose a branch), and
+     * dropped otherwise (`job` carries it).
+     */
+    private releaseHeldIndex;
+    private holdIndex;
+    /**
+     * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
+     * last sent (or has waiting to send): the server's index minimum would only ack it.
+     */
+    private tooLittleNewText;
+    /** Record the history an index call of `lane` delivered. */
+    private noteIndexSent;
     private startLaneIndex;
     /**
      * At shutdown: send every waiting call now, inside the drain, except one whose history
@@ -578,7 +636,20 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
-    /** One POST of a MemTree call's body. */
+    /**
+     * A compress or prepare call's POST, sent once more (within the same budget) when its
+     * connection dropped while the body was still uploading: a Wi-Fi switch cut a 24 MB
+     * upload with EHOSTUNREACH after 89 s, ~1 MB sent (2026-10-28), and the turn went without
+     * memory. Only before the whole body was handed over: after that MemTree may already be
+     * compressing (and billing) it, and a second call would be a second compression.
+     * Index-only calls are not retried: the next turn sends their history again.
+     */
+    private postRetryingDrop;
+    /**
+     * One POST of a MemTree call's body. With `upload`, a body of STREAMED_UPLOAD_MIN_BYTES
+     * or more goes as a stream and `upload.done` turns true once its last byte was handed
+     * over (a smaller one counts as handed over at once).
+     */
     private postContextMemory;
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the
@@ -605,4 +676,16 @@ export interface MainConversation {
 }
 /** The conversation plus the reply that ended it, unless it already ends with a reply. */
 export declare function withFinalReply(messages: Message[], reply: Message | undefined): Message[];
+/** Whether a failed fetch lost its connection (the error's or its cause's code). */
+export declare function isDroppedConnection(err: unknown): boolean;
+/**
+ * The text a history carries, in characters: strings and text blocks, tool inputs and
+ * results; images and documents (base64) count nothing. For INDEX_MIN_NEW_CHARS only.
+ */
+export declare function messagesTextChars(messages: Message[]): number;
+/**
+ * Whether `older` holds an image or document `newer` does not (Claude Code evicted it):
+ * replacing `older` by `newer` would leave it never uploaded.
+ */
+export declare function losesMedia(older: Message[], newer: Message[]): boolean;
 //# sourceMappingURL=memtree.d.ts.map

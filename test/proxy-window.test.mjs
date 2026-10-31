@@ -96,13 +96,19 @@ test("a smaller-window recovery in flight holds the lane's allowance", async () 
         assert.fail("the smaller-window turn must enter blocking compression");
       }),
     ]);
-    await fixture.post(extend(continued, "t2"), { model: SMALL_MODEL }, {}, 503);
-    assert.equal(fixture.lastRecord().routeRecovery.outcome, "in-flight");
+    // A concurrent miss over the window waits for the lane's compression (never a second
+    // attempt beside it, never its oversized original), then rides what that installed.
+    const concurrent = fixture.post(extend(continued, "t2"), { model: SMALL_MODEL });
+    await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(fixture.calls.length, 2, "a concurrent miss cannot buy another attempt");
-    assert.equal(fixture.forwarded.length, 1, "concurrent oversized original is refused");
+    assert.equal(fixture.forwarded.length, 1, "concurrent oversized original is not sent");
     release();
     await rebuilding;
-    assert.equal(fixture.lastRecord().routeRecovery.install, "installed");
+    await concurrent;
+    const records = fixture.messageRecords();
+    assert.ok(records.some((r) => r.routeRecovery?.install === "installed"));
+    assert.ok(records.some((r) => r.laneWaitMs > 0), "the concurrent miss waited for the lane");
+    assert.equal(fixture.calls.length, 2, "it rode the installed route, no compress of its own");
   } finally {
     release();
     await rebuilding;
@@ -300,6 +306,7 @@ async function windowFixture({ compress, status, nativeOneMillionContext, holdFi
   }
   return {
     calls, forwarded, request,
+    messageRecords: () => records.filter((record) => record.kind === "messages"),
     lastRecord: () => records.filter((record) => record.kind === "messages").at(-1),
     async post(messages, extra = {}, headers = {}, expectedStatus = 200) {
       const result = await request(messages, extra, headers, expectedStatus);

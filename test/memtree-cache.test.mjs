@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { MemtreeClient, withFinalReply } from "../dist/memtree.js";
+import { INDEX_MIN_NEW_CHARS, MemtreeClient, isDroppedConnection, messagesTextChars, withFinalReply }
+  from "../dist/memtree.js";
 import { startProxy } from "../dist/proxy.js";
 
 const MESSAGES = [{ role: "user", content: "same conversation" }];
@@ -490,7 +491,7 @@ test("background indexing keeps one call in flight per conversation; the newest 
   // index call, up to 16 at once (424 MB) while a compress of the same history timed out.
   const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
   try {
-    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexMinNewChars: 0 });
     // As the proxy sends them: the system prompt first (its billing line changes per call).
     const history = (n, first = "task", system = "sys 1") => [{ role: "system", content: system },
       ...Array.from({ length: n }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: i ? `turn ${i}` : first }))];
@@ -520,7 +521,7 @@ test("background indexing keeps one call in flight per conversation; the newest 
 test("a waiting index call another branch does not extend is sent, not dropped", async () => {
   const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
   try {
-    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexMinNewChars: 0 });
     const branch = (n, tag) => Array.from({ length: n }, (_, i) =>
       ({ role: i % 2 ? "assistant" : "user", content: i < 3 ? `turn ${i}` : `${tag} ${i}` }));
     for (const messages of [branch(3, "x"), branch(6, "x"), branch(8, "y")]) {
@@ -584,7 +585,7 @@ test("at shutdown a waiting call the final index does not contain (a rewind) is 
 test("at shutdown a waiting index call is sent inside the drain unless the final index carries it", async () => {
   const fixture = await memtreeFixture({ hold: true, result: () => ({ messages: [], index_only: true }) });
   try {
-    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexMinNewChars: 0 });
     const history = (n, first) => Array.from({ length: n }, (_, i) =>
       ({ role: i % 2 ? "assistant" : "user", content: i ? `turn ${i}` : first }));
     const send = (messages) => client.indexInBackground(
@@ -606,6 +607,343 @@ test("at shutdown a waiting index call is sent inside the drain unless the final
   } finally {
     fixture.release();
     await fixture.close();
+  }
+});
+
+test("an index upload waits until its history has gained the server's index minimum of new text", async () => {
+  // 2026-10-30, a 23 MB session: every main-lane tool turn uploaded the whole history to
+  // index; 3 in 4 only got an ack (under the server's 10k-token minimum), ~1 GB per 40 min.
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const conv = [{ role: "user", content: "task" }];
+    const turn = (chars) => {
+      conv.push({ role: "assistant", content: "next" }, { role: "user", content: "y".repeat(chars) });
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    turn(50_000);
+    await waitFor(() => fixture.calls.length === 1);
+    const step = Math.floor(INDEX_MIN_NEW_CHARS / 4);
+    for (let i = 0; i < 3; i++) turn(step); // 3/4 of the minimum: none sent
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(fixture.calls.length, 1, "under the minimum of new text: not uploaded");
+    turn(step + 10); // past it: the whole history goes
+    await waitFor(() => fixture.calls.length === 2);
+    assert.equal(fixture.calls[1].messages.length, conv.length);
+    // A history that does not extend the last one (a rewind) is sent at once.
+    const rewound = [{ role: "user", content: "task" }, { role: "assistant", content: "other" },
+      { role: "user", content: "z" }];
+    client.indexInBackground(MemtreeClient.hashMessages(rewound), rewound, 100, "s");
+    await waitFor(() => fixture.calls.length === 3);
+    // A forced call (a subagent's one index at its end) goes whatever its size.
+    const tail = [...rewound, { role: "assistant", content: "a" }, { role: "user", content: "b" }];
+    client.indexInBackground(MemtreeClient.hashMessages(tail), tail, 100, "s", undefined,
+      undefined, { force: true });
+    await waitFor(() => fixture.calls.length === 4);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("an image is never held back by the text minimum (Claude Code may evict it later)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const send = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    send();
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    conv.push({ role: "assistant", content: "shot" }, { role: "user", content: [
+      { type: "tool_result", tool_use_id: "t", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } }] }] });
+    send();
+    await waitFor(() => fixture.calls.length === 2);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a failed upload is never the baseline, even with branches failing in flight together", async () => {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf8")).messages.length);
+      const ok = calls.length > 3;
+      setTimeout(() => {
+        if (!ok) { res.writeHead(500); return res.end("boom"); }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messages: [], index_only: true }));
+      }, ok ? 0 : 80);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const root = { role: "user", content: "x".repeat(40_000) };
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const a = [root, { role: "assistant", content: "a".repeat(40_000) }];
+    send(a); // in flight, fails
+    send([root, { role: "assistant", content: "b".repeat(40_000) }]); // waits
+    send([root, { role: "assistant", content: "c".repeat(40_000) }]); // b goes beside a; both fail
+    await waitFor(() => calls.length === 3);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    send([...a, { role: "user", content: "small" }]); // a never arrived: sent
+    await waitFor(() => calls.length === 4);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a 401 answered before a streamed upload ended still reads as an invalid key", async () => {
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls++;
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "Invalid API key" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "revoked" });
+    const big = [{ role: "user", content: "x".repeat(25_000_000) }];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(big), big, 1_000_000,
+      undefined, {}), null);
+    assert.equal(client.keyInvalid, true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a waiting index call whose image the next one lost (evicted) is sent, not replaced", async () => {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      calls.push(Buffer.concat(chunks).toString("utf8"));
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messages: [], index_only: true }));
+      }, 100);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]); // in flight
+    const shot = [root, { role: "assistant", content: "look" }, { role: "user", content: [
+      { type: "text", text: "screen" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" } }] }];
+    send(shot); // waits
+    const evicted = [root, { role: "assistant", content: "look" }, { role: "user", content: [
+      { type: "text", text: "screen" }] }, { role: "assistant", content: "y".repeat(40_000) },
+      { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png",
+        data: "iVBORw0KGgoNEW" } }] }]; // a new image: as many as before, not the same one
+    send(evicted);
+    assert.equal(await client.drainBackground(3_000), true);
+    await waitFor(() => calls.length === 3);
+    assert.ok(calls.some((body) => body.includes("iVBORw0KGgo")), "the image reached MemTree");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a held-back history is sent before a rewind replaces it (origin/main sent every turn)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]);
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const branch = [root, { role: "assistant", content: "a".repeat(20_000) }];
+    send(branch); // under the minimum: held back
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(fixture.calls.length, 1);
+    send([root, { role: "assistant", content: "rewound" }]); // a rewind: the branch goes first
+    await waitFor(() => fixture.calls.length >= 2);
+    assert.equal(await client.drainBackground(2_000), true);
+    assert.ok(fixture.calls.some((call) => JSON.stringify(call.messages).includes("a".repeat(100))),
+      "the held-back branch reached MemTree");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("at shutdown a held-back history goes inside the drain (no final index carries it)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]);
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    send([root, { role: "assistant", content: "tail" }]); // held back
+    assert.equal(await client.drainBackground(2_000), true);
+    assert.equal(fixture.calls.length, 2);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a held-back history evicted over capacity is sent, not dropped (Codex r7)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const lanes = 65; // one past the held-history capacity (64)
+    for (let i = 0; i < lanes; i++) {
+      const root = [{ role: "user", content: `lane ${i} ` + "x".repeat(20_000) }];
+      client.indexInBackground(MemtreeClient.hashMessages(root), root, 100, `s${i}`);
+    }
+    // Synchronously, while every root upload is still in flight (the held baseline).
+    for (let i = 0; i < lanes; i++) {
+      const grown = [{ role: "user", content: `lane ${i} ` + "x".repeat(20_000) },
+        { role: "assistant", content: `held ${i} ` + "a".repeat(20_000) }];
+      client.indexInBackground(MemtreeClient.hashMessages(grown), grown, 100, `s${i}`);
+    }
+    assert.equal(await client.drainBackground(10_000), true);
+    const sent = new Set(fixture.calls.map((call) => JSON.stringify(call.messages))
+      .flatMap((text) => [...text.matchAll(/held (\d+) /g)].map((m) => m[1])));
+    assert.equal(sent.size, lanes, `${sent.size} of ${lanes} held histories reached MemTree`);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("text size counts text, tool inputs and results, not images", () => {
+  assert.equal(messagesTextChars([
+    { role: "user", content: "abc" },
+    { role: "assistant", content: [{ type: "text", text: "de" }, { type: "thinking", thinking: "f" },
+      { type: "tool_use", id: "t", name: "Read", input: { p: 1 } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [
+      { type: "text", text: "gh" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "x".repeat(999) } }] }] },
+  ]), 3 + 2 + 1 + JSON.stringify({ p: 1 }).length + 2);
+});
+
+test("a compress whose upload dropped is sent once more; never once its body was sent", async () => {
+  // 2026-10-28: a Wi-Fi switch cut a 24 MB compress upload (EHOSTUNREACH after 89 s, ~1 MB
+  // sent). A drop after the whole body went may be MemTree already compressing (and billing)
+  // it: no second call then.
+  let mode = "mid-upload", compressCalls = 0, indexCalls = 0;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    if (mode === "mid-upload" && compressCalls === 0) {
+      // Read nothing: the socket buffers fill and the client still holds most of the body
+      // (it is larger than any kernel's buffers), then the connection drops.
+      compressCalls++;
+      req.pause();
+      setTimeout(() => req.socket.destroy(), 200);
+      return;
+    }
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (body.index_only) {
+        indexCalls++;
+        return req.socket.destroy();
+      }
+      compressCalls++;
+      if (mode === "after-body") return req.socket.destroy();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(RESULT));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    // Over 1 MB, so it is streamed, and far over socket buffers: the drop lands before its end.
+    const big = [{ role: "user", content: "x".repeat(25_000_000) }];
+    const result = await client.compress(MemtreeClient.hashMessages(big), big, 1_000_000,
+      undefined, {});
+    assert.ok(result, "answered on the second attempt");
+    assert.equal(compressCalls, 2);
+
+    mode = "after-body";
+    compressCalls = 0;
+    const other = [{ role: "user", content: "y".repeat(3_000_000) }];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(other), other, 1_000_000,
+      undefined, {}), null);
+    assert.equal(compressCalls, 1, "the whole body was sent: not sent again");
+
+    client.indexInBackground(HASH, MESSAGES, 1_000_000, "s");
+    assert.equal(await client.drainBackground(2_000), true);
+    assert.equal(indexCalls, 1);
+    assert.equal(isDroppedConnection(Object.assign(new TypeError("fetch failed"),
+      { cause: { code: "EHOSTUNREACH" } })), true);
+    assert.equal(isDroppedConnection(new Error("context_memory 500: boom")), false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a failed index upload is no baseline; a held-back history can still be forced", async () => {
+  let fail = true;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      calls.push(body.messages.length);
+      if (fail) { res.writeHead(500); return res.end("boom"); }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ messages: [], index_only: true }));
+    });
+  });
+  const calls = [];
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const conv = [{ role: "user", content: "x".repeat(40_000) }];
+    const send = (options) => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s",
+        undefined, undefined, options);
+    };
+    send();
+    await waitFor(() => calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fail = false;
+    conv.push({ role: "assistant", content: "a" }, { role: "user", content: "b" });
+    send(); // ~2 characters more than the failed upload: sent, since that one never arrived
+    await waitFor(() => calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    conv.push({ role: "assistant", content: "c" }, { role: "user", content: "d" });
+    send(); // held back: under the minimum over the one that arrived
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(calls.length, 2);
+    send({ force: true }); // the same history, forced (a subagent's end): it goes
+    await waitFor(() => calls.length === 3);
+    assert.equal(calls[2], conv.length);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

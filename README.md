@@ -378,13 +378,29 @@ If counting an assembled compressed prefix discovers that it is over budget,
 whether to forward or refuse it. The request log records that decision under
 `lateCountRecovery.outcome` as `compressed`, `forwarded`, or `refused`.
 
-A blocking compression call normally gets 15 seconds; when it fails, the request
-goes out on the old prefix or whole. When there is neither (no compressed prefix
-to ride, as on the first turn after `--resume`, and a whole request that delivery
-would refuse as over the window), the call gets 120 seconds instead, since a timeout
-could only end in a refusal. `CCC_COMPRESS_TIMEOUT_MS` overrides both. A Claude
-Code retry that arrives while the same session's compression of the same history
-is running waits for that call instead of starting another.
+A blocking compression call normally gets 15 seconds plus 2.5 ms per KiB it uploads
+(~79 seconds for a 26 MB session; MemTree has taken up to 53 seconds for one that size);
+when it fails, the request goes out on the old prefix or whole. When there is neither
+(no compressed prefix to ride, as on the first turn after `--resume`, and a whole
+request that delivery would refuse as over the window), the call gets 120 seconds (or
+its upload's budget, if longer) instead, since a timeout could only end in a refusal.
+`CCC_COMPRESS_TIMEOUT_MS` overrides the 15 and 120 seconds. A Claude Code retry that
+arrives while the same session's compression of the same history is running waits for
+that call instead of starting another. On a 1M window, a main-thread compression the
+turn stopped waiting for (or whose turn Claude Code abandoned) is not dropped: it runs on
+to the long budget as the session's prepared prefix, and the next turn at the budget
+waits for it and rides it instead of starting another (`compress.carriedOver` in
+`requests.jsonl`). A compression whose connection drops before any answer (a Wi-Fi
+switch: `ECONNRESET`, `EHOSTUNREACH`, ...) is sent once more within the same budget, and a
+token count that loses its connection is retried like one that timed out.
+
+Background indexing sends each conversation's history at most one call at a time, keeps
+only the newest waiting call, and skips a call until the history has gained about 30,000
+characters of text (the server's 10k-token index minimum) since the last one it sent.
+A subagent is indexed once, when it ends (SubagentStop, or at exit for one still running),
+and on every tool turn only once it passes half of its budget, so its tree is ready if
+it ever needs compressing. Its tree, searchable with the MemTree tools and on its page,
+therefore covers a running subagent's work only from the moment it ends.
 
 Before publishing a release, verify Claude subscription OAuth counting in a live
 session: launch this checkout's `node dist/cli.js --resume` with the normal Claude

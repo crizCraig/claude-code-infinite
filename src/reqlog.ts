@@ -196,6 +196,11 @@ export interface MessagesRecord {
      * no room): MemTree has the conversation, unlike in an outage.
      */
     refused?: true;
+    /**
+     * Timed out while still running: the call went on as the session's preparation,
+     * which the next turn at the budget waits for (carryOverCompression).
+     */
+    carriedOver?: true;
   };
   /**
    * How much conversation the compressed response actually carried. Recorded
@@ -296,6 +301,11 @@ export interface MessagesRecord {
   overBudgetForward?: {
     reason: "exact-count-fits-window" | "estimate-fits-window" | "bytes-fallback-fits-window";
   };
+  /**
+   * A tool turn over the window with nothing to ride waited this long for its lane's
+   * compression in flight before planning again (instead of going without and refused).
+   */
+  laneWaitMs?: number;
   /**
    * Outcome of a tool-turn compaction attempt (a tool turn whose estimated
    * size reached the budget), or why none was made although one was due.

@@ -15,7 +15,7 @@ const SHORT_MS = 100;
 const LONG_MS = 3_000;
 const SLOW_MS = 500;
 /**
- * A MemTree slower than any short budget here (100 ms plus 1 ms per KiB uploaded: ~450 ms
+ * A MemTree slower than any short budget here (100 ms plus 2.5 ms per KiB uploaded: ~950 ms
  * for 350 KB) yet inside the long one. A turn that got the long budget would wait for it
  * and compress; one that got the short budget returns long before it, with a wide margin
  * for a loaded machine (SLOW_MS was only ~60 ms above the 350 KB turn's short budget).
@@ -101,7 +101,7 @@ async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
     h.budgets.push(meta?.timeoutMs);
     return compress(hash, messages, limit, signal, meta);
   };
-  /** The short budget for the last turn: the base plus 1 ms per KiB it uploaded. */
+  /** The short budget for the last turn: the base plus 2.5 ms per KiB it uploaded. */
   h.shortBudget = () => memtree.compressBudgetForBytes(h.lastRecord().requestBytes);
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
     budgetTokensOverride: 20_000, countTokens,
