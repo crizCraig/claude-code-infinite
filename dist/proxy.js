@@ -4183,7 +4183,9 @@ async function runBlockingCompression(args) {
     // Budget-consumed heuristic: the client maps every failure to null, so a
     // null that took (roughly) the whole abort budget was almost certainly
     // the AbortSignal timeout, not a fast server error.
-    const timedOut = result === null && compressMs >= Math.min(budgetMs, maximumWait);
+    // A few ms of slack: a timer can fire a millisecond early by the wall clock (CI flake).
+    const timedOut = result === null &&
+        compressMs + TIMER_SLACK_MS >= Math.min(budgetMs, maximumWait);
     // A timeout while other compress calls answered (one succeeded after this
     // one started) is this call's size or the server's slow reply, not an outage: it arms no cooldown (2026-10-23:
     // healthy-server timeouts kept the fuse lit and a screenshot turn was refused).
@@ -5081,6 +5083,8 @@ function currentLaneRide(state, routeKey, body, messages, sessionId, isMainReque
     return raw ? { raw, turnType: "tool-memory", sizeHolder: route.stablePrefix ?? route }
         : undefined;
 }
+/** Wall-clock slack when judging whether a call ran its whole budget (timers fire early). */
+const TIMER_SLACK_MS = 5;
 /** How often a turn waiting for its lane's compression looks again. */
 const LANE_WAIT_POLL_MS = 100;
 /**
