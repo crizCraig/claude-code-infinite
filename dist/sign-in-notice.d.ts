@@ -44,6 +44,25 @@ export interface SignInNotice {
     /** Repeated inside Claude Code at its first SessionStart. */
     sessionLine?: string;
 }
+/**
+ * Whether the sign-in message applies this launch: not right after ccc installed Claude
+ * Code (the installer has just said Claude Code asks to sign in). `locateClaude()` gives
+ * null, not undefined, when Claude Code was missing (release 1.0.32 review).
+ */
+export declare function signInNoticeApplies(foundBeforeInstall: object | null | undefined): boolean;
+/**
+ * The probe as this session will see it. `claude auth status` runs non-interactively,
+ * so it counts an ANTHROPIC_API_KEY the user rejected at Claude Code's prompt; the
+ * interactive session skips that key (apiKeyOverride gives no ANTHROPIC_API_KEY
+ * override), so the probe's "api_key" says nothing about it: treated as unknown and left
+ * to the config files (release 1.0.32 review r1).
+ */
+export declare function sessionProbe(probe: AuthProbe, override: ApiKeyOverride | undefined): AuthProbe;
+/**
+ * Whether the notice may wait for Enter: a terminal that shows the prompt (stderr), and
+ * not CI, where a pseudo-terminal has nobody to press Enter (release 1.0.32 review r1).
+ */
+export declare function mayWaitForEnter(interactive: boolean, stderrIsTty: boolean, env: NodeJS.ProcessEnv): boolean;
 /** The sign-in message before Claude Code starts, or undefined when there is nothing to say. */
 export declare function signInNotice(input: SignInNoticeInput): SignInNotice | undefined;
 /** The lines on stderr (stdout stays Claude Code's in print runs). */

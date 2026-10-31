@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { CLAUDE_AUTH_TYPES } from "./claude-auth.js";
+import { isCi } from "./install-ping.js";
 import { apiKeyOverrideText, creditReminderText, needsCreditReminder, needsPlanWarning, PAID_PLANS, } from "./claude-plan-warning.js";
 export const PLAN_URL = "https://claude.ai/upgrade";
 export const MEMTREE_CREDIT_LINE = "Your MemTree credit covers MemTree, not Claude itself.";
@@ -39,6 +40,36 @@ export const SIGN_IN_WARNING_KINDS = [
 /** The file in ccc's config directory holding the last sign-in type Claude Code reported. */
 export const SIGN_IN_STATE_FILE = "claude-sign-in-state.json";
 const CLOUD_AUTH = ["bedrock", "vertex", "foundry"];
+/**
+ * Whether the sign-in message applies this launch: not right after ccc installed Claude
+ * Code (the installer has just said Claude Code asks to sign in). `locateClaude()` gives
+ * null, not undefined, when Claude Code was missing (release 1.0.32 review).
+ */
+export function signInNoticeApplies(foundBeforeInstall) {
+    return foundBeforeInstall !== null && foundBeforeInstall !== undefined;
+}
+/**
+ * The probe as this session will see it. `claude auth status` runs non-interactively,
+ * so it counts an ANTHROPIC_API_KEY the user rejected at Claude Code's prompt; the
+ * interactive session skips that key (apiKeyOverride gives no ANTHROPIC_API_KEY
+ * override), so the probe's "api_key" says nothing about it: treated as unknown and left
+ * to the config files (release 1.0.32 review r1).
+ */
+export function sessionProbe(probe, override) {
+    const status = probe.status;
+    if (status?.auth !== "api_key" || status.keySource !== "ANTHROPIC_API_KEY")
+        return probe;
+    if (override?.source === "ANTHROPIC_API_KEY")
+        return probe;
+    return { result: probe.result, ms: probe.ms };
+}
+/**
+ * Whether the notice may wait for Enter: a terminal that shows the prompt (stderr), and
+ * not CI, where a pseudo-terminal has nobody to press Enter (release 1.0.32 review r1).
+ */
+export function mayWaitForEnter(interactive, stderrIsTty, env) {
+    return interactive && stderrIsTty && !isCi(env);
+}
 /** The sign-in message before Claude Code starts, or undefined when there is nothing to say. */
 export function signInNotice(input) {
     const status = input.probe.status;

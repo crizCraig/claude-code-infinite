@@ -160,7 +160,10 @@ import {
   skippedProbe,
   type AuthProbe,
 } from "./claude-auth-status.js";
-import { presentSignInNotice, signInNotice, SignInTracker } from "./sign-in-notice.js";
+import {
+  mayWaitForEnter, presentSignInNotice, sessionProbe, signInNotice, signInNoticeApplies,
+  SignInTracker,
+} from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -389,6 +392,8 @@ async function showSignInNotice(
   probe: AuthProbe, applies: boolean, ctx: SignInContext
 ): Promise<string | undefined> {
   ctx.diagnostics.record("claude_auth_probe", { result: probe.result, ms: probe.ms });
+  // An env key the user rejected: the probe counts it, this session won't.
+  probe = sessionProbe(probe, ctx.override);
   const status = probe.status;
   if (status && status.auth !== "unknown") {
     const plan = status.plan !== "unknown" ? status.plan : ctx.claudeSignIn.plan;
@@ -404,8 +409,9 @@ async function showSignInNotice(
   const auth = status && status.auth !== "unknown"
     ? status.auth : ctx.claudeSignIn.seen ?? ctx.claudeSignIn.auth;
   const go = await presentSignInNotice(notice, {
-    // The prompt is on stderr: never wait where it can't be seen (`ccc 2>log`).
-    interactive: ctx.interactive && process.stderr.isTTY === true, auth, tracker: ctx.tracker,
+    // The prompt is on stderr: never wait where it can't be seen (`ccc 2>log`), nor in CI.
+    interactive: mayWaitForEnter(ctx.interactive, process.stderr.isTTY === true, process.env),
+    auth, tracker: ctx.tracker,
     record: (name, fields) => ctx.diagnostics.record(name, fields),
   });
   if (!go) {
@@ -822,7 +828,7 @@ async function main() {
   // first prompt (stderr), and when not signed in, held until Enter so it is read.
   // Not right after ccc installed Claude Code: it has just said Claude Code asks to sign in.
   const probe = await authProbe;
-  if (probe) signInSessionLine.text = await showSignInNotice(probe, found !== undefined, {
+  if (probe) signInSessionLine.text = await showSignInNotice(probe, signInNoticeApplies(found), {
     claudeSignIn, creditRefused: creditMemory.refusedAtStart, override: keyOverride,
     interactive: interactiveUi, diagnostics, tracker: signInTracker,
   });
