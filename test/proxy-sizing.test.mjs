@@ -342,9 +342,9 @@ test('late recovery timeout stays bounded and forwards an already-counted fittin
     const start = Date.now();
     assert.equal(await h.post(0, { agent: '', messages: [...original,
       { role: 'assistant', content: 'answer2' }, { role: 'user', content: 'next' }] }), 200);
-    // The 100 ms budget plus 1 ms per KiB of the ~1.2 MB upload (memtree.ts
+    // The 100 ms budget plus 2.5 ms per KiB of the ~1.2 MB upload (~3 s, memtree.ts
     // COMPRESS_TIMEOUT_MS_PER_KIB).
-    assert.ok(Date.now() - start < 2_000, 'late compression does not hold the request indefinitely');
+    assert.ok(Date.now() - start < 5_000, 'late compression does not hold the request indefinitely');
     assert.equal(h.compressions.length, 2);
     assert.equal(h.counts.length, 3, 'one request-local count for the ride, no recount after timeout');
     const rec = h.records.filter(r => r.kind === 'messages').at(-1);

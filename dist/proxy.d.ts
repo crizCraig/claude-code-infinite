@@ -335,6 +335,12 @@ interface ProxyState {
     refusalStreaks: RefusalStreaks;
     /** Suppress producer-side state changes while agent API traffic is active. */
     activeSubagents: Set<string>;
+    /**
+     * Per subagent (agent id), its newest index call not yet sent: a subagent is indexed
+     * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
+     * budget (indexTurn).
+     */
+    deferredAgentIndexes: Map<string, (force: boolean) => void>;
     /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
     memoryRoutes: Map<string, MemoryRoute>;
     /** Latest main route for validated away-summary forks, independent of hook events. */
@@ -587,6 +593,24 @@ export declare const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the ma
 /** "50k", "50000", "1.5m" → tokens; undefined when not a positive count. */
 export declare function parseTokenCount(text: string): number | undefined;
 /**
+ * A main-thread compaction at the automatic target (a turn at the budget): what its
+ * answer needs to become the session's prepared prefix (carryOverCompression).
+ */
+interface CarryOver {
+    body: Record<string, any>;
+    /** The request's messages: the prefix's identity. */
+    messages: Message[];
+    msgsForMemtree: Message[];
+    sessionId: string;
+    modelContextLimit: number;
+    /** The turn's planned size, and the budget (trigger) it was planned against. */
+    tokens: number;
+    triggerTokens: number;
+    targetTokens: number;
+    explicitTarget: false;
+    linkSeq?: number;
+}
+/**
  * Whether a forwarded compressed body still overflows the window: its exact
  * count (`exactTokens`, made for delivery), else its reported input tokens,
  * both Anthropic's own count, so the output floor applies; else its
@@ -638,6 +662,11 @@ declare function runBlockingCompression(args: {
     longBudget?: boolean;
     /** Aborts the compress call; default state.shutdownSignal. */
     signal?: AbortSignal;
+    /**
+     * A main-thread compaction (automatic target): if this wait ends first, the call
+     * runs on to the long budget and becomes the session's preparation (carryOverCompression).
+     */
+    carry?: CarryOver;
 }): Promise<BlockingCompressionOutcome>;
 type BackgroundCompressArgs = Omit<Parameters<typeof runBlockingCompression>[0], "longBudget"> & {
     linkSeq?: number;

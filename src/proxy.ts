@@ -193,8 +193,11 @@ const HOOK_BODY_TIMEOUT_MS = 3_000;
 const TOOL_RECOVERY_FAILURE_COOLDOWN_MS = 60_000;
 /** Safety cap on a long-budget compress, should a transport ignore its abort. */
 const MAX_LONG_COMPRESS_WAIT_MS = 10 * 60_000;
-/** The most a blocking compress with a fallback may wait (its budget grows with its upload). */
-const MAX_COMPRESS_WAIT_MS = 60_000;
+/**
+ * The most a blocking compress with a fallback may wait (its budget grows with its upload):
+ * a 30 MB upload's scaled budget (15 s + 2.5 ms/KiB, ~90 s) fits under it.
+ */
+const MAX_COMPRESS_WAIT_MS = 120_000;
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -497,6 +500,12 @@ interface ProxyState {
   refusalStreaks: RefusalStreaks;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
+  /**
+   * Per subagent (agent id), its newest index call not yet sent: a subagent is indexed
+   * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
+   * budget (indexTurn).
+   */
+  deferredAgentIndexes: Map<string, (force: boolean) => void>;
   /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
   memoryRoutes: Map<string, MemoryRoute>;
   /** Latest main route for validated away-summary forks, independent of hook events. */
@@ -1039,6 +1048,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs),
     refusalStreaks: new RefusalStreaks(),
     activeSubagents: new Set(),
+    deferredAgentIndexes: new Map(),
     memoryRoutes: new Map(),
     mainRouteEpoch: 0,
     mainRouteDecisionGeneration: 0,
@@ -1121,6 +1131,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
         ? Math.floor(timeoutMs)
         : 5_000;
     backgroundAbort.abort();
+    // Subagents still running at exit get their one index inside the drain.
+    sendDeferredAgentIndexes(state);
     const quiesced = (async () => {
       // Once close completes, every accepted request has entered the tracked
       // set.
@@ -1137,7 +1149,10 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       }),
     ]);
     if (timer) clearTimeout(timer);
-    if (completed) return true;
+    if (completed) {
+      sendDeferredAgentIndexes(state);
+      return true;
+    }
 
     // The grace period protects useful in-flight delivery. Once it
     // expires, signal every forwarding path first so each can
@@ -1700,6 +1715,7 @@ async function handleNoticeHook(
   }
   if (parsed.hook_event_name === "SubagentStop") {
     state.activeSubagents.delete(parsed.agent_id);
+    sendDeferredAgentIndex(state, parsed.agent_id);
     res.writeHead(204);
     res.end();
     return;
@@ -2342,7 +2358,8 @@ async function handleMessages(
       toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool",
       sendBody
     );
-    opts.memtree.indexInBackground(hash, msgsForMemtree, modelContextLimit, toolSessionId, clientMeta, transcriptTimesFor(opts, toolSessionId, agentAttributionId(req)));
+    indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
+      sessionId: toolSessionId, clientMeta });
     capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
     // The size Anthropic reports is the next budget check's anchor: a ride
     // reports to its prefix (or route), a whole request to the session's (or
@@ -2719,6 +2736,10 @@ async function handleMessages(
   // conversation the user is looking at.
   const linkSeq =
     isMainRequest && !isAwaySummary ? nextMemtreeCallSeq(state) : undefined;
+  const edgeCarry = edge?.kind === "compress" && !isAwaySummary
+    ? carryFor({ isMainRequest, sessionId, body, messages, msgsForMemtree, modelContextLimit, rec,
+      targetTokens: edge.targetTokens, explicitTarget: edge.explicitTarget, linkSeq })
+    : undefined;
   let compression: BlockingCompressionOutcome;
   try {
     compression = await runBlockingCompression({
@@ -2743,6 +2764,7 @@ async function handleMessages(
       // short budget; with neither, a timeout could only end in a refusal.
       longBudget: !(edge?.kind === "compress" && edge.fallback && !edge.fallback.uncounted) &&
         await wholeRequestRefused(requestSizing, forwardCandidate, sizingLimits()),
+      ...(edgeCarry ? { carry: edgeCarry } : {}),
     });
   } catch {
     const kept = rideOldPrefix(false);
@@ -2782,6 +2804,8 @@ async function handleMessages(
     (res.destroyed && !res.writableFinished)
   ) {
     releaseUncommittedRouteDecision();
+    // Claude Code gave up on the turn, not on the compaction: the next turn rides it.
+    if (result && edgeCarry) carryOverCompression(state, edgeCarry, Promise.resolve(result));
     recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
     return logged(Promise.resolve());
   }
@@ -4823,19 +4847,87 @@ function maybePrepareCompression(args: {
   boundedSet(state.preparing, sessionId, pending);
 }
 
+/**
+ * A subagent's share of its budget from which it is indexed on every tool turn, as the
+ * main thread is; below it, only once, when it ends. 2026-10-30: 29 subagents ran ~32
+ * index jobs each ($45.63 a week for one session), and none came near its budget, so no
+ * subagent tree was ever used to compress. Its tree is still built (at SubagentStop, or
+ * at exit), so MemTree search and the page still find it.
+ */
+const AGENT_PER_TURN_INDEX_SHARE = 0.5;
+/** Subagents whose unsent index is kept; the oldest past this is sent at once. */
+const DEFERRED_AGENT_INDEX_MAX = 64;
+
+/**
+ * A tool turn's background index call: now on the main thread and for a subagent past
+ * AGENT_PER_TURN_INDEX_SHARE of its budget; otherwise kept, replacing the subagent's
+ * previous one, until it ends (sendDeferredAgentIndex).
+ */
+function indexTurn(args: {
+  opts: ProxyOptions; state: ProxyState; req: http.IncomingMessage; rec: MessagesRecord;
+  hash: string; msgsForMemtree: Message[]; modelContextLimit: number;
+  sessionId: string | undefined; clientMeta?: Record<string, string>;
+}): void {
+  const { opts, state, req, sessionId } = args;
+  const agentId = agentAttributionId(req);
+  const send = (force: boolean) => opts.memtree.indexInBackground(args.hash, args.msgsForMemtree,
+    args.modelContextLimit, sessionId, args.clientMeta,
+    transcriptTimesFor(opts, sessionId, agentId), force ? { force } : {});
+  if (agentId === undefined || sessionId === undefined) return send(false);
+  const compaction = args.rec.compaction;
+  if (compaction?.estimatedTokens !== undefined &&
+      compaction.estimatedTokens >= compaction.budgetTokens * AGENT_PER_TURN_INDEX_SHARE) {
+    state.deferredAgentIndexes.delete(agentId);
+    return send(false);
+  }
+  state.deferredAgentIndexes.delete(agentId);
+  state.deferredAgentIndexes.set(agentId, send);
+  while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
+    const oldest = state.deferredAgentIndexes.keys().next().value;
+    if (oldest === undefined) break;
+    sendDeferredAgentIndex(state, oldest);
+  }
+}
+
+/** A subagent ended (or is evicted): send its kept index call, whatever its size. */
+function sendDeferredAgentIndex(state: ProxyState, agentId: string): void {
+  const send = state.deferredAgentIndexes.get(agentId);
+  state.deferredAgentIndexes.delete(agentId);
+  send?.(true);
+}
+
+/** At exit: every subagent's kept index call. */
+function sendDeferredAgentIndexes(state: ProxyState): void {
+  for (const agentId of [...state.deferredAgentIndexes.keys()]) {
+    sendDeferredAgentIndex(state, agentId);
+  }
+}
+
 /** The background prepare call and the prefix it yields (maybePrepareCompression). */
 async function prepareInBackground(args: Parameters<typeof maybePrepareCompression>[0] & {
   tokens: number; targetTokens: number; explicitTarget: boolean; triggerTokens: number;
   linkSeq: number;
 }): Promise<Prepared<StablePrefix> | undefined> {
-  const { opts, state, body, msgsForMemtree, modelContextLimit, sessionId } = args;
+  const { opts, state, body, msgsForMemtree, modelContextLimit } = args;
   const result = await opts.memtree.compress(args.hash, msgsForMemtree, modelContextLimit,
     state.backgroundSignal, preparedCompressMeta(args));
   noteServerBudget(state, body.model, modelContextLimit, result);
   if (!result) return undefined;
   state.prepared.noteServerAnswer(result.prepared === true);
-  if (result.prepared !== true || !didMemtreeCompress(result) ||
-      !checkCompressedHistory(result, msgsForMemtree).usable) return undefined;
+  if (result.prepared !== true) return undefined;
+  return preparedFromResult(args, result);
+}
+
+/** A compressed answer for a session's history, as its prepared prefix (or undefined). */
+function preparedFromResult(args: {
+  body: Record<string, any>; messages: Message[]; msgsForMemtree: Message[]; sessionId: string;
+  modelContextLimit: number; tokens: number; targetTokens: number; explicitTarget: boolean;
+  triggerTokens: number; linkSeq?: number;
+}, result: CompressResult): Prepared<StablePrefix> | undefined {
+  const { body, sessionId, modelContextLimit } = args;
+  if (!didMemtreeCompress(result) || !checkCompressedHistory(result, args.msgsForMemtree).usable) {
+    return undefined;
+  }
   const built = buildCompressedBody(body, result);
   if (!built) return undefined;
   const prefix: StablePrefix = {
@@ -4849,10 +4941,84 @@ async function prepareInBackground(args: Parameters<typeof maybePrepareCompressi
     explicitTarget: args.explicitTarget,
     modelContextLimit,
   };
-  const source = result.memtreeUrl && result.memtreeIndex
+  const source = result.memtreeUrl && result.memtreeIndex && args.linkSeq !== undefined
     ? { url: result.memtreeUrl, index: result.memtreeIndex, seq: args.linkSeq } : undefined;
   return { prefix, atTokens: args.tokens, triggerTokens: args.triggerTokens,
     ...(source ? { source } : {}) };
+}
+
+/**
+ * A main-thread compaction at the automatic target (a turn at the budget): what its
+ * answer needs to become the session's prepared prefix (carryOverCompression).
+ */
+interface CarryOver {
+  body: Record<string, any>;
+  /** The request's messages: the prefix's identity. */
+  messages: Message[];
+  msgsForMemtree: Message[];
+  sessionId: string;
+  modelContextLimit: number;
+  /** The turn's planned size, and the budget (trigger) it was planned against. */
+  tokens: number;
+  triggerTokens: number;
+  targetTokens: number;
+  explicitTarget: false;
+  linkSeq?: number;
+}
+
+/** A main-thread compaction's CarryOver, when its plan has the automatic target. */
+function carryFor(args: {
+  isMainRequest: boolean; sessionId: string | undefined; body: Record<string, any>;
+  messages: Message[]; msgsForMemtree: Message[]; modelContextLimit: number;
+  rec: MessagesRecord; targetTokens: number | undefined; explicitTarget: boolean | undefined;
+  linkSeq?: number;
+}): CarryOver | undefined {
+  const compaction = args.rec.compaction;
+  // Where prepared prefixes exist (preparesCompression): the turn after rides it.
+  if (!args.isMainRequest || args.sessionId === undefined || args.explicitTarget !== false ||
+      args.targetTokens === undefined || compaction?.mode !== "auto" ||
+      !preparesCompression(args.body.model, args.modelContextLimit)) return undefined;
+  return { body: args.body, messages: args.messages, msgsForMemtree: args.msgsForMemtree,
+    sessionId: args.sessionId, modelContextLimit: args.modelContextLimit,
+    tokens: compaction.estimatedTokens ?? 0, triggerTokens: compaction.budgetTokens,
+    targetTokens: args.targetTokens, explicitTarget: false,
+    ...(args.linkSeq !== undefined ? { linkSeq: args.linkSeq } : {}) };
+}
+
+/**
+ * A main-thread compaction its turn stopped waiting for (its budget ran out) becomes the
+ * session's preparation: it runs on to the long budget, the session's next turn at the
+ * budget waits for it (awaitPreparation) instead of starting another, and rides its
+ * answer as a prepared prefix. Before, each turn gave up on its call and started a new
+ * one beside it: 2026-10-30, eleven 26 MB compressions in ten minutes, each billed, none
+ * used. False when the session already has a preparation in flight (it serves instead).
+ */
+function carryOverCompression(
+  state: ProxyState, carry: CarryOver, pending: Promise<CompressResult | null>
+): boolean {
+  const { sessionId } = carry;
+  if (state.backgroundSignal.aborted || state.preparing.has(sessionId) ||
+      !state.prepared.begin(sessionId, carry.tokens, carry.triggerTokens)) return false;
+  const base = state.stablePrefixes.get(sessionId);
+  const done: Promise<void> = pending
+    .then((result) => {
+      noteMemtreeHealth(state, { result, liveHealth: result ? "success" : "failure" });
+      return result ? preparedFromResult(carry, result) : undefined;
+    })
+    .catch(() => undefined)
+    .then((prepared) => {
+      // A prefix installed meanwhile supersedes it.
+      const current = state.stablePrefixes.get(sessionId) === base;
+      state.prepared.finish(sessionId, current ? prepared : undefined);
+      if (state.preparing.get(sessionId) === done) state.preparing.delete(sessionId);
+    });
+  boundedSet(state.preparing, sessionId, done);
+  return true;
+}
+
+/** How long a carried compaction may run: the long budget, or its upload's if longer. */
+function carriedBudgetMs(opts: ProxyOptions, scaledMs: number): number {
+  return Math.min(MAX_LONG_COMPRESS_WAIT_MS, Math.max(opts.memtree.longCompressBudgetMs, scaledMs));
 }
 
 /** What a prepare call sends: a forced compression to the target, no threshold. */
@@ -5365,6 +5531,11 @@ async function runBlockingCompression(args: {
   longBudget?: boolean;
   /** Aborts the compress call; default state.shutdownSignal. */
   signal?: AbortSignal;
+  /**
+   * A main-thread compaction (automatic target): if this wait ends first, the call
+   * runs on to the long budget and becomes the session's preparation (carryOverCompression).
+   */
+  carry?: CarryOver;
 }): Promise<BlockingCompressionOutcome> {
   const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } =
     args;
@@ -5377,10 +5548,11 @@ async function runBlockingCompression(args: {
       : undefined;
   const messageTimes = transcriptTimesFor(opts, args.sessionId, args.agentId)?.(msgsForMemtree);
   const compressStarted = Date.now();
-  // The upload is about the request's size: the budget grows with it.
+  // The upload is about the request's size: the budget grows with it (the long one
+  // too, never below the short one's).
+  const scaledMs = opts.memtree.compressBudgetForBytes(rec.requestBytes);
   const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS,
-    args.longBudget ? opts.memtree.longCompressBudgetMs
-      : opts.memtree.compressBudgetForBytes(rec.requestBytes));
+    args.longBudget ? Math.max(opts.memtree.longCompressBudgetMs, scaledMs) : scaledMs);
   const compressMeta = {
     // Model + tools drive the server's model-based memory budget
     // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -5412,8 +5584,8 @@ async function runBlockingCompression(args: {
     ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
     ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
     // The deadline this wait uses (the upload-scaled budget included), so the
-    // call and its waiters end together.
-    timeoutMs: budgetMs,
+    // call and its waiters end together; a carried call runs on to the long one.
+    timeoutMs: args.carry ? Math.max(budgetMs, carriedBudgetMs(opts, scaledMs)) : budgetMs,
   };
   // Sampled BEFORE the call, while it still describes this call: after the
   // await the hash is in the cache regardless of who put it there.
@@ -5427,12 +5599,19 @@ async function runBlockingCompression(args: {
   let deadline: ReturnType<typeof setTimeout> | undefined;
   const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS,
     Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
+  let settled = false;
+  const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit,
+    args.signal ?? state.shutdownSignal, compressMeta);
+  const settle = () => { settled = true; };
+  call.then(settle, settle);
   const result = await Promise.race([
-    opts.memtree.compress(hash, msgsForMemtree, modelContextLimit,
-      args.signal ?? state.shutdownSignal, compressMeta),
+    call,
     new Promise<null>((resolve) => { deadline = setTimeout(() => resolve(null), maximumWait); }),
   ]).finally(() => { if (deadline) clearTimeout(deadline); });
   const compressMs = Date.now() - compressStarted;
+  // Given up on but still running: the session's next turn waits for it, not a new call.
+  const carried = result === null && !settled && args.carry !== undefined &&
+    carryOverCompression(state, args.carry, call);
   noteServerBudget(state, body.model, modelContextLimit, result);
   // Sampled at this call's settle, before a concurrent same-request failure of
   // another class can overwrite the complete-key entry.
@@ -5454,11 +5633,13 @@ async function runBlockingCompression(args: {
   // one started) is this call's size or the server's slow reply, not an outage: it arms no cooldown (2026-10-23:
   // healthy-server timeouts kept the fuse lit and a screenshot turn was refused).
   const othersAnswered = timedOut && (opts.memtree.lastCompressSuccessAt ?? 0) >= compressStarted;
-  const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered;
+  // A carried call has not failed: it is still running (its answer reports its health).
+  const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
     timedOut,
+    ...(carried ? { carriedOver: true as const } : {}),
     ...(!cached && failureStatus === OVER_CONTEXT_STATUS ? { refused: true as const } : {}),
   };
   return {
@@ -5726,6 +5907,9 @@ async function recoverToolRouteMiss(args: {
   };
   res.once("close", markDownstreamClosed);
   const linkSeq = isMainRequest ? nextMemtreeCallSeq(state) : undefined;
+  const toolCarry = stable ? carryFor({ isMainRequest, sessionId, body, messages, msgsForMemtree,
+    modelContextLimit, rec, targetTokens: stable.targetTokens, explicitTarget: stable.explicitTarget,
+    linkSeq }) : undefined;
   let compression: BlockingCompressionOutcome;
   try {
     compression = await runBlockingCompression({
@@ -5743,6 +5927,7 @@ async function recoverToolRouteMiss(args: {
       inputCandidate: args.inputCandidate,
       ...(args.compaction ? { compaction: args.compaction } : {}),
       longBudget: args.wholeRefused ? await args.wholeRefused() : false,
+      ...(toolCarry ? { carry: toolCarry } : {}),
     });
   } catch {
     releaseOwnReservation();
@@ -5765,9 +5950,10 @@ async function recoverToolRouteMiss(args: {
     (res.destroyed && !res.writableFinished)
   ) {
     // The MemTree work keeps its cache/index value, but a dead client gets
-    // no Anthropic request and no route.
+    // no Anthropic request and no route. The session's next turn rides it.
     rec.routeRecovery = { conversationBytes, outcome: "client-closed" };
     releaseOwnReservation();
+    if (result && toolCarry) carryOverCompression(state, toolCarry, Promise.resolve(result));
     // Same hazard class as the post-forward fates "upstream-failed" /
     // "client-aborted": no route was installed and the client's identical
     // retry is imminent, so no backoff is set and the attempt mark is

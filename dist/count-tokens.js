@@ -139,8 +139,12 @@ export class CountTokensCooldowns {
         this.entries.set(key, now + cooldownDuration(result.retryAfter, now));
     }
 }
-/** Outcomes a retry may follow: the count ran out of time, not refused. */
-export const RETRYABLE_COUNT_OUTCOMES = new Set(["timeout", "deadline"]);
+/**
+ * Outcomes a retry may follow: the count ran out of time or lost its connection, not
+ * refused. A dropped connection says nothing about the body, like a timeout: a ride whose
+ * count dropped stays the fallback a failed compress sends (2026-10-28, a Wi-Fi switch).
+ */
+export const RETRYABLE_COUNT_OUTCOMES = new Set(["timeout", "deadline", "network-error"]);
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's

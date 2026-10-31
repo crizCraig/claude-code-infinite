@@ -52,7 +52,8 @@ Rules of thumb:
   do several things at once:
   - *Subagents:* one session can run any number of subagents (the Agent/Task tool, in the
     foreground or with `run_in_background`) in parallel. Each writes its own transcript under
-    `<session-id>/subagents/`, and MemTree indexes each one into its own tree (see section 3).
+    `<session-id>/subagents/`, and MemTree indexes each one into its own tree when it ends
+    (per tool turn only past half its budget; see section 3).
   - *Forks:* `ccc -p --resume "$sid" --fork-session "…"` starts a new session with the full
     history so far and returns a new `session_id`; the original is untouched. Run as many forks
     at once as you like, then store and resume each fork's own id. MemTree reuses the shared

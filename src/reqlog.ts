@@ -196,6 +196,11 @@ export interface MessagesRecord {
      * no room): MemTree has the conversation, unlike in an outage.
      */
     refused?: true;
+    /**
+     * Timed out while still running: the call went on as the session's preparation,
+     * which the next turn at the budget waits for (carryOverCompression).
+     */
+    carriedOver?: true;
   };
   /**
    * How much conversation the compressed response actually carried. Recorded

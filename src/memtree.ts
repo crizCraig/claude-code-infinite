@@ -61,8 +61,12 @@ const DEFAULT_COMPRESS_TIMEOUT_MS = 15000;
  * body (20+ MB) takes seconds to send on a slow link before the server even
  * starts, so a flat budget times out on size alone (2026-10-23: every tool
  * turn's compress of a 21.5 MB body timed out at 15 s with MemTree healthy).
+ * Measured from ccc's request logs, 2026-10-23..30: compress calls of 21-27 MB
+ * answered in 10-53 s (median ~19 s); at 1 ms/KiB a 26 MB call had ~41 s and lost
+ * to the 53 s ones, refusing a session for ten minutes (2026-10-30). 2.5 ms/KiB
+ * gives a 26 MB call ~79 s, 1.5x the slowest seen.
  */
-export const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
+export const COMPRESS_TIMEOUT_MS_PER_KIB = 2.5;
 /**
  * The budget for a compress with nothing else to send: no compressed prefix to
  * ride and a raw request known not to fit the window (the first turn after
@@ -73,6 +77,13 @@ export const COMPRESS_TIMEOUT_MS_PER_KIB = 1;
 const DEFAULT_LONG_COMPRESS_TIMEOUT_MS = 120_000;
 /** Indexing runs off the response path; give it room. */
 const INDEX_TIMEOUT_MS = 120_000;
+/**
+ * New text (characters) a conversation's history must gain over its last index upload
+ * before the next one is sent: about the server's 10k-token index minimum
+ * (polychat MIN_TOKENS_TO_INDEX) at ~3 characters a token. Under it the server only
+ * acknowledges the upload.
+ */
+export const INDEX_MIN_NEW_CHARS = 30_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -89,6 +100,10 @@ export interface MemtreeOptions {
   compressTimeoutMs?: number;
   /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
   longCompressTimeoutMs?: number;
+  /** New text an index upload waits for (INDEX_MIN_NEW_CHARS); tests set 0. */
+  indexMinNewChars?: number;
+  /** Added to a compress budget per KiB uploaded (COMPRESS_TIMEOUT_MS_PER_KIB); tests set 0. */
+  compressTimeoutMsPerKiB?: number;
   debug?: boolean;
   /** Always-on JSONL diagnostics; every MemTree call logs one line. */
   reqlog?: RequestLogSink;
@@ -968,6 +983,14 @@ interface QueuedIndex {
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
   };
+  /** Sent even under INDEX_MIN_NEW_CHARS of new text (a subagent's one index at its end). */
+  force?: boolean;
+}
+
+/** The history a conversation's last index call carried, and its text size. */
+interface SentIndex {
+  messages: Message[];
+  chars: number;
 }
 
 /** A compress in flight and the size hint it sent (clientInputTokens). */
@@ -1007,6 +1030,10 @@ export class MemtreeClient {
   private readonly indexLanesNext = new Map<string, QueuedIndex>();
   /** Per conversation, the history the exit's final index carries (flushFinalIndexes). */
   private readonly finalIndexLanes = new Map<string, Message[]>();
+  private readonly indexMinNewChars: number;
+  private readonly compressTimeoutMsPerKiB: number;
+  /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
+  private readonly indexLanesSent = new Map<string, SentIndex>();
   /** Once draining begins, no later request may create another log producer. */
   private backgroundClosing = false;
   /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1112,7 +1139,7 @@ export class MemtreeClient {
 
   /** The blocking-compress budget for an upload of `bytes` (COMPRESS_TIMEOUT_MS_PER_KIB). */
   compressBudgetForBytes(bytes: number): number {
-    return scaledTimeout(this.compressBudgetMs, bytes);
+    return scaledTimeout(this.compressBudgetMs, bytes, this.compressTimeoutMsPerKiB);
   }
 
   /**
@@ -1183,6 +1210,8 @@ export class MemtreeClient {
     this.longCompressTimeoutMs =
       opts.longCompressTimeoutMs ??
       Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_LONG_COMPRESS_TIMEOUT_MS);
+    this.indexMinNewChars = opts.indexMinNewChars ?? INDEX_MIN_NEW_CHARS;
+    this.compressTimeoutMsPerKiB = opts.compressTimeoutMsPerKiB ?? COMPRESS_TIMEOUT_MS_PER_KIB;
     this.debug = opts.debug ?? false;
     this.reqlog = opts.reqlog;
     this.memtreeTools = opts.memtreeTools || undefined;
@@ -1377,7 +1406,9 @@ export class MemtreeClient {
     sessionId?: string,
     clientMeta?: Record<string, string>,
     /** Times for retained original messages, in the positions actually sent. */
-    messageTimesFor?: (messages: Message[]) => MessageTimes
+    messageTimesFor?: (messages: Message[]) => MessageTimes,
+    /** `force`: send even under INDEX_MIN_NEW_CHARS of new text. */
+    options: { force?: boolean } = {}
   ): void {
     if (this.backgroundClosing) return;
     const indexKey = JSON.stringify([sessionId ?? null, hash]);
@@ -1387,8 +1418,8 @@ export class MemtreeClient {
       const first = this.indexedHashes.values().next().value;
       if (first !== undefined) this.indexedHashes.delete(first);
     }
-    this.enqueueIndex(indexLaneKey(sessionId, messages),
-      { messages, modelContextLimit, opts: { sessionId, clientMeta, messageTimesFor } });
+    this.enqueueIndex(indexLaneKey(sessionId, messages), { messages, modelContextLimit,
+      opts: { sessionId, clientMeta, messageTimesFor }, ...(options.force ? { force: true } : {}) });
   }
 
   /**
@@ -1397,21 +1428,51 @@ export class MemtreeClient {
    * session's tool rounds otherwise stacked 25 MB uploads, up to 16 at once, and starved
    * the compress calls that share the link (long-session test, staging 2026-10-24). A
    * waiting call is replaced only by one whose history extends it; otherwise it goes now.
+   * A call whose history extends the last one sent by less than INDEX_MIN_NEW_CHARS of
+   * text is not sent at all: the server only acknowledges it (2026-10-30: 3 in 4 of a
+   * 23 MB session's index uploads, ~1 GB per 40 minutes).
    */
   private enqueueIndex(lane: string, job: QueuedIndex): void {
+    const waiting = this.indexLanesNext.get(lane);
+    if (!job.force && this.tooLittleNewText(lane, job, waiting)) return;
     if (!this.indexLanesBusy.has(lane)) {
       this.startLaneIndex(lane, job);
       return;
     }
-    const waiting = this.indexLanesNext.get(lane);
     if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+      this.noteIndexSent(lane, waiting.messages);
       void this.submitIndexOnly(waiting.messages, waiting.modelContextLimit, waiting.opts);
     }
     this.indexLanesNext.set(lane, job);
   }
 
+  /**
+   * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
+   * last sent (or has waiting to send): the server's index minimum would only ack it.
+   */
+  private tooLittleNewText(lane: string, job: QueuedIndex, waiting: QueuedIndex | undefined): boolean {
+    // A waiting call is replaced by this one anyway: it is never held back.
+    if (waiting) return false;
+    const sent = this.indexLanesSent.get(lane);
+    if (this.indexMinNewChars <= 0 || !sent || !extendsHistory(job.messages, sent.messages)) {
+      return false;
+    }
+    return messagesTextChars(job.messages) - sent.chars < this.indexMinNewChars;
+  }
+
+  /** Record the history an index call of `lane` is about to carry. */
+  private noteIndexSent(lane: string, messages: Message[]): void {
+    this.indexLanesSent.delete(lane);
+    this.indexLanesSent.set(lane, { messages, chars: messagesTextChars(messages) });
+    if (this.indexLanesSent.size > DEDUPE_CACHE_MAX) {
+      const first = this.indexLanesSent.keys().next().value;
+      if (first !== undefined) this.indexLanesSent.delete(first);
+    }
+  }
+
   private startLaneIndex(lane: string, job: QueuedIndex): void {
     this.indexLanesBusy.add(lane);
+    this.noteIndexSent(lane, job.messages);
     void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).finally(() => {
       this.indexLanesBusy.delete(lane);
       const next = this.indexLanesNext.get(lane);
@@ -1827,13 +1888,15 @@ export class MemtreeClient {
     // A default compress budget grows with what it uploads; an index call's,
     // and any budget a caller set, is fixed.
     const timeoutMs = opts.scaleTimeout && !opts.indexOnly
-      ? scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8")) : opts.timeoutMs;
+      ? scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8"),
+        this.compressTimeoutMsPerKiB)
+      : opts.timeoutMs;
     const timeout = setTimeout(abort, timeoutMs);
     timeout.unref();
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
     try {
-      const response = await this.postContextMemory(payload, opts, controller.signal);
+      const response = await this.postRetryingDrop(payload, opts, controller.signal);
       status = response.status;
       if (planned.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
@@ -1954,6 +2017,26 @@ export class MemtreeClient {
     }
   }
 
+  /**
+   * A compress or prepare call's POST, sent once more (within the same budget) when its
+   * connection dropped before any answer: a Wi-Fi switch cut a 24 MB upload with
+   * EHOSTUNREACH after 89 s (2026-10-28) and the turn went without memory. Index-only
+   * calls are not retried: the next turn sends their history again.
+   */
+  private async postRetryingDrop(
+    payload: string,
+    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
+    signal: AbortSignal
+  ): Promise<Response> {
+    try {
+      return await this.postContextMemory(payload, opts, signal);
+    } catch (err) {
+      if (opts.indexOnly || signal.aborted || !isDroppedConnection(err)) throw err;
+      this.log(`context_memory connection dropped (${droppedCode(err)}); retrying once`);
+      return await this.postContextMemory(payload, opts, signal);
+    }
+  }
+
   /** One POST of a MemTree call's body. */
   private postContextMemory(
     payload: string,
@@ -2065,10 +2148,56 @@ function callerCut(status: number | undefined): boolean {
   return status === undefined || (status >= 200 && status < 300);
 }
 
+/** Connection-level failures a compress call is retried once after (postRetryingDrop). */
+const DROPPED_CONNECTION_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN", "EPIPE", "ECONNABORTED",
+  "ETIMEDOUT", "EAI_AGAIN", "UND_ERR_SOCKET",
+]);
+
+/** Whether a failed fetch lost its connection (the error's or its cause's code). */
+export function isDroppedConnection(err: unknown): boolean {
+  const code = droppedCode(err);
+  return code !== undefined && DROPPED_CONNECTION_CODES.has(code);
+}
+
+function droppedCode(err: unknown): string | undefined {
+  const own = (err as { code?: unknown } | undefined)?.code;
+  if (typeof own === "string") return own;
+  const cause = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return typeof cause === "string" ? cause : undefined;
+}
+
+/**
+ * The text a history carries, in characters: strings and text blocks, tool inputs and
+ * results; images and documents (base64) count nothing. For INDEX_MIN_NEW_CHARS only.
+ */
+export function messagesTextChars(messages: Message[]): number {
+  let chars = 0;
+  for (const message of messages) chars += contentTextChars(message.content);
+  return chars;
+}
+
+function contentTextChars(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) {
+    let chars = 0;
+    for (const item of value) chars += contentTextChars(item);
+    return chars;
+  }
+  if (!value || typeof value !== "object") return 0;
+  const block = value as Record<string, unknown>;
+  if (block.type === "image" || block.type === "document") return 0;
+  if (typeof block.text === "string") return block.text.length;
+  if (typeof block.thinking === "string") return block.thinking.length;
+  if (block.content !== undefined) return contentTextChars(block.content);
+  if (block.input !== undefined) return JSON.stringify(block.input)?.length ?? 0;
+  return 0;
+}
+
 /** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
-function scaledTimeout(baseMs: number, bytes: number): number {
+function scaledTimeout(baseMs: number, bytes: number, perKiB: number): number {
   if (!Number.isFinite(baseMs)) return baseMs;
-  return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * COMPRESS_TIMEOUT_MS_PER_KIB;
+  return baseMs + Math.ceil(Math.max(0, bytes) / 1024) * perKiB;
 }
 
 /**

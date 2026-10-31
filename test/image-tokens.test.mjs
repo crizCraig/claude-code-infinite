@@ -82,11 +82,13 @@ test('the reported estimate scales only text: a screenshot adds its visual token
   assert.ok(estimateRequestTokens(legacy, after.length, images).tokens >= 100_420);
 });
 
-test('a compress budget grows by 1 ms per KiB of its upload', () => {
+test('a compress budget grows by 2.5 ms per KiB of its upload', () => {
   const memtree = new MemtreeClient({ baseUrl: 'http://127.0.0.1:9', apiKey: 'k', compressTimeoutMs: 15_000 });
-  assert.equal(COMPRESS_TIMEOUT_MS_PER_KIB, 1);
+  assert.equal(COMPRESS_TIMEOUT_MS_PER_KIB, 2.5);
   assert.equal(memtree.compressBudgetForBytes(0), 15_000);
-  assert.equal(memtree.compressBudgetForBytes(21.5 * 1024 * 1024), 15_000 + 22_016);
+  assert.equal(memtree.compressBudgetForBytes(21.5 * 1024 * 1024), 15_000 + 55_040);
+  // 2026-10-30: a 26 MB compress answered in 53 s; its budget now has ~79 s.
+  assert.ok(memtree.compressBudgetForBytes(26_161_378) > 53_000 * 1.4);
   assert.equal(memtree.lastCompressSuccessAt, 0);
 });
 

@@ -10263,6 +10263,8 @@ test("a subagent's MemTree calls are timed from that subagent's transcript", asy
   try {
     await postMessages(proxy.port, base, agent);
     await postMessages(proxy.port, extendToolLoop(base, "t1"), agent);
+    // A subagent this small is indexed once, when it ends.
+    await postHook(proxy, { hook_event_name: "SubagentStop", agent_id: "agent-9" });
     await waitFor(() => memtreeSrv.calls.some((c) => c.index_only));
     const session = SESSION["x-claude-code-session-id"];
     assert.ok(asked.length >= 2, JSON.stringify(asked));
