@@ -7,7 +7,8 @@ export interface WrapperArgs {
 export declare function isPrintInvocation(args: string[]): boolean;
 /**
  * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
- * cluster containing p (`-pc`, `-cp`) or `--print=…`. Conservative: for
+ * cluster with p among its leading letters (`-pc`, `-cp`, `-pr<id>`) or
+ * `--print=…`. Conservative: for
  * choices that must never happen in print mode, such as opening a browser.
  */
 export declare function mayBePrintInvocation(args: string[]): boolean;

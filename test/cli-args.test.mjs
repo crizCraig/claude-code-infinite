@@ -37,7 +37,8 @@ test("Claude print flags are recognized only before --", () => {
 });
 
 test("mayBePrintInvocation also counts combined short flags with p (no browser opened)", () => {
-  for (const args of [["-p"], ["--print"], ["--print=true"], ["-pc", "hi"], ["-cp"], ["-dpc"]]) {
+  for (const args of [["-p"], ["--print"], ["--print=true"], ["-pc", "hi"], ["-cp"], ["-dpc"],
+    ["-pr0f1c2d3e-4a5b-4c6d-8e7f-001122334455", "/ccc:memtree-view"], ["-pdapi,http"]]) {
     assert.equal(mayBePrintInvocation(args), true, args.join(" "));
   }
   for (const args of [[], ["-c"], ["--resume", "abc"], ["-r", "abc"], ["--", "-pc"], ["--permission-mode", "plan"]]) {
