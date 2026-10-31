@@ -8,7 +8,7 @@ export declare function isPrintInvocation(args: string[]): boolean;
 /**
  * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
  * cluster with p among its leading letters (`-pc`, `-cp`, `-pr<id>`) or
- * `--print=…`. Conservative: for
+ * `--print=…`, anywhere in the arguments. Conservative: for
  * choices that must never happen in print mode, such as opening a browser.
  */
 export declare function mayBePrintInvocation(args: string[]): boolean;

@@ -11,13 +11,13 @@ export function isPrintInvocation(args) {
 /**
  * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
  * cluster with p among its leading letters (`-pc`, `-cp`, `-pr<id>`) or
- * `--print=…`. Conservative: for
+ * `--print=…`, anywhere in the arguments. Conservative: for
  * choices that must never happen in print mode, such as opening a browser.
  */
 export function mayBePrintInvocation(args) {
+    // Every argument, `--` included: an option's value can be `--` itself
+    // (`--append-system-prompt -- -cp`), so it need not end Claude's options.
     for (const arg of args) {
-        if (arg === "--")
-            return false;
         if (arg === "--print" || arg.startsWith("--print="))
             return true;
         // Commander reads a cluster up to a flag that takes a value, the rest being
