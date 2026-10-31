@@ -189,7 +189,7 @@ locally, so they cost no model turn.
 | Command | What it does |
 | --- | --- |
 | `/ccc:memtree` | Lists the MemTree commands and links your usage dashboard. |
-| `/ccc:memtree-view` | Opens this session's MemTree page (its newest tree) in your browser and prints its one link. It only prints the link in `-p`/non-TTY runs, over SSH, in CI, and on Linux without a display. |
+| `/ccc:memtree-view` | Opens this session's MemTree page (its newest tree) in your browser and prints its one link. It only prints the link in `-p`/non-TTY runs, over SSH, in CI, on Linux without a display, and for any URL that is not a page of the MemTree server `ccc` uses. |
 | `/ccc:memtree-compact [tokens]` | Compacts the session on your next message (to half the budget, or a target such as `400k`) and keeps the compressed history. |
 | `/ccc:memtree-compact off` | Goes back to sending the conversation whole. |
 

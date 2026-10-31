@@ -6,10 +6,13 @@
  * person who typed the command: an interactive session (not `-p` or a pipe),
  * not CI, not over SSH (the browser would open on the remote machine, if
  * anywhere), and on Linux only with a display. Elsewhere the link is printed
- * and nothing is opened.
+ * and nothing is opened. Only a MemTree page of the environment ccc talks to
+ * is opened (memtreePageUrl): another URL, even from the server, is printed.
  */
 import { spawn } from "node:child_process";
+import { win32 } from "node:path";
 import { isCi } from "./install-ping.js";
+import { usageDashboardUrl } from "./usage-link.js";
 
 export interface OpenCommand {
   command: string;
@@ -28,15 +31,45 @@ export type SpawnLike = (
 
 /** Set by an SSH session; a browser opened there is on the remote machine. */
 const SSH_ENV = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"];
+/** Paths of a MemTree page: `/m/<link id>` or `/usage/memtree/<request ref>`. */
+const PAGE_PATH = /^\/(?:m|usage\/memtree)\/[A-Za-z0-9_-]+$/;
 
 /**
  * The opener for this CLI run, or undefined where a browser must not be opened
- * (mayOpenBrowser): then `/memtree-view` only prints its link.
+ * (mayOpenBrowser): then `/memtree-view` only prints its link. It opens only
+ * pages of the MemTree at `memtreeBaseUrl` (memtreePageUrl).
  */
 export function urlOpenerFor(input: {
-  interactive: boolean; env: NodeJS.ProcessEnv; platform: NodeJS.Platform;
+  interactive: boolean; env: NodeJS.ProcessEnv; platform: NodeJS.Platform; memtreeBaseUrl: string;
+  spawnFn?: SpawnLike;
 }): UrlOpener | undefined {
-  return mayOpenBrowser(input) ? browserOpener(input.platform) : undefined;
+  if (!mayOpenBrowser(input)) return undefined;
+  const open = browserOpener(input.platform, input.spawnFn);
+  return (url) => {
+    if (memtreePageUrl(url, input.memtreeBaseUrl)) open(url);
+  };
+}
+
+/**
+ * Whether `url` is a MemTree page of the server at `baseUrl`: its origin, or
+ * the browser host its pages are served from (app.polychat.co for
+ * api.polychat.co, as for the usage dashboard), a page path, no user info and
+ * no query or fragment.
+ */
+export function memtreePageUrl(url: string, baseUrl: string): boolean {
+  let page: URL;
+  let base: URL;
+  try {
+    page = new URL(url);
+    base = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  const browser = usageDashboardUrl(baseUrl);
+  const origins = new Set([base.origin, ...(browser ? [new URL(browser).origin] : [])]);
+  return (page.protocol === "https:" || page.protocol === "http:") &&
+    origins.has(page.origin) && !page.username && !page.password &&
+    !page.search && !page.hash && PAGE_PATH.test(page.pathname);
 }
 
 /** Whether a browser opened now would appear in front of the user. */
@@ -74,11 +107,15 @@ export function browserOpener(
  * an http(s) URL. Windows uses url.dll's handler (what `start` reaches) so
  * cmd.exe never parses the URL.
  */
-export function browserOpenCommand(url: string, platform: NodeJS.Platform): OpenCommand | undefined {
+export function browserOpenCommand(
+  url: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv = process.env
+): OpenCommand | undefined {
   if (!/^https?:\/\/[^\s]+$/i.test(url)) return undefined;
   if (platform === "darwin") return { command: "open", args: [url] };
   if (platform === "win32") {
-    return { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] };
+    // System32's own copy, never one found through PATH or the working directory.
+    const rundll32 = win32.join(env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe");
+    return { command: rundll32, args: ["url.dll,FileProtocolHandler", url] };
   }
   return { command: "xdg-open", args: [url] };
 }

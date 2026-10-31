@@ -15,13 +15,23 @@ export type SpawnLike = (command: string, args: string[], options: {
 };
 /**
  * The opener for this CLI run, or undefined where a browser must not be opened
- * (mayOpenBrowser): then `/memtree-view` only prints its link.
+ * (mayOpenBrowser): then `/memtree-view` only prints its link. It opens only
+ * pages of the MemTree at `memtreeBaseUrl` (memtreePageUrl).
  */
 export declare function urlOpenerFor(input: {
     interactive: boolean;
     env: NodeJS.ProcessEnv;
     platform: NodeJS.Platform;
+    memtreeBaseUrl: string;
+    spawnFn?: SpawnLike;
 }): UrlOpener | undefined;
+/**
+ * Whether `url` is a MemTree page of the server at `baseUrl`: its origin, or
+ * the browser host its pages are served from (app.polychat.co for
+ * api.polychat.co, as for the usage dashboard), a page path, no user info and
+ * no query or fragment.
+ */
+export declare function memtreePageUrl(url: string, baseUrl: string): boolean;
 /** Whether a browser opened now would appear in front of the user. */
 export declare function mayOpenBrowser(input: {
     interactive: boolean;
@@ -35,5 +45,5 @@ export declare function browserOpener(platform: NodeJS.Platform, spawnFn?: Spawn
  * an http(s) URL. Windows uses url.dll's handler (what `start` reaches) so
  * cmd.exe never parses the URL.
  */
-export declare function browserOpenCommand(url: string, platform: NodeJS.Platform): OpenCommand | undefined;
+export declare function browserOpenCommand(url: string, platform: NodeJS.Platform, env?: NodeJS.ProcessEnv): OpenCommand | undefined;
 //# sourceMappingURL=open-url.d.ts.map

@@ -820,7 +820,10 @@ async function main() {
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     // `/memtree-view` opens its link only where a browser would appear in
     // front of the user: interactive, not SSH or CI (open-url.ts).
-    openUrl: urlOpenerFor({ interactive: interactiveUi, env: process.env, platform: process.platform }),
+    openUrl: urlOpenerFor({
+      interactive: interactiveUi, env: process.env, platform: process.platform,
+      memtreeBaseUrl,
+    }),
     projectTrees,
     subagentHint,
     resumeGuidance,
