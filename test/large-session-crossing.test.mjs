@@ -330,6 +330,26 @@ test('subagent deferral: per conversation of an agent, and never for a parent-id
   } finally { h.close(); }
 });
 
+test('a subagent rewound before it ends: the kept history it no longer extends is sent at once', async () => {
+  const h = await harness();
+  try {
+    const conv = [{ role: 'user', content: 'You are implementing Phase 4.' }];
+    addRound(conv, 'r0', 20_000 * 4);
+    addRound(conv, 'r1', 20_000 * 4);
+    assert.equal((await h.post(conv, { agent: 'agent-9' })).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(h.indexCalls.length, 0);
+    const rewound = conv.slice(0, 1);
+    addRound(rewound, 'b0', 20_000 * 4);
+    assert.equal((await h.post(rewound, { agent: 'agent-9' })).status, 200);
+    await until(() => h.indexCalls.length === 1);
+    assert.equal(h.indexCalls[0].messages, conv.length, 'the earlier branch, not lost');
+    await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-9' });
+    await until(() => h.indexCalls.length === 2);
+    assert.equal(h.indexCalls[1].messages, rewound.length);
+  } finally { h.close(); }
+});
+
 test('an abandoned crossing whose prefix another turn replaced meanwhile is not ridden', async () => {
   let arrived = 0;
   // Call 2 (the abandoned crossing) takes 1.5 s; call 3 (the next crossing) answers at once.

@@ -3535,8 +3535,12 @@ function indexTurn(args) {
     // Per agent and conversation: a side request made under the subagent's (or its parent's)
     // id is another conversation and must not replace the subagent's own.
     const key = deferredIndexKey(agentId, args.msgsForMemtree);
+    const kept = state.deferredAgentIndexes.get(key);
+    // A rewind or another branch: the kept history is not part of this one, so it goes now.
+    if (kept && !extendsHistory(args.msgsForMemtree, kept.messages))
+        sendDeferredIndex(state, key);
     state.deferredAgentIndexes.delete(key);
-    state.deferredAgentIndexes.set(key, send);
+    state.deferredAgentIndexes.set(key, { messages: args.msgsForMemtree, send });
     while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
         const oldest = state.deferredAgentIndexes.keys().next().value;
         if (oldest === undefined)
@@ -3557,9 +3561,9 @@ function sendDeferredAgentIndex(state, agentId) {
     }
 }
 function sendDeferredIndex(state, key) {
-    const send = state.deferredAgentIndexes.get(key);
+    const kept = state.deferredAgentIndexes.get(key);
     state.deferredAgentIndexes.delete(key);
-    send?.(true);
+    kept?.send(true);
 }
 /** At exit: every subagent's kept index calls. */
 function sendDeferredAgentIndexes(state) {

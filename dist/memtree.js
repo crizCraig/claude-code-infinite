@@ -789,6 +789,8 @@ export class MemtreeClient {
     compressTimeoutMsPerKiB;
     /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
     indexLanesSent = new Map();
+    /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
+    indexLanesPending = new Map();
     /** Once draining begins, no later request may create another log producer. */
     backgroundClosing = false;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -1148,19 +1150,18 @@ export class MemtreeClient {
         this.indexLanesNext.set(lane, job);
     }
     /**
-     * Send `job` as its conversation's newest upload (the INDEX_MIN_NEW_CHARS baseline); if
-     * it fails, the baseline goes back to what it was, so the next turn is not held back by
-     * an upload the server never got.
+     * Send `job` as its conversation's newest upload: the INDEX_MIN_NEW_CHARS baseline while
+     * it is in flight, and once it succeeded. A failed one is never a baseline, so the next
+     * turn is not held back by an upload the server never got.
      */
     sendLaneIndex(lane, job) {
-        const previous = this.indexLanesSent.get(lane);
-        const sent = this.noteIndexSent(lane, job.messages);
+        const sent = { messages: job.messages, chars: messagesTextChars(job.messages) };
+        this.indexLanesPending.set(lane, sent);
         return this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).then((ok) => {
-            if (!ok && this.indexLanesSent.get(lane) === sent) {
-                this.indexLanesSent.delete(lane);
-                if (previous)
-                    this.indexLanesSent.set(lane, previous);
-            }
+            if (this.indexLanesPending.get(lane) === sent)
+                this.indexLanesPending.delete(lane);
+            if (ok)
+                this.noteIndexSent(lane, sent);
             return ok;
         });
     }
@@ -1172,15 +1173,18 @@ export class MemtreeClient {
         // A waiting call is replaced by this one anyway: it is never held back.
         if (this.indexLanesNext.has(lane))
             return false;
-        const sent = this.indexLanesSent.get(lane);
+        const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
         if (this.indexMinNewChars <= 0 || !sent || !extendsHistory(job.messages, sent.messages)) {
             return false;
         }
+        // An image or document carries no text but may be evicted by Claude Code before a
+        // later upload: never held back.
+        if (carriesMedia(job.messages.slice(sent.messages.length)))
+            return false;
         return messagesTextChars(job.messages) - sent.chars < this.indexMinNewChars;
     }
-    /** Record the history an index call of `lane` is about to carry. */
-    noteIndexSent(lane, messages) {
-        const sent = { messages, chars: messagesTextChars(messages) };
+    /** Record the history an index call of `lane` delivered. */
+    noteIndexSent(lane, sent) {
         this.indexLanesSent.delete(lane);
         this.indexLanesSent.set(lane, sent);
         if (this.indexLanesSent.size > DEDUPE_CACHE_MAX) {
@@ -1188,7 +1192,6 @@ export class MemtreeClient {
             if (first !== undefined)
                 this.indexLanesSent.delete(first);
         }
-        return sent;
     }
     startLaneIndex(lane, job) {
         this.indexLanesBusy.add(lane);
@@ -1681,7 +1684,7 @@ export class MemtreeClient {
                 throw err;
             // A 401 to a streamed body: fetch reports a network error, not the status. A 401
             // compresses nothing (nothing billed): sent again whole, its status is seen.
-            if (upload.done && isStreamedBodyAuthChallenge(err)) {
+            if (isStreamedBodyAuthChallenge(err)) {
                 return await this.postContextMemory(payload, opts, signal);
             }
             if (upload.done || !isDroppedConnection(err))
@@ -1854,6 +1857,17 @@ export function messagesTextChars(messages) {
     for (const message of messages)
         chars += contentTextChars(message.content);
     return chars;
+}
+/** Whether `messages` hold an image or document block (at any depth). */
+function carriesMedia(value) {
+    if (Array.isArray(value))
+        return value.some(carriesMedia);
+    if (!value || typeof value !== "object")
+        return false;
+    const block = value;
+    if (block.type === "image" || block.type === "document")
+        return true;
+    return Array.isArray(block.content) && carriesMedia(block.content);
 }
 function contentTextChars(value) {
     if (typeof value === "string")

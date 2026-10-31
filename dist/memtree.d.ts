@@ -364,6 +364,8 @@ export declare class MemtreeClient {
     private readonly compressTimeoutMsPerKiB;
     /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
     private readonly indexLanesSent;
+    /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
+    private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
     private backgroundClosing;
     /** drainBackground ran out and is aborting what is left (exit_index_cut, not an error). */
@@ -539,9 +541,9 @@ export declare class MemtreeClient {
      */
     private enqueueIndex;
     /**
-     * Send `job` as its conversation's newest upload (the INDEX_MIN_NEW_CHARS baseline); if
-     * it fails, the baseline goes back to what it was, so the next turn is not held back by
-     * an upload the server never got.
+     * Send `job` as its conversation's newest upload: the INDEX_MIN_NEW_CHARS baseline while
+     * it is in flight, and once it succeeded. A failed one is never a baseline, so the next
+     * turn is not held back by an upload the server never got.
      */
     private sendLaneIndex;
     /**
@@ -549,7 +551,7 @@ export declare class MemtreeClient {
      * last sent (or has waiting to send): the server's index minimum would only ack it.
      */
     private tooLittleNewText;
-    /** Record the history an index call of `lane` is about to carry. */
+    /** Record the history an index call of `lane` delivered. */
     private noteIndexSent;
     private startLaneIndex;
     /**

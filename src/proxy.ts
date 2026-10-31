@@ -505,7 +505,7 @@ interface ProxyState {
    * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
    * budget (indexTurn).
    */
-  deferredAgentIndexes: Map<string, (force: boolean) => void>;
+  deferredAgentIndexes: Map<string, DeferredIndex>;
   /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
   memoryRoutes: Map<string, MemoryRoute>;
   /** Latest main route for validated away-summary forks, independent of hook events. */
@@ -4887,13 +4887,22 @@ function indexTurn(args: {
   // Per agent and conversation: a side request made under the subagent's (or its parent's)
   // id is another conversation and must not replace the subagent's own.
   const key = deferredIndexKey(agentId, args.msgsForMemtree);
+  const kept = state.deferredAgentIndexes.get(key);
+  // A rewind or another branch: the kept history is not part of this one, so it goes now.
+  if (kept && !extendsHistory(args.msgsForMemtree, kept.messages)) sendDeferredIndex(state, key);
   state.deferredAgentIndexes.delete(key);
-  state.deferredAgentIndexes.set(key, send);
+  state.deferredAgentIndexes.set(key, { messages: args.msgsForMemtree, send });
   while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
     const oldest = state.deferredAgentIndexes.keys().next().value;
     if (oldest === undefined) break;
     sendDeferredIndex(state, oldest);
   }
+}
+
+/** A subagent's kept index call and the history it carries. */
+interface DeferredIndex {
+  messages: Message[];
+  send: (force: boolean) => void;
 }
 
 /** A deferred index's key: the agent id and its conversation's first message. */
@@ -4910,9 +4919,9 @@ function sendDeferredAgentIndex(state: ProxyState, agentId: string): void {
 }
 
 function sendDeferredIndex(state: ProxyState, key: string): void {
-  const send = state.deferredAgentIndexes.get(key);
+  const kept = state.deferredAgentIndexes.get(key);
   state.deferredAgentIndexes.delete(key);
-  send?.(true);
+  kept?.send(true);
 }
 
 /** At exit: every subagent's kept index calls. */

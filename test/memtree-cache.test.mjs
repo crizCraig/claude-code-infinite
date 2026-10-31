@@ -647,6 +647,87 @@ test("an index upload waits until its history has gained the server's index mini
   }
 });
 
+test("an image is never held back by the text minimum (Claude Code may evict it later)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const send = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    send();
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    conv.push({ role: "assistant", content: "shot" }, { role: "user", content: [
+      { type: "tool_result", tool_use_id: "t", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } }] }] });
+    send();
+    await waitFor(() => fixture.calls.length === 2);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a failed upload is never the baseline, even with branches failing in flight together", async () => {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      calls.push(JSON.parse(Buffer.concat(chunks).toString("utf8")).messages.length);
+      const ok = calls.length > 3;
+      setTimeout(() => {
+        if (!ok) { res.writeHead(500); return res.end("boom"); }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messages: [], index_only: true }));
+      }, ok ? 0 : 80);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const root = { role: "user", content: "x".repeat(40_000) };
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const a = [root, { role: "assistant", content: "a".repeat(40_000) }];
+    send(a); // in flight, fails
+    send([root, { role: "assistant", content: "b".repeat(40_000) }]); // waits
+    send([root, { role: "assistant", content: "c".repeat(40_000) }]); // b goes beside a; both fail
+    await waitFor(() => calls.length === 3);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    send([...a, { role: "user", content: "small" }]); // a never arrived: sent
+    await waitFor(() => calls.length === 4);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a 401 answered before a streamed upload ended still reads as an invalid key", async () => {
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls++;
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: "Invalid API key" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "revoked" });
+    const big = [{ role: "user", content: "x".repeat(25_000_000) }];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(big), big, 1_000_000,
+      undefined, {}), null);
+    assert.equal(client.keyInvalid, true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("text size counts text, tool inputs and results, not images", () => {
   assert.equal(messagesTextChars([
     { role: "user", content: "abc" },
