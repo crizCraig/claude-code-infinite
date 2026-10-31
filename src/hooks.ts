@@ -73,7 +73,7 @@ const RESUME_RELAY_FILE = "resume-link.mjs";
 export const MEMTREE_HELP_COMMAND = "memtree";
 /** The session plugin's name, which prefixes its commands in Claude Code's menu. */
 export const SESSION_PLUGIN_NAME = "ccc";
-/** `/memtree-view`: print this session's MemTree page link. */
+/** `/memtree-view`: open this session's MemTree page and print its link. */
 export const MEMTREE_VIEW_COMMAND = "memtree-view";
 /**
  * `/memtree-compact [tokens|off]`: compact this session on its next message
@@ -91,7 +91,7 @@ const SESSION_COMMANDS: Record<string, string> = {
   [MEMTREE_HELP_COMMAND]:
     "---\ndescription: List the MemTree commands (/memtree-view, /memtree-compact) and the usage dashboard link\n---\n" + UNAVAILABLE_BODY,
   [MEMTREE_VIEW_COMMAND]:
-    "---\ndescription: Show the link to this session's MemTree page\n---\n" + UNAVAILABLE_BODY,
+    "---\ndescription: Open this session's MemTree page in your browser and show its link\n---\n" + UNAVAILABLE_BODY,
   [MEMTREE_COMPACT_COMMAND]:
     "---\ndescription: Compact this session with MemTree now and keep the compressed history (optional token target, or off)\n" +
     "argument-hint: [tokens | off]\n---\n" + UNAVAILABLE_BODY,

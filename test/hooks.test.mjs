@@ -405,7 +405,7 @@ test("session plugin lists /memtree-view and /memtree-compact in the command men
   const plugin = createSessionNoticePlugin("http://127.0.0.1:1/_ccc/hooks/x", { tempRoot });
   try {
     const md = await fsp.readFile(path.join(plugin.dir, "commands", "memtree-view.md"), "utf-8");
-    assert.match(md, /^---\ndescription: Show the link to this session's MemTree page\n---\n/);
+    assert.match(md, /^---\ndescription: Open this session's MemTree page in your browser and show its link\n---\n/);
     const help = await fsp.readFile(path.join(plugin.dir, "commands", "memtree.md"), "utf-8");
     assert.match(help, /description: List the MemTree commands .*and the usage dashboard link/);
     const compact = await fsp.readFile(path.join(plugin.dir, "commands", "memtree-compact.md"), "utf-8");

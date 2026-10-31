@@ -57,6 +57,7 @@ import { CreditRefusalMemory, creditAdviceApplies, isInfoOnlyRun, readSeenClaude
 import { probeAnswersForSession, probeClaudeAuthStatus, skippedProbe, } from "./claude-auth-status.js";
 import { mayWaitForEnter, presentSignInNotice, sessionProbe, signInNotice, signInNoticeApplies, SignInTracker, } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
+import { urlOpenerFor } from "./open-url.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -640,6 +641,9 @@ async function main() {
         // install) on a later SessionStart of this session, once.
         sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
         promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
+        // `/memtree-view` opens its link only where a browser would appear in
+        // front of the user: interactive, not SSH or CI (open-url.ts).
+        openUrl: urlOpenerFor({ interactive: interactiveUi, env: process.env, platform: process.platform }),
         projectTrees,
         subagentHint,
         resumeGuidance,

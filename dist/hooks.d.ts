@@ -51,7 +51,7 @@ export declare const DEFAULT_NOTICE_TTL_MS: number;
 export declare const MEMTREE_HELP_COMMAND = "memtree";
 /** The session plugin's name, which prefixes its commands in Claude Code's menu. */
 export declare const SESSION_PLUGIN_NAME = "ccc";
-/** `/memtree-view`: print this session's MemTree page link. */
+/** `/memtree-view`: open this session's MemTree page and print its link. */
 export declare const MEMTREE_VIEW_COMMAND = "memtree-view";
 /**
  * `/memtree-compact [tokens|off]`: compact this session on its next message
