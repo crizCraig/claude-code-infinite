@@ -525,7 +525,10 @@ export declare class MemtreeClient {
     indexInBackground(hash: string, messages: Message[], modelContextLimit: number, sessionId?: string, clientMeta?: Record<string, string>, 
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes, 
-    /** `force`: send even under INDEX_MIN_NEW_CHARS of new text. */
+    /**
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text, flagged final_index so the
+     * server indexes the tail under its own minimum too (a subagent's end).
+     */
     options?: {
         force?: boolean;
     }): void;
@@ -666,4 +669,6 @@ export declare function isDroppedConnection(err: unknown): boolean;
  * results; images and documents (base64) count nothing. For INDEX_MIN_NEW_CHARS only.
  */
 export declare function messagesTextChars(messages: Message[]): number;
+/** Image and document blocks in `value` (messages or content), at any depth. */
+export declare function mediaCount(value: unknown): number;
 //# sourceMappingURL=memtree.d.ts.map

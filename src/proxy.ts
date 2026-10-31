@@ -80,6 +80,7 @@ import {
   didMemtreeCompress,
   indexLagEvidence,
   MemtreeClient,
+  mediaCount,
   modelBudgetTokens,
   normalizeMessagesForMemtree,
   serverFlattenedMessages,
@@ -4895,7 +4896,9 @@ function indexTurn(args: {
 function keepDeferredIndex(state: ProxyState, key: string, entry: DeferredIndex): void {
   const kept = state.deferredAgentIndexes.get(key);
   // A rewind or another branch: the kept history is not part of this one, so it goes now.
-  if (kept && !extendsHistory(entry.messages, kept.messages)) sendDeferredIndex(state, key);
+  // So does one holding media Claude Code has evicted since (never uploaded otherwise).
+  if (kept && (!extendsHistory(entry.messages, kept.messages) ||
+      mediaCount(kept.messages) > mediaCount(entry.messages))) sendDeferredIndex(state, key);
   state.deferredAgentIndexes.delete(key);
   state.deferredAgentIndexes.set(key, entry);
   while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
@@ -5650,11 +5653,10 @@ async function runBlockingCompression(args: {
   const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS,
     Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
   let settled = false;
-  // Its own abort too: a carry refused at the deadline must not run on unused.
-  const carryAbort = carry ? new AbortController() : undefined;
-  const callSignal = args.signal ?? state.shutdownSignal;
+  // A refused carry is not aborted: the call may be shared (in-flight join) with a
+  // request that carried it.
   const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit,
-    carryAbort ? AbortSignal.any([callSignal, carryAbort.signal]) : callSignal, compressMeta);
+    args.signal ?? state.shutdownSignal, compressMeta);
   const settle = () => { settled = true; };
   call.then(settle, settle);
   const result = await Promise.race([
@@ -5665,7 +5667,6 @@ async function runBlockingCompression(args: {
   // Given up on but still running: the session's next turn waits for it, not a new call.
   const carried = result === null && !settled && carry !== undefined &&
     carryOverCompression(state, carry, call);
-  if (result === null && !settled && !carried) carryAbort?.abort();
   noteServerBudget(state, body.model, modelContextLimit, result);
   // Sampled at this call's settle, before a concurrent same-request failure of
   // another class can overwrite the complete-key entry.

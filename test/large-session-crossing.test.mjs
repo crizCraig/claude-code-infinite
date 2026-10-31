@@ -57,6 +57,7 @@ async function harness({ compressMs = 0, prepareMs = compressMs, compressTimeout
     try { body = await readJson(req); } catch { return; }
     if (body.index_only) {
       indexCalls.push({ messages: body.messages.length, agent: req.headers['x-client-meta'] ?? '',
+        final: body.final_index === true,
         last: JSON.stringify(body.messages.at(-1)).slice(0, 80) });
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ index_only: true, messages: [] }));
@@ -305,6 +306,7 @@ test('a subagent is indexed once when it ends, per turn only past half its budge
     await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-2' });
     await until(() => h.indexCalls.length === 4);
     assert.equal(h.indexCalls[3].messages, long.length);
+    assert.equal(h.indexCalls[3].final, true, 'final_index: the server indexes the small tail');
 
     // A subagent still running at exit gets its one index inside the drain.
     const third = [{ role: 'user', content: 'You are reviewing the diff.' }];
@@ -356,6 +358,28 @@ test('a subagent rewound before it ends: the kept history it no longer extends i
     await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-9' });
     await until(() => h.indexCalls.length === 2);
     assert.equal(h.indexCalls[1].messages, rewound.length);
+  } finally { h.close(); }
+});
+
+test('a deferred subagent history whose image Claude Code then evicted is sent before replacement', async () => {
+  const h = await harness();
+  try {
+    const conv = [{ role: 'user', content: 'You are checking the screenshots.' }];
+    addRound(conv, 'i0', 20_000 * 4);
+    conv.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'Screenshot', input: {} }] });
+    conv.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', content: [
+      { type: 'text', text: 'screen' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo' } }] }] });
+    assert.equal((await h.post(conv, { agent: 'agent-5' })).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(h.indexCalls.length, 0);
+    // Claude Code evicts the image; the subagent goes on.
+    const evicted = structuredClone(conv);
+    evicted.at(-1).content[0].content = [{ type: 'text', text: 'screen' }];
+    addRound(evicted, 'i1', 2_000);
+    assert.equal((await h.post(evicted, { agent: 'agent-5' })).status, 200);
+    await until(() => h.indexCalls.length === 1);
+    assert.equal(h.indexCalls[0].messages, conv.length, 'the history that still had its image');
   } finally { h.close(); }
 });
 

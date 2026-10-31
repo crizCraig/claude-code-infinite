@@ -982,6 +982,8 @@ interface QueuedIndex {
     sessionId?: string;
     clientMeta?: Record<string, string>;
     messageTimesFor?: (messages: Message[]) => MessageTimes;
+    /** A forced call (a subagent's end): the server indexes its tail below its minimum. */
+    finalIndex?: boolean;
   };
 }
 
@@ -1407,15 +1409,19 @@ export class MemtreeClient {
     clientMeta?: Record<string, string>,
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor?: (messages: Message[]) => MessageTimes,
-    /** `force`: send even under INDEX_MIN_NEW_CHARS of new text. */
+    /**
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text, flagged final_index so the
+     * server indexes the tail under its own minimum too (a subagent's end).
+     */
     options: { force?: boolean } = {}
   ): void {
     if (this.backgroundClosing) return;
-    const indexKey = JSON.stringify([sessionId ?? null, hash]);
+    // A final call is its own entry: the same history sent per turn may have left a tail.
+    const indexKey = JSON.stringify([sessionId ?? null, hash, ...(options.force ? ["final"] : [])]);
     if (this.indexedHashes.has(indexKey)) return;
     const lane = indexLaneKey(sessionId, messages);
     const job: QueuedIndex = { messages, modelContextLimit,
-      opts: { sessionId, clientMeta, messageTimesFor } };
+      opts: { sessionId, clientMeta, messageTimesFor, ...(options.force ? { finalIndex: true } : {}) } };
     // Held back is not sent: a later (or forced) call of the same history still goes.
     if (!options.force && this.tooLittleNewText(lane, job)) return;
     this.indexedHashes.add(indexKey);
@@ -1442,7 +1448,11 @@ export class MemtreeClient {
       return;
     }
     const waiting = this.indexLanesNext.get(lane);
-    if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+    // Not replaced when the new one does not carry it whole: another branch, media Claude
+    // Code evicted since (never uploaded otherwise), or a final call.
+    if (waiting && (!extendsHistory(job.messages, waiting.messages) ||
+        mediaCount(waiting.messages) > mediaCount(job.messages) ||
+        (waiting.opts.finalIndex && !job.opts.finalIndex))) {
       void this.sendLaneIndex(lane, waiting);
     }
     this.indexLanesNext.set(lane, job);
@@ -2252,11 +2262,16 @@ export function messagesTextChars(messages: Message[]): number {
 
 /** Whether `messages` hold an image or document block (at any depth). */
 function carriesMedia(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(carriesMedia);
-  if (!value || typeof value !== "object") return false;
+  return mediaCount(value) > 0;
+}
+
+/** Image and document blocks in `value` (messages or content), at any depth. */
+export function mediaCount(value: unknown): number {
+  if (Array.isArray(value)) return value.reduce((n: number, item) => n + mediaCount(item), 0);
+  if (!value || typeof value !== "object") return 0;
   const block = value as Record<string, unknown>;
-  if (block.type === "image" || block.type === "document") return true;
-  return Array.isArray(block.content) && carriesMedia(block.content);
+  if (block.type === "image" || block.type === "document") return 1;
+  return Array.isArray(block.content) ? mediaCount(block.content) : 0;
 }
 
 function contentTextChars(value: unknown): number {

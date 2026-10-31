@@ -52,7 +52,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, MemtreeClient, mediaCount, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, SLOW_RETRY_NOTICE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
@@ -3540,7 +3540,9 @@ function indexTurn(args) {
 function keepDeferredIndex(state, key, entry) {
     const kept = state.deferredAgentIndexes.get(key);
     // A rewind or another branch: the kept history is not part of this one, so it goes now.
-    if (kept && !extendsHistory(entry.messages, kept.messages))
+    // So does one holding media Claude Code has evicted since (never uploaded otherwise).
+    if (kept && (!extendsHistory(entry.messages, kept.messages) ||
+        mediaCount(kept.messages) > mediaCount(entry.messages)))
         sendDeferredIndex(state, key);
     state.deferredAgentIndexes.delete(key);
     state.deferredAgentIndexes.set(key, entry);
@@ -4135,10 +4137,9 @@ async function runBlockingCompression(args) {
     let deadline;
     const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
     let settled = false;
-    // Its own abort too: a carry refused at the deadline must not run on unused.
-    const carryAbort = carry ? new AbortController() : undefined;
-    const callSignal = args.signal ?? state.shutdownSignal;
-    const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, carryAbort ? AbortSignal.any([callSignal, carryAbort.signal]) : callSignal, compressMeta);
+    // A refused carry is not aborted: the call may be shared (in-flight join) with a
+    // request that carried it.
+    const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, args.signal ?? state.shutdownSignal, compressMeta);
     const settle = () => { settled = true; };
     call.then(settle, settle);
     const result = await Promise.race([
@@ -4150,8 +4151,6 @@ async function runBlockingCompression(args) {
     // Given up on but still running: the session's next turn waits for it, not a new call.
     const carried = result === null && !settled && carry !== undefined &&
         carryOverCompression(state, carry, call);
-    if (result === null && !settled && !carried)
-        carryAbort?.abort();
     noteServerBudget(state, body.model, modelContextLimit, result);
     // Sampled at this call's settle, before a concurrent same-request failure of
     // another class can overwrite the complete-key entry.

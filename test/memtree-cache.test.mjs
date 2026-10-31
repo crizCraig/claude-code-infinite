@@ -728,6 +728,43 @@ test("a 401 answered before a streamed upload ended still reads as an invalid ke
   }
 });
 
+test("a waiting index call whose image the next one lost (evicted) is sent, not replaced", async () => {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      calls.push(Buffer.concat(chunks).toString("utf8"));
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messages: [], index_only: true }));
+      }, 100);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]); // in flight
+    const shot = [root, { role: "assistant", content: "look" }, { role: "user", content: [
+      { type: "text", text: "screen" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" } }] }];
+    send(shot); // waits
+    const evicted = [root, { role: "assistant", content: "look" }, { role: "user", content: [
+      { type: "text", text: "screen" }] }, { role: "assistant", content: "y".repeat(40_000) }];
+    send(evicted);
+    assert.equal(await client.drainBackground(3_000), true);
+    await waitFor(() => calls.length === 3);
+    assert.ok(calls.some((body) => body.includes("iVBORw0KGgo")), "the image reached MemTree");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("text size counts text, tool inputs and results, not images", () => {
   assert.equal(messagesTextChars([
     { role: "user", content: "abc" },

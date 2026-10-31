@@ -1107,16 +1107,20 @@ export class MemtreeClient {
     indexInBackground(hash, messages, modelContextLimit, sessionId, clientMeta, 
     /** Times for retained original messages, in the positions actually sent. */
     messageTimesFor, 
-    /** `force`: send even under INDEX_MIN_NEW_CHARS of new text. */
+    /**
+     * `force`: send even under INDEX_MIN_NEW_CHARS of new text, flagged final_index so the
+     * server indexes the tail under its own minimum too (a subagent's end).
+     */
     options = {}) {
         if (this.backgroundClosing)
             return;
-        const indexKey = JSON.stringify([sessionId ?? null, hash]);
+        // A final call is its own entry: the same history sent per turn may have left a tail.
+        const indexKey = JSON.stringify([sessionId ?? null, hash, ...(options.force ? ["final"] : [])]);
         if (this.indexedHashes.has(indexKey))
             return;
         const lane = indexLaneKey(sessionId, messages);
         const job = { messages, modelContextLimit,
-            opts: { sessionId, clientMeta, messageTimesFor } };
+            opts: { sessionId, clientMeta, messageTimesFor, ...(options.force ? { finalIndex: true } : {}) } };
         // Held back is not sent: a later (or forced) call of the same history still goes.
         if (!options.force && this.tooLittleNewText(lane, job))
             return;
@@ -1144,7 +1148,11 @@ export class MemtreeClient {
             return;
         }
         const waiting = this.indexLanesNext.get(lane);
-        if (waiting && !extendsHistory(job.messages, waiting.messages)) {
+        // Not replaced when the new one does not carry it whole: another branch, media Claude
+        // Code evicted since (never uploaded otherwise), or a final call.
+        if (waiting && (!extendsHistory(job.messages, waiting.messages) ||
+            mediaCount(waiting.messages) > mediaCount(job.messages) ||
+            (waiting.opts.finalIndex && !job.opts.finalIndex))) {
             void this.sendLaneIndex(lane, waiting);
         }
         this.indexLanesNext.set(lane, job);
@@ -1860,14 +1868,18 @@ export function messagesTextChars(messages) {
 }
 /** Whether `messages` hold an image or document block (at any depth). */
 function carriesMedia(value) {
+    return mediaCount(value) > 0;
+}
+/** Image and document blocks in `value` (messages or content), at any depth. */
+export function mediaCount(value) {
     if (Array.isArray(value))
-        return value.some(carriesMedia);
+        return value.reduce((n, item) => n + mediaCount(item), 0);
     if (!value || typeof value !== "object")
-        return false;
+        return 0;
     const block = value;
     if (block.type === "image" || block.type === "document")
-        return true;
-    return Array.isArray(block.content) && carriesMedia(block.content);
+        return 1;
+    return Array.isArray(block.content) ? mediaCount(block.content) : 0;
 }
 function contentTextChars(value) {
     if (typeof value === "string")
