@@ -55,7 +55,7 @@ import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, losesMedia, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, SLOW_RETRY_NOTICE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
-import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, urlLine, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
+import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
@@ -350,6 +350,7 @@ export function startProxy(opts) {
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
         promptSubmitNotice: opts.promptSubmitNotice,
+        openUrl: opts.openUrl,
         projectTrees: opts.projectTrees,
         subagentHint: opts.subagentHint,
         resumeGuidance: opts.resumeGuidance,
@@ -2389,15 +2390,14 @@ function sessionCommandReply(state, sessionId, prompt) {
         : pausedCompactionText(viewUrl(subscribeUrlFromDetail(unpaid)));
     if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
         return [
-            "• /memtree-view · show this session's MemTree page link",
+            "• /memtree-view · open this session's MemTree page and show its link",
             paused !== undefined ? `• ${paused}`
                 : `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
             usageLines(state),
         ].filter((line) => line !== undefined).join("\n");
     }
-    if (isMemtreeViewCommand(prompt)) {
-        return joinNoticeLines(memtreeViewLine(state, sessionId), usageLines(state)) ?? "";
-    }
+    if (isMemtreeViewCommand(prompt))
+        return memtreeView(state, sessionId);
     const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
     if (args === undefined)
         return undefined;
@@ -2441,10 +2441,8 @@ export const SUBAGENT_COMPACT_REPLY = "MemTree compact applies to the main sessi
  * is refused rather than applied to the main conversation from here.
  */
 function subagentCommandReply(state, sessionId, prompt) {
-    if (isMemtreeViewCommand(prompt)) {
-        const view = `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
-        return joinNoticeLines(view, usageLines(state)) ?? view;
-    }
+    if (isMemtreeViewCommand(prompt))
+        return `${memtreeView(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
     if (sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND) !== undefined) {
         return `${TRAILER_LABEL} ${SUBAGENT_COMPACT_REPLY}`;
     }
@@ -2459,8 +2457,13 @@ export function parseTokenCount(text) {
     const value = Math.round(Number(match[1]) * scale);
     return Number.isFinite(value) && value > 0 ? value : undefined;
 }
-/** The `/memtree-view` answer: this session's newest page, or why there is none. */
-function memtreeViewLine(state, sessionId) {
+/**
+ * The `/memtree-view` answer: one link, this session's newest page (the
+ * newest completed tree, which covers the whole session, rather than the
+ * possibly stale page its memory was compressed from), opened in the browser
+ * where the CLI allows it; or why there is none.
+ */
+function memtreeView(state, sessionId) {
     const inMemory = state.memtreePages.get(sessionId);
     const page = inMemory && (inMemory.sessionId === undefined || inMemory.sessionId === sessionId)
         ? inMemory
@@ -2469,15 +2472,17 @@ function memtreeViewLine(state, sessionId) {
     if (!link) {
         return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
     }
+    try {
+        state.openUrl?.(link.link);
+    }
+    catch {
+        // The printed link below is the fallback.
+    }
     // Blocked-prompt reasons need an explicit hyperlink in styled terminals.
-    const lines = linkLines(LINK_LABEL, viewUrl(link.link), link.note);
-    // The memory the agent works from can be an older tree than the newest one.
-    return page?.compressed && page.url !== link.link
-        ? `${lines}\n${urlLine(viewUrl(page.url), "memory from ")}`
-        : lines;
+    return linkLines(LINK_LABEL, viewUrl(link.link), link.note);
 }
 /**
- * The usage dashboard link that `/memtree` and `/memtree-view` end with,
+ * The usage dashboard link that `/memtree` ends with,
  * formatted like the MemTree link; undefined when the environment has none.
  */
 function usageLines(state) {

@@ -3348,7 +3348,8 @@ test("/memtree-view is answered by the hook and blocked, without touching turn s
     const none = await view();
     assert.equal(none.body.decision, "block");
     assert.match(none.body.reason, /no page yet/);
-    assert.ok(stripAnsi(none.body.reason).endsWith(`\n${usageLines(memtreeSrv.origin)}`));
+    // One link at most: no usage dashboard link here (that is /memtree's).
+    assert.ok(!stripAnsi(none.body.reason).includes(`${memtreeSrv.origin}/usage`), none.body.reason);
 
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postMessages(proxy.port, followupTurn("turn two"), { "x-claude-code-session-id": "session-1" });
@@ -3360,7 +3361,7 @@ test("/memtree-view is answered by the hook and blocked, without touching turn s
     }
     assert.deepEqual({ ...shown.body, reason: shown.body.reason.replace(osc8, "") }, {
       decision: "block",
-      reason: `• MemTree\n  ${PAGE_URL_1} ↗\n${usageLines(memtreeSrv.origin)}`,
+      reason: `• MemTree\n  ${PAGE_URL_1} ↗`,
       hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
     });
 
@@ -3400,7 +3401,7 @@ test(`ccc commands typed in a subagent's view are answered, never left to the fa
     const shown = await inAgent("/ccc:memtree-view");
     assert.deepEqual({ ...shown.body, reason: shown.body.reason.replace(osc8, "") }, {
       decision: "block",
-      reason: `• MemTree\n  ${PAGE_URL_1} ↗\n(main session's page; subagent pages aren't linked yet)\n${usageLines(memtreeSrv.origin)}`,
+      reason: `• MemTree\n  ${PAGE_URL_1} ↗\n(main session's page; subagent pages aren't linked yet)`,
       hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true },
     });
     const help = await inAgent("/ccc:memtree");
@@ -11037,7 +11038,7 @@ test(`stale link: memory compressed long ago, newer index-only trees since (${co
     assert.equal(await getCurrentId(proxy, "session-1"), "ea18af90658b");
 
     const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
-    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗\n  memory from ${PAGE_URL_1} ↗\n${usageLines(memtreeSrv.origin)}`);
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗`);
   } finally {
     proxy.close();
     upstream.close();
@@ -11045,6 +11046,62 @@ test(`stale link: memory compressed long ago, newer index-only trees since (${co
   }
 });
 }
+
+for (const osc of [false, true]) {
+test(`/memtree-view opens its one link in the browser when the CLI allows it (${osc ? "OSC 8" : "bare"})`, async (t) => {
+  setNoticeColorMode(t, true);
+  setHyperlinkTerminal(t, osc ? {TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.0'} : {}, true);
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const { lookup } = await newestLookup(() => ({ sessions: [sessionsItem("session-1", NEWEST_REQUEST_ID)] }));
+  const opened = [];
+  const proxy = await startProxy({
+    memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    openUrl: (url) => opened.push(url),
+  });
+  const submit = (prompt, extra = {}) => postHook(proxy, {
+    hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt, prompt_id: "p-view", ...extra,
+  });
+  try {
+    assert.match((await submit("/memtree-view", { session_id: "session-9" })).body.reason, /no page yet/);
+    assert.deepEqual(opened, [], "nothing to open before the session has a page");
+
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    const view = await submit("/ccc:memtree-view");
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗`);
+    // The bare URL, never the OSC 8 escape the terminal line carries.
+    assert.deepEqual(opened, [NEWEST_URL]);
+
+    // A subagent's view opens the main session's page too.
+    await submit("/memtree-view", { agent_id: "agent-1" });
+    assert.deepEqual(opened, [NEWEST_URL, NEWEST_URL]);
+    // Other commands and prompts open nothing.
+    await submit("/memtree");
+    await submit("/memtree-compact 100k");
+    await submit("tell me about /memtree-view");
+    assert.equal(opened.length, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+}
+
+test("/memtree-view still answers when opening the browser throws", async () => {
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }), newestTrees: lookup,
+    openUrl: () => { throw new Error("no opener"); },
+  });
+  try {
+    const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "v" });
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗`);
+  } finally { proxy.close(); }
+});
 
 test("a server without the sessions endpoint keeps today's link, and is asked once", async () => {
   const upstream = await mockUpstream();
@@ -11061,7 +11118,7 @@ test("a server without the sessions endpoint keeps today's link, and is asked on
     const display = await postHook(proxy, displayHook({ prompt_id: "prompt-1", final: true }));
     assert.ok(linkText(display.body.hookSpecificOutput.displayContent).endsWith(`\n${trailerNew(PAGE_URL_1)}`));
     const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
-    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${PAGE_URL_1} ↗\n${usageLines(memtreeSrv.origin)}`);
+    assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${PAGE_URL_1} ↗`);
     assert.equal(asked.length, 1, "404 turns the lookup off for a while");
   } finally {
     proxy.close();
@@ -11088,9 +11145,9 @@ test("the newest-tree link never shows another session's tree", async () => {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postSessionMessages(proxy.port, followupTurn("turn two"));
     await lookup.settle("session-1");
-    assert.equal(stripAnsi((await view("session-1")).body.reason), `• MemTree\n  ${PAGE_URL_1} ↗\n${usageLines(memtreeSrv.origin)}`);
+    assert.equal(stripAnsi((await view("session-1")).body.reason), `• MemTree\n  ${PAGE_URL_1} ↗`);
     // A session this proxy never served still gets its own tree, and only its own.
-    assert.equal(stripAnsi((await view("session-3")).body.reason), `• MemTree\n  ${NEWEST_URL} ↗\n${usageLines(memtreeSrv.origin)}`);
+    assert.equal(stripAnsi((await view("session-3")).body.reason), `• MemTree\n  ${NEWEST_URL} ↗`);
     assert.match((await view("session-4")).body.reason, /no page yet/);
     for (const s of ["session-1", "session-3", "session-4"]) {
       assert.ok(!(await view(s)).body.reason.includes(OTHER_URL), s);
@@ -11243,18 +11300,16 @@ for (const mode of [
     const proxy = await startProxy({memtree: new MemtreeClient({baseUrl:'http://127.0.0.1:1',apiKey:'k'}), newestTrees:lookup});
     try {
       const view = await postHook(proxy, {hook_event_name:'UserPromptSubmit',prompt:'/memtree-view',prompt_id:'view'});
-      assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗\n${usageLines('http://127.0.0.1:1')}`);
+      assert.equal(stripAnsi(view.body.reason), `• MemTree\n  ${NEWEST_URL} ↗`);
       assert.equal(view.body.reason.includes('\x1b]8;;'), mode.osc);
-      for (const url of [NEWEST_URL, 'http://127.0.0.1:1/usage']) {
-        assert.equal(view.body.reason.includes(`\x1b]8;;${url}\x1b\\${url}\x1b]8;;\x1b\\ ↗`), mode.osc, url);
-      }
+      assert.equal(view.body.reason.includes(`\x1b]8;;${NEWEST_URL}\x1b\\${NEWEST_URL}\x1b]8;;\x1b\\ ↗`), mode.osc);
       if (!mode.osc) assert.equal(view.body.reason, stripAnsi(view.body.reason));
     } finally { proxy.close(); }
   });
 }
 
 for (const osc of [false, true]) {
-  test(`/memtree-view memory-from link is closed, never the output's last word (${osc ? "OSC 8" : "bare"})`, async (t) => {
+  test(`/memtree-view shows one link, closed, never the output's last word (${osc ? "OSC 8" : "bare"})`, async (t) => {
     setNoticeColorMode(t, true);
     setHyperlinkTerminal(t, osc ? {TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.0'} : {}, true);
     const upstream = await mockUpstream();
@@ -11270,11 +11325,11 @@ for (const osc of [false, true]) {
       await lookup.settle("session-1");
       const view = await postHook(proxy, { hook_event_name: "UserPromptSubmit", prompt: "/memtree-view", prompt_id: "p-view" });
       const reason = view.body.reason;
-      assert.equal(stripAnsi(reason), `• MemTree\n  ${NEWEST_URL} ↗\n  memory from ${PAGE_URL_1} ↗\n${usageLines(memtreeSrv.origin)}`);
-      assert.ok(!stripAnsi(reason).trimEnd().endsWith(PAGE_URL_1), "the last URL is closed");
-      for (const url of [NEWEST_URL, PAGE_URL_1, `${memtreeSrv.origin}/usage`]) {
-        assert.equal(reason.includes(`\x1b]8;;${url}\x1b\\${url}\x1b]8;;\x1b\\ ↗`), osc, url);
-      }
+      assert.equal(stripAnsi(reason), `• MemTree\n  ${NEWEST_URL} ↗`);
+      assert.ok(!stripAnsi(reason).trimEnd().endsWith(NEWEST_URL), "the URL is closed");
+      assert.equal(reason.includes(`\x1b]8;;${NEWEST_URL}\x1b\\${NEWEST_URL}\x1b]8;;\x1b\\ ↗`), osc);
+      // Not the stale compress page the memory was built from, nor the usage dashboard.
+      assert.ok(!reason.includes(PAGE_URL_1) && !reason.includes(`${memtreeSrv.origin}/usage`), reason);
     } finally {
       proxy.close();
       upstream.close();

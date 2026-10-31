@@ -119,7 +119,6 @@ import {
   TRAILER_LABEL,
   LINK_LABEL,
   linkLines,
-  urlLine,
   terminalSupportsHyperlinks,
   isMemtreeViewCommand,
   sessionCommandArgs,
@@ -167,6 +166,7 @@ import { bodyImages } from "./image-tokens.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
+import type { UrlOpener } from "./open-url.js";
 import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
@@ -365,6 +365,12 @@ export interface ProxyOptions {
    */
   promptSubmitNotice?: () => string | undefined;
   /**
+   * Opens `/memtree-view`'s link in the user's browser (open-url.ts). The CLI
+   * passes it only for interactive local sessions (not `-p`, SSH or CI);
+   * omitted, the command only prints the link.
+   */
+  openUrl?: UrlOpener;
+  /**
    * Earlier MemTree sessions in this project, added to a main session's
    * SessionStart as model context (project-trees.ts). Omitted means none.
    */
@@ -479,6 +485,8 @@ interface ProxyState {
   sessionStartNotice?: () => string | undefined;
   /** ProxyOptions.promptSubmitNotice. */
   promptSubmitNotice?: () => string | undefined;
+  /** ProxyOptions.openUrl. */
+  openUrl?: UrlOpener;
   /** ProxyOptions.projectTrees. */
   projectTrees?: ProjectTreesHint;
   /** ProxyOptions.subagentHint. */
@@ -1043,6 +1051,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
     promptSubmitNotice: opts.promptSubmitNotice,
+    openUrl: opts.openUrl,
     projectTrees: opts.projectTrees,
     subagentHint: opts.subagentHint,
     resumeGuidance: opts.resumeGuidance,
@@ -3384,15 +3393,13 @@ function sessionCommandReply(
     : pausedCompactionText(viewUrl(subscribeUrlFromDetail(unpaid)));
   if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
     return [
-      "• /memtree-view · show this session's MemTree page link",
+      "• /memtree-view · open this session's MemTree page and show its link",
       paused !== undefined ? `• ${paused}`
         : `• /memtree-compact [tokens | off] · compact this session on your next message (default half the budget, at least ${MEMTREE_COMPACT_MIN_TOKENS / 1000}k)`,
       usageLines(state),
     ].filter((line): line is string => line !== undefined).join("\n");
   }
-  if (isMemtreeViewCommand(prompt)) {
-    return joinNoticeLines(memtreeViewLine(state, sessionId), usageLines(state)) ?? "";
-  }
+  if (isMemtreeViewCommand(prompt)) return memtreeView(state, sessionId);
   const args = sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND);
   if (args === undefined) return undefined;
   const keep =
@@ -3438,10 +3445,7 @@ function subagentCommandReply(
   sessionId: string,
   prompt: string
 ): string | undefined {
-  if (isMemtreeViewCommand(prompt)) {
-    const view = `${memtreeViewLine(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
-    return joinNoticeLines(view, usageLines(state)) ?? view;
-  }
+  if (isMemtreeViewCommand(prompt)) return `${memtreeView(state, sessionId)}\n${SUBAGENT_VIEW_NOTE}`;
   if (sessionCommandArgs(prompt, MEMTREE_COMPACT_COMMAND) !== undefined) {
     return `${TRAILER_LABEL} ${SUBAGENT_COMPACT_REPLY}`;
   }
@@ -3457,8 +3461,13 @@ export function parseTokenCount(text: string): number | undefined {
   return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-/** The `/memtree-view` answer: this session's newest page, or why there is none. */
-function memtreeViewLine(state: ProxyState, sessionId: string): string {
+/**
+ * The `/memtree-view` answer: one link, this session's newest page (the
+ * newest completed tree, which covers the whole session, rather than the
+ * possibly stale page its memory was compressed from), opened in the browser
+ * where the CLI allows it; or why there is none.
+ */
+function memtreeView(state: ProxyState, sessionId: string): string {
   const inMemory = state.memtreePages.get(sessionId);
   const page =
     inMemory && (inMemory.sessionId === undefined || inMemory.sessionId === sessionId)
@@ -3468,16 +3477,17 @@ function memtreeViewLine(state: ProxyState, sessionId: string): string {
   if (!link) {
     return `${TRAILER_LABEL} no page yet: this session has not been indexed. The link appears once it has.`;
   }
+  try {
+    state.openUrl?.(link.link);
+  } catch {
+    // The printed link below is the fallback.
+  }
   // Blocked-prompt reasons need an explicit hyperlink in styled terminals.
-  const lines = linkLines(LINK_LABEL, viewUrl(link.link), link.note);
-  // The memory the agent works from can be an older tree than the newest one.
-  return page?.compressed && page.url !== link.link
-    ? `${lines}\n${urlLine(viewUrl(page.url), "memory from ")}`
-    : lines;
+  return linkLines(LINK_LABEL, viewUrl(link.link), link.note);
 }
 
 /**
- * The usage dashboard link that `/memtree` and `/memtree-view` end with,
+ * The usage dashboard link that `/memtree` ends with,
  * formatted like the MemTree link; undefined when the environment has none.
  */
 function usageLines(state: ProxyState): string | undefined {

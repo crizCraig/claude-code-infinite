@@ -4,6 +4,7 @@ import {
   anthropicUpstreamFromEnv,
   compactTargetFromEnv,
   isPrintInvocation,
+  mayBePrintInvocation,
   memtreeLinkPlacementFromEnv,
   parseWrapperArgs,
 } from "../dist/cli-args.js";
@@ -33,6 +34,17 @@ test("Claude print flags are recognized only before --", () => {
   assert.equal(isPrintInvocation(["--", "-p"]), false);
   assert.equal(isPrintInvocation(["--", "--print"]), false);
   assert.equal(isPrintInvocation(["hello", "--", "--print"]), false);
+});
+
+test("mayBePrintInvocation also counts combined short flags with p (no browser opened)", () => {
+  for (const args of [["-p"], ["--print"], ["--print=true"], ["-pc", "hi"], ["-cp"], ["-dpc"],
+    ["-pr0f1c2d3e-4a5b-4c6d-8e7f-001122334455", "/ccc:memtree-view"], ["-pdapi,http"],
+    ["--append-system-prompt", "--", "-cp", "/ccc:memtree-view"], ["--", "-pc"]]) {
+    assert.equal(mayBePrintInvocation(args), true, args.join(" "));
+  }
+  for (const args of [[], ["-c"], ["--resume", "abc"], ["-r", "abc"], ["--", "hello"], ["--permission-mode", "plan"]]) {
+    assert.equal(mayBePrintInvocation(args), false, args.join(" "));
+  }
 });
 
 test("CCC_MEMTREE_LINK picks a known placement, anything else means default", () => {

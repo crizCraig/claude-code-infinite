@@ -133,7 +133,7 @@ Then go step by step, as if you had only heard of MemTree:
 | 5 | Run `ccc` for the first time: install Claude Code if ccc offers, then paste the key. |
 | 6 | Sign Claude Code in with your Claude account. |
 | 7 | Send your first message and get an answer. |
-| 8 | Find your first MemTree link (ccc shows one; `/memtree-view` prints it) and open it. |
+| 8 | Find your first MemTree link (ccc shows one; `/memtree-view` prints it and opens it in your browser) and check it opened. |
 
 For **each step**, note (one or two lines is fine) and screenshot:
 

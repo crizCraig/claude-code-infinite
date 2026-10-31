@@ -14,6 +14,24 @@ export function isPrintInvocation(args: string[]): boolean {
 }
 
 /**
+ * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
+ * cluster with p among its leading letters (`-pc`, `-cp`, `-pr<id>`) or
+ * `--print=…`, anywhere in the arguments. Conservative: for
+ * choices that must never happen in print mode, such as opening a browser.
+ */
+export function mayBePrintInvocation(args: string[]): boolean {
+  // Every argument, `--` included: an option's value can be `--` itself
+  // (`--append-system-prompt -- -cp`), so it need not end Claude's options.
+  for (const arg of args) {
+    if (arg === "--print" || arg.startsWith("--print=")) return true;
+    // Commander reads a cluster up to a flag that takes a value, the rest being
+    // that value (`-pr<session-id>`, `-pdapi,http`): p among the leading letters.
+    if (/^-[A-Za-z]*p/.test(arg)) return true;
+  }
+  return false;
+}
+
+/**
  * `ccc --version` / `ccc -v` (alone, or after `local`/`staging`): answered by ccc itself,
  * with no MemTree key, proxy or session, so it works right after installing.
  */

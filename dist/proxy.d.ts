@@ -60,6 +60,7 @@ import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
+import type { UrlOpener } from "./open-url.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -208,6 +209,12 @@ export interface ProxyOptions {
      */
     promptSubmitNotice?: () => string | undefined;
     /**
+     * Opens `/memtree-view`'s link in the user's browser (open-url.ts). The CLI
+     * passes it only for interactive local sessions (not `-p`, SSH or CI);
+     * omitted, the command only prints the link.
+     */
+    openUrl?: UrlOpener;
+    /**
      * Earlier MemTree sessions in this project, added to a main session's
      * SessionStart as model context (project-trees.ts). Omitted means none.
      */
@@ -313,6 +320,8 @@ interface ProxyState {
     sessionStartNotice?: () => string | undefined;
     /** ProxyOptions.promptSubmitNotice. */
     promptSubmitNotice?: () => string | undefined;
+    /** ProxyOptions.openUrl. */
+    openUrl?: UrlOpener;
     /** ProxyOptions.projectTrees. */
     projectTrees?: ProjectTreesHint;
     /** ProxyOptions.subagentHint. */
