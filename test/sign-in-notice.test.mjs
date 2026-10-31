@@ -13,9 +13,12 @@ import {
   SIGN_IN_WARNING_KINDS,
   SignInTracker,
   apiBillingText,
+  mayWaitForEnter,
   presentSignInNotice,
   readSignInState,
+  sessionProbe,
   signInNotice,
+  signInNoticeApplies,
   waitForEnter,
 } from "../dist/sign-in-notice.js";
 import { SIGN_IN_WARNING_KINDS as SCHEMA_KINDS, sanitizeEvent } from "../dist/diagnostics-schema.js";
@@ -318,4 +321,35 @@ test("diagnostics: the new events keep only their allowlisted values", () => {
     since_warning_ms: 60_000 });
   assert.deepEqual(sanitizeEvent("first_request", { status: 200, since_warning_ms: 9000 }, 1),
     { name: "first_request", t: 1, status: 200, since_warning_ms: 9000 });
+});
+
+test("no sign-in message right after ccc installed Claude Code (locateClaude gave null)", () => {
+  assert.equal(signInNoticeApplies(null), false);
+  assert.equal(signInNoticeApplies(undefined), false);
+  assert.equal(signInNoticeApplies({ command: "claude", source: "native" }), true);
+});
+
+test("an ANTHROPIC_API_KEY rejected at Claude Code's prompt: no billing message", () => {
+  // `claude auth status` (non-interactive) counts the env key; the session skips it.
+  const probe = { result: "ok", ms: 90, status: { auth: "api_key", plan: "unknown",
+    keySource: "ANTHROPIC_API_KEY", console: false } };
+  const subscriber = { auth: "api_key", plan: "unknown", subscriptionLogin: true };
+  assert.deepEqual(sessionProbe(probe, undefined), { result: "ok", ms: 90 });
+  assert.equal(signInNotice(input(sessionProbe(probe, undefined), { fallback: subscriber })),
+    undefined);
+  // An approved key (or a print run, which always uses it) still gets the message.
+  const approved = { source: "ANTHROPIC_API_KEY", asks: false };
+  assert.equal(sessionProbe(probe, approved), probe);
+  assert.equal(signInNotice(input(sessionProbe(probe, approved))).kind, "api_billing");
+  // Other answers are kept as they are.
+  const helper = { ...probe, status: { ...probe.status, keySource: "apiKeyHelper" } };
+  assert.equal(sessionProbe(helper, undefined), helper);
+});
+
+test("the sign-in notice waits for Enter only in a terminal outside CI", () => {
+  assert.equal(mayWaitForEnter(true, true, {}), true);
+  assert.equal(mayWaitForEnter(true, true, { CI: "true" }), false);
+  assert.equal(mayWaitForEnter(true, true, { CI: "false" }), true);
+  assert.equal(mayWaitForEnter(true, false, {}), false);
+  assert.equal(mayWaitForEnter(false, true, {}), false);
 });
