@@ -296,6 +296,15 @@ test('a subagent is indexed once when it ends, per turn only past half its budge
       assert.equal((await h.post(long, { agent: 'agent-2' })).status, 200);
       await until(() => h.indexCalls.length === 2 + i);
     }
+    // Its last turn adds little text (under the index minimum): held back per turn, but
+    // sent when it ends, so its result is in its tree.
+    addRound(long, 'b-last', 2_000);
+    assert.equal((await h.post(long, { agent: 'agent-2' })).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(h.indexCalls.length, 3);
+    await h.hook({ hook_event_name: 'SubagentStop', agent_id: 'agent-2' });
+    await until(() => h.indexCalls.length === 4);
+    assert.equal(h.indexCalls[3].messages, long.length);
 
     // A subagent still running at exit gets its one index inside the drain.
     const third = [{ role: 'user', content: 'You are reviewing the diff.' }];

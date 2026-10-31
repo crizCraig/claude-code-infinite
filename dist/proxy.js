@@ -440,8 +440,6 @@ export function startProxy(opts) {
             ? Math.floor(timeoutMs)
             : 5_000;
         backgroundAbort.abort();
-        // Subagents still running at exit get their one index inside the drain.
-        sendDeferredAgentIndexes(state);
         const quiesced = (async () => {
             // Once close completes, every accepted request has entered the tracked
             // set.
@@ -3529,18 +3527,23 @@ function indexTurn(args) {
     const compaction = args.rec.compaction;
     if (compaction?.estimatedTokens !== undefined &&
         compaction.estimatedTokens >= compaction.budgetTokens * AGENT_PER_TURN_INDEX_SHARE) {
-        state.deferredAgentIndexes.delete(deferredIndexKey(agentId, args.msgsForMemtree));
-        return send(false);
+        send(false);
+        // Kept too: its last turns under the text minimum still go at its end (forced).
+        keepDeferredIndex(state, deferredIndexKey(agentId, args.msgsForMemtree), { messages: args.msgsForMemtree, send });
+        return;
     }
     // Per agent and conversation: a side request made under the subagent's (or its parent's)
     // id is another conversation and must not replace the subagent's own.
-    const key = deferredIndexKey(agentId, args.msgsForMemtree);
+    keepDeferredIndex(state, deferredIndexKey(agentId, args.msgsForMemtree), { messages: args.msgsForMemtree, send });
+}
+/** Keep `entry` as its key's newest unsent index call (bounded). */
+function keepDeferredIndex(state, key, entry) {
     const kept = state.deferredAgentIndexes.get(key);
     // A rewind or another branch: the kept history is not part of this one, so it goes now.
-    if (kept && !extendsHistory(args.msgsForMemtree, kept.messages))
+    if (kept && !extendsHistory(entry.messages, kept.messages))
         sendDeferredIndex(state, key);
     state.deferredAgentIndexes.delete(key);
-    state.deferredAgentIndexes.set(key, { messages: args.msgsForMemtree, send });
+    state.deferredAgentIndexes.set(key, entry);
     while (state.deferredAgentIndexes.size > DEFERRED_AGENT_INDEX_MAX) {
         const oldest = state.deferredAgentIndexes.keys().next().value;
         if (oldest === undefined)
@@ -3615,7 +3618,8 @@ function carryFor(args) {
     // refused, its call left running for nothing).
     if (!args.isMainRequest || args.sessionId === undefined || args.explicitTarget !== false ||
         args.targetTokens === undefined || compaction?.mode !== "auto" ||
-        compaction.reason === "manual" || args.state.compactNow.has(args.sessionId) ||
+        // A crossing only: a call the server decides (maybe a passthrough) is not waited for.
+        (compaction.reason !== "budget" && compaction.reason !== "prefix-mismatch") || args.state.compactNow.has(args.sessionId) ||
         args.state.preparing.has(args.sessionId) || args.state.prepared.isInFlight(args.sessionId) ||
         args.state.backgroundSignal.aborted ||
         !preparesCompression(args.body.model, args.modelContextLimit))
@@ -3662,6 +3666,8 @@ function carryOverCompression(state, carry, pending) {
     return true;
 }
 /** How long a carried compaction may run: the long budget, or its upload's if longer. */
+/** How much longer than its turn's wait a carried call must be allowed to run. */
+const CARRY_MIN_EXTRA_MS = 5_000;
 function carriedBudgetMs(opts, scaledMs) {
     return Math.min(MAX_LONG_COMPRESS_WAIT_MS, Math.max(opts.memtree.longCompressBudgetMs, scaledMs));
 }
@@ -4087,6 +4093,9 @@ async function runBlockingCompression(args) {
     // too, never below the short one's).
     const scaledMs = opts.memtree.compressBudgetForBytes(rec.requestBytes);
     const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, args.longBudget ? Math.max(opts.memtree.longCompressBudgetMs, scaledMs) : scaledMs);
+    // Carried only when running on gives it meaningfully more time than this wait.
+    const carry = args.carry && carriedBudgetMs(opts, scaledMs) >= budgetMs + CARRY_MIN_EXTRA_MS
+        ? args.carry : undefined;
     const compressMeta = {
         // Model + tools drive the server's model-based memory budget
         // (e.g. 800k whole-request target for Fable / Opus 5). Omitting
@@ -4116,7 +4125,7 @@ async function runBlockingCompression(args) {
         ...(args.clientMeta ? { clientMeta: args.clientMeta } : {}),
         // The deadline this wait uses (the upload-scaled budget included), so the
         // call and its waiters end together; a carried call runs on to the long one.
-        timeoutMs: args.carry ? Math.max(budgetMs, carriedBudgetMs(opts, scaledMs)) : budgetMs,
+        timeoutMs: carry ? Math.max(budgetMs, carriedBudgetMs(opts, scaledMs)) : budgetMs,
     };
     // Sampled BEFORE the call, while it still describes this call: after the
     // await the hash is in the cache regardless of who put it there.
@@ -4126,7 +4135,10 @@ async function runBlockingCompression(args) {
     let deadline;
     const maximumWait = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, Math.max(1, Number.isFinite(budgetMs) ? budgetMs : 15_000));
     let settled = false;
-    const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, args.signal ?? state.shutdownSignal, compressMeta);
+    // Its own abort too: a carry refused at the deadline must not run on unused.
+    const carryAbort = carry ? new AbortController() : undefined;
+    const callSignal = args.signal ?? state.shutdownSignal;
+    const call = opts.memtree.compress(hash, msgsForMemtree, modelContextLimit, carryAbort ? AbortSignal.any([callSignal, carryAbort.signal]) : callSignal, compressMeta);
     const settle = () => { settled = true; };
     call.then(settle, settle);
     const result = await Promise.race([
@@ -4136,8 +4148,10 @@ async function runBlockingCompression(args) {
         clearTimeout(deadline); });
     const compressMs = Date.now() - compressStarted;
     // Given up on but still running: the session's next turn waits for it, not a new call.
-    const carried = result === null && !settled && args.carry !== undefined &&
-        carryOverCompression(state, args.carry, call);
+    const carried = result === null && !settled && carry !== undefined &&
+        carryOverCompression(state, carry, call);
+    if (result === null && !settled && !carried)
+        carryAbort?.abort();
     noteServerBudget(state, body.model, modelContextLimit, result);
     // Sampled at this call's settle, before a concurrent same-request failure of
     // another class can overwrite the complete-key entry.
