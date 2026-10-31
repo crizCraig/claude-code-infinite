@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.32](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.31...v1.0.32) (2026-10-31)
+
+
+### Features
+
+* a resumed session is given the current MemTree guidance ([#51](https://github.com/crizCraig/claude-code-infinite/issues/51)) ([bd094ec](https://github.com/crizCraig/claude-code-infinite/commit/bd094ec2ee64e297c4fce643e7bd4325a20e9fcc))
+* subagents are told whose memory to search; memtree tools say they are loaded ([#49](https://github.com/crizCraig/claude-code-infinite/issues/49)) ([300aa42](https://github.com/crizCraig/claude-code-infinite/commit/300aa42472d3e750ce63063414dcba76c4d6aba9))
+
+
+### Bug Fixes
+
+* ask Claude Code whether it is signed in, and hold the sign-in message until it is read ([#48](https://github.com/crizCraig/claude-code-infinite/issues/48)) ([d05e2b5](https://github.com/crizCraig/claude-code-infinite/commit/d05e2b513fa44723257cbb12a3fbfd1460fd1bd1))
+* no "ran uncompressed" notice on a refused turn; keep an uncounted prefix as the fallback ([#46](https://github.com/crizCraig/claude-code-infinite/issues/46)) ([56d8003](https://github.com/crizCraig/claude-code-infinite/commit/56d80037ae98f93f515454349b222a63e4739665))
+* release 1.0.32 review: no sign-in pause after ccc installs Claude Code, none in CI, no billing message for a rejected env key ([#53](https://github.com/crizCraig/claude-code-infinite/issues/53)) ([e0021e0](https://github.com/crizCraig/claude-code-infinite/commit/e0021e07be358d013efa7e9958ffd64d1e00445a))
+
 ## [1.0.31](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.30...v1.0.31) (2026-10-28)
 
 
