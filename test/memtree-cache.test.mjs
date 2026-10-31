@@ -665,17 +665,16 @@ test("a compress whose upload dropped is sent once more; never once its body was
   let mode = "mid-upload", compressCalls = 0, indexCalls = 0;
   const server = http.createServer((req, res) => {
     const chunks = [];
-    let dropped = false;
-    req.on("data", (chunk) => {
-      chunks.push(chunk);
-      if (mode === "mid-upload" && compressCalls === 0 && !dropped && !req.headers["x-index"]) {
-        dropped = true;
-        compressCalls++;
-        req.socket.destroy();
-      }
-    });
+    if (mode === "mid-upload" && compressCalls === 0) {
+      // Read nothing: the socket buffers fill and the client still holds most of the body
+      // (it is larger than any kernel's buffers), then the connection drops.
+      compressCalls++;
+      req.pause();
+      setTimeout(() => req.socket.destroy(), 200);
+      return;
+    }
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
-      if (dropped) return;
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       if (body.index_only) {
         indexCalls++;
@@ -691,8 +690,8 @@ test("a compress whose upload dropped is sent once more; never once its body was
   try {
     const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
       apiKey: "k" });
-    // Over 1 MB, so it is streamed and the drop lands before its end.
-    const big = [{ role: "user", content: "x".repeat(3_000_000) }];
+    // Over 1 MB, so it is streamed, and far over socket buffers: the drop lands before its end.
+    const big = [{ role: "user", content: "x".repeat(25_000_000) }];
     const result = await client.compress(MemtreeClient.hashMessages(big), big, 1_000_000,
       undefined, {});
     assert.ok(result, "answered on the second attempt");
