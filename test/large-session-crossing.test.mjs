@@ -416,8 +416,11 @@ test('a deferred subagent history whose image Claude Code then evicted is sent b
 test('an abandoned crossing whose prefix another turn replaced meanwhile is not ridden', async () => {
   let arrived = 0;
   // Call 2 (the abandoned crossing) takes 1.5 s; call 3 (the next crossing) answers at once.
+  // The next prompt waits for call 2 only its long budget (300 ms here; release 1.0.33 E2E:
+  // it waits on the lane), then compresses on its own (call 3): a bounded overlap on purpose,
+  // so the late call 2 meets a newer prefix. Not a no-overlap scenario.
   const h = await harness({ compressMs: n => { arrived = n; return n === 2 ? 1_500 : 0; },
-    compressTimeoutMs: 5_000, perKiB: 0 });
+    compressTimeoutMs: 5_000, longCompressTimeoutMs: 300, perKiB: 0 });
   try {
     const conv = await stablePrefixAt820k(h);
     addRound(conv, 'jump', 142_000 * 4);
@@ -518,3 +521,88 @@ test('two human turns waiting for the same carried compression: both ride it (Co
       assert.equal(h.blocking().length, 2, 'the carried compression served both turns');
     } finally { h.close(); }
   });
+
+test('a failed preparation two crossing turns waited for: one compression, never two at once', async () => {
+  // Release 1.0.33 E2E (staging): the crossing tool turn (abandoned) and the user's next
+  // prompt both waited for the session's preparation; it failed (timed out) and each turn
+  // then compressed: two 27 MB compressions side by side, both billed.
+  let arrived = 0;
+  const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 800; },
+    prepareMs: 600, prepares: false, compressTimeoutMs: 5_000, perKiB: 0 });
+  try {
+    const conv = await stablePrefixAt820k(h);
+    await rideTo(h, conv, 870_000);
+    await until(() => h.preparing().length >= 1);
+    addRound(conv, 'jump', 100_000 * 4);
+    const crossing = h.post(structuredClone(conv));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] });
+    conv.push({ role: 'user', content: 'Never mind that, look at the parser instead.' });
+    const human = h.post(conv);
+    const [a, b] = await Promise.all([crossing, human]);
+    for (const turn of [a, b]) assert.equal(turn.status, 200, JSON.stringify(turn.record));
+    const blocking = h.blocking().sort((x, y) => x.startedAt - y.startedAt);
+    for (let i = 1; i < blocking.length; i++) {
+      assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt,
+        `never two compresses at once: ${JSON.stringify(blocking)}`);
+    }
+    void arrived;
+  } finally { h.close(); }
+});
+
+test('a prompt while a dropped crossing turn still compresses waits and rides it, no second call',
+  async () => {
+    let arrived = 0;
+    const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 1_000; },
+      compressTimeoutMs: 5_000, perKiB: 0 });
+    try {
+      const conv = await stablePrefixAt820k(h);
+      addRound(conv, 'jump', 142_000 * 4);
+      const controller = new AbortController();
+      const dropped = h.post(structuredClone(conv), { signal: controller.signal }).catch(err => err);
+      await until(() => arrived === 2);
+      controller.abort();
+      await dropped;
+      conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] });
+      conv.push({ role: 'user', content: 'Look at the parser instead.' });
+      const prompt = await h.post(conv);
+      assert.equal(prompt.status, 200, JSON.stringify(prompt.record));
+      assert.ok(tokensOf(prompt.sent) < 960_000, `${tokensOf(prompt.sent)} sent`);
+      const blocking = h.blocking();
+      for (let i = 1; i < blocking.length; i++) {
+        assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, 'never two compresses at once');
+      }
+      assert.equal(blocking.length, 2, 'the dropped turn\'s compression served the prompt');
+    } finally { h.close(); }
+  });
+
+test('a prompt dropped while it waits on the lane does not compress beside it (r3 P1)', async () => {
+  let arrived = 0;
+  const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 1_500; },
+    compressTimeoutMs: 5_000, perKiB: 0 });
+  try {
+    const conv = await stablePrefixAt820k(h);
+    addRound(conv, 'jump', 142_000 * 4);
+    const first = new AbortController();
+    const dropped = h.post(structuredClone(conv), { signal: first.signal }).catch(err => err);
+    await until(() => arrived === 2);
+    first.abort();
+    await dropped;
+    conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] });
+    conv.push({ role: 'user', content: 'Look at the parser instead.' });
+    const second = new AbortController();
+    const waiting = h.post(structuredClone(conv), { signal: second.signal }).catch(err => err);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    second.abort();
+    await waiting;
+    await new Promise(resolve => setTimeout(resolve, 2_500));
+    const blocking = h.blocking();
+    for (let i = 1; i < blocking.length; i++) {
+      assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, `overlap: ${JSON.stringify(blocking)}`);
+    }
+    // The prompt Claude Code then sends again rides the dropped turns' one compression.
+    const retried = await h.post(conv);
+    assert.equal(retried.status, 200, JSON.stringify(retried.record));
+    assert.equal(h.blocking().length, 2, 'one compression for the crossing');
+  } finally { h.close(); }
+});

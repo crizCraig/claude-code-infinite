@@ -2317,6 +2317,9 @@ async function handleMessages(
           // every tool turn over the budget. A cooldown skip does not start
           // the lane's backoff.
           rec.routeRecovery = { outcome: "cooldown" };
+        } else if (state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight) {
+          // Claimed while the cooldown check above awaited a count (a crossing prompt).
+          rec.routeRecovery = { outcome: "in-flight" };
         } else {
           const recoveryAttempt: ToolRecoveryAttempt = { modelContextLimit, inFlight: true };
           if (!prior && state.toolRecoveryAttemptedLanes.size >= 128) {
@@ -2485,6 +2488,32 @@ async function handleMessages(
       rec.compaction.preparedWaitMs = total;
       rec.compaction.prepared ??= prepared;
     }
+  }
+  // Never beside the main lane's compression in flight either (a tool turn's that Claude
+  // Code dropped, or another prompt's, both after the preparation they waited for failed):
+  // wait for it, then plan again on what it left: a prefix to ride, or a preparation.
+  // Bounded; stops early if Claude Code drops this request (release 1.0.33 E2E).
+  const crossing = () => edge?.kind === "compress" && isMainRequest &&
+    isAutoCrossing(rec, body.model, modelContextLimit);
+  for (let i = 0; i < 2 && crossing() &&
+      state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight; i++) {
+    const clientGone = new AbortController();
+    const onClose = () => clientGone.abort();
+    res.once("close", onClose);
+    if (res.destroyed) clientGone.abort();
+    rec.laneWaitMs = (rec.laneWaitMs ?? 0) + await waitForLaneIdle(state, requestRouteKey,
+      Math.min(MAX_LONG_COMPRESS_WAIT_MS, opts.memtree.longCompressBudgetMs), clientGone.signal);
+    res.off("close", onClose);
+    await awaitPreparation(state, sessionId!, opts.memtree.longCompressBudgetMs, rec.compaction!);
+    edge = await planEdge();
+  }
+  // Claude Code dropped it while it waited: the lane's compression in flight already carries
+  // this session's crossing (the next turn rides it), so none beside it for nobody (r3 P1).
+  if (crossing() && state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight &&
+      res.destroyed && !res.writableFinished) {
+    releaseUncommittedRouteDecision();
+    recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
+    return logged(Promise.resolve());
   }
   // Not beside a blocking compress call: the two would overlap on the server.
   if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass")) {
@@ -2777,8 +2806,12 @@ async function handleMessages(
       targetTokens: edge.targetTokens, explicitTarget: edge.explicitTarget, linkSeq })
     : undefined;
   let compression: BlockingCompressionOutcome;
+  // A main-thread compaction holds its lane, claimed with no await since the check above:
+  // a concurrent turn of the lane waits for it or rides its fallback, never compresses beside it.
+  const edgeLane = <T>(run: () => Promise<T>): Promise<T> =>
+    crossing() ? holdingLane(state, requestRouteKey, run) : run();
   try {
-    compression = await runBlockingCompression({
+    compression = await edgeLane(async () => runBlockingCompression({
       opts,
       state,
       body,
@@ -2801,7 +2834,7 @@ async function handleMessages(
       longBudget: !(edge?.kind === "compress" && edge.fallback && !edge.fallback.uncounted) &&
         await wholeRequestRefused(requestSizing, forwardCandidate, sizingLimits()),
       ...(edgeCarry ? { carry: edgeCarry } : {}),
-    });
+    }));
   } catch {
     const kept = rideOldPrefix(false);
     if (kept) return kept;
@@ -5099,6 +5132,18 @@ interface CarryOver {
   linkSeq?: number;
   /** The session's stable prefix when the call started: a different one at its end wins. */
   base: StablePrefix | undefined;
+}
+
+/**
+ * Whether a main-thread compaction is a budget crossing at the automatic target where
+ * preparations exist: the turns that may race one (a dropped crossing turn and the next
+ * prompt) are serialized on its lane, as carryFor carries it.
+ */
+function isAutoCrossing(rec: MessagesRecord, model: unknown, modelContextLimit: number): boolean {
+  const compaction = rec.compaction;
+  return compaction?.mode === "auto" &&
+    (compaction.reason === "budget" || compaction.reason === "prefix-mismatch") &&
+    preparesCompression(model, modelContextLimit);
 }
 
 /** A main-thread compaction's CarryOver, when its plan has the automatic target. */
