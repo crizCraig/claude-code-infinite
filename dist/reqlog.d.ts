@@ -289,6 +289,11 @@ export interface MessagesRecord {
         reason: "exact-count-fits-window" | "estimate-fits-window" | "bytes-fallback-fits-window";
     };
     /**
+     * A tool turn over the window with nothing to ride waited this long for its lane's
+     * compression in flight before planning again (instead of going without and refused).
+     */
+    laneWaitMs?: number;
+    /**
      * Outcome of a tool-turn compaction attempt (a tool turn whose estimated
      * size reached the budget), or why none was made although one was due.
      * Absent on tool turns under the budget: they forward with no attempt.

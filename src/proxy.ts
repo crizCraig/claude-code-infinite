@@ -2213,7 +2213,7 @@ async function handleMessages(
       // prefix, else whole) with no compress call; at it, compress once to
       // the target (planToolCompaction). A "replay" is a client retry of the
       // request that installed the route, forwarded verbatim.
-      const plan = await planToolCompaction({
+      const planArgs = {
         opts,
         state,
         body,
@@ -2228,7 +2228,18 @@ async function handleMessages(
         rec,
         ride: toolRide,
         canCompress,
-      });
+      };
+      let plan = await planToolCompaction(planArgs);
+      // Over the window with nothing to ride while the lane compresses: going without it
+      // can only be refused (staging 2026-10-30: a 120 s compress, every tool turn meanwhile
+      // refused). Wait for it, then plan again on what it installed.
+      if (plan.kind === "compress" && plan.overWindow && !plan.fallback &&
+          state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight) {
+        rec.laneWaitMs = await waitForLaneIdle(state, requestRouteKey,
+          Math.min(MAX_LONG_COMPRESS_WAIT_MS, opts.memtree.longCompressBudgetMs),
+          state.shutdownSignal);
+        plan = await planToolCompaction(planArgs);
+      }
       if (isMainRequest && toolSessionId !== undefined && canCompress &&
           (plan.kind === "ride" || plan.kind === "pass")) {
         maybePrepareCompression({ opts, state, body, messages, msgsForMemtree, hash,
@@ -6747,6 +6758,26 @@ function lateRecoveryPlan(
   return preferred.kind === "original" && !fitsMeasured(measured, limits)
     ? { tokens: measured.tokens } : undefined;
 }
+
+/**
+ * Wait (up to `maxMs`, or until `signal` aborts) for the lane's in-flight compression to
+ * end; the milliseconds waited.
+ */
+async function waitForLaneIdle(
+  state: ProxyState, routeKey: string, maxMs: number, signal: AbortSignal
+): Promise<number> {
+  const started = Date.now();
+  while (state.toolRecoveryAttemptedLanes.get(routeKey)?.inFlight && !signal.aborted &&
+      !state.shutdownSignal.aborted && !state.backgroundSignal.aborted &&
+      Date.now() - started < maxMs) {
+    // Unref'd: a wait never holds the process open.
+    await new Promise((resolve) => setTimeout(resolve, LANE_WAIT_POLL_MS).unref());
+  }
+  return Date.now() - started;
+}
+
+/** How often a turn waiting for its lane's compression looks again. */
+const LANE_WAIT_POLL_MS = 100;
 
 /**
  * Run a delivery-time compression as the lane's in-flight operation, so a

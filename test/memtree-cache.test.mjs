@@ -767,6 +767,48 @@ test("a waiting index call whose image the next one lost (evicted) is sent, not 
   }
 });
 
+test("a held-back history is sent before a rewind replaces it (origin/main sent every turn)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]);
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const branch = [root, { role: "assistant", content: "a".repeat(20_000) }];
+    send(branch); // under the minimum: held back
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(fixture.calls.length, 1);
+    send([root, { role: "assistant", content: "rewound" }]); // a rewind: the branch goes first
+    await waitFor(() => fixture.calls.length >= 2);
+    assert.equal(await client.drainBackground(2_000), true);
+    assert.ok(fixture.calls.some((call) => JSON.stringify(call.messages).includes("a".repeat(100))),
+      "the held-back branch reached MemTree");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("at shutdown a held-back history goes inside the drain (no final index carries it)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+      messages, 100, "s");
+    const root = { role: "user", content: "x".repeat(40_000) };
+    send([root]);
+    await waitFor(() => fixture.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    send([root, { role: "assistant", content: "tail" }]); // held back
+    assert.equal(await client.drainBackground(2_000), true);
+    assert.equal(fixture.calls.length, 2);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("text size counts text, tool inputs and results, not images", () => {
   assert.equal(messagesTextChars([
     { role: "user", content: "abc" },

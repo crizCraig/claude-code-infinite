@@ -271,6 +271,30 @@ test('replay 2026-10-30: over the window with no fallback, a 3 s compression is 
   } finally { h.close(); }
 });
 
+test('staging 2026-10-30: a tool turn over the window while its lane compresses waits, not refused', async () => {
+  // Staging, 9 MB synthetic session: a crossing's compress ran 120 s; every tool turn that
+  // came meanwhile was over the window with no prefix to ride and was refused at once
+  // (routeRecovery "in-flight"), 503 then 400, until it ended.
+  let arrived = 0;
+  const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 1_500; },
+    compressTimeoutMs: 300, longCompressTimeoutMs: 10_000, perKiB: 0 });
+  try {
+    const conv = await stablePrefixAt820k(h);
+    addRound(conv, 'jump', 170_000 * 4);
+    const first = h.post(structuredClone(conv));
+    await until(() => arrived === 2);
+    addRound(conv, 'meanwhile', 2_000);
+    const second = await h.post(conv);
+    assert.equal(second.status, 200, JSON.stringify(second.record));
+    assert.ok(tokensOf(second.sent) < 960_000, `${tokensOf(second.sent)} sent`);
+    assert.equal((await first).status, 200);
+    const blocking = h.blocking();
+    for (let i = 1; i < blocking.length; i++) {
+      assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, 'never two compresses at once');
+    }
+  } finally { h.close(); }
+});
+
 test('a subagent is indexed once when it ends, per turn only past half its budget', async () => {
   const h = await harness();
   try {

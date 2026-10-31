@@ -364,6 +364,11 @@ export declare class MemtreeClient {
     private readonly compressTimeoutMsPerKiB;
     /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
     private readonly indexLanesSent;
+    /**
+     * Per conversation, the newest history held back by INDEX_MIN_NEW_CHARS: sent before a
+     * call that does not carry it whole (a rewind, evicted media) replaces it.
+     */
+    private readonly indexLanesHeld;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
@@ -551,6 +556,13 @@ export declare class MemtreeClient {
      * turn is not held back by an upload the server never got.
      */
     private sendLaneIndex;
+    /**
+     * Before `job` goes or is held: the lane's held-back history is sent if `job` does not
+     * carry it whole (origin/main sent every turn, so a rewind must not lose a branch), and
+     * dropped otherwise (`job` carries it).
+     */
+    private releaseHeldIndex;
+    private holdIndex;
     /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
      * last sent (or has waiting to send): the server's index minimum would only ack it.

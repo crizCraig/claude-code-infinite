@@ -1034,6 +1034,11 @@ export class MemtreeClient {
   private readonly compressTimeoutMsPerKiB: number;
   /** Per conversation, the last history an index call was started for (INDEX_MIN_NEW_CHARS). */
   private readonly indexLanesSent = new Map<string, SentIndex>();
+  /**
+   * Per conversation, the newest history held back by INDEX_MIN_NEW_CHARS: sent before a
+   * call that does not carry it whole (a rewind, evicted media) replaces it.
+   */
+  private readonly indexLanesHeld = new Map<string, QueuedIndex>();
   /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
   private readonly indexLanesPending = new Map<string, SentIndex>();
   /** Once draining begins, no later request may create another log producer. */
@@ -1424,8 +1429,12 @@ export class MemtreeClient {
     const lane = indexLaneKey(sessionId, messages);
     const job: QueuedIndex = { messages, modelContextLimit,
       opts: { sessionId, clientMeta, messageTimesFor, ...(final ? { finalIndex: true } : {}) } };
+    this.releaseHeldIndex(lane, job);
     // Held back is not sent: a later (or forced) call of the same history still goes.
-    if (!options.force && !final && this.tooLittleNewText(lane, job)) return;
+    if (!options.force && !final && this.tooLittleNewText(lane, job)) {
+      this.holdIndex(lane, job);
+      return;
+    }
     this.indexedHashes.add(indexKey);
     if (this.indexedHashes.size > DEDUPE_CACHE_MAX) {
       const first = this.indexedHashes.values().next().value;
@@ -1476,6 +1485,28 @@ export class MemtreeClient {
   }
 
   /**
+   * Before `job` goes or is held: the lane's held-back history is sent if `job` does not
+   * carry it whole (origin/main sent every turn, so a rewind must not lose a branch), and
+   * dropped otherwise (`job` carries it).
+   */
+  private releaseHeldIndex(lane: string, job: QueuedIndex): void {
+    const held = this.indexLanesHeld.get(lane);
+    if (!held) return;
+    this.indexLanesHeld.delete(lane);
+    if (!extendsHistory(job.messages, held.messages) || losesMedia(held.messages, job.messages)) {
+      this.enqueueIndex(lane, held);
+    }
+  }
+
+  private holdIndex(lane: string, job: QueuedIndex): void {
+    this.indexLanesHeld.set(lane, job);
+    if (this.indexLanesHeld.size > DEDUPE_CACHE_MAX) {
+      const first = this.indexLanesHeld.keys().next().value;
+      if (first !== undefined) this.indexLanesHeld.delete(first);
+    }
+  }
+
+  /**
    * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
    * last sent (or has waiting to send): the server's index minimum would only ack it.
    */
@@ -1518,6 +1549,15 @@ export class MemtreeClient {
    * the final index carries (a main session's, unless it was rewound since).
    */
   private sendWaitingIndexes(): void {
+    // A history held back by the text minimum goes too (origin/main sent every turn),
+    // unless a waiting call or the final index carries it.
+    for (const [lane, held] of this.indexLanesHeld) {
+      const carriers = [this.indexLanesNext.get(lane)?.messages, this.finalIndexLanes.get(lane)];
+      if (!carriers.some((messages) => messages && extendsHistory(messages, held.messages))) {
+        void this.submitIndexOnly(held.messages, held.modelContextLimit, held.opts);
+      }
+    }
+    this.indexLanesHeld.clear();
     for (const [lane, job] of this.indexLanesNext) {
       const final = this.finalIndexLanes.get(lane);
       if (!final || !extendsHistory(final, job.messages)) {

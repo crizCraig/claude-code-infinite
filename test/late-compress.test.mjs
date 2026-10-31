@@ -436,8 +436,11 @@ test('a late recovery does not compress beside a same-lane compression in flight
     await until(() => blocking === 1);
     const again = [...conv];
     addRound(again, 'more', 2_000);
+    // Over the window with nothing to ride, it waits for the lane's compression (not
+    // refused, no compress of its own beside it), then rides what that installed.
     const second = await h.post(again);
-    assert.equal(second.record.routeRecovery.outcome, 'in-flight');
+    assert.equal(second.status, 200, 'delivered, not refused');
+    assert.ok(second.record.laneWaitMs > 0, 'waited for the lane');
     assert.equal((await first).status, 200);
     assert.equal(blocking, 1, 'one compression of this history, not a second at another target');
   } finally { h.close(); }
