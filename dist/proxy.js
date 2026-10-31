@@ -1439,8 +1439,16 @@ async function handleMessages(req, res, opts, upstream, state) {
             // refused). Wait for it, then plan again on what it installed.
             if (plan.kind === "compress" && plan.overWindow && !plan.fallback &&
                 state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight) {
-                rec.laneWaitMs = await waitForLaneIdle(state, requestRouteKey, Math.min(MAX_LONG_COMPRESS_WAIT_MS, opts.memtree.longCompressBudgetMs), state.shutdownSignal);
-                plan = await planToolCompaction(planArgs);
+                // Stops early if Claude Code drops this request meanwhile.
+                const clientGone = new AbortController();
+                const onClose = () => clientGone.abort();
+                res.once("close", onClose);
+                rec.laneWaitMs = await waitForLaneIdle(state, requestRouteKey, Math.min(MAX_LONG_COMPRESS_WAIT_MS, opts.memtree.longCompressBudgetMs), clientGone.signal);
+                res.off("close", onClose);
+                // Plan on what the lane holds now: the route its compression installed (or, on the
+                // main lane, the session's new stable prefix), never the ride read before the wait.
+                plan = await planToolCompaction({ ...planArgs,
+                    ride: currentLaneRide(state, requestRouteKey, body, messages, toolSessionId, isMainRequest) });
             }
             if (isMainRequest && toolSessionId !== undefined && canCompress &&
                 (plan.kind === "ride" || plan.kind === "pass")) {
@@ -4440,7 +4448,9 @@ async function recoverToolRouteMiss(args) {
         // submission: its longer independent budget can still warm the index for
         // a later turn. An unpaid key (402, possibly set by this very compress)
         // or a shutting-down proxy gets no retry.
+        // A carried compression still runs on this history (and indexes it): no upload beside it.
         if (!state.shutdownSignal.aborted &&
+            rec.compress?.carriedOver !== true &&
             opts.memtree.paymentRequiredDetail === null &&
             !opts.memtree.keyInvalid // a refused key refuses the index too
         ) {
@@ -5054,6 +5064,22 @@ async function waitForLaneIdle(state, routeKey, maxMs, signal) {
         await new Promise((resolve) => setTimeout(resolve, LANE_WAIT_POLL_MS).unref());
     }
     return Date.now() - started;
+}
+/**
+ * The ride the lane's current memory route gives this request, read afresh (after a wait):
+ * undefined when there is none, it does not match this history, or (main lane) a newer
+ * stable prefix superseded it, which the planner then rides itself.
+ */
+function currentLaneRide(state, routeKey, body, messages, sessionId, isMainRequest) {
+    const route = getMemoryRoute(state, routeKey);
+    if (!route)
+        return undefined;
+    if (isMainRequest && sessionId !== undefined &&
+        route.stablePrefix !== state.stablePrefixes.get(sessionId))
+        return undefined;
+    const raw = memoryRoutedToolBody(body, messages, route, state.mainRouteEpoch, sessionId);
+    return raw ? { raw, turnType: "tool-memory", sizeHolder: route.stablePrefix ?? route }
+        : undefined;
 }
 /** How often a turn waiting for its lane's compression looks again. */
 const LANE_WAIT_POLL_MS = 100;

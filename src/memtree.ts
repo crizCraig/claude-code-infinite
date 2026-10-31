@@ -1501,8 +1501,10 @@ export class MemtreeClient {
   private holdIndex(lane: string, job: QueuedIndex): void {
     this.indexLanesHeld.set(lane, job);
     if (this.indexLanesHeld.size > DEDUPE_CACHE_MAX) {
-      const first = this.indexLanesHeld.keys().next().value;
-      if (first !== undefined) this.indexLanesHeld.delete(first);
+      // Over capacity the oldest held history is sent, not dropped (origin/main sent it).
+      const [first, evicted] = this.indexLanesHeld.entries().next().value!;
+      this.indexLanesHeld.delete(first);
+      this.enqueueIndex(first, evicted);
     }
   }
 

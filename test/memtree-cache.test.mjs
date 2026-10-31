@@ -809,6 +809,30 @@ test("at shutdown a held-back history goes inside the drain (no final index carr
   }
 });
 
+test("a held-back history evicted over capacity is sent, not dropped (Codex r7)", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k" });
+    const lanes = 65; // one past the held-history capacity (64)
+    for (let i = 0; i < lanes; i++) {
+      const root = [{ role: "user", content: `lane ${i} ` + "x".repeat(20_000) }];
+      client.indexInBackground(MemtreeClient.hashMessages(root), root, 100, `s${i}`);
+    }
+    // Synchronously, while every root upload is still in flight (the held baseline).
+    for (let i = 0; i < lanes; i++) {
+      const grown = [{ role: "user", content: `lane ${i} ` + "x".repeat(20_000) },
+        { role: "assistant", content: `held ${i} ` + "a".repeat(20_000) }];
+      client.indexInBackground(MemtreeClient.hashMessages(grown), grown, 100, `s${i}`);
+    }
+    assert.equal(await client.drainBackground(10_000), true);
+    const sent = new Set(fixture.calls.map((call) => JSON.stringify(call.messages))
+      .flatMap((text) => [...text.matchAll(/held (\d+) /g)].map((m) => m[1])));
+    assert.equal(sent.size, lanes, `${sent.size} of ${lanes} held histories reached MemTree`);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("text size counts text, tool inputs and results, not images", () => {
   assert.equal(messagesTextChars([
     { role: "user", content: "abc" },

@@ -289,6 +289,7 @@ test('staging 2026-10-30: a tool turn over the window while its lane compresses 
     assert.ok(tokensOf(second.sent) < 960_000, `${tokensOf(second.sent)} sent`);
     assert.equal((await first).status, 200);
     const blocking = h.blocking();
+    assert.equal(blocking.length, 2, 'it rode what the lane installed, no compress of its own');
     for (let i = 1; i < blocking.length; i++) {
       assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, 'never two compresses at once');
     }
