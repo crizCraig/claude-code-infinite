@@ -170,6 +170,33 @@ test('a session riding its stable prefix prepares from ~850k and crosses 960k on
     } finally { h.close(); }
   });
 
+test('a session that never compressed (whole requests) prepares from ~850k: its first crossing rides it',
+  async () => {
+    // 2026-10-30 report: compaction.prepared was never set; that session ran 1.0.29, which
+    // had no preparation. Here: the first crossing of a session sent whole until then.
+    const h = await harness({ compressMs: 300, prepareMs: 300 });
+    try {
+      const conv = session(800_000);
+      assert.equal((await h.post(conv)).status, 200);
+      assert.equal(h.calls.length, 0, 'under the budget: no compression');
+      let last;
+      do {
+        addRound(conv, `w${conv.length}`, 20_000 * 4);
+        last = await h.post(conv);
+        assert.equal(last.status, 200, JSON.stringify(last.record));
+      } while (tokensOf(last.sent) < 880_000);
+      await until(() => h.preparing().length >= 1);
+      await until(() => h.preparing().every(c => c.answeredAt));
+      await new Promise(resolve => setImmediate(resolve));
+      addRound(conv, 'cross', 90_000 * 4);
+      const turn = await h.post(conv);
+      assert.equal(turn.status, 200, JSON.stringify(turn.record));
+      assert.equal(h.blocking().length, 0, 'no blocking compress at the crossing');
+      assert.equal(turn.record.compaction.prepared, 'used', JSON.stringify(turn.record.compaction));
+      assert.ok(tokensOf(turn.sent) < 960_000, `${tokensOf(turn.sent)} sent`);
+    } finally { h.close(); }
+  });
+
 /** The stable prefix (~480k) from a first compression, then rides up to ~820k: no preparation yet. */
 async function stablePrefixAt820k(h) {
   const conv = session(990_000);

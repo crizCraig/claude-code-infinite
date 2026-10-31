@@ -1677,7 +1677,14 @@ export class MemtreeClient {
             return await this.postContextMemory(payload, opts, signal, opts.indexOnly ? undefined : upload);
         }
         catch (err) {
-            if (opts.indexOnly || upload.done || signal.aborted || !isDroppedConnection(err))
+            if (opts.indexOnly || signal.aborted)
+                throw err;
+            // A 401 to a streamed body: fetch reports a network error, not the status. A 401
+            // compresses nothing (nothing billed): sent again whole, its status is seen.
+            if (upload.done && isStreamedBodyAuthChallenge(err)) {
+                return await this.postContextMemory(payload, opts, signal);
+            }
+            if (upload.done || !isDroppedConnection(err))
                 throw err;
             this.log(`context_memory upload dropped (${droppedCode(err)}); retrying once`);
             return await this.postContextMemory(payload, opts, signal);
@@ -1796,6 +1803,8 @@ const DROPPED_CONNECTION_CODES = new Set([
 /** Bodies from this size are streamed, so a drop can be told to come before their end. */
 const STREAMED_UPLOAD_MIN_BYTES = 1024 * 1024;
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
+/** undici's message for a 401/407 answer to a body it cannot send again. */
+const STREAMED_BODY_AUTH_ERROR = /non-null body source/;
 /** `bytes` as a stream that sets `upload.done` once its last chunk was taken. */
 function uploadStream(bytes, upload) {
     let offset = 0;
@@ -1818,6 +1827,16 @@ function uploadStream(bytes, upload) {
 export function isDroppedConnection(err) {
     const code = droppedCode(err);
     return code !== undefined && DROPPED_CONNECTION_CODES.has(code);
+}
+/**
+ * Whether fetch failed a streamed body on a 401 (or 407) answer: the fetch standard turns
+ * those into a network error ("expected non-null body source") when the body cannot be
+ * replayed, so a revoked key would otherwise read as a lost connection.
+ */
+function isStreamedBodyAuthChallenge(err) {
+    const cause = err?.cause;
+    return cause?.code === undefined && typeof cause?.message === "string" &&
+        STREAMED_BODY_AUTH_ERROR.test(cause.message);
 }
 function droppedCode(err) {
     const own = err?.code;
