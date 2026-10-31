@@ -341,6 +341,11 @@ interface ProxyState {
      * budget (indexTurn).
      */
     deferredAgentIndexes: Map<string, DeferredIndex>;
+    /**
+     * Per session, a turn adopting its prepared prefix (adoptPreparedPrefix): another turn
+     * that waited for the same preparation waits for it, then rides what it installed.
+     */
+    adoptingPrepared: Map<string, Promise<void>>;
     /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
     memoryRoutes: Map<string, MemoryRoute>;
     /** Latest main route for validated away-summary forks, independent of hook events. */

@@ -507,6 +507,11 @@ interface ProxyState {
    * budget (indexTurn).
    */
   deferredAgentIndexes: Map<string, DeferredIndex>;
+  /**
+   * Per session, a turn adopting its prepared prefix (adoptPreparedPrefix): another turn
+   * that waited for the same preparation waits for it, then rides what it installed.
+   */
+  adoptingPrepared: Map<string, Promise<void>>;
   /** Validated prefixes per API session/lane, LRU-bounded to MEMORY_ROUTE_MAX_LANES. */
   memoryRoutes: Map<string, MemoryRoute>;
   /** Latest main route for validated away-summary forks, independent of hook events. */
@@ -1050,6 +1055,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     refusalStreaks: new RefusalStreaks(),
     activeSubagents: new Set(),
     deferredAgentIndexes: new Map(),
+    adoptingPrepared: new Map(),
     memoryRoutes: new Map(),
     mainRouteEpoch: 0,
     mainRouteDecisionGeneration: 0,
@@ -4559,6 +4565,8 @@ async function planToolCompaction(args: {
   rec: MessagesRecord;
   ride: ToolRide | undefined;
   canCompress: boolean;
+  /** Planned again on a prefix another turn installed meanwhile (once). */
+  replanned?: boolean;
 }): Promise<ToolPlan> {
   const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } =
     args;
@@ -4621,6 +4629,15 @@ async function planToolCompaction(args: {
   if (adopted) {
     return { kind: "ride",
       ride: { raw: adopted.routed.raw, turnType: "tool-prefix", sizeHolder: adopted.prefix } };
+  }
+  // Another turn that waited for the same preparation installed it meanwhile: plan again on
+  // it (once) rather than compress beside it (Codex r1 P1, release 1.0.33).
+  if (stableLane && !args.replanned && state.stablePrefixes.get(sessionId) !== current) {
+    const waited = compaction.preparedWaitMs;
+    const plan = await planToolCompaction({ ...args, replanned: true,
+      ride: currentLaneRide(state, args.routeKey, body, messages, sessionId, true) });
+    if (waited !== undefined && rec.compaction) rec.compaction.preparedWaitMs = waited;
+    return plan;
   }
   // Settings current after any wait for a preparation (a /memtree-compact N meanwhile).
   const modeNow = compactionMode(opts, state, sessionId);
@@ -4698,9 +4715,52 @@ async function adoptPreparedPrefix(args: {
   const { state, sessionId } = args;
   const base = state.stablePrefixes.get(sessionId);
   await awaitPreparation(state, sessionId, args.waitMs, args.compaction);
+  // Checked and taken with no await between: two turns resuming together see one owner.
+  while (state.adoptingPrepared.has(sessionId)) await awaitAdoption(state, sessionId, args.compaction);
   const entry = state.prepared.get(sessionId);
   if (!entry) return undefined;
   state.prepared.discard(sessionId);
+  const release = holdAdoption(state, sessionId);
+  try {
+    return await adoptEntry(args, entry, base);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Another turn of the session is adopting its prepared prefix (two turns waited for the same
+ * preparation): wait for it to finish, so this turn plans on the prefix it installs instead of
+ * compressing again (Codex r1 P1, release 1.0.33). Counted as preparation wait, so a human
+ * turn plans again after it.
+ */
+async function awaitAdoption(
+  state: ProxyState, sessionId: string, compaction: CompactionRecord
+): Promise<void> {
+  const adopting = state.adoptingPrepared.get(sessionId);
+  if (!adopting) return;
+  const started = Date.now();
+  await adopting;
+  compaction.preparedWaitMs = (compaction.preparedWaitMs ?? 0) + (Date.now() - started);
+}
+
+/** Mark the session's prepared prefix as being adopted; the returned function ends it. */
+function holdAdoption(state: ProxyState, sessionId: string): () => void {
+  let done!: () => void;
+  const adopting = new Promise<void>((resolve) => { done = resolve; });
+  state.adoptingPrepared.set(sessionId, adopting);
+  return () => {
+    if (state.adoptingPrepared.get(sessionId) === adopting) state.adoptingPrepared.delete(sessionId);
+    done();
+  };
+}
+
+/** adoptPreparedPrefix's check and install of the entry it took. */
+async function adoptEntry(
+  args: Parameters<typeof adoptPreparedPrefix>[0], entry: Prepared<StablePrefix>,
+  base: StablePrefix | undefined
+): Promise<{ prefix: StablePrefix; routed: { body: Record<string, any>; raw: Buffer } } | undefined> {
+  const { state, sessionId } = args;
   const fit = await preparedFit(args, entry);
   // Another request installed a prefix, or `/memtree-compact` asked for its
   // own target, while this one waited or counted: that wins.
