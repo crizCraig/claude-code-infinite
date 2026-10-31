@@ -954,3 +954,49 @@ async function waitFor(check, ms = 2_000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+test("at shutdown a held-back history whose image the final index lost is still sent (Codex r1 P0)",
+  async () => {
+    // Release 1.0.33 review: an image-bearing upload fails, a small extension is held back,
+    // Claude Code then evicts the image; the final index (image-free) must not stand in for it.
+    const calls = [];
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        calls.push(Buffer.concat(chunks).toString("utf8"));
+        const fail = calls.length === 1;
+        setTimeout(() => {
+          if (fail) { res.writeHead(500); return res.end("boom"); }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ messages: [], index_only: true }));
+        }, fail ? 80 : 0);
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+        apiKey: "k" });
+      const send = (messages) => client.indexInBackground(MemtreeClient.hashMessages(messages),
+        messages, 100, "s");
+      const root = { role: "user", content: "x".repeat(40_000) };
+      const look = { role: "assistant", content: "look" };
+      const shot = [root, look, { role: "user", content: [{ type: "text", text: "screen" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" } }] }];
+      send(shot); // in flight; fails
+      const tail = [{ role: "assistant", content: "ok" }, { role: "user", content: "small" }];
+      send([...shot, ...tail]); // under the minimum over the upload in flight: held back
+      await waitFor(() => calls.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const evicted = [root, look, { role: "user", content: [{ type: "text", text: "screen" }] },
+        ...tail, { role: "assistant", content: "answered" }];
+      client.noteMainConversation("s", { messages: evicted, modelContextLimit: 100 });
+      client.flushFinalIndexes(2_000);
+      assert.equal(await client.drainBackground(2_000), true);
+      assert.ok(calls.slice(1).some((body) => body.includes("iVBORw0KGgo")),
+        "the image reached MemTree after its failed upload");
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });

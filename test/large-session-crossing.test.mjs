@@ -442,3 +442,79 @@ test('an abandoned crossing whose prefix another turn replaced meanwhile is not 
       'the newer prefix, not call 2');
   } finally { h.close(); }
 });
+
+test('an abandoned crossing still compressing: the turns meanwhile and after ride it, no second call',
+  async () => {
+    // Release 1.0.33 E2E: Claude Code abandons the crossing turn (Esc) and the next turn arrives
+    // while its compression still runs. Nothing may be refused or compressed beside it.
+    let arrived = 0;
+    const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 1_500; },
+      compressTimeoutMs: 5_000, perKiB: 0 });
+    try {
+      const conv = await stablePrefixAt820k(h);
+      addRound(conv, 'jump', 142_000 * 4);
+      const controller = new AbortController();
+      const abandoned = h.post(structuredClone(conv), { signal: controller.signal }).catch(err => err);
+      await until(() => arrived === 2);
+      controller.abort();
+      assert.equal((await abandoned).name, 'AbortError');
+      addRound(conv, 'meanwhile', 2_000);
+      const meanwhile = await h.post(conv);
+      assert.equal(meanwhile.status, 200, JSON.stringify(meanwhile.record));
+      assert.ok(tokensOf(meanwhile.sent) < 1_000_000, `${tokensOf(meanwhile.sent)} sent`);
+      await until(() => h.blocking()[1]?.answeredAt !== undefined);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      addRound(conv, 'after', 2_000);
+      const after = await h.post(conv);
+      assert.equal(after.status, 200, JSON.stringify(after.record));
+      assert.ok(tokensOf(after.sent) < 700_000, `${tokensOf(after.sent)} sent: rode the compression`);
+      const blocking = h.blocking();
+      assert.equal(blocking.length, 2, 'one compression for the crossing');
+      for (let i = 1; i < blocking.length; i++) {
+        assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, 'never two compresses at once');
+      }
+    } finally { h.close(); }
+  });
+
+test('two turns waiting for the same carried compression: both ride it, no second call (Codex r1 P1)',
+  async () => {
+    const h = await harness({ compressMs: n => (n === 1 ? 0 : 1_500), compressTimeoutMs: 300,
+      longCompressTimeoutMs: 10_000, perKiB: 0 });
+    try {
+      const conv = await stablePrefixAt820k(h);
+      addRound(conv, 'jump', 142_000 * 4);
+      const crossing = await h.post(conv);
+      assert.equal(crossing.record.compress.carriedOver, true, JSON.stringify(crossing.record));
+      // Claude Code's turn and a retry of it (or Esc and a new prompt) wait together.
+      addRound(conv, 'first', 2_000);
+      const firstConv = structuredClone(conv);
+      addRound(conv, 'second', 2_000);
+      const [first, second] = await Promise.all([h.post(firstConv), h.post(conv)]);
+      for (const turn of [first, second]) assert.equal(turn.status, 200, JSON.stringify(turn.record));
+      const sent = h.forwards.slice(-2).map(tokensOf);
+      assert.ok(sent.every(tokens => tokens < 700_000), `${sent} sent: both rode the compression`);
+      assert.equal(h.blocking().length, 2, 'the carried compression served both turns');
+    } finally { h.close(); }
+  });
+
+test('two human turns waiting for the same carried compression: both ride it (Codex r1 P1)',
+  async () => {
+    const h = await harness({ compressMs: n => (n === 1 ? 0 : 1_500), compressTimeoutMs: 300,
+      longCompressTimeoutMs: 10_000, perKiB: 0 });
+    try {
+      const conv = await stablePrefixAt820k(h);
+      addRound(conv, 'jump', 142_000 * 4);
+      const crossing = await h.post(conv);
+      assert.equal(crossing.record.compress.carriedOver, true, JSON.stringify(crossing.record));
+      conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Done.' }] });
+      conv.push({ role: 'user', content: 'Now the parser, please.' });
+      const firstConv = structuredClone(conv);
+      conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] });
+      conv.push({ role: 'user', content: 'Actually, the lexer first.' });
+      const [first, second] = await Promise.all([h.post(firstConv), h.post(conv)]);
+      for (const turn of [first, second]) assert.equal(turn.status, 200, JSON.stringify(turn.record));
+      const sent = h.forwards.slice(-2).map(tokensOf);
+      assert.ok(sent.every(tokens => tokens < 700_000), `${sent} sent: both rode the compression`);
+      assert.equal(h.blocking().length, 2, 'the carried compression served both turns');
+    } finally { h.close(); }
+  });

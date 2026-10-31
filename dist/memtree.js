@@ -1252,16 +1252,18 @@ export class MemtreeClient {
     sendWaitingIndexes() {
         // A history held back by the text minimum goes too (origin/main sent every turn),
         // unless a waiting call or the final index carries it.
+        // A carrier must hold the media too: extendsHistory tolerates media Claude Code evicted,
+        // which no later upload would carry (Codex r1 P0, release 1.0.33).
+        const carries = (carrier, messages) => carrier !== undefined && extendsHistory(carrier, messages) && !losesMedia(messages, carrier);
         for (const [lane, held] of this.indexLanesHeld) {
             const carriers = [this.indexLanesNext.get(lane)?.messages, this.finalIndexLanes.get(lane)];
-            if (!carriers.some((messages) => messages && extendsHistory(messages, held.messages))) {
+            if (!carriers.some((messages) => carries(messages, held.messages))) {
                 void this.submitIndexOnly(held.messages, held.modelContextLimit, held.opts);
             }
         }
         this.indexLanesHeld.clear();
         for (const [lane, job] of this.indexLanesNext) {
-            const final = this.finalIndexLanes.get(lane);
-            if (!final || !extendsHistory(final, job.messages)) {
+            if (!carries(this.finalIndexLanes.get(lane), job.messages)) {
                 void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
             }
         }
