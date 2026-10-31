@@ -70,6 +70,7 @@ import {
   anthropicUpstreamFromEnv,
   compactTargetFromEnv,
   isPrintInvocation,
+  mayBePrintInvocation,
   parseWrapperArgs,
   memtreeLinkPlacementFromEnv,
   environmentOf,
@@ -819,9 +820,11 @@ async function main() {
     sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     // `/memtree-view` opens its link only where a browser would appear in
-    // front of the user: interactive, not SSH or CI (open-url.ts).
+    // front of the user: interactive (also not `-pc`-style print), not SSH
+    // or CI (open-url.ts).
     openUrl: urlOpenerFor({
-      interactive: interactiveUi, env: process.env, platform: process.platform,
+      interactive: interactiveUi && !mayBePrintInvocation(claudeArgs),
+      env: process.env, platform: process.platform,
       memtreeBaseUrl,
     }),
     projectTrees,

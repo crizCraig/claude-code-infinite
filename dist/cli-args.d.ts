@@ -6,6 +6,12 @@ export interface WrapperArgs {
 /** Whether Claude's own print mode was requested before its `--` separator. */
 export declare function isPrintInvocation(args: string[]): boolean;
 /**
+ * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
+ * cluster containing p (`-pc`, `-cp`) or `--print=…`. Conservative: for
+ * choices that must never happen in print mode, such as opening a browser.
+ */
+export declare function mayBePrintInvocation(args: string[]): boolean;
+/**
  * `ccc --version` / `ccc -v` (alone, or after `local`/`staging`): answered by ccc itself,
  * with no MemTree key, proxy or session, so it works right after installing.
  */

@@ -9,6 +9,22 @@ export function isPrintInvocation(args) {
     return false;
 }
 /**
+ * isPrintInvocation, plus forms it leaves to Claude: a combined short-flag
+ * cluster containing p (`-pc`, `-cp`) or `--print=…`. Conservative: for
+ * choices that must never happen in print mode, such as opening a browser.
+ */
+export function mayBePrintInvocation(args) {
+    for (const arg of args) {
+        if (arg === "--")
+            return false;
+        if (arg === "--print" || arg.startsWith("--print="))
+            return true;
+        if (/^-[A-Za-z]*p[A-Za-z]*$/.test(arg))
+            return true;
+    }
+    return false;
+}
+/**
  * `ccc --version` / `ccc -v` (alone, or after `local`/`staging`): answered by ccc itself,
  * with no MemTree key, proxy or session, so it works right after installing.
  */

@@ -35,7 +35,7 @@ import { resumeGuidanceFor } from "./resume-guidance.js";
 import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate } from "./auto-update-setup.js";
-import { anthropicUpstreamFromEnv, compactTargetFromEnv, isPrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
+import { anthropicUpstreamFromEnv, compactTargetFromEnv, isPrintInvocation, mayBePrintInvocation, parseWrapperArgs, memtreeLinkPlacementFromEnv, environmentOf, isVersionRequest, subcommandArgs, } from "./cli-args.js";
 import { routeConsoleToStderr } from "./cli-output.js";
 import { runMemtreeFetchCommand } from "./memtree-fetch.js";
 import { runLinkCommand } from "./link-command.js";
@@ -642,9 +642,11 @@ async function main() {
         sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
         promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
         // `/memtree-view` opens its link only where a browser would appear in
-        // front of the user: interactive, not SSH or CI (open-url.ts).
+        // front of the user: interactive (also not `-pc`-style print), not SSH
+        // or CI (open-url.ts).
         openUrl: urlOpenerFor({
-            interactive: interactiveUi, env: process.env, platform: process.platform,
+            interactive: interactiveUi && !mayBePrintInvocation(claudeArgs),
+            env: process.env, platform: process.platform,
             memtreeBaseUrl,
         }),
         projectTrees,
