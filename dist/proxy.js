@@ -1509,6 +1509,10 @@ async function handleMessages(req, res, opts, upstream, state) {
                     // the lane's backoff.
                     rec.routeRecovery = { outcome: "cooldown" };
                 }
+                else if (state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight) {
+                    // Claimed while the cooldown check above awaited a count (a crossing prompt).
+                    rec.routeRecovery = { outcome: "in-flight" };
+                }
                 else {
                     const recoveryAttempt = { modelContextLimit, inFlight: true };
                     if (!prior && state.toolRecoveryAttemptedLanes.size >= 128) {
@@ -1664,6 +1668,14 @@ async function handleMessages(req, res, opts, upstream, state) {
         res.off("close", onClose);
         await awaitPreparation(state, sessionId, opts.memtree.longCompressBudgetMs, rec.compaction);
         edge = await planEdge();
+    }
+    // Claude Code dropped it while it waited: the lane's compression in flight already carries
+    // this session's crossing (the next turn rides it), so none beside it for nobody (r3 P1).
+    if (crossing() && state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight &&
+        res.destroyed && !res.writableFinished) {
+        releaseUncommittedRouteDecision();
+        recordTurn(rec, "followup-client-closed", Buffer.alloc(0));
+        return logged(Promise.resolve());
     }
     // Not beside a blocking compress call: the two would overlap on the server.
     if (sessionId !== undefined && edge && (edge.kind === "ride" || edge.kind === "pass")) {

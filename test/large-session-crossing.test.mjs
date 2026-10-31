@@ -417,7 +417,8 @@ test('an abandoned crossing whose prefix another turn replaced meanwhile is not 
   let arrived = 0;
   // Call 2 (the abandoned crossing) takes 1.5 s; call 3 (the next crossing) answers at once.
   // The next prompt waits for call 2 only its long budget (300 ms here; release 1.0.33 E2E:
-  // it waits on the lane), then compresses on its own (call 3).
+  // it waits on the lane), then compresses on its own (call 3): a bounded overlap on purpose,
+  // so the late call 2 meets a newer prefix. Not a no-overlap scenario.
   const h = await harness({ compressMs: n => { arrived = n; return n === 2 ? 1_500 : 0; },
     compressTimeoutMs: 5_000, longCompressTimeoutMs: 300, perKiB: 0 });
   try {
@@ -574,3 +575,34 @@ test('a prompt while a dropped crossing turn still compresses waits and rides it
       assert.equal(blocking.length, 2, 'the dropped turn\'s compression served the prompt');
     } finally { h.close(); }
   });
+
+test('a prompt dropped while it waits on the lane does not compress beside it (r3 P1)', async () => {
+  let arrived = 0;
+  const h = await harness({ compressMs: n => { arrived = n; return n === 1 ? 0 : 1_500; },
+    compressTimeoutMs: 5_000, perKiB: 0 });
+  try {
+    const conv = await stablePrefixAt820k(h);
+    addRound(conv, 'jump', 142_000 * 4);
+    const first = new AbortController();
+    const dropped = h.post(structuredClone(conv), { signal: first.signal }).catch(err => err);
+    await until(() => arrived === 2);
+    first.abort();
+    await dropped;
+    conv.push({ role: 'assistant', content: [{ type: 'text', text: 'Interrupted.' }] });
+    conv.push({ role: 'user', content: 'Look at the parser instead.' });
+    const second = new AbortController();
+    const waiting = h.post(structuredClone(conv), { signal: second.signal }).catch(err => err);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    second.abort();
+    await waiting;
+    await new Promise(resolve => setTimeout(resolve, 2_500));
+    const blocking = h.blocking();
+    for (let i = 1; i < blocking.length; i++) {
+      assert.ok(blocking[i].startedAt >= blocking[i - 1].answeredAt, `overlap: ${JSON.stringify(blocking)}`);
+    }
+    // The prompt Claude Code then sends again rides the dropped turns' one compression.
+    const retried = await h.post(conv);
+    assert.equal(retried.status, 200, JSON.stringify(retried.record));
+    assert.equal(h.blocking().length, 2, 'one compression for the crossing');
+  } finally { h.close(); }
+});
