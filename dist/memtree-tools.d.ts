@@ -82,11 +82,11 @@ export interface SearchHit {
     lineHits: number;
     score: number;
     range?: LeafRange;
-    /** `at`: when the line's message was written (trees with per-message times). */
+    /** `at`: when the line's message was written (trees with per-message times; null: not recorded). */
     snippets: {
         line: number;
         text: string;
-        at?: string;
+        at?: string | null;
     }[];
     /** `<tree>#<node>` from servers that address hits. */
     address?: string;

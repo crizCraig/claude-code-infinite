@@ -90,7 +90,7 @@ export class StaleToolsNotice {
 export function staleToolsNote(installed, own, startedAt) {
     const safe = installed.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
     const loaded = formatTime(startedAt.toISOString());
-    return `(These MemTree tools are ccc ${own}${loaded ? `, loaded ${loaded}` : ""}; ccc ${safe} is installed: restart ccc for message times and the newest tool fixes.)`;
+    return `(These MemTree tools are ccc ${own}${loaded ? `, loaded ${loaded}` : ""}; ccc ${safe} is installed: restart ccc to use its newer MemTree tools.)`;
 }
 /** The version in this install's package.json now (ccc may have been updated since it started). */
 export function installedVersion() {

@@ -214,8 +214,9 @@ export class MemtreeIndex {
       .slice(0, SNIPPETS_PER_LEAF)
       .sort((a, b) => a.line - b.line)
       .map(({ line }) => {
-        const at = this.lineTime(range!.block, line);
-        return { line, text: snippet(this.lines[range!.block][line - 1], terms), ...(at ? { at } : {}) };
+        // `at` null: the block has per-message times but not this message's.
+        const at = this.lineTimes.has(range!.block) ? this.lineTime(range!.block, line) ?? null : undefined;
+        return { line, text: snippet(this.lines[range!.block][line - 1], terms), ...(at !== undefined ? { at } : {}) };
       });
 
     const times = this.times.get(node.id);
@@ -255,8 +256,8 @@ export interface SearchHit {
   lineHits: number;
   score: number;
   range?: LeafRange;
-  /** `at`: when the line's message was written (trees with per-message times). */
-  snippets: { line: number; text: string; at?: string }[];
+  /** `at`: when the line's message was written (trees with per-message times; null: not recorded). */
+  snippets: { line: number; text: string; at?: string | null }[];
   /** `<tree>#<node>` from servers that address hits. */
   address?: string;
   /** Ancestors, root first (servers that address hits). */
@@ -384,7 +385,7 @@ function serverSnippets(raw: unknown[]): SearchHit["snippets"] {
     .map((s) => ({
       line: s.line as number,
       text: s.text as string,
-      ...(timeSpan([s.at, s.at]) ? { at: s.at as string } : {}),
+      ...(timeSpan([s.at, s.at]) ? { at: s.at as string } : s.at === null ? { at: null } : {}),
     }));
 }
 
@@ -431,7 +432,7 @@ export function formatSearchHits(
       out.push(`  path: ${hit.path.map((p) => `${truncate(p.summary, 80)} (node ${p.id})`).join(" › ")}`);
     }
     for (const s of hit.snippets) {
-      const at = clock.format(s.at);
+      const at = s.at === null ? missing.next() : clock.format(s.at);
       out.push(`  L${s.line}${at ? ` · ${at}` : ""}: ${s.text}`);
     }
   }
@@ -546,9 +547,7 @@ export function formatLines(
   const out: string[] = [];
   let chars = 0;
   let shown = start - 1;
-  const entries = index.lineTimes.get(block);
-  const starts = new Map(entries ?? []);
-  const clock = new ClockFormat();
+  const rows: [number, string][] = [];
   for (let n = start; n <= last; n++) {
     let text = lines[n - 1];
     const room = READ_LINES_MAX_CHARS - chars;
@@ -558,7 +557,7 @@ export function formatLines(
       text = `${text.slice(0, room)}… [line truncated: ${lines[n - 1].length} chars]`;
     }
     chars += text.length + 1;
-    out.push(`${n}\t${datedHeader(text, starts.get(n), clock)}`);
+    rows.push([n, text]);
     shown = n;
   }
   const wanted = Math.min(end, lines.length);
@@ -568,19 +567,21 @@ export function formatLines(
         `continue with read_lines {${treeArg(tree)}"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`
     );
   }
+  const missing = new MissingTimeNote();
   const span = bracketedSpan(index.rangeSpan(block, start, Math.max(start, shown)));
-  const header = `block ${block}${span || ` [${new MissingTimeNote().next()}]`} lines ${start}-${shown} (line number, tab, exact text):`;
+  const header = `block ${block}${span || ` [${missing.next()}]`} lines ${start}-${shown} (line number, tab, exact text):`;
+  // Each message header with its time; a message without one says so, once per read.
+  const starts = new Map(index.lineTimes.get(block) ?? []);
+  const clock = new ClockFormat();
+  for (const [n, text] of rows) {
+    const match = starts.has(n) ? MESSAGE_HEADER_RE.exec(text) : null;
+    const when = match ? clock.format(starts.get(n)) ?? missing.next() : "";
+    out.push(`${n}\t${match && when ? `${match[1]} · ${when}:` : text}`);
+  }
   return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
 }
 
 const MESSAGE_HEADER_RE = /^(Message \d+ from [^:\s]+):$/;
-
-/** `Message 11 from assistant:` as `Message 11 from assistant · 08:38:` when its time is known. */
-function datedHeader(text: string, at: string | undefined, clock: ClockFormat): string {
-  const match = at ? MESSAGE_HEADER_RE.exec(text) : null;
-  const when = match ? clock.format(at) : undefined;
-  return match && when ? `${match[1]} · ${when}:` : text;
-}
 
 /** One un-indexed message from the server's `/messages` read (polychat memtree_tail.py). */
 interface TailMessage {

@@ -1035,7 +1035,8 @@ test("read_lines dates each message header, the date once, and the header spans 
     assert.match(text, /^block 0 \[2026-09-30 14:02–14:08 PT\] lines 2-9 /);
     assert.match(text, /\n3\tMessage 1 from assistant · 2026-09-30 14:05:\n/);
     assert.match(text, /\n6\tMessage 2 from user · 14:08:\n/, "same day: the time only");
-    assert.match(text, /\n8\tMessage 3 from assistant:\n/, "a message without a time is left as is");
+    assert.match(text, /\n8\tMessage 3 from assistant · time not recorded:\n/, "a message without a time says so");
+    assert.equal(text.match(/time not recorded/g).length, 1);
     assert.match(formatLines(lined, 0, 6, 7), /^block 0 \[2026-09-30 14:08 PT\] lines 6-7/);
     // A block without per-message times keeps its block's span; none at all says so once.
     assert.match(formatLines(lined, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2/);
@@ -1061,18 +1062,18 @@ test("search: each matched line carries its message's time; the tree's span head
   inZone("America/Los_Angeles", () => {
     const local = formatSearch(new MemtreeIndex(LINED), "bucket");
     assert.match(local, /^\d+ best match(es)? for "bucket" \(terms: bucket\); the tree's messages span 2026-09-30 14:02–14:40 PT:/);
-    assert.match(local, /\n  L7 · 2026-09-30 14:08: Rename the bucket\n  L9: Renamed/, "date first, none unknown");
+    assert.match(local, /\n  L7 · 2026-09-30 14:08: Rename the bucket\n  L9 · time not recorded: Renamed/, "date first; unknown once");
     assert.match(local, /\n  L4 · 14:05: I created deploy\.yaml/, "same day: the time only");
     const body = { terms: ["pr"], tree_times: ["2026-09-30T21:02:00.000Z", "2026-09-30T21:40:00.000Z"], hits: [
-      { id: 5, leaf: true, summary: "s", times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:30:00.000Z"], snippets: [{ line: 3, text: "a", at: "2026-09-30T21:25:00.000Z" }, { line: 4, text: "b", at: "junk" }] },
+      { id: 5, leaf: true, summary: "s", times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:30:00.000Z"], snippets: [{ line: 3, text: "a", at: "2026-09-30T21:25:00.000Z" }, { line: 4, text: "b", at: "junk" }, { line: 5, text: "c", at: null }] },
       { id: 6, leaf: true, summary: "t", snippets: [] },
       { id: 7, leaf: true, summary: "u", snippets: [] }] };
     const parsed = serverSearchHits(body);
     const text = formatSearchHits(parsed.hits, "pr", parsed.terms, undefined, [], parsed.treeTimes);
     assert.match(text, /; the tree's messages span 2026-09-30 14:02–14:40 PT:/);
-    assert.match(text, /\n  L3 · 2026-09-30 14:25: a\n  L4: b\n/);
-    assert.match(text, /\[node 6 · leaf · time not recorded · matched/);
-    assert.match(text, /\[node 7 · leaf · matched/, "said once");
+    assert.match(text, /\n  L3 · 2026-09-30 14:25: a\n  L4: b\n  L5 · time not recorded: c\n/);
+    assert.match(text, /\[node 6 · leaf · matched/, "said once, at L5");
+    assert.match(text, /\[node 7 · leaf · matched/);
   });
 });
 
@@ -1099,7 +1100,7 @@ test("a stale MemTree server says once that ccc was updated and needs a restart"
   assert.equal(notice.next(), undefined, "checked at most once a minute");
   now = 61_000;
   const note = notice.next();
-  assert.match(note, /These MemTree tools are ccc 1\.0\.29, loaded 2026-10-17 .*; ccc 1\.0\.34 is installed: restart ccc for message times/);
+  assert.match(note, /These MemTree tools are ccc 1\.0\.29, loaded 2026-10-17 .*; ccc 1\.0\.34 is installed: restart ccc to use its newer MemTree tools/);
   now = 200_000;
   assert.equal(notice.next(), undefined, "once per session");
   assert.match(staleToolsNote("1.0.34;rm -rf", "1.0.29", new Date(0)), /ccc 1\.0\.34rm-rf is installed/);
