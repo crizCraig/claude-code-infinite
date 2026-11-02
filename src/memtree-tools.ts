@@ -568,10 +568,15 @@ export function formatLines(
     );
   }
   const missing = new MissingTimeNote();
-  const span = bracketedSpan(index.rangeSpan(block, start, Math.max(start, shown)));
-  const header = `block ${block}${span || ` [${missing.next()}]`} lines ${start}-${shown} (line number, tab, exact text):`;
+  const entries = index.lineTimes.get(block) ?? [];
+  const span = formatTimeSpan(index.rangeSpan(block, start, Math.max(start, shown)));
+  const leading = span ? leadingUntimed(entries, start, shown, lines) : undefined;
+  const when = span
+    ? ` [${span}${leading ? `; lines ${leading[0]}-${leading[1]}: ${missing.next()}` : ""}]`
+    : ` [${missing.next()}]`;
+  const header = `block ${block}${when} lines ${start}-${shown} (line number, tab, exact text):`;
   // Each message header with its time; a message without one says so, once per read.
-  const starts = new Map(index.lineTimes.get(block) ?? []);
+  const starts = new Map(entries);
   const clock = new ClockFormat();
   for (const [n, text] of rows) {
     const match = starts.has(n) ? MESSAGE_HEADER_RE.exec(text) : null;
@@ -582,6 +587,19 @@ export function formatLines(
 }
 
 const MESSAGE_HEADER_RE = /^(Message \d+ from [^:\s]+):$/;
+
+/**
+ * The lines a read begins with that belong to a message without a time, when that
+ * message's header is not among them (the read starts inside it): `[start, last]`.
+ */
+function leadingUntimed(entries: LineEntry[], start: number, shown: number, lines: string[]): [number, number] | undefined {
+  const k = entries.findLastIndex(([line]) => line <= start);
+  if (k < 0 || entries[k][1] !== undefined) return undefined;
+  const [first] = entries[k];
+  if (first === start && MESSAGE_HEADER_RE.test(lines[first - 1] ?? "")) return undefined;
+  const next = entries[k + 1]?.[0] ?? Infinity;
+  return [start, Math.min(shown, next - 1)];
+}
 
 /** One un-indexed message from the server's `/messages` read (polychat memtree_tail.py). */
 interface TailMessage {

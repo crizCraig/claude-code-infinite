@@ -606,10 +606,12 @@ export class CurrentTree implements TreeSource {
 /**
  * A page that may still change: a served prefix that may later switch to the request's
  * own tree (a pinned ref never does), or any page whose transcript blocks are still
- * uploading (`blocks_pending`: the tree was just built), so a retry can read them.
+ * uploading (`blocks_pending`: the tree was just built), so a retry can read them, or
+ * whose per-message times are incomplete (`line_times_incomplete`).
  */
 function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
-  if (index.page.blocks_pending === true) return true;
+  // Also a page whose per-message times could not all be read this time (a slow lookup).
+  if (index.page.blocks_pending === true || index.page.line_times_incomplete === true) return true;
   return index.page.served_prefix === true && index.page.ref !== id;
 }
 

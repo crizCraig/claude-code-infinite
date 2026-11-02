@@ -482,6 +482,30 @@ test("CurrentTree refetches a page whose transcript blocks are still uploading",
   }
 });
 
+test("CurrentTree refetches a page whose per-message times are incomplete", async () => {
+  const path = "/memtree/aaa111.json";
+  const state = { urls: [], pageFetches: 0, current: "aaa111",
+    pages: { [path]: { ...LINED, session_id: "session-1", line_times_incomplete: true } } };
+  let clock = 0;
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", now: () => clock,
+    fetch: fakeProxyFetch(state) });
+  await tree.get();
+  state.pages[path] = { ...LINED, session_id: "session-1" };
+  clock += 45_001;
+  const complete = await tree.get();
+  assert.equal(await tree.get(), complete, "cached once complete");
+  assert.equal(state.pageFetches, 2);
+});
+
+test("read_lines starting inside a message without a time says so", () => {
+  inZone("America/Los_Angeles", () => {
+    const page = { ...LINED, line_times: { "0": [[1, null], [3, "2026-09-30T21:05:00.000Z"], [6, null]] } };
+    const text = formatLines(new MemtreeIndex(page), 0, 2, 7);
+    assert.match(text, /^block 0 \[2026-09-30 14:05 PT; lines 2-2: time not recorded\] lines 2-7 /);
+    assert.match(text, /\n6\tMessage 2 from user:\n/, "said once");
+  });
+});
+
 test("read_lines and read_node take current#N as this session's current tree", async () => {
   const state = { urls: [], pageFetches: 0, current: "aaa111",
     pages: { "/memtree/aaa111.json": { ...PAGE, session_id: "session-1" } } };
