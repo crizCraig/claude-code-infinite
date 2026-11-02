@@ -11,6 +11,25 @@ export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
 export declare const PROXY_VERSION_ENV = "CCC_PROXY_VERSION";
 /** The note added to failed tool calls when this server and its proxy differ. */
 export declare function versionMismatchNote(proxyVersion: string | undefined, ownVersion?: string): string | undefined;
+/**
+ * Says once per session, after a tool's answer, that ccc was updated on disk since
+ * this server started: Claude Code keeps an MCP server for the whole session, so
+ * the tools stay the version it loaded (an older one may lack message times) until
+ * ccc restarts. Silent when the versions match or package.json is unreadable.
+ */
+export declare class StaleToolsNotice {
+    private readonly readInstalled;
+    private readonly own;
+    private readonly now;
+    private readonly startedAt;
+    private said;
+    private checkedAt;
+    constructor(readInstalled?: () => string | undefined, own?: string, now?: () => number, startedAt?: Date);
+    next(): string | undefined;
+}
+export declare function staleToolsNote(installed: string, own: string, startedAt: Date): string;
+/** The version in this install's package.json now (ccc may have been updated since it started). */
+export declare function installedVersion(): string | undefined;
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list"];
 /** `tree` value naming this session's own current tree. */
@@ -254,6 +273,8 @@ export declare class CurrentTree implements TreeSource {
     private inFlight?;
     /** Other trees, least recently used first. */
     private readonly others;
+    /** Pages whose per-message times were incomplete: when to refetch them (timesDue). */
+    private readonly timesRetryAt;
     /** Set once the server answered 404 to a tree search the page JSON could answer. */
     private serverSearchMissing;
     private readonly fetchImpl;
@@ -271,6 +292,14 @@ export declare class CurrentTree implements TreeSource {
      */
     tail(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
     private loadCurrent;
+    /**
+     * Whether a cached page's per-message times were incomplete (`line_times_incomplete`:
+     * the server's times lookup was slow) and are due a refetch. The page itself is
+     * readable meanwhile, so it stays cached; only its times are retried.
+     */
+    private timesDue;
+    /** `load()`, or the readable `stale` copy when that fails (its times retried later). */
+    private refreshed;
     private requireSessionId;
     /** The proxy's current page for the calling session; fails closed on any other session. */
     currentId(validatePage?: boolean): Promise<string>;
@@ -307,7 +336,11 @@ export declare class SessionFinder implements SessionFinderSource {
  */
 export declare function handleMcpMessage(input: unknown, tree: TreeSource, finder?: SessionFinderSource, 
 /** versionMismatchNote: appended to failed tool calls. */
-versionNote?: string): Promise<object | undefined>;
+versionNote?: string, 
+/** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
+notice?: {
+    next(): string | undefined;
+}): Promise<object | undefined>;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

@@ -13,7 +13,7 @@
  * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
-import { formatTime, formatTimeSpan } from "./memtree-times.js";
+import { bracketedSpan, formatTime, formatTimeSpan, MissingTimeNote } from "./memtree-times.js";
 import { ToolInputError } from "./memtree-tools.js";
 
 export const SESSIONS_DEFAULT_LIMIT = 20;
@@ -51,7 +51,8 @@ export interface FinderSession {
   models?: string[];
   request_count?: number;
   tokens?: { prompt?: number; completion?: number; conversation?: number | null };
-  latest_tree?: { request_id: string; ref?: string; links?: FinderTreeLinks } | null;
+  /** `times`: when the tree's messages were written, first to last (servers from 2026-11). */
+  latest_tree?: { request_id: string; ref?: string; links?: FinderTreeLinks; times?: unknown } | null;
   /** How it ended, from the newest stored record (polychat memtree_session_endings.py). */
   ending?: FinderSessionEnding | null;
 }
@@ -180,7 +181,7 @@ export function formatSessions(body: FinderSessionsResponse, args: Record<string
     if (tree?.request_id) {
       const ref = tree.ref ?? tree.request_id;
       out.push(
-        `    latest tree: ${tree.request_id}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
+        `    latest tree: ${tree.request_id}${bracketedSpan(tree.times)}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
           `browse it with read_node {"tree": "${ref}", "id": 0}, or search it with search {"tree": "${ref}", "query": …}`
       );
     }
@@ -202,9 +203,10 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
     if (groups.length > 1) {
       out.push("Each embedding model is ranked on its own; scores are not comparable across groups.");
     }
+    const missing = new MissingTimeNote();
     for (const group of groups) {
       out.push("", `== ${group.embedding_model} ==`);
-      group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
+      group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     }
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
@@ -212,7 +214,8 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
   const hits = body.hits ?? [];
   if (!hits.length) return noHits(query, "text", args);
   const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
-  hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
+  const missing = new MissingTimeNote();
+  hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
   if (body.relaxed === "any_word") {
     out.splice(1, 0, "(No passage has every word, so these have some of them, best first. Try other words, or mode \"vector\" for meaning.)");
   }
@@ -227,7 +230,7 @@ const OPEN_NOTE =
   "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
   "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 
-function formatHit(hit: FinderHit, n: number): string[] {
+function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[] {
   const tree = hit.tree?.request_id;
   const ref = hit.tree?.ref ?? tree;
   const range = hit.range;
@@ -236,7 +239,7 @@ function formatHit(hit: FinderHit, n: number): string[] {
     hit.tree?.created_at ? `tree ${tree} of ${shortTime(hit.tree.created_at)}` : `tree ${tree}`,
     hit.leaf ? `leaf ${hit.leaf}` : undefined,
     range ? `block ${range.block} lines ${range.start}-${range.end}` : undefined,
-    formatTimeSpan(hit.times),
+    formatTimeSpan(hit.times) ?? missing.next(),
     typeof hit.score === "number" ? `score ${hit.score.toFixed(3)}` : undefined,
   ]
     .filter(Boolean)

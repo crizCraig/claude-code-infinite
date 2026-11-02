@@ -12,15 +12,24 @@
  * covers, then total hits. No embeddings and no server calls.
  *
  * Nodes, hits and read lines are dated by when their messages were written
- * (the page's `block_times`, memtree-times.ts) when the tree has times.
+ * (the page's `block_times`, memtree-times.ts) when the tree has times; where a
+ * block's per-message times are known (`line_times`), a leaf spans its own
+ * messages, each read message header and matched line shows its message's time.
+ * A result that has no time says "time not recorded" once instead of nothing.
  */
 import {
   blockTimes,
   bracketedSpan,
+  ClockFormat,
   formatTime,
   formatTimeSpan,
+  lineTimes,
+  linesSpan,
   mergeSpans,
+  MissingTimeNote,
+  timeAt,
   timeSpan,
+  type LineEntry,
   type TimeSpan,
 } from "./memtree-times.js";
 
@@ -57,7 +66,9 @@ export class MemtreeIndex {
   readonly depth = new Map<number, number>();
   /** Block -> when its messages were written; empty for trees without times. */
   readonly blockSpans: Map<number, TimeSpan>;
-  /** Node -> its span: a leaf's block's, a branch's merged over its subtree. */
+  /** Block -> each message's first line and time (`line_times`); empty without them. */
+  readonly lineTimes: Map<number, LineEntry[]>;
+  /** Node -> its span: a leaf's own messages' (else its block's), a branch's merged over its subtree. */
   readonly times = new Map<number, TimeSpan>();
   private readonly lines: string[][];
   private readonly lowerLines: string[][];
@@ -86,13 +97,14 @@ export class MemtreeIndex {
     this.lines = (page.blocks ?? []).map(splitLines);
     this.lowerLines = this.lines.map((block) => block.map((line) => line.toLowerCase()));
     this.blockSpans = blockTimes(page.block_times);
-    if (this.blockSpans.size) this.spanNodes(order);
+    this.lineTimes = lineTimes(page.line_times);
+    if (this.blockSpans.size || this.lineTimes.size) this.spanNodes(order);
   }
 
-  /** Leaves take their block's span; then each span merges into its parent's, children first. */
+  /** Leaves take their own span; then each span merges into its parent's, children first. */
   private spanNodes(order: number[]): void {
     for (const node of this.nodes.values()) {
-      const span = this.isLeaf(node) ? this.blockSpans.get(node.l![0]) : undefined;
+      const span = this.isLeaf(node) ? this.rangeSpan(...node.l!) : undefined;
       if (span) this.times.set(node.id, span);
     }
     for (const id of order.reverse()) {
@@ -100,6 +112,17 @@ export class MemtreeIndex {
       const parent = this.parent.get(id);
       if (span && parent !== undefined) this.times.set(parent, mergeSpans(this.times.get(parent), span));
     }
+  }
+
+  /** When lines `start..end` of `block` were written: their messages' span, else the block's. */
+  rangeSpan(block: number, start: number, end: number): TimeSpan | undefined {
+    const entries = this.lineTimes.get(block);
+    return entries ? linesSpan(entries, start, end) : this.blockSpans.get(block);
+  }
+
+  /** The time of the message `line` of `block` belongs to; undefined when unknown. */
+  lineTime(block: number, line: number): string | undefined {
+    return timeAt(this.lineTimes.get(block), line);
   }
 
   get blockCount(): number {
@@ -190,10 +213,11 @@ export class MemtreeIndex {
       .sort((a, b) => b.terms - a.terms || a.line - b.line)
       .slice(0, SNIPPETS_PER_LEAF)
       .sort((a, b) => a.line - b.line)
-      .map(({ line }) => ({
-        line,
-        text: snippet(this.lines[range!.block][line - 1], terms),
-      }));
+      .map(({ line }) => {
+        // `at` null: the block has per-message times but not this message's.
+        const at = this.lineTimes.has(range!.block) ? this.lineTime(range!.block, line) ?? null : undefined;
+        return { line, text: snippet(this.lines[range!.block][line - 1], terms), ...(at !== undefined ? { at } : {}) };
+      });
 
     const times = this.times.get(node.id);
     return {
@@ -232,7 +256,8 @@ export interface SearchHit {
   lineHits: number;
   score: number;
   range?: LeafRange;
-  snippets: { line: number; text: string }[];
+  /** `at`: when the line's message was written (trees with per-message times; null: not recorded). */
+  snippets: { line: number; text: string; at?: string | null }[];
   /** `<tree>#<node>` from servers that address hits. */
   address?: string;
   /** Ancestors, root first (servers that address hits). */
@@ -317,7 +342,7 @@ function treeArg(tree?: string): string {
 export function formatSearch(index: MemtreeIndex, query: string, limit?: number, tree?: string): string {
   const terms = queryTerms(query);
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
-  return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree);
+  return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree, [], index.times.get(0));
 }
 
 /**
@@ -325,8 +350,10 @@ export function formatSearch(index: MemtreeIndex, query: string, limit?: number,
  * (`GET /usage/memtree/<id>/search`, a port of MemtreeIndex.search), in the
  * local shape; undefined when the body is not that endpoint's answer.
  */
-export function serverSearchHits(body: unknown): { hits: SearchHit[]; terms: string[] } | undefined {
-  const json = body as { terms?: unknown; hits?: unknown } | undefined;
+export function serverSearchHits(
+  body: unknown
+): { hits: SearchHit[]; terms: string[]; treeTimes?: TimeSpan } | undefined {
+  const json = body as { terms?: unknown; hits?: unknown; tree_times?: unknown } | undefined;
   if (!json || !Array.isArray(json.hits) || !Array.isArray(json.terms)) return undefined;
   const hits: SearchHit[] = [];
   for (const raw of json.hits as Record<string, unknown>[]) {
@@ -341,13 +368,25 @@ export function serverSearchHits(body: unknown): { hits: SearchHit[]; terms: str
       lineHits: typeof raw.line_hits === "number" ? raw.line_hits : 0,
       score: typeof raw.score === "number" ? raw.score : 0,
       ...(range && Number.isInteger(range.block) ? { range } : {}),
-      snippets: Array.isArray(raw.snippets) ? (raw.snippets as SearchHit["snippets"]) : [],
+      snippets: Array.isArray(raw.snippets) ? serverSnippets(raw.snippets) : [],
       ...(typeof raw.address === "string" ? { address: raw.address } : {}),
       ...(Array.isArray(raw.path) ? { path: raw.path as SearchHit["path"] } : {}),
       ...(timeSpan(raw.times) ? { times: timeSpan(raw.times) } : {}),
     });
   }
-  return { hits, terms: (json.terms as unknown[]).map(String) };
+  const treeTimes = timeSpan(json.tree_times);
+  return { hits, terms: (json.terms as unknown[]).map(String), ...(treeTimes ? { treeTimes } : {}) };
+}
+
+/** A server hit's snippets; `at` kept only when it is a time. */
+function serverSnippets(raw: unknown[]): SearchHit["snippets"] {
+  return (raw as { line?: unknown; text?: unknown; at?: unknown }[])
+    .filter((s) => Number.isInteger(s?.line) && typeof s?.text === "string")
+    .map((s) => ({
+      line: s.line as number,
+      text: s.text as string,
+      ...(timeSpan([s.at, s.at]) ? { at: s.at as string } : s.at === null ? { at: null } : {}),
+    }));
 }
 
 export function formatSearchHits(
@@ -355,7 +394,9 @@ export function formatSearchHits(
   query: string,
   terms: string[],
   tree?: string,
-  tailHits: TailHit[] = []
+  tailHits: TailHit[] = [],
+  /** When the tree's messages were written, first to last: said in the header. */
+  treeTimes?: TimeSpan
 ): string {
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
   if (!hits.length && tailHits.length) {
@@ -365,14 +406,21 @@ export function formatSearchHits(
   if (!hits.length) {
     return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
   }
-  const out = [`${hits.length} best match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)} (terms: ${terms.join(", ")}):`];
+  const span = formatTimeSpan(treeTimes);
+  const out = [
+    `${hits.length} best match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)} (terms: ${terms.join(", ")})` +
+      (span ? `; the tree's messages span ${span}` : "") +
+      ":",
+  ];
+  const clock = new ClockFormat();
+  const missing = new MissingTimeNote();
   for (const hit of hits) {
     const head = [
       `node ${hit.id}`,
       hit.leaf ? "leaf" : "branch",
       hit.depth !== undefined ? `depth ${hit.depth}` : undefined,
       hit.range ? `block ${hit.range.block} lines ${hit.range.start}-${hit.range.end}` : undefined,
-      formatTimeSpan(hit.times),
+      formatTimeSpan(hit.times) ?? missing.next(),
       `matched ${hit.matchedTerms.join(", ")}`,
       hit.leaf ? `${hit.lineHits} matching line${hit.lineHits === 1 ? "" : "s"}` : undefined,
     ]
@@ -383,7 +431,10 @@ export function formatSearchHits(
     if (hit.path?.length) {
       out.push(`  path: ${hit.path.map((p) => `${truncate(p.summary, 80)} (node ${p.id})`).join(" › ")}`);
     }
-    for (const s of hit.snippets) out.push(`  L${s.line}: ${s.text}`);
+    for (const s of hit.snippets) {
+      const at = s.at === null ? missing.next() : clock.format(s.at);
+      out.push(`  L${s.line}${at ? ` · ${at}` : ""}: ${s.text}`);
+    }
   }
   out.push(
     "",
@@ -403,10 +454,11 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
       `read_node: no node ${id} (this tree has ${index.nodes.size} nodes; node 0 is the root)`
     );
   }
+  const missing = new MissingTimeNote();
   const out = [
     `node ${id} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
       (index.depth.has(id) ? ` · depth ${index.depth.get(id)}` : "") +
-      bracketedSpan(index.times.get(id)),
+      (bracketedSpan(index.times.get(id)) || ` [${missing.next()}]`),
     `summary: ${node.s ?? ""}`,
   ];
   if (index.isLeaf(node)) {
@@ -430,7 +482,8 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
     for (const child of children) {
       const c = index.nodes.get(child)!;
       const tag = index.isLeaf(c) ? `leaf, block ${c.l![0]} lines ${c.l![1]}-${c.l![2]}` : "branch";
-      const when = dated ? bracketedSpan(index.times.get(child)) : "";
+      const note = dated && !index.times.has(child) ? missing.next() : "";
+      const when = dated ? bracketedSpan(index.times.get(child)) || (note ? ` [${note}]` : "") : "";
       out.push(`  node ${child} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
     }
   }
@@ -494,6 +547,7 @@ export function formatLines(
   const out: string[] = [];
   let chars = 0;
   let shown = start - 1;
+  const rows: [number, string][] = [];
   for (let n = start; n <= last; n++) {
     let text = lines[n - 1];
     const room = READ_LINES_MAX_CHARS - chars;
@@ -502,8 +556,8 @@ export function formatLines(
       // A single line longer than the whole budget: show its head.
       text = `${text.slice(0, room)}… [line truncated: ${lines[n - 1].length} chars]`;
     }
-    out.push(`${n}\t${text}`);
     chars += text.length + 1;
+    rows.push([n, text]);
     shown = n;
   }
   const wanted = Math.min(end, lines.length);
@@ -513,8 +567,38 @@ export function formatLines(
         `continue with read_lines {${treeArg(tree)}"block": ${block}, "start": ${shown + 1}, "end": ${wanted}}`
     );
   }
-  const header = `block ${block}${bracketedSpan(index.blockSpans.get(block))} lines ${start}-${shown} (line number, tab, exact text):`;
+  const missing = new MissingTimeNote();
+  const entries = index.lineTimes.get(block) ?? [];
+  const span = formatTimeSpan(index.rangeSpan(block, start, Math.max(start, shown)));
+  const leading = span ? leadingUntimed(entries, start, shown, lines) : undefined;
+  const when = span
+    ? ` [${span}${leading ? `; lines ${leading[0]}-${leading[1]}: ${missing.next()}` : ""}]`
+    : ` [${missing.next()}]`;
+  const header = `block ${block}${when} lines ${start}-${shown} (line number, tab, exact text):`;
+  // Each message header with its time; a message without one says so, once per read.
+  const starts = new Map(entries);
+  const clock = new ClockFormat();
+  for (const [n, text] of rows) {
+    const match = starts.has(n) ? MESSAGE_HEADER_RE.exec(text) : null;
+    const when = match ? clock.format(starts.get(n)) ?? missing.next() : "";
+    out.push(`${n}\t${match && when ? `${match[1]} · ${when}:` : text}`);
+  }
   return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
+}
+
+const MESSAGE_HEADER_RE = /^(Message \d+ from [^:\s]+):$/;
+
+/**
+ * The lines a read begins with that belong to a message without a time, when that
+ * message's header is not among them (the read starts inside it): `[start, last]`.
+ */
+function leadingUntimed(entries: LineEntry[], start: number, shown: number, lines: string[]): [number, number] | undefined {
+  const k = entries.findLastIndex(([line]) => line <= start);
+  if (k < 0 || entries[k][1] !== undefined) return undefined;
+  const [first] = entries[k];
+  if (first === start && MESSAGE_HEADER_RE.test(lines[first - 1] ?? "")) return undefined;
+  const next = entries[k + 1]?.[0] ?? Infinity;
+  return [start, Math.min(shown, next - 1)];
 }
 
 /** One un-indexed message from the server's `/messages` read (polychat memtree_tail.py). */

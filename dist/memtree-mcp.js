@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
 import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, serverTailHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
+import { formatTime } from "./memtree-times.js";
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
 /**
  * The version of the ccc whose proxy this server talks to, set in the config
@@ -53,6 +54,53 @@ export function versionMismatchNote(proxyVersion, ownVersion = CLIENT_VERSION) {
         return undefined;
     const safe = proxyVersion.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
     return `(These MemTree tools are ccc ${ownVersion} but this session runs ccc ${safe}: ccc was updated during the session. Restart ccc to use one version.)`;
+}
+/** How often a tool call may re-read the installed package.json (StaleToolsNotice). */
+const STALE_CHECK_INTERVAL_MS = 60_000;
+/**
+ * Says once per session, after a tool's answer, that ccc was updated on disk since
+ * this server started: Claude Code keeps an MCP server for the whole session, so
+ * the tools stay the version it loaded (an older one may lack message times) until
+ * ccc restarts. Silent when the versions match or package.json is unreadable.
+ */
+export class StaleToolsNotice {
+    readInstalled;
+    own;
+    now;
+    startedAt;
+    said = false;
+    checkedAt = -Infinity;
+    constructor(readInstalled = installedVersion, own = CLIENT_VERSION, now = Date.now, startedAt = new Date()) {
+        this.readInstalled = readInstalled;
+        this.own = own;
+        this.now = now;
+        this.startedAt = startedAt;
+    }
+    next() {
+        if (this.said || this.now() - this.checkedAt < STALE_CHECK_INTERVAL_MS)
+            return undefined;
+        this.checkedAt = this.now();
+        const installed = this.readInstalled();
+        if (!installed || installed === this.own)
+            return undefined;
+        this.said = true;
+        return staleToolsNote(installed, this.own, this.startedAt);
+    }
+}
+export function staleToolsNote(installed, own, startedAt) {
+    const safe = installed.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
+    const loaded = formatTime(startedAt.toISOString());
+    return `(These MemTree tools are ccc ${own}${loaded ? `, loaded ${loaded}` : ""}; ccc ${safe} is installed: restart ccc to use its newer MemTree tools.)`;
+}
+/** The version in this install's package.json now (ccc may have been updated since it started). */
+export function installedVersion() {
+    try {
+        const version = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
+        return typeof version === "string" ? version : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export const MEMTREE_TOOL_NAMES = [
@@ -129,7 +177,7 @@ export const MEMTREE_TOOLS = [
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
             "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
             "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
-            "Results show when the messages were written (per transcript block). " +
+            "Results show when the messages were written, each matched line its own message's time where recorded. " +
             // Live on every request, unlike the server instructions and Claude Code's
             // deferred-tools list, which a resumed session keeps from its first day.
             MEMTREE_LOADED_NOTE,
@@ -152,7 +200,7 @@ export const MEMTREE_TOOLS = [
         name: "read_node",
         description: "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
             "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
-            "Results show when the messages were written (per transcript block).",
+            "Results show when the messages were written (a leaf: its own messages, where recorded).",
         inputSchema: {
             type: "object",
             properties: {
@@ -169,7 +217,7 @@ export const MEMTREE_TOOLS = [
             "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
             "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
             "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole. " +
-            "Results show when the messages were written (per transcript block).",
+            "Results show when the messages were written: each message header its own time, where recorded.",
         inputSchema: {
             type: "object",
             properties: {
@@ -267,6 +315,8 @@ export class CurrentTree {
     inFlight;
     /** Other trees, least recently used first. */
     others = new Map();
+    /** Pages whose per-message times were incomplete: when to refetch them (timesDue). */
+    timesRetryAt = new WeakMap();
     /** Set once the server answered 404 to a tree search the page JSON could answer. */
     serverSearchMissing = false;
     fetchImpl;
@@ -314,7 +364,7 @@ export class CurrentTree {
                 if (!other && session !== undefined)
                     this.checkSession(session, this.requireSessionId());
                 if (other || session !== undefined) {
-                    return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body));
+                    return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes);
                 }
                 // Older servers omit identity: search only the session-validated page.
             }
@@ -360,12 +410,34 @@ export class CurrentTree {
     async loadCurrent() {
         const id = await this.currentId();
         const sessionId = this.requireSessionId();
-        if (this.cached?.id === id)
+        if (this.cached?.id === id && !this.timesDue(this.cached.index))
             return this.cached.index;
-        const index = await this.loadPage(id, "this session", sessionId);
+        const stale = this.cached?.id === id ? this.cached.index : undefined;
+        const index = await this.refreshed(stale, () => this.loadPage(id, "this session", sessionId));
         if (!isTemporaryPrefix(index, id))
             this.cached = { id, index };
         return index;
+    }
+    /**
+     * Whether a cached page's per-message times were incomplete (`line_times_incomplete`:
+     * the server's times lookup was slow) and are due a refetch. The page itself is
+     * readable meanwhile, so it stays cached; only its times are retried.
+     */
+    timesDue(index) {
+        const at = this.timesRetryAt.get(index);
+        return at !== undefined && this.now() >= at;
+    }
+    /** `load()`, or the readable `stale` copy when that fails (its times retried later). */
+    async refreshed(stale, load) {
+        if (!stale)
+            return load();
+        try {
+            return await load();
+        }
+        catch {
+            this.timesRetryAt.set(stale, this.now() + PREFIX_RETRY_INTERVAL_MS);
+            return stale;
+        }
     }
     requireSessionId() {
         const sessionId = this.deps.sessionId;
@@ -407,12 +479,13 @@ export class CurrentTree {
     }
     async getOther(id) {
         const hit = this.others.get(id);
-        if (hit) {
+        if (hit && !this.timesDue(hit)) {
             this.others.delete(id);
             this.others.set(id, hit);
             return hit;
         }
-        const index = await this.loadPage(id, `tree ${id}`);
+        const index = await this.refreshed(hit, () => this.loadPage(id, `tree ${id}`));
+        this.others.delete(id);
         if (!isTemporaryPrefix(index, id))
             this.others.set(id, index);
         while (this.others.size > OTHER_TREES_CACHED) {
@@ -457,6 +530,9 @@ export class CurrentTree {
             throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
         }
         const index = new MemtreeIndex(json);
+        // Readable now; its incomplete per-message times are refetched after the cooldown.
+        if (json.line_times_incomplete === true)
+            this.timesRetryAt.set(index, this.now() + PREFIX_RETRY_INTERVAL_MS);
         if (isTemporaryPrefix(index, id)) {
             this.prefixRetryAt.set(id, this.now() + PREFIX_RETRY_INTERVAL_MS);
             this.prefixes.delete(id);
@@ -529,7 +605,9 @@ export class SessionFinder {
  */
 export async function handleMcpMessage(input, tree, finder, 
 /** versionMismatchNote: appended to failed tool calls. */
-versionNote) {
+versionNote, 
+/** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
+notice) {
     if (!isRpcRequest(input)) {
         return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
     }
@@ -558,16 +636,20 @@ versionNote) {
         case "tools/call": {
             const name = message.params?.name;
             const args = (message.params?.arguments ?? {});
+            const withNotice = (text) => {
+                const note = notice?.next();
+                return note ? `${text}\n\n${note}` : text;
+            };
             try {
                 const text = await callTool(String(name), args, tree, finder);
-                return reply({ content: [{ type: "text", text }] });
+                return reply({ content: [{ type: "text", text: withNotice(text) }] });
             }
             catch (err) {
                 if (err instanceof UnknownToolError)
                     return fail(-32602, err.message);
                 const message = err instanceof Error ? err.message : String(err);
                 const text = versionNote ? `${message}\n${versionNote}` : message;
-                return reply({ content: [{ type: "text", text }], isError: true });
+                return reply({ content: [{ type: "text", text: withNotice(text) }], isError: true });
             }
         }
         default:
@@ -683,6 +765,7 @@ export function runMemtreeMcpServer(env = process.env) {
     const tree = new CurrentTree(deps);
     const finder = new SessionFinder(deps);
     const versionNote = versionMismatchNote(env[PROXY_VERSION_ENV]);
+    const notice = new StaleToolsNotice();
     if (versionNote)
         process.stderr.write(`memtree MCP: ${versionNote}\n`);
     let buffer = "";
@@ -707,7 +790,7 @@ export function runMemtreeMcpServer(env = process.env) {
                 continue;
             }
             queue = queue.then(async () => {
-                const response = await handleMcpMessage(message, tree, finder, versionNote).catch((err) => ({
+                const response = await handleMcpMessage(message, tree, finder, versionNote, notice).catch((err) => ({
                     jsonrpc: "2.0",
                     id: isRpcRequest(message) ? message.id ?? null : null,
                     error: { code: -32603, message: String(err) },
