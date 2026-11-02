@@ -31,10 +31,12 @@ export interface FinderSession {
         completion?: number;
         conversation?: number | null;
     };
+    /** `times`: when the tree's messages were written, first to last (servers from 2026-11). */
     latest_tree?: {
         request_id: string;
         ref?: string;
         links?: FinderTreeLinks;
+        times?: unknown;
     } | null;
     /** How it ended, from the newest stored record (polychat memtree_session_endings.py). */
     ending?: FinderSessionEnding | null;

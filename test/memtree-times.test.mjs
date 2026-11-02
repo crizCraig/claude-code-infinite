@@ -69,3 +69,26 @@ test("block times parse and merge", () => {
   assert.deepEqual(mergeSpans(["2026-09-30T21:02:00.000Z", "2026-09-30T21:10:00.000Z"], ["2026-09-30T20:00:00.000Z", "2026-09-30T21:05:00.000Z"]),
     ["2026-09-30T20:00:00.000Z", "2026-09-30T21:10:00.000Z"]);
 });
+
+test("line times: parse, the time a line belongs to, and the span of a range", async () => {
+  const { lineTimes, timeAt, entriesIn, linesSpan, ClockFormat, MissingTimeNote } = await import("../dist/memtree-times.js");
+  const t = (m) => `2026-10-16T15:${String(m).padStart(2, "0")}:00.000Z`;
+  const parsed = lineTimes({ "0": [[1, t(1)], [6, null], [10, t(4)]], "1": [[3, t(1)], [2, t(2)]], x: [[1, t(1)]], "2": [[0, t(1)]] });
+  assert.deepEqual([...parsed.keys()], [0], "unordered, junk keys and line 0 dropped");
+  const e = parsed.get(0);
+  assert.deepEqual(e[1], [6, undefined]);
+  assert.equal(timeAt(e, 5), t(1));
+  assert.equal(timeAt(e, 7), undefined);
+  assert.equal(timeAt([[3, t(1)]], 2), undefined);
+  assert.deepEqual(entriesIn(e, 2, 6), [[1, t(1)], [6, undefined]]);
+  assert.deepEqual(linesSpan(e, 2, 12), [t(1), t(4)]);
+  assert.equal(linesSpan(e, 6, 9), undefined);
+  const clock = new ClockFormat(PT);
+  assert.equal(clock.format("2026-10-16T15:38:00Z"), "2026-10-16 08:38");
+  assert.equal(clock.format("2026-10-16T16:02:00Z"), "09:02");
+  assert.equal(clock.format(undefined), undefined);
+  assert.equal(clock.format("2026-10-17T16:02:00Z"), "2026-10-17 09:02", "the date again when it changes");
+  const missing = new MissingTimeNote();
+  assert.equal(missing.next(), "time not recorded");
+  assert.equal(missing.next(), "");
+});

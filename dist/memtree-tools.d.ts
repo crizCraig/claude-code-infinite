@@ -12,9 +12,12 @@
  * covers, then total hits. No embeddings and no server calls.
  *
  * Nodes, hits and read lines are dated by when their messages were written
- * (the page's `block_times`, memtree-times.ts) when the tree has times.
+ * (the page's `block_times`, memtree-times.ts) when the tree has times; where a
+ * block's per-message times are known (`line_times`), a leaf spans its own
+ * messages, each read message header and matched line shows its message's time.
+ * A result that has no time says "time not recorded" once instead of nothing.
  */
-import { type TimeSpan } from "./memtree-times.js";
+import { type LineEntry, type TimeSpan } from "./memtree-times.js";
 export interface MemtreeNode {
     id: number;
     s?: string;
@@ -43,13 +46,19 @@ export declare class MemtreeIndex {
     readonly depth: Map<number, number>;
     /** Block -> when its messages were written; empty for trees without times. */
     readonly blockSpans: Map<number, TimeSpan>;
-    /** Node -> its span: a leaf's block's, a branch's merged over its subtree. */
+    /** Block -> each message's first line and time (`line_times`); empty without them. */
+    readonly lineTimes: Map<number, LineEntry[]>;
+    /** Node -> its span: a leaf's own messages' (else its block's), a branch's merged over its subtree. */
     readonly times: Map<number, TimeSpan>;
     private readonly lines;
     private readonly lowerLines;
     constructor(page: MemtreePageJson);
-    /** Leaves take their block's span; then each span merges into its parent's, children first. */
+    /** Leaves take their own span; then each span merges into its parent's, children first. */
     private spanNodes;
+    /** When lines `start..end` of `block` were written: their messages' span, else the block's. */
+    rangeSpan(block: number, start: number, end: number): TimeSpan | undefined;
+    /** The time of the message `line` of `block` belongs to; undefined when unknown. */
+    lineTime(block: number, line: number): string | undefined;
     get blockCount(): number;
     blockLines(block: number): string[] | undefined;
     /** Root first, the node's parent last. */
@@ -73,9 +82,11 @@ export interface SearchHit {
     lineHits: number;
     score: number;
     range?: LeafRange;
+    /** `at`: when the line's message was written (trees with per-message times). */
     snippets: {
         line: number;
         text: string;
+        at?: string;
     }[];
     /** `<tree>#<node>` from servers that address hits. */
     address?: string;
@@ -105,8 +116,11 @@ export declare function formatSearch(index: MemtreeIndex, query: string, limit?:
 export declare function serverSearchHits(body: unknown): {
     hits: SearchHit[];
     terms: string[];
+    treeTimes?: TimeSpan;
 } | undefined;
-export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string, tailHits?: TailHit[]): string;
+export declare function formatSearchHits(hits: SearchHit[], query: string, terms: string[], tree?: string, tailHits?: TailHit[], 
+/** When the tree's messages were written, first to last: said in the header. */
+treeTimes?: TimeSpan): string;
 export declare function formatNode(index: MemtreeIndex, id: number, tree?: string): string;
 export declare function formatLines(index: MemtreeIndex, block: number, start: number, end: number, tree?: string): string;
 /** A tail message matching a tree search (`tail_hits`, polychat memtree_tail_search.py). */

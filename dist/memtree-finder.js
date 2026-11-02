@@ -13,7 +13,7 @@
  * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
-import { formatTime, formatTimeSpan } from "./memtree-times.js";
+import { bracketedSpan, formatTime, formatTimeSpan, MissingTimeNote } from "./memtree-times.js";
 import { ToolInputError } from "./memtree-tools.js";
 export const SESSIONS_DEFAULT_LIMIT = 20;
 export const SESSIONS_MAX_LIMIT = 100;
@@ -105,7 +105,7 @@ export function formatSessions(body, args) {
         const tree = s.latest_tree;
         if (tree?.request_id) {
             const ref = tree.ref ?? tree.request_id;
-            out.push(`    latest tree: ${tree.request_id}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
+            out.push(`    latest tree: ${tree.request_id}${bracketedSpan(tree.times)}${tree.links?.url ? ` (${tree.links.url})` : ""}; ` +
                 `browse it with read_node {"tree": "${ref}", "id": 0}, or search it with search {"tree": "${ref}", "query": …}`);
         }
     });
@@ -126,9 +126,10 @@ export function formatSearchResults(body, args) {
         if (groups.length > 1) {
             out.push("Each embedding model is ranked on its own; scores are not comparable across groups.");
         }
+        const missing = new MissingTimeNote();
         for (const group of groups) {
             out.push("", `== ${group.embedding_model} ==`);
-            group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
+            group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
         }
         out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
         return out.join("\n");
@@ -137,7 +138,8 @@ export function formatSearchResults(body, args) {
     if (!hits.length)
         return noHits(query, "text", args);
     const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
-    hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1)));
+    const missing = new MissingTimeNote();
+    hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     if (body.relaxed === "any_word") {
         out.splice(1, 0, "(No passage has every word, so these have some of them, best first. Try other words, or mode \"vector\" for meaning.)");
     }
@@ -149,7 +151,7 @@ export function formatSearchResults(body, args) {
 }
 const OPEN_NOTE = "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
     "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
-function formatHit(hit, n) {
+function formatHit(hit, n, missing) {
     const tree = hit.tree?.request_id;
     const ref = hit.tree?.ref ?? tree;
     const range = hit.range;
@@ -158,7 +160,7 @@ function formatHit(hit, n) {
         hit.tree?.created_at ? `tree ${tree} of ${shortTime(hit.tree.created_at)}` : `tree ${tree}`,
         hit.leaf ? `leaf ${hit.leaf}` : undefined,
         range ? `block ${range.block} lines ${range.start}-${range.end}` : undefined,
-        formatTimeSpan(hit.times),
+        formatTimeSpan(hit.times) ?? missing.next(),
         typeof hit.score === "number" ? `score ${hit.score.toFixed(3)}` : undefined,
     ]
         .filter(Boolean)

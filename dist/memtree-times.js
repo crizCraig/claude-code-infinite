@@ -163,4 +163,81 @@ function zoneLabel(names, date) {
     const short = name(names.short);
     return short === "GMT+0" || !short ? "UTC" : short;
 }
+/** `line_times` (`{"3": [[1, iso], [7, null]]}`) as block -> entries; malformed blocks dropped. */
+export function lineTimes(raw) {
+    const out = new Map();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        return out;
+    for (const [key, value] of Object.entries(raw)) {
+        if (!/^\d{1,9}$/.test(key) || !Array.isArray(value))
+            continue;
+        const entries = value
+            .filter((e) => Array.isArray(e) && e.length === 2 && Number.isInteger(e[0]) && e[0] >= 1)
+            .map(([line, at]) => [line, isIsoTime(at) ? at : undefined]);
+        if (entries.length && entries.every((e, i) => i === 0 || entries[i - 1][0] < e[0]))
+            out.set(Number(key), entries);
+    }
+    return out;
+}
+/** The time of the message `line` belongs to; undefined when unknown. */
+export function timeAt(entries, line) {
+    let at;
+    for (const [first, time] of entries ?? []) {
+        if (first > line)
+            break;
+        at = time;
+    }
+    return at;
+}
+/** The entries in effect over lines `start..end`: the one `start` falls in, then each starting inside. */
+export function entriesIn(entries, start, end) {
+    if (!entries?.length)
+        return [];
+    let k = -1;
+    while (k + 1 < entries.length && entries[k + 1][0] <= start)
+        k++;
+    return entries.filter((e, i) => e[0] <= end && (i === k || e[0] >= start));
+}
+/** `[earliest, latest]` of the messages lines `start..end` belong to; undefined when none is known. */
+export function linesSpan(entries, start, end) {
+    const known = entriesIn(entries, start, end)
+        .map(([, at]) => at)
+        .filter((at) => !!at)
+        .sort((a, b) => Date.parse(a) - Date.parse(b));
+    return known.length ? [known[0], known[known.length - 1]] : undefined;
+}
+/**
+ * Compact times for one result, in the zone its header names: the date and time the
+ * first time and whenever the date changes (`2026-10-16 08:38`), else the time only
+ * (`08:38`). One instance per tool output.
+ */
+export class ClockFormat {
+    zone;
+    lastDate;
+    constructor(zone = localTimeZone()) {
+        this.zone = zone;
+    }
+    format(value) {
+        if (!isIsoTime(value))
+            return undefined;
+        const text = zoneParts(this.zone).format(new Date(value));
+        const date = text.slice(0, 10);
+        const sameDay = date === this.lastDate;
+        this.lastDate = date;
+        return sameDay ? text.slice(11) : text;
+    }
+}
+/** Said once per result where a time would be, instead of silence. */
+export const TIME_NOT_RECORDED = "time not recorded";
+/** Hands out TIME_NOT_RECORDED once per tool output. */
+export class MissingTimeNote {
+    said = false;
+    /** The note the first time a time is missing, then "". */
+    next() {
+        if (this.said)
+            return "";
+        this.said = true;
+        return TIME_NOT_RECORDED;
+    }
+}
 //# sourceMappingURL=memtree-times.js.map

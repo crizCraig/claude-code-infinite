@@ -140,7 +140,7 @@ test("search snippets window long lines around the hit", () => {
 
 test("formatSearch names ranges and the follow-up tools; no terms is an input error", () => {
   const text = formatSearch(index(), "0042 duplicate");
-  assert.match(text, /\[node 5 · leaf · depth 2 · block 1 lines 1-6 · matched 0042, duplicate/);
+  assert.match(text, /\[node 5 · leaf · depth 2 · block 1 lines 1-6 · time not recorded · matched 0042, duplicate/);
   assert.match(text, /L4: Migration 0042_add_invoice_index failed/);
   assert.match(text, /read_lines \{block, start, end\}/);
   assert.match(formatSearch(index(), "zebra"), /No node or transcript line matches/);
@@ -149,7 +149,7 @@ test("formatSearch names ranges and the follow-up tools; no terms is an input er
 
 test("read_node: summary, path from the root, children, leaf range", () => {
   const leaf = formatNode(index(), 3);
-  assert.match(leaf, /^node 3 · leaf · depth 2\nsummary: Bucket renamed\./);
+  assert.match(leaf, /^node 3 · leaf · depth 2 \[time not recorded\]\nsummary: Bucket renamed\./);
   assert.match(leaf, /transcript: block 0 lines 6-9 \(4 lines;/);
   assert.match(leaf, /path from the root:\n  node 0: Billing service.*\n  node 1: Deploy pipeline/);
   const root = formatNode(index(), 0);
@@ -163,12 +163,12 @@ test("read_node: summary, path from the root, children, leaf range", () => {
 test("read_lines returns exact numbered lines and rejects bad bounds", () => {
   assert.equal(
     formatLines(index(), 0, 4, 5),
-    "block 0 lines 4-5 (line number, tab, exact text):\n" +
+    "block 0 [time not recorded] lines 4-5 (line number, tab, exact text):\n" +
       "4\tI created deploy.yaml with region us-west2 and bucket billing-artifacts-7731\n" +
       "5\tThe billing service port is 8443"
   );
   // End past the block is clamped and said so.
-  assert.match(formatLines(index(), 0, 8, 50), /^block 0 lines 8-9 [\s\S]*\[block 0 ends at line 9\]$/);
+  assert.match(formatLines(index(), 0, 8, 50), /^block 0 \[time not recorded\] lines 8-9 [\s\S]*\[block 0 ends at line 9\]$/);
   assert.throws(() => formatLines(index(), 2, 1, 2), /no block 2 \(blocks 0-1\)/);
   assert.throws(() => formatLines(index(), 0, 0, 2), /at least 1/);
   assert.throws(() => formatLines(index(), 0, 5, 4), /end must be at least start/);
@@ -182,7 +182,7 @@ test("read_lines returns exact numbered lines and rejects bad bounds", () => {
 test("read_lines caps characters and lines, and says where to continue", () => {
   // Line 6 of block 1 is 50k chars: past the char cap after lines 1-5.
   const capped = formatLines(index(), 1, 1, 6);
-  assert.match(capped, /^block 1 lines 1-5 /);
+  assert.match(capped, /^block 1 \[time not recorded\] lines 1-5 /);
   assert.match(capped, /capped at 400 lines \/ 40000 chars per call: showed 1-5; continue with read_lines \{"block": 1, "start": 6, "end": 6\}/);
   // A single over-long line is shown truncated rather than not at all.
   const single = formatLines(index(), 1, 6, 6);
@@ -489,7 +489,7 @@ test("read_lines and read_node take current#N as this session's current tree", a
   const call = async (name, args) =>
     (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree))
       .result.content[0].text;
-  assert.match(await call("read_lines", { node: "current#2" }), /^block 0 lines 1-5/);
+  assert.match(await call("read_lines", { node: "current#2" }), /^block 0 \[time not recorded\] lines 1-5/);
   assert.match(await call("read_node", { node: "current#2" }), /^node 2 · leaf/);
   assert.match(await call("read_lines", { node: "current#0" }), /node current#0 is a branch; read_node \{"node": "current#0"\}/);
   assert.match(await call("read_lines", { node: "current#99" }), /no node 99 in tree current/);
@@ -571,7 +571,7 @@ test("search routes by tree and mode; read_node and read_lines take node address
 
   seen.length = 0;
   assert.match(await call("read_node", { node: "abc-v1-own#5" }), /^node 5 · leaf/);
-  assert.match(await call("read_lines", { node: "abc-v1-own#5" }), /^block 1 lines 1-5 .*\n1\tMessage 4 from user/);
+  assert.match(await call("read_lines", { node: "abc-v1-own#5" }), /^block 1 \[time not recorded\] lines 1-5 .*\n1\tMessage 4 from user/);
   assert.deepEqual(seen, [["get", "abc-v1-own"], ["get", "abc-v1-own"]]);
   assert.match(await call("read_lines", { node: "abc-v1-own#0" }), /is a branch; read_node/);
   assert.match(await call("read_node", { node: "abc#x" }), /node must be an address/);
@@ -714,7 +714,7 @@ test("CurrentTree search: the server's tree search first, the page JSON when the
   };
   const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", fetch: fetchImpl });
   const viaServer = await tree.search("8443", 3);
-  assert.match(viaServer, /\[node 5 · leaf · depth 2 · block 0 lines 5-5 · matched 8443 · 1 matching line\]/);
+  assert.match(viaServer, /\[node 5 · leaf · depth 2 · block 0 lines 5-5 · time not recorded · matched 8443 · 1 matching line\]/);
   assert.match(viaServer, /L5: port 8443/);
   assert.deepEqual(urls, ["/memtree/current?session=session-1", "/memtree/aaa111/search?q=8443&limit=3"], "no page download");
 
@@ -975,7 +975,7 @@ test("read_node dates the node and each child by when its messages were written"
     // Children all written when the node was (one block): the header says it once.
     assert.match(formatNode(timed, 1), /\nchildren \(2, same time as the node\):\n  node 2 \(leaf, block 0 lines 1-5\): User asks/);
     const mixed = new MemtreeIndex({ ...TIMED, block_times: { "0": TIMED.block_times["0"] } });
-    assert.match(formatNode(mixed, 0), /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy[^\n]*\n  node 4 \(branch\): Migration/);
+    assert.match(formatNode(mixed, 0), /\n  node 1 \(branch\) \[2026-09-30 14:02–14:10 PT\]: Deploy[^\n]*\n  node 4 \(branch\) \[time not recorded\]: Migration/);
     assert.match(formatNode(timed, 5), /^node 5 · leaf · depth 2 \[2026-09-30 14:20–14:40 PT\]\n/);
     // A detached branch (no span of its own) still shows its children's.
     const detached = new MemtreeIndex({ ...TIMED, nodes: [...TIMED.nodes, { id: 7, s: "loose", k: [8] },
@@ -990,7 +990,7 @@ test("read_lines dates its block in the header", () => {
   inZone("America/Los_Angeles", () => {
     const timed = new MemtreeIndex(TIMED);
     assert.match(formatLines(timed, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2 \(line number, tab, exact text\):\n/);
-    assert.match(formatLines(index(), 1, 1, 2), /^block 1 lines 1-2 \(line number/);
+    assert.match(formatLines(index(), 1, 1, 2), /^block 1 \[time not recorded\] lines 1-2 \(line number/);
   });
 });
 
@@ -1005,13 +1005,13 @@ test("search hits are dated: local search, the server's tree search and search a
     const parsed = serverSearchHits(body);
     const text = formatSearchHits(parsed.hits, "pr", parsed.terms);
     assert.match(text, /\[node 5 · leaf · 2026-09-30 14:20–14:40 PT · matched/);
-    assert.match(text, /\[node 6 · leaf · matched/);
+    assert.match(text, /\[node 6 · leaf · time not recorded · matched/);
     const across = formatSearchResults({ hits: [
       { id: "s1", kind: "claude_code_session", session_id: "s1", tree: { request_id: "r1", created_at: "2026-09-30T22:00:00Z" },
         range: { block: 1, start: 1, end: 6 }, times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:40:00.000Z"] },
       { id: "s2", tree: { request_id: "r2" }, range: { block: 0, start: 1, end: 2 } }] }, { query: "x" });
     assert.match(across, /\[1\] session s1 · tree r1 of 2026-09-30 15:00 PT · block 1 lines 1-6 · 2026-09-30 14:20–14:40 PT\n/);
-    assert.match(across, /\[2\] session s2 · tree r2 · block 0 lines 1-2\n/);
+    assert.match(across, /\[2\] session s2 · tree r2 · block 0 lines 1-2 · time not recorded\n/);
   });
 });
 
@@ -1019,4 +1019,93 @@ test("tool descriptions say results show when the messages were written", () => 
   for (const name of ["search", "read_node", "read_lines"]) {
     assert.match(MEMTREE_TOOLS.find((t) => t.name === name).description, /[Rr]esults show when the messages were written/, name);
   }
+});
+
+const LINED = {
+  ...TIMED,
+  // Block 0: messages 0-3 start at lines 1, 3, 6, 8; block 1 has no per-message times.
+  line_times: { "0": [[1, "2026-09-30T21:02:00.000Z"], [3, "2026-09-30T21:05:00.000Z"],
+    [6, "2026-09-30T21:08:00.000Z"], [8, null]] },
+};
+
+test("read_lines dates each message header, the date once, and the header spans the lines shown", () => {
+  inZone("America/Los_Angeles", () => {
+    const lined = new MemtreeIndex(LINED);
+    const text = formatLines(lined, 0, 2, 9);
+    assert.match(text, /^block 0 \[2026-09-30 14:02–14:08 PT\] lines 2-9 /);
+    assert.match(text, /\n3\tMessage 1 from assistant · 2026-09-30 14:05:\n/);
+    assert.match(text, /\n6\tMessage 2 from user · 14:08:\n/, "same day: the time only");
+    assert.match(text, /\n8\tMessage 3 from assistant:\n/, "a message without a time is left as is");
+    assert.match(formatLines(lined, 0, 6, 7), /^block 0 \[2026-09-30 14:08 PT\] lines 6-7/);
+    // A block without per-message times keeps its block's span; none at all says so once.
+    assert.match(formatLines(lined, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2/);
+    assert.match(formatLines(index(), 1, 1, 2), /^block 1 \[time not recorded\] lines 1-2 \(line number/);
+  });
+});
+
+test("leaves span their own messages; a missing time is said once", () => {
+  inZone("America/Los_Angeles", () => {
+    const lined = new MemtreeIndex(LINED);
+    assert.match(formatNode(lined, 2), /^node 2 · leaf · depth 2 \[2026-09-30 14:02–14:05 PT\]\n/);
+    assert.match(formatNode(lined, 3), /^node 3 · leaf · depth 2 \[2026-09-30 14:08 PT\]\n/);
+    assert.match(formatNode(lined, 1), /\n  node 2 \(leaf, block 0 lines 1-5\) \[2026-09-30 14:02–14:05 PT\]/);
+    const old = formatNode(index(), 0);
+    assert.match(old, /^node 0 · branch · depth 0 \[time not recorded\]\n/);
+    assert.equal(old.match(/time not recorded/g).length, 1, old);
+    const mixed = formatNode(new MemtreeIndex({ ...TIMED, block_times: { "0": TIMED.block_times["0"] } }), 0);
+    assert.match(mixed, /\n  node 4 \(branch\) \[time not recorded\]: Migration/);
+  });
+});
+
+test("search: each matched line carries its message's time; the tree's span heads the result", () => {
+  inZone("America/Los_Angeles", () => {
+    const local = formatSearch(new MemtreeIndex(LINED), "bucket");
+    assert.match(local, /^\d+ best match(es)? for "bucket" \(terms: bucket\); the tree's messages span 2026-09-30 14:02–14:40 PT:/);
+    assert.match(local, /\n  L7 · 2026-09-30 14:08: Rename the bucket\n  L9: Renamed/, "date first, none unknown");
+    assert.match(local, /\n  L4 · 14:05: I created deploy\.yaml/, "same day: the time only");
+    const body = { terms: ["pr"], tree_times: ["2026-09-30T21:02:00.000Z", "2026-09-30T21:40:00.000Z"], hits: [
+      { id: 5, leaf: true, summary: "s", times: ["2026-09-30T21:20:00.000Z", "2026-09-30T21:30:00.000Z"], snippets: [{ line: 3, text: "a", at: "2026-09-30T21:25:00.000Z" }, { line: 4, text: "b", at: "junk" }] },
+      { id: 6, leaf: true, summary: "t", snippets: [] },
+      { id: 7, leaf: true, summary: "u", snippets: [] }] };
+    const parsed = serverSearchHits(body);
+    const text = formatSearchHits(parsed.hits, "pr", parsed.terms, undefined, [], parsed.treeTimes);
+    assert.match(text, /; the tree's messages span 2026-09-30 14:02–14:40 PT:/);
+    assert.match(text, /\n  L3 · 2026-09-30 14:25: a\n  L4: b\n/);
+    assert.match(text, /\[node 6 · leaf · time not recorded · matched/);
+    assert.match(text, /\[node 7 · leaf · matched/, "said once");
+  });
+});
+
+test("search across sessions says a missing time once; list dates each latest tree", () => {
+  inZone("America/Los_Angeles", () => {
+    const across = formatSearchResults({ hits: [
+      { id: "s1", tree: { request_id: "r1" }, range: { block: 0, start: 1, end: 2 } },
+      { id: "s2", tree: { request_id: "r2" }, range: { block: 0, start: 1, end: 2 } }] }, { query: "x" });
+    assert.match(across, /\[1\] session s1 · tree r1 · block 0 lines 1-2 · time not recorded\n/);
+    assert.match(across, /\[2\] session s2 · tree r2 · block 0 lines 1-2\n/);
+    const list = formatSessions({ sessions: [{ id: "s1", latest_tree: { request_id: "r1",
+      times: ["2026-09-30T21:02:00.000Z", "2026-10-01T03:00:00.000Z"] } }] }, {});
+    assert.match(list, /latest tree: r1 \[2026-09-30 14:02–20:00 PT\];/);
+  });
+});
+
+test("a stale MemTree server says once that ccc was updated and needs a restart", async () => {
+  const { StaleToolsNotice, staleToolsNote } = await import("../dist/memtree-mcp.js");
+  let installed = "1.0.29";
+  let now = 0;
+  const notice = new StaleToolsNotice(() => installed, "1.0.29", () => now, new Date("2026-10-17T12:00:00Z"));
+  assert.equal(notice.next(), undefined, "same version: nothing");
+  installed = "1.0.34";
+  assert.equal(notice.next(), undefined, "checked at most once a minute");
+  now = 61_000;
+  const note = notice.next();
+  assert.match(note, /These MemTree tools are ccc 1\.0\.29, loaded 2026-10-17 .*; ccc 1\.0\.34 is installed: restart ccc for message times/);
+  now = 200_000;
+  assert.equal(notice.next(), undefined, "once per session");
+  assert.match(staleToolsNote("1.0.34;rm -rf", "1.0.29", new Date(0)), /ccc 1\.0\.34rm-rf is installed/);
+  const once = { said: false, next() { if (this.said) return undefined; this.said = true; return "(restart)"; } };
+  const call = (id) => handleMcpMessage({ jsonrpc: "2.0", id, method: "tools/call",
+    params: { name: "read_node", arguments: { id: 0 } } }, { get: async () => index() }, undefined, undefined, once);
+  assert.match((await call(1)).result.content[0].text, /\n\n\(restart\)$/);
+  assert.doesNotMatch((await call(2)).result.content[0].text, /restart/);
 });

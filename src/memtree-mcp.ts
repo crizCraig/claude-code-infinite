@@ -63,6 +63,7 @@ import {
   type MemtreePageJson,
 } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
+import { formatTime } from "./memtree-times.js";
 
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
 /**
@@ -84,6 +85,52 @@ export function versionMismatchNote(
   const safe = proxyVersion.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
   return `(These MemTree tools are ccc ${ownVersion} but this session runs ccc ${safe}: ccc was updated during the session. Restart ccc to use one version.)`;
 }
+/** How often a tool call may re-read the installed package.json (StaleToolsNotice). */
+const STALE_CHECK_INTERVAL_MS = 60_000;
+
+/**
+ * Says once per session, after a tool's answer, that ccc was updated on disk since
+ * this server started: Claude Code keeps an MCP server for the whole session, so
+ * the tools stay the version it loaded (an older one may lack message times) until
+ * ccc restarts. Silent when the versions match or package.json is unreadable.
+ */
+export class StaleToolsNotice {
+  private said = false;
+  private checkedAt = -Infinity;
+
+  constructor(
+    private readonly readInstalled: () => string | undefined = installedVersion,
+    private readonly own: string = CLIENT_VERSION,
+    private readonly now: () => number = Date.now,
+    private readonly startedAt: Date = new Date()
+  ) {}
+
+  next(): string | undefined {
+    if (this.said || this.now() - this.checkedAt < STALE_CHECK_INTERVAL_MS) return undefined;
+    this.checkedAt = this.now();
+    const installed = this.readInstalled();
+    if (!installed || installed === this.own) return undefined;
+    this.said = true;
+    return staleToolsNote(installed, this.own, this.startedAt);
+  }
+}
+
+export function staleToolsNote(installed: string, own: string, startedAt: Date): string {
+  const safe = installed.replace(/[^0-9A-Za-z.+-]/g, "").slice(0, 40);
+  const loaded = formatTime(startedAt.toISOString());
+  return `(These MemTree tools are ccc ${own}${loaded ? `, loaded ${loaded}` : ""}; ccc ${safe} is installed: restart ccc for message times and the newest tool fixes.)`;
+}
+
+/** The version in this install's package.json now (ccc may have been updated since it started). */
+export function installedVersion(): string | undefined {
+  try {
+    const version = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
+    return typeof version === "string" ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
 export const MEMTREE_TOOL_NAMES = [
   "search",
@@ -167,7 +214,7 @@ export const MEMTREE_TOOLS = [
       "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
       "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
-      "Results show when the messages were written (per transcript block). " +
+      "Results show when the messages were written, each matched line its own message's time where recorded. " +
       // Live on every request, unlike the server instructions and Claude Code's
       // deferred-tools list, which a resumed session keeps from its first day.
       MEMTREE_LOADED_NOTE,
@@ -191,7 +238,7 @@ export const MEMTREE_TOOLS = [
     description:
       "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
       "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
-      "Results show when the messages were written (per transcript block).",
+      "Results show when the messages were written (a leaf: its own messages, where recorded).",
     inputSchema: {
       type: "object",
       properties: {
@@ -209,7 +256,7 @@ export const MEMTREE_TOOLS = [
       "With tail: true, read the messages after the tree that no tree covers yet (the end of a session usually is there): " +
       "the newest ones, or start/end message positions; add tree for another session's page. Tool calls and results over " +
       "2,000 characters or 40 lines come shortened to their first and last lines; add full: true to read them whole. " +
-      "Results show when the messages were written (per transcript block).",
+      "Results show when the messages were written: each message header its own time, where recorded.",
     inputSchema: {
       type: "object",
       properties: {
@@ -388,7 +435,7 @@ export class CurrentTree implements TreeSource {
         const session = (answer.body as { session_id?: unknown }).session_id;
         if (!other && session !== undefined) this.checkSession(session, this.requireSessionId());
         if (other || session !== undefined) {
-          return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body));
+          return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes);
         }
         // Older servers omit identity: search only the session-validated page.
       }
@@ -622,7 +669,9 @@ export async function handleMcpMessage(
   tree: TreeSource,
   finder?: SessionFinderSource,
   /** versionMismatchNote: appended to failed tool calls. */
-  versionNote?: string
+  versionNote?: string,
+  /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
+  notice?: { next(): string | undefined }
 ): Promise<object | undefined> {
   if (!isRpcRequest(input)) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
@@ -652,14 +701,18 @@ export async function handleMcpMessage(
     case "tools/call": {
       const name = message.params?.name;
       const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
+      const withNotice = (text: string) => {
+        const note = notice?.next();
+        return note ? `${text}\n\n${note}` : text;
+      };
       try {
         const text = await callTool(String(name), args, tree, finder);
-        return reply({ content: [{ type: "text", text }] });
+        return reply({ content: [{ type: "text", text: withNotice(text) }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
         const message = err instanceof Error ? err.message : String(err);
         const text = versionNote ? `${message}\n${versionNote}` : message;
-        return reply({ content: [{ type: "text", text }], isError: true });
+        return reply({ content: [{ type: "text", text: withNotice(text) }], isError: true });
       }
     }
     default:
@@ -785,6 +838,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
   const tree = new CurrentTree(deps);
   const finder = new SessionFinder(deps);
   const versionNote = versionMismatchNote(env[PROXY_VERSION_ENV]);
+  const notice = new StaleToolsNotice();
   if (versionNote) process.stderr.write(`memtree MCP: ${versionNote}\n`);
   let buffer = "";
   // Replies go out in arrival order even though tool calls are async.
@@ -806,7 +860,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
         continue;
       }
       queue = queue.then(async () => {
-        const response = await handleMcpMessage(message, tree, finder, versionNote).catch((err) => ({
+        const response = await handleMcpMessage(message, tree, finder, versionNote, notice).catch((err) => ({
           jsonrpc: "2.0",
           id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },
