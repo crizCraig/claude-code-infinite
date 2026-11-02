@@ -492,13 +492,8 @@ export class CurrentTree implements TreeSource {
    * readable meanwhile, so it stays cached; only its times are retried.
    */
   private timesDue(index: MemtreeIndex): boolean {
-    if (index.page.line_times_incomplete !== true) return false;
     const at = this.timesRetryAt.get(index);
-    if (at === undefined) {
-      this.timesRetryAt.set(index, this.now() + PREFIX_RETRY_INTERVAL_MS);
-      return false;
-    }
-    return this.now() >= at;
+    return at !== undefined && this.now() >= at;
   }
 
   /** `load()`, or the readable `stale` copy when that fails (its times retried later). */
@@ -605,6 +600,8 @@ export class CurrentTree implements TreeSource {
       throw new ToolInputError("MemTree unavailable: page belongs to a different or unknown session");
     }
     const index = new MemtreeIndex(json);
+    // Readable now; its incomplete per-message times are refetched after the cooldown.
+    if (json.line_times_incomplete === true) this.timesRetryAt.set(index, this.now() + PREFIX_RETRY_INTERVAL_MS);
     if (isTemporaryPrefix(index, id)) {
       this.prefixRetryAt.set(id, this.now() + PREFIX_RETRY_INTERVAL_MS);
       this.prefixes.delete(id);

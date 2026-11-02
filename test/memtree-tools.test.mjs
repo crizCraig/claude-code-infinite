@@ -493,6 +493,9 @@ test("CurrentTree refetches a page whose per-message times are incomplete", asyn
   assert.equal(await tree.get(), partial, "readable meanwhile: served from the cache");
   assert.equal(state.pageFetches, 1);
   clock += 45_001;
+  await tree.get();
+  assert.equal(state.pageFetches, 2, "the first read after the cooldown refetches");
+  clock += 45_001;
   state.pages[path] = undefined; // the refetch fails: the readable copy is still served
   assert.equal(await tree.get(), partial);
   state.pages[path] = { ...LINED, session_id: "session-1" };
