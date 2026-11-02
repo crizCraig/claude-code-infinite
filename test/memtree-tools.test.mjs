@@ -489,12 +489,27 @@ test("CurrentTree refetches a page whose per-message times are incomplete", asyn
   let clock = 0;
   const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:9", sessionId: "session-1", now: () => clock,
     fetch: fakeProxyFetch(state) });
-  await tree.get();
+  const partial = await tree.get();
+  assert.equal(await tree.get(), partial, "readable meanwhile: served from the cache");
+  assert.equal(state.pageFetches, 1);
+  clock += 45_001;
+  state.pages[path] = undefined; // the refetch fails: the readable copy is still served
+  assert.equal(await tree.get(), partial);
   state.pages[path] = { ...LINED, session_id: "session-1" };
   clock += 45_001;
   const complete = await tree.get();
+  assert.notEqual(complete, partial);
   assert.equal(await tree.get(), complete, "cached once complete");
-  assert.equal(state.pageFetches, 2);
+  // Another tree with incomplete times, evicted and reopened: refetched, never an error.
+  const other = "ea18af90-658b-485f-ad71-063e0ca5e724-v1-own";
+  state.pages[`/memtree/${other}.json`] = { ...LINED, line_times_incomplete: true };
+  await tree.get(other);
+  for (let i = 0; i < 5; i++) {
+    const id = `ea18af90-658b-485f-ad71-063e0ca5e72${i}-v1-own`;
+    state.pages[`/memtree/${id}.json`] = { ...LINED };
+    await tree.get(id);
+  }
+  assert.ok(await tree.get(other), "an evicted page is simply fetched again");
 });
 
 test("read_lines starting inside a message without a time says so", () => {

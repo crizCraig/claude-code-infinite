@@ -273,6 +273,8 @@ export declare class CurrentTree implements TreeSource {
     private inFlight?;
     /** Other trees, least recently used first. */
     private readonly others;
+    /** Pages whose per-message times were incomplete: when to refetch them (timesDue). */
+    private readonly timesRetryAt;
     /** Set once the server answered 404 to a tree search the page JSON could answer. */
     private serverSearchMissing;
     private readonly fetchImpl;
@@ -290,6 +292,14 @@ export declare class CurrentTree implements TreeSource {
      */
     tail(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
     private loadCurrent;
+    /**
+     * Whether a cached page's per-message times were incomplete (`line_times_incomplete`:
+     * the server's times lookup was slow) and are due a refetch. The page itself is
+     * readable meanwhile, so it stays cached; only its times are retried.
+     */
+    private timesDue;
+    /** `load()`, or the readable `stale` copy when that fails (its times retried later). */
+    private refreshed;
     private requireSessionId;
     /** The proxy's current page for the calling session; fails closed on any other session. */
     currentId(validatePage?: boolean): Promise<string>;

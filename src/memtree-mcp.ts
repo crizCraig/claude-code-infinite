@@ -392,6 +392,8 @@ export class CurrentTree implements TreeSource {
   private inFlight?: Promise<MemtreeIndex>;
   /** Other trees, least recently used first. */
   private readonly others = new Map<string, MemtreeIndex>();
+  /** Pages whose per-message times were incomplete: when to refetch them (timesDue). */
+  private readonly timesRetryAt = new WeakMap<MemtreeIndex, number>();
   /** Set once the server answered 404 to a tree search the page JSON could answer. */
   private serverSearchMissing = false;
   private readonly fetchImpl: typeof fetch;
@@ -477,10 +479,37 @@ export class CurrentTree implements TreeSource {
   private async loadCurrent(): Promise<MemtreeIndex> {
     const id = await this.currentId();
     const sessionId = this.requireSessionId();
-    if (this.cached?.id === id) return this.cached.index;
-    const index = await this.loadPage(id, "this session", sessionId);
+    if (this.cached?.id === id && !this.timesDue(this.cached.index)) return this.cached.index;
+    const stale = this.cached?.id === id ? this.cached.index : undefined;
+    const index = await this.refreshed(stale, () => this.loadPage(id, "this session", sessionId));
     if (!isTemporaryPrefix(index, id)) this.cached = { id, index };
     return index;
+  }
+
+  /**
+   * Whether a cached page's per-message times were incomplete (`line_times_incomplete`:
+   * the server's times lookup was slow) and are due a refetch. The page itself is
+   * readable meanwhile, so it stays cached; only its times are retried.
+   */
+  private timesDue(index: MemtreeIndex): boolean {
+    if (index.page.line_times_incomplete !== true) return false;
+    const at = this.timesRetryAt.get(index);
+    if (at === undefined) {
+      this.timesRetryAt.set(index, this.now() + PREFIX_RETRY_INTERVAL_MS);
+      return false;
+    }
+    return this.now() >= at;
+  }
+
+  /** `load()`, or the readable `stale` copy when that fails (its times retried later). */
+  private async refreshed(stale: MemtreeIndex | undefined, load: () => Promise<MemtreeIndex>): Promise<MemtreeIndex> {
+    if (!stale) return load();
+    try {
+      return await load();
+    } catch {
+      this.timesRetryAt.set(stale, this.now() + PREFIX_RETRY_INTERVAL_MS);
+      return stale;
+    }
   }
 
   private requireSessionId(): string {
@@ -525,12 +554,13 @@ export class CurrentTree implements TreeSource {
 
   private async getOther(id: string): Promise<MemtreeIndex> {
     const hit = this.others.get(id);
-    if (hit) {
+    if (hit && !this.timesDue(hit)) {
       this.others.delete(id);
       this.others.set(id, hit);
       return hit;
     }
-    const index = await this.loadPage(id, `tree ${id}`);
+    const index = await this.refreshed(hit, () => this.loadPage(id, `tree ${id}`));
+    this.others.delete(id);
     if (!isTemporaryPrefix(index, id)) this.others.set(id, index);
     while (this.others.size > OTHER_TREES_CACHED) {
       this.others.delete(this.others.keys().next().value!);
@@ -606,12 +636,10 @@ export class CurrentTree implements TreeSource {
 /**
  * A page that may still change: a served prefix that may later switch to the request's
  * own tree (a pinned ref never does), or any page whose transcript blocks are still
- * uploading (`blocks_pending`: the tree was just built), so a retry can read them, or
- * whose per-message times are incomplete (`line_times_incomplete`).
+ * uploading (`blocks_pending`: the tree was just built), so a retry can read them.
  */
 function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
-  // Also a page whose per-message times could not all be read this time (a slow lookup).
-  if (index.page.blocks_pending === true || index.page.line_times_incomplete === true) return true;
+  if (index.page.blocks_pending === true) return true;
   return index.page.served_prefix === true && index.page.ref !== id;
 }
 
