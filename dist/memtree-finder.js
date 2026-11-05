@@ -76,7 +76,9 @@ function addLimit(params, value, max) {
         throw new ToolInputError("limit must be a number");
     params.set("limit", String(Math.max(1, Math.min(max, Math.floor(n)))));
 }
-export function formatSessions(body, args) {
+export function formatSessions(body, args, 
+/** The calling Claude Code session: its entry is marked "(this session)". */
+currentSessionId) {
     const sessions = body.sessions ?? [];
     if (!sessions.length) {
         return args.cursor
@@ -85,7 +87,8 @@ export function formatSessions(body, args) {
     }
     const out = [`${sessions.length} session${sessions.length === 1 ? "" : "s"}, most recently active first:`];
     sessions.forEach((s, i) => {
-        out.push("", `[${i + 1}] ${oneLine(s.title, TITLE_CHARS) || "(no MemTree yet)"}`);
+        const mine = currentSessionId && s.session_id === currentSessionId ? " (this session)" : "";
+        out.push("", `[${i + 1}]${mine} ${oneLine(s.title, TITLE_CHARS) || "(no MemTree yet)"}`);
         const when = [s.first_at, s.last_at].map(shortTime).filter(Boolean);
         out.push("    " +
             [
@@ -117,7 +120,7 @@ export function formatSearchResults(body, args) {
     if (body.groups) {
         const groups = body.groups.filter((g) => g.hits?.length);
         if (!groups.length)
-            return noHits(query, "vector", args);
+            return noHits(query, "vector", args, body.coverage);
         const out = [
             `Semantic matches for ${JSON.stringify(query)}` +
                 (body.charged ? " (charged: one query embedding per model)" : "") +
@@ -136,7 +139,7 @@ export function formatSearchResults(body, args) {
     }
     const hits = body.hits ?? [];
     if (!hits.length)
-        return noHits(query, "text", args);
+        return noHits(query, "text", args, body.coverage);
     const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
     const missing = new MissingTimeNote();
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
@@ -186,17 +189,66 @@ export function formatPath(path, ref) {
         .map((p) => `${oneLine(p.summary, PATH_SUMMARY_CHARS)}${ref ? ` (${ref}#${p.id})` : ` (node ${p.id})`}`)
         .join(" › ");
 }
-function noHits(query, mode, args) {
+function noHits(query, mode, args, coverage) {
     if (args.cursor)
         return "No more matches.";
     const other = mode === "vector"
         ? 'For an exact word, id or path, try mode "text".'
-        : 'For meaning rather than exact words, try mode "vector".';
+        : 'Text mode needs the exact words; for meaning, try mode "vector".';
     if (typeof args.tree === "string" && args.tree) {
         return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${mode} search). ${other}`;
     }
-    return `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search). ${other} Or widen since/until, or drop the project filter.`;
+    const filtered = ["project", "since", "until"].some((k) => typeof args[k] === "string" && args[k]);
+    return [
+        `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search).`,
+        ...coverageLines(coverage),
+        other + (filtered ? " Or widen since/until, or drop the project filter." : ""),
+        NOT_SEARCHED_NOTE,
+    ].join(" ");
 }
+/** What an empty search covered: sessions searched, the newest index, this session's state. */
+export function coverageLines(coverage) {
+    if (!coverage || typeof coverage.sessions !== "number")
+        return [];
+    const n = coverage.sessions;
+    const newest = shortTime(coverage.newest_indexed_at);
+    const lines = [
+        n === 0
+            ? "None of your sessions has a MemTree yet."
+            : `Searched ${n} session${n === 1 ? "" : "s"}${newest ? ` (newest indexed ${newest})` : ""}.`,
+    ];
+    const own = thisSessionLine(coverage.this_session);
+    if (own)
+        lines.push(own);
+    return lines;
+}
+function thisSessionLine(own) {
+    switch (own?.state) {
+        case "indexed": {
+            const at = shortTime(own.indexed_at);
+            return `This session is indexed${at ? ` up to ${at}` : ""}.`;
+        }
+        case "building":
+            return `This session isn't indexed yet: its first index is ${Math.max(0, Math.min(99, Math.floor(own.percent ?? 0)))}% done.`;
+        case "too_short":
+            return `This session isn't indexed yet: indexing starts at about ${kTokens(own.start_tokens)} tokens and it has about ${kTokens(own.tokens)}.`;
+        case "not_indexed":
+            return "This session isn't indexed yet.";
+        default:
+            return undefined;
+    }
+}
+function kTokens(n) {
+    const value = Math.max(0, Number(n) || 0);
+    return value >= 1000 ? `${Math.round(value / 1000)}k` : String(Math.round(value));
+}
+/**
+ * Why a session may not be found, said on every empty search across sessions: only
+ * ccc sessions are indexed, and a session's newest messages wait for its next index.
+ */
+export const NOT_SEARCHED_NOTE = "Only ccc sessions on this MemTree account are searched (any machine); Codex and plain claude sessions are not. " +
+    "A session's newest turns reach search and list's ending only with its next index (often 10+ minutes later); " +
+    "read_lines {\"tree\": <ref>, \"tail\": true} shows its messages up to its latest user prompt.";
 function nextPage(tool, cursor) {
     return cursor
         ? `More results: call ${tool} again with the same arguments and "cursor": "${cursor}".`

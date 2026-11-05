@@ -851,8 +851,9 @@ test("MCP instructions and search lead with when to use them, before any compres
   assert.match(search.description, /^Find what this conversation doesn't show: /);
   assert.match(search.description.split(". ")[0], /only summarizes.*other sessions/);
   // Constant overhead: instructions + search description, measured 2026-10-18, plus the
-  // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28.
-  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_500,
+  // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28, plus
+  // the cross-session scope (ccc sessions on any machine) and hand-off line, 2026-11-05.
+  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_700,
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
 
@@ -1151,4 +1152,16 @@ test("a stale MemTree server says once that ccc was updated and needs a restart"
     params: { name: "read_node", arguments: { id: 0 } } }, { get: async () => index() }, undefined, undefined, once);
   assert.match((await call(1)).result.content[0].text, /\n\n\(restart\)$/);
   assert.doesNotMatch((await call(2)).result.content[0].text, /restart/);
+});
+
+test("search and list say which sessions they cover; instructions ask hand-offs to name the session", () => {
+  const search = MEMTREE_TOOLS.find((t) => t.name === "search");
+  const list = MEMTREE_TOOLS.find((t) => t.name === "list");
+  for (const text of [search.description, list.description, MEMTREE_MCP_INSTRUCTIONS]) {
+    assert.match(text, /ccc sessions? on any machine/);
+    assert.match(text, /not Codex or plain claude sessions|Codex and plain claude sessions are not included/);
+  }
+  assert.match(search.description, /without tree, all of the user's ccc sessions/);
+  assert.match(list.description, /this one marked/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /hand-off or kickoff prompt .* names this session's id and MemTree link/);
 });

@@ -98,6 +98,21 @@ export interface FinderSearchResponse {
   charged?: boolean;
   /** "any_word": no passage held every word, so these hold some of them. */
   relaxed?: string;
+  /** On an empty first page across sessions (servers from 2026-11): what was searched. */
+  coverage?: FinderSearchCoverage;
+}
+
+/** Counts and times of the caller's own sessions; never content (polychat memtree_search_coverage.py). */
+export interface FinderSearchCoverage {
+  sessions?: number;
+  newest_indexed_at?: string | null;
+  this_session?: {
+    state?: string;
+    indexed_at?: string | null;
+    percent?: number;
+    tokens?: number;
+    start_tokens?: number;
+  };
 }
 
 /** Query string for `/memtree/sessions` from the tool's arguments. */
@@ -151,7 +166,12 @@ function addLimit(params: URLSearchParams, value: unknown, max: number): void {
   params.set("limit", String(Math.max(1, Math.min(max, Math.floor(n)))));
 }
 
-export function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>): string {
+export function formatSessions(
+  body: FinderSessionsResponse,
+  args: Record<string, unknown>,
+  /** The calling Claude Code session: its entry is marked "(this session)". */
+  currentSessionId?: string
+): string {
   const sessions = body.sessions ?? [];
   if (!sessions.length) {
     return args.cursor
@@ -160,7 +180,8 @@ export function formatSessions(body: FinderSessionsResponse, args: Record<string
   }
   const out = [`${sessions.length} session${sessions.length === 1 ? "" : "s"}, most recently active first:`];
   sessions.forEach((s, i) => {
-    out.push("", `[${i + 1}] ${oneLine(s.title, TITLE_CHARS) || "(no MemTree yet)"}`);
+    const mine = currentSessionId && s.session_id === currentSessionId ? " (this session)" : "";
+    out.push("", `[${i + 1}]${mine} ${oneLine(s.title, TITLE_CHARS) || "(no MemTree yet)"}`);
     const when = [s.first_at, s.last_at].map(shortTime).filter(Boolean);
     out.push(
       "    " +
@@ -194,7 +215,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
   const query = typeof body.query === "string" ? body.query : String(args.query ?? "");
   if (body.groups) {
     const groups = body.groups.filter((g) => g.hits?.length);
-    if (!groups.length) return noHits(query, "vector", args);
+    if (!groups.length) return noHits(query, "vector", args, body.coverage);
     const out = [
       `Semantic matches for ${JSON.stringify(query)}` +
         (body.charged ? " (charged: one query embedding per model)" : "") +
@@ -212,7 +233,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
     return out.join("\n");
   }
   const hits = body.hits ?? [];
-  if (!hits.length) return noHits(query, "text", args);
+  if (!hits.length) return noHits(query, "text", args, body.coverage);
   const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
   const missing = new MissingTimeNote();
   hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
@@ -265,17 +286,74 @@ export function formatPath(path: { id: number; summary: string }[], ref?: string
     .join(" › ");
 }
 
-function noHits(query: string, mode: string, args: Record<string, unknown>): string {
+function noHits(
+  query: string,
+  mode: string,
+  args: Record<string, unknown>,
+  coverage?: FinderSearchCoverage
+): string {
   if (args.cursor) return "No more matches.";
   const other =
     mode === "vector"
       ? 'For an exact word, id or path, try mode "text".'
-      : 'For meaning rather than exact words, try mode "vector".';
+      : 'Text mode needs the exact words; for meaning, try mode "vector".';
   if (typeof args.tree === "string" && args.tree) {
     return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${mode} search). ${other}`;
   }
-  return `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search). ${other} Or widen since/until, or drop the project filter.`;
+  const filtered = ["project", "since", "until"].some((k) => typeof args[k] === "string" && args[k]);
+  return [
+    `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search).`,
+    ...coverageLines(coverage),
+    other + (filtered ? " Or widen since/until, or drop the project filter." : ""),
+    NOT_SEARCHED_NOTE,
+  ].join(" ");
 }
+
+/** What an empty search covered: sessions searched, the newest index, this session's state. */
+export function coverageLines(coverage: FinderSearchCoverage | undefined): string[] {
+  if (!coverage || typeof coverage.sessions !== "number") return [];
+  const n = coverage.sessions;
+  const newest = shortTime(coverage.newest_indexed_at);
+  const lines = [
+    n === 0
+      ? "None of your sessions has a MemTree yet."
+      : `Searched ${n} session${n === 1 ? "" : "s"}${newest ? ` (newest indexed ${newest})` : ""}.`,
+  ];
+  const own = thisSessionLine(coverage.this_session);
+  if (own) lines.push(own);
+  return lines;
+}
+
+function thisSessionLine(own: FinderSearchCoverage["this_session"]): string | undefined {
+  switch (own?.state) {
+    case "indexed": {
+      const at = shortTime(own.indexed_at);
+      return `This session is indexed${at ? ` up to ${at}` : ""}.`;
+    }
+    case "building":
+      return `This session isn't indexed yet: its first index is ${Math.max(0, Math.min(99, Math.floor(own.percent ?? 0)))}% done.`;
+    case "too_short":
+      return `This session isn't indexed yet: indexing starts at about ${kTokens(own.start_tokens)} tokens and it has about ${kTokens(own.tokens)}.`;
+    case "not_indexed":
+      return "This session isn't indexed yet.";
+    default:
+      return undefined;
+  }
+}
+
+function kTokens(n: number | undefined): string {
+  const value = Math.max(0, Number(n) || 0);
+  return value >= 1000 ? `${Math.round(value / 1000)}k` : String(Math.round(value));
+}
+
+/**
+ * Why a session may not be found, said on every empty search across sessions: only
+ * ccc sessions are indexed, and a session's newest messages wait for its next index.
+ */
+export const NOT_SEARCHED_NOTE =
+  "Only ccc sessions on this MemTree account are searched (any machine); Codex and plain claude sessions are not. " +
+  "A session's newest turns reach search and list's ending only with its next index (often 10+ minutes later); " +
+  "read_lines {\"tree\": <ref>, \"tail\": true} shows its messages up to its latest user prompt.";
 
 function nextPage(tool: string, cursor: string | null | undefined): string {
   return cursor

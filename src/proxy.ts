@@ -1337,7 +1337,9 @@ async function handleMemTreePassthrough(
   try {
     const upstream = await opts.memtree.fetchMemTree(
       `/usage/memtree/${target}${url.search}`,
-      req.headers.accept ?? "application/json"
+      req.headers.accept ?? "application/json",
+      undefined,
+      memtreeToolHeaders(req)
     );
     res.writeHead(upstream.status, { "content-type": upstream.contentType });
     res.end(upstream.body);
@@ -1365,6 +1367,24 @@ const MEMTREE_FINDER_RELAY = new Map<string, string>([
   [`${MEMTREE_PASSTHROUGH_PREFIX}search`, "/v1/memtree/search"],
 ]);
 const SESSION_ID_HEADER_VALUE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** `x-memtree-tool` as the memtree MCP server sends it: a tool name. */
+const MEMTREE_TOOL_HEADER_VALUE = /^[a-z_]{1,20}$/;
+
+/**
+ * What a MemTree tool's read carries on to the server: the tool (`x-memtree-tool`)
+ * and the calling Claude Code session, when well formed. The server logs one
+ * content-free line per tool call with them (polychat memtree_tool_log.py).
+ */
+export function memtreeToolHeaders(req: http.IncomingMessage): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const tool = firstNonEmptyHeader(req, "x-memtree-tool");
+  if (tool && MEMTREE_TOOL_HEADER_VALUE.test(tool)) headers["x-memtree-tool"] = tool;
+  const sessionId = firstNonEmptyHeader(req, "x-claude-code-session-id");
+  if (sessionId && SESSION_ID_HEADER_VALUE.test(sessionId)) {
+    headers["x-claude-code-session-id"] = sessionId;
+  }
+  return headers;
+}
 
 async function handleMemTreeFinder(
   req: http.IncomingMessage,
@@ -1373,13 +1393,9 @@ async function handleMemTreeFinder(
   upstreamPath: string,
   url: URL
 ): Promise<void> {
-  const headers: Record<string, string> = {};
+  const headers = memtreeToolHeaders(req);
   const meta = memtreeClientMeta({ project: opts.projectMeta });
   if (Object.keys(meta).length) headers["x-client-meta"] = JSON.stringify(meta);
-  const sessionId = firstNonEmptyHeader(req, "x-claude-code-session-id");
-  if (sessionId && SESSION_ID_HEADER_VALUE.test(sessionId)) {
-    headers["x-claude-code-session-id"] = sessionId;
-  }
   try {
     const upstream = await opts.memtree.fetchMemTree(
       `${upstreamPath}${url.search}`,
@@ -1437,7 +1453,9 @@ async function handleMemTreeCurrent(
   try {
     const upstream = await opts.memtree.fetchMemTree(
       `/usage/memtree/${id}.json`,
-      req.headers.accept ?? "application/json"
+      req.headers.accept ?? "application/json",
+      undefined,
+      memtreeToolHeaders(req)
     );
     res.writeHead(upstream.status, {
       "content-type": upstream.contentType,

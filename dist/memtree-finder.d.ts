@@ -95,19 +95,42 @@ export interface FinderSearchResponse {
     charged?: boolean;
     /** "any_word": no passage held every word, so these hold some of them. */
     relaxed?: string;
+    /** On an empty first page across sessions (servers from 2026-11): what was searched. */
+    coverage?: FinderSearchCoverage;
+}
+/** Counts and times of the caller's own sessions; never content (polychat memtree_search_coverage.py). */
+export interface FinderSearchCoverage {
+    sessions?: number;
+    newest_indexed_at?: string | null;
+    this_session?: {
+        state?: string;
+        indexed_at?: string | null;
+        percent?: number;
+        tokens?: number;
+        start_tokens?: number;
+    };
 }
 /** Query string for `/memtree/sessions` from the tool's arguments. */
 export declare function sessionsQuery(args: Record<string, unknown>): string;
 /** Query string for `/memtree/search`; `mode` defaults to text; `tree` scopes it to one tree. */
 export declare function searchQuery(args: Record<string, unknown>, tree?: string): string;
 export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
-export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>): string;
+export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
+/** The calling Claude Code session: its entry is marked "(this session)". */
+currentSessionId?: string): string;
 export declare function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string;
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
 export declare function formatPath(path: {
     id: number;
     summary: string;
 }[], ref?: string): string;
+/** What an empty search covered: sessions searched, the newest index, this session's state. */
+export declare function coverageLines(coverage: FinderSearchCoverage | undefined): string[];
+/**
+ * Why a session may not be found, said on every empty search across sessions: only
+ * ccc sessions are indexed, and a session's newest messages wait for its next index.
+ */
+export declare const NOT_SEARCHED_NOTE: string;
 /** "how it ended" lines of a session: last user message, then the tools and last reply after it. */
 export declare function endingLines(ending: FinderSessionEnding | null | undefined): string[];
 //# sourceMappingURL=memtree-finder.d.ts.map

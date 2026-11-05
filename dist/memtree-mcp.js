@@ -140,8 +140,8 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
     "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
     "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
-    "sessions, and list shows those " +
-    "sessions by time and project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
+    "ccc sessions on any machine (not Codex or plain claude sessions), and list shows those sessions by time and " +
+    "project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
     "meaning: its first page is charged even when the query embedding is cached; cursor continuation is free, " +
     "including when the embedding must be regenerated. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
     "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
@@ -149,7 +149,9 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
     "yet. A text search of one tree also matches them (listed after the tree's hits), list shows how each session " +
     "ended, and read_lines {\"tail\": true} reads them (with tree for another session's page; large tool calls are " +
-    "shortened, \"full\": true reads them whole).";
+    "shortened, \"full\": true reads them whole).\n\n" +
+    "A hand-off or kickoff prompt you write for another agent or machine names this session's id and MemTree link " +
+    "(list marks this session), so that agent can read this work with list, search and read_node.";
 const TREE_DESC = "A tree reference from list or search (keep its style and own/served suffix; legacy request ids work), or \"current\" for this session's tree.";
 /**
  * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
@@ -171,7 +173,8 @@ export const MEMTREE_TOOLS = [
         name: "search",
         description: "Find what this conversation doesn't show: exact details from earlier in this session that the memory only " +
             "summarizes, or earlier work from the user's other sessions. Search one tree (tree, \"current\" for this session) " +
-            "or, without tree, all of the user's sessions. Use it before re-deriving or guessing something from earlier work. " +
+            "or, without tree, all of the user's ccc sessions on any machine (not Codex or plain claude sessions). " +
+            "Use it before re-deriving or guessing something from earlier work. " +
             "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
             "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
             "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
@@ -233,7 +236,8 @@ export const MEMTREE_TOOLS = [
     },
     {
         name: "list",
-        description: "List the user's own MemTree sessions (this one and others), most recently active first: title (the tree's root summary), " +
+        description: "List the user's own MemTree sessions, most recently active first: every ccc session on any machine using this " +
+            "account (this one marked; Codex and plain claude sessions are not included). Each: title (the tree's root summary), " +
             "first message, how it ended (last user message, the tools after it and the last reply, with the time), times, " +
             "project (directory, git repo, branch, commit), models, request count and the latest tree's reference. " +
             "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <ref>, \"id\": 0} or search {\"tree\": <ref>, ...}.",
@@ -285,6 +289,19 @@ async function proxyGetJson(fetchImpl, url, headers = {}) {
     catch {
         return { ok: false, status: response.status, error: "response was not JSON" };
     }
+}
+/**
+ * Sent with each tool's proxy reads: which tool (`page` is a whole tree's `.json`) and
+ * the calling session, which the proxy passes on so the server's one content-free log
+ * line per call can say which tool read what (polychat memtree_tool_log.py). Not to be
+ * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
+ */
+export const MEMTREE_TOOL_HEADER = "x-memtree-tool";
+export function toolHeaders(tool, deps) {
+    const headers = { [MEMTREE_TOOL_HEADER]: tool };
+    if (deps.sessionId)
+        headers["x-claude-code-session-id"] = deps.sessionId;
+    return headers;
 }
 function proxyBase(deps) {
     const base = deps.proxyUrl?.replace(/\/$/, "");
@@ -357,7 +374,7 @@ export class CurrentTree {
             if (limit !== undefined && Number.isFinite(limit))
                 params.set("limit", String(limit));
             const base = proxyBase(this.deps);
-            const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/search?${params}`);
+            const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/search?${params}`, toolHeaders("search", this.deps));
             const parsed = answer.ok ? serverSearchHits(answer.body) : undefined;
             if (parsed) {
                 const session = answer.body.session_id;
@@ -394,7 +411,7 @@ export class CurrentTree {
             params.set("full", "true");
         const query = params.toString() ? `?${params}` : "";
         const base = proxyBase(this.deps);
-        const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/messages${query}`);
+        const answer = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/messages${query}`, toolHeaders("read_lines", this.deps));
         if (answer.status === 404) {
             return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails).";
         }
@@ -518,7 +535,7 @@ export class CurrentTree {
         if (retryAt !== undefined)
             this.prefixRetryAt.set(id, now + PREFIX_RETRY_INTERVAL_MS);
         const base = proxyBase(this.deps);
-        const page = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}.json`);
+        const page = await proxyGetJson(this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}.json`, toolHeaders("page", this.deps));
         if (!page.ok)
             throw new ToolInputError(`MemTree unavailable (page ${id}: ${page.error})`);
         const json = page.body;
@@ -577,7 +594,7 @@ export class SessionFinder {
     }
     async listSessions(args) {
         const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list");
-        return formatSessions(body, args);
+        return formatSessions(body, args, this.deps.sessionId);
     }
     async searchSessions(args, tree) {
         const body = await this.get(`/memtree/search${searchQuery(args, tree)}`, "search");
@@ -587,10 +604,7 @@ export class SessionFinder {
         return formatSearchResults(body, { ...args, tree });
     }
     async get(pathAndQuery, tool) {
-        const headers = {};
-        if (this.deps.sessionId)
-            headers["x-claude-code-session-id"] = this.deps.sessionId;
-        const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, headers);
+        const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, toolHeaders(tool, this.deps));
         if (answer.ok)
             return answer.body;
         if (answer.status === 404) {

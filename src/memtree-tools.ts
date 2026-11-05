@@ -403,10 +403,13 @@ export function formatSearchHits(
     return [`No node of the tree matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}).`,
       ...formatTailHits(tailHits, tree)].join("\n");
   }
-  if (!hits.length) {
-    return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}). Try other words, fewer terms, or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
-  }
   const span = formatTimeSpan(treeTimes);
+  if (!hits.length) {
+    return `No node or transcript line matches ${JSON.stringify(query)} (terms: ${terms.join(", ")})` +
+      (span ? `; the tree's messages span ${span}` : "") +
+      `. Text search needs the words themselves: try other words, fewer terms, mode "vector" for meaning, ` +
+      `or read_node {${treeArg(tree)}"id": 0} to browse from the root.`;
+  }
   const out = [
     `${hits.length} best match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)} (terms: ${terms.join(", ")})` +
       (span ? `; the tree's messages span ${span}` : "") +

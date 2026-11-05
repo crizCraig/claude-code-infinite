@@ -249,6 +249,14 @@ export interface MemtreeMcpDeps {
     fetch?: typeof fetch;
     now?: () => number;
 }
+/**
+ * Sent with each tool's proxy reads: which tool (`page` is a whole tree's `.json`) and
+ * the calling session, which the proxy passes on so the server's one content-free log
+ * line per call can say which tool read what (polychat memtree_tool_log.py). Not to be
+ * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
+ */
+export declare const MEMTREE_TOOL_HEADER = "x-memtree-tool";
+export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string>;
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
