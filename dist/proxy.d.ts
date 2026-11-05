@@ -45,6 +45,7 @@ import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
 import { PreparedCompressions } from "./prepared-compression.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
+import http from "node:http";
 import { MemtreeClient, type CompressResult } from "./memtree.js";
 import { type Message } from "./turns.js";
 import { NoticeDeliveryQueue, type FirstTreeIntro } from "./hooks.js";
@@ -592,6 +593,12 @@ interface ToolRecoveryAttempt {
     };
 }
 export declare function startProxy(opts: ProxyOptions): Promise<RunningProxy>;
+/**
+ * What a MemTree tool's read carries on to the server: the tool (`x-memtree-tool`)
+ * and the calling Claude Code session, when well formed. The server logs one
+ * content-free line per tool call with them (polychat memtree_tool_log.py).
+ */
+export declare function memtreeToolHeaders(req: http.IncomingMessage): Record<string, string>;
 /** The page id in a server-stamped link (`…/m/<id>` or `…/usage/memtree/<id>`). */
 export declare function memtreePageId(pageUrl: string): string | undefined;
 /**

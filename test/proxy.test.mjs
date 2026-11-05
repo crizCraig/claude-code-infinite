@@ -4373,7 +4373,8 @@ test("list and search through the proxy against a mock MemTree server", async ()
   });
   const memtreeSrv = await listen((req, res) => {
     const url = new URL(req.url, "http://x");
-    requests.push({ path: url.pathname, params: Object.fromEntries(url.searchParams), session: req.headers["x-claude-code-session-id"] });
+    requests.push({ path: url.pathname, params: Object.fromEntries(url.searchParams), session: req.headers["x-claude-code-session-id"],
+      tool: req.headers["x-memtree-tool"] });
     const send = (status, body) => {
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
@@ -4403,7 +4404,8 @@ test("list and search through the proxy against a mock MemTree server", async ()
   const finder = new SessionFinder({ proxyUrl: `http://127.0.0.1:${proxy.port}`, sessionId: "sess-9" });
   try {
     const listed = await finder.listSessions({ project: "polychat", since: "2026-09-01" });
-    assert.deepEqual(requests.at(-1), { path: "/v1/memtree/sessions", params: { since: "2026-09-01", project: "polychat" }, session: "sess-9" });
+    assert.deepEqual(requests.at(-1), { path: "/v1/memtree/sessions", params: { since: "2026-09-01", project: "polychat" }, session: "sess-9",
+      tool: "list" });
     assert.match(listed, /^1 session, most recently active first:/);
     assert.match(listed, /\[1\] Usage dashboard overhaul/);
     assert.match(listed, /session 6025e1f7-074b-4abb-a8e7-dbf07ef1e81f · 2026-09-28 17:02 UTC → 2026-09-29 01:40 UTC · 212 requests/);
@@ -4422,6 +4424,7 @@ test("list and search through the proxy against a mock MemTree server", async ()
 
     const exact = await finder.searchSessions({ query: "deploy", mode: "text", project: "polychat" });
     assert.deepEqual(requests.at(-1).params, { q: "deploy", mode: "text", project: "polychat" });
+    assert.equal(requests.at(-1).tool, "search", "the server logs which tool asked");
     assert.match(exact, /1 text match for "deploy":/);
     assert.match(exact, /the \*\*Deploy\*\* target/);
     assert.match(exact, /page: https:\/\/api\.polychat\.co\/m\/3f2a9c1b7e40/);
@@ -11532,6 +11535,33 @@ test("while the tree builds, an uncounted over-bound original waits for the inde
     proxy.close();
     upstream.close();
     memtreeSrv.server.closeAllConnections();
+    memtreeSrv.close();
+  }
+});
+
+test("MemTree tool reads carry the tool and session on to the server; malformed values are dropped", async () => {
+  const upstream = await mockUpstream();
+  const seen = [];
+  const memtreeSrv = await listen((req, res) => {
+    seen.push({ url: req.url, tool: req.headers["x-memtree-tool"], session: req.headers["x-claude-code-session-id"] });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  const get = (path, headers = {}) => fetch(`http://127.0.0.1:${proxy.port}${path}`, { headers });
+  try {
+    await get("/memtree/ea18af90658b.json", { "x-memtree-tool": "page", "x-claude-code-session-id": "sess-9" });
+    assert.deepEqual(seen.at(-1), { url: "/usage/memtree/ea18af90658b.json", tool: "page", session: "sess-9" });
+    await get("/memtree/ea18af90658b/messages", { "x-memtree-tool": "read_lines" });
+    assert.deepEqual(seen.at(-1), { url: "/usage/memtree/ea18af90658b/messages", tool: "read_lines", session: undefined });
+    await get("/memtree/ea18af90658b/search?q=x", { "x-memtree-tool": "my query words", "x-claude-code-session-id": "../x" });
+    assert.deepEqual(seen.at(-1), { url: "/usage/memtree/ea18af90658b/search?q=x", tool: undefined, session: undefined });
+    await get("/memtree/ea18af90658b.json");
+    assert.equal(seen.at(-1).tool, undefined, "a read no tool asked for is not labelled");
+  } finally {
+    proxy.close();
+    upstream.close();
     memtreeSrv.close();
   }
 });
