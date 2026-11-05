@@ -357,7 +357,8 @@ async function proxyGetJson(
 /**
  * Sent with each tool's proxy reads: which tool (`page` is a whole tree's `.json`) and
  * the calling session, which the proxy passes on so the server's one content-free log
- * line per call can say which tool read what (polychat memtree_tool_log.py).
+ * line per call can say which tool read what (polychat memtree_tool_log.py). Not to be
+ * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
  */
 export const MEMTREE_TOOL_HEADER = "x-memtree-tool";
 export function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string> {
