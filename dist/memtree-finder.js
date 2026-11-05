@@ -247,8 +247,8 @@ function kTokens(n) {
  * ccc sessions are indexed, and a session's newest messages wait for its next index.
  */
 export const NOT_SEARCHED_NOTE = "Only ccc sessions on this MemTree account are searched (any machine); Codex and plain claude sessions are not. " +
-    "A session's newest messages are not indexed yet: list shows how each session ended, and " +
-    "read_lines {\"tree\": <ref>, \"tail\": true} reads its newest messages.";
+    "A session's newest turns reach search and list only with its next index (often 10+ minutes later); " +
+    "read_lines {\"tree\": <ref>, \"tail\": true} shows its messages up to its latest user prompt.";
 function nextPage(tool, cursor) {
     return cursor
         ? `More results: call ${tool} again with the same arguments and "cursor": "${cursor}".`

@@ -115,6 +115,36 @@ otherwise unchanged.
 The tools can read every session your MemTree key owns. If your platform runs agents for
 different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.
 
+### Two agents, or two machines
+
+**Is MemTree a way for agents to message each other?** No. It is shared memory: every agent
+on your account can read what the others did, but nothing is pushed to them. To hand work over,
+tell the other agent where to look.
+
+**Which sessions can an agent find?** Every ccc session on any machine signed in to the same
+MemTree account (the same key). Codex sessions and plain `claude` sessions never go through
+MemTree, so they can't be found: a plan written by a Codex agent has to be passed as a file or
+pasted.
+
+**How fresh is it?** A new session is indexed after about 10k tokens of work (or after 10
+minutes idle or when it exits), and later turns reach `search` and `list`'s "ended" line only
+with the session's next index, often 10 or more minutes behind. `read_lines {"tree": <ref>,
+"tail": true}` is the freshest view: it shows the session's messages up to its latest user
+prompt within seconds, but the agent's tool calls and reply for that turn only after the next
+prompt is sent. An empty search says how many sessions it searched, when the newest was
+indexed, and whether the calling session is indexed yet.
+
+**How does one agent pick up another's reasoning?**
+1. In the hand-off or kickoff prompt, name the source session id and its MemTree link. The
+   agents are told to do this when they write such a prompt; `list` marks the calling session,
+   so an agent can find its own id and link.
+2. The receiving agent runs `mcp__memtree__list` (filter with `q`, `project` or `since`) to find
+   the session and its latest tree reference.
+3. Then `mcp__memtree__search` without `tree` for the topic (or with `"tree": <ref>` to stay in
+   that session), and `mcp__memtree__read_node {"node": <address>}` on a hit, then `read_lines`
+   for the exact lines.
+4. For what the other agent is doing right now, `read_lines {"tree": <ref>, "tail": true}`.
+
 ## 4. Seeing an agent's memory
 
 Every session's memory is a tree you can open in the browser, search, share, or paste into any
