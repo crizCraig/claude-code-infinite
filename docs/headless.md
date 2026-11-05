@@ -122,12 +122,12 @@ on your account can read what the others did, but nothing is pushed to them. To 
 tell the other agent where to look.
 
 **Which sessions can an agent find?** Every ccc session on any machine signed in to the same
-MemTree account (the same key). Codex sessions and plain `claude` sessions never go through
+MemTree account (any of its API keys), once it has been indexed. Codex sessions and plain `claude` sessions never go through
 MemTree, so they can't be found: a plan written by a Codex agent has to be passed as a file or
 pasted.
 
 **How fresh is it?** A new session is indexed after about 10k tokens of work (or after 10
-minutes idle or when it exits), and later turns reach `search` and `list`'s "ended" line only
+minutes idle or when it exits, at most once per 30 minutes), and later turns reach `search` and `list`'s "ended" line only
 with the session's next index, often 10 or more minutes behind. `read_lines {"tree": <ref>,
 "tail": true}` is the freshest view: it shows the session's messages up to its latest user
 prompt within seconds, but the agent's tool calls and reply for that turn only after the next

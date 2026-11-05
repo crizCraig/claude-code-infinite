@@ -99,7 +99,7 @@ your indexed sessions, so you can just ask:
 | `read_node` | Opens a node: its summary, its path from the root, and its children. |
 | `read_lines` | Reads the exact original transcript lines under a leaf. |
 
-Every `ccc` session on any machine using the same MemTree account is searchable; Codex and plain
+Every indexed `ccc` session on any machine using the same MemTree account is searchable; Codex and plain
 `claude` sessions are not. MemTree is shared memory, not messaging: to hand work to another agent
 or machine, name the source session id in the prompt (see
 [Two agents, or two machines](docs/headless.md#two-agents-or-two-machines)).

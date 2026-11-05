@@ -352,7 +352,7 @@ function kTokens(n: number | undefined): string {
  */
 export const NOT_SEARCHED_NOTE =
   "Only ccc sessions on this MemTree account are searched (any machine); Codex and plain claude sessions are not. " +
-  "A session's newest turns reach search and list only with its next index (often 10+ minutes later); " +
+  "A session's newest turns reach search and list's ending only with its next index (often 10+ minutes later); " +
   "read_lines {\"tree\": <ref>, \"tail\": true} shows its messages up to its latest user prompt.";
 
 function nextPage(tool: string, cursor: string | null | undefined): string {
