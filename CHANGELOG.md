@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.34](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.33...v1.0.34) (2026-11-06)
+
+
+### Features
+
+* MemTree tools say which sessions they cover and why a search came back empty ([#61](https://github.com/crizCraig/claude-code-infinite/issues/61)) ([42b4dc0](https://github.com/crizCraig/claude-code-infinite/commit/42b4dc02619e8ca7b0e15effefa54ccd1db2006b))
+* MemTree tools show when each message was written ([#59](https://github.com/crizCraig/claude-code-infinite/issues/59)) ([158daa2](https://github.com/crizCraig/claude-code-infinite/commit/158daa262feb5755a3edb4cf4de50025163f7adf))
+* point headless agents at other sessions' MemTree work ([#62](https://github.com/crizCraig/claude-code-infinite/issues/62)) ([1f6e33f](https://github.com/crizCraig/claude-code-infinite/commit/1f6e33fbb228fd423e00b6c20f2287594aea96ce))
+
 ## [1.0.33](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.32...v1.0.33) (2026-10-31)
 
 
