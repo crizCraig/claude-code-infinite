@@ -92,6 +92,18 @@ test("a search across all sessions refused as too broad (422) is retried over 3 
     /search failed: HTTP 422 The search matched too much.*also tried the last 3 and 1 days/);
   assert.equal(urls.length, 3);
 
+  // A narrowed retry that fails otherwise: the refusal says the windows were tried.
+  urls.length = 0;
+  answers = [tooBroad, () => Response.json({ detail: "boom" }, { status: 500 }),
+    () => Response.json({ detail: "boom" }, { status: 500 })];
+  await assert.rejects(finder.searchSessions({ query: "x" }), /HTTP 422 .*also tried the last 3 and 1 days/);
+
+  // A vector search is never narrowed (its embedding is paid again on each try).
+  urls.length = 0;
+  answers = [tooBroad];
+  await assert.rejects(finder.searchSessions({ query: "x", mode: "vector" }), /HTTP 422/);
+  assert.equal(urls.length, 1);
+
   // Another failure is not narrowed.
   urls.length = 0;
   answers = [() => Response.json({ detail: "boom" }, { status: 500 })];
@@ -602,6 +614,18 @@ test("SessionFinder.sessionTree finds the exact session past sessions that quote
   const treeless = new SessionFinder({ proxyUrl: "http://localhost:9",
     fetch: async () => Response.json({ sessions: [{ session_id: SID, latest_tree: null }] }) });
   assert.equal(await treeless.sessionTree(SID), undefined);
+  // Answers (hits and misses) are reused for a minute: a legacy id read node by node
+  // asks once.
+  let now = 0;
+  let asked = 0;
+  const cached = new SessionFinder({ proxyUrl: "http://localhost:9", now: () => now,
+    fetch: async () => { asked++; return Response.json({ sessions: [] }); } });
+  assert.equal(await cached.sessionTree(SID), undefined);
+  assert.equal(await cached.sessionTree(SID), undefined);
+  assert.equal(asked, 1);
+  now = 61_000;
+  await cached.sessionTree(SID);
+  assert.equal(asked, 2);
 });
 
 test("a session id passed as tree reads that session's newest tree, and says so", async () => {

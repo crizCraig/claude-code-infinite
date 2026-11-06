@@ -55,7 +55,11 @@ export const SUBAGENT_RESULT_HINT = "ccc: This result is only the subagent's fin
 export const AGENT_TOOL_NAMES = ["Agent", "Task"];
 /**
  * Whether a PostToolUse input is a finished foreground subagent call: an Agent/Task
- * call not sent to the background (whose result is only a launch receipt).
+ * call that was not launched in the background, whose result is only a launch receipt.
+ * Claude Code (2.1.319) also backgrounds agents without `run_in_background` (forced
+ * async, `background: true` definitions, forks, remote isolation) and then answers
+ * `tool_response.status` "async_launched" or "remote_launched"; a status, when there is
+ * one, must be "completed".
  */
 export function isFinishedSubagentCall(input) {
     const raw = input;
@@ -64,7 +68,10 @@ export function isFinishedSubagentCall(input) {
     if (!AGENT_TOOL_NAMES.includes(raw.tool_name))
         return false;
     const toolInput = raw.tool_input;
-    return toolInput?.run_in_background !== true;
+    if (toolInput?.run_in_background === true)
+        return false;
+    const status = raw.tool_response?.status;
+    return status === undefined || status === "completed";
 }
 /** The PostToolUse hook's answer carrying `context` to the model. */
 export function postToolUseOutput(context) {

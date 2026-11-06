@@ -258,6 +258,9 @@ export const MEMTREE_TOOLS = [
 const TREE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /** Pages of `list` results a session-id-as-tree lookup reads at most. */
 const SESSION_TREE_MAX_PAGES = 3;
+/** How long a session-id-as-tree answer is reused (its newest tree can change). */
+const SESSION_TREE_TTL_MS = 60_000;
+const SESSION_TREES_CACHED = 64;
 /** Other sessions' pages kept in memory at once (each can be several MB). */
 const OTHER_TREES_CACHED = 4;
 /** GET JSON from the loopback proxy; never throws. */
@@ -598,7 +601,20 @@ export class SessionFinder {
         const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list");
         return formatSessions(body, args, this.deps.sessionId);
     }
+    sessionTrees = new Map();
+    /** sessionTree, remembered for SESSION_TREE_TTL_MS (hits and misses: legacy ids repeat). */
     async sessionTree(sessionId) {
+        const known = this.sessionTrees.get(sessionId);
+        if (known && this.now() - known.at < SESSION_TREE_TTL_MS)
+            return known.ref;
+        const ref = await this.lookupSessionTree(sessionId);
+        this.sessionTrees.set(sessionId, { ref, at: this.now() });
+        while (this.sessionTrees.size > SESSION_TREES_CACHED) {
+            this.sessionTrees.delete(this.sessionTrees.keys().next().value);
+        }
+        return ref;
+    }
+    async lookupSessionTree(sessionId) {
         // `q` also matches titles and first messages, so sessions quoting the id (a hand-off)
         // can fill the first page: follow the cursor, a few pages at most.
         let cursor;
@@ -634,7 +650,7 @@ export class SessionFinder {
             answer = await this.fetch(`/memtree/search${searchQuery(recent, tree)}`, "search");
         }
         // No window answered: the first refusal says how to narrow the search.
-        const body = this.bodyOf(answer.ok ? answer : narrowed && answer.status === 422
+        const body = this.bodyOf(answer.ok ? answer : narrowed
             ? { ...first, error: `${first.error}${recentSearchFailedNote()}` } : first, "search");
         if (tree && (!body || typeof body !== "object" || body.tree !== tree)) {
             throw new ToolInputError("search: server did not confirm the requested tree; update the MemTree server before scoped search");

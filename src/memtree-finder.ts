@@ -167,17 +167,19 @@ export function recentSearchArgs(
 ): Record<string, unknown> | undefined {
   if (status !== 422 || tree) return undefined;
   if (isSet(args.since) || isSet(args.until) || isSet(args.cursor)) return undefined;
+  // A vector search may time out after its paid embedding: a retry would pay again.
+  if (searchMode(args.mode) === "vector") return undefined;
   const since = new Date(nowMs - days * DAY_MS).toISOString().slice(0, 10);
   return { ...args, since };
 }
 
-/** Said first in a narrowed retry's answer, so the model knows what was left out. */
-/** Added to the refusal when every narrowed window was refused too. */
+/** Added to the refusal when no narrowed window answered either. */
 export function recentSearchFailedNote(): string {
-  return ` (ccc also tried the last ${RECENT_SEARCH_WINDOWS_DAYS.join(" and ")} days: ` +
-    "too broad as well; add a rarer word, project or tree)";
+  return ` (ccc also tried the last ${RECENT_SEARCH_WINDOWS_DAYS.join(" and ")} days, ` +
+    "without an answer; add a rarer word, project or tree)";
 }
 
+/** Said first in a narrowed retry's answer, so the model knows what was left out. */
 export function recentSearchNote(since: string, days: number, pages = false): string {
   // The server binds a cursor to the search's filters, `since` included.
   const more = pages

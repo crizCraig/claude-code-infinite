@@ -118,15 +118,17 @@ message, and its own work is in its own tree, so search without `tree` for a det
 report before re-running its work.
 
 **Earlier sessions in the same repo are named at start.** In a repository with an `origin`
-remote, a new, resumed or forked session (headless too) starts with a short list of the
-newest earlier sessions in that repo that have a tree, with their summaries and tree
-references, as model context (stdout is unchanged). In a print run ccc waits up to 2.5 s for
-that list; `CCC_PROJECT_TREES=0` turns it off.
+remote, a session (headless too) gets a short list of the newest earlier sessions in that
+repo that have a tree, with their summaries and tree references, as model context. In a print
+run it comes with the call's first prompt (a UserPromptSubmit hook, so stdout, stream-json
+included, is unchanged unless you pass `--include-hook-events`), and ccc waits up to 2.5 s for
+the list. `CCC_PROJECT_TREES=0` turns it off.
 
 **A search across all sessions that is too broad is narrowed, not refused.** If the server
 answers that the search matched too much to finish (422), ccc retries it over the last 3
-days, then the last day, and says so first in the answer (only when you gave no `tree`,
-`since`, `until` or `cursor`). On a large account a search across all sessions can take
+days, then the last day, and says so first in the answer (a text search with no `tree`,
+`since`, `until` or `cursor`; `project` may be set; never a vector search, whose embedding is
+paid). On a large account a search across all sessions can take
 ~10 s; adding `since` (or `project`) keeps it well under a second.
 
 The tools can read every session your MemTree key owns. If your platform runs agents for

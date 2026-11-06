@@ -16,7 +16,8 @@ import path from "node:path";
 export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 /**
  * The print-mode project-trees hook's path (project-trees.ts): the notice hook's secret
- * path plus this. It answers only the earlier-sessions block, never a user-facing line.
+ * path plus this. It answers a session's first UserPromptSubmit with only the
+ * earlier-sessions block, never a user-facing line.
  */
 export const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
 /** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
@@ -993,9 +994,11 @@ export function createSubagentHookPlugin(
   opts: {
     tempRoot?: string;
     /**
-     * Name earlier sessions in this project at session start (project-trees.ts), from a
-     * SessionStart command hook relaying to PROJECT_TREES_HOOK_SUFFIX: additionalContext
-     * only (the model reads it), so stdout stays Claude Code's.
+     * Name earlier sessions in this project with the first prompt (project-trees.ts):
+     * a UserPromptSubmit hook to PROJECT_TREES_HOOK_SUFFIX, answered with
+     * additionalContext only. Not SessionStart: Claude Code always prints SessionStart
+     * hook events (with the hook's output) on stream-json stdout; UserPromptSubmit's
+     * only with --include-hook-events.
      */
     projectTrees?: boolean;
     /** Point the parent at a finished subagent's tree (PostToolUse on Agent|Task). */
@@ -1017,18 +1020,8 @@ export function createSubagentHookPlugin(
   };
   if (opts.subagentResult) hooks.PostToolUse = [subagentResultHook(hookUrl)];
   if (opts.projectTrees) {
-    const relay = path.join(hooksDir, RESUME_RELAY_FILE);
-    fs.writeFileSync(relay, RESUME_RELAY_SOURCE, { mode: 0o600 });
-    hooks.SessionStart = [{
-      // A new, resumed, cleared or forked conversation; never a compaction.
-      matcher: "startup|resume|clear|fork",
-      hooks: [{
-        type: "command",
-        command: [process.execPath, relay, `${hookUrl}${PROJECT_TREES_HOOK_SUFFIX}`]
-          .map(singleQuoteForShell)
-          .join(" "),
-        timeout: 5,
-      }],
+    hooks.UserPromptSubmit = [{
+      hooks: [{ type: "http", url: `${hookUrl}${PROJECT_TREES_HOOK_SUFFIX}`, timeout: 5 }],
     }];
   }
   writePluginFiles(dir, hooks);

@@ -569,7 +569,8 @@ async function main() {
     });
     // Earlier sessions in this project, named to the model at session start
     // (project-trees.ts). Asked now so the answer is in before Claude Code's
-    // first SessionStart hook; sessions with the memtree tools only (print runs too).
+    // first SessionStart hook (a print run: its first prompt); sessions with the memtree
+    // tools only.
     // Not after an invalid key or [c] at the payment gate (a resumed session
     // reaches here paused): the lookup could only fail.
     const projectTrees = projectTreesHintFor({

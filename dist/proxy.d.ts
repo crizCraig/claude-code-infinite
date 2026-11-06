@@ -325,6 +325,8 @@ interface ProxyState {
     openUrl?: UrlOpener;
     /** ProxyOptions.projectTrees. */
     projectTrees?: ProjectTreesHint;
+    /** Print-run sessions already given the project-trees block (handlePrintProjectTreesHook). */
+    projectTreesGiven: Set<string>;
     /** ProxyOptions.subagentHint. */
     subagentHint?: SubagentMemoryHint;
     /** ProxyOptions.resumeGuidance. */

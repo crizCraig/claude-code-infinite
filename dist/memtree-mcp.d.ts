@@ -337,7 +337,10 @@ export declare class SessionFinder implements SessionFinderSource {
     private readonly fetchImpl;
     constructor(deps: MemtreeMcpDeps);
     listSessions(args: Record<string, unknown>): Promise<string>;
+    private readonly sessionTrees;
+    /** sessionTree, remembered for SESSION_TREE_TTL_MS (hits and misses: legacy ids repeat). */
     sessionTree(sessionId: string): Promise<string | undefined>;
+    private lookupSessionTree;
     searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
     private now;
     private get;

@@ -186,9 +186,10 @@ async function withinMs(promise, ms) {
  * The hint for this run, or undefined: MemTree on (a valid key, not continued
  * past the payment gate: the lookup could only fail), with both `search` and
  * `read_node` (the block names them), a known project, and not
- * `CCC_PROJECT_TREES=0`. Print runs get it too, as model context only (their
- * stdout stays Claude Code's): a headless agent continuing earlier work in the
- * same repo otherwise never learns it exists (xsession benchmark, 2026-11-06).
+ * `CCC_PROJECT_TREES=0`. Print runs get it too, with their first prompt as model
+ * context only (their stdout stays Claude Code's; hooks.ts createSubagentHookPlugin):
+ * a headless agent continuing earlier work in the same repo otherwise never learns it
+ * exists (xsession benchmark, 2026-11-06).
  */
 export function projectTreesHintFor(s) {
     if (s.env.CCC_PROJECT_TREES === "0")

@@ -127,9 +127,9 @@ export declare function searchQuery(args: Record<string, unknown>, tree?: string
 export declare const RECENT_SEARCH_WINDOWS_DAYS: readonly [3, 1];
 /** The narrowed retry's arguments for `days`, or undefined when no retry applies. */
 export declare function recentSearchArgs(args: Record<string, unknown>, tree: string | undefined, status: number, nowMs: number, days: number): Record<string, unknown> | undefined;
-/** Said first in a narrowed retry's answer, so the model knows what was left out. */
-/** Added to the refusal when every narrowed window was refused too. */
+/** Added to the refusal when no narrowed window answered either. */
 export declare function recentSearchFailedNote(): string;
+/** Said first in a narrowed retry's answer, so the model knows what was left out. */
 export declare function recentSearchNote(since: string, days: number, pages?: boolean): string;
 export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 

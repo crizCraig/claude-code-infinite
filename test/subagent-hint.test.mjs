@@ -11,7 +11,6 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 import {
@@ -91,25 +90,24 @@ test("the print-mode plugin has only the subagent hooks, pointed at the proxy", 
   assert.throws(() => createSubagentHookPlugin("http://example.com/x", { tempRoot }), /localhost/);
 });
 
-test("the print-mode plugin relays SessionStart to the project-trees path when asked", () => {
+test("the print-mode plugin asks the project-trees path on UserPromptSubmit when asked", () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-subagent-plugin-"));
   const url = "http://127.0.0.1:12345/_ccc/hooks/token";
   const plugin = createSubagentHookPlugin(url, { tempRoot, projectTrees: true });
   try {
     const { hooks } = JSON.parse(fs.readFileSync(path.join(plugin.dir, "hooks", "hooks.json"), "utf8"));
-    assert.deepEqual(Object.keys(hooks).sort(), ["SessionStart", "SubagentStart", "SubagentStop"]);
-    const [start] = hooks.SessionStart;
-    assert.equal(start.matcher, "startup|resume|clear|fork", "never a compaction");
-    assert.equal(start.hooks[0].type, "command");
-    assert.ok(start.hooks[0].command.includes(`${url}${PROJECT_TREES_HOOK_SUFFIX}`));
-    assert.ok(fs.existsSync(path.join(plugin.dir, "hooks", "resume-link.mjs")), "the relay script");
+    assert.deepEqual(Object.keys(hooks).sort(), ["SubagentStart", "SubagentStop", "UserPromptSubmit"]);
+    assert.equal(hooks.SessionStart, undefined,
+      "never SessionStart: Claude Code prints its hook events on stream-json stdout");
+    assert.deepEqual(hooks.UserPromptSubmit,
+      [{ hooks: [{ type: "http", url: `${url}${PROJECT_TREES_HOOK_SUFFIX}`, timeout: 5 }] }]);
   } finally {
     plugin.close();
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 
-test("proxy: the project-trees path answers SessionStart with model context only", async () => {
+test("proxy: the project-trees path answers a session's first prompt, once, context only", async () => {
   const upstream = await serve((req, res) => res.end("{}"));
   const trees = { trees: [{ session_id: "other", last_at: "2026-11-05T10:00:00Z",
     title: "Invoice rounding: agreed ROUND_HALF_EVEN", tree: { ref: "abc-v1-own" } }] };
@@ -123,17 +121,24 @@ test("proxy: the project-trees path answers SessionStart with model context only
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     return res.status === 204 ? null : await res.json();
   };
+  const prompt = (extra = {}) => ({ session_id: SESSION, hook_event_name: "UserPromptSubmit",
+    prompt: "fix the bug", ...extra });
   try {
-    const out = await post({ session_id: SESSION, hook_event_name: "SessionStart", source: "startup" });
+    const out = await post(prompt());
     assert.equal(out.systemMessage, undefined, "nothing for stdout or the user");
+    assert.equal(out.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(out.hookSpecificOutput.additionalContext, /Earlier sessions in this project/);
     assert.match(out.hookSpecificOutput.additionalContext, /abc-v1-own/);
-    assert.equal(await post({ session_id: SESSION, hook_event_name: "SessionStart",
-      source: "compact" }), null, "not after a compaction");
-    assert.equal(await post({ session_id: SESSION, hook_event_name: "SubagentStart",
-      agent_id: "a1", agent_type: "x" }), null, "SessionStart only");
+    assert.equal(await post(prompt()), null, "once per session");
+    assert.ok(await post(prompt({ session_id: "fd0b6b1c-1f1e-4c1e-9e57-2b1f3f9d2a10" })),
+      "another session gets its own");
+    assert.equal(await post(prompt({ session_id: "aaaaaaaa-1f1e-4c1e-9e57-2b1f3f9d2a10",
+      agent_id: "a1" })), null, "never a subagent's prompt");
+    assert.equal(await post({ session_id: "bbbbbbbb-1f1e-4c1e-9e57-2b1f3f9d2a10",
+      hook_event_name: "SessionStart", source: "startup" }), null, "UserPromptSubmit only");
   } finally { proxy.close(); upstream.close(); }
 });
+
 
 // ------------------------------------------------------------------ through the proxy
 
@@ -285,6 +290,11 @@ test("the subagent-result line is short and names search without tree and read_l
   assert.ok(isFinishedSubagentCall(call({ tool_name: "Task" })));
   assert.ok(!isFinishedSubagentCall(call({ tool_input: { run_in_background: true } })),
     "a background launch returns only a receipt");
+  assert.ok(isFinishedSubagentCall(call({ tool_response: { status: "completed" } })));
+  for (const status of ["async_launched", "remote_launched"]) {
+    assert.ok(!isFinishedSubagentCall(call({ tool_response: { status } })),
+      `${status}: launched in the background without run_in_background`);
+  }
   assert.ok(!isFinishedSubagentCall(call({ tool_name: "Bash" })));
   assert.ok(!isFinishedSubagentCall(call({ hook_event_name: "PreToolUse" })));
   assert.ok(!isFinishedSubagentCall(null));
@@ -332,6 +342,11 @@ test("proxy: a finished subagent call points the parent at its tree while MemTre
     assert.deepEqual(await subagentResult(h), postToolUseOutput(SUBAGENT_RESULT_HINT));
     assert.equal(await subagentResult(h, { tool_input: { run_in_background: true } }), null);
     assert.equal(await subagentResult(h, { tool_name: "Bash" }), null);
+    assert.equal(await subagentResult(h, { tool_response: { status: "async_launched" } }), null);
+    const big = "x".repeat(200 * 1024);
+    assert.deepEqual(await subagentResult(h, { tool_response: { status: "completed",
+      content: [{ type: "text", text: big }] } }), postToolUseOutput(SUBAGENT_RESULT_HINT),
+      "a long subagent result still gets the line");
   } finally { h.close(); }
   const paused = await harness();
   try {
@@ -346,43 +361,3 @@ test("proxy: a finished subagent call points the parent at its tree while MemTre
   } finally { toolless.close(); }
 });
 
-test("print mode: the generated SessionStart command relays to the proxy in every shell", async () => {
-  const upstream = await serve((req, res) => res.end("{}"));
-  const trees = { trees: [{ session_id: "other", title: "Invoice rounding work",
-    tree: { ref: "abc-v1-own" } }] };
-  const projectTrees = new ProjectTreesHint(
-    async () => ({ status: 200, body: Buffer.from(JSON.stringify(trees)) }), "o/r");
-  projectTrees.prefetch();
-  const memtree = new MemtreeClient({ baseUrl: upstream.url, apiKey: "offline" });
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.url, projectTrees });
-  // A temp root with a space and an apostrophe exercises the command's quoting.
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccc it's plugin "));
-  const plugin = createSubagentHookPlugin(proxy.hookUrl, { tempRoot, projectTrees: true });
-  try {
-    const { hooks } = JSON.parse(fs.readFileSync(path.join(plugin.dir, "hooks", "hooks.json"), "utf8"));
-    const command = hooks.SessionStart[0].hooks[0].command;
-    const input = JSON.stringify({ session_id: SESSION, hook_event_name: "SessionStart", source: "startup" });
-    const shells = process.platform === "win32"
-      ? ["bash"]
-      : ["/bin/sh", "/bin/bash", "/bin/zsh"].filter((sh) => sh === "/bin/sh" || fs.existsSync(sh));
-    for (const shell of shells) {
-      // Async: the proxy answering the relay runs in this process.
-      const stdout = await new Promise((resolve, reject) => {
-        const child = spawn(command, { shell, stdio: ["pipe", "pipe", "inherit"] });
-        let out = "";
-        child.stdout.on("data", (d) => { out += d; });
-        child.on("error", reject);
-        child.on("close", () => resolve(out));
-        child.stdin.end(input);
-      });
-      const output = JSON.parse(stdout);
-      assert.equal(output.systemMessage, undefined, `${shell}: nothing for the user`);
-      assert.match(output.hookSpecificOutput.additionalContext, /abc-v1-own/, shell);
-    }
-  } finally {
-    plugin.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
-    proxy.close();
-    upstream.close();
-  }
-});
