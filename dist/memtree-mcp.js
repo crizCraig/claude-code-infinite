@@ -642,16 +642,19 @@ export class SessionFinder {
         const first = await this.fetch(`/memtree/search${searchQuery(args, tree)}`, "search");
         let answer = first;
         let narrowed;
+        const tried = [];
         for (const days of RECENT_SEARCH_WINDOWS_DAYS) {
             const recent = recentSearchArgs(args, tree, answer.status, this.now(), days);
             if (!recent)
                 break;
             narrowed = { args: recent, days };
+            tried.push(days);
             answer = await this.fetch(`/memtree/search${searchQuery(recent, tree)}`, "search");
         }
-        // No window answered: the first refusal says how to narrow the search.
+        // No window answered: the first refusal says how to narrow the search, plus what ccc
+        // tried and, when the last try failed otherwise, how.
         const body = this.bodyOf(answer.ok ? answer : narrowed
-            ? { ...first, error: `${first.error}${recentSearchFailedNote()}` } : first, "search");
+            ? { ...first, error: `${first.error}${recentSearchFailedNote(tried, answer)}` } : first, "search");
         if (tree && (!body || typeof body !== "object" || body.tree !== tree)) {
             throw new ToolInputError("search: server did not confirm the requested tree; update the MemTree server before scoped search");
         }

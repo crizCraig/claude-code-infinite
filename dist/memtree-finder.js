@@ -76,9 +76,11 @@ export function recentSearchArgs(args, tree, status, nowMs, days) {
     return { ...args, since };
 }
 /** Added to the refusal when no narrowed window answered either. */
-export function recentSearchFailedNote() {
-    return ` (ccc also tried the last ${RECENT_SEARCH_WINDOWS_DAYS.join(" and ")} days, ` +
-        "without an answer; add a rarer word, project or tree)";
+export function recentSearchFailedNote(triedDays, last) {
+    const windows = triedDays.map((d) => (d === 1 ? "1 day" : `${d} days`)).join(", then ");
+    const how = last.status === 422 ? "too broad as well; add a rarer word, project or tree"
+        : `that failed: ${last.error ?? `HTTP ${last.status}`}`;
+    return ` (ccc also tried the last ${windows}: ${how})`;
 }
 /** Said first in a narrowed retry's answer, so the model knows what was left out. */
 export function recentSearchNote(since, days, pages = false) {

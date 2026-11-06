@@ -130,6 +130,9 @@ test("proxy: the project-trees path answers a session's first prompt, once, cont
     assert.match(out.hookSpecificOutput.additionalContext, /Earlier sessions in this project/);
     assert.match(out.hookSpecificOutput.additionalContext, /abc-v1-own/);
     assert.equal(await post(prompt()), null, "once per session");
+    const long = await post(prompt({ session_id: "cccccccc-1f1e-4c1e-9e57-2b1f3f9d2a10",
+      prompt: "y".repeat(70 * 1024) }));
+    assert.match(long.hookSpecificOutput.additionalContext, /abc-v1-own/, "a long prompt too");
     assert.ok(await post(prompt({ session_id: "fd0b6b1c-1f1e-4c1e-9e57-2b1f3f9d2a10" })),
       "another session gets its own");
     assert.equal(await post(prompt({ session_id: "aaaaaaaa-1f1e-4c1e-9e57-2b1f3f9d2a10",

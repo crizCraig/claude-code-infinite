@@ -73,8 +73,11 @@ import { rateLimitFromResponse } from "./rate-limit.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
-/** PostToolUse(Agent|Task) bodies hold the subagent's prompt and full result. */
-const SUBAGENT_RESULT_BODY_LIMIT = 16 * 1024 * 1024;
+/**
+ * Hook bodies that carry a whole prompt (UserPromptSubmit) or a subagent's prompt and
+ * full result (PostToolUse on Agent|Task).
+ */
+const LARGE_HOOK_BODY_LIMIT = 16 * 1024 * 1024;
 /** A hook body still arriving after this is dropped (the hook itself waits 5 s). */
 const HOOK_BODY_TIMEOUT_MS = 3_000;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
@@ -776,7 +779,7 @@ function noteMainSessionStart(state, source, sessionId) {
 async function handleSubagentResultHook(req, res, state) {
     // The body carries the subagent's whole prompt and result: allow a large one.
     const raw = req.method === "POST"
-        ? await readBodyWithin(req, SUBAGENT_RESULT_BODY_LIMIT) : undefined;
+        ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
     if (req.method !== "POST")
         req.resume();
     let input = null;
@@ -808,7 +811,8 @@ async function handleSubagentResultHook(req, res, state) {
  * process; anything unexpected is 204.
  */
 async function handlePrintProjectTreesHook(req, res, state) {
-    const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
+    // The body carries the whole prompt.
+    const raw = req.method === "POST" ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
     if (req.method !== "POST")
         req.resume();
     let input = null;

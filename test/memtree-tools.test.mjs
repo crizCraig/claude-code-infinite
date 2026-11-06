@@ -89,14 +89,15 @@ test("a search across all sessions refused as too broad (422) is retried over 3 
   urls.length = 0;
   answers = [tooBroad, tooBroad, tooBroad];
   await assert.rejects(finder.searchSessions({ query: "x" }),
-    /search failed: HTTP 422 The search matched too much.*also tried the last 3 and 1 days/);
+    /search failed: HTTP 422 The search matched too much.*also tried the last 3 days, then 1 day: too broad as well/);
   assert.equal(urls.length, 3);
 
   // A narrowed retry that fails otherwise: the refusal says the windows were tried.
   urls.length = 0;
-  answers = [tooBroad, () => Response.json({ detail: "boom" }, { status: 500 }),
-    () => Response.json({ detail: "boom" }, { status: 500 })];
-  await assert.rejects(finder.searchSessions({ query: "x" }), /HTTP 422 .*also tried the last 3 and 1 days/);
+  answers = [tooBroad, () => Response.json({ detail: "slow down" }, { status: 429 })];
+  await assert.rejects(finder.searchSessions({ query: "x" }),
+    /HTTP 422 .*also tried the last 3 days: that failed: HTTP 429 slow down\)/);
+  assert.equal(urls.length, 2, "a non-422 failure is not narrowed again");
 
   // A vector search is never narrowed (its embedding is paid again on each try).
   urls.length = 0;
