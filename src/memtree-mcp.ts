@@ -40,6 +40,10 @@ import {
   formatSearchResults,
   searchMode,
   formatSessions,
+  RECENT_SEARCH_WINDOWS_DAYS,
+  recentSearchArgs,
+  recentSearchFailedNote,
+  recentSearchNote,
   searchQuery,
   SESSIONS_DEFAULT_LIMIT,
   SESSIONS_MAX_LIMIT,
@@ -666,6 +670,8 @@ function isTemporaryPrefix(index: MemtreeIndex, id: string): boolean {
 /** The cross-session tools: formatted text from the proxy's finder relay. */
 export interface SessionFinderSource {
   listSessions(args: Record<string, unknown>): Promise<string>;
+  /** The newest tree of the user's session `sessionId`, or undefined (none, or not a session). */
+  sessionTree?(sessionId: string): Promise<string | undefined>;
   /** Server search across sessions, or within ``tree`` (any mode). */
   searchSessions(args: Record<string, unknown>, tree?: string): Promise<string>;
 }
@@ -682,18 +688,55 @@ export class SessionFinder implements SessionFinderSource {
     return formatSessions(body as Parameters<typeof formatSessions>[0], args, this.deps.sessionId);
   }
 
+  async sessionTree(sessionId: string): Promise<string | undefined> {
+    const answer = await this.fetch(`/memtree/sessions${sessionsQuery({ q: sessionId, limit: 5 })}`, "list");
+    if (!answer.ok) return undefined;
+    const sessions = (answer.body as { sessions?: unknown } | null)?.sessions;
+    if (!Array.isArray(sessions)) return undefined;
+    const item = sessions.find((s) => (s as { session_id?: unknown })?.session_id === sessionId) as
+      { latest_tree?: { ref?: unknown; request_id?: unknown } | null } | undefined;
+    const ref = item?.latest_tree?.ref ?? item?.latest_tree?.request_id;
+    return typeof ref === "string" && TREE_ID_RE.test(ref) && ref !== sessionId ? ref : undefined;
+  }
+
   async searchSessions(args: Record<string, unknown>, tree?: string): Promise<string> {
-    const body = await this.get(`/memtree/search${searchQuery(args, tree)}`, "search");
+    const first = await this.fetch(`/memtree/search${searchQuery(args, tree)}`, "search");
+    let answer = first;
+    let narrowed: { args: Record<string, unknown>; days: number } | undefined;
+    for (const days of RECENT_SEARCH_WINDOWS_DAYS) {
+      const recent = recentSearchArgs(args, tree, answer.status, this.now(), days);
+      if (!recent) break;
+      narrowed = { args: recent, days };
+      answer = await this.fetch(`/memtree/search${searchQuery(recent, tree)}`, "search");
+    }
+    // No window answered: the first refusal says how to narrow the search.
+    const body = this.bodyOf(answer.ok ? answer : narrowed && answer.status === 422
+      ? { ...first, error: `${first.error}${recentSearchFailedNote()}` } : first, "search");
     if (tree && (!body || typeof body !== "object" || (body as { tree?: unknown }).tree !== tree)) {
       throw new ToolInputError("search: server did not confirm the requested tree; update the MemTree server before scoped search");
     }
-    return formatSearchResults(body as Parameters<typeof formatSearchResults>[0], { ...args, tree });
+    const text = formatSearchResults(body as Parameters<typeof formatSearchResults>[0], {
+      ...(narrowed?.args ?? args), tree,
+    });
+    if (!narrowed) return text;
+    return `${recentSearchNote(narrowed.args.since as string, narrowed.days)}\n\n${text}`;
+  }
+
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
   }
 
   private async get(pathAndQuery: string, tool: string): Promise<unknown> {
-    const answer = await proxyGetJson(
+    return this.bodyOf(await this.fetch(pathAndQuery, tool), tool);
+  }
+
+  private fetch(pathAndQuery: string, tool: string): Promise<ProxyJson> {
+    return proxyGetJson(
       this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, toolHeaders(tool, this.deps)
     );
+  }
+
+  private bodyOf(answer: ProxyJson, tool: string): unknown {
     if (answer.ok) return answer.body;
     if (answer.status === 404) {
       throw new ToolInputError(`${tool}: this MemTree server does not support finding sessions yet (${answer.error}).`);
@@ -784,6 +827,45 @@ function isRpcRequest(value: unknown): value is JsonRpcRequest {
 class UnknownToolError extends Error {}
 
 async function callTool(
+  name: string,
+  args: Record<string, unknown>,
+  tree: TreeSource,
+  finder?: SessionFinderSource
+): Promise<string> {
+  const session = await sessionAsTree(args.tree, finder);
+  if (session) {
+    const text = await dispatchTool(name, { ...args, tree: session.ref }, tree, finder);
+    return `(${session.id} is a session id: this reads its newest tree, ${session.ref}.)\n\n${text}`;
+  }
+  return dispatchTool(name, args, tree, finder);
+}
+
+/** A bare UUID: a session id, or a legacy request id (a ref ends in -v<N>-own/served). */
+const BARE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * A `tree` that is a session id, resolved to that session's newest tree. Hand-offs name
+ * session ids (the instructions ask them to), and receiving agents pass them as `tree`:
+ * the page lookup then fails with 404, or a tail reads nothing (xsession benchmark,
+ * 2026-11-06). Undefined for anything else, including a legacy request id.
+ */
+async function sessionAsTree(
+  value: unknown,
+  finder?: SessionFinderSource
+): Promise<{ id: string; ref: string } | undefined> {
+  if (typeof value !== "string" || !BARE_UUID_RE.test(value.trim()) || !finder?.sessionTree) {
+    return undefined;
+  }
+  const id = value.trim();
+  try {
+    const ref = await finder.sessionTree(id);
+    return ref ? { id, ref } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function dispatchTool(
   name: string,
   args: Record<string, unknown>,
   tree: TreeSource,

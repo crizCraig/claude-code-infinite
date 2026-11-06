@@ -55,6 +55,51 @@ test("scoped finder responses must confirm the requested tree; unscoped legacy h
   assert.match(await finder.searchSessions({ query: "x" }, "wanted"), /read_lines/);
 });
 
+test("a search across all sessions refused as too broad (422) is retried over 3 days, then 1", async () => {
+  const urls = [];
+  const tooBroad = () => Response.json({ detail: "The search matched too much to finish in time." }, { status: 422 });
+  const hits = () => Response.json({ hits: [{ id: "s", tree: { request_id: "t1" }, range: { block: 0, start: 1, end: 2 } }] });
+  let answers = [tooBroad, hits];
+  const finder = new SessionFinder({
+    proxyUrl: "http://localhost:9",
+    now: () => Date.parse("2026-11-06T12:00:00Z"),
+    fetch: async (url) => { urls.push(String(url)); return answers.shift()(); },
+  });
+  const since = () => urls.map((u) => new URL(u).searchParams.get("since"));
+  let text = await finder.searchSessions({ query: "memtree-note to:beta" });
+  assert.deepEqual(since(), [null, "2026-11-03"]);
+  assert.match(text, /^Searching all sessions matched too much .* since 2026-11-03 \(the last 3 days\)/);
+  assert.match(text, /read_lines/);
+
+  urls.length = 0;
+  answers = [tooBroad, tooBroad, hits];
+  text = await finder.searchSessions({ query: "x" });
+  assert.deepEqual(since(), [null, "2026-11-03", "2026-11-05"]);
+  assert.match(text, /since 2026-11-05 \(the last day\)/);
+
+  // No window answered: the first refusal's advice is the answer.
+  urls.length = 0;
+  answers = [tooBroad, tooBroad, tooBroad];
+  await assert.rejects(finder.searchSessions({ query: "x" }),
+    /search failed: HTTP 422 The search matched too much.*also tried the last 3 and 1 days/);
+  assert.equal(urls.length, 3);
+
+  // Another failure is not narrowed.
+  urls.length = 0;
+  answers = [() => Response.json({ detail: "boom" }, { status: 500 })];
+  await assert.rejects(finder.searchSessions({ query: "x" }), /HTTP 500/);
+  assert.equal(urls.length, 1);
+
+  // The caller's own bounds, a tree or a cursor: no second guess.
+  for (const [args, tree] of [[{ query: "x", since: "2026-01-01" }], [{ query: "x", until: "2026-01-01" }],
+    [{ query: "x", cursor: "c" }], [{ query: "x" }, "tree-1"]]) {
+    urls.length = 0;
+    answers = [tooBroad];
+    await assert.rejects(finder.searchSessions(args, tree), /HTTP 422/);
+    assert.equal(urls.length, 1);
+  }
+});
+
 test("current search and prefix cache enforce the page session", async () => {
   const fetch = async (url) => Response.json(String(url).includes("/current")
     ? { id: "page", session_id: "A" }
@@ -522,6 +567,32 @@ test("read_lines starting inside a message without a time says so", () => {
     assert.match(text, /^block 0 \[2026-09-30 14:05 PT; lines 2-2: time not recorded\] lines 2-7 /);
     assert.match(text, /\n6\tMessage 2 from user:\n/, "said once");
   });
+});
+
+test("a session id passed as tree reads that session's newest tree, and says so", async () => {
+  const SID = "c4e76ef6-0cc0-4291-beef-9a0c29681fa6";
+  const asked = [];
+  const tree = { get: async (id) => { asked.push(id); return index(); },
+    tail: async (id) => `tail of ${id}` };
+  const finder = {
+    listSessions: async () => "",
+    searchSessions: async (args, scope) => `searched ${scope}`,
+    sessionTree: async (id) => (id === SID ? "8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own" : undefined),
+  };
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } },
+      tree, finder)).result.content[0].text;
+  const note = new RegExp(`^\\(${SID} is a session id: this reads its newest tree, 8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own\\.\\)`);
+  assert.match(await call("read_node", { tree: SID, id: 0 }), note);
+  assert.deepEqual(asked, ["8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own"]);
+  assert.match(await call("read_lines", { tree: SID, tail: true }), /tail of 8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own/);
+  assert.match(await call("search", { tree: SID, query: "x", mode: "vector" }), /searched 8004b306/);
+  // A legacy request id (no session of that id) and a pinned ref pass through unchanged.
+  asked.length = 0;
+  const other = "11111111-2222-3333-4444-555555555555";
+  assert.doesNotMatch(await call("read_node", { tree: other, id: 0 }), /is a session id/);
+  await call("read_node", { tree: "abc-v1-own", id: 0 });
+  assert.deepEqual(asked, [other, "abc-v1-own"]);
 });
 
 test("read_lines and read_node take current#N as this session's current tree", async () => {

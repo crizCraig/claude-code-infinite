@@ -26,6 +26,23 @@ export declare class SubagentMemoryHint {
 }
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
 export declare function subagentMemoryHintText(sessionId: string, treeRef: string): string | undefined;
+/**
+ * Said to the parent when a (foreground) Agent/Task call returns: the result is only
+ * the subagent's final message; its evidence is in its own MemTree tree, which nothing
+ * else points at (xsession benchmark 2026-11-06: parents asked for a detail the
+ * subagent read but didn't report resumed it or re-ran the work instead of searching).
+ * Constant, so it adds no cache churn beyond its own few tokens.
+ */
+export declare const SUBAGENT_RESULT_HINT: string;
+/** Agent tools whose PostToolUse gets SUBAGENT_RESULT_HINT. */
+export declare const AGENT_TOOL_NAMES: readonly ["Agent", "Task"];
+/**
+ * Whether a PostToolUse input is a finished foreground subagent call: an Agent/Task
+ * call not sent to the background (whose result is only a launch receipt).
+ */
+export declare function isFinishedSubagentCall(input: unknown): boolean;
+/** The PostToolUse hook's answer carrying `context` to the model. */
+export declare function postToolUseOutput(context: string): Record<string, unknown>;
 /** The SubagentStart hook's answer carrying `context` to the subagent. */
 export declare function subagentStartOutput(context: string): Record<string, unknown>;
 //# sourceMappingURL=subagent-hint.d.ts.map

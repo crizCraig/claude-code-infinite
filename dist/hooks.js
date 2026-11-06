@@ -12,6 +12,20 @@ import os from "node:os";
 import path from "node:path";
 /** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
 export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
+/**
+ * The print-mode project-trees hook's path (project-trees.ts): the notice hook's secret
+ * path plus this. It answers only the earlier-sessions block, never a user-facing line.
+ */
+export const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
+/** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
+export const SUBAGENT_RESULT_HOOK_SUFFIX = "/subagent-result";
+/** PostToolUse on a finished subagent call, answered with SUBAGENT_RESULT_HINT. */
+function subagentResultHook(hookUrl) {
+    return {
+        matcher: "Agent|Task",
+        hooks: [{ type: "http", url: `${hookUrl}${SUBAGENT_RESULT_HOOK_SUFFIX}`, timeout: 5 }],
+    };
+}
 export const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export const TRAILER_LABEL = "• MemTree ·";
@@ -650,6 +664,8 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     if (opts.messageDisplay !== false) {
         hooks.MessageDisplay = [{ hooks: [hook] }];
     }
+    if (opts.subagentResult)
+        hooks.PostToolUse = [subagentResultHook(hookUrl)];
     if (opts.interceptCompact !== false) {
         hooks.PreCompact = [{ matcher: "manual", hooks: [compactHook] }];
     }
@@ -750,13 +766,32 @@ export function createSubagentHookPlugin(hookUrl, opts = {}) {
         throw new Error("notice hook URL must use randomized localhost HTTP endpoint");
     }
     const dir = fs.mkdtempSync(path.join(opts.tempRoot ?? os.tmpdir(), "ccc-notice-plugin-"));
+    const hooksDir = path.join(dir, "hooks");
     fs.mkdirSync(path.join(dir, ".claude-plugin"), { recursive: true });
-    fs.mkdirSync(path.join(dir, "hooks"), { recursive: true });
+    fs.mkdirSync(hooksDir, { recursive: true });
     const hook = { type: "http", url: hookUrl, timeout: 5 };
-    writePluginFiles(dir, {
+    const hooks = {
         SubagentStart: [{ hooks: [hook] }],
         SubagentStop: [{ hooks: [hook] }],
-    });
+    };
+    if (opts.subagentResult)
+        hooks.PostToolUse = [subagentResultHook(hookUrl)];
+    if (opts.projectTrees) {
+        const relay = path.join(hooksDir, RESUME_RELAY_FILE);
+        fs.writeFileSync(relay, RESUME_RELAY_SOURCE, { mode: 0o600 });
+        hooks.SessionStart = [{
+                // A new, resumed, cleared or forked conversation; never a compaction.
+                matcher: "startup|resume|clear|fork",
+                hooks: [{
+                        type: "command",
+                        command: [process.execPath, relay, `${hookUrl}${PROJECT_TREES_HOOK_SUFFIX}`]
+                            .map(singleQuoteForShell)
+                            .join(" "),
+                        timeout: 5,
+                    }],
+            }];
+    }
+    writePluginFiles(dir, hooks);
     let closed = false;
     return {
         dir,

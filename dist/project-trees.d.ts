@@ -11,8 +11,8 @@
  *
  * The block goes into the SessionStart hook's `additionalContext`: the model
  * reads it, the user sees it only in the transcript view. It is added only when
- * the session has the `memtree` MCP tools it names, never for a subagent or a
- * compaction, and not at all on any failure: an older server (404), a slow or
+ * the session has the `memtree` MCP tools it names (print runs included), never for a
+ * subagent or a compaction, and not at all on any failure: an older server (404), a slow or
  * failed request, no project, or no earlier trees.
  */
 import type { KeyCheck } from "./key-status.js";
@@ -20,6 +20,12 @@ import type { KeyCheck } from "./key-status.js";
 export declare const PROJECT_TREES_LIMIT = 5;
 /** Most a SessionStart hook waits for an answer still on its way. */
 export declare const PROJECT_TREES_WAIT_MS = 300;
+/**
+ * The same in a print run, whose Claude Code starts its first turn within about a
+ * second of ccc's prefetch: at 300 ms the block was never in time on staging
+ * (2026-11-06), and a headless call can afford a short wait once per session.
+ */
+export declare const PROJECT_TREES_PRINT_WAIT_MS = 2500;
 /** A request that has not answered by then is dropped. */
 export declare const PROJECT_TREES_FETCH_TIMEOUT_MS = 5000;
 /** A later session start reuses an answer this fresh instead of asking again. */
@@ -90,11 +96,12 @@ export interface ProjectTreesStartup {
     fetchJson: ProjectTreesFetch;
 }
 /**
- * The hint for this run, or undefined: interactive sessions only (print runs
- * keep Claude Code's output as it is) with MemTree on (a valid key, not
- * continued past the payment gate: the lookup could only fail), with both
- * `search` and `read_node` (the block names them), a known project, and not
- * `CCC_PROJECT_TREES=0`.
+ * The hint for this run, or undefined: MemTree on (a valid key, not continued
+ * past the payment gate: the lookup could only fail), with both `search` and
+ * `read_node` (the block names them), a known project, and not
+ * `CCC_PROJECT_TREES=0`. Print runs get it too, as model context only (their
+ * stdout stays Claude Code's): a headless agent continuing earlier work in the
+ * same repo otherwise never learns it exists (xsession benchmark, 2026-11-06).
  */
 export declare function projectTreesHintFor(s: ProjectTreesStartup): ProjectTreesHint | undefined;
 //# sourceMappingURL=project-trees.d.ts.map

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   PROJECT_TREES_FOOTER,
   PROJECT_TREES_HEADER,
+  PROJECT_TREES_PRINT_WAIT_MS,
   PROJECT_TREES_WAIT_MS,
   ProjectTreesHint,
   formatProjectTrees,
@@ -87,9 +88,9 @@ function startup(over = {}) {
   };
 }
 
-test("the hint is on only for interactive sessions with search and read_node and a project", () => {
+test("the hint is on for sessions with search and read_node and a project, print runs too", () => {
   assert.ok(projectTreesHintFor(startup()));
-  assert.equal(projectTreesHintFor(startup({ interactive: false })), undefined, "print runs");
+  assert.ok(projectTreesHintFor(startup({ interactive: false })), "print runs (model context only)");
   assert.equal(projectTreesHintFor(startup({ tools: ["search", "list"] })), undefined);
   assert.equal(projectTreesHintFor(startup({ meta: {} })), undefined, "no project");
   assert.equal(projectTreesHintFor(startup({ meta: { project_dir: "app" } })), undefined);
@@ -131,6 +132,22 @@ test("startup: the paid path asks once at prefetch, within the wait, silent on 4
   hint.prefetch();
   assert.equal(await hint.contextFor("s2"), undefined);
   assert.equal(asked, 1, "404 is remembered: asked once");
+});
+
+test("startup: a print run waits longer for an answer on its way than an interactive one", async () => {
+  const body = Buffer.from(JSON.stringify({ trees: [{ session_id: "a", title: "Earlier work",
+    tree: { ref: "abc-v1-own" } }] }));
+  const slow = async () => {
+    await new Promise((resolve) => setTimeout(resolve, PROJECT_TREES_WAIT_MS + 300));
+    return { status: 200, body };
+  };
+  assert.ok(PROJECT_TREES_PRINT_WAIT_MS > PROJECT_TREES_WAIT_MS + 300);
+  const print = projectTreesHintFor(startup({ interactive: false, fetchJson: slow }));
+  print.prefetch();
+  assert.match(await print.contextFor("s1"), /abc-v1-own/);
+  const interactive = projectTreesHintFor(startup({ fetchJson: slow }));
+  interactive.prefetch();
+  assert.equal(await interactive.contextFor("s1"), undefined, "interactive keeps its 300 ms");
 });
 
 test("contextFor uses the startup prefetch and asks for one more than it shows", async () => {

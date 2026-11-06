@@ -40,6 +40,36 @@ export function subagentMemoryHintText(sessionId, treeRef) {
         "findings or commands from the parent's work, search its memory: mcp__memtree__search " +
         `with tree ${treeRef} (or without tree to search all sessions).`);
 }
+/**
+ * Said to the parent when a (foreground) Agent/Task call returns: the result is only
+ * the subagent's final message; its evidence is in its own MemTree tree, which nothing
+ * else points at (xsession benchmark 2026-11-06: parents asked for a detail the
+ * subagent read but didn't report resumed it or re-ran the work instead of searching).
+ * Constant, so it adds no cache churn beyond its own few tokens.
+ */
+export const SUBAGENT_RESULT_HINT = "ccc: This result is only the subagent's final message. Its own work (files it read, " +
+    "commands and their output) is in MemTree, in its own tree, indexed as it ends. For a " +
+    "detail it didn't report, mcp__memtree__search without tree (an id, name or term from " +
+    "its task), then read_lines on the hit, before re-running its work.";
+/** Agent tools whose PostToolUse gets SUBAGENT_RESULT_HINT. */
+export const AGENT_TOOL_NAMES = ["Agent", "Task"];
+/**
+ * Whether a PostToolUse input is a finished foreground subagent call: an Agent/Task
+ * call not sent to the background (whose result is only a launch receipt).
+ */
+export function isFinishedSubagentCall(input) {
+    const raw = input;
+    if (!raw || raw.hook_event_name !== "PostToolUse")
+        return false;
+    if (!AGENT_TOOL_NAMES.includes(raw.tool_name))
+        return false;
+    const toolInput = raw.tool_input;
+    return toolInput?.run_in_background !== true;
+}
+/** The PostToolUse hook's answer carrying `context` to the model. */
+export function postToolUseOutput(context) {
+    return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: context } };
+}
 /** The SubagentStart hook's answer carrying `context` to the subagent. */
 export function subagentStartOutput(context) {
     return { hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: context } };

@@ -13,10 +13,19 @@ import os from "node:os";
 import path from "node:path";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
-import { createSubagentHookPlugin } from "../dist/hooks.js";
+import {
+  createSessionNoticePlugin,
+  createSubagentHookPlugin,
+  PROJECT_TREES_HOOK_SUFFIX,
+  SUBAGENT_RESULT_HOOK_SUFFIX,
+} from "../dist/hooks.js";
+import { ProjectTreesHint } from "../dist/project-trees.js";
 import { MEMTREE_LOADED_NOTE, MEMTREE_TOOLS } from "../dist/memtree-mcp.js";
 import { NewestTreeLookup } from "../dist/memtree-newest.js";
 import {
+  isFinishedSubagentCall,
+  postToolUseOutput,
+  SUBAGENT_RESULT_HINT,
   SubagentMemoryHint,
   subagentMemoryHintText,
   subagentStartOutput,
@@ -79,6 +88,50 @@ test("the print-mode plugin has only the subagent hooks, pointed at the proxy", 
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   assert.throws(() => createSubagentHookPlugin("http://example.com/x", { tempRoot }), /localhost/);
+});
+
+test("the print-mode plugin relays SessionStart to the project-trees path when asked", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-subagent-plugin-"));
+  const url = "http://127.0.0.1:12345/_ccc/hooks/token";
+  const plugin = createSubagentHookPlugin(url, { tempRoot, projectTrees: true });
+  try {
+    const { hooks } = JSON.parse(fs.readFileSync(path.join(plugin.dir, "hooks", "hooks.json"), "utf8"));
+    assert.deepEqual(Object.keys(hooks).sort(), ["SessionStart", "SubagentStart", "SubagentStop"]);
+    const [start] = hooks.SessionStart;
+    assert.equal(start.matcher, "startup|resume|clear|fork", "never a compaction");
+    assert.equal(start.hooks[0].type, "command");
+    assert.ok(start.hooks[0].command.includes(`${url}${PROJECT_TREES_HOOK_SUFFIX}`));
+    assert.ok(fs.existsSync(path.join(plugin.dir, "hooks", "resume-link.mjs")), "the relay script");
+  } finally {
+    plugin.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("proxy: the project-trees path answers SessionStart with model context only", async () => {
+  const upstream = await serve((req, res) => res.end("{}"));
+  const trees = { trees: [{ session_id: "other", last_at: "2026-11-05T10:00:00Z",
+    title: "Invoice rounding: agreed ROUND_HALF_EVEN", tree: { ref: "abc-v1-own" } }] };
+  const projectTrees = new ProjectTreesHint(
+    async () => ({ status: 200, body: Buffer.from(JSON.stringify(trees)) }), "o/r");
+  projectTrees.prefetch();
+  const memtree = new MemtreeClient({ baseUrl: upstream.url, apiKey: "offline" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.url, projectTrees });
+  const post = async (body) => {
+    const res = await fetch(`${proxy.hookUrl}${PROJECT_TREES_HOOK_SUFFIX}`, { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    return res.status === 204 ? null : await res.json();
+  };
+  try {
+    const out = await post({ session_id: SESSION, hook_event_name: "SessionStart", source: "startup" });
+    assert.equal(out.systemMessage, undefined, "nothing for stdout or the user");
+    assert.match(out.hookSpecificOutput.additionalContext, /Earlier sessions in this project/);
+    assert.match(out.hookSpecificOutput.additionalContext, /abc-v1-own/);
+    assert.equal(await post({ session_id: SESSION, hook_event_name: "SessionStart",
+      source: "compact" }), null, "not after a compaction");
+    assert.equal(await post({ session_id: SESSION, hook_event_name: "SubagentStart",
+      agent_id: "a1", agent_type: "x" }), null, "SessionStart only");
+  } finally { proxy.close(); upstream.close(); }
 });
 
 // ------------------------------------------------------------------ through the proxy
@@ -217,4 +270,77 @@ test("proxy: a tree lookup that never answers delays a subagent start at most ~2
     assert.equal(await subagentStart(h), null);
     assert.ok(Date.now() - started < 4_000, "well within Claude Code's 5 s hook timeout");
   } finally { h.close(); }
+});
+
+// ------------------------------------------------------------------ the parent, after a subagent
+
+test("the subagent-result line is short and names search without tree and read_lines", () => {
+  assert.ok(SUBAGENT_RESULT_HINT.length < 400, SUBAGENT_RESULT_HINT.length);
+  assert.match(SUBAGENT_RESULT_HINT, /mcp__memtree__search without tree/);
+  assert.match(SUBAGENT_RESULT_HINT, /read_lines/);
+  const call = (extra = {}) => ({ hook_event_name: "PostToolUse", tool_name: "Agent",
+    tool_input: { prompt: "x" }, ...extra });
+  assert.ok(isFinishedSubagentCall(call()));
+  assert.ok(isFinishedSubagentCall(call({ tool_name: "Task" })));
+  assert.ok(!isFinishedSubagentCall(call({ tool_input: { run_in_background: true } })),
+    "a background launch returns only a receipt");
+  assert.ok(!isFinishedSubagentCall(call({ tool_name: "Bash" })));
+  assert.ok(!isFinishedSubagentCall(call({ hook_event_name: "PreToolUse" })));
+  assert.ok(!isFinishedSubagentCall(null));
+});
+
+test("both plugins add PostToolUse on Agent|Task only when asked", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-subagent-plugin-"));
+  const url = "http://127.0.0.1:12345/_ccc/hooks/token";
+  const expected = [{ matcher: "Agent|Task",
+    hooks: [{ type: "http", url: `${url}${SUBAGENT_RESULT_HOOK_SUFFIX}`, timeout: 5 }] }];
+  const read = (plugin) =>
+    JSON.parse(fs.readFileSync(path.join(plugin.dir, "hooks", "hooks.json"), "utf8")).hooks;
+  const plugins = [
+    createSubagentHookPlugin(url, { tempRoot, subagentResult: true }),
+    createSessionNoticePlugin(url, { tempRoot, subagentResult: true }),
+    createSubagentHookPlugin(url, { tempRoot }),
+    createSessionNoticePlugin(url, { tempRoot }),
+  ];
+  try {
+    assert.deepEqual(read(plugins[0]).PostToolUse, expected);
+    assert.deepEqual(read(plugins[1]).PostToolUse, expected);
+    assert.equal(read(plugins[2]).PostToolUse, undefined);
+    assert.equal(read(plugins[3]).PostToolUse, undefined);
+  } finally {
+    for (const plugin of plugins) plugin.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+async function subagentResult(h, extra = {}) {
+  const res = await fetch(`${h.proxy.hookUrl}${SUBAGENT_RESULT_HOOK_SUFFIX}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: SESSION, hook_event_name: "PostToolUse", tool_name: "Agent",
+      tool_input: { prompt: "read the log" }, tool_response: {}, ...extra }),
+  });
+  return res.status === 204 ? null : await res.json();
+}
+
+test("proxy: a finished subagent call points the parent at its tree while MemTree works", async () => {
+  const h = await harness();
+  try {
+    assert.equal(await subagentResult(h), null, "MemTree has not answered yet");
+    await turn(h);
+    assert.deepEqual(await subagentResult(h), postToolUseOutput(SUBAGENT_RESULT_HINT));
+    assert.equal(await subagentResult(h, { tool_input: { run_in_background: true } }), null);
+    assert.equal(await subagentResult(h, { tool_name: "Bash" }), null);
+  } finally { h.close(); }
+  const paused = await harness();
+  try {
+    paused.status = 402;
+    await turn(paused, false);
+    assert.equal(await subagentResult(paused), null, "paused: its tools cannot help");
+  } finally { paused.close(); }
+  const toolless = await harness({ hint: null });
+  try {
+    await turn(toolless);
+    assert.equal(await subagentResult(toolless), null, "no memtree tools in the session");
+  } finally { toolless.close(); }
 });

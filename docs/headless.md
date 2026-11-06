@@ -112,6 +112,23 @@ step). In `-p` runs this hook comes from a small session plugin, so a stream-jso
 lists a plugin named `ccc` (and `--include-hook-events` shows its hook events); stdout is
 otherwise unchanged.
 
+**Parents are pointed at their subagents' work.** When a foreground Agent/Task call returns,
+ccc adds one line for the parent (PostToolUse): the result is only the subagent's final
+message, and its own work is in its own tree, so search without `tree` for a detail it didn't
+report before re-running its work.
+
+**Earlier sessions in the same repo are named at start.** In a repository with an `origin`
+remote, a new, resumed or forked session (headless too) starts with a short list of the
+newest earlier sessions in that repo that have a tree, with their summaries and tree
+references, as model context (stdout is unchanged). In a print run ccc waits up to 2.5 s for
+that list; `CCC_PROJECT_TREES=0` turns it off.
+
+**A search across all sessions that is too broad is narrowed, not refused.** If the server
+answers that the search matched too much to finish (422), ccc retries it over the last 3
+days, then the last day, and says so first in the answer (only when you gave no `tree`,
+`since`, `until` or `cursor`). On a large account a search across all sessions can take
+~10 s; adding `since` (or `project`) keeps it well under a second.
+
 The tools can read every session your MemTree key owns. If your platform runs agents for
 different people, give each person their own key, or set `CCC_MEMTREE_MCP=0`.
 
@@ -144,6 +161,13 @@ indexed, and whether the calling session is indexed yet.
    that session), and `mcp__memtree__read_node {"node": <address>}` on a hit, then `read_lines`
    for the exact lines.
 4. For what the other agent is doing right now, `read_lines {"tree": <ref>, "tail": true}`.
+
+**Can two agents leave each other notes?** Yes, by convention, with no files: an agent writes
+a line `memtree-note to:<agent name> re:<topic>` followed by the note in its reply, and the
+other agent searches for `memtree-note to:<its own name>` without `tree` (add `since` with
+today's date to keep the search small), or reads the sender's tail for the newest notes.
+Notes arrive with the sender's next index (often minutes): in a benchmark of two headless
+agents exchanging config values this way (2026-11-06), both finished in their second call.
 
 ## 4. Seeing an agent's memory
 

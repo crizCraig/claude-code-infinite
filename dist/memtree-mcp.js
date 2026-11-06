@@ -34,7 +34,7 @@
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
+import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, RECENT_SEARCH_WINDOWS_DAYS, recentSearchArgs, recentSearchFailedNote, recentSearchNote, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
 import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, serverTailHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
 import { formatTime } from "./memtree-times.js";
@@ -596,15 +596,51 @@ export class SessionFinder {
         const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list");
         return formatSessions(body, args, this.deps.sessionId);
     }
+    async sessionTree(sessionId) {
+        const answer = await this.fetch(`/memtree/sessions${sessionsQuery({ q: sessionId, limit: 5 })}`, "list");
+        if (!answer.ok)
+            return undefined;
+        const sessions = answer.body?.sessions;
+        if (!Array.isArray(sessions))
+            return undefined;
+        const item = sessions.find((s) => s?.session_id === sessionId);
+        const ref = item?.latest_tree?.ref ?? item?.latest_tree?.request_id;
+        return typeof ref === "string" && TREE_ID_RE.test(ref) && ref !== sessionId ? ref : undefined;
+    }
     async searchSessions(args, tree) {
-        const body = await this.get(`/memtree/search${searchQuery(args, tree)}`, "search");
+        const first = await this.fetch(`/memtree/search${searchQuery(args, tree)}`, "search");
+        let answer = first;
+        let narrowed;
+        for (const days of RECENT_SEARCH_WINDOWS_DAYS) {
+            const recent = recentSearchArgs(args, tree, answer.status, this.now(), days);
+            if (!recent)
+                break;
+            narrowed = { args: recent, days };
+            answer = await this.fetch(`/memtree/search${searchQuery(recent, tree)}`, "search");
+        }
+        // No window answered: the first refusal says how to narrow the search.
+        const body = this.bodyOf(answer.ok ? answer : narrowed && answer.status === 422
+            ? { ...first, error: `${first.error}${recentSearchFailedNote()}` } : first, "search");
         if (tree && (!body || typeof body !== "object" || body.tree !== tree)) {
             throw new ToolInputError("search: server did not confirm the requested tree; update the MemTree server before scoped search");
         }
-        return formatSearchResults(body, { ...args, tree });
+        const text = formatSearchResults(body, {
+            ...(narrowed?.args ?? args), tree,
+        });
+        if (!narrowed)
+            return text;
+        return `${recentSearchNote(narrowed.args.since, narrowed.days)}\n\n${text}`;
+    }
+    now() {
+        return this.deps.now?.() ?? Date.now();
     }
     async get(pathAndQuery, tool) {
-        const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, toolHeaders(tool, this.deps));
+        return this.bodyOf(await this.fetch(pathAndQuery, tool), tool);
+    }
+    fetch(pathAndQuery, tool) {
+        return proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, toolHeaders(tool, this.deps));
+    }
+    bodyOf(answer, tool) {
         if (answer.ok)
             return answer.body;
         if (answer.status === 404) {
@@ -685,6 +721,35 @@ function isRpcRequest(value) {
 class UnknownToolError extends Error {
 }
 async function callTool(name, args, tree, finder) {
+    const session = await sessionAsTree(args.tree, finder);
+    if (session) {
+        const text = await dispatchTool(name, { ...args, tree: session.ref }, tree, finder);
+        return `(${session.id} is a session id: this reads its newest tree, ${session.ref}.)\n\n${text}`;
+    }
+    return dispatchTool(name, args, tree, finder);
+}
+/** A bare UUID: a session id, or a legacy request id (a ref ends in -v<N>-own/served). */
+const BARE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * A `tree` that is a session id, resolved to that session's newest tree. Hand-offs name
+ * session ids (the instructions ask them to), and receiving agents pass them as `tree`:
+ * the page lookup then fails with 404, or a tail reads nothing (xsession benchmark,
+ * 2026-11-06). Undefined for anything else, including a legacy request id.
+ */
+async function sessionAsTree(value, finder) {
+    if (typeof value !== "string" || !BARE_UUID_RE.test(value.trim()) || !finder?.sessionTree) {
+        return undefined;
+    }
+    const id = value.trim();
+    try {
+        const ref = await finder.sessionTree(id);
+        return ref ? { id, ref } : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+async function dispatchTool(name, args, tree, finder) {
     switch (name) {
         case "search":
             return searchTool(args, tree, finder);

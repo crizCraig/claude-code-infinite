@@ -9,6 +9,13 @@
  */
 /** The resume-guidance hook's path (resume-guidance.ts): the notice hook's secret path plus this. */
 export declare const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
+/**
+ * The print-mode project-trees hook's path (project-trees.ts): the notice hook's secret
+ * path plus this. It answers only the earlier-sessions block, never a user-facing line.
+ */
+export declare const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
+/** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
+export declare const SUBAGENT_RESULT_HOOK_SUFFIX = "/subagent-result";
 export declare const MESSAGE_DISPLAY_MIN_VERSION = "2.1.166";
 /** Trailer labels; kept here so hooks.ts stays free of notices.ts imports. */
 export declare const TRAILER_LABEL = "\u2022 MemTree \u00B7";
@@ -320,6 +327,8 @@ export declare function createSessionNoticePlugin(hookUrl: string, opts?: {
      * Default on; off under CCC_AUTO_COMPACT=1, where Claude Code's own wins.
      */
     interceptCompact?: boolean;
+    /** Point the parent at a finished subagent's tree (PostToolUse on Agent|Task). */
+    subagentResult?: boolean;
 }): SessionNoticePlugin;
 /**
  * A plugin with only the SessionStart banner, for a session that runs without the
@@ -338,6 +347,14 @@ export declare function createStartupBannerPlugin(startupMessage: string, opts?:
  */
 export declare function createSubagentHookPlugin(hookUrl: string, opts?: {
     tempRoot?: string;
+    /**
+     * Name earlier sessions in this project at session start (project-trees.ts), from a
+     * SessionStart command hook relaying to PROJECT_TREES_HOOK_SUFFIX: additionalContext
+     * only (the model reads it), so stdout stays Claude Code's.
+     */
+    projectTrees?: boolean;
+    /** Point the parent at a finished subagent's tree (PostToolUse on Agent|Task). */
+    subagentResult?: boolean;
 }): SessionNoticePlugin;
 /** Return true only for known Claude versions that support MessageDisplay. */
 export declare function supportsMessageDisplay(versionOutput: string): boolean;

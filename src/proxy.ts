@@ -155,12 +155,17 @@ import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import {
+  isFinishedSubagentCall,
+  postToolUseOutput,
+  SUBAGENT_RESULT_HINT,
   subagentMemoryHintText,
   subagentStartOutput,
   type SubagentMemoryHint,
 } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
-import { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
+import {
+  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX,
+} from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
@@ -1230,7 +1235,14 @@ async function handleRequest(
     return handleNoticeHook(req, res, state, opts.reqlog, undefined, "PreCompact");
   }
   if (url.pathname === `${hookPath}${RESUME_GUIDANCE_HOOK_SUFFIX}`) {
-    return handleResumeGuidanceHook(req, res, state);
+    return handleSessionStartContextHook(req, res, (input) => resumeGuidanceContext(state, input));
+  }
+  if (url.pathname === `${hookPath}${SUBAGENT_RESULT_HOOK_SUFFIX}`) {
+    return handleSubagentResultHook(req, res, state);
+  }
+  if (url.pathname === `${hookPath}${PROJECT_TREES_HOOK_SUFFIX}`) {
+    return handleSessionStartContextHook(req, res,
+      (input) => projectTreesContext(state.projectTrees, input));
   }
   if (url.pathname === hookPath) {
     return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) =>
@@ -1534,10 +1546,47 @@ function noteMainSessionStart(
  * guidance, so Claude Code sees it as one context of its own and adds an
  * identical one only once. Never fails the hook: anything unexpected is 204.
  */
-async function handleResumeGuidanceHook(
+/**
+ * PostToolUse after a foreground Agent/Task call: point the model at the subagent's
+ * own tree (subagent-hint.ts), while MemTree works and the session has the tools.
+ */
+async function handleSubagentResultHook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: ProxyState
+): Promise<void> {
+  const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
+  if (req.method !== "POST") req.resume();
+  let input: unknown = null;
+  try {
+    if (raw !== undefined && raw.length > 0) input = JSON.parse(raw.toString("utf-8"));
+  } catch {
+    input = null;
+  }
+  const say = state.subagentHint?.enabled === true && memtreeWorking(state) &&
+    isFinishedSubagentCall(input);
+  if (!say) {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  const body = Buffer.from(JSON.stringify(postToolUseOutput(SUBAGENT_RESULT_HINT)), "utf-8");
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "content-length": String(body.length),
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+/**
+ * A SessionStart hook answered with model context only (no user-facing line): the
+ * resume guidance (resume-guidance.ts) and, in print runs, the project trees.
+ */
+async function handleSessionStartContextHook(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  contextFor: (input: SessionStartHookInput) => Promise<string | undefined>
 ): Promise<void> {
   const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
   if (req.method !== "POST") req.resume();
@@ -1550,7 +1599,7 @@ async function handleResumeGuidanceHook(
     input = null;
   }
   const context = input?.hook_event_name === "SessionStart"
-    ? await resumeGuidanceContext(state, input) : undefined;
+    ? await contextFor(input) : undefined;
   if (!context) {
     res.writeHead(204);
     res.end();
