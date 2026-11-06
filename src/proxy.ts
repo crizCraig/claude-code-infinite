@@ -155,7 +155,7 @@ import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import {
-  isFinishedSubagentCall,
+  isSubagentCall,
   postToolUseOutput,
   SUBAGENT_RESULT_HINT,
   subagentMemoryHintText,
@@ -1549,8 +1549,8 @@ function noteMainSessionStart(
 }
 
 /**
- * PostToolUse after a foreground Agent/Task call: point the model at the subagent's
- * own tree (subagent-hint.ts), while MemTree works and the session has the tools.
+ * PostToolUse after an Agent/Task call: point the model at the subagent's own tree
+ * (subagent-hint.ts), while MemTree works and the session has the tools.
  */
 async function handleSubagentResultHook(
   req: http.IncomingMessage,
@@ -1568,7 +1568,7 @@ async function handleSubagentResultHook(
     input = null;
   }
   const say = state.subagentHint?.enabled === true && memtreeWorking(state) &&
-    isFinishedSubagentCall(input);
+    isSubagentCall(input);
   if (!say) {
     res.writeHead(204);
     res.end();

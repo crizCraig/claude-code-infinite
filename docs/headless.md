@@ -112,10 +112,10 @@ step). In `-p` runs this hook comes from a small session plugin, so a stream-jso
 lists a plugin named `ccc` (and `--include-hook-events` shows its hook events); stdout is
 otherwise unchanged.
 
-**Parents are pointed at their subagents' work.** When a foreground Agent/Task call returns,
-ccc adds one line for the parent (PostToolUse): the result is only the subagent's final
-message, and its own work is in its own tree, so search without `tree` for a detail it didn't
-report before re-running its work.
+**Parents are pointed at their subagents' work.** After each Agent/Task call (a foreground
+result or a background launch), ccc adds one line for the parent (PostToolUse): a subagent's
+result is only its final message, and its own work is in its own tree, so search without
+`tree` for a detail it didn't report before re-running its work.
 
 **Earlier sessions in the same repo are named at start.** In a repository with an `origin`
 remote, a session (headless too) gets a short list of the newest earlier sessions in that

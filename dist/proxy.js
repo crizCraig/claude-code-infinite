@@ -64,7 +64,7 @@ import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paym
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
 import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
-import { isFinishedSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
+import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
@@ -773,8 +773,8 @@ function noteMainSessionStart(state, source, sessionId) {
     }
 }
 /**
- * PostToolUse after a foreground Agent/Task call: point the model at the subagent's
- * own tree (subagent-hint.ts), while MemTree works and the session has the tools.
+ * PostToolUse after an Agent/Task call: point the model at the subagent's own tree
+ * (subagent-hint.ts), while MemTree works and the session has the tools.
  */
 async function handleSubagentResultHook(req, res, state) {
     // The body carries the subagent's whole prompt and result: allow a large one.
@@ -791,7 +791,7 @@ async function handleSubagentResultHook(req, res, state) {
         input = null;
     }
     const say = state.subagentHint?.enabled === true && memtreeWorking(state) &&
-        isFinishedSubagentCall(input);
+        isSubagentCall(input);
     if (!say) {
         res.writeHead(204);
         res.end();

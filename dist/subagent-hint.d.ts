@@ -27,24 +27,19 @@ export declare class SubagentMemoryHint {
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
 export declare function subagentMemoryHintText(sessionId: string, treeRef: string): string | undefined;
 /**
- * Said to the parent when a (foreground) Agent/Task call returns: the result is only
- * the subagent's final message; its evidence is in its own MemTree tree, which nothing
- * else points at (xsession benchmark 2026-11-06: parents asked for a detail the
- * subagent read but didn't report resumed it or re-ran the work instead of searching).
- * Constant, so it adds no cache churn beyond its own few tokens.
+ * Said to the parent after each Agent/Task call: a subagent's result (returned now, or
+ * as a notification when it was launched in the background, which `-p` runs mostly
+ * are) is only its final message; its evidence is in its own MemTree tree, which
+ * nothing else points at. xsession benchmark 2026-11-06: parents asked for a detail
+ * the subagent read but didn't report searched only their own tree, resumed the
+ * subagent or re-ran the work; with this line they searched memory first. Worded to be
+ * true at launch and at completion. Constant: no cache churn beyond its own tokens.
  */
 export declare const SUBAGENT_RESULT_HINT: string;
 /** Agent tools whose PostToolUse gets SUBAGENT_RESULT_HINT. */
 export declare const AGENT_TOOL_NAMES: readonly ["Agent", "Task"];
-/**
- * Whether a PostToolUse input is a finished foreground subagent call: an Agent/Task
- * call that was not launched in the background, whose result is only a launch receipt.
- * Claude Code (2.1.319) also backgrounds agents without `run_in_background` (forced
- * async, `background: true` definitions, forks, remote isolation) and then answers
- * `tool_response.status` "async_launched" or "remote_launched"; a status, when there is
- * one, must be "completed".
- */
-export declare function isFinishedSubagentCall(input: unknown): boolean;
+/** Whether a PostToolUse input is an Agent/Task call (foreground, or a background launch). */
+export declare function isSubagentCall(input: unknown): boolean;
 /** The PostToolUse hook's answer carrying `context` to the model. */
 export declare function postToolUseOutput(context: string): Record<string, unknown>;
 /** The SubagentStart hook's answer carrying `context` to the subagent. */

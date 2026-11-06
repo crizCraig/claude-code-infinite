@@ -20,7 +20,7 @@ export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
 export const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
 /** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
 export const SUBAGENT_RESULT_HOOK_SUFFIX = "/subagent-result";
-/** PostToolUse on a finished subagent call, answered with SUBAGENT_RESULT_HINT. */
+/** PostToolUse on a subagent call (Agent|Task), answered with SUBAGENT_RESULT_HINT. */
 function subagentResultHook(hookUrl) {
     return {
         matcher: "Agent|Task",

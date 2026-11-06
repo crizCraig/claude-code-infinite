@@ -23,7 +23,7 @@ import { ProjectTreesHint } from "../dist/project-trees.js";
 import { MEMTREE_LOADED_NOTE, MEMTREE_TOOLS } from "../dist/memtree-mcp.js";
 import { NewestTreeLookup } from "../dist/memtree-newest.js";
 import {
-  isFinishedSubagentCall,
+  isSubagentCall,
   postToolUseOutput,
   SUBAGENT_RESULT_HINT,
   SubagentMemoryHint,
@@ -287,20 +287,18 @@ test("the subagent-result line is short and names search without tree and read_l
   assert.ok(SUBAGENT_RESULT_HINT.length < 400, SUBAGENT_RESULT_HINT.length);
   assert.match(SUBAGENT_RESULT_HINT, /mcp__memtree__search without tree/);
   assert.match(SUBAGENT_RESULT_HINT, /read_lines/);
+  assert.match(SUBAGENT_RESULT_HINT, /^ccc: A subagent's result is only its final message/,
+    "true at launch and at completion");
   const call = (extra = {}) => ({ hook_event_name: "PostToolUse", tool_name: "Agent",
     tool_input: { prompt: "x" }, ...extra });
-  assert.ok(isFinishedSubagentCall(call()));
-  assert.ok(isFinishedSubagentCall(call({ tool_name: "Task" })));
-  assert.ok(!isFinishedSubagentCall(call({ tool_input: { run_in_background: true } })),
-    "a background launch returns only a receipt");
-  assert.ok(isFinishedSubagentCall(call({ tool_response: { status: "completed" } })));
-  for (const status of ["async_launched", "remote_launched"]) {
-    assert.ok(!isFinishedSubagentCall(call({ tool_response: { status } })),
-      `${status}: launched in the background without run_in_background`);
-  }
-  assert.ok(!isFinishedSubagentCall(call({ tool_name: "Bash" })));
-  assert.ok(!isFinishedSubagentCall(call({ hook_event_name: "PreToolUse" })));
-  assert.ok(!isFinishedSubagentCall(null));
+  assert.ok(isSubagentCall(call()));
+  assert.ok(isSubagentCall(call({ tool_name: "Task" })));
+  assert.ok(isSubagentCall(call({ tool_input: { run_in_background: true } })),
+    "a background launch too: -p runs launch most subagents that way");
+  assert.ok(isSubagentCall(call({ tool_response: { status: "async_launched" } })));
+  assert.ok(!isSubagentCall(call({ tool_name: "Bash" })));
+  assert.ok(!isSubagentCall(call({ hook_event_name: "PreToolUse" })));
+  assert.ok(!isSubagentCall(null));
 });
 
 test("both plugins add PostToolUse on Agent|Task only when asked", () => {
@@ -337,15 +335,15 @@ async function subagentResult(h, extra = {}) {
   return res.status === 204 ? null : await res.json();
 }
 
-test("proxy: a finished subagent call points the parent at its tree while MemTree works", async () => {
+test("proxy: a subagent call points the parent at its tree while MemTree works", async () => {
   const h = await harness();
   try {
     assert.equal(await subagentResult(h), null, "MemTree has not answered yet");
     await turn(h);
     assert.deepEqual(await subagentResult(h), postToolUseOutput(SUBAGENT_RESULT_HINT));
-    assert.equal(await subagentResult(h, { tool_input: { run_in_background: true } }), null);
+    assert.deepEqual(await subagentResult(h, { tool_response: { status: "async_launched" } }),
+      postToolUseOutput(SUBAGENT_RESULT_HINT), "a background launch too");
     assert.equal(await subagentResult(h, { tool_name: "Bash" }), null);
-    assert.equal(await subagentResult(h, { tool_response: { status: "async_launched" } }), null);
     const big = "x".repeat(200 * 1024);
     assert.deepEqual(await subagentResult(h, { tool_response: { status: "completed",
       content: [{ type: "text", text: big }] } }), postToolUseOutput(SUBAGENT_RESULT_HINT),

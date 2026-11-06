@@ -52,37 +52,28 @@ export function subagentMemoryHintText(
 }
 
 /**
- * Said to the parent when a (foreground) Agent/Task call returns: the result is only
- * the subagent's final message; its evidence is in its own MemTree tree, which nothing
- * else points at (xsession benchmark 2026-11-06: parents asked for a detail the
- * subagent read but didn't report resumed it or re-ran the work instead of searching).
- * Constant, so it adds no cache churn beyond its own few tokens.
+ * Said to the parent after each Agent/Task call: a subagent's result (returned now, or
+ * as a notification when it was launched in the background, which `-p` runs mostly
+ * are) is only its final message; its evidence is in its own MemTree tree, which
+ * nothing else points at. xsession benchmark 2026-11-06: parents asked for a detail
+ * the subagent read but didn't report searched only their own tree, resumed the
+ * subagent or re-ran the work; with this line they searched memory first. Worded to be
+ * true at launch and at completion. Constant: no cache churn beyond its own tokens.
  */
 export const SUBAGENT_RESULT_HINT =
-  "ccc: This result is only the subagent's final message. Its own work (files it read, " +
-  "commands and their output) is in MemTree, in its own tree, indexed as it ends. For a " +
+  "ccc: A subagent's result is only its final message. Its own work (files it read, " +
+  "commands and their output) is in MemTree, in its own tree, indexed when it ends. For a " +
   "detail it didn't report, mcp__memtree__search without tree (an id, name or term from " +
   "its task), then read_lines on the hit, before re-running its work.";
 
 /** Agent tools whose PostToolUse gets SUBAGENT_RESULT_HINT. */
 export const AGENT_TOOL_NAMES = ["Agent", "Task"] as const;
 
-/**
- * Whether a PostToolUse input is a finished foreground subagent call: an Agent/Task
- * call that was not launched in the background, whose result is only a launch receipt.
- * Claude Code (2.1.319) also backgrounds agents without `run_in_background` (forced
- * async, `background: true` definitions, forks, remote isolation) and then answers
- * `tool_response.status` "async_launched" or "remote_launched"; a status, when there is
- * one, must be "completed".
- */
-export function isFinishedSubagentCall(input: unknown): boolean {
+/** Whether a PostToolUse input is an Agent/Task call (foreground, or a background launch). */
+export function isSubagentCall(input: unknown): boolean {
   const raw = input as Record<string, unknown> | null;
   if (!raw || raw.hook_event_name !== "PostToolUse") return false;
-  if (!(AGENT_TOOL_NAMES as readonly unknown[]).includes(raw.tool_name)) return false;
-  const toolInput = raw.tool_input as Record<string, unknown> | undefined;
-  if (toolInput?.run_in_background === true) return false;
-  const status = (raw.tool_response as Record<string, unknown> | undefined)?.status;
-  return status === undefined || status === "completed";
+  return (AGENT_TOOL_NAMES as readonly unknown[]).includes(raw.tool_name);
 }
 
 /** The PostToolUse hook's answer carrying `context` to the model. */
