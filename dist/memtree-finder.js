@@ -51,6 +51,51 @@ export function searchQuery(args, tree) {
     addLimit(params, args.limit, FINDER_SEARCH_MAX_LIMIT);
     return `?${params.toString()}`;
 }
+/**
+ * A search across all sessions that the server refused as too broad (422: it
+ * did not finish in time) is retried over the newest days, widest window first.
+ * Measured on staging (2026-11-06): ~28% of agent searches came back 422 after
+ * 9-16 s. On its busiest account an unscoped search took ~10.5 s even for a word in
+ * no session (the cost is finding the account's trees, not matching), 14 and 7 days
+ * still timed out, and 2-3 days answered in ~0.5 s. The agents' own retries succeeded
+ * once they added a recent `since`. Only when the caller set no tree, time bounds or
+ * cursor.
+ */
+export const RECENT_SEARCH_WINDOWS_DAYS = [3, 1];
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** The narrowed retry's arguments for `days`, or undefined when no retry applies. */
+export function recentSearchArgs(args, tree, status, nowMs, days) {
+    if (status !== 422 || tree)
+        return undefined;
+    if (isSet(args.since) || isSet(args.until) || isSet(args.cursor))
+        return undefined;
+    // A vector search may time out after its paid embedding: a retry would pay again.
+    if (searchMode(args.mode) === "vector")
+        return undefined;
+    const since = new Date(nowMs - days * DAY_MS).toISOString().slice(0, 10);
+    return { ...args, since };
+}
+/** Added to the refusal when no narrowed window answered either. */
+export function recentSearchFailedNote(triedDays, last) {
+    const windows = triedDays.map((d) => (d === 1 ? "1 day" : `${d} days`)).join(", then ");
+    const how = last.status === 422 ? "too broad as well; add a rarer word, project or tree"
+        : `that failed: ${last.error ?? `HTTP ${last.status}`}`;
+    return ` (ccc also tried the last ${windows}: ${how})`;
+}
+/** Said first in a narrowed retry's answer, so the model knows what was left out. */
+export function recentSearchNote(since, days, pages = false) {
+    // The server binds a cursor to the search's filters, `since` included.
+    const more = pages
+        ? ` To page on, add "since": "${since}" to the same arguments with the cursor below.`
+        : "";
+    return (`Searching all sessions matched too much to finish in time, so this searched only ` +
+        `sessions active since ${since} (the last ${days === 1 ? "day" : `${days} days`}). ` +
+        "For older work, search again " +
+        "with since/until, project or tree, or a rarer word (a name, id or path)." + more);
+}
+function isSet(value) {
+    return value !== undefined && value !== null && value !== "";
+}
 export function searchMode(value) {
     if (value === undefined || value === null || value === "")
         return "text";

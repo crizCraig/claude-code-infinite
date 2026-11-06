@@ -31,6 +31,17 @@ export class SubagentMemoryHint {
         return !this.disabled;
     }
 }
+/**
+ * The subagent hints for this run, or undefined: the session needs the `search` tool
+ * they name, and MemTree must not be known off at startup (an invalid key, or [c] at
+ * the payment gate). The proxy's own working check can't know that before MemTree
+ * answers a request, and the after-a-subagent line is given before then too.
+ */
+export function subagentHintFor(s) {
+    if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff)
+        return undefined;
+    return new SubagentMemoryHint();
+}
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
 export function subagentMemoryHintText(sessionId, treeRef) {
     if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef))
@@ -39,6 +50,32 @@ export function subagentMemoryHintText(sessionId, treeRef) {
         `${treeRef}; your own work is indexed too. Before re-deriving earlier decisions, ` +
         "findings or commands from the parent's work, search its memory: mcp__memtree__search " +
         `with tree ${treeRef} (or without tree to search all sessions).`);
+}
+/**
+ * Said to the parent after each Agent/Task call: a subagent's result (returned now, or
+ * as a notification when it was launched in the background, which `-p` runs mostly
+ * are) is only its final message; its evidence is in its own MemTree tree, which
+ * nothing else points at. xsession benchmark 2026-11-06: parents asked for a detail
+ * the subagent read but didn't report searched only their own tree, resumed the
+ * subagent or re-ran the work; with this line they searched memory first. Worded to be
+ * true at launch and at completion. Constant: no cache churn beyond its own tokens.
+ */
+export const SUBAGENT_RESULT_HINT = "ccc: A subagent's result is only its final message. Its own work (files it read, " +
+    "commands and their output) is in MemTree, in its own tree, indexed when it ends. For a " +
+    "detail it didn't report, mcp__memtree__search without tree (an id, name or term from " +
+    "its task), then read_lines on the hit, before re-running its work.";
+/** Agent tools whose PostToolUse gets SUBAGENT_RESULT_HINT. */
+export const AGENT_TOOL_NAMES = ["Agent", "Task"];
+/** Whether a PostToolUse input is an Agent/Task call (foreground, or a background launch). */
+export function isSubagentCall(input) {
+    const raw = input;
+    if (!raw || raw.hook_event_name !== "PostToolUse")
+        return false;
+    return AGENT_TOOL_NAMES.includes(raw.tool_name);
+}
+/** The PostToolUse hook's answer carrying `context` to the model. */
+export function postToolUseOutput(context) {
+    return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: context } };
 }
 /** The SubagentStart hook's answer carrying `context` to the subagent. */
 export function subagentStartOutput(context) {

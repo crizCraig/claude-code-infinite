@@ -155,12 +155,17 @@ import type { ProjectMeta } from "./project-meta.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import {
+  isSubagentCall,
+  postToolUseOutput,
+  SUBAGENT_RESULT_HINT,
   subagentMemoryHintText,
   subagentStartOutput,
   type SubagentMemoryHint,
 } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
-import { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
+import {
+  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX,
+} from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
@@ -181,6 +186,11 @@ import {
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
+/**
+ * Hook bodies that carry a whole prompt (UserPromptSubmit) or a subagent's prompt and
+ * full result (PostToolUse on Agent|Task).
+ */
+const LARGE_HOOK_BODY_LIMIT = 16 * 1024 * 1024;
 /** A hook body still arriving after this is dropped (the hook itself waits 5 s). */
 const HOOK_BODY_TIMEOUT_MS = 3_000;
 // After a recovery attempt returns null (MemTree down, 5xx, or a burned
@@ -489,6 +499,8 @@ interface ProxyState {
   openUrl?: UrlOpener;
   /** ProxyOptions.projectTrees. */
   projectTrees?: ProjectTreesHint;
+  /** Print-run sessions already given the project-trees block (handlePrintProjectTreesHook). */
+  projectTreesGiven: Set<string>;
   /** ProxyOptions.subagentHint. */
   subagentHint?: SubagentMemoryHint;
   /** ProxyOptions.resumeGuidance. */
@@ -1054,6 +1066,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     openUrl: opts.openUrl,
     projectTrees: opts.projectTrees,
     subagentHint: opts.subagentHint,
+    projectTreesGiven: new Set<string>(),
     resumeGuidance: opts.resumeGuidance,
     diagnostics: opts.diagnostics,
     notices: new NoticeDeliveryQueue(),
@@ -1230,7 +1243,13 @@ async function handleRequest(
     return handleNoticeHook(req, res, state, opts.reqlog, undefined, "PreCompact");
   }
   if (url.pathname === `${hookPath}${RESUME_GUIDANCE_HOOK_SUFFIX}`) {
-    return handleResumeGuidanceHook(req, res, state);
+    return handleSessionStartContextHook(req, res, (input) => resumeGuidanceContext(state, input));
+  }
+  if (url.pathname === `${hookPath}${SUBAGENT_RESULT_HOOK_SUFFIX}`) {
+    return handleSubagentResultHook(req, res, state);
+  }
+  if (url.pathname === `${hookPath}${PROJECT_TREES_HOOK_SUFFIX}`) {
+    return handlePrintProjectTreesHook(req, res, state);
   }
   if (url.pathname === hookPath) {
     return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) =>
@@ -1530,14 +1549,101 @@ function noteMainSessionStart(
 }
 
 /**
+ * PostToolUse after an Agent/Task call: point the model at the subagent's own tree
+ * (subagent-hint.ts), unless MemTree is known not to work, when the session has the tools.
+ */
+async function handleSubagentResultHook(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  state: ProxyState
+): Promise<void> {
+  // The body carries the subagent's whole prompt and result: allow a large one.
+  const raw = req.method === "POST"
+    ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
+  if (req.method !== "POST") req.resume();
+  let input: unknown = null;
+  try {
+    if (raw !== undefined && raw.length > 0) input = JSON.parse(raw.toString("utf-8"));
+  } catch {
+    input = null;
+  }
+  // Not known to be broken is enough: a short print run's first requests can finish
+  // before MemTree has answered any (non-blocking first turn), and the subagent is
+  // indexed either way.
+  const say = state.subagentHint?.enabled === true && resumeMemtreeWorking(state) &&
+    isSubagentCall(input);
+  if (!say) {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  const body = Buffer.from(JSON.stringify(postToolUseOutput(SUBAGENT_RESULT_HINT)), "utf-8");
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "content-length": String(body.length),
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+/**
+ * Print runs: the earlier-sessions block (project-trees.ts) with a session's first
+ * prompt, as UserPromptSubmit context. Main sessions only, once per session per
+ * process; anything unexpected is 204.
+ */
+async function handlePrintProjectTreesHook(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  state: ProxyState
+): Promise<void> {
+  // The body carries the whole prompt.
+  const raw = req.method === "POST" ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
+  if (req.method !== "POST") req.resume();
+  let input: NoticeHookInput | null = null;
+  try {
+    if (raw !== undefined && raw.length > 0) {
+      input = parseNoticeHookInput(JSON.parse(raw.toString("utf-8")));
+    }
+  } catch {
+    input = null;
+  }
+  const first = input?.hook_event_name === "UserPromptSubmit" && input.agent_id === undefined &&
+    !state.projectTreesGiven.has(input.session_id);
+  const context = first && state.projectTrees
+    ? await safeContext(() => state.projectTrees!.contextFor(input!.session_id)) : undefined;
+  if (!context) {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  state.projectTreesGiven.add(input!.session_id);
+  const body = Buffer.from(JSON.stringify({ hookSpecificOutput: {
+    hookEventName: "UserPromptSubmit", additionalContext: context } }), "utf-8");
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "content-length": String(body.length),
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+async function safeContext(get: () => Promise<string | undefined>): Promise<string | undefined> {
+  try {
+    return await get();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * SessionStart on its own hook (resume-guidance.ts): only the current MemTree
  * guidance, so Claude Code sees it as one context of its own and adds an
  * identical one only once. Never fails the hook: anything unexpected is 204.
  */
-async function handleResumeGuidanceHook(
+async function handleSessionStartContextHook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  state: ProxyState
+  contextFor: (input: SessionStartHookInput) => Promise<string | undefined>
 ): Promise<void> {
   const raw = req.method === "POST" ? await readBodyWithin(req, HOOK_BODY_LIMIT) : undefined;
   if (req.method !== "POST") req.resume();
@@ -1550,7 +1656,7 @@ async function handleResumeGuidanceHook(
     input = null;
   }
   const context = input?.hook_event_name === "SessionStart"
-    ? await resumeGuidanceContext(state, input) : undefined;
+    ? await contextFor(input) : undefined;
   if (!context) {
     res.writeHead(204);
     res.end();

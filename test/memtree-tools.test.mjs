@@ -55,6 +55,72 @@ test("scoped finder responses must confirm the requested tree; unscoped legacy h
   assert.match(await finder.searchSessions({ query: "x" }, "wanted"), /read_lines/);
 });
 
+test("a search across all sessions refused as too broad (422) is retried over 3 days, then 1", async () => {
+  const urls = [];
+  const tooBroad = () => Response.json({ detail: "The search matched too much to finish in time." }, { status: 422 });
+  const hits = () => Response.json({ hits: [{ id: "s", tree: { request_id: "t1" }, range: { block: 0, start: 1, end: 2 } }] });
+  let answers = [tooBroad, hits];
+  const finder = new SessionFinder({
+    proxyUrl: "http://localhost:9",
+    now: () => Date.parse("2026-11-06T12:00:00Z"),
+    fetch: async (url) => { urls.push(String(url)); return answers.shift()(); },
+  });
+  const since = () => urls.map((u) => new URL(u).searchParams.get("since"));
+  let text = await finder.searchSessions({ query: "memtree-note to:beta" });
+  assert.deepEqual(since(), [null, "2026-11-03"]);
+  assert.doesNotMatch(text, /To page on/, "one page: nothing to continue");
+  assert.match(text, /^Searching all sessions matched too much .* since 2026-11-03 \(the last 3 days\)/);
+  assert.match(text, /read_lines/);
+
+  urls.length = 0;
+  answers = [tooBroad, tooBroad, hits];
+  text = await finder.searchSessions({ query: "x" });
+  assert.deepEqual(since(), [null, "2026-11-03", "2026-11-05"]);
+  assert.match(text, /since 2026-11-05 \(the last day\)/);
+
+  // A narrowed answer with more pages says the cursor needs the narrowed `since`.
+  urls.length = 0;
+  answers = [tooBroad, () => Response.json({ hits: [{ id: "s", tree: { request_id: "t1" },
+    range: { block: 0, start: 1, end: 2 } }], next_cursor: "bound" })];
+  text = await finder.searchSessions({ query: "x" });
+  assert.match(text, /To page on, add "since": "2026-11-03" to the same arguments with the cursor below\./);
+
+  // No window answered: the first refusal's advice is the answer.
+  urls.length = 0;
+  answers = [tooBroad, tooBroad, tooBroad];
+  await assert.rejects(finder.searchSessions({ query: "x" }),
+    /search failed: HTTP 422 The search matched too much.*also tried the last 3 days, then 1 day: too broad as well/);
+  assert.equal(urls.length, 3);
+
+  // A narrowed retry that fails otherwise: the refusal says the windows were tried.
+  urls.length = 0;
+  answers = [tooBroad, () => Response.json({ detail: "slow down" }, { status: 429 })];
+  await assert.rejects(finder.searchSessions({ query: "x" }),
+    /HTTP 422 .*also tried the last 3 days: that failed: HTTP 429 slow down\)/);
+  assert.equal(urls.length, 2, "a non-422 failure is not narrowed again");
+
+  // A vector search is never narrowed (its embedding is paid again on each try).
+  urls.length = 0;
+  answers = [tooBroad];
+  await assert.rejects(finder.searchSessions({ query: "x", mode: "vector" }), /HTTP 422/);
+  assert.equal(urls.length, 1);
+
+  // Another failure is not narrowed.
+  urls.length = 0;
+  answers = [() => Response.json({ detail: "boom" }, { status: 500 })];
+  await assert.rejects(finder.searchSessions({ query: "x" }), /HTTP 500/);
+  assert.equal(urls.length, 1);
+
+  // The caller's own bounds, a tree or a cursor: no second guess.
+  for (const [args, tree] of [[{ query: "x", since: "2026-01-01" }], [{ query: "x", until: "2026-01-01" }],
+    [{ query: "x", cursor: "c" }], [{ query: "x" }, "tree-1"]]) {
+    urls.length = 0;
+    answers = [tooBroad];
+    await assert.rejects(finder.searchSessions(args, tree), /HTTP 422/);
+    assert.equal(urls.length, 1);
+  }
+});
+
 test("current search and prefix cache enforce the page session", async () => {
   const fetch = async (url) => Response.json(String(url).includes("/current")
     ? { id: "page", session_id: "A" }
@@ -522,6 +588,71 @@ test("read_lines starting inside a message without a time says so", () => {
     assert.match(text, /^block 0 \[2026-09-30 14:05 PT; lines 2-2: time not recorded\] lines 2-7 /);
     assert.match(text, /\n6\tMessage 2 from user:\n/, "said once");
   });
+});
+
+test("SessionFinder.sessionTree finds the exact session past sessions that quote its id", async () => {
+  const SID = "c4e76ef6-0cc0-4291-beef-9a0c29681fa6";
+  const urls = [];
+  const finder = new SessionFinder({ proxyUrl: "http://localhost:9", fetch: async (url) => {
+    const u = new URL(url);
+    urls.push(u.searchParams.get("cursor"));
+    if (!u.searchParams.has("cursor")) {
+      return Response.json({ sessions: Array.from({ length: 5 }, (_, i) =>
+        ({ session_id: `other-${i}`, title: `hand-off from ${SID}` })), next_cursor: "page2" });
+    }
+    return Response.json({ sessions: [{ session_id: SID, latest_tree: { ref: "abc-v1-own" } }], next_cursor: null });
+  } });
+  assert.equal(await finder.sessionTree(SID), "abc-v1-own");
+  assert.deepEqual(urls, [null, "page2"]);
+  // No such session, a cursor that repeats, or no tree: undefined, within a few pages.
+  urls.length = 0;
+  const looping = new SessionFinder({ proxyUrl: "http://localhost:9", fetch: async (url) => {
+    urls.push(new URL(url).searchParams.get("cursor"));
+    return Response.json({ sessions: [{ session_id: "other" }], next_cursor: `c${urls.length}` });
+  } });
+  assert.equal(await looping.sessionTree(SID), undefined);
+  assert.equal(urls.length, 3);
+  const treeless = new SessionFinder({ proxyUrl: "http://localhost:9",
+    fetch: async () => Response.json({ sessions: [{ session_id: SID, latest_tree: null }] }) });
+  assert.equal(await treeless.sessionTree(SID), undefined);
+  // Answers (hits and misses) are reused for a minute: a legacy id read node by node
+  // asks once.
+  let now = 0;
+  let asked = 0;
+  const cached = new SessionFinder({ proxyUrl: "http://localhost:9", now: () => now,
+    fetch: async () => { asked++; return Response.json({ sessions: [] }); } });
+  assert.equal(await cached.sessionTree(SID), undefined);
+  assert.equal(await cached.sessionTree(SID), undefined);
+  assert.equal(asked, 1);
+  now = 61_000;
+  await cached.sessionTree(SID);
+  assert.equal(asked, 2);
+});
+
+test("a session id passed as tree reads that session's newest tree, and says so", async () => {
+  const SID = "c4e76ef6-0cc0-4291-beef-9a0c29681fa6";
+  const asked = [];
+  const tree = { get: async (id) => { asked.push(id); return index(); },
+    tail: async (id) => `tail of ${id}` };
+  const finder = {
+    listSessions: async () => "",
+    searchSessions: async (args, scope) => `searched ${scope}`,
+    sessionTree: async (id) => (id === SID ? "8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own" : undefined),
+  };
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } },
+      tree, finder)).result.content[0].text;
+  const note = new RegExp(`^\\(${SID} is a session id: this reads its newest tree, 8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own\\.\\)`);
+  assert.match(await call("read_node", { tree: SID, id: 0 }), note);
+  assert.deepEqual(asked, ["8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own"]);
+  assert.match(await call("read_lines", { tree: SID, tail: true }), /tail of 8004b306-72c6-4ffc-a77a-1b2b2b30535a-v1-own/);
+  assert.match(await call("search", { tree: SID, query: "x", mode: "vector" }), /searched 8004b306/);
+  // A legacy request id (no session of that id) and a pinned ref pass through unchanged.
+  asked.length = 0;
+  const other = "11111111-2222-3333-4444-555555555555";
+  assert.doesNotMatch(await call("read_node", { tree: other, id: 0 }), /is a session id/);
+  await call("read_node", { tree: "abc-v1-own", id: 0 });
+  assert.deepEqual(asked, [other, "abc-v1-own"]);
 });
 
 test("read_lines and read_node take current#N as this session's current tree", async () => {

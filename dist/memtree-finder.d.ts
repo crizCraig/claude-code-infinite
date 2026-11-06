@@ -114,6 +114,26 @@ export interface FinderSearchCoverage {
 export declare function sessionsQuery(args: Record<string, unknown>): string;
 /** Query string for `/memtree/search`; `mode` defaults to text; `tree` scopes it to one tree. */
 export declare function searchQuery(args: Record<string, unknown>, tree?: string): string;
+/**
+ * A search across all sessions that the server refused as too broad (422: it
+ * did not finish in time) is retried over the newest days, widest window first.
+ * Measured on staging (2026-11-06): ~28% of agent searches came back 422 after
+ * 9-16 s. On its busiest account an unscoped search took ~10.5 s even for a word in
+ * no session (the cost is finding the account's trees, not matching), 14 and 7 days
+ * still timed out, and 2-3 days answered in ~0.5 s. The agents' own retries succeeded
+ * once they added a recent `since`. Only when the caller set no tree, time bounds or
+ * cursor.
+ */
+export declare const RECENT_SEARCH_WINDOWS_DAYS: readonly [3, 1];
+/** The narrowed retry's arguments for `days`, or undefined when no retry applies. */
+export declare function recentSearchArgs(args: Record<string, unknown>, tree: string | undefined, status: number, nowMs: number, days: number): Record<string, unknown> | undefined;
+/** Added to the refusal when no narrowed window answered either. */
+export declare function recentSearchFailedNote(triedDays: readonly number[], last: {
+    status: number;
+    error?: string;
+}): string;
+/** Said first in a narrowed retry's answer, so the model knows what was left out. */
+export declare function recentSearchNote(since: string, days: number, pages?: boolean): string;
 export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
 /** The calling Claude Code session: its entry is marked "(this session)". */

@@ -126,8 +126,13 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.equal(result.args[2], "--plugin-dir");
   assert.deepEqual(result.args.slice(4), ["-p", "--output-format", "json", "--", "hi"]);
   assert.deepEqual(result.servers, ["memtree"]);
-  assert.deepEqual(result.hooks, ["SubagentStart", "SubagentStop"],
-    "only the subagent hooks: a subagent is told whose memory to search");
+  // The subagent hooks (a subagent is told whose memory to search), the parent's pointer
+  // to a finished subagent's tree, and, in a repo with an origin remote (as this
+  // checkout), the earlier-sessions block with the first prompt: none prints to stdout.
+  assert.deepEqual(result.hooks.filter((name) => name !== "UserPromptSubmit"),
+    ["SubagentStart", "SubagentStop", "PostToolUse"]);
+  assert.ok(!result.hooks.includes("SessionStart"),
+    "Claude Code prints SessionStart hook events on stream-json stdout");
   // The banner and notices still reach a human, on stderr and uncoloured.
   assert.match(stderr, /Claude Code Infinite/);
   assert.match(stderr, /LOCAL MODE/);

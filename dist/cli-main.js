@@ -30,7 +30,7 @@ import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, upd
 import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
-import { SubagentMemoryHint } from "./subagent-hint.js";
+import { subagentHintFor } from "./subagent-hint.js";
 import { resumeGuidanceFor } from "./resume-guidance.js";
 import { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, fetchKeyStatus, keyPageUrl, resolveInvalidKey, } from "./key-status.js";
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
@@ -569,7 +569,8 @@ async function main() {
     });
     // Earlier sessions in this project, named to the model at session start
     // (project-trees.ts). Asked now so the answer is in before Claude Code's
-    // first SessionStart hook; interactive sessions with the memtree tools only.
+    // first SessionStart hook (a print run: its first prompt); sessions with the memtree
+    // tools only.
     // Not after an invalid key or [c] at the payment gate (a resumed session
     // reaches here paused): the lookup could only fail.
     const projectTrees = projectTreesHintFor({
@@ -578,10 +579,12 @@ async function main() {
         fetchJson: (pathAndQuery, signal) => memtree.fetchMemTree(pathAndQuery, "application/json", signal),
     });
     projectTrees?.prefetch();
-    // A subagent is told whose memory to search (subagent-hint.ts) when the
-    // session has the `search` tool the hint names.
-    const subagentHint = memtreeMcpPlan.tools.includes("search")
-        ? new SubagentMemoryHint() : undefined;
+    // A subagent is told whose memory to search, and its parent where the subagent's
+    // work is (subagent-hint.ts), when the session has the `search` tool they name and
+    // MemTree is not known off at startup.
+    const subagentHint = subagentHintFor({
+        tools: memtreeMcpPlan.tools, keyCheck: checked.check, memtreeOff,
+    });
     // A resumed session is given the current MemTree guidance (resume-guidance.ts):
     // Claude Code keeps the server instructions it first announced.
     const resumeGuidance = resumeGuidanceFor({
@@ -698,6 +701,7 @@ async function main() {
                 resumeGuidance: resumeGuidance !== undefined,
                 // CCC_AUTO_COMPACT=1 hands compaction back to Claude Code: /compact runs as typed.
                 interceptCompact: process.env.CCC_AUTO_COMPACT !== "1",
+                subagentResult: subagentHint !== undefined,
             });
             // Global option must precede a user-supplied `--`, positional prompt, or
             // subcommand; --plugin-dir itself is repeatable, so existing dirs remain.
@@ -714,7 +718,10 @@ async function main() {
     else if (subagentHint) {
         // Print/non-TTY: no display hooks, but subagents still get the memory hint.
         try {
-            noticePlugin = createSubagentHookPlugin(proxy.hookUrl);
+            noticePlugin = createSubagentHookPlugin(proxy.hookUrl, {
+                projectTrees: projectTrees !== undefined,
+                subagentResult: true,
+            });
             childArgs = withSessionNoticePluginArgs(childArgs, noticePlugin.dir);
         }
         catch (err) {
