@@ -256,6 +256,8 @@ export const MEMTREE_TOOLS = [
 ].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
 /** A request id in either spelling (UUID or the short leading-hex form). */
 const TREE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** Pages of `list` results a session-id-as-tree lookup reads at most. */
+const SESSION_TREE_MAX_PAGES = 3;
 /** Other sessions' pages kept in memory at once (each can be several MB). */
 const OTHER_TREES_CACHED = 4;
 /** GET JSON from the loopback proxy; never throws. */
@@ -597,15 +599,28 @@ export class SessionFinder {
         return formatSessions(body, args, this.deps.sessionId);
     }
     async sessionTree(sessionId) {
-        const answer = await this.fetch(`/memtree/sessions${sessionsQuery({ q: sessionId, limit: 5 })}`, "list");
-        if (!answer.ok)
-            return undefined;
-        const sessions = answer.body?.sessions;
-        if (!Array.isArray(sessions))
-            return undefined;
-        const item = sessions.find((s) => s?.session_id === sessionId);
-        const ref = item?.latest_tree?.ref ?? item?.latest_tree?.request_id;
-        return typeof ref === "string" && TREE_ID_RE.test(ref) && ref !== sessionId ? ref : undefined;
+        // `q` also matches titles and first messages, so sessions quoting the id (a hand-off)
+        // can fill the first page: follow the cursor, a few pages at most.
+        let cursor;
+        for (let page = 0; page < SESSION_TREE_MAX_PAGES; page++) {
+            const query = sessionsQuery({ q: sessionId, limit: SESSIONS_MAX_LIMIT, cursor });
+            const answer = await this.fetch(`/memtree/sessions${query}`, "list");
+            if (!answer.ok)
+                return undefined;
+            const body = answer.body;
+            if (!Array.isArray(body?.sessions))
+                return undefined;
+            const item = body.sessions.find((s) => s?.session_id === sessionId);
+            if (item) {
+                const ref = item.latest_tree?.ref ?? item.latest_tree?.request_id;
+                return typeof ref === "string" && TREE_ID_RE.test(ref) && ref !== sessionId ? ref : undefined;
+            }
+            if (typeof body.next_cursor !== "string" || !body.next_cursor || body.next_cursor === cursor) {
+                return undefined;
+            }
+            cursor = body.next_cursor;
+        }
+        return undefined;
     }
     async searchSessions(args, tree) {
         const first = await this.fetch(`/memtree/search${searchQuery(args, tree)}`, "search");
@@ -629,7 +644,8 @@ export class SessionFinder {
         });
         if (!narrowed)
             return text;
-        return `${recentSearchNote(narrowed.args.since, narrowed.days)}\n\n${text}`;
+        const pages = typeof body?.next_cursor === "string";
+        return `${recentSearchNote(narrowed.args.since, narrowed.days, pages)}\n\n${text}`;
     }
     now() {
         return this.deps.now?.() ?? Date.now();

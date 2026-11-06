@@ -11,6 +11,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 import {
@@ -343,4 +344,45 @@ test("proxy: a finished subagent call points the parent at its tree while MemTre
     await turn(toolless);
     assert.equal(await subagentResult(toolless), null, "no memtree tools in the session");
   } finally { toolless.close(); }
+});
+
+test("print mode: the generated SessionStart command relays to the proxy in every shell", async () => {
+  const upstream = await serve((req, res) => res.end("{}"));
+  const trees = { trees: [{ session_id: "other", title: "Invoice rounding work",
+    tree: { ref: "abc-v1-own" } }] };
+  const projectTrees = new ProjectTreesHint(
+    async () => ({ status: 200, body: Buffer.from(JSON.stringify(trees)) }), "o/r");
+  projectTrees.prefetch();
+  const memtree = new MemtreeClient({ baseUrl: upstream.url, apiKey: "offline" });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.url, projectTrees });
+  // A temp root with a space and an apostrophe exercises the command's quoting.
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccc it's plugin "));
+  const plugin = createSubagentHookPlugin(proxy.hookUrl, { tempRoot, projectTrees: true });
+  try {
+    const { hooks } = JSON.parse(fs.readFileSync(path.join(plugin.dir, "hooks", "hooks.json"), "utf8"));
+    const command = hooks.SessionStart[0].hooks[0].command;
+    const input = JSON.stringify({ session_id: SESSION, hook_event_name: "SessionStart", source: "startup" });
+    const shells = process.platform === "win32"
+      ? ["bash"]
+      : ["/bin/sh", "/bin/bash", "/bin/zsh"].filter((sh) => sh === "/bin/sh" || fs.existsSync(sh));
+    for (const shell of shells) {
+      // Async: the proxy answering the relay runs in this process.
+      const stdout = await new Promise((resolve, reject) => {
+        const child = spawn(command, { shell, stdio: ["pipe", "pipe", "inherit"] });
+        let out = "";
+        child.stdout.on("data", (d) => { out += d; });
+        child.on("error", reject);
+        child.on("close", () => resolve(out));
+        child.stdin.end(input);
+      });
+      const output = JSON.parse(stdout);
+      assert.equal(output.systemMessage, undefined, `${shell}: nothing for the user`);
+      assert.match(output.hookSpecificOutput.additionalContext, /abc-v1-own/, shell);
+    }
+  } finally {
+    plugin.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+    proxy.close();
+    upstream.close();
+  }
 });

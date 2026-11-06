@@ -68,6 +68,7 @@ test("a search across all sessions refused as too broad (422) is retried over 3 
   const since = () => urls.map((u) => new URL(u).searchParams.get("since"));
   let text = await finder.searchSessions({ query: "memtree-note to:beta" });
   assert.deepEqual(since(), [null, "2026-11-03"]);
+  assert.doesNotMatch(text, /To page on/, "one page: nothing to continue");
   assert.match(text, /^Searching all sessions matched too much .* since 2026-11-03 \(the last 3 days\)/);
   assert.match(text, /read_lines/);
 
@@ -76,6 +77,13 @@ test("a search across all sessions refused as too broad (422) is retried over 3 
   text = await finder.searchSessions({ query: "x" });
   assert.deepEqual(since(), [null, "2026-11-03", "2026-11-05"]);
   assert.match(text, /since 2026-11-05 \(the last day\)/);
+
+  // A narrowed answer with more pages says the cursor needs the narrowed `since`.
+  urls.length = 0;
+  answers = [tooBroad, () => Response.json({ hits: [{ id: "s", tree: { request_id: "t1" },
+    range: { block: 0, start: 1, end: 2 } }], next_cursor: "bound" })];
+  text = await finder.searchSessions({ query: "x" });
+  assert.match(text, /To page on, add "since": "2026-11-03" to the same arguments with the cursor below\./);
 
   // No window answered: the first refusal's advice is the answer.
   urls.length = 0;
@@ -567,6 +575,33 @@ test("read_lines starting inside a message without a time says so", () => {
     assert.match(text, /^block 0 \[2026-09-30 14:05 PT; lines 2-2: time not recorded\] lines 2-7 /);
     assert.match(text, /\n6\tMessage 2 from user:\n/, "said once");
   });
+});
+
+test("SessionFinder.sessionTree finds the exact session past sessions that quote its id", async () => {
+  const SID = "c4e76ef6-0cc0-4291-beef-9a0c29681fa6";
+  const urls = [];
+  const finder = new SessionFinder({ proxyUrl: "http://localhost:9", fetch: async (url) => {
+    const u = new URL(url);
+    urls.push(u.searchParams.get("cursor"));
+    if (!u.searchParams.has("cursor")) {
+      return Response.json({ sessions: Array.from({ length: 5 }, (_, i) =>
+        ({ session_id: `other-${i}`, title: `hand-off from ${SID}` })), next_cursor: "page2" });
+    }
+    return Response.json({ sessions: [{ session_id: SID, latest_tree: { ref: "abc-v1-own" } }], next_cursor: null });
+  } });
+  assert.equal(await finder.sessionTree(SID), "abc-v1-own");
+  assert.deepEqual(urls, [null, "page2"]);
+  // No such session, a cursor that repeats, or no tree: undefined, within a few pages.
+  urls.length = 0;
+  const looping = new SessionFinder({ proxyUrl: "http://localhost:9", fetch: async (url) => {
+    urls.push(new URL(url).searchParams.get("cursor"));
+    return Response.json({ sessions: [{ session_id: "other" }], next_cursor: `c${urls.length}` });
+  } });
+  assert.equal(await looping.sessionTree(SID), undefined);
+  assert.equal(urls.length, 3);
+  const treeless = new SessionFinder({ proxyUrl: "http://localhost:9",
+    fetch: async () => Response.json({ sessions: [{ session_id: SID, latest_tree: null }] }) });
+  assert.equal(await treeless.sessionTree(SID), undefined);
 });
 
 test("a session id passed as tree reads that session's newest tree, and says so", async () => {

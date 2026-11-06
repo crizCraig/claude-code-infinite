@@ -178,12 +178,16 @@ export function recentSearchFailedNote(): string {
     "too broad as well; add a rarer word, project or tree)";
 }
 
-export function recentSearchNote(since: string, days: number): string {
+export function recentSearchNote(since: string, days: number, pages = false): string {
+  // The server binds a cursor to the search's filters, `since` included.
+  const more = pages
+    ? ` To page on, add "since": "${since}" to the same arguments with the cursor below.`
+    : "";
   return (
     `Searching all sessions matched too much to finish in time, so this searched only ` +
     `sessions active since ${since} (the last ${days === 1 ? "day" : `${days} days`}). ` +
     "For older work, search again " +
-    "with since/until, project or tree, or a rarer word (a name, id or path)."
+    "with since/until, project or tree, or a rarer word (a name, id or path)." + more
   );
 }
 

@@ -78,11 +78,15 @@ export function recentSearchFailedNote() {
     return ` (ccc also tried the last ${RECENT_SEARCH_WINDOWS_DAYS.join(" and ")} days: ` +
         "too broad as well; add a rarer word, project or tree)";
 }
-export function recentSearchNote(since, days) {
+export function recentSearchNote(since, days, pages = false) {
+    // The server binds a cursor to the search's filters, `since` included.
+    const more = pages
+        ? ` To page on, add "since": "${since}" to the same arguments with the cursor below.`
+        : "";
     return (`Searching all sessions matched too much to finish in time, so this searched only ` +
         `sessions active since ${since} (the last ${days === 1 ? "day" : `${days} days`}). ` +
         "For older work, search again " +
-        "with since/until, project or tree, or a rarer word (a name, id or path).");
+        "with since/until, project or tree, or a rarer word (a name, id or path)." + more);
 }
 function isSet(value) {
     return value !== undefined && value !== null && value !== "";

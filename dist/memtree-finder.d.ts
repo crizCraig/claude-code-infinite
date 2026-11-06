@@ -130,7 +130,7 @@ export declare function recentSearchArgs(args: Record<string, unknown>, tree: st
 /** Said first in a narrowed retry's answer, so the model knows what was left out. */
 /** Added to the refusal when every narrowed window was refused too. */
 export declare function recentSearchFailedNote(): string;
-export declare function recentSearchNote(since: string, days: number): string;
+export declare function recentSearchNote(since: string, days: number, pages?: boolean): string;
 export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
 /** The calling Claude Code session: its entry is marked "(this session)". */
