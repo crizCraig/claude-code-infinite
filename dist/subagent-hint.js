@@ -31,6 +31,17 @@ export class SubagentMemoryHint {
         return !this.disabled;
     }
 }
+/**
+ * The subagent hints for this run, or undefined: the session needs the `search` tool
+ * they name, and MemTree must not be known off at startup (an invalid key, or [c] at
+ * the payment gate). The proxy's own working check can't know that before MemTree
+ * answers a request, and the after-a-subagent line is given before then too.
+ */
+export function subagentHintFor(s) {
+    if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff)
+        return undefined;
+    return new SubagentMemoryHint();
+}
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
 export function subagentMemoryHintText(sessionId, treeRef) {
     if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef))

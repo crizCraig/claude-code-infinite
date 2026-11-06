@@ -27,6 +27,7 @@ import {
   postToolUseOutput,
   SUBAGENT_RESULT_HINT,
   SubagentMemoryHint,
+  subagentHintFor,
   subagentMemoryHintText,
   subagentStartOutput,
 } from "../dist/subagent-hint.js";
@@ -363,3 +364,15 @@ test("proxy: a subagent call points the parent at its tree unless MemTree is kno
   } finally { toolless.close(); }
 });
 
+
+test("startup: no subagent hints without search, after an invalid key, or with MemTree off", () => {
+  const tools = ["search", "list", "read_node", "read_lines"];
+  const paid = { paid: true, message: null, url: null };
+  assert.ok(subagentHintFor({ tools, keyCheck: paid, memtreeOff: false }));
+  assert.ok(subagentHintFor({ tools, keyCheck: null, memtreeOff: false }), "unknown: offline check");
+  assert.equal(subagentHintFor({ tools: ["list"], keyCheck: paid, memtreeOff: false }), undefined);
+  assert.equal(subagentHintFor({ tools, keyCheck: "invalid", memtreeOff: false }), undefined,
+    "a refused key: the line would point at memory the session can't read");
+  assert.equal(subagentHintFor({ tools, keyCheck: paid, memtreeOff: true }), undefined,
+    "[c] at the payment gate");
+});

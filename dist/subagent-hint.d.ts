@@ -15,6 +15,7 @@
  * when the server named the parent's newest tree: a parent without one has
  * little to re-derive.
  */
+import type { KeyCheck } from "./key-status.js";
 /**
  * Whether subagents get the hint: on while the session has the memtree
  * `search` tool, off once ccc could not register the server after all.
@@ -24,6 +25,17 @@ export declare class SubagentMemoryHint {
     disable(): void;
     get enabled(): boolean;
 }
+/**
+ * The subagent hints for this run, or undefined: the session needs the `search` tool
+ * they name, and MemTree must not be known off at startup (an invalid key, or [c] at
+ * the payment gate). The proxy's own working check can't know that before MemTree
+ * answers a request, and the after-a-subagent line is given before then too.
+ */
+export declare function subagentHintFor(s: {
+    tools: readonly string[];
+    keyCheck: KeyCheck;
+    memtreeOff: boolean;
+}): SubagentMemoryHint | undefined;
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
 export declare function subagentMemoryHintText(sessionId: string, treeRef: string): string | undefined;
 /**

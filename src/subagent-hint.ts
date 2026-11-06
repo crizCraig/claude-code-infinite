@@ -16,6 +16,7 @@
  * little to re-derive.
  */
 
+import type { KeyCheck } from "./key-status.js";
 import { SESSION_ID } from "./memtree-newest.js";
 
 /** The server's tree refs (`<uuid>-v1-own`). */
@@ -35,6 +36,21 @@ export class SubagentMemoryHint {
   get enabled(): boolean {
     return !this.disabled;
   }
+}
+
+/**
+ * The subagent hints for this run, or undefined: the session needs the `search` tool
+ * they name, and MemTree must not be known off at startup (an invalid key, or [c] at
+ * the payment gate). The proxy's own working check can't know that before MemTree
+ * answers a request, and the after-a-subagent line is given before then too.
+ */
+export function subagentHintFor(s: {
+  tools: readonly string[];
+  keyCheck: KeyCheck;
+  memtreeOff: boolean;
+}): SubagentMemoryHint | undefined {
+  if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff) return undefined;
+  return new SubagentMemoryHint();
 }
 
 /** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */

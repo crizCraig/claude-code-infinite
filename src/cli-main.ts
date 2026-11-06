@@ -54,7 +54,7 @@ import {
 } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
-import { SubagentMemoryHint } from "./subagent-hint.js";
+import { subagentHintFor } from "./subagent-hint.js";
 import { resumeGuidanceFor } from "./resume-guidance.js";
 import {
   KEY_PAGE_URL,
@@ -754,10 +754,12 @@ async function main() {
       memtree.fetchMemTree(pathAndQuery, "application/json", signal),
   });
   projectTrees?.prefetch();
-  // A subagent is told whose memory to search (subagent-hint.ts) when the
-  // session has the `search` tool the hint names.
-  const subagentHint = memtreeMcpPlan.tools.includes("search")
-    ? new SubagentMemoryHint() : undefined;
+  // A subagent is told whose memory to search, and its parent where the subagent's
+  // work is (subagent-hint.ts), when the session has the `search` tool they name and
+  // MemTree is not known off at startup.
+  const subagentHint = subagentHintFor({
+    tools: memtreeMcpPlan.tools, keyCheck: checked.check, memtreeOff,
+  });
   // A resumed session is given the current MemTree guidance (resume-guidance.ts):
   // Claude Code keeps the server instructions it first announced.
   const resumeGuidance = resumeGuidanceFor({
