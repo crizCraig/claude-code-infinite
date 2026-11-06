@@ -774,7 +774,7 @@ function noteMainSessionStart(state, source, sessionId) {
 }
 /**
  * PostToolUse after an Agent/Task call: point the model at the subagent's own tree
- * (subagent-hint.ts), while MemTree works and the session has the tools.
+ * (subagent-hint.ts), unless MemTree is known not to work, when the session has the tools.
  */
 async function handleSubagentResultHook(req, res, state) {
     // The body carries the subagent's whole prompt and result: allow a large one.
@@ -790,7 +790,10 @@ async function handleSubagentResultHook(req, res, state) {
     catch {
         input = null;
     }
-    const say = state.subagentHint?.enabled === true && memtreeWorking(state) &&
+    // Not known to be broken is enough: a short print run's first requests can finish
+    // before MemTree has answered any (non-blocking first turn), and the subagent is
+    // indexed either way.
+    const say = state.subagentHint?.enabled === true && resumeMemtreeWorking(state) &&
         isSubagentCall(input);
     if (!say) {
         res.writeHead(204);

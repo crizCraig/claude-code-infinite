@@ -335,10 +335,11 @@ async function subagentResult(h, extra = {}) {
   return res.status === 204 ? null : await res.json();
 }
 
-test("proxy: a subagent call points the parent at its tree while MemTree works", async () => {
+test("proxy: a subagent call points the parent at its tree unless MemTree is known broken", async () => {
   const h = await harness();
   try {
-    assert.equal(await subagentResult(h), null, "MemTree has not answered yet");
+    assert.deepEqual(await subagentResult(h), postToolUseOutput(SUBAGENT_RESULT_HINT),
+      "MemTree has not answered yet (a short print run): said, as it is not known broken");
     await turn(h);
     assert.deepEqual(await subagentResult(h), postToolUseOutput(SUBAGENT_RESULT_HINT));
     assert.deepEqual(await subagentResult(h, { tool_response: { status: "async_launched" } }),
