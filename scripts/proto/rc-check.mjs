@@ -1,17 +1,22 @@
-// PROTOTYPE (proto/https-proxy-rc): did the turns of one ccc session get MemTree?
+// PROTOTYPE (proto/https-proxy-rc): how did one ccc session's model turns go?
 // Usage: node scripts/proto/rc-check.mjs --pid <ccc pid> --since <ISO time> [--until <ISO>]
 //        [--log ~/.claude-code-infinite/logs/requests.jsonl]
-// Reads ccc's request log (no bodies in it), keeps that pid's records in the window, and fails
-// if any model turn bypassed or lost MemTree, or a turn has no successful MemTree call
-// (index or compress) from the same ccc within 2 minutes of it.
+// Reads ccc's request log (no bodies in it), keeps that pid's records in the window, and
+// classifies each `messages` record by its turnType. Exit 1 if any turn bypassed or lost
+// MemTree (foreign, degraded, refused, ...), had an unknown type or a non-200 upstream, or if
+// any MemTree call failed (other than the final index cut short at exit). This checks how
+// ccc classified each turn; it does not tie a turn to its own MemTree call (the log has no
+// shared id), so the MemTree lines are listed for reading alongside, not matched.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const OK_TURNS = new Set(["first-user", "tool", "tool-memory", "tool-prefix", "tool-recompressed",
-  "followup-compressed", "followup-noop", "followup-prefix", "followup-under-budget",
-  "followup-empty-memory"]);
-const PAIR_MS = 120_000;
+/** Turns that went through MemTree's route logic as designed (src/reqlog.ts). */
+const MEMTREE_TURNS = new Set(["first-user", "tool", "tool-memory", "tool-prefix",
+  "tool-recompressed", "followup-compressed", "followup-prefix", "followup-noop",
+  "followup-under-budget", "followup-empty-memory"]);
+/** Healthy requests that by design make no MemTree call (security monitor, away recap). */
+const AUXILIARY = new Set(["side-request", "fork-memory"]);
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, v, i, all) =>
   (v.startsWith("--") ? [...acc, [v.slice(2), all[i + 1]]] : acc), []));
@@ -27,16 +32,23 @@ const records = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l
 }).filter((r) => r && String(r.pid) === String(args.pid) &&
   Date.parse(r.ts) >= since && Date.parse(r.ts) <= until);
 
-const turns = records.filter((r) => r.kind === "messages");
-const memtreeOk = records.filter((r) => r.kind === "memtree" && r.ok === true).map((r) => Date.parse(r.ts));
 let failures = 0;
-for (const t of turns) {
-  const at = Date.parse(t.ts);
-  const paired = memtreeOk.some((m) => Math.abs(m - at) <= PAIR_MS);
-  const good = OK_TURNS.has(t.turnType) && t.upstreamStatus === 200 && paired;
-  if (!good) failures++;
-  console.log(`${good ? "ok  " : "FAIL"} ${t.ts} turnType=${t.turnType} upstream=${t.upstreamStatus}` +
-    `${paired ? "" : " (no successful MemTree call within 2 min)"}`);
+let turns = 0;
+for (const r of records) {
+  if (r.kind === "messages") {
+    const aux = AUXILIARY.has(r.turnType);
+    const ok = (MEMTREE_TURNS.has(r.turnType) || aux) && r.upstreamStatus === 200;
+    if (!aux) turns++;
+    if (!ok) failures++;
+    console.log(`${ok ? (aux ? "aux " : "ok  ") : "FAIL"} ${r.ts} turn turnType=${r.turnType} ` +
+      `upstream=${r.upstreamStatus}`);
+  } else if (r.kind === "memtree") {
+    const exitCut = r.exitCut === true || r.finalIndex === true;
+    const ok = r.ok === true || exitCut;
+    if (!ok) failures++;
+    console.log(`${ok ? "    " : "FAIL"} ${r.ts}   memtree ${r.indexOnly ? "index" : "compress"} ` +
+      `ok=${r.ok}${exitCut && r.ok !== true ? " (final index cut at exit: fine)" : ""}`);
+  }
 }
-console.log(`${turns.length} model turns, ${memtreeOk.length} successful MemTree calls, ${failures} failing`);
-process.exit(turns.length > 0 && failures === 0 ? 0 : 1);
+console.log(`${turns} model turns, ${failures} failing`);
+process.exit(turns > 0 && failures === 0 ? 0 : 1);

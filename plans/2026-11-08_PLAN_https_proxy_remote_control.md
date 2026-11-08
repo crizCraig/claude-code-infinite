@@ -275,10 +275,15 @@ CCC_HTTPS_PROXY_MODE=1 CCC_PROXY_TRACE=/tmp/ccc-rc-trace.jsonl node ~/src/ccc-rc
    MemTree, and a follow-up can come out `followup-degraded`. While the session runs, note
    its pid (`pgrep -f ccc-rc-proxy/dist/cli.js`), then:
    `node ~/src/ccc-rc-proxy/scripts/proto/rc-check.mjs --pid <pid> --since <launch time, UTC ISO>`
-   It keeps only that ccc's records since launch. It fails on any foreign, unparseable,
-   degraded, refused, client-closed or no-flatten turn, a non-200 upstream, or a turn with no
-   successful MemTree call from the same ccc within 2 minutes. Expect exit 0, with the phone
-   turns' timestamps among the `ok` lines.
+   It keeps only that ccc's records since launch and lists each model turn with how ccc
+   classified it, interleaved with the MemTree calls. It exits 1 on any foreign,
+   unparseable, degraded, refused, client-closed, no-flatten or unknown turn, a non-200
+   upstream, or a failed MemTree call (other than the final index cut short at exit). The
+   security monitor and away-recap requests are listed as `aux` (healthy, no MemTree call
+   by design). Expect exit 0, with the phone turns' timestamps among the `ok` lines. This
+   checks classification; the log has no id tying a turn to its own MemTree call, so read
+   the MemTree lines alongside (an `ok` compress or index next to each phone turn) rather
+   than as proof per turn.
 5. Exit, then check `ls -d ${TMPDIR:-/tmp}/ccc-ca-*` (the session's dir should be gone).
 6. Send `/tmp/ccc-rc-trace.jsonl` back. It holds paths (which include
    environment and session ids, not secrets), statuses, CONNECT targets with header names,
