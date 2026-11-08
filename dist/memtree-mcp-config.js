@@ -28,7 +28,7 @@
  *   pre-allows nothing (if it runs `ccc memtree-mcp` the header is still
  *   sent); tools named by `--disallowedTools` (a tool, `mcp__memtree`,
  *   or a `*` pattern) are neither pre-allowed nor named in the header, and
- *   with all four disallowed ccc registers nothing. Claude Code applies a
+ *   with all of them disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
  */
 import fs from "node:fs";

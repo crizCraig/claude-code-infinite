@@ -14,7 +14,7 @@ import {
   withMemtreeMcpArgs,
 } from "../dist/memtree-mcp-config.js";
 
-const ALL = ["search", "read_node", "read_lines", "list"];
+const ALL = ["search", "read_node", "read_lines", "list", "user_messages", "handover"];
 
 function withConfigDir(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-mcp-plan-"));
@@ -25,7 +25,7 @@ function withConfigDir(fn) {
   }
 }
 
-test("print and plain runs get ccc's server with all four tools by default", () => {
+test("print and plain runs get ccc's server with all its tools by default", () => {
   for (const args of [["-p", "q"], ["--print", "--output-format", "json", "q"], ["q"], []]) {
     assert.deepEqual(planMemtreeMcp(args, {}), { register: true, tools: ALL }, args.join(" "));
   }
@@ -76,11 +76,11 @@ test("--disallowedTools is respected: whole server, wildcard, or single tools", 
   assert.deepEqual(planMemtreeMcp(["-p", "--disallowed-tools", "Bash", "mcp__memtree"], {}), none);
   assert.deepEqual(
     planMemtreeMcp(["-p", "--disallowedTools", "mcp__memtree__list,mcp__memtree__search", "q"], {}),
-    { register: true, tools: ["read_node", "read_lines"] }
+    { register: true, tools: ["read_node", "read_lines", "user_messages", "handover"] }
   );
   assert.deepEqual(
     planMemtreeMcp(["-p", "--disallowedTools", "mcp__memtree__read_lines", "--disallowedTools=Edit"], {}),
-    { register: true, tools: ["search", "read_node", "list"] }
+    { register: true, tools: ["search", "read_node", "list", "user_messages", "handover"] }
   );
   // After `--` it is prompt text, not an option.
   assert.deepEqual(planMemtreeMcp(["-p", "--", "--disallowedTools", "mcp__memtree"], {}),
@@ -97,13 +97,14 @@ test("pre-allow adds only the memtree tools ccc registers; the caller's lists st
   const child = withMemtreeMcpArgs(args, "/tmp/m.json", plan.tools);
   assert.deepEqual(child, [
     "--mcp-config=/tmp/m.json",
-    "--allowedTools=mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines",
+    "--allowedTools=mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines," +
+      "mcp__memtree__user_messages,mcp__memtree__handover",
     ...args,
   ]);
-  // Default: all four, and never anything that is not a memtree tool.
+  // Default: all of them, and never anything that is not a memtree tool.
   const allowed = withMemtreeMcpArgs(["q"], "/tmp/m.json")[1].slice("--allowedTools=".length).split(",");
   assert.deepEqual(allowed, MEMTREE_ALLOWED_TOOLS);
-  assert.ok(allowed.every((tool) => /^mcp__memtree__(search|read_node|read_lines|list)$/.test(tool)));
+  assert.ok(allowed.every((tool) => /^mcp__memtree__(search|read_node|read_lines|list|user_messages|handover)$/.test(tool)));
 });
 
 test("a --mcp-config ccc cannot read might define memtree: fail closed (no server, no pre-allow)", () => {

@@ -687,6 +687,8 @@ test("MCP handler: initialize, tools/list, tools/call results and errors", async
     "read_node",
     "read_lines",
     "list",
+    "user_messages",
+    "handover",
   ]);
   assert.equal(list.result.tools, MEMTREE_TOOLS);
   // Non-deferred even under a caller-supplied --mcp-config without alwaysLoad.
@@ -780,7 +782,7 @@ test("hits show their node address and path from the root", () => {
 });
 
 test("mcp config: bound to the proxy, argv prepended with = forms, detection in --mcp-config", () => {
-  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines,list");
+  assert.equal(MEMTREE_TOOLS_HEADER_VALUE, "search,read_node,read_lines,list,user_messages,handover");
   const config = memtreeMcpConfig("http://127.0.0.1:1234");
   const server = config.mcpServers.memtree;
   assert.equal(server.env.CCC_MEMTREE_PROXY, "http://127.0.0.1:1234");
@@ -798,6 +800,8 @@ test("mcp config: bound to the proxy, argv prepended with = forms, detection in 
     "mcp__memtree__read_node",
     "mcp__memtree__read_lines",
     "mcp__memtree__list",
+    "mcp__memtree__user_messages",
+    "mcp__memtree__handover",
   ]);
 
   assert.deepEqual(mcpConfigArgs(["-p", "q", "--mcp-config", "a.json", "b.json", "--strict-mcp-config", "--mcp-config=c", "--", "--mcp-config", "d"]),
@@ -983,8 +987,9 @@ test("MCP instructions and search lead with when to use them, before any compres
   assert.match(search.description.split(". ")[0], /only summarizes.*other sessions/);
   // Constant overhead: instructions + search description, measured 2026-10-18, plus the
   // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28, plus
-  // the cross-session scope (ccc sessions on any machine) and hand-off line, 2026-11-05.
-  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_700,
+  // the cross-session scope (ccc sessions on any machine) and hand-off line, 2026-11-05, plus
+  // the handover / user_messages line, 2026-11-08.
+  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_850,
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
 

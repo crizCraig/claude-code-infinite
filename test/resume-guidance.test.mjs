@@ -103,14 +103,17 @@ test("the needle matches Claude Code's transcript line for the current instructi
   assert.ok(!announcement(OLD_INSTRUCTIONS).includes(ANNOUNCED_INSTRUCTIONS_NEEDLE));
 });
 
-test("resumes get the guidance only in interactive runs with MemTree on and every memtree tool", () => {
+test("resumes get the guidance only in interactive runs with MemTree on and the tools it names", () => {
   const on = { interactive: true, memtreeOff: false, tools: [...MEMTREE_TOOL_NAMES] };
   assert.ok(resumeGuidanceFor(on) instanceof ResumeGuidance);
   assert.equal(resumeGuidanceFor({ ...on, interactive: false }), undefined, "-p resumes every call");
   assert.equal(resumeGuidanceFor({ ...on, memtreeOff: true }), undefined);
   assert.equal(resumeGuidanceFor({ ...on, tools: [] }), undefined);
   assert.equal(resumeGuidanceFor({ ...on, tools: MEMTREE_TOOL_NAMES.slice(1) }), undefined,
-    "the guidance names every tool");
+    "the guidance names search, read_node and read_lines");
+  const withoutLaterTools = MEMTREE_TOOL_NAMES.filter((t) => t !== "handover" && t !== "user_messages");
+  assert.ok(resumeGuidanceFor({ ...on, tools: withoutLaterTools }) instanceof ResumeGuidance,
+    "disallowing handover or user_messages keeps the guidance");
 });
 
 // ------------------------------------------------------------------ transcript scan

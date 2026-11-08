@@ -122,7 +122,8 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   const result = JSON.parse(lines[0]);
   assert.match(result.args[0], /^--mcp-config=/);
   assert.equal(result.args[1],
-    "--allowedTools=mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines,mcp__memtree__list");
+    "--allowedTools=mcp__memtree__search,mcp__memtree__read_node,mcp__memtree__read_lines,mcp__memtree__list," +
+    "mcp__memtree__user_messages,mcp__memtree__handover");
   assert.equal(result.args[2], "--plugin-dir");
   assert.deepEqual(result.args.slice(4), ["-p", "--output-format", "json", "--", "hi"]);
   assert.deepEqual(result.servers, ["memtree"]);

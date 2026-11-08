@@ -726,7 +726,7 @@ async function main() {
   // The `memtree` MCP server (memtree-mcp-config.ts): registered by ccc for
   // every session, interactive or print/non-TTY, unless CCC_MEMTREE_MCP=0,
   // the caller's own --mcp-config names a `memtree` server, or its
-  // --disallowedTools covers all four tools. MemTree is told
+  // --disallowedTools covers all of its tools. MemTree is told
   // (x-memtree-tools) only which tools the session really has.
   const memtreeMcpPlan = planMemtreeMcp(claudeArgs, process.env);
 

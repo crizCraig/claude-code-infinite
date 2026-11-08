@@ -31,7 +31,7 @@ export declare function staleToolsNote(installed: string, own: string, startedAt
 /** The version in this install's package.json now (ccc may have been updated since it started). */
 export declare function installedVersion(): string | undefined;
 /** Sent to MemTree as `x-memtree-tools` when this server is configured. */
-export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list"];
+export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list", "user_messages", "handover"];
 /** `tree` value naming this session's own current tree. */
 export declare const CURRENT_TREE = "current";
 /**
@@ -106,6 +106,8 @@ export declare const MEMTREE_TOOLS: ({
             tail?: undefined;
             full?: undefined;
             q?: undefined;
+            context?: undefined;
+            days?: undefined;
         };
         required: string[];
     };
@@ -143,6 +145,8 @@ export declare const MEMTREE_TOOLS: ({
             tail?: undefined;
             full?: undefined;
             q?: undefined;
+            context?: undefined;
+            days?: undefined;
         };
         required?: undefined;
     };
@@ -192,6 +196,8 @@ export declare const MEMTREE_TOOLS: ({
             limit?: undefined;
             id?: undefined;
             q?: undefined;
+            context?: undefined;
+            days?: undefined;
         };
         required?: undefined;
     };
@@ -238,6 +244,104 @@ export declare const MEMTREE_TOOLS: ({
             end?: undefined;
             tail?: undefined;
             full?: undefined;
+            context?: undefined;
+            days?: undefined;
+        };
+        required?: undefined;
+    };
+} | {
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
+    name: string;
+    description: string;
+    inputSchema: {
+        type: string;
+        properties: {
+            tree: {
+                type: string;
+                description: string;
+            };
+            since: {
+                type: string;
+                description: string;
+            };
+            until: {
+                type: string;
+                description: string;
+            };
+            query: {
+                type: string;
+                description: string;
+            };
+            cursor: {
+                type: string;
+                description: string;
+            };
+            limit: {
+                type: string;
+                description: string;
+            };
+            full: {
+                type: string;
+                description: string;
+            };
+            context: {
+                type: string;
+                description: string;
+            };
+            mode?: undefined;
+            project?: undefined;
+            node?: undefined;
+            id?: undefined;
+            block?: undefined;
+            start?: undefined;
+            end?: undefined;
+            tail?: undefined;
+            q?: undefined;
+            days?: undefined;
+        };
+        required?: undefined;
+    };
+} | {
+    _meta: {
+        readonly "anthropic/alwaysLoad": true;
+    };
+    name: string;
+    description: string;
+    inputSchema: {
+        type: string;
+        properties: {
+            tree: {
+                type: string;
+                description: string;
+            };
+            days: {
+                type: string;
+                description: string;
+            };
+            since: {
+                type: string;
+                description: string;
+            };
+            until: {
+                type: string;
+                description: string;
+            };
+            query?: undefined;
+            mode?: undefined;
+            project?: undefined;
+            cursor?: undefined;
+            limit?: undefined;
+            node?: undefined;
+            id?: undefined;
+            block?: undefined;
+            start?: undefined;
+            end?: undefined;
+            tail?: undefined;
+            full?: undefined;
+            q?: undefined;
+            context?: undefined;
         };
         required?: undefined;
     };
@@ -266,7 +370,11 @@ export interface TreeSource {
     search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
     /** The un-indexed messages after the tree, read fresh from the server; `full`: tool calls whole. */
     tail?(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
+    /** A tree's `user_messages` or `handover` answer (JSON), read fresh from the server. */
+    serverRead?(route: TreeRoute, tree: string | undefined, params: URLSearchParams): Promise<unknown>;
 }
+/** Per-tree server reads that are not page JSON: the person's messages, the handover pack. */
+export type TreeRoute = "user_messages" | "handover";
 /**
  * Resolves, fetches and caches the current page, and other sessions' pages
  * by request id.
@@ -299,6 +407,12 @@ export declare class CurrentTree implements TreeSource {
      * it grows with the conversation. With no range, the newest messages.
      */
     tail(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
+    /**
+     * `/memtree/<id>/<route>`, never cached (the newest messages grow). This session's
+     * tree must be this session's (as tail); a 404 without the server's own detail means
+     * the server or this ccc's proxy predates the route.
+     */
+    serverRead(route: TreeRoute, tree: string | undefined, params: URLSearchParams): Promise<unknown>;
     private loadCurrent;
     /**
      * Whether a cached page's per-message times were incomplete (`line_times_incomplete`:

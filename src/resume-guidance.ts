@@ -36,7 +36,7 @@
  */
 
 import fs from "node:fs";
-import { MEMTREE_MCP_INSTRUCTIONS, MEMTREE_TOOL_NAMES } from "./memtree-mcp.js";
+import { MEMTREE_MCP_INSTRUCTIONS } from "./memtree-mcp.js";
 
 export { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
 
@@ -137,10 +137,16 @@ export function resumeGuidanceAgain(at: Date): string {
     "MemTree may have compressed this conversation, so an earlier copy may be out of view.)";
 }
 
+/**
+ * The tools the guidance relies on (it names search, read_node and read_lines). Not every
+ * memtree tool: disallowing a later one (user_messages, handover) keeps the guidance.
+ */
+export const RESUME_GUIDANCE_TOOLS = ["search", "read_node", "read_lines", "list"] as const;
+
 /** The gate for this run, or undefined (see ResumeGuidance). */
 export function resumeGuidanceFor(s: ResumeGuidanceStartup): ResumeGuidance | undefined {
   if (!s.interactive || s.memtreeOff) return undefined;
-  if (!MEMTREE_TOOL_NAMES.every((tool) => s.tools.includes(tool))) return undefined;
+  if (!RESUME_GUIDANCE_TOOLS.every((tool) => s.tools.includes(tool))) return undefined;
   return new ResumeGuidance();
 }
 

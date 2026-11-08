@@ -67,6 +67,15 @@ import {
   type MemtreePageJson,
 } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
+import {
+  formatHandover,
+  formatUserMessages,
+  HANDOVER_DEFAULT_DAYS,
+  HANDOVER_MAX_DAYS,
+  handoverQuery,
+  USER_MESSAGES_MAX_LIMIT,
+  userMessagesQuery,
+} from "./memtree-handover.js";
 import { formatTime } from "./memtree-times.js";
 
 export const MEMTREE_MCP_SERVER_NAME = "memtree";
@@ -141,6 +150,8 @@ export const MEMTREE_TOOL_NAMES = [
   "read_node",
   "read_lines",
   "list",
+  "user_messages",
+  "handover",
 ] as const;
 /** `tree` value naming this session's own current tree. */
 export const CURRENT_TREE = "current";
@@ -185,6 +196,8 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "yet. A text search of one tree also matches them (listed after the tree's hits), list shows how each session " +
   "ended, and read_lines {\"tail\": true} reads them (with tree for another session's page; large tool calls are " +
   "shortened, \"full\": true reads them whole).\n\n" +
+  "To take over another session's work, call handover with its session id first; user_messages lists only the " +
+  "person's own messages over a time range.\n\n" +
   "A hand-off or kickoff prompt you write for another agent or machine names this session's id and MemTree link " +
   "(list marks this session), so that agent can read this work with list, search and read_node.";
 
@@ -297,6 +310,46 @@ export const MEMTREE_TOOLS = [
       },
     },
   },
+  {
+    name: "user_messages",
+    description:
+      "The person's own messages in a session over a time range: what they typed, commands they ran, words sent while " +
+      "the agent worked, and board messages. Tool results, reminders, prompts the agent scheduled and other agents' " +
+      "messages are left out. Use it to learn what the user asked for, decided and corrected. Covers the tree and its " +
+      "newest messages no tree covers yet. Returns the newest page, oldest first; cursor lists older ones. Each " +
+      "message says where read_lines shows its context. Results show when each message was written.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tree: { type: "string", description: `${TREE_DESC} A session id works too. Omit for this session.` },
+        since: { type: "string", description: "Only messages at or after this ISO 8601 time or date (UTC unless an offset is given)." },
+        until: { type: "string", description: "Only messages before this ISO 8601 time or date." },
+        query: { type: "string", description: "Only messages holding every one of these words." },
+        cursor: { type: "string", description: "next cursor from a previous call: older messages (same other arguments)." },
+        limit: { type: "number", description: `Messages per page (default 50, at most ${USER_MESSAGES_MAX_LIMIT}).` },
+        full: { type: "boolean", description: "Long messages and pastes whole (default: shortened)." },
+        context: { type: "boolean", description: "Also the agent's last words before each message (what it answered)." },
+      },
+    },
+  },
+  {
+    name: "handover",
+    description:
+      "A handover pack for taking over or continuing a session's work: the person's messages over its last days (each " +
+      "with the agent's words it answered), how the session ended, and a model's reading of their goals, standing " +
+      "instructions, decisions with reasons and open questions, each citing its messages. Call it first when you take " +
+      "over another session (tree: its session id or tree). The model's lists can be wrong: check one against the " +
+      "messages it cites before acting on it. A first call for a session can take up to a minute.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tree: { type: "string", description: `${TREE_DESC} A session id works too. Omit for this session.` },
+        days: { type: "number", description: `Days before the session's newest message to cover (default ${HANDOVER_DEFAULT_DAYS}, at most ${HANDOVER_MAX_DAYS}).` },
+        since: { type: "string", description: "Instead of days: messages at or after this ISO 8601 time or date." },
+        until: { type: "string", description: "Only messages before this ISO 8601 time or date." },
+      },
+    },
+  },
 ].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
 
 export interface MemtreeMcpDeps {
@@ -403,7 +456,12 @@ export interface TreeSource {
   search?(query: string, limit: number | undefined, tree?: string): Promise<string>;
   /** The un-indexed messages after the tree, read fresh from the server; `full`: tool calls whole. */
   tail?(tree: string | undefined, start?: number, end?: number, full?: boolean): Promise<string>;
+  /** A tree's `user_messages` or `handover` answer (JSON), read fresh from the server. */
+  serverRead?(route: TreeRoute, tree: string | undefined, params: URLSearchParams): Promise<unknown>;
 }
+
+/** Per-tree server reads that are not page JSON: the person's messages, the handover pack. */
+export type TreeRoute = "user_messages" | "handover";
 
 /**
  * Resolves, fetches and caches the current page, and other sessions' pages
@@ -504,6 +562,28 @@ export class CurrentTree implements TreeSource {
     if (!answer.ok) throw new ToolInputError(`MemTree tail unavailable (page ${id}: ${answer.error})`);
     if (!other) this.checkSession((answer.body as { session_id?: unknown }).session_id, this.requireSessionId());
     return formatTail(answer.body, other);
+  }
+
+  /**
+   * `/memtree/<id>/<route>`, never cached (the newest messages grow). This session's
+   * tree must be this session's (as tail); a 404 without the server's own detail means
+   * the server or this ccc's proxy predates the route.
+   */
+  async serverRead(route: TreeRoute, tree: string | undefined, params: URLSearchParams): Promise<unknown> {
+    const other = checkTreeId(tree);
+    const id = other ?? (await this.currentId());
+    const query = params.toString() ? `?${params}` : "";
+    const answer = await proxyGetJson(
+      this.fetchImpl, `${proxyBase(this.deps)}/memtree/${encodeURIComponent(id)}/${route}${query}`,
+      toolHeaders(route, this.deps)
+    );
+    if (answer.status === 202) throw new ToolInputError("That MemTree is still being built; try again in a minute.");
+    if (answer.status === 404 && /^HTTP 404 Not Found$/.test(answer.error ?? "")) {
+      throw new ToolInputError(`${route}: this MemTree server (or this ccc) does not have it yet; update ccc or try later.`);
+    }
+    if (!answer.ok) throw new ToolInputError(`${route}: ${(answer.error ?? "").replace(/^HTTP (400|404) /, "")}`);
+    if (!other) this.checkSession((answer.body as { session_id?: unknown }).session_id, this.requireSessionId());
+    return answer.body;
   }
 
   private async loadCurrent(): Promise<MemtreeIndex> {
@@ -920,6 +1000,9 @@ async function dispatchTool(
     case "list":
       if (!finder) throw new ToolInputError("list is not available here");
       return finder.listSessions(args);
+    case "user_messages":
+    case "handover":
+      return treeRouteTool(name, args, tree);
     default:
       throw new UnknownToolError(`Unknown tool: ${name}`);
   }
@@ -963,6 +1046,16 @@ function nodeTarget(args: Record<string, unknown>, field: string): { tree?: stri
 
 function treeArgument(tree: unknown): string | undefined {
   return tree === CURRENT_TREE ? undefined : checkTreeId(tree);
+}
+
+/** `user_messages` / `handover`: the server's answer for the tree, formatted. */
+async function treeRouteTool(name: TreeRoute, args: Record<string, unknown>, tree: TreeSource): Promise<string> {
+  if (!tree.serverRead) throw new ToolInputError(`${name} is not available here`);
+  const target = treeArgument(args.tree);
+  if (name === "user_messages") {
+    return formatUserMessages(await tree.serverRead(name, target, userMessagesQuery(args)), args, target);
+  }
+  return formatHandover(await tree.serverRead(name, target, handoverQuery(args)), target);
 }
 
 /** read_lines by leaf address (its range unless block/start/end are given), by range, or the tail. */

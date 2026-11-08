@@ -4206,6 +4206,11 @@ test("GET /memtree/<id>[.json] relays the user's page with the key, either id sp
     // read_lines {"tail": true}: the un-indexed messages after the tree.
     await get("/memtree/ea18af90658b/messages?start=5&end=9");
     assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/messages?start=5&end=9");
+    // user_messages and handover: the person's own messages, and the handover pack.
+    await get("/memtree/ea18af90658b/user_messages?since=2026-11-01&cursor=12");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90658b/user_messages?since=2026-11-01&cursor=12");
+    await get("/memtree/ea18af90-658b-485f-ad71-063e0ca5e724-v1-own/handover?days=3");
+    assert.equal(pageGets.at(-1).url, "/usage/memtree/ea18af90-658b-485f-ad71-063e0ca5e724-v1-own/handover?days=3");
     await get("/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
     assert.equal(pageGets.at(-1).url, "/usage/memtree/sessions/6025e1f7-074b-4abb-a8e7-dbf07ef1e81f.json");
     assert.equal((await get("/memtree/sessions/..%2Fx.json")).status, 404);
