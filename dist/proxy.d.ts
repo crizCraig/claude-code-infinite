@@ -39,6 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
+import { type HttpsProxyModeOptions } from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
@@ -239,6 +240,8 @@ export interface ProxyOptions {
     diagnostics?: DiagnosticsRecorder;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
+    /** PROTOTYPE: also act as Claude Code's HTTPS_PROXY (https-proxy-mode.ts). */
+    httpsProxyMode?: HttpsProxyModeOptions;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
     captureDir?: string;
     /**

@@ -40,13 +40,29 @@
  */
 /** Claude Code's local refusal limit under ccc: effectively never reached. */
 export const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
-export function claudeChildEnv(parentEnv, anthropicBaseUrl) {
-    const childEnv = {
-        ...parentEnv,
-        ANTHROPIC_BASE_URL: anthropicBaseUrl,
-        _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
-        CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000",
-    };
+export function claudeChildEnv(parentEnv, anthropicBaseUrl, httpsProxy) {
+    const childEnv = httpsProxy
+        ? {
+            ...parentEnv,
+            // PROTOTYPE experiment: which variable Claude Code reads (CCC_PROTO_PROXY_VAR).
+            [parentEnv.CCC_PROTO_PROXY_VAR || "HTTPS_PROXY"]: anthropicBaseUrl,
+            NODE_EXTRA_CA_CERTS: httpsProxy.caBundlePath,
+            // The MemTree MCP server and agents find the loopback here instead.
+            CCC_MEMTREE_PROXY: anthropicBaseUrl,
+            ...(httpsProxy.bashEnvPath ? { CLAUDE_ENV_FILE: httpsProxy.bashEnvPath } : {}),
+            CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000",
+        }
+        : {
+            ...parentEnv,
+            ANTHROPIC_BASE_URL: anthropicBaseUrl,
+            _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
+            CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000",
+        };
+    if (httpsProxy) {
+        delete childEnv.ANTHROPIC_BASE_URL;
+        delete childEnv._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL;
+        delete childEnv.https_proxy;
+    }
     // Wrapper-only control; do not leak it into Claude Code itself.
     delete childEnv.CCC_AUTO_COMPACT;
     if (parentEnv.CCC_AUTO_COMPACT === "1") {

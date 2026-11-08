@@ -166,6 +166,8 @@ import {
   SignInTracker,
 } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
+import { createSessionCa, writeCaBundle, type SessionCa, type SessionCaFiles } from "./mitm-ca.js";
+import { readFileSync as readCaFile, writeFileSync } from "node:fs";
 import { urlOpenerFor } from "./open-url.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -772,7 +774,9 @@ async function main() {
   const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
   const memtreeLinkStore = new MemtreeLinkStore();
   const transcriptUsage = new ClaudeTranscriptUsage();
+  const proxyMode = startHttpsProxyMode(process.env);
   const proxy = await startProxy({
+    ...(proxyMode ? { httpsProxyMode: { ca: proxyMode.ca, tracePath: process.env.CCC_PROXY_TRACE } } : {}),
     memtree,
     debug: isDebugMode,
     reqlog: observedLog,
@@ -935,12 +939,19 @@ async function main() {
     }
   }
 
+  if (proxyMode) {
+    baseUrlForBash = `http://127.0.0.1:${proxy.port}`;
+    rewriteBashEnv();
+  }
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
   // native login and sends its own OAuth bearer to the local base URL.
   const claudeStartedAt = Date.now();
   const child = spawn(claude.command, childArgs, {
     env: withClaudeOnPath(
-      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`),
+      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`,
+        proxyMode ? { caBundlePath: proxyMode.files.bundlePath,
+          ...(process.env.CCC_PROTO_BASH_ENV !== "0" ? { bashEnvPath: proxyMode.bashEnvPath } : {}) }
+          : undefined),
       claude
     ),
     stdio: "inherit",
@@ -1208,3 +1219,55 @@ function pausedUpdateLine(autoUpdate: AutoUpdateSetup | null): string | null {
   if (autoUpdate?.bannerInstalled) return updateInstalledNoticeText(autoUpdate.bannerInstalled, color);
   return autoUpdate?.bannerUpdate ? updateNoticeText(autoUpdate.bannerUpdate, color) : null;
 }
+
+/**
+ * PROTOTYPE: `CCC_HTTPS_PROXY_MODE=1` starts ccc as Claude Code's HTTPS proxy
+ * (https-proxy-mode.ts) with a fresh per-session CA; its public cert, after
+ * any CAs the user already trusts through NODE_EXTRA_CA_CERTS, goes to a
+ * private temp file removed when ccc exits.
+ */
+function startHttpsProxyMode(
+  env: NodeJS.ProcessEnv
+): { ca: SessionCa; files: SessionCaFiles; bashEnvPath: string } | undefined {
+  if (env.CCC_HTTPS_PROXY_MODE !== "1") return undefined;
+  const started = performance.now();
+  const ca = createSessionCa();
+  let userExtra = "";
+  try {
+    if (env.NODE_EXTRA_CA_CERTS) userExtra = readCaFile(env.NODE_EXTRA_CA_CERTS, "utf8");
+  } catch { /* unreadable: Claude Code would have warned and ignored it too */ }
+  const files = writeCaBundle(ca, userExtra);
+  process.on("exit", files.cleanup);
+  const bashEnvPath = writeBashEnv(files.dir, env, () => baseUrlForBash);
+  if (env.CCC_PROXY_TRACE) {
+    console.error(`[ccc proto] session CA ready in ${(performance.now() - started).toFixed(2)} ms`);
+  }
+  return { ca, files, bashEnvPath };
+}
+
+let baseUrlForBash = "";
+
+/**
+ * Bash commands see what they see today under ccc: the user's own proxy and
+ * CA settings, and ANTHROPIC_BASE_URL at the loopback (programs' Anthropic
+ * calls and `$ANTHROPIC_BASE_URL/memtree/...` reach ccc as before). Claude
+ * Code itself never reads this file. Written once the port is known.
+ */
+function writeBashEnv(dir: string, env: NodeJS.ProcessEnv, baseUrl: () => string): string {
+  const path = `${dir}/bash-env.sh`;
+  const quote = (v: string): string => `'${v.replace(/'/g, "'\\''")}'`;
+  const write = (): void => {
+    const lines = ["HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"].map((name) =>
+      env[name] !== undefined ? `export ${name}=${quote(env[name]!)}` : `unset ${name}`);
+    if (baseUrl()) {
+      lines.push(`export ANTHROPIC_BASE_URL=${quote(baseUrl())}`,
+        "export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1");
+    }
+    if (env.CLAUDE_ENV_FILE) lines.push(`. ${quote(env.CLAUDE_ENV_FILE)}`);
+    writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
+  };
+  write();
+  rewriteBashEnv = write;
+  return path;
+}
+let rewriteBashEnv: () => void = () => {};

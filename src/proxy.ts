@@ -40,6 +40,8 @@
  */
 
 import { capCacheBreakpoints } from "./route-cache.js";
+import { attachHttpsProxyMode, isInterceptedRequest, type HttpsProxyModeOptions }
+  from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal }
   from "./route-fallback.js";
@@ -404,6 +406,8 @@ export interface ProxyOptions {
   diagnostics?: DiagnosticsRecorder;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
+  /** PROTOTYPE: also act as Claude Code's HTTPS_PROXY (https-proxy-mode.ts). */
+  httpsProxyMode?: HttpsProxyModeOptions;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
   captureDir?: string;
   /**
@@ -1138,6 +1142,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     );
     if (shutdownAbort.signal.aborted) cancelAcceptedRequest(accepted);
   });
+  if (opts.httpsProxyMode) attachHttpsProxyMode(server, opts.httpsProxyMode);
   // Long-running SSE responses must not be cut by idle timeouts.
   server.requestTimeout = 0;
   server.headersTimeout = 60_000;
@@ -1234,6 +1239,17 @@ async function handleRequest(
 ): Promise<void> {
   const url = new URL(req.url ?? "/", `http://127.0.0.1`);
 
+  if (isInterceptedRequest(req)) {
+    // Claude Code's own api.anthropic.com traffic, decrypted: model calls get
+    // MemTree as before; everything else (bridge, OAuth, files) goes verbatim.
+    if (req.method === "POST" && url.pathname === "/v1/messages") {
+      return handleMessages(req, res, opts, upstream, state);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+      return handleCountTokens(req, res, opts, upstream, state);
+    }
+    return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+  }
   if (!isLocalCaller(req)) {
     res.writeHead(403, { "content-type": "application/json" });
     res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));

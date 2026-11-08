@@ -1,0 +1,29 @@
+# PROTOTYPE (proto/https-proxy-rc only): per-session CA timing on Linux, macOS and Windows.
+name: proto-ca-bench
+on:
+  push:
+    branches:
+      - "proto/**"
+permissions:
+  contents: read
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run build
+      - name: Time install-equivalent (npm ci) is not affected; time CA generation
+        run: node scripts/proto/ca-bench.mjs
+      - name: Cold process (what a session start pays)
+        shell: bash
+        run: |
+          for i in 1 2 3; do node -e "const t=performance.now();import('./dist/mitm-ca.js').then(m=>{const a=performance.now();m.createSessionCa();console.log(JSON.stringify({importMs:+(a-t).toFixed(2),createMs:+(performance.now()-a).toFixed(2)}))})"; done

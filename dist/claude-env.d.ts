@@ -40,7 +40,13 @@
  */
 /** Claude Code's local refusal limit under ccc: effectively never reached. */
 export declare const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
-export declare function claudeChildEnv(parentEnv: NodeJS.ProcessEnv, anthropicBaseUrl: string): NodeJS.ProcessEnv;
+/** PROTOTYPE: HTTPS-proxy mode (https-proxy-mode.ts): no base URL, so Remote Control stays. */
+export interface HttpsProxyChild {
+    caBundlePath: string;
+    /** Sourced by Claude Code before each Bash command: restores the user's proxy/CA env. */
+    bashEnvPath?: string;
+}
+export declare function claudeChildEnv(parentEnv: NodeJS.ProcessEnv, anthropicBaseUrl: string, httpsProxy?: HttpsProxyChild): NodeJS.ProcessEnv;
 /**
  * Keep the proxy's MemTree budget in lockstep with Claude Code's own context
  * accounting. This is the documented escape hatch for forcing native-1M
