@@ -15,6 +15,7 @@ import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import { appendFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 import { INTERCEPT_HOST } from "./mitm-ca.js";
 /** Decrypted api.anthropic.com streams: their requests skip the loopback-only routes. */
 const intercepted = new WeakSet();
@@ -38,6 +39,11 @@ export function attachHttpsProxyMode(server, opts) {
         trace({ ev: "connect", target: req.url, ua, headerNames: Object.keys(req.headers), mitm });
         if (!target)
             return void socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+        if (!authorized(req, opts.proxyToken)) {
+            trace({ ev: "connect_refused", target: req.url });
+            return void socket.end("HTTP/1.1 407 Proxy Authentication Required\r\n" +
+                "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
+        }
         socket.on("error", () => { });
         if (mitm)
             return interceptConnect(server, socket, head, secureContext, trace);
@@ -104,6 +110,11 @@ function upgradeToUpstream(req, socket, head) {
     upstream.on("error", () => socket.destroy());
     socket.on("error", () => upstream.destroy());
     socket.on("close", () => upstream.destroy());
+}
+function authorized(req, token) {
+    const expected = Buffer.from(`Basic ${Buffer.from(`ccc:${token}`).toString("base64")}`);
+    const got = Buffer.from(String(req.headers["proxy-authorization"] ?? ""));
+    return got.length === expected.length && timingSafeEqual(got, expected);
 }
 function parseAuthority(authority) {
     const m = /^\[?([^\]\s]+?)\]?:(\d{1,5})$/.exec(authority);

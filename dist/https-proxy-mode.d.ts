@@ -16,6 +16,8 @@ import { type SessionCa } from "./mitm-ca.js";
 export declare function isInterceptedRequest(req: http.IncomingMessage): boolean;
 export interface HttpsProxyModeOptions {
     ca: SessionCa;
+    /** Per-session secret: Claude Code sends it on every CONNECT (from HTTPS_PROXY's userinfo). */
+    proxyToken: string;
     /** Debug trace (CONNECT targets, intercepted method/path/status; never header values). */
     tracePath?: string;
 }

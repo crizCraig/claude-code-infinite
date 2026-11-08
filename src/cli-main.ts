@@ -168,6 +168,7 @@ import {
 import { exitResumeHint } from "./resume-hint.js";
 import { createSessionCa, writeCaBundle, type SessionCa, type SessionCaFiles } from "./mitm-ca.js";
 import { readFileSync as readCaFile, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { urlOpenerFor } from "./open-url.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -776,7 +777,8 @@ async function main() {
   const transcriptUsage = new ClaudeTranscriptUsage();
   const proxyMode = startHttpsProxyMode(process.env);
   const proxy = await startProxy({
-    ...(proxyMode ? { httpsProxyMode: { ca: proxyMode.ca, tracePath: process.env.CCC_PROXY_TRACE } } : {}),
+    ...(proxyMode ? { httpsProxyMode: { ca: proxyMode.ca, proxyToken: proxyMode.proxyToken,
+      tracePath: process.env.CCC_PROXY_TRACE } } : {}),
     memtree,
     debug: isDebugMode,
     reqlog: observedLog,
@@ -950,6 +952,7 @@ async function main() {
     env: withClaudeOnPath(
       claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`,
         proxyMode ? { caBundlePath: proxyMode.files.bundlePath,
+          proxyUrl: `http://ccc:${proxyMode.proxyToken}@127.0.0.1:${proxy.port}`,
           ...(process.env.CCC_PROTO_BASH_ENV !== "0" ? { bashEnvPath: proxyMode.bashEnvPath } : {}) }
           : undefined),
       claude
@@ -1228,7 +1231,7 @@ function pausedUpdateLine(autoUpdate: AutoUpdateSetup | null): string | null {
  */
 function startHttpsProxyMode(
   env: NodeJS.ProcessEnv
-): { ca: SessionCa; files: SessionCaFiles; bashEnvPath: string } | undefined {
+): { ca: SessionCa; files: SessionCaFiles; bashEnvPath: string; proxyToken: string } | undefined {
   if (env.CCC_HTTPS_PROXY_MODE !== "1") return undefined;
   const started = performance.now();
   const ca = createSessionCa();
@@ -1242,7 +1245,7 @@ function startHttpsProxyMode(
   if (env.CCC_PROXY_TRACE) {
     console.error(`[ccc proto] session CA ready in ${(performance.now() - started).toFixed(2)} ms`);
   }
-  return { ca, files, bashEnvPath };
+  return { ca, files, bashEnvPath, proxyToken: randomBytes(18).toString("hex") };
 }
 
 let baseUrlForBash = "";

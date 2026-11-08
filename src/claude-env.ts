@@ -44,6 +44,8 @@ export const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
 /** PROTOTYPE: HTTPS-proxy mode (https-proxy-mode.ts): no base URL, so Remote Control stays. */
 export interface HttpsProxyChild {
   caBundlePath: string;
+  /** HTTPS_PROXY for Claude Code: the loopback with the per-session proxy token. */
+  proxyUrl: string;
   /** Sourced by Claude Code before each Bash command: restores the user's proxy/CA env. */
   bashEnvPath?: string;
 }
@@ -57,7 +59,7 @@ export function claudeChildEnv(
     ? {
       ...parentEnv,
       // PROTOTYPE experiment: which variable Claude Code reads (CCC_PROTO_PROXY_VAR).
-      [parentEnv.CCC_PROTO_PROXY_VAR || "HTTPS_PROXY"]: anthropicBaseUrl,
+      [parentEnv.CCC_PROTO_PROXY_VAR || "HTTPS_PROXY"]: httpsProxy.proxyUrl,
       NODE_EXTRA_CA_CERTS: httpsProxy.caBundlePath,
       // The MemTree MCP server and agents find the loopback here instead.
       CCC_MEMTREE_PROXY: anthropicBaseUrl,

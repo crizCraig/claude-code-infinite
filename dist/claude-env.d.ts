@@ -43,6 +43,8 @@ export declare const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
 /** PROTOTYPE: HTTPS-proxy mode (https-proxy-mode.ts): no base URL, so Remote Control stays. */
 export interface HttpsProxyChild {
     caBundlePath: string;
+    /** HTTPS_PROXY for Claude Code: the loopback with the per-session proxy token. */
+    proxyUrl: string;
     /** Sourced by Claude Code before each Bash command: restores the user's proxy/CA env. */
     bashEnvPath?: string;
 }
