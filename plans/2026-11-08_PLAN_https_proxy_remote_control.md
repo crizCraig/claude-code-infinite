@@ -23,7 +23,8 @@ per-session CA instead of a per-install one.**
 - Security: better than the proposed per-install CA. The CA key exists only in the ccc
   process's memory for one session and is never written to disk. The CA is name-constrained
   to the DNS name `api.anthropic.com` with every IP address excluded, so even a leaked key
-  can't vouch for any other host name (Claude Code enforces this) or IP address (Node
+  can't vouch for any other host name, subdomains included (Claude Code enforces this for
+  other names; Node and OpenSSL for subdomains) or IP address (Node
   and OpenSSL enforce this; Bun not yet tested for IPs). Nothing persists, so nothing
   needs revocation, rotation or Windows ACLs.
 - Ship it behind a switch (`CCC_HTTPS_PROXY_MODE=1`, later a config key). It falls back to
@@ -65,7 +66,8 @@ request's method, path, status and User-Agent (no other header values, no bodies
 1. **Session CA** (`mitm-ca.ts`, no dependencies). `node:crypto` makes the P-256 keys and
    signatures; about 200 lines (with comments) write the X.509 DER around them. The CA has
    `basicConstraints CA:TRUE, pathlen:0`, `keyUsage keyCertSign`, critical
-   `nameConstraints` (permitted `DNS:api.anthropic.com`; excluded `IP:0.0.0.0/0` and
+   `nameConstraints` (permitted `DNS:api.anthropic.com`; excluded `DNS:.api.anthropic.com`
+   (its subdomains, which a permitted DNS name would otherwise include), `IP:0.0.0.0/0` and
    `IP:::/0`, since RFC 5280 leaves unlisted name forms unconstrained), and is valid for 365 days from
    yesterday (a session can run for weeks; the key dies with the process anyway). The leaf
    has SAN `api.anthropic.com` and EKU serverAuth. The CA key is a local variable: it is
@@ -166,7 +168,10 @@ nothing: Claude Code and Node both accept P-256.
 - **Interception scope.** Only `CONNECT api.anthropic.com:443` carrying the session token is
   decrypted. Every other host is a blind TCP tunnel. The nameConstraints extension makes this
   hold in the certificate itself: a stolen session CA key still can't mint a trusted
-  certificate for any other DNS name (Bun and OpenSSL both enforce it, as tested above) or
+  certificate for any other DNS name (Bun and OpenSSL both enforce it, as tested above), for
+  a subdomain of api.anthropic.com (excluded subtree after Codex r1; `openssl verify`
+  rejects `child.api.anthropic.com`, Node TLS too, in `test/mitm-ca.test.mjs`; Claude Code
+  still accepts the exact-host leaf, checked live) or
   for any IP address (tested with OpenSSL and Node; Bun not yet tested for IPs). The Remote Control WebSocket goes to `bridge.claudeusercontent.com`
   (from the binary), so it is tunnelled blind; the upgrade path on api.anthropic.com is
   only a fallback.
@@ -263,8 +268,15 @@ CCC_HTTPS_PROXY_MODE=1 CCC_PROXY_TRACE=/tmp/ccc-rc-trace.jsonl node ~/src/ccc-rc
    `grep -E '"ev":"(connect_refused|upgrade|tls_error|tunnel_error)"' /tmp/ccc-rc-trace.jsonl`.
    Any `connect_refused` means a Claude Code client didn't send the proxy token (the /rc
    WebSocket is the untested one). `tls_error`/`tunnel_error` resets around exit are
-   harmless; ones while /rc is failing are the clue. Then confirm the phone turns appear as `"kind":"messages"` in
-   `~/.claude-code-infinite/logs/requests.jsonl`.
+   harmless; ones while /rc is failing are the clue.
+   Then check that the phone turns got MemTree, not just the proxy (a request without
+   Claude Code's session header is logged as `"kind":"messages"` too, but as
+   `"turnType":"foreign"`, with no MemTree):
+   `tail -n 40 ~/.claude-code-infinite/logs/requests.jsonl | grep '"kind":"messages"'`
+   should show `"turnType"` values like `first-user`, `tool` or `followup-...` (no
+   `foreign`) with `"upstreamStatus":200`, around the times you sent from the phone, and
+   `grep -c '"kind":"memtree".*"ok":true'` on the same tail should be ≥ 1 (MemTree index or
+   compress calls succeeded).
 5. Exit, then check `ls -d ${TMPDIR:-/tmp}/ccc-ca-*` (the session's dir should be gone).
 6. Send `/tmp/ccc-rc-trace.jsonl` back. It holds paths (which include
    environment and session ids, not secrets), statuses, CONNECT targets with header names,

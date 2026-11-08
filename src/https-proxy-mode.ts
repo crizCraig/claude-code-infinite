@@ -60,14 +60,15 @@ export function attachHttpsProxyMode(
     const ua = String(req.headers["user-agent"] ?? "");
     const mitm = target !== null && target.host === INTERCEPT_HOST && target.port === 443;
     trace({ ev: "connect", target: req.url, ua, headerNames: Object.keys(req.headers), mitm });
-    if (!target) return void socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-    if (!authorized(req, opts.proxyToken)) {
-      trace({ ev: "connect_refused", target: req.url });
-      return void socket.end("HTTP/1.1 407 Proxy Authentication Required\r\n" +
-        "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
-    }
+    // Before any answer: a reset must not be an unhandled error, and drain must see it.
     socket.on("error", () => {});
     track(socket, mitm ? raw : blind);
+    if (!target) return refuse(socket, "HTTP/1.1 400 Bad Request\r\n\r\n");
+    if (!authorized(req, opts.proxyToken)) {
+      trace({ ev: "connect_refused", target: req.url });
+      return refuse(socket, "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+        "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
+    }
     if (mitm) return interceptConnect(server, socket, head, secureContext, trace);
     tunnelConnect(socket, head, target.host, target.port, trace);
   });
@@ -145,6 +146,12 @@ function upgradeToUpstream(req: http.IncomingMessage, socket: net.Socket, head: 
   upstream.on("error", () => socket.destroy());
   socket.on("error", () => upstream.destroy());
   socket.on("close", () => upstream.destroy());
+}
+
+/** Answer, then close: a refused client can't hold the socket open. */
+function refuse(socket: net.Socket, response: string): void {
+  socket.end(response);
+  setTimeout(() => socket.destroy(), 1_000).unref();
 }
 
 function authorized(req: http.IncomingMessage, token: string): boolean {

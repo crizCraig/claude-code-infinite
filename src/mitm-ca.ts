@@ -99,11 +99,12 @@ function caExtensions(host: string, skid: Buffer): Buffer[] {
   return [
     extension("2.5.29.19", true, seq(bool(true), int(Buffer.from([0])))), // CA, pathLen 0
     extension("2.5.29.15", true, Buffer.from([0x03, 0x02, 0x01, 0x06])), // keyCertSign, cRLSign
-    // permitted: DNS api.anthropic.com; excluded: every IPv4 and IPv6 address (an unlisted
-    // name form would otherwise be unconstrained, RFC 5280 4.2.1.10).
+    // permitted: DNS api.anthropic.com; excluded: its subdomains and every IPv4 and IPv6
+    // address (an unlisted name form would otherwise be unconstrained, RFC 5280 4.2.1.10).
     extension("2.5.29.30", true, seq(
       tagged(0xa0, seq(tagged(0x82, Buffer.from(host)))),
       tagged(0xa1, Buffer.concat([
+        seq(tagged(0x82, Buffer.from(`.${host}`))), // subdomains: the exact host only
         seq(tagged(0x87, Buffer.alloc(8))), // 0.0.0.0/0
         seq(tagged(0x87, Buffer.alloc(32))), // ::/0
       ])),

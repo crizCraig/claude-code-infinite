@@ -25,6 +25,11 @@ test("TLS accepts the leaf for api.anthropic.com and rejects one the CA may not 
     false);
 });
 
+test("the CA can't vouch for a subdomain of api.anthropic.com", async () => {
+  const ca = createSessionCa("api.anthropic.com", "ec", "child.api.anthropic.com");
+  assert.equal(await handshake(ca, "child.api.anthropic.com"), false);
+});
+
 test("the CA can't vouch for an IP address either (excluded subtrees)", async () => {
   const ca = createSessionCa("api.anthropic.com", "ec", "127.0.0.1");
   assert.equal(new X509Certificate(ca.leafCertPem).checkIP("127.0.0.1"), "127.0.0.1");
