@@ -24,9 +24,10 @@ export function isInterceptedRequest(req) {
 }
 export function attachHttpsProxyMode(server, opts) {
     const raw = new Set();
-    const track = (sock) => {
-        raw.add(sock);
-        sock.once("close", () => raw.delete(sock));
+    const blind = new Set();
+    const track = (sock, set = raw) => {
+        set.add(sock);
+        sock.once("close", () => set.delete(sock));
     };
     const secureContext = tls.createSecureContext({ cert: opts.ca.leafCertPem, key: opts.ca.leafKeyPem });
     const trace = (event) => {
@@ -50,7 +51,7 @@ export function attachHttpsProxyMode(server, opts) {
                 "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
         }
         socket.on("error", () => { });
-        track(socket);
+        track(socket, mitm ? raw : blind);
         if (mitm)
             return interceptConnect(server, socket, head, secureContext, trace);
         tunnelConnect(socket, head, target.host, target.port, trace);
@@ -74,11 +75,12 @@ export function attachHttpsProxyMode(server, opts) {
             }));
         });
     }
-    return () => {
-        for (const sock of raw)
+    const destroy = (set) => {
+        for (const sock of set)
             sock.destroy();
-        raw.clear();
+        set.clear();
     };
+    return { blind: () => destroy(blind), all: () => { destroy(blind); destroy(raw); } };
 }
 function interceptConnect(server, socket, head, secureContext, trace) {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");

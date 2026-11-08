@@ -7,8 +7,9 @@ well"). Everything below was measured on Claude Code 2.1.319 (Bun 1.4.4), Node 2
 
 ## Recommendation
 
-**Build it, opt-in first (macOS and Linux; Windows stays in today's mode until its
-PowerShell gap is solved), with a per-session CA instead of a per-install one.**
+**Build it, opt-in first (macOS and Linux; Windows, Claude Code's Bash sandbox and
+settings-level proxy/CA config stay in today's mode until their gaps are solved), with a
+per-session CA instead of a per-install one.**
 
 - Remote Control works in principle: with ccc as Claude Code's `HTTPS_PROXY` instead of its
   `ANTHROPIC_BASE_URL`, `/remote-control` shows up in a ccc session and its eligibility
@@ -92,13 +93,14 @@ request's method, path, status and User-Agent (no other header values, no bodies
    Bash-tool command). It puts back the user's own `HTTPS_PROXY`, `https_proxy` and
    `NODE_EXTRA_CA_CERTS` (or unsets them) **only while each still holds ccc's value**
    (`case "${HTTPS_PROXY-}" in http://ccc:*@127.0.0.1:<port>)`, so the token itself is
-   never written to the file). Claude Code's Bash sandbox sets its own proxy and CA before
+   never written to the file; `https_proxy`, which ccc removed from Claude Code's env, is
+   restored in the same branch). Claude Code's Bash sandbox sets its own proxy and CA before
    the file is sourced, and those survive (checked by sourcing the generated file under
    sandbox-like values). It also restores `CLAUDE_ENV_FILE`, `CCC_MEMTREE_PROXY` and
    `CCC_HTTPS_PROXY_MODE` to the user's values, exports today's
    `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` and
    `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`, then sources a `CLAUDE_ENV_FILE` the user
-   already had. So scripts, SDK apps, `$ANTHROPIC_BASE_URL/memtree/...` (the guidance
+   already had (only if it is readable, as Claude Code itself does). So scripts, SDK apps, `$ANTHROPIC_BASE_URL/memtree/...` (the guidance
    polychat's MemTree pages give agents) and a nested ccc started from Bash behave as
    today, and none of them sees the proxy token. (Claude Code caches an env file's
    content; the `. <user file>` line makes the user's file re-read on each command
@@ -159,8 +161,8 @@ nothing: Claude Code and Node both accept P-256.
 - **Interception scope.** Only `CONNECT api.anthropic.com:443` carrying the session token is
   decrypted. Every other host is a blind TCP tunnel. The nameConstraints extension makes this
   hold in the certificate itself: a stolen session CA key still can't mint a trusted
-  certificate for any other DNS name or for any IP address (Bun and OpenSSL both enforce it,
-  as tested above). The Remote Control WebSocket goes to `bridge.claudeusercontent.com`
+  certificate for any other DNS name (Bun and OpenSSL both enforce it, as tested above) or
+  for any IP address (tested with OpenSSL and Node; Bun not yet tested for IPs). The Remote Control WebSocket goes to `bridge.claudeusercontent.com`
   (from the binary), so it is tunnelled blind; the upgrade path on api.anthropic.com is
   only a fallback.
 - **What ccc newly sees.** Decrypted in memory, it now also sees Claude Code's non-model
@@ -189,11 +191,13 @@ nothing: Claude Code and Node both accept P-256.
 
 | Area | Effect | Handling |
 |---|---|---|
-| Bash-tool programs (macOS, Linux) | None: probe output identical to today's mode, including inside Claude Code's sandbox (its own proxy/CA values are kept) | `CLAUDE_ENV_FILE` (2.5) |
+| Bash-tool programs (macOS, Linux), sandbox off | None: probe output identical to today's mode | `CLAUDE_ENV_FILE` (2.5) |
+| Claude Code's Bash sandbox on | The env-file logic keeps the sandbox's own proxy/CA values (checked by sourcing the file under sandbox-like values). **But the sandbox's proxy forwards upstream through Claude Code's own `HTTPS_PROXY` when no `sandbox.network.parentProxy` is set (2.1.319 binary, review r2), with the token, so ccc accepts it.** Sandboxed calls to api.anthropic.com then hit the interception and fail TLS, and the sandbox's resolved-address check (it blocks names resolving to private/metadata addresses) is documented as not applying to connections routed through a parent proxy, so proxy mode would switch it off. | **v1: stay in base-URL mode when the sandbox is enabled in any settings scope.** Later: point `sandbox.network.parentProxy` at a tunnel-only token if settings allow it, or give blind tunnels a private-address check. |
 | A user's own `CLAUDE_ENV_FILE` | Kept | Restored for Bash and sourced at the end of ccc's file. SessionStart/Setup/CwdChanged/FileChanged hooks get their own env files from Claude Code (under session-env), sourced after this one, so they are unaffected. |
 | Command hooks, the status line command, and MCP servers started by Claude Code | Not Bash-tool commands, so the env file doesn't apply: they inherit `HTTPS_PROXY` (with the token) and the session CA. Node ones work (Node's fetch/https ignore `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY` or a proxy library is used, so they go direct). **Non-Node ones that call api.anthropic.com fail TLS: e.g. a status line or hook that curls `https://api.anthropic.com/api/oauth/usage`, or a Python MCP server using the API.** Other hosts work through the blind tunnel. | Name status lines and hooks in the README note; `CCC_HTTPS_PROXY_MODE=0` is the escape. Option when building: give children a full CA bundle (system roots + user extras + session CA) via `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`, which makes curl and Python work too. Decide before making it the default. |
 | User already has `HTTPS_PROXY`/`https_proxy` (corporate proxy) | Blind tunnels and ccc's own upstream would go direct, bypassing that proxy | **v1: stay in base-URL mode** and say once that /rc needs it off. Today ccc's upstream ignores proxies too, so those users mostly can't use ccc now. A later version can chain CONNECT through the user's proxy. |
-| Proxy set in Claude Code's `settings.json` `env` (user, project, local or managed), not the shell | Those values override the process env, so Claude Code would send its traffic to that proxy instead of ccc: **model calls skip MemTree with no error** | Detection must also read the settings `env` blocks (and their `NO_PROXY`); and ccc should warn at runtime if no intercepted `/v1/messages` arrives while Claude Code is clearly active. Not in the prototype. |
+| `NODE_EXTRA_CA_CERTS` set in a Claude Code `settings.json` `env` block (Claude Code's own TLS error text tells corporate users to put it there) | Settings env is applied over the process env, replacing ccc's bundle path: Claude Code no longer trusts the session CA and **every model call fails TLS** (loud, not silent) | Same detection as the next row: stay in base-URL mode. |
+| Proxy set in Claude Code's `settings.json` `env` (user, project, local or managed), not the shell | Those values override the process env, so Claude Code would send its traffic to that proxy instead of ccc: **model calls skip MemTree with no error** | Detection must also read the settings `env` blocks (`HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`); and ccc should warn at runtime if no intercepted `/v1/messages` arrives while Claude Code is clearly active. Not in the prototype. |
 | `NO_PROXY`/`no_proxy` covering api.anthropic.com (`*`, `.anthropic.com`, ...) | Claude Code would bypass ccc, so model calls skip MemTree silently | Strip matching entries from the child's `NO_PROXY`; `bash-env.sh` restores the user's value. (Not in the prototype.) |
 | User's `NODE_EXTRA_CA_CERTS` | Kept | Prepended to the bundle; restored for Bash |
 | `/memtree/*` and the MemTree MCP tools | Unchanged | MCP uses `CCC_MEMTREE_PROXY`; Bash has `ANTHROPIC_BASE_URL` |
@@ -201,7 +205,7 @@ nothing: Claude Code and Node both accept P-256.
 | Attachment uploads | Previously went to the base URL (ccc, passthrough); now to api.anthropic.com through the interception (passthrough) | none |
 | Claude Code's telemetry to api.anthropic.com | Now relayed through ccc verbatim, where before it went direct | Disclosure only |
 | 1M context / first-party features | Native: Claude Code sees no custom base URL | Keep the assume-first-party var only in base-URL mode |
-| Shutdown | Intercepted requests are normal tracked requests and drain as today. Blind tunnels and upgrade pipes are raw sockets that keep `server.close()` waiting: an orphaned MCP server holding a tunnel would block ccc's exit indefinitely (review r1 measured it) | Fixed in the prototype: tunnels are tracked and destroyed at the drain deadline. Test it when building. |
+| Shutdown | Intercepted requests are normal tracked requests and drain as today. Blind tunnels and upgrade pipes are raw sockets that keep `server.close()` waiting: an orphaned MCP server holding a tunnel would block ccc's exit indefinitely (review r1 measured it) | Fixed in the prototype: blind tunnels (no ccc work in them) are destroyed when drain starts, intercepted sockets at the drain deadline. Test it when building. |
 | `claude remote-control` (server mode, spawning sessions) | Not supported under ccc: it refuses ccc's `--mcp-config` placed before the verb | Out of scope; in-session `/rc` is the target |
 | If Anthropic ever pins certs, or drops `NODE_EXTRA_CA_CERTS`/`HTTPS_PROXY` support | Model calls would fail outright instead of degrading | Both are documented enterprise features, so this is unlikely. The daily e2e should run proxy mode once it is the default. |
 
@@ -209,7 +213,8 @@ nothing: Claude Code and Node both accept P-256.
 
 1. A `CCC_HTTPS_PROXY_MODE` switch (or config `httpsProxyMode`), default off. It is ignored,
    with a one-line notice, when the parent env or any Claude Code settings `env` block sets
-   a proxy, and on Windows.
+   a proxy or `NODE_EXTRA_CA_CERTS`, when the Bash sandbox is enabled in any settings scope,
+   and on Windows.
 2. `NO_PROXY` sanitizing; a runtime warning when no intercepted `/v1/messages` arrives;
    sweeping stale `ccc-ca-*` dirs at startup; README privacy and "Remote Control"
    sections; the hooks/status-line decision above.

@@ -48,7 +48,7 @@ export function createSessionCa(
   const leafKeys = makeKeyPair(alg);
   const leafSpki = spkiDer(leafKeys.publicKey);
   const leafCert = signCert({
-    serial: serialNumber(), issuer: caName, subject: name(leafHost), spki: leafSpki,
+    serial: serialNumber(), issuer: caName, subject: name(isIpv4(leafHost) ? "test leaf" : leafHost), spki: leafSpki,
     notBefore: now - 24 * 3600_000, notAfter: now + 365 * 24 * 3600_000,
     extensions: leafExtensions(leafHost, keyId(leafSpki), caKeyId, alg),
     signer: caKeys.privateKey, alg,
@@ -123,6 +123,10 @@ function leafExtensions(host: string, skid: Buffer, akid: Buffer, alg: KeyAlg): 
     extension("2.5.29.14", false, octet(skid)),
     extension("2.5.29.35", false, seq(tagged(0x80, akid))),
   ];
+}
+
+function isIpv4(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
 /** dNSName, or iPAddress for a dotted IPv4 (only test leaves use one). */

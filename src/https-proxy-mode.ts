@@ -33,16 +33,20 @@ export interface HttpsProxyModeOptions {
   tracePath?: string;
 }
 
-/** Destroys every blind tunnel and upgrade pipe (they are not http requests, so drain can't). */
-export type CloseTunnels = () => void;
+/**
+ * Raw sockets drain can't see (they keep server.close() waiting): `blind` destroys the blind
+ * tunnels (no ccc work in them; called when drain starts), `all` everything left (deadline).
+ */
+export interface CloseTunnels { blind: () => void; all: () => void }
 
 export function attachHttpsProxyMode(
   server: http.Server, opts: HttpsProxyModeOptions
 ): CloseTunnels {
   const raw = new Set<net.Socket>();
-  const track = (sock: net.Socket): void => {
-    raw.add(sock);
-    sock.once("close", () => raw.delete(sock));
+  const blind = new Set<net.Socket>();
+  const track = (sock: net.Socket, set = raw): void => {
+    set.add(sock);
+    sock.once("close", () => set.delete(sock));
   };
   const secureContext = tls.createSecureContext({ cert: opts.ca.leafCertPem, key: opts.ca.leafKeyPem });
   const trace = (event: Record<string, unknown>): void => {
@@ -63,7 +67,7 @@ export function attachHttpsProxyMode(
         "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
     }
     socket.on("error", () => {});
-    track(socket);
+    track(socket, mitm ? raw : blind);
     if (mitm) return interceptConnect(server, socket, head, secureContext, trace);
     tunnelConnect(socket, head, target.host, target.port, trace);
   });
@@ -84,10 +88,11 @@ export function attachHttpsProxyMode(
       }));
     });
   }
-  return () => {
-    for (const sock of raw) sock.destroy();
-    raw.clear();
+  const destroy = (set: Set<net.Socket>): void => {
+    for (const sock of set) sock.destroy();
+    set.clear();
   };
+  return { blind: () => destroy(blind), all: () => { destroy(blind); destroy(raw); } };
 }
 
 function interceptConnect(

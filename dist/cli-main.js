@@ -1073,16 +1073,18 @@ function writeBashEnv(dir, env, baseUrl, bundlePath) {
     const write = () => {
         const proxyPattern = `http://ccc:*@127.0.0.1:${proxyPortForBash || "*"}`;
         const lines = [
-            `case "\${HTTPS_PROXY-}" in ${proxyPattern}) ${restore("HTTPS_PROXY")};; esac`,
-            `case "\${https_proxy-}" in ${proxyPattern}) ${restore("https_proxy")};; esac`,
+            // ccc removed https_proxy from Claude Code's env exactly when it set HTTPS_PROXY.
+            `case "\${HTTPS_PROXY-}" in ${proxyPattern}) ${restore("HTTPS_PROXY")}; ` +
+                `${restore("https_proxy")};; esac`,
             `if [ "\${NODE_EXTRA_CA_CERTS-}" = ${quote(bundlePath)} ]; then ${restore("NODE_EXTRA_CA_CERTS")}; fi`,
             restore("CLAUDE_ENV_FILE"), restore("CCC_MEMTREE_PROXY"), restore("CCC_HTTPS_PROXY_MODE"),
         ];
         if (baseUrl()) {
             lines.push(`export ANTHROPIC_BASE_URL=${quote(baseUrl())}`, "export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1");
         }
-        if (env.CLAUDE_ENV_FILE)
-            lines.push(`. ${quote(env.CLAUDE_ENV_FILE)}`);
+        if (env.CLAUDE_ENV_FILE) {
+            lines.push(`if [ -r ${quote(env.CLAUDE_ENV_FILE)} ]; then . ${quote(env.CLAUDE_ENV_FILE)}; fi`);
+        }
         writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
     };
     write();

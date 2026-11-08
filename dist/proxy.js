@@ -429,7 +429,7 @@ export function startProxy(opts) {
             cancelAcceptedRequest(accepted);
     });
     const closeTunnels = opts.httpsProxyMode
-        ? attachHttpsProxyMode(server, opts.httpsProxyMode) : () => { };
+        ? attachHttpsProxyMode(server, opts.httpsProxyMode) : { blind: () => { }, all: () => { } };
     // Long-running SSE responses must not be cut by idle timeouts.
     server.requestTimeout = 0;
     server.headersTimeout = 60_000;
@@ -451,6 +451,7 @@ export function startProxy(opts) {
             ? Math.floor(timeoutMs)
             : 5_000;
         backgroundAbort.abort();
+        closeTunnels.blind();
         const quiesced = (async () => {
             // Once close completes, every accepted request has entered the tracked
             // set.
@@ -480,7 +481,7 @@ export function startProxy(opts) {
         for (const accepted of acceptedRequests)
             cancelAcceptedRequest(accepted);
         // CONNECT tunnels hold the server open (server.close waits for them).
-        closeTunnels();
+        closeTunnels.all();
         await quiesced;
         sendDeferredAgentIndexes(state);
         return false;

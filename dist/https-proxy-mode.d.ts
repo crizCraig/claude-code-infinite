@@ -21,7 +21,13 @@ export interface HttpsProxyModeOptions {
     /** Debug trace (CONNECT targets, intercepted method/path/status, User-Agent; no other values). */
     tracePath?: string;
 }
-/** Destroys every blind tunnel and upgrade pipe (they are not http requests, so drain can't). */
-export type CloseTunnels = () => void;
+/**
+ * Raw sockets drain can't see (they keep server.close() waiting): `blind` destroys the blind
+ * tunnels (no ccc work in them; called when drain starts), `all` everything left (deadline).
+ */
+export interface CloseTunnels {
+    blind: () => void;
+    all: () => void;
+}
 export declare function attachHttpsProxyMode(server: http.Server, opts: HttpsProxyModeOptions): CloseTunnels;
 //# sourceMappingURL=https-proxy-mode.d.ts.map
