@@ -252,6 +252,7 @@ git -C ~/src/claude-code-infinite fetch origin proto/https-proxy-rc
 git -C ~/src/claude-code-infinite worktree add ~/src/ccc-rc-proxy origin/proto/https-proxy-rc
 cd ~/src/ccc-rc-proxy && npm ci && npm run build
 cd ~/src/<any project>
+date -u +%Y-%m-%dT%H:%M:%SZ   # launch time, for step 4
 CCC_HTTPS_PROXY_MODE=1 CCC_PROXY_TRACE=/tmp/ccc-rc-trace.jsonl node ~/src/ccc-rc-proxy/dist/cli.js
 ```
 
@@ -269,14 +270,15 @@ CCC_HTTPS_PROXY_MODE=1 CCC_PROXY_TRACE=/tmp/ccc-rc-trace.jsonl node ~/src/ccc-rc
    Any `connect_refused` means a Claude Code client didn't send the proxy token (the /rc
    WebSocket is the untested one). `tls_error`/`tunnel_error` resets around exit are
    harmless; ones while /rc is failing are the clue.
-   Then check that the phone turns got MemTree, not just the proxy (a request without
-   Claude Code's session header is logged as `"kind":"messages"` too, but as
-   `"turnType":"foreign"`, with no MemTree):
-   `tail -n 40 ~/.claude-code-infinite/logs/requests.jsonl | grep '"kind":"messages"'`
-   should show `"turnType"` values like `first-user`, `tool` or `followup-...` (no
-   `foreign`) with `"upstreamStatus":200`, around the times you sent from the phone, and
-   `grep -c '"kind":"memtree".*"ok":true'` on the same tail should be ≥ 1 (MemTree index or
-   compress calls succeeded).
+   Then check that the turns got MemTree, not just the proxy. A request without Claude
+   Code's session header is logged as `"kind":"messages"` too, but as `foreign` with no
+   MemTree, and a follow-up can come out `followup-degraded`. While the session runs, note
+   its pid (`pgrep -f ccc-rc-proxy/dist/cli.js`), then:
+   `node ~/src/ccc-rc-proxy/scripts/proto/rc-check.mjs --pid <pid> --since <launch time, UTC ISO>`
+   It keeps only that ccc's records since launch. It fails on any foreign, unparseable,
+   degraded, refused, client-closed or no-flatten turn, a non-200 upstream, or a turn with no
+   successful MemTree call from the same ccc within 2 minutes. Expect exit 0, with the phone
+   turns' timestamps among the `ok` lines.
 5. Exit, then check `ls -d ${TMPDIR:-/tmp}/ccc-ca-*` (the session's dir should be gone).
 6. Send `/tmp/ccc-rc-trace.jsonl` back. It holds paths (which include
    environment and session ids, not secrets), statuses, CONNECT targets with header names,
