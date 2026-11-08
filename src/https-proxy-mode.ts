@@ -29,7 +29,7 @@ export interface HttpsProxyModeOptions {
   ca: SessionCa;
   /** Per-session secret: Claude Code sends it on every CONNECT (from HTTPS_PROXY's userinfo). */
   proxyToken: string;
-  /** Debug trace (CONNECT targets, intercepted method/path/status; never header values). */
+  /** Debug trace (CONNECT targets, intercepted method/path/status, User-Agent; no other values). */
   tracePath?: string;
 }
 
