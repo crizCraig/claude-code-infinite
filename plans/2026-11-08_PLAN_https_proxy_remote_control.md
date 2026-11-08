@@ -55,7 +55,7 @@ Prototype files: `src/mitm-ca.ts`, `src/https-proxy-mode.ts`, plus small hooks i
 request's method, path, status and User-Agent (no other header values, no bodies).
 
 1. **Session CA** (`mitm-ca.ts`, no dependencies). `node:crypto` makes the P-256 keys and
-   signatures; about 150 lines write the X.509 DER around them. The CA has
+   signatures; about 200 lines (with comments) write the X.509 DER around them. The CA has
    `basicConstraints CA:TRUE, pathlen:0`, `keyUsage keyCertSign`, critical
    `nameConstraints permitted;DNS:api.anthropic.com`, and is valid for 365 days from
    yesterday (a session can run for weeks; the key dies with the process anyway). The leaf
