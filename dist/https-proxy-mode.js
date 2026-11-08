@@ -23,6 +23,11 @@ export function isInterceptedRequest(req) {
     return intercepted.has(req.socket);
 }
 export function attachHttpsProxyMode(server, opts) {
+    const raw = new Set();
+    const track = (sock) => {
+        raw.add(sock);
+        sock.once("close", () => raw.delete(sock));
+    };
     const secureContext = tls.createSecureContext({ cert: opts.ca.leafCertPem, key: opts.ca.leafKeyPem });
     const trace = (event) => {
         if (!opts.tracePath)
@@ -45,14 +50,16 @@ export function attachHttpsProxyMode(server, opts) {
                 "Proxy-Authenticate: Basic realm=\"ccc\"\r\n\r\n");
         }
         socket.on("error", () => { });
+        track(socket);
         if (mitm)
             return interceptConnect(server, socket, head, secureContext, trace);
         tunnelConnect(socket, head, target.host, target.port, trace);
     });
     server.on("upgrade", (req, socket, head) => {
-        trace({ ev: "upgrade", path: req.url, intercepted: intercepted.has(socket) });
+        trace({ ev: "upgrade", path: (req.url ?? "").split("?")[0], intercepted: intercepted.has(socket) });
         if (!intercepted.has(socket))
             return void socket.destroy();
+        track(socket);
         upgradeToUpstream(req, socket, head);
     });
     if (opts.tracePath) {
@@ -67,6 +74,11 @@ export function attachHttpsProxyMode(server, opts) {
             }));
         });
     }
+    return () => {
+        for (const sock of raw)
+            sock.destroy();
+        raw.clear();
+    };
 }
 function interceptConnect(server, socket, head, secureContext, trace) {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -80,7 +92,9 @@ function interceptConnect(server, socket, head, secureContext, trace) {
     server.emit("connection", tlsSocket);
 }
 function tunnelConnect(socket, head, host, port, trace) {
+    let established = false;
     const upstream = net.connect(port, host, () => {
+        established = true;
         socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (head.length > 0)
             upstream.write(head);
@@ -89,7 +103,11 @@ function tunnelConnect(socket, head, host, port, trace) {
     });
     upstream.on("error", (err) => {
         trace({ ev: "tunnel_error", host, port, message: err.message });
-        if (!socket.destroyed)
+        if (socket.destroyed)
+            return;
+        if (established)
+            socket.destroy();
+        else
             socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
     });
     socket.on("close", () => upstream.destroy());

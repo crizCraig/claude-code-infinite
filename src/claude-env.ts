@@ -58,8 +58,7 @@ export function claudeChildEnv(
   const childEnv: NodeJS.ProcessEnv = httpsProxy
     ? {
       ...parentEnv,
-      // PROTOTYPE experiment: which variable Claude Code reads (CCC_PROTO_PROXY_VAR).
-      [parentEnv.CCC_PROTO_PROXY_VAR || "HTTPS_PROXY"]: httpsProxy.proxyUrl,
+      HTTPS_PROXY: httpsProxy.proxyUrl,
       NODE_EXTRA_CA_CERTS: httpsProxy.caBundlePath,
       // The MemTree MCP server and agents find the loopback here instead.
       CCC_MEMTREE_PROXY: anthropicBaseUrl,

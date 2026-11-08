@@ -25,6 +25,12 @@ test("TLS accepts the leaf for api.anthropic.com and rejects one the CA may not 
     false);
 });
 
+test("the CA can't vouch for an IP address either (excluded subtrees)", async () => {
+  const ca = createSessionCa("api.anthropic.com", "ec", "127.0.0.1");
+  assert.equal(new X509Certificate(ca.leafCertPem).checkIP("127.0.0.1"), "127.0.0.1");
+  assert.equal(await handshake(ca, undefined), false);
+});
+
 test("the bundle keeps the user's extra CAs, is owner-only, and is removed on cleanup", () => {
   const ca = createSessionCa();
   const userPem = createSessionCa().caCertPem;

@@ -1142,7 +1142,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     );
     if (shutdownAbort.signal.aborted) cancelAcceptedRequest(accepted);
   });
-  if (opts.httpsProxyMode) attachHttpsProxyMode(server, opts.httpsProxyMode);
+  const closeTunnels = opts.httpsProxyMode
+    ? attachHttpsProxyMode(server, opts.httpsProxyMode) : () => {};
   // Long-running SSE responses must not be cut by idle timeouts.
   server.requestTimeout = 0;
   server.headersTimeout = 60_000;
@@ -1192,6 +1193,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     // still reading/dispatching before it installed a path-specific listener.
     shutdownAbort.abort();
     for (const accepted of acceptedRequests) cancelAcceptedRequest(accepted);
+    // CONNECT tunnels hold the server open (server.close waits for them).
+    closeTunnels();
     await quiesced;
     sendDeferredAgentIndexes(state);
     return false;

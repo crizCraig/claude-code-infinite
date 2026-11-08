@@ -21,5 +21,7 @@ export interface HttpsProxyModeOptions {
     /** Debug trace (CONNECT targets, intercepted method/path/status, User-Agent; no other values). */
     tracePath?: string;
 }
-export declare function attachHttpsProxyMode(server: http.Server, opts: HttpsProxyModeOptions): void;
+/** Destroys every blind tunnel and upgrade pipe (they are not http requests, so drain can't). */
+export type CloseTunnels = () => void;
+export declare function attachHttpsProxyMode(server: http.Server, opts: HttpsProxyModeOptions): CloseTunnels;
 //# sourceMappingURL=https-proxy-mode.d.ts.map

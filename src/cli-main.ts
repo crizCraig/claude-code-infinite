@@ -943,6 +943,7 @@ async function main() {
 
   if (proxyMode) {
     baseUrlForBash = `http://127.0.0.1:${proxy.port}`;
+    proxyPortForBash = String(proxy.port);
     rewriteBashEnv();
   }
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
@@ -1241,7 +1242,7 @@ function startHttpsProxyMode(
   } catch { /* unreadable: Claude Code would have warned and ignored it too */ }
   const files = writeCaBundle(ca, userExtra);
   process.on("exit", files.cleanup);
-  const bashEnvPath = writeBashEnv(files.dir, env, () => baseUrlForBash);
+  const bashEnvPath = writeBashEnv(files.dir, env, () => baseUrlForBash, files.bundlePath);
   if (env.CCC_PROXY_TRACE) {
     console.error(`[ccc proto] session CA ready in ${(performance.now() - started).toFixed(2)} ms`);
   }
@@ -1249,19 +1250,33 @@ function startHttpsProxyMode(
 }
 
 let baseUrlForBash = "";
+let proxyPortForBash = "";
 
 /**
- * Bash commands see what they see today under ccc: the user's own proxy and
- * CA settings, and ANTHROPIC_BASE_URL at the loopback (programs' Anthropic
- * calls and `$ANTHROPIC_BASE_URL/memtree/...` reach ccc as before). Claude
- * Code itself never reads this file. Written once the port is known.
+ * Bash commands see what they see today under ccc: the user's own proxy, CA
+ * and env-file settings, and ANTHROPIC_BASE_URL at the loopback (programs'
+ * Anthropic calls and `$ANTHROPIC_BASE_URL/memtree/...` reach ccc as before).
+ * Claude Code itself never reads this file. Each proxy/CA variable is put back
+ * only while it still holds ccc's value: Claude Code's sandbox sets its own
+ * proxy and CA before this file is sourced, and those must survive. The proxy
+ * token is never written here (matched by pattern). Rewritten once the port
+ * is known. Nested ccc started from Bash sees the user's original env.
  */
-function writeBashEnv(dir: string, env: NodeJS.ProcessEnv, baseUrl: () => string): string {
+function writeBashEnv(
+  dir: string, env: NodeJS.ProcessEnv, baseUrl: () => string, bundlePath: string
+): string {
   const path = `${dir}/bash-env.sh`;
   const quote = (v: string): string => `'${v.replace(/'/g, "'\\''")}'`;
+  const restore = (name: string): string =>
+    env[name] !== undefined ? `export ${name}=${quote(env[name]!)}` : `unset ${name}`;
   const write = (): void => {
-    const lines = ["HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"].map((name) =>
-      env[name] !== undefined ? `export ${name}=${quote(env[name]!)}` : `unset ${name}`);
+    const proxyPattern = `http://ccc:*@127.0.0.1:${proxyPortForBash || "*"}`;
+    const lines = [
+      `case "\${HTTPS_PROXY-}" in ${proxyPattern}) ${restore("HTTPS_PROXY")};; esac`,
+      `case "\${https_proxy-}" in ${proxyPattern}) ${restore("https_proxy")};; esac`,
+      `if [ "\${NODE_EXTRA_CA_CERTS-}" = ${quote(bundlePath)} ]; then ${restore("NODE_EXTRA_CA_CERTS")}; fi`,
+      restore("CLAUDE_ENV_FILE"), restore("CCC_MEMTREE_PROXY"), restore("CCC_HTTPS_PROXY_MODE"),
+    ];
     if (baseUrl()) {
       lines.push(`export ANTHROPIC_BASE_URL=${quote(baseUrl())}`,
         "export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1");

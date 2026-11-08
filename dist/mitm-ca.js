@@ -63,7 +63,12 @@ function caExtensions(host, skid) {
     return [
         extension("2.5.29.19", true, seq(bool(true), int(Buffer.from([0])))), // CA, pathLen 0
         extension("2.5.29.15", true, Buffer.from([0x03, 0x02, 0x01, 0x06])), // keyCertSign, cRLSign
-        extension("2.5.29.30", true, seq(tagged(0xa0, seq(tagged(0x82, Buffer.from(host)))))),
+        // permitted: DNS api.anthropic.com; excluded: every IPv4 and IPv6 address (an unlisted
+        // name form would otherwise be unconstrained, RFC 5280 4.2.1.10).
+        extension("2.5.29.30", true, seq(tagged(0xa0, seq(tagged(0x82, Buffer.from(host)))), tagged(0xa1, Buffer.concat([
+            seq(tagged(0x87, Buffer.alloc(8))), // 0.0.0.0/0
+            seq(tagged(0x87, Buffer.alloc(32))), // ::/0
+        ])))),
         extension("2.5.29.14", false, octet(skid)),
     ];
 }
@@ -74,10 +79,15 @@ function leafExtensions(host, skid, akid, alg) {
         extension("2.5.29.19", true, seq()),
         extension("2.5.29.15", true, Buffer.from(usage)),
         extension("2.5.29.37", false, seq(oid("1.3.6.1.5.5.7.3.1"))), // serverAuth
-        extension("2.5.29.17", false, seq(tagged(0x82, Buffer.from(host)))),
+        extension("2.5.29.17", false, seq(subjectAltName(host))),
         extension("2.5.29.14", false, octet(skid)),
         extension("2.5.29.35", false, seq(tagged(0x80, akid))),
     ];
+}
+/** dNSName, or iPAddress for a dotted IPv4 (only test leaves use one). */
+function subjectAltName(host) {
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    return ipv4 ? tagged(0x87, Buffer.from(ipv4.slice(1).map(Number))) : tagged(0x82, Buffer.from(host));
 }
 function makeKeyPair(alg) {
     return alg === "ec"
