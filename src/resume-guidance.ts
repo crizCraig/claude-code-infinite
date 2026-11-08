@@ -70,7 +70,7 @@ export interface ResumeGuidanceStartup {
   interactive: boolean;
   /** Unpaid and [c] at the payment gate, or an invalid key: MemTree is off. */
   memtreeOff: boolean;
-  /** The memtree tools the session has (bare names); the guidance names them all. */
+  /** The memtree tools the session has (bare names); RESUME_GUIDANCE_TOOLS must be among them. */
   tools: readonly string[];
 }
 
@@ -88,7 +88,7 @@ export interface ResumeGuidanceState {
 
 /**
  * Whether resumes get the guidance: on for an interactive run with MemTree on
- * and every memtree tool, off once ccc could not register the server after all.
+ * and the tools it names (RESUME_GUIDANCE_TOOLS), off once ccc could not register the server after all.
  */
 export class ResumeGuidance {
   private disabled = false;
@@ -138,8 +138,9 @@ export function resumeGuidanceAgain(at: Date): string {
 }
 
 /**
- * The tools the guidance relies on (it names search, read_node and read_lines). Not every
- * memtree tool: disallowing a later one (user_messages, handover) keeps the guidance.
+ * The tools the guidance relies on (search, read_node, read_lines, list). Not every memtree
+ * tool: disallowing a later one (user_messages, handover) keeps the guidance, whose embedded
+ * instructions still name them (a call then gets Claude Code's permission denial).
  */
 export const RESUME_GUIDANCE_TOOLS = ["search", "read_node", "read_lines", "list"] as const;
 

@@ -116,6 +116,11 @@ export const MEMTREE_TOOL_NAMES = [
 export const CURRENT_TREE = "current";
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
+/**
+ * A handover pack's first build runs a model call on the server (up to 90 s, plus loading
+ * the tree): wait longer for it. Past this, the server still finishes and caches the pack.
+ */
+const HANDOVER_TIMEOUT_MS = 150_000;
 const PREFIX_RETRY_INTERVAL_MS = 45_000;
 /**
  * The MCP server's instructions, which Claude Code places in the system prompt
@@ -307,12 +312,12 @@ const SESSION_TREES_CACHED = 64;
 /** Other sessions' pages kept in memory at once (each can be several MB). */
 const OTHER_TREES_CACHED = 4;
 /** GET JSON from the loopback proxy; never throws. */
-async function proxyGetJson(fetchImpl, url, headers = {}) {
+async function proxyGetJson(fetchImpl, url, headers = {}, timeoutMs = FETCH_TIMEOUT_MS) {
     let response;
     try {
         response = await fetchImpl(url, {
             headers: { accept: "application/json", ...headers },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
         });
     }
     catch (err) {
@@ -481,9 +486,12 @@ export class CurrentTree {
         const other = checkTreeId(tree);
         const id = other ?? (await this.currentId());
         const query = params.toString() ? `?${params}` : "";
-        const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}/memtree/${encodeURIComponent(id)}/${route}${query}`, toolHeaders(route, this.deps));
+        const answer = await proxyGetJson(this.fetchImpl, `${proxyBase(this.deps)}/memtree/${encodeURIComponent(id)}/${route}${query}`, toolHeaders(route, this.deps), route === "handover" ? HANDOVER_TIMEOUT_MS : FETCH_TIMEOUT_MS);
         if (answer.status === 202)
             throw new ToolInputError("That MemTree is still being built; try again in a minute.");
+        if (answer.status === 0 && route === "handover" && /timeout|abort/i.test(answer.error ?? "")) {
+            throw new ToolInputError("handover: the pack is still being prepared on the server; call handover again in a minute.");
+        }
         if (answer.status === 404 && /^HTTP 404 Not Found$/.test(answer.error ?? "")) {
             throw new ToolInputError(`${route}: this MemTree server (or this ccc) does not have it yet; update ccc or try later.`);
         }

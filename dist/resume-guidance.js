@@ -59,7 +59,7 @@ const SCAN_CHUNK_BYTES = 4 * 1024 * 1024;
 export const ANNOUNCED_SCAN_MS = 1_000;
 /**
  * Whether resumes get the guidance: on for an interactive run with MemTree on
- * and every memtree tool, off once ccc could not register the server after all.
+ * and the tools it names (RESUME_GUIDANCE_TOOLS), off once ccc could not register the server after all.
  */
 export class ResumeGuidance {
     scanMs;
@@ -107,8 +107,9 @@ export function resumeGuidanceAgain(at) {
         "MemTree may have compressed this conversation, so an earlier copy may be out of view.)";
 }
 /**
- * The tools the guidance relies on (it names search, read_node and read_lines). Not every
- * memtree tool: disallowing a later one (user_messages, handover) keeps the guidance.
+ * The tools the guidance relies on (search, read_node, read_lines, list). Not every memtree
+ * tool: disallowing a later one (user_messages, handover) keeps the guidance, whose embedded
+ * instructions still name them (a call then gets Claude Code's permission denial).
  */
 export const RESUME_GUIDANCE_TOOLS = ["search", "read_node", "read_lines", "list"];
 /** The gate for this run, or undefined (see ResumeGuidance). */

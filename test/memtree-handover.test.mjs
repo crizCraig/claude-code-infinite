@@ -63,7 +63,7 @@ test("user_messages reads the server's view with its filters and formats each me
   assert.match(text, /\[n 7 · 2026-11-06 10:00 UTC · typed · block 3 lines 10-11\]\nKeep prices flat this month/);
   assert.match(text, /\[n 9 · ~2026-11-07 00:00 UTC · board \(Pricing\) · block 4 lines 1-2 · shortened from 9000 chars\]\n↳ answering: Price the reads\?\na cent per read/);
   assert.match(text, /\[n 12 · 2026-11-08 19:38 UTC · mid_turn · tail 14100\]\nLet's go/);
-  assert.match(text, /older: user_messages \{"cursor": "7", "since": "2026-11-05", "query": "price"\}/);
+  assert.match(text, /older: user_messages \{"cursor": "7", "since": "2026-11-05", "query": "price", "limit": 500, "context": true\}/);
   assert.match(text, /read_lines \{"tail": true, "start": N, "end": N\}/);
   await call("user_messages", { tree: "bbb222-v1-own", cursor: "7" });
   assert.equal(urls.at(-1), "/memtree/bbb222-v1-own/user_messages?cursor=7", "another session's tree by ref");
@@ -74,7 +74,8 @@ test("user_messages and handover check their arguments before any read", async (
   for (const [name, args, pattern] of [
     ["user_messages", { limit: 0 }, /limit must be 1 to 200/],
     ["user_messages", { full: "yes" }, /full must be true or false/],
-    ["user_messages", { since: 20261105 }, /since must be a string/],
+    ["user_messages", { since: 20261105 }, /user_messages: since must be a string/],
+    ["user_messages", { limit: true }, /limit must be 1 to 200/],
     ["handover", { days: 90 }, /days must be 1 to 60/],
     ["handover", { tree: "../x" }, /tree must be a tree reference/],
   ]) {
@@ -100,6 +101,8 @@ test("server answers: errors carry its detail; an old server or proxy says to up
   assert.match((await call("user_messages", { since: "2026-11-02", until: "2026-11-01" })).text, /^user_messages: until must be after since/);
   answer = () => Response.json({ status: "building" }, { status: 202 });
   assert.match((await call("handover", {})).text, /still being built/);
+  const slow = fakeServer({ handover: () => { throw new DOMException("The operation was aborted due to timeout", "TimeoutError"); } });
+  assert.match((await slow.call("handover", {})).text, /still being prepared on the server; call handover again/);
   answer = () => Response.json({ ...PACK, session_id: "someone-else" });
   assert.match((await call("handover", {})).text, /different or unknown session/, "this session's tree must be its own");
 });
@@ -118,7 +121,7 @@ test("handover formats how it ended, the model's lists with their messages, then
   assert.match(text, /Decisions \(newest first\):\n- Charge a cent per read \(why: value, not cost\) \(n 9\)/);
   assert.match(text, /Open questions: none found\./);
   assert.match(text, /The person's messages in the window \(3 of 106, oldest first/);
-  assert.match(text, /older messages in the window: user_messages \{"tree": "e32c1f3e-v1-own", "cursor": "1051", "since": "2026-11-05T19:47:30Z"\}/);
+  assert.match(text, /older messages in the window: user_messages \{"tree": "e32c1f3e-v1-own", "cursor": "1051", "since": "2026-11-05T19:47:30Z", "context": true\}/);
   const off = formatHandover({ ...PACK, llm: "rate_limited", goals: undefined });
   assert.match(off, /No model summary this time: too many packs this hour/);
   assert.doesNotMatch(off, /Goals:/);
@@ -134,4 +137,11 @@ test("the tools are listed, loaded up front, and the instructions point at them"
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /call handover with its session id first/);
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /user_messages lists only the person's own messages/);
   assert.equal(formatUserMessages({ messages: [] }, { query: "zebra" }), 'No messages from the person with "zebra".');
+  assert.match(formatUserMessages({ messages: [], untimed: 2, newest: { note: "Messages 5-9 after the tree are not included" } }, {}),
+    /^No messages from the person\.\n\[2 older message\(s\) have no recorded time.*Messages 5-9/);
+  const split = formatUserMessages({ messages: [{ n: 1, text: "x", read: { block: 4, start: 90, end: 99, continues: { block: 5, start: 1, end: 3 } } }],
+    next_cursor: "1" }, { context: true, limit: 5 });
+  assert.match(split, /block 4 lines 90-99 \+ block 5 lines 1-3/);
+  assert.match(split, /older: user_messages \{"cursor": "1", "limit": 5, "context": true\}/);
+  assert.doesNotMatch(formatHandover({ llm: "off", ending: {}, messages: [] }), /How it ended/);
 });

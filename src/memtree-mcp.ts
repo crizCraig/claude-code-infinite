@@ -157,6 +157,11 @@ export const MEMTREE_TOOL_NAMES = [
 export const CURRENT_TREE = "current";
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
+/**
+ * A handover pack's first build runs a model call on the server (up to 90 s, plus loading
+ * the tree): wait longer for it. Past this, the server still finishes and caches the pack.
+ */
+const HANDOVER_TIMEOUT_MS = 150_000;
 const PREFIX_RETRY_INTERVAL_MS = 45_000;
 
 /**
@@ -387,13 +392,14 @@ interface ProxyJson {
 async function proxyGetJson(
   fetchImpl: typeof fetch,
   url: string,
-  headers: Record<string, string> = {}
+  headers: Record<string, string> = {},
+  timeoutMs: number = FETCH_TIMEOUT_MS
 ): Promise<ProxyJson> {
   let response: Response;
   try {
     response = await fetchImpl(url, {
       headers: { accept: "application/json", ...headers },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     return { ok: false, status: 0, error: String(err) };
@@ -575,9 +581,12 @@ export class CurrentTree implements TreeSource {
     const query = params.toString() ? `?${params}` : "";
     const answer = await proxyGetJson(
       this.fetchImpl, `${proxyBase(this.deps)}/memtree/${encodeURIComponent(id)}/${route}${query}`,
-      toolHeaders(route, this.deps)
+      toolHeaders(route, this.deps), route === "handover" ? HANDOVER_TIMEOUT_MS : FETCH_TIMEOUT_MS
     );
     if (answer.status === 202) throw new ToolInputError("That MemTree is still being built; try again in a minute.");
+    if (answer.status === 0 && route === "handover" && /timeout|abort/i.test(answer.error ?? "")) {
+      throw new ToolInputError("handover: the pack is still being prepared on the server; call handover again in a minute.");
+    }
     if (answer.status === 404 && /^HTTP 404 Not Found$/.test(answer.error ?? "")) {
       throw new ToolInputError(`${route}: this MemTree server (or this ccc) does not have it yet; update ccc or try later.`);
     }

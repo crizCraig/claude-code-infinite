@@ -23,7 +23,10 @@ interface MessageView {
   approx?: [string, string];
   kind?: string;
   text?: string;
-  read?: { block?: number; start?: number; end?: number; tail?: number };
+  read?: {
+    block?: number; start?: number; end?: number; tail?: number;
+    continues?: { block?: number; start?: number; end?: number };
+  };
   board?: { title?: string; item?: string; id?: string; source?: string };
   shortened?: boolean;
   chars?: number;
@@ -42,11 +45,11 @@ interface Item {
 /** `user_messages` arguments as the server's query string; throws on bad input. */
 export function userMessagesQuery(args: Record<string, unknown>): URLSearchParams {
   const params = new URLSearchParams();
-  for (const key of ["since", "until", "cursor"] as const) setString(params, args, key, key);
-  setString(params, args, "query", "q");
+  for (const key of ["since", "until", "cursor"] as const) setString("user_messages", params, args, key, key);
+  setString("user_messages", params, args, "query", "q");
   if (args.limit !== undefined && args.limit !== null) {
-    const limit = Number(args.limit);
-    if (!Number.isInteger(limit) || limit < 1) {
+    const limit = integer(args.limit);
+    if (limit === undefined || limit < 1) {
       throw new ToolInputError(`user_messages: limit must be 1 to ${USER_MESSAGES_MAX_LIMIT}`);
     }
     params.set("limit", String(Math.min(limit, USER_MESSAGES_MAX_LIMIT)));
@@ -62,11 +65,11 @@ export function userMessagesQuery(args: Record<string, unknown>): URLSearchParam
 /** `handover` arguments as the server's query string; throws on bad input. */
 export function handoverQuery(args: Record<string, unknown>): URLSearchParams {
   const params = new URLSearchParams();
-  setString(params, args, "since", "since");
-  setString(params, args, "until", "until");
+  setString("handover", params, args, "since", "since");
+  setString("handover", params, args, "until", "until");
   if (args.days !== undefined && args.days !== null) {
-    const days = Number(args.days);
-    if (!Number.isInteger(days) || days < 1 || days > HANDOVER_MAX_DAYS) {
+    const days = integer(args.days);
+    if (days === undefined || days < 1 || days > HANDOVER_MAX_DAYS) {
       throw new ToolInputError(`handover: days must be 1 to ${HANDOVER_MAX_DAYS}`);
     }
     params.set("days", String(days));
@@ -83,7 +86,9 @@ export function formatUserMessages(body: unknown, args: Record<string, unknown>,
   const messages = Array.isArray(page.messages) ? page.messages : [];
   const where = windowText(page.window);
   if (!messages.length) {
-    return `No messages from the person${where}${args.query ? ` with ${JSON.stringify(args.query)}` : ""}.`;
+    const none = `No messages from the person${where}${args.query ? ` with ${JSON.stringify(args.query)}` : ""}.`;
+    const notes = pageNotes(page, args);
+    return notes.length ? `${none}\n[${notes.join("; ")}]` : none;
   }
   const out = [
     `The person's own messages${where}: ${messages.length} of ${page.total ?? messages.length}, oldest first ` +
@@ -111,7 +116,7 @@ export function formatHandover(body: unknown, tree?: string): string {
     out.push(...listLines("Open questions", pack.open_questions,
       (i) => `${i.question}${i.context ? ` (${i.context})` : ""}`));
   } else {
-    out.push("", `(No model summary this time: ${llmNote(pack.llm)}. The messages below are complete.)`);
+    out.push("", `(No model summary this time: ${llmNote(pack.llm)}. The messages below are the person's own words.)`);
   }
   const messages = Array.isArray(pack.messages) ? (pack.messages as MessageView[]) : [];
   out.push("", `The person's messages in the window (${messages.length} of ${pack.messages_total ?? messages.length}, ` +
@@ -119,7 +124,7 @@ export function formatHandover(body: unknown, tree?: string): string {
   for (const m of messages) out.push("", ...messageLines(m));
   const cursor = pack.messages_cursor;
   if (typeof cursor === "string" && cursor) {
-    out.push("", `[older messages in the window: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(cursor)}${sinceArg(pack.window)}}]`);
+    out.push("", `[older messages in the window: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(cursor)}${sinceArg(pack.window)}, "context": true}]`);
   }
   out.push("", readHint(tree));
   const newest = (pack.newest as { note?: string } | undefined)?.note;
@@ -129,11 +134,18 @@ export function formatHandover(body: unknown, tree?: string): string {
 
 // --- helpers -----------------------------------------------------------------
 
-function setString(params: URLSearchParams, args: Record<string, unknown>, key: string, param: string): void {
+function setString(tool: string, params: URLSearchParams, args: Record<string, unknown>, key: string, param: string): void {
   const value = args[key];
-  if (value === undefined || value === null || value === "") return;
-  if (typeof value !== "string") throw new ToolInputError(`${key} must be a string`);
-  params.set(param, value.trim());
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string") throw new ToolInputError(`${tool}: ${key} must be a string`);
+  if (value.trim()) params.set(param, value.trim());
+}
+
+/** An integer given as a number or a numeric string; undefined for anything else. */
+function integer(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isInteger(value) ? value : undefined;
+  if (typeof value === "string" && /^\s*-?\d+\s*$/.test(value)) return Number(value);
+  return undefined;
 }
 
 function messageLines(m: MessageView): string[] {
@@ -150,22 +162,31 @@ function messageLines(m: MessageView): string[] {
 function readRef(read: MessageView["read"]): string {
   if (!read) return "?";
   if (typeof read.tail === "number") return `tail ${read.tail}`;
-  return `block ${read.block} lines ${read.start}-${read.end}`;
+  const more = read.continues ? ` + block ${read.continues.block} lines ${read.continues.start}-${read.continues.end}` : "";
+  return `block ${read.block} lines ${read.start}-${read.end}${more}`;
 }
 
-function footer(page: { next_cursor?: string | null; untimed?: number; newest?: { note?: string } },
-  args: Record<string, unknown>, tree?: string): string[] {
+type PageInfo = { next_cursor?: string | null; untimed?: number; newest?: { note?: string } };
+
+function footer(page: PageInfo, args: Record<string, unknown>, tree?: string): string[] {
   const notes: string[] = [];
   if (page.next_cursor) {
-    const rest = ["since", "until", "query"].filter((k) => typeof args[k] === "string" && args[k])
+    const rest = ["since", "until", "query", "limit", "full", "context"]
+      .filter((k) => args[k] !== undefined && args[k] !== null && args[k] !== "" && args[k] !== false)
       .map((k) => `, ${JSON.stringify(k)}: ${JSON.stringify(args[k])}`).join("");
     notes.push(`older: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(page.next_cursor)}${rest}}`);
   }
-  if (page.untimed) notes.push(`${page.untimed} older message(s) have no recorded time and are only listed without since/until`);
-  if (page.newest?.note) notes.push(page.newest.note);
+  notes.push(...pageNotes(page, args));
   const out = notes.length ? [`[${notes.join("; ")}]`] : [];
   out.push(readHint(tree));
   return out;
+}
+
+function pageNotes(page: PageInfo, _args: Record<string, unknown>): string[] {
+  const notes: string[] = [];
+  if (page.untimed) notes.push(`${page.untimed} older message(s) have no recorded time and are only listed without since/until`);
+  if (page.newest?.note) notes.push(page.newest.note);
+  return notes;
 }
 
 function readHint(tree?: string): string {
@@ -174,7 +195,7 @@ function readHint(tree?: string): string {
 }
 
 function endingLines(ending: Record<string, unknown> | undefined): string[] {
-  if (!ending || typeof ending !== "object") return [];
+  if (!ending || typeof ending !== "object" || !Object.keys(ending).length) return [];
   const at = typeof ending.at === "string" ? ` (newest message ${formatTime(ending.at) ?? ending.at})` : "";
   const out = ["", `How it ended${at}:`];
   if (typeof ending.summary === "string") out.push(ending.summary);

@@ -19,11 +19,11 @@ export const USER_MESSAGES_MAX_LIMIT = 200;
 export function userMessagesQuery(args) {
     const params = new URLSearchParams();
     for (const key of ["since", "until", "cursor"])
-        setString(params, args, key, key);
-    setString(params, args, "query", "q");
+        setString("user_messages", params, args, key, key);
+    setString("user_messages", params, args, "query", "q");
     if (args.limit !== undefined && args.limit !== null) {
-        const limit = Number(args.limit);
-        if (!Number.isInteger(limit) || limit < 1) {
+        const limit = integer(args.limit);
+        if (limit === undefined || limit < 1) {
             throw new ToolInputError(`user_messages: limit must be 1 to ${USER_MESSAGES_MAX_LIMIT}`);
         }
         params.set("limit", String(Math.min(limit, USER_MESSAGES_MAX_LIMIT)));
@@ -41,11 +41,11 @@ export function userMessagesQuery(args) {
 /** `handover` arguments as the server's query string; throws on bad input. */
 export function handoverQuery(args) {
     const params = new URLSearchParams();
-    setString(params, args, "since", "since");
-    setString(params, args, "until", "until");
+    setString("handover", params, args, "since", "since");
+    setString("handover", params, args, "until", "until");
     if (args.days !== undefined && args.days !== null) {
-        const days = Number(args.days);
-        if (!Number.isInteger(days) || days < 1 || days > HANDOVER_MAX_DAYS) {
+        const days = integer(args.days);
+        if (days === undefined || days < 1 || days > HANDOVER_MAX_DAYS) {
             throw new ToolInputError(`handover: days must be 1 to ${HANDOVER_MAX_DAYS}`);
         }
         params.set("days", String(days));
@@ -58,7 +58,9 @@ export function formatUserMessages(body, args, tree) {
     const messages = Array.isArray(page.messages) ? page.messages : [];
     const where = windowText(page.window);
     if (!messages.length) {
-        return `No messages from the person${where}${args.query ? ` with ${JSON.stringify(args.query)}` : ""}.`;
+        const none = `No messages from the person${where}${args.query ? ` with ${JSON.stringify(args.query)}` : ""}.`;
+        const notes = pageNotes(page, args);
+        return notes.length ? `${none}\n[${notes.join("; ")}]` : none;
     }
     const out = [
         `The person's own messages${where}: ${messages.length} of ${page.total ?? messages.length}, oldest first ` +
@@ -85,7 +87,7 @@ export function formatHandover(body, tree) {
         out.push(...listLines("Open questions", pack.open_questions, (i) => `${i.question}${i.context ? ` (${i.context})` : ""}`));
     }
     else {
-        out.push("", `(No model summary this time: ${llmNote(pack.llm)}. The messages below are complete.)`);
+        out.push("", `(No model summary this time: ${llmNote(pack.llm)}. The messages below are the person's own words.)`);
     }
     const messages = Array.isArray(pack.messages) ? pack.messages : [];
     out.push("", `The person's messages in the window (${messages.length} of ${pack.messages_total ?? messages.length}, ` +
@@ -94,7 +96,7 @@ export function formatHandover(body, tree) {
         out.push("", ...messageLines(m));
     const cursor = pack.messages_cursor;
     if (typeof cursor === "string" && cursor) {
-        out.push("", `[older messages in the window: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(cursor)}${sinceArg(pack.window)}}]`);
+        out.push("", `[older messages in the window: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(cursor)}${sinceArg(pack.window)}, "context": true}]`);
     }
     out.push("", readHint(tree));
     const newest = pack.newest?.note;
@@ -103,13 +105,22 @@ export function formatHandover(body, tree) {
     return out.join("\n");
 }
 // --- helpers -----------------------------------------------------------------
-function setString(params, args, key, param) {
+function setString(tool, params, args, key, param) {
     const value = args[key];
-    if (value === undefined || value === null || value === "")
+    if (value === undefined || value === null)
         return;
     if (typeof value !== "string")
-        throw new ToolInputError(`${key} must be a string`);
-    params.set(param, value.trim());
+        throw new ToolInputError(`${tool}: ${key} must be a string`);
+    if (value.trim())
+        params.set(param, value.trim());
+}
+/** An integer given as a number or a numeric string; undefined for anything else. */
+function integer(value) {
+    if (typeof value === "number")
+        return Number.isInteger(value) ? value : undefined;
+    if (typeof value === "string" && /^\s*-?\d+\s*$/.test(value))
+        return Number(value);
+    return undefined;
 }
 function messageLines(m) {
     const at = m.at ? formatTime(m.at) ?? m.at : m.approx ? `~${formatTime(m.approx[0]) ?? m.approx[0]}` : "time unknown";
@@ -127,29 +138,36 @@ function readRef(read) {
         return "?";
     if (typeof read.tail === "number")
         return `tail ${read.tail}`;
-    return `block ${read.block} lines ${read.start}-${read.end}`;
+    const more = read.continues ? ` + block ${read.continues.block} lines ${read.continues.start}-${read.continues.end}` : "";
+    return `block ${read.block} lines ${read.start}-${read.end}${more}`;
 }
 function footer(page, args, tree) {
     const notes = [];
     if (page.next_cursor) {
-        const rest = ["since", "until", "query"].filter((k) => typeof args[k] === "string" && args[k])
+        const rest = ["since", "until", "query", "limit", "full", "context"]
+            .filter((k) => args[k] !== undefined && args[k] !== null && args[k] !== "" && args[k] !== false)
             .map((k) => `, ${JSON.stringify(k)}: ${JSON.stringify(args[k])}`).join("");
         notes.push(`older: user_messages {${treeArg(tree)}"cursor": ${JSON.stringify(page.next_cursor)}${rest}}`);
     }
+    notes.push(...pageNotes(page, args));
+    const out = notes.length ? [`[${notes.join("; ")}]`] : [];
+    out.push(readHint(tree));
+    return out;
+}
+function pageNotes(page, _args) {
+    const notes = [];
     if (page.untimed)
         notes.push(`${page.untimed} older message(s) have no recorded time and are only listed without since/until`);
     if (page.newest?.note)
         notes.push(page.newest.note);
-    const out = notes.length ? [`[${notes.join("; ")}]`] : [];
-    out.push(readHint(tree));
-    return out;
+    return notes;
 }
 function readHint(tree) {
     return `Context of one message: read_lines {${treeArg(tree)}"block": B, "start": S, "end": E} for "block B lines S-E", ` +
         `read_lines {${treeArg(tree)}"tail": true, "start": N, "end": N} for "tail N".`;
 }
 function endingLines(ending) {
-    if (!ending || typeof ending !== "object")
+    if (!ending || typeof ending !== "object" || !Object.keys(ending).length)
         return [];
     const at = typeof ending.at === "string" ? ` (newest message ${formatTime(ending.at) ?? ending.at})` : "";
     const out = ["", `How it ended${at}:`];

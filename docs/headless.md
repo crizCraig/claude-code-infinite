@@ -81,17 +81,20 @@ the request log path) go to stderr.
 
 ## 3. Searching memory across sessions
 
-Every ccc session, headless or interactive, gets MemTree's four read-only tools with no extra
-flags: `mcp__memtree__search` (text or meaning, in this session's tree or across all your
-sessions), `mcp__memtree__list`, `mcp__memtree__read_node` and `mcp__memtree__read_lines`. An
-agent can look up what it or any other agent on the same key decided, tried or ruled out. ccc
-pre-allows these four tools, so a `-p` run can call them without a permission prompt.
+Every ccc session, headless or interactive, gets MemTree's six tools with no extra flags:
+`mcp__memtree__search` (text or meaning, in this session's tree or across all your sessions),
+`mcp__memtree__list`, `mcp__memtree__read_node`, `mcp__memtree__read_lines`,
+`mcp__memtree__user_messages` (only the person's own messages over a time range) and
+`mcp__memtree__handover` (a handover pack for taking over a session; the server builds it
+with a model call). An agent can look up what it or any other agent on the same key decided,
+tried or ruled out. ccc pre-allows these tools, so a `-p` run can call them without a
+permission prompt.
 
 Your own flags win:
 - `CCC_MEMTREE_MCP=0` turns the tools off.
 - `--disallowedTools mcp__memtree` (or a single tool, or `mcp__memtree__*`) removes them;
   ccc neither pre-allows nor advertises a disallowed tool.
-- Your `--allowedTools` list is kept: ccc adds only the four memtree tools to it.
+- Your `--allowedTools` list is kept: ccc adds only the memtree tools to it.
 - If your own `--mcp-config` defines a server named `memtree`, ccc adds nothing and yours is
   used. You don't need one, but if you write one, run ccc's server with
   `{"mcpServers": {"memtree": {"command": "ccc", "args": ["memtree-mcp"]}}}` and pre-allow
