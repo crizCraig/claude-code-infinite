@@ -205,6 +205,11 @@ test("a prefix still covers ToolSearch results after a model switch drops their 
     assert.ok(!matches(user(refs, typed), user(refs)), "other text after the result");
     assert.ok(!matches(user(note), user()), "the user typed it");
     assert.ok(!matches(user(other, note), user(other)), "a result that loaded no tool");
+    assert.ok(matches(user(refs, refs, note, note), user(refs, refs)), "two ToolSearch calls");
+    const withIds = { type: "text", text: "Tool loaded.\n[id:toolu_1]\n[id:toolu_2]\n" };
+    assert.ok(matches(user(refs, withIds), user(refs)), "the note with its id lines");
+    assert.ok(!matches(user(refs, { type: "text", text: "Tool loaded. Thanks" }), user(refs)));
+    assert.ok(!matches(user(other, note, note), user(other)), "notes with no tool loaded");
     assert.ok(!matches(user(note, refs), user(refs)), "before the result");
     assert.ok(!matches(user(refs, typed, other, note), user(refs, typed, other)), "text between");
     const empty = { type: "tool_result", tool_use_id: "t", content: [] };

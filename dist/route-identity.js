@@ -206,7 +206,7 @@ function portableContent(content) {
     });
 }
 /** Claude Code's note after a ToolSearch result that loaded tools; sent or not by model. */
-const TOOL_LOADED_TEXT = "Tool loaded.";
+const TOOL_LOADED_RE = /^Tool loaded\.(?:\n\[id:[^\]\n]+\])*\n?$/;
 /**
  * Top-level content without each "Tool loaded." note that follows the turn's tool
  * results when one of them holds only tool references. On the same Claude Code
@@ -219,13 +219,19 @@ function withoutToolLoadedNotes(content) {
     return content.filter((part, index) => !(isToolLoadedNote(part) && followsLoadedTools(content, index)));
 }
 function isToolLoadedNote(part) {
-    return part?.type === "text" && part.text === TOOL_LOADED_TEXT &&
+    return part?.type === "text" && typeof part.text === "string" &&
+        TOOL_LOADED_RE.test(part.text) &&
         Object.keys(part).every((key) => key === "type" || key === "text" || key === "cache_control");
 }
-/** Whether the run of tool results ending just before `index` loads tools. */
+/**
+ * Whether the run of tool results ending just before `index` loads tools. Earlier notes
+ * are skipped: two ToolSearch calls in one turn leave two notes.
+ */
 function followsLoadedTools(content, index) {
     for (let i = index - 1; i >= 0; i--) {
         const part = content[i];
+        if (isToolLoadedNote(part))
+            continue;
         if (part?.type !== "tool_result")
             return false;
         if (Array.isArray(part.content) && part.content.length > 0 &&
