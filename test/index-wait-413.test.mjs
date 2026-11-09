@@ -310,3 +310,21 @@ test("concurrent retries joining one indexing 413 both wait for the index", asyn
     }
   } finally { h.close(); }
 });
+
+test("a hold never pauses or asks past the lane's wait (Codex r2)", async () => {
+  const h = await harness(indexing(0.2), { indexHoldMs: 5_000, indexPollMaxMs: 1_000,
+    indexWaitMaxMs: 300 });
+  try {
+    const started = Date.now();
+    const response = await post(h, humanMessages);
+    assert.ok(Date.now() - started < 900, `${Date.now() - started} ms`);
+    assert.equal(h.compressCalls, 1, "no ask after the lane's wait ends");
+    assert.equal(response.status, 503, "the lane's wait is still open for Claude Code's retry");
+  } finally { h.close(); }
+});
+
+test("indexWaitDeadline: the lane's deadline while open, undefined once closed", () => {
+  const failures = new RouteFallbackFailures();
+  assert.equal(failures.indexWaitDeadline("l", 10, 0), 135_000);
+  assert.equal(failures.indexWaitDeadline("l", undefined, 135_000), undefined);
+});

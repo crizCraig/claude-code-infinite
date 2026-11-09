@@ -64,6 +64,16 @@ export class RouteFallbackFailures {
     indexWaitOpen(lane, secondsLeft, now = Date.now()) {
         return this.track(lane, now, secondsLeft) !== "closed";
     }
+    /**
+     * indexWaitOpen, and when the lane's wait ends: its deadline (Infinity when no slot was
+     * free to track it), or undefined once closed.
+     */
+    indexWaitDeadline(lane, secondsLeft, now = Date.now()) {
+        const state = this.track(lane, now, secondsLeft);
+        if (state === "closed")
+            return undefined;
+        return state === "untracked" ? Infinity : this.indexWaits.get(lane).deadline;
+    }
     /** Whether a stated time left is too long to wait for at all (refused at once). */
     hopeless(secondsLeft) {
         return secondsLeft !== undefined && secondsLeft * 1000 > this.indexWaitMaxMs;

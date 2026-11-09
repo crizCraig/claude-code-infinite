@@ -4353,8 +4353,11 @@ const activeIndexWaits = new WeakMap();
 const INDEX_HOLD_MS = 120_000;
 /** The longest pause between asks while held (the server's Retry-After, when shorter). */
 const INDEX_POLL_MAX_MS = 30_000;
-/** A held ask gets at least this long; with less left, the request is not held. */
-const INDEX_MIN_ASK_MS = 5_000;
+/**
+ * A held ask gets at least this long (MemTree itself holds an indexing 413 for up to
+ * 90 s); with less left, the request is not held.
+ */
+const INDEX_MIN_ASK_MS = 30_000;
 /** An indexing 413: refusing this request waits for the index, saying how long is left. */
 function noteIndexWait413(rec, seconds) {
     if (!activeIndexWaits.has(rec) && rec.indexBehind !== true)
@@ -4385,14 +4388,14 @@ async function holdForIndex(args, seconds) {
     const hold = indexHolds.get(args.rec);
     if (!hold || args.longBudget !== true)
         return undefined;
-    if (hold.lane !== undefined && !args.state.fallbackFailures.indexWaitOpen(hold.lane, seconds)) {
-        return undefined;
-    }
-    if (args.state.fallbackFailures.hopeless(seconds))
+    const laneEnds = hold.lane === undefined ? Infinity
+        : args.state.fallbackFailures.indexWaitDeadline(hold.lane, seconds);
+    if (laneEnds === undefined || args.state.fallbackFailures.hopeless(seconds))
         return undefined;
     const pause = Math.min(seconds * 1000, args.opts.indexPollMaxMs ?? INDEX_POLL_MAX_MS);
     const holdMs = args.opts.indexHoldMs ?? INDEX_HOLD_MS;
-    const left = () => holdMs - (Date.now() - hold.started);
+    // The earlier of the request's hold and the lane's wait bounds the pause and the ask.
+    const left = () => Math.min(holdMs - (Date.now() - hold.started), laneEnds - Date.now());
     if (left() - pause < Math.min(INDEX_MIN_ASK_MS, holdMs / 4))
         return undefined;
     const signals = [hold.closed, args.state.shutdownSignal, args.signal]
@@ -4539,7 +4542,9 @@ async function runBlockingCompressionOnce(args) {
         ok: result !== null,
         timedOut,
         ...(carried ? { carriedOver: true } : {}),
-        ...(!cached && failureStatus === OVER_CONTEXT_STATUS ? { refused: true } : {}),
+        // A joined call's indexing 413 is MemTree's refusal of this request too.
+        ...((!cached && failureStatus === OVER_CONTEXT_STATUS) || indexWaitSeconds !== undefined
+            ? { refused: true } : {}),
     };
     return {
         result,

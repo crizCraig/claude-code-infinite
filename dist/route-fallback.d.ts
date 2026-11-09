@@ -67,6 +67,11 @@ export declare class RouteFallbackFailures {
      * the lane was refused), so a held request stops asking and is refused.
      */
     indexWaitOpen(lane: string, secondsLeft: number | undefined, now?: number): boolean;
+    /**
+     * indexWaitOpen, and when the lane's wait ends: its deadline (Infinity when no slot was
+     * free to track it), or undefined once closed.
+     */
+    indexWaitDeadline(lane: string, secondsLeft: number | undefined, now?: number): number | undefined;
     /** Whether a stated time left is too long to wait for at all (refused at once). */
     hopeless(secondsLeft: number | undefined): boolean;
     succeeded(lane: string): void;
