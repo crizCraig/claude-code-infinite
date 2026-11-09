@@ -138,6 +138,8 @@ export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
 /** The calling Claude Code session: its entry is marked "(this session)". */
 currentSessionId?: string): string;
+/** Said after a charged first page's heading (the server's `charged`). */
+export declare const CHARGED_NOTE = "charged: one search";
 export declare function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string;
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
 export declare function formatPath(path: {

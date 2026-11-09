@@ -988,7 +988,7 @@ test("MCP instructions and search lead with when to use them, before any compres
   // Constant overhead: instructions + search description, measured 2026-10-18, plus the
   // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28, plus
   // the cross-session scope (ccc sessions on any machine) and hand-off line, 2026-11-05, plus
-  // the handover / user_messages line, 2026-11-08.
+  // the handover / user_messages line, 2026-11-08, plus the search price, 2026-11-09.
   assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_850,
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
@@ -1006,10 +1006,14 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
     assert.match(description, /first page.*charged/i);
     assert.match(description, /cached/i);
     assert.match(description, /cursor continuation.*free/i);
-    assert.match(description, /text.*free/i);
+    // Text search across sessions is charged like vector (polychat, 2026-11-09); one tree is free.
+    assert.match(description, /\$0\.0005 either way/);
+    assert.match(description, /free.*text search of one tree/i);
+    assert.doesNotMatch(description, /default, free/i);
     assert.match(description, /live.*snapshot/i);
   }
   assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
+  assert.doesNotMatch(search.inputSchema.properties.mode.description, /\bfree\b/i);
   assert.equal(search.inputSchema.properties.mode.enum.join(","), "text,vector");
   for (const name of ["search", "read_node", "read_lines"]) {
     const tree = MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree;

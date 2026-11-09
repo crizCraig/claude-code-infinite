@@ -4402,7 +4402,8 @@ test("list and search through the proxy against a mock MemTree server", async ()
         groups: [{ embedding_model: "voyage-3.5", has_more: true, hits: [hit(0.88, "voyage-3.5")] },
                  { embedding_model: "gemini-embedding-001", has_more: false, hits: [hit(0.61, "gemini-embedding-001")] }] });
     }
-    return send(200, { query: url.searchParams.get("q"), mode: "text", hits: [hit(0.0913)], next_cursor: null, matches_capped: false });
+    return send(200, { query: url.searchParams.get("q"), mode: "text", hits: [hit(0.0913)], next_cursor: null, matches_capped: false,
+      charged: !url.searchParams.get("cursor") });
   });
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "secret-key" });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
@@ -4421,7 +4422,7 @@ test("list and search through the proxy against a mock MemTree server", async ()
 
     const semantic = await finder.searchSessions({ query: "how did we pick the deploy target", mode: "vector" });
     assert.equal(requests.at(-1).params.mode, "vector");
-    assert.match(semantic, /charged: one query embedding per model/);
+    assert.match(semantic, /\(charged: one search\):/);
     assert.match(semantic, /== voyage-3\.5 ==[\s\S]*== gemini-embedding-001 ==/, "one ranking per model");
     assert.match(semantic, /scores are not comparable across groups/);
     assert.match(semantic, new RegExp(`open: read_lines \\{"tree": "${rid}", "block": 1, "start": 2, "end": 4\\}`));
@@ -4430,7 +4431,7 @@ test("list and search through the proxy against a mock MemTree server", async ()
     const exact = await finder.searchSessions({ query: "deploy", mode: "text", project: "polychat" });
     assert.deepEqual(requests.at(-1).params, { q: "deploy", mode: "text", project: "polychat" });
     assert.equal(requests.at(-1).tool, "search", "the server logs which tool asked");
-    assert.match(exact, /1 text match for "deploy":/);
+    assert.match(exact, /1 text match for "deploy" \(charged: one search\):/);
     assert.match(exact, /the \*\*Deploy\*\* target/);
     assert.match(exact, /page: https:\/\/api\.polychat\.co\/m\/3f2a9c1b7e40/);
     assert.match(exact, /block 1 lines 2-4/);

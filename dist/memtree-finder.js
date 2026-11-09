@@ -160,6 +160,8 @@ currentSessionId) {
     out.push("", nextPage("list", body.next_cursor));
     return out.join("\n");
 }
+/** Said after a charged first page's heading (the server's `charged`). */
+export const CHARGED_NOTE = "charged: one search";
 export function formatSearchResults(body, args) {
     const query = typeof body.query === "string" ? body.query : String(args.query ?? "");
     if (body.groups) {
@@ -168,7 +170,7 @@ export function formatSearchResults(body, args) {
             return noHits(query, "vector", args, body.coverage);
         const out = [
             `Semantic matches for ${JSON.stringify(query)}` +
-                (body.charged ? " (charged: one query embedding per model)" : "") +
+                (body.charged ? ` (${CHARGED_NOTE})` : "") +
                 ":",
         ];
         if (groups.length > 1) {
@@ -185,7 +187,11 @@ export function formatSearchResults(body, args) {
     const hits = body.hits ?? [];
     if (!hits.length)
         return noHits(query, "text", args, body.coverage);
-    const out = [`${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
+    const out = [
+        `${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}` +
+            (body.charged ? ` (${CHARGED_NOTE})` : "") +
+            ":",
+    ];
     const missing = new MissingTimeNote();
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     if (body.relaxed === "any_word") {

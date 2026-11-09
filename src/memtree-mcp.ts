@@ -192,9 +192,9 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
   "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
   "ccc sessions on any machine (not Codex or plain claude sessions), and list shows those sessions by time and " +
-  "project. Text mode (default, free) matches exact words, ids and paths; vector mode matches " +
-  "meaning: its first page is charged even when the query embedding is cached; cursor continuation is free, " +
-  "including when the embedding must be regenerated. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
+  "project. Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
+  "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
+  "re-embedded, as is a text search of one tree. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
   "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
   "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
   "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
@@ -234,9 +234,9 @@ export const MEMTREE_TOOLS = [
       "summarizes, or earlier work from the user's other sessions. Search one tree (tree, \"current\" for this session) " +
       "or, without tree, all of the user's ccc sessions on any machine (not Codex or plain claude sessions). " +
       "Use it before re-deriving or guessing something from earlier work. " +
-      "mode \"text\" (default, free) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
-      "lines); mode \"vector\" matches meaning, ranked per embedding model; its first page is charged even when the " +
-      "query embedding is cached, and cursor continuation is free. Cursors page over live results, not a frozen snapshot. " +
+      "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
+      "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
+      "first page is charged even when cached; cursor continuation and a text search of one tree are free. Cursors page over live results, not a frozen snapshot. " +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
       "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
       "Results show when the messages were written, each matched line its own message's time where recorded. " +
@@ -248,7 +248,7 @@ export const MEMTREE_TOOLS = [
       properties: {
         query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions) or a question (vector)." },
         tree: { type: "string", description: `Optional. ${TREE_DESC} Omit to search all sessions.` },
-        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words, free) or vector (meaning, first page charged)." },
+        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words) or vector (meaning); first page charged, except text in one tree." },
         project: { type: "string", description: "Without tree: only sessions in this working directory or git repository (owner/repo, or just repo)." },
         since: { type: "string", description: "Without tree: only requests at or after this ISO 8601 time or date." },
         until: { type: "string", description: "Without tree: only requests before this ISO 8601 time or date." },
