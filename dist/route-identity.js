@@ -3,6 +3,8 @@ import { stripSystemReminderText } from "./turns.js";
 // Request messages are immutable snapshots. Weak keys retain no completed request.
 // Route installation stores these digests, not the original megabytes of history.
 const hashCaches = new Map();
+/** Each message's tool input JSON strings (jsonStringFields), computed once. */
+const jsonFieldCache = new WeakMap();
 const EXACT = { media: "keep" };
 const MEDIA_FREE = { media: "drop" };
 /** Hash each incoming message once, then reuse it across route candidates/checks. */
@@ -19,8 +21,8 @@ export function prefixIdentity(messages, kind) {
     return {
         originalPrefixHashes: messages.map(exact),
         originalMediaFreeHashes: messages.map((m) => mediaFreeHash(m, kind)),
-        originalPortableHashes: messages.map((m) => portableHash(m, kind, "keep", "stored")),
-        originalPortableMediaFreeHashes: messages.map((m) => portableHash(m, kind, "drop", "stored")),
+        originalPortableHashes: messages.map((m) => portableIdentity(m, kind, "keep")),
+        originalPortableMediaFreeHashes: messages.map((m) => portableIdentity(m, kind, "drop")),
     };
 }
 /**
@@ -38,14 +40,13 @@ export function prefixMessageMatches(message, kind, exact, mediaFree, portable, 
     const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
     if (hash === exact)
         return true;
-    if (portable !== undefined && portableHash(message, kind, "keep", "incoming") === portable) {
+    if (portable !== undefined && portableMatches(message, kind, "keep", portable))
         return true;
-    }
     if (carriesMedia(message.content))
         return false;
     return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
         (portableMediaFree !== undefined &&
-            portableHash(message, kind, "drop", "incoming") === portableMediaFree);
+            portableMatches(message, kind, "drop", portableMediaFree));
 }
 /**
  * Whether `newer` carries everything `older` does: every message of `older` after the
@@ -69,18 +70,72 @@ function mediaFreeHash(message, kind) {
 /**
  * An identity that also ignores how Claude Code renders unchanged history, which differs
  * between versions (2.1.302 -> 2.1.319 on 2026-11-09): a reminder inside a tool result's
- * text or in a block of its own, a tool result's text as a string or a text block. And a
- * tool input value the model sent as a JSON string that a newer Claude Code parsed: one
- * way only, a stored string standing for its parse, so two different strings never match.
+ * text or in a block of its own, a tool result's text as a string or a text block, a tool
+ * input value as the JSON string the model sent or the value a newer Claude Code parsed
+ * it to. Followed by the digests of the message's tool input JSON strings, so that one
+ * still a string is held to the very string stored (portableMatches).
  */
-function portableHash(message, kind, media, side) {
-    return messageHash(message, kind === "stable" && stableShape(message), { media, portable: side });
+function portableIdentity(message, kind, media) {
+    const fields = jsonStringFields(message);
+    const hash = portableHash(message, kind, media);
+    return fields.size ? `${hash}|${JSON.stringify([...fields].sort())}` : hash;
+}
+/**
+ * Whether `message` matches a stored portableIdentity: the same content as rendered either
+ * way, and each tool input it still sends as a JSON string the same string as stored there
+ * (so two strings that parse alike never match); one parsed since matches by its value.
+ */
+function portableMatches(message, kind, media, stored) {
+    const split = stored.indexOf("|");
+    const hash = split === -1 ? stored : stored.slice(0, split);
+    if (portableHash(message, kind, media) !== hash)
+        return false;
+    const fields = jsonStringFields(message);
+    if (!fields.size)
+        return true;
+    let storedFields;
+    try {
+        storedFields = new Map(split === -1 ? [] : JSON.parse(stored.slice(split + 1)));
+    }
+    catch {
+        return false;
+    }
+    for (const [field, digest] of fields)
+        if (storedFields.get(field) !== digest)
+            return false;
+    return true;
+}
+function portableHash(message, kind, media) {
+    return messageHash(message, kind === "stable" && stableShape(message), { media, portable: true });
+}
+/**
+ * The message's tool input values that are JSON strings portableContent parses: tool use
+ * id and input key -> a digest of the string as sent.
+ */
+function jsonStringFields(message) {
+    const cached = jsonFieldCache.get(message);
+    if (cached)
+        return cached;
+    const fields = new Map();
+    const content = Array.isArray(message.content) ? message.content : [];
+    content.forEach((part, index) => {
+        if (part?.type !== "tool_use" || !isPlainObject(part.input))
+            return;
+        for (const [key, value] of Object.entries(part.input)) {
+            if (typeof value !== "string" || parsedJson(value) === value)
+                continue;
+            const digest = createHash("sha256").update(value, "utf16le").digest("hex");
+            fields.set(JSON.stringify([part.id ?? `#${index}`, key]), digest);
+        }
+    });
+    jsonFieldCache.set(message, fields);
+    return fields;
 }
 function stableShape(message) {
     return message.role === "assistant" && Array.isArray(message.content);
 }
 function hashCache(stable, mode) {
-    const key = `${stable}:${mode.media}:${mode.portable ?? ""}`;
+    const key = `${stable}:${mode.media}:${mode.portable === true}`;
     let cache = hashCaches.get(key);
     if (!cache)
         hashCaches.set(key, cache = new WeakMap());
@@ -99,8 +154,7 @@ function messageHash(message, stable, mode) {
     const reminded = normalizeReminders(blocks);
     const kept = mode.media === "drop" ? withoutMedia(reminded) : reminded;
     const normalized = {
-        ...message, content: stripBlockCache(mode.portable
-            ? portableContent(kept, mode.portable === "stored") : kept),
+        ...message, content: stripBlockCache(mode.portable ? portableContent(kept) : kept),
     };
     const hash = createHash("sha256");
     updateCanonical(hash, normalized);
@@ -130,10 +184,10 @@ function normalizeReminders(content) {
 }
 /**
  * Content with rendering choices canonicalized (portableHash): text blocks left empty by
- * reminder removal dropped, a tool result's string as one text block, and (`parseInputs`,
- * the stored side) tool input values that are JSON strings of an object or array parsed.
+ * reminder removal dropped, a tool result's string as one text block, and tool input
+ * values that are JSON strings of an object or array parsed (losslessly: parsedJson).
  */
-function portableContent(content, parseInputs) {
+function portableContent(content) {
     if (!Array.isArray(content))
         return content;
     return content.filter((part) => !isEmptyText(part)).map((part) => {
@@ -142,9 +196,9 @@ function portableContent(content, parseInputs) {
         if (part.type === "tool_result") {
             const inner = typeof part.content === "string"
                 ? [{ type: "text", text: part.content }] : part.content;
-            return { ...part, content: portableContent(inner, parseInputs) };
+            return { ...part, content: portableContent(inner) };
         }
-        if (parseInputs && part.type === "tool_use" && isPlainObject(part.input)) {
+        if (part.type === "tool_use" && isPlainObject(part.input)) {
             return { ...part, input: parsedJsonValues(part.input) };
         }
         return part;

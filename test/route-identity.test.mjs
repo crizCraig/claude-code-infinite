@@ -264,3 +264,21 @@ test("a reminder moved while Claude Code evicted the image beside it still match
     assert.ok(!matches(edited), `${kind}: edited text`);
   }
 });
+
+test("one input parsed since beside one still the same JSON string matches (Codex r3)", () => {
+  const edits = [{ old_str: "a", new_str: "b" }];
+  const message = (editsValue, content) => ({ role: "assistant", content: [
+    { type: "tool_use", id: "u1", name: "Artifact", input: { edits: editsValue } },
+    { type: "tool_use", id: "u2", name: "Write", input: { content } }] });
+  const stored = message(JSON.stringify(edits), '{"a":1}');
+  for (const kind of ["route", "stable"]) {
+    const id = prefixIdentity([stored], kind);
+    const matches = (m) => prefixMessageMatches(m, kind, id.originalPrefixHashes[0],
+      id.originalMediaFreeHashes[0], id.originalPortableHashes[0],
+      id.originalPortableMediaFreeHashes[0]);
+    assert.ok(matches(message(edits, '{"a":1}')), `${kind}: edits parsed, content unchanged`);
+    assert.ok(!matches(message(edits, '{ "a": 1 }')), `${kind}: content reformatted`);
+    assert.ok(matches(message(edits, { a: 1 })), `${kind}: both parsed`);
+    assert.ok(!matches(message([{ old_str: "a", new_str: "c" }], '{"a":1}')), `${kind}: other edits`);
+  }
+});
