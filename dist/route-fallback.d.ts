@@ -74,6 +74,8 @@ export declare class RouteFallbackFailures {
     indexWaitDeadline(lane: string, secondsLeft: number | undefined, now?: number): number | undefined;
     /** Whether the lane is waiting for its index (a wait started, not yet ended). */
     indexWaiting(lane: string): boolean;
+    /** The time left MemTree last stated for the lane's index wait, if any. */
+    indexSecondsLeft(lane: string): number | undefined;
     /** Whether a stated time left is too long to wait for at all (refused at once). */
     hopeless(secondsLeft: number | undefined): boolean;
     succeeded(lane: string): void;

@@ -39,6 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 
+import { UNKNOWN_INDEX_WAIT_SECONDS } from "./index-wait-413.js";
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal }
@@ -2117,7 +2118,12 @@ async function handleMessages(
   const isMainRequest = requestRouteLane === "main";
   const requestSizeKey = laneSizeKey(req, requestRouteKey, body.model);
   const hold = indexHolds.get(rec);
-  if (hold) hold.lane = requestRouteKey;
+  if (hold) {
+    hold.lane = requestRouteKey;
+    // Arriving while the lane waits for its index: this request's asks stay within its
+    // own hold even if that wait ends meanwhile (laneHeldCap).
+    if (state.fallbackFailures.indexWaiting(requestRouteKey)) hold.underIndexWait = true;
+  }
   // Extended 1M context arrives as the `context-1m` beta header (Claude Code
   // strips the `[1m]` model suffix on the wire). Current native-1M models send
   // neither, so contextLimitForModel also needs the launcher's native setting.
@@ -5869,8 +5875,18 @@ async function runBlockingCompression(
   for (;;) {
     const outcome = await runBlockingCompressionOnce(capMs === undefined ? args
       : { ...args, capMs });
-    // An ask cut short by the hold's end is no evidence of an outage.
-    if (capMs !== undefined && args.rec.compress?.timedOut) outcome.liveHealth = "none";
+    // An ask cut short by the hold's end is no evidence of an outage; and while the
+    // lane waits for its index it is that wait, not a strike (a later answer ends it).
+    if (capMs !== undefined && args.rec.compress?.timedOut) {
+      outcome.liveHealth = "none";
+      if (outcome.indexWaitSeconds === undefined && !activeIndexWaits.has(args.rec)) {
+        const lane = indexHolds.get(args.rec)?.lane;
+        noteIndexWait413(args.rec, (lane !== undefined
+          ? args.state.fallbackFailures.indexSecondsLeft(lane) : undefined) ??
+          UNKNOWN_INDEX_WAIT_SECONDS);
+        return outcome;
+      }
+    }
     if (outcome.indexWaitSeconds === undefined) {
       // Settled otherwise (an answer, or a failure of another kind): the wait is over.
       // A timed-out ask said nothing new, so a refusal still waits.
@@ -5891,13 +5907,16 @@ async function runBlockingCompression(
 function laneHeldCap(args: Parameters<typeof runBlockingCompressionOnce>[0]): number | undefined {
   const hold = indexHolds.get(args.rec);
   if (!hold || hold.lane === undefined) return undefined;
-  if (!args.state.fallbackFailures.indexWaiting(hold.lane)) return undefined;
+  if (!hold.underIndexWait && !args.state.fallbackFailures.indexWaiting(hold.lane)) {
+    return undefined;
+  }
+  hold.underIndexWait = true;
   return Math.max(1, (args.opts.indexHoldMs ?? INDEX_HOLD_MS) - (Date.now() - hold.started));
 }
 
 /** One request's index hold: when it arrived, its lane, and a signal for Claude Code leaving. */
 const indexHolds = new WeakMap<MessagesRecord,
-  { started: number; closed: AbortSignal; lane?: string }>();
+  { started: number; closed: AbortSignal; lane?: string; underIndexWait?: boolean }>();
 /**
  * Requests whose latest compress answer was an indexing 413: the seconds it stated. Set
  * only by runBlockingCompression, and cleared when a later ask settles otherwise.

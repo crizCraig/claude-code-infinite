@@ -341,6 +341,8 @@ test("a turn arriving while its lane waits for the index asks within its own hol
     const second = await post(h, other);
     assert.ok(Date.now() - started < 1_500, `${Date.now() - started} ms`);
     assert.equal(second.status, 503);
+    assert.match(second.message, /catching up on this session's index, about 4 minutes left/,
+      "its cut-short ask is the lane's index wait, not a strike (Codex r4)");
     assert.equal((await first).status, 503);
   } finally { h.close(); }
 });

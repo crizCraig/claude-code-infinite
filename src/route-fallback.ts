@@ -69,7 +69,7 @@ export class RouteFallbackFailures {
    * strike table had no room to record the refusal (still refused, never extended).
    */
   private readonly indexWaits =
-    new Map<string, { started: number; deadline: number; over?: true }>();
+    new Map<string, { started: number; deadline: number; over?: true; secondsLeft?: number }>();
 
   constructor(
     private readonly capacity = 128,
@@ -112,6 +112,11 @@ export class RouteFallbackFailures {
   indexWaiting(lane: string): boolean {
     const wait = this.indexWaits.get(lane);
     return wait !== undefined && !wait.over;
+  }
+
+  /** The time left MemTree last stated for the lane's index wait, if any. */
+  indexSecondsLeft(lane: string): number | undefined {
+    return this.indexWaits.get(lane)?.secondsLeft;
   }
 
   /** Whether a stated time left is too long to wait for at all (refused at once). */
@@ -169,10 +174,12 @@ export class RouteFallbackFailures {
     if (wait === undefined) {
       this.retireExpiredWaits(now);
       if (this.indexWaits.size >= this.capacity) return "untracked";
-      this.indexWaits.set(lane, { started: now, deadline: this.deadline(now, now, secondsLeft) });
+      this.indexWaits.set(lane, { started: now, deadline: this.deadline(now, now, secondsLeft),
+        secondsLeft });
       return "open";
     }
     if (secondsLeft !== undefined) {
+      wait.secondsLeft = secondsLeft;
       wait.deadline = Math.max(wait.deadline, this.deadline(wait.started, now, secondsLeft));
     }
     return now < wait.deadline ? "open" : this.close(lane);
