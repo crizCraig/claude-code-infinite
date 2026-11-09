@@ -279,6 +279,10 @@ test("networkFailureOf reads undici's cause and ignores aborts and HTTP answers"
     { code: "ECONNRESET", syscall: "connect" }), "h")?.code, "ECONNRESET");
   assert.equal(networkFailureOf(Object.assign(new Error("read ECONNRESET"),
     { code: "ECONNRESET", syscall: "read" }), "h"), undefined, "a reset once connected");
+  const attempt = () => Object.assign(new Error("connect ETIMEDOUT"),
+    { code: "ETIMEDOUT", syscall: "connect" });
+  assert.equal(networkFailureOf(Object.assign(new AggregateError([attempt(), attempt()]),
+    { code: "ETIMEDOUT" }), "h")?.code, "ETIMEDOUT", "happy eyeballs: every attempt's connect");
   assert.equal(networkFailureOf(Object.assign(new Error("x"), { code: "EPIPE" }), "h"),
     undefined);
   assert.equal(networkFailureOf(new DOMException("aborted", "AbortError"), "h"), undefined);

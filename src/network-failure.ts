@@ -39,7 +39,7 @@ export function networkFailureOf(
   const source = errorCode(err) !== undefined ? err : (err as { cause?: unknown } | undefined)?.cause;
   const code = errorCode(source);
   if (code === undefined) return undefined;
-  const connecting = (source as { syscall?: unknown }).syscall === "connect";
+  const connecting = connectFailed(source);
   return UNREACHABLE_CODES.has(code) || (connecting && CONNECT_ONLY_CODES.has(code))
     ? { code, host, at: now } : undefined;
 }
@@ -65,6 +65,17 @@ export function unreachableMessage(
   const [name, failure] = memtree ? ["MemTree", memtree] : ["Anthropic", anthropic!];
   return `ccc can't reach ${name} (${failure.host}: ${failure.code}). ` +
     "Check your internet connection and retry.";
+}
+
+/**
+ * Whether the connect itself failed: its syscall, or every attempt's (Node's happy-eyeballs
+ * AggregateError carries the syscall only on its `errors`: review r2).
+ */
+function connectFailed(err: unknown): boolean {
+  const { syscall, errors } = err as { syscall?: unknown; errors?: unknown };
+  if (syscall === "connect") return true;
+  return Array.isArray(errors) && errors.length > 0 &&
+    errors.every((each) => (each as { syscall?: unknown } | null)?.syscall === "connect");
 }
 
 function errorCode(err: unknown): string | undefined {
