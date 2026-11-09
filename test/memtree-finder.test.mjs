@@ -43,6 +43,13 @@ test("an empty search across sessions says what it covered and why a session may
   const old = formatSearchResults({ hits: [] }, { query: "x" });
   assert.match(old, /^No passage in your sessions matches "x" \(text search\)\. Text mode needs/);
   assert.equal(formatSearchResults({ hits: [] }, { query: "x", cursor: "c" }), "No more matches.");
+  // An empty first page is still a charged search (Codex r1 P3).
+  for (const [body, mode] of [[{ hits: [], charged: true }, "text"], [{ groups: [], charged: true }, "vector"]]) {
+    const empty = formatSearchResults(body, { query: "x", mode });
+    assert.match(empty, new RegExp(`\\(${mode} search, charged: one search\\)\\.`), empty);
+  }
+  const scoped = formatSearchResults({ groups: [], charged: true }, { query: "x", mode: "vector", tree: "t1" });
+  assert.match(scoped, /^Nothing in tree t1 matches "x" \(vector search, charged: one search\)\./);
 });
 
 test("list marks the calling session", () => {

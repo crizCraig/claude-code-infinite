@@ -277,7 +277,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
   const query = typeof body.query === "string" ? body.query : String(args.query ?? "");
   if (body.groups) {
     const groups = body.groups.filter((g) => g.hits?.length);
-    if (!groups.length) return noHits(query, "vector", args, body.coverage);
+    if (!groups.length) return noHits(query, "vector", args, body.coverage, body.charged);
     const out = [
       `Semantic matches for ${JSON.stringify(query)}` +
         (body.charged ? ` (${CHARGED_NOTE})` : "") +
@@ -295,7 +295,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
     return out.join("\n");
   }
   const hits = body.hits ?? [];
-  if (!hits.length) return noHits(query, "text", args, body.coverage);
+  if (!hits.length) return noHits(query, "text", args, body.coverage, body.charged);
   const out = [
     `${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}` +
       (body.charged ? ` (${CHARGED_NOTE})` : "") +
@@ -356,19 +356,21 @@ function noHits(
   query: string,
   mode: string,
   args: Record<string, unknown>,
-  coverage?: FinderSearchCoverage
+  coverage?: FinderSearchCoverage,
+  charged?: boolean
 ): string {
   if (args.cursor) return "No more matches.";
+  const searched = charged ? `${mode} search, ${CHARGED_NOTE}` : `${mode} search`;
   const other =
     mode === "vector"
       ? 'For an exact word, id or path, try mode "text".'
       : 'Text mode needs the exact words; for meaning, try mode "vector".';
   if (typeof args.tree === "string" && args.tree) {
-    return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${mode} search). ${other}`;
+    return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${searched}). ${other}`;
   }
   const filtered = ["project", "since", "until"].some((k) => typeof args[k] === "string" && args[k]);
   return [
-    `No passage in your sessions matches ${JSON.stringify(query)} (${mode} search).`,
+    `No passage in your sessions matches ${JSON.stringify(query)} (${searched}).`,
     ...coverageLines(coverage),
     other + (filtered ? " Or widen since/until, or drop the project filter." : ""),
     NOT_SEARCHED_NOTE,
