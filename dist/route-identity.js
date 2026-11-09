@@ -154,7 +154,8 @@ function messageHash(message, stable, mode) {
     const reminded = normalizeReminders(blocks);
     const kept = mode.media === "drop" ? withoutMedia(reminded) : reminded;
     const normalized = {
-        ...message, content: stripBlockCache(mode.portable ? portableContent(kept) : kept),
+        ...message,
+        content: stripBlockCache(mode.portable ? withoutToolLoadedNotes(portableContent(kept)) : kept),
     };
     const hash = createHash("sha256");
     updateCanonical(hash, normalized);
@@ -203,6 +204,35 @@ function portableContent(content) {
         }
         return part;
     });
+}
+/** Claude Code's note after a ToolSearch result that loaded tools; sent or not by model. */
+const TOOL_LOADED_TEXT = "Tool loaded.";
+/**
+ * Top-level content without each "Tool loaded." note that follows the turn's tool
+ * results when one of them holds only tool references. On the same Claude Code
+ * (2.1.321), Opus 5.5 gets the note and Fable 5.2 does not, so a model switch changed
+ * old messages (2026-11-09). Mirrors polychat's rerender_match.portable_message.
+ */
+function withoutToolLoadedNotes(content) {
+    if (!Array.isArray(content))
+        return content;
+    return content.filter((part, index) => !(isToolLoadedNote(part) && followsLoadedTools(content, index)));
+}
+function isToolLoadedNote(part) {
+    return part?.type === "text" && part.text === TOOL_LOADED_TEXT &&
+        Object.keys(part).every((key) => key === "type" || key === "text" || key === "cache_control");
+}
+/** Whether the run of tool results ending just before `index` loads tools. */
+function followsLoadedTools(content, index) {
+    for (let i = index - 1; i >= 0; i--) {
+        const part = content[i];
+        if (part?.type !== "tool_result")
+            return false;
+        if (Array.isArray(part.content) && part.content.length > 0 &&
+            part.content.every((inner) => inner?.type === "tool_reference"))
+            return true;
+    }
+    return false;
 }
 function isEmptyText(part) {
     return typeof part === "string" ? part === "" :

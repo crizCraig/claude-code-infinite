@@ -180,6 +180,38 @@ test("a prefix still covers messages a newer Claude Code renders differently on 
   }
 });
 
+test("a prefix still covers ToolSearch results after a model switch drops their note", () => {
+  // 2026-11-09 (session e32c1f3e): on Claude Code 2.1.321, Opus 5.5 gets "Tool loaded."
+  // after a ToolSearch result and Fable 5.2 does not. Switching the model changed 12 of
+  // 14,274 covered messages and the persisted prefix was discarded.
+  const refs = { type: "tool_result", tool_use_id: "t", content: [
+    { type: "tool_reference", tool_name: "mcp__memtree__search" },
+    { type: "tool_reference", tool_name: "mcp__memtree__list" }] };
+  const other = { type: "tool_result", tool_use_id: "u", content: "ran" };
+  const note = { type: "text", text: "Tool loaded." };
+  const typed = { type: "text", text: "and then?" };
+  const user = (...content) => ({ role: "user", content });
+  for (const kind of ["route", "stable"]) {
+    const matches = (stored, message) => {
+      const id = prefixIdentity([stored], kind);
+      return prefixMessageMatches(message, kind, id.originalPrefixHashes[0],
+        id.originalMediaFreeHashes[0], id.originalPortableHashes[0]);
+    };
+    assert.ok(matches(user(refs, note), user(refs)), `${kind}: Opus then Fable`);
+    assert.ok(matches(user(refs), user(refs, note)), `${kind}: Fable then Opus`);
+    assert.ok(matches(user(refs, other, note), user(refs, other)), `${kind}: parallel tool call`);
+    assert.ok(matches(user(refs, { ...note, cache_control: { type: "ephemeral" } }), user(refs)));
+    assert.ok(matches(user(refs, note, typed), user(refs, typed)), "only the note is dropped");
+    assert.ok(!matches(user(refs, typed), user(refs)), "other text after the result");
+    assert.ok(!matches(user(note), user()), "the user typed it");
+    assert.ok(!matches(user(other, note), user(other)), "a result that loaded no tool");
+    assert.ok(!matches(user(note, refs), user(refs)), "before the result");
+    assert.ok(!matches(user(refs, typed, other, note), user(refs, typed, other)), "text between");
+    const empty = { type: "tool_result", tool_use_id: "t", content: [] };
+    assert.ok(!matches(user(empty, note), user(empty)), "an empty result loaded nothing");
+  }
+});
+
 test("a portable match never equates different content (Codex r1)", () => {
   for (const kind of ["route", "stable"]) {
     const ids = (message) => prefixIdentity([message], kind);
