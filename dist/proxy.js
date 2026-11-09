@@ -1616,12 +1616,13 @@ async function handleMessages(req, res, opts, upstream, state) {
                 }
                 else if (prior?.retryAtTokens !== undefined &&
                     plan.estimateTokens < prior.retryAtTokens &&
-                    Date.now() < (prior.retryDeadline ?? 0)) {
+                    Date.now() < (prior.retryDeadline ?? 0) && !outageOver(state, prior.offline)) {
                     // This lane's last attempt this human turn produced nothing; wait
                     // for growth instead of paying a blocking call on every tool turn.
                     rec.routeRecovery = { outcome: "backoff" };
                 }
                 else if (Date.now() < state.toolRecoveryCooldownUntil &&
+                    !outageOver(state, state.toolRecoveryCooldownOffline) &&
                     !(plan.overWindow && !plan.fallback && (!plan.uncountedOverWindowOnly ||
                         await wholeRequestRefused(requestSizing, originalCandidate, sizingLimits())))) {
                     // A recent attempt burned the full compress budget and still
@@ -2769,6 +2770,7 @@ function noteMemtreeHealth(state, compression) {
             return;
         state.toolRecoveryCooldownUntil =
             Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+        state.toolRecoveryCooldownOffline = state.memtreeUnreachable() !== undefined;
         return;
     }
     if (compression.liveHealth === "success") {
@@ -4705,6 +4707,10 @@ async function recoverToolRouteMiss(args) {
         if (args.retryAtTokens !== undefined) {
             recoveryAttempt.retryAtTokens = args.retryAtTokens;
             recoveryAttempt.retryDeadline = Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+            if (state.memtreeUnreachable())
+                recoveryAttempt.offline = true;
+            else
+                delete recoveryAttempt.offline;
         }
     };
     const sessionId = requestSessionId(req);
@@ -5588,6 +5594,13 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     if (keyInvalid && args.rec.routeLane === "main")
         args.state.keyNotice.markShown();
     return false;
+}
+/**
+ * Whether a backoff or cooldown armed by a call that could not connect (`offline`) is over:
+ * MemTree has answered since, so the next request asks it again.
+ */
+function outageOver(state, offline) {
+    return offline === true && state.memtreeUnreachable() === undefined;
 }
 /**
  * Why a request only MemTree could fit can't go now, when MemTree's latest call could not

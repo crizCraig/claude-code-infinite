@@ -682,6 +682,8 @@ interface ProxyState {
    * attempt, set when an attempt returns null. Zero means no cooldown.
    */
   toolRecoveryCooldownUntil: number;
+  /** The cooldown came from a call that could not connect (see ToolRecoveryAttempt.offline). */
+  toolRecoveryCooldownOffline?: boolean;
   /** Fired by drain after its grace period so every forwarding path can stop. */
   shutdownSignal: AbortSignal;
   /**
@@ -828,6 +830,12 @@ interface ToolRecoveryAttempt {
    * every tool turn (routeRecovery outcome "backoff").
    */
   retryAtTokens?: number;
+  /**
+   * The backoff came from an attempt that could not connect to MemTree: it ends as soon as
+   * MemTree answers again (memtree.unreachable clears), so a lane is not refused for its
+   * fit by an outage that is over.
+   */
+  offline?: true;
   /**
    * Set when the attempt's reply showed no finished tree for the conversation
    * (a no-op with no indexed tokens), or a reply whose index trails the
@@ -2465,12 +2473,13 @@ async function handleMessages(
         } else if (
           prior?.retryAtTokens !== undefined &&
           plan.estimateTokens < prior.retryAtTokens &&
-          Date.now() < (prior.retryDeadline ?? 0)
+          Date.now() < (prior.retryDeadline ?? 0) && !outageOver(state, prior.offline)
         ) {
           // This lane's last attempt this human turn produced nothing; wait
           // for growth instead of paying a blocking call on every tool turn.
           rec.routeRecovery = { outcome: "backoff" };
         } else if (Date.now() < state.toolRecoveryCooldownUntil &&
+            !outageOver(state, state.toolRecoveryCooldownOffline) &&
             !(plan.overWindow && !plan.fallback && (!plan.uncountedOverWindowOnly ||
               await wholeRequestRefused(requestSizing, originalCandidate, sizingLimits())))) {
           // A recent attempt burned the full compress budget and still
@@ -3835,6 +3844,7 @@ function noteMemtreeHealth(
     if (state.shutdownSignal.aborted || state.backgroundSignal.aborted) return;
     state.toolRecoveryCooldownUntil =
       Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+    state.toolRecoveryCooldownOffline = state.memtreeUnreachable() !== undefined;
     return;
   }
   if (compression.liveHealth === "success") {
@@ -6364,6 +6374,8 @@ async function recoverToolRouteMiss(args: {
     if (args.retryAtTokens !== undefined) {
       recoveryAttempt.retryAtTokens = args.retryAtTokens;
       recoveryAttempt.retryDeadline = Date.now() + TOOL_RECOVERY_FAILURE_COOLDOWN_MS;
+      if (state.memtreeUnreachable()) recoveryAttempt.offline = true;
+      else delete recoveryAttempt.offline;
     }
   };
 
@@ -7386,6 +7398,14 @@ function refuseWholeRequest(
   // The refusal named the key: it counts as the key notice on the user's screen.
   if (keyInvalid && args.rec.routeLane === "main") args.state.keyNotice.markShown();
   return false;
+}
+
+/**
+ * Whether a backoff or cooldown armed by a call that could not connect (`offline`) is over:
+ * MemTree has answered since, so the next request asks it again.
+ */
+function outageOver(state: ProxyState, offline: boolean | undefined): boolean {
+  return offline === true && state.memtreeUnreachable() === undefined;
 }
 
 /**

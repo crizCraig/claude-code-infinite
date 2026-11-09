@@ -44,7 +44,18 @@ async function closedPort() {
   return port;
 }
 
-async function harness({ upstreamDown = false } = {}) {
+function fitAnswer() {
+  const content = "saved memory ".repeat(200);
+  return new Response(JSON.stringify({ compressed: true, messages: [{ role: "user", content }],
+    flattened_messages: [{ role: "user", content }],
+    usage: { indexed_tokens: 220_000, raw_prompt_tokens: 230_000 } }),
+  { status: 200, headers: { "content-type": "application/json" } });
+}
+
+async function harness(options = {}) {
+  const { upstreamDown = false, indexing = false, budget = 1000 } = options;
+  // A tool turn compresses only with compaction on (an undefined target: budget/2).
+  const compactTarget = "compactTarget" in options ? options.compactTarget : null;
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -59,10 +70,12 @@ async function harness({ upstreamDown = false } = {}) {
   await new Promise(resolve => upstream.listen(0, "127.0.0.1", resolve));
   const port = upstreamDown ? await closedPort() : upstream.address().port;
   const memtree = new MemtreeClient({ baseUrl: MEMTREE_URL, apiKey: "offline" });
-  memtree.indexInBackground = () => {};
+  if (!indexing) memtree.indexInBackground = () => {};
+  const records = [];
   const proxy = await startProxy({ memtree, upstreamOrigin: `http://127.0.0.1:${port}`,
-    budgetTokensOverride: 1000, defaultCompactTarget: null });
-  return { proxy, seen, close() { proxy.close(); upstream.close(); globalThis.fetch = realFetch; } };
+    budgetTokensOverride: budget, defaultCompactTarget: compactTarget,
+    reqlog: { log: record => records.push(structuredClone(record)) } });
+  return { proxy, seen, records, close() { proxy.close(); upstream.close(); globalThis.fetch = realFetch; } };
 }
 
 function request(proxy, raw, session = "net-session") {
@@ -83,6 +96,10 @@ const body = (text) => JSON.stringify({ model: "claude-x", max_tokens: 100, mess
   { role: "user", content: text }, { role: "assistant", content: "prior answer" },
   { role: "user", content: "next" }] });
 const oversized = () => body("x".repeat(900_000));
+const toolBody = (result = "done") => JSON.stringify({ model: "claude-x", max_tokens: 100,
+  messages: [{ role: "user", content: "x".repeat(900_000) },
+    { role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: result }] }] });
 const message = (response) => JSON.parse(response.body).error.message;
 
 function assertNetworkRefusal(response, pattern) {
@@ -139,6 +156,33 @@ test("network refusals spend no strikes: once MemTree answers, a real misfit ref
       }
       assert.deepEqual(statuses, [503, 503, 400]);
       assert.match(message(last), /couldn't fit this request.*\/ccc:memtree-compact or \/clear/);
+    } finally { h.close(); }
+  });
+
+// The incident's own path: a main-lane tool turn whose compress failed in 9 ms, then the
+// lane's growth backoff refused its retries without asking MemTree (400 attempt 3).
+test("a tool turn in its lane's backoff says MemTree can't be reached, then delivers once it can",
+  async () => {
+    const h = await harness({ indexing: true, budget: 20_000, compactTarget: undefined });
+    stubMemtree(() => { throw fetchFailed("ENOTFOUND"); });
+    try {
+      for (let retry = 0; retry < 4; retry++) {
+        assertNetworkRefusal(await request(h.proxy, toolBody()), /can't reach MemTree/);
+      }
+      stubMemtree(fitAnswer);
+      const statuses = [];
+      for (let retry = 0; retry < 4 && statuses.at(-1) !== 200; retry++) {
+        const response = await request(h.proxy, toolBody(`done ${retry}`));
+        statuses.push(response.status);
+        if (response.status !== 200) {
+          // Retryable, never the fit: a background index call may answer mid-request.
+          assert.equal(response.status, 503);
+          assert.doesNotMatch(message(response), /couldn't fit|memtree-compact|\/clear/);
+          // A background index call answers meanwhile: MemTree is reachable again.
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }
+      assert.equal(statuses.at(-1), 200, `delivered once MemTree answers (${statuses})`);
     } finally { h.close(); }
   });
 

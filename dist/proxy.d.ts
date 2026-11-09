@@ -508,6 +508,8 @@ interface ProxyState {
      * attempt, set when an attempt returns null. Zero means no cooldown.
      */
     toolRecoveryCooldownUntil: number;
+    /** The cooldown came from a call that could not connect (see ToolRecoveryAttempt.offline). */
+    toolRecoveryCooldownOffline?: boolean;
     /** Fired by drain after its grace period so every forwarding path can stop. */
     shutdownSignal: AbortSignal;
     /**
@@ -599,6 +601,12 @@ interface ToolRecoveryAttempt {
      * every tool turn (routeRecovery outcome "backoff").
      */
     retryAtTokens?: number;
+    /**
+     * The backoff came from an attempt that could not connect to MemTree: it ends as soon as
+     * MemTree answers again (memtree.unreachable clears), so a lane is not refused for its
+     * fit by an outage that is over.
+     */
+    offline?: true;
     /**
      * Set when the attempt's reply showed no finished tree for the conversation
      * (a no-op with no indexed tokens), or a reply whose index trails the
