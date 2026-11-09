@@ -22,6 +22,9 @@ export const FINDER_SEARCH_DEFAULT_LIMIT = 10;
 export const FINDER_SEARCH_MAX_LIMIT = 50;
 export const FINDER_SEARCH_MODES = ["vector", "text"] as const;
 const SNIPPET_CHARS = 400;
+/** One `snippets` line of a cross-session hit (the server cuts them at ~240 characters). */
+const SNIPPET_LINE_CHARS = 300;
+const SUMMARY_CHARS = 300;
 const TITLE_CHARS = 300;
 const PATH_SUMMARY_CHARS = 80;
 
@@ -71,7 +74,12 @@ export interface FinderHit {
   tree: { request_id: string; ref?: string; created_at?: string | null; links?: FinderTreeLinks | null };
   leaf?: string;
   range?: { block: number; start: number; end: number } | null;
+  /** The lines joined; older servers send only this. */
   snippet?: string | null;
+  /** The 1-3 lines densest in the query's words, by block line (servers from 2026-11-09). */
+  snippets?: { line: number; text: string }[] | null;
+  /** The leaf's own summary (servers from 2026-11-09). */
+  summary?: string | null;
   score?: number;
   embedding_model?: string;
   /** `<tree>#<node>`: the matched node, for read_node / read_lines `node`. */
@@ -92,7 +100,7 @@ export interface FinderSearchResponse {
   query?: string;
   mode?: string;
   hits?: FinderHit[];
-  groups?: { embedding_model: string; hits: FinderHit[]; has_more?: boolean }[];
+  groups?: FinderSearchGroup[];
   next_cursor?: string | null;
   matches_capped?: boolean;
   charged?: boolean;
@@ -100,6 +108,15 @@ export interface FinderSearchResponse {
   relaxed?: string;
   /** On an empty first page across sessions (servers from 2026-11): what was searched. */
   coverage?: FinderSearchCoverage;
+}
+
+/** One embedding model's ranking. */
+export interface FinderSearchGroup {
+  embedding_model: string;
+  hits: FinderHit[];
+  has_more?: boolean;
+  /** The ranking ran out of time, so only the newest trees were ranked (servers from 2026-11-09). */
+  partial?: { trees?: number; of_trees?: number; since?: string | null; note?: string } | null;
 }
 
 /** Counts and times of the caller's own sessions; never content (polychat memtree_search_coverage.py). */
@@ -289,6 +306,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
     const missing = new MissingTimeNote();
     for (const group of groups) {
       out.push("", `== ${group.embedding_model} ==`);
+      if (group.partial) out.push(partialNote(group.partial));
       group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     }
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
@@ -314,7 +332,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
 }
 
 const OPEN_NOTE =
-  "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
+  "Snippets are excerpts (L<n>: the line in the hit's block). read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
   "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 
 function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[] {
@@ -334,7 +352,8 @@ function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[
   const lines = ["", `[${n}] ${head}`];
   if (hit.tree?.links?.url) lines.push(`    page: ${hit.tree.links.url}`);
   if (hit.path?.length) lines.push(`    path: ${formatPath(hit.path, ref)}`);
-  if (hit.snippet) lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
+  if (hit.summary) lines.push(`    summary: ${oneLine(hit.summary, SUMMARY_CHARS)}`);
+  lines.push(...hitSnippets(hit));
   if (hit.address) {
     lines.push(`    address: ${hit.address}`);
   } else if (ref && range) {
@@ -343,6 +362,27 @@ function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[
     );
   }
   return lines;
+}
+
+/** `L<n>: text` per server snippet line, else the joined `snippet` (older servers). */
+function hitSnippets(hit: FinderHit): string[] {
+  const numbered = (Array.isArray(hit.snippets) ? hit.snippets : []).filter(
+    (s) => Number.isInteger(s?.line) && typeof s?.text === "string"
+  );
+  if (numbered.length) {
+    return numbered.map((s) => `    L${s.line}: ${oneLine(boldToMarkdown(s.text), SNIPPET_LINE_CHARS)}`);
+  }
+  return hit.snippet ? [`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`] : [];
+}
+
+/** Why a vector group ranked only the newest trees. */
+function partialNote(partial: NonNullable<FinderSearchGroup["partial"]>): string {
+  const counted =
+    typeof partial.trees === "number" && typeof partial.of_trees === "number"
+      ? ` (${partial.trees} of ${partial.of_trees} trees${partial.since ? `, made since ${shortTime(partial.since)}` : ""})`
+      : "";
+  return `(Only the newest trees were ranked${counted}: the full ranking ran out of time. ` +
+    "There is no next page; narrow with since, until, project or tree to rank the others, or use mode \"text\".)";
 }
 
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */

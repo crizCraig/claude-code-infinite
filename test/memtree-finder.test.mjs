@@ -60,3 +60,38 @@ test("list marks the calling session", () => {
   assert.match(text, /\[2\] \(this session\) Mine/);
   assert.doesNotMatch(formatSessions(body, {}), /this session/);
 });
+
+test("a cross-session hit shows its summary and numbered snippet lines", () => {
+  const hit = {
+    kind: "claude_code_session", id: "s1", session_id: "s1",
+    tree: { request_id: "r1", ref: "r1-v1-own" }, leaf: "leaf_node_851:101:165.txt",
+    range: { block: 851, start: 101, end: 165 }, score: 0.622,
+    summary: "Updating   board now.md with role-play benchmark findings",
+    snippets: [{ line: 114, text: "<b>Role-play</b> <b>benchmark</b>: recall 0.06" },
+               { line: 120, text: "story-detail <b>indexing</b>" }, { line: "x", text: "bad" }],
+    snippet: "<b>Role-play</b> <b>benchmark</b>: recall 0.06 … story-detail <b>indexing</b>",
+    address: "r1-v1-own#7",
+  };
+  const text = formatSearchResults({ query: "role-play benchmark indexing", hits: [hit] }, {});
+  assert.match(text, /\n {4}summary: Updating board now\.md with role-play benchmark findings\n/);
+  assert.match(text, /\n {4}L114: \*\*Role-play\*\* \*\*benchmark\*\*: recall 0\.06\n {4}L120: story-detail \*\*indexing\*\*\n/);
+  assert.doesNotMatch(text, /recall 0\.06 … story-detail/, "the joined snippet is not repeated");
+  assert.doesNotMatch(text, /bad/);
+  assert.ok(text.indexOf("summary:") < text.indexOf("L114:") && text.indexOf("L120:") < text.indexOf("address:"));
+  const old = formatSearchResults({ query: "q", hits: [{ ...hit, snippets: undefined, summary: undefined }] }, {});
+  assert.match(old, /\n {4}\*\*Role-play\*\* \*\*benchmark\*\*: recall 0\.06 … story-detail \*\*indexing\*\*\n/);
+  assert.doesNotMatch(old, /summary:|L114:/);
+});
+
+test("a vector group ranked over the newest trees says so", () => {
+  const hit = { kind: "claude_code_session", id: "s1", tree: { request_id: "r1" }, snippets: [{ line: 3, text: "opening line" }] };
+  const text = formatSearchResults({
+    query: "gmail drafts", charged: true,
+    groups: [{ embedding_model: "voyage-3.5", hits: [hit], has_more: false,
+               partial: { trees: 2150, of_trees: 28154, since: "2026-11-06T01:29:20+00:00", note: "server note" } }],
+  }, { mode: "vector" });
+  assert.match(text, /Only the newest trees were ranked \(2150 of 28154 trees, made since [^)]+\): the full ranking ran out of time\. There is no next page/);
+  assert.match(text, /\n {4}L3: opening line\n/);
+  const whole = formatSearchResults({ query: "q", groups: [{ embedding_model: "m", hits: [hit] }] }, { mode: "vector" });
+  assert.doesNotMatch(whole, /newest trees/);
+});

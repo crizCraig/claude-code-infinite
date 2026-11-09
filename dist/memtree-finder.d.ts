@@ -63,7 +63,15 @@ export interface FinderHit {
         start: number;
         end: number;
     } | null;
+    /** The lines joined; older servers send only this. */
     snippet?: string | null;
+    /** The 1-3 lines densest in the query's words, by block line (servers from 2026-11-09). */
+    snippets?: {
+        line: number;
+        text: string;
+    }[] | null;
+    /** The leaf's own summary (servers from 2026-11-09). */
+    summary?: string | null;
     score?: number;
     embedding_model?: string;
     /** `<tree>#<node>`: the matched node, for read_node / read_lines `node`. */
@@ -85,11 +93,7 @@ export interface FinderSearchResponse {
     query?: string;
     mode?: string;
     hits?: FinderHit[];
-    groups?: {
-        embedding_model: string;
-        hits: FinderHit[];
-        has_more?: boolean;
-    }[];
+    groups?: FinderSearchGroup[];
     next_cursor?: string | null;
     matches_capped?: boolean;
     charged?: boolean;
@@ -97,6 +101,19 @@ export interface FinderSearchResponse {
     relaxed?: string;
     /** On an empty first page across sessions (servers from 2026-11): what was searched. */
     coverage?: FinderSearchCoverage;
+}
+/** One embedding model's ranking. */
+export interface FinderSearchGroup {
+    embedding_model: string;
+    hits: FinderHit[];
+    has_more?: boolean;
+    /** The ranking ran out of time, so only the newest trees were ranked (servers from 2026-11-09). */
+    partial?: {
+        trees?: number;
+        of_trees?: number;
+        since?: string | null;
+        note?: string;
+    } | null;
 }
 /** Counts and times of the caller's own sessions; never content (polychat memtree_search_coverage.py). */
 export interface FinderSearchCoverage {

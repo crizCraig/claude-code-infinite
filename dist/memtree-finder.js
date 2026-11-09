@@ -21,6 +21,9 @@ export const FINDER_SEARCH_DEFAULT_LIMIT = 10;
 export const FINDER_SEARCH_MAX_LIMIT = 50;
 export const FINDER_SEARCH_MODES = ["vector", "text"];
 const SNIPPET_CHARS = 400;
+/** One `snippets` line of a cross-session hit (the server cuts them at ~240 characters). */
+const SNIPPET_LINE_CHARS = 300;
+const SUMMARY_CHARS = 300;
 const TITLE_CHARS = 300;
 const PATH_SUMMARY_CHARS = 80;
 /** Query string for `/memtree/sessions` from the tool's arguments. */
@@ -180,6 +183,8 @@ export function formatSearchResults(body, args) {
         const missing = new MissingTimeNote();
         for (const group of groups) {
             out.push("", `== ${group.embedding_model} ==`);
+            if (group.partial)
+                out.push(partialNote(group.partial));
             group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
         }
         out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
@@ -204,7 +209,7 @@ export function formatSearchResults(body, args) {
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
 }
-const OPEN_NOTE = "Snippets are excerpts. read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
+const OPEN_NOTE = "Snippets are excerpts (L<n>: the line in the hit's block). read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
     "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 function formatHit(hit, n, missing) {
     const tree = hit.tree?.request_id;
@@ -225,8 +230,9 @@ function formatHit(hit, n, missing) {
         lines.push(`    page: ${hit.tree.links.url}`);
     if (hit.path?.length)
         lines.push(`    path: ${formatPath(hit.path, ref)}`);
-    if (hit.snippet)
-        lines.push(`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`);
+    if (hit.summary)
+        lines.push(`    summary: ${oneLine(hit.summary, SUMMARY_CHARS)}`);
+    lines.push(...hitSnippets(hit));
     if (hit.address) {
         lines.push(`    address: ${hit.address}`);
     }
@@ -234,6 +240,22 @@ function formatHit(hit, n, missing) {
         lines.push(`    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`);
     }
     return lines;
+}
+/** `L<n>: text` per server snippet line, else the joined `snippet` (older servers). */
+function hitSnippets(hit) {
+    const numbered = (Array.isArray(hit.snippets) ? hit.snippets : []).filter((s) => Number.isInteger(s?.line) && typeof s?.text === "string");
+    if (numbered.length) {
+        return numbered.map((s) => `    L${s.line}: ${oneLine(boldToMarkdown(s.text), SNIPPET_LINE_CHARS)}`);
+    }
+    return hit.snippet ? [`    ${oneLine(boldToMarkdown(hit.snippet), SNIPPET_CHARS)}`] : [];
+}
+/** Why a vector group ranked only the newest trees. */
+function partialNote(partial) {
+    const counted = typeof partial.trees === "number" && typeof partial.of_trees === "number"
+        ? ` (${partial.trees} of ${partial.of_trees} trees${partial.since ? `, made since ${shortTime(partial.since)}` : ""})`
+        : "";
+    return `(Only the newest trees were ranked${counted}: the full ranking ran out of time. ` +
+        "There is no next page; narrow with since, until, project or tree to rank the others, or use mode \"text\".)";
 }
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
 export function formatPath(path, ref) {
