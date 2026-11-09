@@ -2020,7 +2020,8 @@ export class MemtreeClient {
           new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`),
           { status: response.status,
             indexWaitSeconds: indexWaitFrom413(response.status, text,
-              response.headers.get("retry-after")) }
+              response.headers.get("retry-after"), Date.now(),
+              response.headers.get("x-polychat-index-pending")) }
         );
       }
 

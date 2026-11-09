@@ -46,6 +46,18 @@ test("an explicit index_pending decides, with the body's seconds when no header"
     undefined, "the server says waiting will not help");
 });
 
+test("X-Polychat-Index-Pending: true is a wait; false or absent decides nothing", () => {
+  const plain = JSON.stringify({ detail: "Request exceeds the context window" });
+  assert.equal(indexWaitFrom413(413, plain, "30", 0, "true"), 30);
+  assert.equal(indexWaitFrom413(413, plain, null, 0, "True"), 60, "time unknown: a minute");
+  assert.equal(indexWaitFrom413(413, todays("about 4 minutes"), null, 0, "true"), 240);
+  assert.equal(indexWaitFrom413(413, plain, null, 0, "false"), undefined);
+  assert.equal(indexWaitFrom413(413, todays("about 4 minutes"), "240", 0, "false"), 240,
+    "false: as before the header");
+  assert.equal(indexWaitFrom413(413, JSON.stringify({ detail: "x", index_pending: false }),
+    "30", 0, "true"), 30, "the header decides over the body");
+});
+
 test("a 413 that waiting cannot fix, or another status, is no index wait", () => {
   for (const detail of [
     "Request too large: 11000000 un-indexed tokens exceeds the maximum of 10000000",
@@ -344,5 +356,15 @@ test("a turn arriving while its lane waits for the index asks within its own hol
     assert.match(second.message, /catching up on this session's index, about 4 minutes left/,
       "its cut-short ask is the lane's index wait, not a strike (Codex r4)");
     assert.equal((await first).status, 503);
+  } finally { h.close(); }
+});
+
+test("a 413 whose X-Polychat-Index-Pending is true holds the turn until delivery", async () => {
+  const h = await harness({ body: JSON.stringify({ detail: "over the context window" }),
+    headers: { "x-polychat-index-pending": "true" } });
+  h.refusals = 2;
+  try {
+    assert.equal((await post(h, humanMessages)).status, 200);
+    assert.equal(h.compressCalls, 3);
   } finally { h.close(); }
 });

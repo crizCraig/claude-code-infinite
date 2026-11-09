@@ -232,7 +232,8 @@ const RETRY_MESSAGE =
  * retry line): how long the server expects, when it said.
  */
 export function indexWaitStatus(secondsLeft: number | undefined): string {
-  const left = secondsLeft === undefined ? "" : `, ${timeLeftText(secondsLeft)} left`;
+  const left = secondsLeft === undefined ? ""
+    : `, ${timeLeftText(secondsLeft)} left by its estimate`;
   return `MemTree is catching up on this session's index${left}. ` +
     "This turn continues on its own once it's ready.";
 }

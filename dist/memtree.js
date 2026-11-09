@@ -1650,7 +1650,7 @@ export class MemtreeClient {
                 // The status rides on the error so compress() can classify the
                 // failure for the fuse without parsing message text.
                 throw Object.assign(new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`), { status: response.status,
-                    indexWaitSeconds: indexWaitFrom413(response.status, text, response.headers.get("retry-after")) });
+                    indexWaitSeconds: indexWaitFrom413(response.status, text, response.headers.get("retry-after"), Date.now(), response.headers.get("x-polychat-index-pending")) });
             }
             const json = (await response.json());
             this.imageRefs.noteAnswer(json);

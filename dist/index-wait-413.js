@@ -10,17 +10,24 @@
  * many unindexed tokens) carry no Retry-After. An explicit `index_pending` (or
  * `index_behind`) boolean in the body, top level or in `detail`, decides when present.
  * Older servers sent the background-compression text with a range ("5 to 9.9 hours").
+ * Since polychat 53459dbd every over-context 413 also says `X-Polychat-Index-Pending`:
+ * `true` when a live index job will cover what did not fit (then this is a wait, whatever
+ * else the answer says); `false` or absent decides nothing (a newest message too large
+ * says false while the server may still shrink it), and the rules above apply.
+ * Retry-After can be far too low (an incident's said 30 s; the job took ~14 min), so a
+ * wait goes on while MemTree keeps saying so (route-fallback.ts extends it).
  */
 /** The background-indexing sentence every indexing 413 starts with (polychat constants). */
 const INDEXING_TEXT = "being compressed in the background";
 /** Seconds assumed when an indexing 413 says it is behind but not for how long. */
 export const UNKNOWN_INDEX_WAIT_SECONDS = 60;
 /** Seconds of indexing the server expects before this request fits; undefined: no wait. */
-export function indexWaitFrom413(status, bodyText, retryAfter, now = Date.now()) {
+export function indexWaitFrom413(status, bodyText, retryAfter, now = Date.now(), indexPendingHeader) {
     if (status !== 413)
         return undefined;
     const fields = bodyFields(bodyText);
-    const flag = explicitFlag(fields);
+    const flag = indexPendingHeader?.trim().toLowerCase() === "true" ? true
+        : explicitFlag(fields);
     if (flag === false)
         return undefined;
     const headerSeconds = retryAfterSeconds(retryAfter, now);
