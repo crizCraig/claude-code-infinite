@@ -92,6 +92,10 @@ test("a vector group ranked over the newest trees says so", () => {
   }, { mode: "vector" });
   assert.match(text, /Only the newest trees were ranked \(2150 of 28154 trees, made since [^)]+\): the full ranking ran out of time\. There is no next page/);
   assert.match(text, /\n {4}L3: opening line\n/);
+  const empty = formatSearchResults({
+    query: "q", groups: [{ embedding_model: "m", hits: [], partial: { trees: 0, of_trees: 9 } }],
+  }, { mode: "vector" });
+  assert.match(empty, /== m ==\n\(Only the newest trees were ranked \(0 of 9 trees\)/, "an empty partial group still warns");
   const whole = formatSearchResults({ query: "q", groups: [{ embedding_model: "m", hits: [hit] }] }, { mode: "vector" });
   assert.doesNotMatch(whole, /newest trees/);
 });

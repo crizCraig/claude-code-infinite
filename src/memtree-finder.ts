@@ -293,7 +293,8 @@ export const CHARGED_NOTE = "charged: one search";
 export function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string {
   const query = typeof body.query === "string" ? body.query : String(args.query ?? "");
   if (body.groups) {
-    const groups = body.groups.filter((g) => g.hits?.length);
+    // A group ranked over only the newest trees says so even when it found nothing there.
+    const groups = body.groups.filter((g) => g.hits?.length || g.partial);
     if (!groups.length) return noHits(query, "vector", args, body.coverage, body.charged);
     const out = [
       `Semantic matches for ${JSON.stringify(query)}` +
@@ -307,7 +308,7 @@ export function formatSearchResults(body: FinderSearchResponse, args: Record<str
     for (const group of groups) {
       out.push("", `== ${group.embedding_model} ==`);
       if (group.partial) out.push(partialNote(group.partial));
-      group.hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
+      (group.hits ?? []).forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     }
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
