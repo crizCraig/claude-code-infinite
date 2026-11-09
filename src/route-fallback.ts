@@ -71,6 +71,9 @@ export class RouteFallbackFailures {
   private readonly indexWaits =
     new Map<string, { started: number; deadline: number; over?: true; secondsLeft?: number }>();
 
+  /** Lane -> when it was last seen waiting for its index; a delivery does not clear it. */
+  private readonly indexWaitSeen = new Map<string, number>();
+
   constructor(
     private readonly capacity = 128,
     /** A wait's length when the server stated no time left. */
@@ -112,6 +115,11 @@ export class RouteFallbackFailures {
   indexWaiting(lane: string): boolean {
     const wait = this.indexWaits.get(lane);
     return wait !== undefined && !wait.over;
+  }
+
+  /** Whether the lane waits for its index now, or did at any time from `since` on. */
+  indexWaitSince(lane: string, since: number): boolean {
+    return this.indexWaiting(lane) || (this.indexWaitSeen.get(lane) ?? -Infinity) >= since;
   }
 
   /** The time left MemTree last stated for the lane's index wait, if any. */
@@ -165,6 +173,23 @@ export class RouteFallbackFailures {
    * when every wait slot is taken (the strikes decide).
    */
   private track(
+    lane: string, now: number, secondsLeft: number | undefined
+  ): "open" | "closed" | "untracked" {
+    const state = this.trackWait(lane, now, secondsLeft);
+    if (state !== "closed") this.seen(lane, now);
+    return state;
+  }
+
+  /** Note the lane waiting for its index at `now` (bounded: oldest first out). */
+  private seen(lane: string, now: number): void {
+    this.indexWaitSeen.delete(lane);
+    this.indexWaitSeen.set(lane, now);
+    if (this.indexWaitSeen.size > this.capacity) {
+      this.indexWaitSeen.delete(this.indexWaitSeen.keys().next().value!);
+    }
+  }
+
+  private trackWait(
     lane: string, now: number, secondsLeft: number | undefined
   ): "open" | "closed" | "untracked" {
     if ((this.failures.get(lane) ?? 0) >= 3) return "closed";

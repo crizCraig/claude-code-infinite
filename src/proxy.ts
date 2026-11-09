@@ -5907,7 +5907,10 @@ async function runBlockingCompression(
 function laneHeldCap(args: Parameters<typeof runBlockingCompressionOnce>[0]): number | undefined {
   const hold = indexHolds.get(args.rec);
   if (!hold || hold.lane === undefined) return undefined;
-  if (!hold.underIndexWait && !args.state.fallbackFailures.indexWaiting(hold.lane)) {
+  // Waiting now, or at any time since this request arrived (it may have queued behind a
+  // hold that has since delivered).
+  if (!hold.underIndexWait &&
+      !args.state.fallbackFailures.indexWaitSince(hold.lane, hold.started)) {
     return undefined;
   }
   hold.underIndexWait = true;

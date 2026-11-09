@@ -56,6 +56,8 @@ export declare class RouteFallbackFailures {
      * strike table had no room to record the refusal (still refused, never extended).
      */
     private readonly indexWaits;
+    /** Lane -> when it was last seen waiting for its index; a delivery does not clear it. */
+    private readonly indexWaitSeen;
     constructor(capacity?: number, 
     /** A wait's length when the server stated no time left. */
     indexWaitMs?: number, indexWaitMaxMs?: number);
@@ -74,6 +76,8 @@ export declare class RouteFallbackFailures {
     indexWaitDeadline(lane: string, secondsLeft: number | undefined, now?: number): number | undefined;
     /** Whether the lane is waiting for its index (a wait started, not yet ended). */
     indexWaiting(lane: string): boolean;
+    /** Whether the lane waits for its index now, or did at any time from `since` on. */
+    indexWaitSince(lane: string, since: number): boolean;
     /** The time left MemTree last stated for the lane's index wait, if any. */
     indexSecondsLeft(lane: string): number | undefined;
     /** Whether a stated time left is too long to wait for at all (refused at once). */
@@ -97,6 +101,9 @@ export declare class RouteFallbackFailures {
      * when every wait slot is taken (the strikes decide).
      */
     private track;
+    /** Note the lane waiting for its index at `now` (bounded: oldest first out). */
+    private seen;
+    private trackWait;
     /** When a wait begun at `started` ends, given the time left stated at `now`. */
     private deadline;
     private indexWaitError;

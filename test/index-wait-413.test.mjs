@@ -368,3 +368,13 @@ test("a 413 whose X-Polychat-Index-Pending is true holds the turn until delivery
     assert.equal(h.compressCalls, 3);
   } finally { h.close(); }
 });
+
+test("a lane seen waiting since a request arrived still bounds it after a delivery (Codex r5)", () => {
+  const failures = new RouteFallbackFailures();
+  assert.equal(failures.indexWaitSince("l", 0), false);
+  failures.indexWaitOpen("l", 30, 1_000);
+  failures.succeeded("l");
+  assert.equal(failures.indexWaiting("l"), false);
+  assert.equal(failures.indexWaitSince("l", 500), true, "arrived before the wait began");
+  assert.equal(failures.indexWaitSince("l", 2_000), false, "arrived after it ended");
+});
