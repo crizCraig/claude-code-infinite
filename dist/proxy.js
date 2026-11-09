@@ -5616,7 +5616,10 @@ function outageOver(state, offline) {
  */
 function unreachableNow(state, rec) {
     if (rec.compress?.ok === true || rec.compress?.refused === true ||
-        answeredBackoffs.has(rec) || rec.compaction?.prepared === "used" || rec.indexBehind === true ||
+        // The backoff's answer speaks only while this request made no compress call of its
+        // own (a delivery-time one that could not connect is its own evidence: Codex r2).
+        (rec.compress === undefined && answeredBackoffs.has(rec)) ||
+        rec.compaction?.prepared === "used" || rec.indexBehind === true ||
         activeIndexWaits.has(rec))
         return undefined;
     const memtree = freshFailure(state.memtreeUnreachable());

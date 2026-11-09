@@ -63,8 +63,12 @@ async function harness(options = {}) {
     const chunks = [];
     req.on("data", chunk => chunks.push(chunk));
     req.on("end", () => {
-      seen.push(Buffer.concat(chunks).toString());
       res.setHeader("content-type", "application/json");
+      if (options.countTokens !== undefined && req.url.includes("count_tokens")) {
+        res.end(JSON.stringify({ input_tokens: options.countTokens }));
+        return;
+      }
+      seen.push(Buffer.concat(chunks).toString());
       res.end(JSON.stringify({ type: "message", role: "assistant",
         content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }));
     });
@@ -76,6 +80,7 @@ async function harness(options = {}) {
   const records = [];
   const proxy = await startProxy({ memtree, upstreamOrigin: `http://127.0.0.1:${port}`,
     budgetTokensOverride: budget, defaultCompactTarget: compactTarget,
+    ...(options.countTokens !== undefined ? { countTokens: true } : {}),
     reqlog: { log: record => records.push(structuredClone(record)) } });
   return { proxy, memtree, seen, records, close() { proxy.close(); upstream.close(); globalThis.fetch = realFetch; } };
 }
@@ -227,6 +232,24 @@ test("a lane backing off after a misfit answer keeps the fit refusal through ano
       const third = await request(h.proxy, raw);
       assert.deepEqual([second.status, third.status], [503, 400]);
       assert.match(message(third), /couldn't fit this request/);
+    } finally { h.close(); }
+  });
+
+// Codex r2 P2: that marker must not hide the request's own later compress failing to connect.
+test("a backed-off turn whose own late recompression can't connect is a network refusal",
+  async () => {
+    const h = await harness({ budget: 20_000, compactTarget: undefined, countTokens: 300_000 });
+    stubMemtree(unfitAnswer);
+    try {
+      const raw = toolBody();
+      assert.equal((await request(h.proxy, raw)).status, 503);
+      stubMemtree(() => { throw fetchFailed("ENOTFOUND"); });
+      // The next tool round (a new history, so no cached answer), still within the backoff.
+      const response = await request(h.proxy, toolBody("done again"));
+      const decision = h.records.at(-1);
+      assert.equal(decision.routeRecovery?.outcome, "backoff");
+      assert.equal(decision.compress?.ok, false, "delivery recompressed and failed to connect");
+      assertNetworkRefusal(response, /can't reach MemTree/);
     } finally { h.close(); }
   });
 
