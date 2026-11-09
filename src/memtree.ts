@@ -1132,8 +1132,8 @@ export class MemtreeClient {
   }
 
   /**
-   * The connection failure (DNS, connect, dropped socket) of the latest MemTree call that
-   * got no answer, while no later call got one; undefined once MemTree answers anything.
+   * The connection failure (DNS or connect) of the latest compress or prepare call that got
+   * no answer, while no later call got one; undefined once MemTree answers any call.
    */
   get unreachable(): NetworkFailure | undefined {
     return this.lastUnreachable;
@@ -2000,7 +2000,12 @@ export class MemtreeClient {
     if (opts.signal?.aborted) abort();
     try {
       const response = await this.postRetryingDrop(payload, opts, controller.signal)
-        .catch((err: unknown) => { this.noteUnreachable(err); throw err; });
+        .catch((err: unknown) => {
+          // A background index call is no request's own evidence (review r1): it may clear
+          // the state by an answer, never set it.
+          if (!opts.indexOnly) this.noteUnreachable(err);
+          throw err;
+        });
       status = response.status;
       this.lastUnreachable = undefined;
       if (planned.refs.length && !response.ok) {

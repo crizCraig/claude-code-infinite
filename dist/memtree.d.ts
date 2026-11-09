@@ -436,8 +436,8 @@ export declare class MemtreeClient {
      */
     get answering(): boolean | undefined;
     /**
-     * The connection failure (DNS, connect, dropped socket) of the latest MemTree call that
-     * got no answer, while no later call got one; undefined once MemTree answers anything.
+     * The connection failure (DNS or connect) of the latest compress or prepare call that got
+     * no answer, while no later call got one; undefined once MemTree answers any call.
      */
     get unreachable(): NetworkFailure | undefined;
     /** Where to get a new key for this client's environment (its base URL). */

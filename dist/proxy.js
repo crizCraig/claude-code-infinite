@@ -5548,7 +5548,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const keyInvalid = args.state.keyInvalid();
     const unpaid = keyInvalid ? null : args.state.pausedDetail();
     // MemTree can't be reached: nothing says the request can't fit, so no strike (2026-11-09).
-    const offline = keyInvalid || unpaid !== null ? undefined : unreachableNow(args.state);
+    const offline = keyInvalid || unpaid !== null ? undefined : unreachableNow(args.state, args.rec);
     const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
         : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
             : offline ? unreachableRefusal(offline.message)
@@ -5603,10 +5603,16 @@ function outageOver(state, offline) {
     return offline === true && state.memtreeUnreachable() === undefined;
 }
 /**
- * Why a request only MemTree could fit can't go now, when MemTree's latest call could not
- * connect (recently): the internet when Anthropic's latest forward could not either.
+ * Why a request only MemTree could fit can't go now, when MemTree's latest compress call
+ * could not connect (recently): the internet when Anthropic's latest forward could not
+ * either. Never for a request MemTree answered (live or from the cache), or one sent on a
+ * prepared prefix or waiting for its index: its refusal is about the fit (review r1).
  */
-function unreachableNow(state) {
+function unreachableNow(state, rec) {
+    if (rec.compress?.ok === true || rec.compress?.refused === true ||
+        rec.compaction?.prepared === "used" || rec.indexBehind === true ||
+        activeIndexWaits.has(rec))
+        return undefined;
     const memtree = freshFailure(state.memtreeUnreachable());
     if (!memtree)
         return undefined;
@@ -6148,8 +6154,9 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             });
         });
         upstreamReq.on("error", (err) => {
-            if (!shutdownCancelled)
-                sendAnthropicError(res, upstreamFailureMessage(upstream, err));
+            if (!shutdownCancelled) {
+                sendAnthropicError(res, upstreamFailureMessage(upstream, err, !activeUpstreamRes));
+            }
             settle(false);
         });
         upstreamReq.end(bodyBuffer);
@@ -6346,7 +6353,7 @@ function passThroughStreaming(req, res, upstream, shutdownSignal) {
             if (upstreamReq)
                 req.unpipe(upstreamReq);
             activeUpstreamRes?.unpipe(res);
-            sendAnthropicError(res, upstreamFailureMessage(upstream, err));
+            sendAnthropicError(res, upstreamFailureMessage(upstream, err, !activeUpstreamRes));
             if (res.writableFinished)
                 onDownstreamFinish();
         });
@@ -6382,10 +6389,11 @@ function forwardableResponseHeaders(upstreamRes) {
 }
 /**
  * The 502 text for a forward that got no answer: plainly that ccc can't reach Anthropic
- * when it could not connect (noted on `upstream`), else the error as it came.
+ * when it could not connect (noted on `upstream`; only before any response: review r1 P3),
+ * else the error as it came.
  */
-function upstreamFailureMessage(upstream, err) {
-    const failure = networkFailureOf(err, upstream.host);
+function upstreamFailureMessage(upstream, err, unanswered) {
+    const failure = unanswered ? networkFailureOf(err, upstream.host) : undefined;
     if (!failure)
         return `upstream connection failed: ${err.message}`;
     upstream.unreachable = failure;

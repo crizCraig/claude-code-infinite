@@ -8,7 +8,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
-import { networkFailureOf } from "../dist/network-failure.js";
+import {
+  NETWORK_FAILURE_FRESH_MS, freshFailure, networkFailureOf,
+} from "../dist/network-failure.js";
 
 const MEMTREE_URL = "http://memtree.test";
 const realFetch = globalThis.fetch;
@@ -75,7 +77,7 @@ async function harness(options = {}) {
   const proxy = await startProxy({ memtree, upstreamOrigin: `http://127.0.0.1:${port}`,
     budgetTokensOverride: budget, defaultCompactTarget: compactTarget,
     reqlog: { log: record => records.push(structuredClone(record)) } });
-  return { proxy, seen, records, close() { proxy.close(); upstream.close(); globalThis.fetch = realFetch; } };
+  return { proxy, memtree, seen, records, close() { proxy.close(); upstream.close(); globalThis.fetch = realFetch; } };
 }
 
 function request(proxy, raw, session = "net-session") {
@@ -208,10 +210,77 @@ test("MemTree and Anthropic both unreachable: ccc can't reach the internet", asy
   } finally { h.close(); }
 });
 
+test("a connection reset mid-call is no network refusal: the strikes run as before", async () => {
+  const h = await harness();
+  // A reset on a connection that was up (syscall "read"): the server may have the call.
+  stubMemtree(() => { throw Object.assign(fetchFailed("ECONNRESET"),
+    { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }) }); });
+  try {
+    const statuses = [];
+    let last;
+    for (let retry = 0; retry < 3; retry++) {
+      last = await request(h.proxy, oversized());
+      statuses.push(last.status);
+    }
+    assert.deepEqual(statuses, [503, 503, 400]);
+    assert.match(message(last), /couldn't fit this request/);
+  } finally { h.close(); }
+});
+
+// Review r1 P1: a background index call failing to connect after this request's compress
+// answered must not turn its fit refusal into "can't reach MemTree".
+test("an index-only connection failure after a compress answered keeps the fit refusal",
+  async () => {
+    const h = await harness({ indexing: true });
+    stubMemtree(unfitAnswer);
+    try {
+      const raw = oversized();
+      assert.equal((await request(h.proxy, raw)).status, 503);
+      stubMemtree(() => { throw fetchFailed("ENOTFOUND"); });
+      h.memtree.indexInBackground("index-only-hash",
+        [{ role: "user", content: "w".repeat(200_000) }], 200_000);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(h.memtree.unreachable, undefined, "an index call is no request's evidence");
+      // The retries are answered from the compress cache: no live call.
+      const second = await request(h.proxy, raw);
+      const third = await request(h.proxy, raw);
+      assert.deepEqual([second.status, third.status], [503, 400]);
+      assert.match(message(third), /couldn't fit this request/);
+    } finally { h.close(); }
+  });
+
+test("a non-messages forward (streamed pass-through) says ccc can't reach Anthropic", async () => {
+  const h = await harness({ upstreamDown: true });
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request({ host: "127.0.0.1", port: h.proxy.port, path: "/v1/models",
+        method: "GET" }, res => {
+        const chunks = [];
+        res.on("data", chunk => chunks.push(chunk));
+        res.on("end", () => resolve({ status: res.statusCode,
+          body: Buffer.concat(chunks).toString() }));
+      });
+      req.on("error", reject); req.end();
+    });
+    assert.equal(response.status, 502);
+    assert.match(message(response), /can't reach Anthropic \(127\.0\.0\.1: ECONNREFUSED\)/);
+  } finally { h.close(); }
+});
+
+test("a connection failure explains refusals for two minutes, no longer", () => {
+  const failure = networkFailureOf(fetchFailed("ENOTFOUND"), "h", 1_000);
+  assert.equal(freshFailure(failure, 1_000 + NETWORK_FAILURE_FRESH_MS), failure);
+  assert.equal(freshFailure(failure, 1_001 + NETWORK_FAILURE_FRESH_MS), undefined);
+});
+
 test("networkFailureOf reads undici's cause and ignores aborts and HTTP answers", () => {
   assert.equal(networkFailureOf(fetchFailed("ENOTFOUND"), "h")?.code, "ENOTFOUND");
-  assert.equal(networkFailureOf(Object.assign(new Error("x"), { code: "ECONNRESET" }), "h")
-    ?.code, "ECONNRESET");
+  assert.equal(networkFailureOf(Object.assign(new Error("connect ECONNRESET"),
+    { code: "ECONNRESET", syscall: "connect" }), "h")?.code, "ECONNRESET");
+  assert.equal(networkFailureOf(Object.assign(new Error("read ECONNRESET"),
+    { code: "ECONNRESET", syscall: "read" }), "h"), undefined, "a reset once connected");
+  assert.equal(networkFailureOf(Object.assign(new Error("x"), { code: "EPIPE" }), "h"),
+    undefined);
   assert.equal(networkFailureOf(new DOMException("aborted", "AbortError"), "h"), undefined);
   assert.equal(networkFailureOf(Object.assign(new Error("context_memory 503"),
     { status: 503 }), "h"), undefined);

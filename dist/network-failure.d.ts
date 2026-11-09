@@ -3,6 +3,10 @@
  * gets while one can't be reached. 2026-11-09: with the network down, compression failed
  * with getaddrinfo ENOTFOUND and over-budget turns were refused as "MemTree couldn't fit
  * this request ... run /ccc:memtree-compact or /clear", blaming the fit for the network.
+ *
+ * Limit: a call aborted by its own deadline before the connect error arrives (undici gives
+ * up connecting after 10 s; a caller's budget can be shorter) carries no code, so it is not
+ * counted here and its refusal runs the usual strikes. Neither is a captive portal's TLS error.
  */
 /** A failure this recent still explains a refusal (outlasts the 60 s outage cooldown). */
 export declare const NETWORK_FAILURE_FRESH_MS: number;
