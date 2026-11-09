@@ -2478,6 +2478,8 @@ async function handleMessages(
           // This lane's last attempt this human turn produced nothing; wait
           // for growth instead of paying a blocking call on every tool turn.
           rec.routeRecovery = { outcome: "backoff" };
+          // MemTree answered that attempt: a refusal now is about the fit (Codex r1 P2).
+          if (!prior.offline) answeredBackoffs.add(rec);
         } else if (Date.now() < state.toolRecoveryCooldownUntil &&
             !outageOver(state, state.toolRecoveryCooldownOffline) &&
             !(plan.overWindow && !plan.fallback && (!plan.uncountedOverWindowOnly ||
@@ -7400,6 +7402,9 @@ function refuseWholeRequest(
   return false;
 }
 
+/** Requests held back by a lane backoff whose attempt MemTree answered (unreachableNow). */
+const answeredBackoffs = new WeakSet<MessagesRecord>();
+
 /**
  * Whether a backoff or cooldown armed by a call that could not connect (`offline`) is over:
  * MemTree has answered since, so the next request asks it again.
@@ -7411,14 +7416,15 @@ function outageOver(state: ProxyState, offline: boolean | undefined): boolean {
 /**
  * Why a request only MemTree could fit can't go now, when MemTree's latest compress call
  * could not connect (recently): the internet when Anthropic's latest forward could not
- * either. Never for a request MemTree answered (live or from the cache), or one sent on a
- * prepared prefix or waiting for its index: its refusal is about the fit (review r1).
+ * either. Never for a request MemTree answered (live or from the cache), one held back by a
+ * backoff MemTree's answer armed, or one sent on a prepared prefix or waiting for its index:
+ * its refusal is about the fit (review r1, Codex r1).
  */
 function unreachableNow(
   state: ProxyState, rec: MessagesRecord
 ): { message: string; what: "memtree" | "internet" } | undefined {
   if (rec.compress?.ok === true || rec.compress?.refused === true ||
-      rec.compaction?.prepared === "used" || rec.indexBehind === true ||
+      answeredBackoffs.has(rec) || rec.compaction?.prepared === "used" || rec.indexBehind === true ||
       activeIndexWaits.has(rec)) return undefined;
   const memtree = freshFailure(state.memtreeUnreachable());
   if (!memtree) return undefined;

@@ -210,6 +210,26 @@ test("MemTree and Anthropic both unreachable: ccc can't reach the internet", asy
   } finally { h.close(); }
 });
 
+// Codex r1 P2: a lane backing off after MemTree answered with a result too large keeps its
+// fit refusal when another request then fails to connect.
+test("a lane backing off after a misfit answer keeps the fit refusal through another's outage",
+  async () => {
+    const h = await harness({ budget: 20_000, compactTarget: undefined });
+    stubMemtree(unfitAnswer);
+    try {
+      const raw = toolBody();
+      assert.equal((await request(h.proxy, raw)).status, 503);
+      stubMemtree(() => { throw fetchFailed("ENOTFOUND"); });
+      assertNetworkRefusal(await request(h.proxy, oversized(), "other-session"),
+        /can't reach MemTree/);
+      const second = await request(h.proxy, raw);
+      assert.equal(h.records.at(-1).routeRecovery?.outcome, "backoff");
+      const third = await request(h.proxy, raw);
+      assert.deepEqual([second.status, third.status], [503, 400]);
+      assert.match(message(third), /couldn't fit this request/);
+    } finally { h.close(); }
+  });
+
 test("a connection reset mid-call is no network refusal: the strikes run as before", async () => {
   const h = await harness();
   // A reset on a connection that was up (syscall "read"): the server may have the call.
