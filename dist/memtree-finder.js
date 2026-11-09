@@ -69,7 +69,8 @@ export function recentSearchArgs(args, tree, status, nowMs, days) {
         return undefined;
     if (isSet(args.since) || isSet(args.until) || isSet(args.cursor))
         return undefined;
-    // A vector search may time out after its paid embedding: a retry would pay again.
+    // Vector search is left to the agent: its 422 already says how to narrow it (neither is
+    // charged, a search is charged only when its first page is delivered).
     if (searchMode(args.mode) === "vector")
         return undefined;
     const since = new Date(nowMs - days * DAY_MS).toISOString().slice(0, 10);
