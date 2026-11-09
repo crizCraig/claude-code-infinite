@@ -676,6 +676,11 @@ export declare class MemtreeClient {
      */
     private refusedRefs;
     /**
+     * `body` with every image the server has not said it lacks as a reference, when
+     * that fits the limit (image-refs.ts: referenceUnconfirmed); undefined otherwise.
+     */
+    private planUnconfirmed;
+    /**
      * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
      * Logged like any call, with `bodyLimit` (memtree_body_limit, not memtree_error); the
      * error carries 413, the status the server's front end would have answered.

@@ -119,6 +119,106 @@ test("a session's later calls send stored images as references; a 409 resends by
   }
 });
 
+/** Two images whose bytes alone put a compress body over the HTTP/1 limit. */
+const oversizedPair = () => [png(12 * 1024 * 1024), png(12 * 1024 * 1024)];
+
+test("a fresh process sends an oversized compress with unconfirmed references", async () => {
+  // A resumed session: this process has no answer listing stored images yet, and the
+  // body with every image's bytes is over the limit, so it used to be never sent.
+  const [a, b] = oversizedPair();
+  const server = await fakeMemtree();
+  const records = [];
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k",
+      reqlog: { log: (r) => records.push(r) } });
+    const messages = conversation(a, b);
+    server.stored = [sha(a), sha(b)];
+    const result = await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000);
+    assert.ok(result, "the compress is answered");
+    assert.equal(server.bodies.length, 1);
+    assert.ok(server.bodies[0].bytes < 10_000, `${server.bodies[0].bytes}`);
+    assert.equal(server.bodies[0].json.messages[0].content[1].source.data,
+      IMAGE_REF_PREFIX + sha(a));
+    assert.deepEqual(records.map((r) => [r.ok, r.bodyLimit, r.unconfirmedImageRefs]),
+      [[true, undefined, 2]]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("unconfirmed references the server lacks go again as bytes, the rest stay", async () => {
+  const [a, b] = oversizedPair();
+  const c = png(200_000);
+  const server = await fakeMemtree();
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const messages = [...conversation(a, b), { role: "user", content: [image(c)] }];
+    server.stored = [sha(a), sha(b)];
+    server.missing = [sha(c)];
+    assert.ok(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000));
+    assert.deepEqual(server.bodies.map((body) => body.status), [409, 200]);
+    const resent = server.bodies[1].json.messages;
+    assert.equal(resent[3].content[0].source.data, c, "the missing image's bytes");
+    assert.equal(resent[0].content[1].source.data, IMAGE_REF_PREFIX + sha(a));
+  } finally {
+    await server.close();
+  }
+});
+
+test("too many missing images to fit as bytes: the compress fails as over the limit", async () => {
+  const [a, b] = oversizedPair();
+  const server = await fakeMemtree();
+  const records = [];
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k",
+      reqlog: { log: (r) => records.push(r) } });
+    const messages = conversation(a, b);
+    server.missing = [sha(a), sha(b)];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000),
+      null);
+    assert.deepEqual(server.bodies.map((body) => body.status), [409]);
+    assert.equal(records.at(-1).bodyLimit.action, "skipped");
+    // The lack may have been a slow read on the server: the next attempt asks again.
+    server.stored = [sha(a), sha(b)];
+    assert.ok(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000));
+  } finally {
+    await server.close();
+  }
+});
+
+test("a server that does not prove it resolves references gets no unconfirmed ones", async () => {
+  // An answer without the stored-images field may come from a server that read the
+  // references as image data: its result is not used and none are sent again.
+  const [a, b] = oversizedPair();
+  const server = await fakeMemtree();
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k" });
+    const messages = conversation(a, b);
+    server.stored = undefined;
+    assert.equal(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000),
+      null);
+    const next = [...messages, { role: "user", content: "again" }];
+    assert.equal(await client.compress(MemtreeClient.hashMessages(next), next, 200_000), null);
+    assert.equal(server.bodies.length, 1, "the second call is not sent");
+  } finally {
+    await server.close();
+  }
+});
+
+test("unconfirmed references skip images the server lacks, and stop when disabled", () => {
+  const [a, b] = oversizedPair();
+  const refs = new ImageRefs();
+  assert.deepEqual(refs.referenceMessages(conversation(a, b)).refs, []);
+  const assumed = refs.referenceUnconfirmed(conversation(a, b));
+  assert.deepEqual(assumed.refs, [sha(a), sha(b)]);
+  refs.noteMissing([sha(a)]);
+  assert.deepEqual(refs.referenceUnconfirmed(conversation(a, b)).refs, [sha(b)]);
+  refs.noteAnswer({ [STORED_IMAGES_FIELD]: [sha(a)] });
+  assert.deepEqual(refs.referenceUnconfirmed(conversation(a, b)).refs, [sha(a), sha(b)]);
+  refs.disable();
+  assert.deepEqual(refs.referenceUnconfirmed(conversation(a, b)).refs, []);
+});
+
 test("a resend after a slow 409 keeps the call's deadline", async () => {
   // Virtual time (mocked setTimeout and Date) and a scripted fetch: the deadline is checked
   // to the millisecond, however slow the machine running the test.

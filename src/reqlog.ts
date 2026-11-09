@@ -526,6 +526,11 @@ export interface MemtreeRecord {
    * dropped (an index call) or not sent at all. Diagnostics: memtree_body_limit.
    */
   bodyLimit?: { action: "trimmed" | "skipped"; requestBytes: number; imagesDropped: number };
+  /**
+   * A compress whose body with image bytes was over the limit, sent with this many
+   * images as references the server had not listed (image-refs.ts: referenceUnconfirmed).
+   */
+  unconfirmedImageRefs?: number;
   /** Aborted because the exit drain ran out of time (diagnostics: exit_index_cut). */
   exitCut?: boolean;
   /** With exitCut: the call was the session's final index. */

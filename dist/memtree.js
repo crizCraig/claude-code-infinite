@@ -1606,7 +1606,13 @@ export class MemtreeClient {
                 ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
             imageRefs: refs ? this.imageRefs : undefined,
         });
-        const planned = plan(opts.imageRefs !== false);
+        let planned = plan(opts.imageRefs !== false);
+        // A compress over the limit is not sent at all: before that, try it with images
+        // the server has not listed as references too (a resumed session's first call).
+        const unconfirmed = planned.payload === undefined && !opts.indexOnly &&
+            opts.imageRefs !== false ? this.planUnconfirmed(body, messages) : undefined;
+        if (unconfirmed)
+            planned = unconfirmed;
         if (planned.payload === undefined)
             throw this.oversized(planned.limit, opts);
         const payload = planned.payload;
@@ -1651,8 +1657,12 @@ export class MemtreeClient {
                     // budget adds its allowance to what is left, however negative.
                     resent = true;
                     const budget = opts.timeoutMs;
+                    // Unconfirmed references the server named as missing: only those go as bytes
+                    // (all bytes would be over the limit again), once.
+                    const keepRefs = unconfirmed !== undefined && !opts.unconfirmedRetry &&
+                        namesMissingImages(response.status, refusalText);
                     return await this.callContextMemory(messages, modelContextLimit, {
-                        ...opts, imageRefs: false,
+                        ...opts, ...(keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
                         get timeoutMs() { return budget - (Date.now() - started); },
                     });
                 }
@@ -1671,6 +1681,11 @@ export class MemtreeClient {
                     indexWaitSeconds: indexWaitFrom413(response.status, text, response.headers.get("retry-after"), Date.now(), response.headers.get("x-polychat-index-pending")) });
             }
             const json = (await response.json());
+            if (unconfirmed && !ImageRefs.resolvedBy(json)) {
+                // No proof the server put the images back: its result may hold references.
+                this.imageRefs.disable();
+                throw new Error("context_memory answer does not show it resolves image references");
+            }
             this.imageRefs.noteAnswer(json);
             // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
             // true }` by contract: the server skips compression and returns no
@@ -1739,6 +1754,7 @@ export class MemtreeClient {
                     status,
                     requestBytes: Buffer.byteLength(payload),
                     ...(planned.limit ? { bodyLimit: planned.limit } : {}),
+                    ...(unconfirmed ? { unconfirmedImageRefs: unconfirmed.refs.length } : {}),
                     // Aborted by an exit drain that ran out: a known cut, not a server failure.
                     ...(!ok && this.drainCutting && controller.signal.aborted
                         ? { exitCut: true, finalIndex: opts.finalIndex === true }
@@ -1828,6 +1844,7 @@ export class MemtreeClient {
         const refused = refusesImageRefs(status, text);
         if (missing !== undefined) {
             this.imageRefs.forget(missing.length ? missing : refs);
+            this.imageRefs.noteMissing(missing);
         }
         else if (refused === "never") {
             this.imageRefs.disable();
@@ -1840,6 +1857,19 @@ export class MemtreeClient {
         }
         this.log(`context_memory ${status} on image references: sending their bytes`);
         return true;
+    }
+    /**
+     * `body` with every image the server has not said it lacks as a reference, when
+     * that fits the limit (image-refs.ts: referenceUnconfirmed); undefined otherwise.
+     */
+    planUnconfirmed(body, messages) {
+        const referenced = this.imageRefs.referenceUnconfirmed(messages);
+        const planned = referenced.refs.length
+            ? planMemtreeBody({ body, messages: referenced.value, indexOnly: false }) : undefined;
+        if (planned?.payload !== undefined)
+            return { ...planned, refs: referenced.refs };
+        this.imageRefs.retryMissing();
+        return undefined;
     }
     /**
      * A body over the limit that nothing could shrink (memtree-body.ts): never sent.
@@ -1858,6 +1888,10 @@ export class MemtreeClient {
         if (this.debug)
             console.error(`[ccc proxy] ${msg}`);
     }
+}
+/** A 409 that names the references it could not serve (not one refusing them all). */
+function namesMissingImages(status, text) {
+    return status === MISSING_IMAGES_STATUS && (missingImageShas(text)?.length ?? 0) > 0;
 }
 /** A failed answer's body; an abort while reading it is thrown, never read as "". */
 async function readUnlessAborted(response, signal) {

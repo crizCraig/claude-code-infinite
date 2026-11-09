@@ -8,6 +8,8 @@ export declare const STORED_IMAGES_FIELD = "memtree_image_sha256s";
 export declare const MISSING_IMAGES_FIELD = "missing_image_sha256s";
 /** The server's answer to references it cannot serve; the call is sent again with bytes. */
 export declare const MISSING_IMAGES_STATUS = 409;
+/** Reference blocks one call may carry unconfirmed (the server's MAX_IMAGE_REFS). */
+export declare const MAX_UNCONFIRMED_REFS = 1000;
 /** A message list as sent, and the shas it references (empty: nothing changed). */
 export interface Referenced<T> {
     value: T;
@@ -15,6 +17,8 @@ export interface Referenced<T> {
 }
 export declare class ImageRefs {
     private known;
+    /** Shas the server said it lacks, until an answer lists them (bounded like known). */
+    private lacking;
     private shaOf;
     private shaChars;
     private disabled;
@@ -22,18 +26,36 @@ export declare class ImageRefs {
     get active(): boolean;
     /** Learn the stored images an answer lists; a server that lists none changes nothing. */
     noteAnswer(json: unknown): void;
+    /** Whether an answer shows a server that resolves references (it lists stored images). */
+    static resolvedBy(json: unknown): boolean;
+    /** The server lacks these: they are not referenced unconfirmed again. */
+    noteMissing(shas: readonly string[]): void;
     /** The server could not serve these (or, without a list, any): send bytes for them. */
     forget(shas: readonly string[]): void;
+    /**
+     * Forget what the server lacked: its bytes did not fit, and a lack can be a slow
+     * read on the server (its read deadline) that the next attempt no longer hits.
+     */
+    retryMissing(): void;
     /** The server refused references outright (an older or misconfigured server). */
     disable(): void;
     /** `messages` with each stored image as a reference; copy on write. */
     referenceMessages(messages: Message[]): Referenced<Message[]>;
+    /**
+     * `messages` with every image as a reference unless the server said it lacks it, up
+     * to MAX_UNCONFIRMED_REFS: for a body that cannot be sent with its images' bytes, in
+     * a process that has no answer listing stored images yet (a resumed session). The
+     * server names the ones it lacks (409) and the caller sends those as bytes.
+     */
+    referenceUnconfirmed(messages: Message[]): Referenced<Message[]>;
     /** One message with each stored image as a reference; the same object if none is. */
     referenceMessage(message: Message): Referenced<Message>;
+    private referenceAll;
+    private referenceOne;
     private referenceBlocks;
     private referenceBlock;
-    /** The image's sha when the server stores it and its base64 re-encodes identically. */
-    private storedSha;
+    /** The image's sha when its base64 re-encodes identically (what the server stores). */
+    private canonicalSha;
     private rememberSha;
 }
 /** The shas a refusal names (409 detail), or undefined when it names none. */
