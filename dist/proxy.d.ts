@@ -726,6 +726,8 @@ declare function runBlockingCompressionOnce(args: {
      * request known over the window): use the long budget. See longCompressFor.
      */
     longBudget?: boolean;
+    /** A held request's ask again (runBlockingCompression): what is left of its hold. */
+    capMs?: number;
     /** Aborts the compress call; default state.shutdownSignal. */
     signal?: AbortSignal;
     /**

@@ -64,8 +64,12 @@ export interface FallbackFailureContext {
  */
 export class RouteFallbackFailures {
   private readonly failures = new Map<string, number>();
-  /** Lane -> when its index wait began and when it ends. */
-  private readonly indexWaits = new Map<string, { started: number; deadline: number }>();
+  /**
+   * Lane -> when its index wait began and when it ends; `over` once it ended but the
+   * strike table had no room to record the refusal (still refused, never extended).
+   */
+  private readonly indexWaits =
+    new Map<string, { started: number; deadline: number; over?: true }>();
 
   constructor(
     private readonly capacity = 128,
@@ -80,6 +84,16 @@ export class RouteFallbackFailures {
       if (waiting) return waiting;
     }
     return this.strike(lane);
+  }
+
+  /**
+   * Note MemTree saying the lane's index is still catching up (a held request's 413):
+   * starts the lane's wait, or extends it by the stated time left. False once waiting
+   * can no longer pay off (the estimate is past the cap, the wait's deadline passed, or
+   * the lane was refused), so a held request stops asking and is refused.
+   */
+  indexWaitOpen(lane: string, secondsLeft: number | undefined, now = Date.now()): boolean {
+    return this.track(lane, now, secondsLeft) !== "closed";
   }
 
   /** Whether a stated time left is too long to wait for at all (refused at once). */
@@ -117,21 +131,33 @@ export class RouteFallbackFailures {
   private waitForIndex(
     lane: string, now: number, secondsLeft: number | undefined
   ): RouteFallbackError | undefined {
+    const state = this.track(lane, now, secondsLeft);
+    if (state === "untracked") return undefined;
+    return state === "open" ? this.indexWaitError(lane, secondsLeft) : refusal(3);
+  }
+
+  /**
+   * Start or extend the lane's wait: "open" while the index may still land in time,
+   * "closed" once it may not (and the lane is refused until a delivery), "untracked"
+   * when every wait slot is taken (the strikes decide).
+   */
+  private track(
+    lane: string, now: number, secondsLeft: number | undefined
+  ): "open" | "closed" | "untracked" {
+    if ((this.failures.get(lane) ?? 0) >= 3) return "closed";
     const wait = this.indexWaits.get(lane);
+    if (wait?.over) return "closed";
+    if (this.hopeless(secondsLeft)) return this.close(lane);
     if (wait === undefined) {
-      if ((this.failures.get(lane) ?? 0) >= 3) return undefined;
-      if (this.hopeless(secondsLeft)) return this.refuseHopeless(lane);
       this.retireExpiredWaits(now);
-      if (this.indexWaits.size >= this.capacity) return undefined;
+      if (this.indexWaits.size >= this.capacity) return "untracked";
       this.indexWaits.set(lane, { started: now, deadline: this.deadline(now, now, secondsLeft) });
-      return this.indexWaitError(lane, secondsLeft);
+      return "open";
     }
     if (secondsLeft !== undefined) {
       wait.deadline = Math.max(wait.deadline, this.deadline(wait.started, now, secondsLeft));
     }
-    if (now < wait.deadline) return this.indexWaitError(lane, secondsLeft);
-    this.retire(lane);
-    return refusal(3);
+    return now < wait.deadline ? "open" : this.close(lane);
   }
 
   /** When a wait begun at `started` ends, given the time left stated at `now`. */
@@ -140,12 +166,6 @@ export class RouteFallbackFailures {
     const ms = secondsLeft * 1000;
     return Math.min(started + this.indexWaitMaxMs,
       now + ms + ms * INDEX_WAIT_MARGIN_RATIO + INDEX_WAIT_MARGIN_MS);
-  }
-
-  /** The final refusal, at once: the strike state, so no retry waits again. */
-  private refuseHopeless(lane: string): RouteFallbackError {
-    if (this.failures.has(lane) || this.failures.size < this.capacity) this.failures.set(lane, 3);
-    return refusal(3);
   }
 
   private indexWaitError(lane: string, secondsLeft: number | undefined): RouteFallbackError {
@@ -158,19 +178,25 @@ export class RouteFallbackFailures {
   /** Free the slots of waits past their deadline, keeping them refused. */
   private retireExpiredWaits(now: number): void {
     for (const [lane, wait] of this.indexWaits) {
-      if (now >= wait.deadline) this.retire(lane);
+      if (now >= wait.deadline) this.close(lane);
     }
   }
 
   /**
-   * An expired wait's lane moves to the terminal strike state. If the strike
-   * table is full the wait keeps its slot instead (still expired, still
-   * refused), so no lane can be re-admitted with a fresh deadline.
+   * End the lane's wait in the terminal strike state. If the strike table is full a wait
+   * keeps its slot instead, marked over (still refused, never extended), so no lane can
+   * be re-admitted with a fresh deadline; with neither, the refusal stands for this
+   * request only.
    */
-  private retire(lane: string): void {
-    if (!this.failures.has(lane) && this.failures.size >= this.capacity) return;
-    this.failures.set(lane, 3);
-    this.indexWaits.delete(lane);
+  private close(lane: string): "closed" {
+    if (this.failures.has(lane) || this.failures.size < this.capacity) {
+      this.failures.set(lane, 3);
+      this.indexWaits.delete(lane);
+    } else {
+      const wait = this.indexWaits.get(lane);
+      if (wait) wait.over = true;
+    }
+    return "closed";
   }
 }
 

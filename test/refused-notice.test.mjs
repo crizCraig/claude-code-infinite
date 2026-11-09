@@ -220,13 +220,19 @@ test("a failed compress's ride that delivery cannot send, sent whole instead, wa
   }
 });
 
-test("the whole history sent with its tool result truncated still warns (MemTree 413)", async () => {
+for (const [kind, detail] of [
+  ["MemTree 413", "Request exceeds the context window after compression"],
+  // An indexing 413 too (review r1 P2): the safety net still fits it before any wait.
+  ["indexing 413", "Memory for this conversation is being compressed in the background to " +
+    "fit within the model's input limit. Estimated indexing time left: about 4 minutes."],
+])
+test(`the whole history sent with its tool result truncated still warns (${kind})`, async () => {
   const outputs = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-refused-notice-"));
   const quarter = (body) => Math.floor(JSON.stringify(body).length / 4);
   const h = await harness({ count: (body) => ({ input_tokens: quarter(body) }), usage: quarter,
     toolOutputs: new ToolOutputStore(outputs),
-    compress: () => ({ status: 413,
-      body: { detail: "Request exceeds the context window after compression" } }) });
+    proxyOptions: { indexHoldMs: 100, indexPollMaxMs: 10 },
+    compress: () => ({ status: 413, body: { detail } }) });
   try {
     await h.armMainTurn("next question");
     assert.equal(await h.post([
@@ -298,7 +304,7 @@ function readJson(req) {
 
 /** Anthropic (messages + count_tokens), MemTree and a proxy; counting on when `count` is given. */
 async function harness({ count, usage = () => 1_000, compress, budget = 100_000,
-  memtreeOptions = {}, countTokens = count !== undefined, toolOutputs } = {}) {
+  memtreeOptions = {}, countTokens = count !== undefined, toolOutputs, proxyOptions = {} } = {}) {
   const forwards = [], records = [];
   const upstream = await listen(async (req, res) => {
     const body = await readJson(req);
@@ -327,7 +333,7 @@ async function harness({ count, usage = () => 1_000, compress, budget = 100_000,
   });
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k", ...memtreeOptions });
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
-    budgetTokensOverride: budget, countTokens, toolOutputs,
+    budgetTokensOverride: budget, countTokens, toolOutputs, ...proxyOptions,
     reqlog: { log: (record) => records.push(structuredClone(record)) } });
   const hook = async (input) => {
     const res = await fetch(proxy.hookUrl, { method: "POST",

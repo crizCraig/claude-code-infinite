@@ -51,12 +51,22 @@ export declare class RouteFallbackFailures {
     private readonly indexWaitMs;
     private readonly indexWaitMaxMs;
     private readonly failures;
-    /** Lane -> when its index wait began and when it ends. */
+    /**
+     * Lane -> when its index wait began and when it ends; `over` once it ended but the
+     * strike table had no room to record the refusal (still refused, never extended).
+     */
     private readonly indexWaits;
     constructor(capacity?: number, 
     /** A wait's length when the server stated no time left. */
     indexWaitMs?: number, indexWaitMaxMs?: number);
     fail(lane: string, context?: FallbackFailureContext): RouteFallbackError;
+    /**
+     * Note MemTree saying the lane's index is still catching up (a held request's 413):
+     * starts the lane's wait, or extends it by the stated time left. False once waiting
+     * can no longer pay off (the estimate is past the cap, the wait's deadline passed, or
+     * the lane was refused), so a held request stops asking and is refused.
+     */
+    indexWaitOpen(lane: string, secondsLeft: number | undefined, now?: number): boolean;
     /** Whether a stated time left is too long to wait for at all (refused at once). */
     hopeless(secondsLeft: number | undefined): boolean;
     succeeded(lane: string): void;
@@ -72,19 +82,24 @@ export declare class RouteFallbackFailures {
      * to the strikes.
      */
     private waitForIndex;
+    /**
+     * Start or extend the lane's wait: "open" while the index may still land in time,
+     * "closed" once it may not (and the lane is refused until a delivery), "untracked"
+     * when every wait slot is taken (the strikes decide).
+     */
+    private track;
     /** When a wait begun at `started` ends, given the time left stated at `now`. */
     private deadline;
-    /** The final refusal, at once: the strike state, so no retry waits again. */
-    private refuseHopeless;
     private indexWaitError;
     /** Free the slots of waits past their deadline, keeping them refused. */
     private retireExpiredWaits;
     /**
-     * An expired wait's lane moves to the terminal strike state. If the strike
-     * table is full the wait keeps its slot instead (still expired, still
-     * refused), so no lane can be re-admitted with a fresh deadline.
+     * End the lane's wait in the terminal strike state. If the strike table is full a wait
+     * keeps its slot instead, marked over (still refused, never extended), so no lane can
+     * be re-admitted with a fresh deadline; with neither, the refusal stands for this
+     * request only.
      */
-    private retire;
+    private close;
 }
 /**
  * The one-line status a waiting turn shows (Claude Code prints a 503's message on its

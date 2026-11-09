@@ -135,11 +135,19 @@ async function harness(refusal, options = {}) {
     res.end(JSON.stringify({ type: "message", role: "assistant",
       content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }));
   });
-  const memory = await serve((req, res, body) => {
+  const memory = await serve(async (req, res, body) => {
     res.setHeader("content-type", "application/json");
     if (req.method === "GET") { res.statusCode = 202; return res.end("{}"); }
     if (body.index_only) return res.end(JSON.stringify({ messages: [], index_only: true }));
     h.compressCalls++;
+    const delay = h.delays?.[h.compressCalls - 1] ?? 0;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    if (res.destroyed) return;
+    if (h.answers?.[h.compressCalls - 1]) {
+      const { status, body: answer, headers = {} } = h.answers[h.compressCalls - 1];
+      res.writeHead(status, { "content-type": "application/json", ...headers });
+      return res.end(answer);
+    }
     if (h.compressCalls <= h.refusals) {
       res.writeHead(413, { "content-type": "application/json", ...(h.refusal.headers ?? {}) });
       return res.end(h.refusal.body);
@@ -235,5 +243,70 @@ test("a held turn stops asking once Claude Code leaves", async () => {
     const calls = h.compressCalls;
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(h.compressCalls, calls, "no more asks after the client left");
+  } finally { h.close(); }
+});
+
+test("existing waits: a later estimate past the cap refuses; a full table keeps it refused", () => {
+  const failures = new RouteFallbackFailures();
+  assert.equal(failures.fail("a", { awaitingIndex: true, indexSecondsLeft: 60, now: 0 }).status, 503);
+  assert.equal(failures.fail("a", { awaitingIndex: true, indexSecondsLeft: 3600, now: 1 }).status,
+    400, "the estimate grew past the cap");
+  assert.equal(failures.fail("a", { awaitingIndex: true, indexSecondsLeft: 60, now: 2 }).status, 400);
+  // Capacity one, its strike slot taken: an ended wait cannot move to the strike table.
+  const full = new RouteFallbackFailures(1, 1_000);
+  full.fail("x");
+  assert.equal(full.fail("b", { awaitingIndex: true, indexSecondsLeft: 1, now: 0 }).status, 503);
+  assert.equal(full.fail("b", { awaitingIndex: true, now: 200_000 }).status, 400);
+  assert.equal(full.fail("b", { awaitingIndex: true, indexSecondsLeft: 1, now: 200_001 }).status,
+    400, "never revived by a later estimate");
+  assert.equal(full.indexWaitOpen("b", 1, 200_002), false);
+});
+
+test("a held request's lane wait starts at the first indexing 413 and closes at its deadline", () => {
+  const failures = new RouteFallbackFailures();
+  assert.equal(failures.indexWaitOpen("lane", 10, 0), true);
+  // 10 s + 5 s + 2 min.
+  assert.equal(failures.indexWaitOpen("lane", undefined, 134_999), true);
+  assert.equal(failures.indexWaitOpen("lane", undefined, 135_000), false);
+  assert.equal(failures.fail("lane", { awaitingIndex: true, now: 135_001 }).status, 400);
+});
+
+test("a hold never runs past its bound, even when a later ask is slow", async () => {
+  const h = await harness(indexing(240), { indexHoldMs: 600 });
+  h.delays = [0, 0, 5_000];
+  try {
+    const started = Date.now();
+    const response = await post(h, humanMessages);
+    const elapsed = Date.now() - started;
+    assert.equal(response.status, 503);
+    assert.match(response.message, /about 4 minutes left/, "still waiting for the index");
+    assert.ok(elapsed < 1_500, `${elapsed} ms`);
+  } finally { h.close(); }
+});
+
+test("an ask answered otherwise ends the wait: no stale index status", async () => {
+  const h = await harness(indexing(240));
+  h.answers = [undefined, { status: 413, body: JSON.stringify({
+    detail: "Request exceeds the context window after compression" }) }];
+  h.refusals = 1;
+  try {
+    const response = await post(h, humanMessages);
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(response.message, /catching up/);
+    const rec = h.records.find((r) => r.kind === "messages" && r.indexWait);
+    assert.equal(rec.indexWait.ended, true);
+    assert.equal(rec.indexBehind, undefined);
+  } finally { h.close(); }
+});
+
+test("concurrent retries joining one indexing 413 both wait for the index", async () => {
+  const h = await harness(indexing(240), { indexHoldMs: 60 });
+  h.delays = [150];
+  try {
+    const [a, b] = await Promise.all([post(h, humanMessages), post(h, humanMessages)]);
+    for (const response of [a, b]) {
+      assert.equal(response.status, 503);
+      assert.match(response.message, /catching up on this session's index/);
+    }
   } finally { h.close(); }
 });

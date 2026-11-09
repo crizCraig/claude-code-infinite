@@ -398,8 +398,8 @@ export declare class MemtreeClient {
     private compressFailureArming;
     /** HTTP status of each key's latest failed compress (absent: no response). */
     private compressFailureStatus;
-    /** Seconds of indexing left, for a key whose latest compress was an indexing 413. */
-    private compressFailureIndexWait;
+    /** Seconds of indexing left, per compress call that MemTree answered with an indexing 413. */
+    private compressIndexWaits;
     /**
      * Non-null when the server last answered 402 (unpaid MemTree key): the
      * server's human-readable detail text. Set by both compression and
@@ -505,11 +505,11 @@ export declare class MemtreeClient {
      */
     lastCompressFailureStatus(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): number | undefined;
     /**
-     * When the latest failed compress of this request was MemTree's 413 for an index still
-     * catching up (index-wait-413.ts): the seconds of indexing it said were left. Sampled at
-     * its settle like lastCompressFailureStatus; undefined for any other failure.
+     * When the compress call `call` (as compress() returned it, joined or not) failed with
+     * MemTree's 413 for an index still catching up (index-wait-413.ts): the seconds of
+     * indexing it said were left. Undefined for any other outcome, or before it settles.
      */
-    lastCompressIndexWait(hash: string, modelContextLimit: number, meta?: CompressRequestMeta): number | undefined;
+    compressIndexWait(call: Promise<CompressResult | null>): number | undefined;
     /**
      * Blocking user-turn compression. Returns null on ANY failure (timeout,
      * network, 4xx/5xx including 402) — the caller must degrade to passthrough.

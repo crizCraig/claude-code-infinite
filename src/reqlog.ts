@@ -161,9 +161,10 @@ export interface MessagesRecord {
   /**
    * MemTree answered 413 because its index is still catching up (index-wait-413.ts):
    * the seconds of indexing it said were left (the latest), how many compress calls got
-   * that answer, and how long the request was held between them.
+   * that answer, and how long the request was held between them; `ended` when a later
+   * ask was answered otherwise.
    */
-  indexWait?: { secondsLeft: number; asks: number; heldMs: number };
+  indexWait?: { secondsLeft: number; asks: number; heldMs: number; ended?: true };
   /** Body bytes actually sent to Anthropic (after notice strip / compression). */
   forwardedBytes?: number;
   /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
