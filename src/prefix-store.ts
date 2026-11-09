@@ -35,6 +35,8 @@ export interface PersistedPrefix {
   originalMediaFreeHashes?: string[];
   /** Rendering-independent identities (route-identity portableHash); absent before them. */
   originalPortableHashes?: string[];
+  /** The same without media (Claude Code's eviction beside a re-render); absent before them. */
+  originalPortableMediaFreeHashes?: string[];
   compressedMessages: any[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -297,6 +299,7 @@ function isPrefix(p: PersistedPrefix): boolean {
     p.originalPrefixHashes.every(nonEmptyString) &&
     optionalHashes(p.originalMediaFreeHashes, p.originalPrefixHashes.length) &&
     optionalHashes(p.originalPortableHashes, p.originalPrefixHashes.length) &&
+    optionalHashes(p.originalPortableMediaFreeHashes, p.originalPrefixHashes.length) &&
     Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
     p.compressedMessages.every(isMessage) &&
     typeof p.hasCompressedSystem === "boolean" &&

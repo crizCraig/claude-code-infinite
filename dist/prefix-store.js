@@ -258,6 +258,7 @@ function isPrefix(p) {
         p.originalPrefixHashes.every(nonEmptyString) &&
         optionalHashes(p.originalMediaFreeHashes, p.originalPrefixHashes.length) &&
         optionalHashes(p.originalPortableHashes, p.originalPrefixHashes.length) &&
+        optionalHashes(p.originalPortableMediaFreeHashes, p.originalPrefixHashes.length) &&
         Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
         p.compressedMessages.every(isMessage) &&
         typeof p.hasCompressedSystem === "boolean" &&

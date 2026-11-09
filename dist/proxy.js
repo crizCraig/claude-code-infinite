@@ -2909,6 +2909,7 @@ function persistStablePrefix(state, sessionId, prefix) {
             originalPrefixHashes: prefix.originalPrefixHashes,
             originalMediaFreeHashes: prefix.originalMediaFreeHashes,
             originalPortableHashes: prefix.originalPortableHashes,
+            originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
             compressedMessages: prefix.compressedMessages,
             compressedSystem: prefix.compressedSystem,
             hasCompressedSystem: prefix.hasCompressedSystem,
@@ -3006,7 +3007,7 @@ function prefixMismatch(body, messages, prefix, sessionId, kind = "route") {
 function firstPrefixMiss(messages, prefix, kind) {
     const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
     for (let i = 0; i < length; i++) {
-        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i])) {
+        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i], prefix.originalPortableMediaFreeHashes?.[i])) {
             return i;
         }
     }
@@ -3941,7 +3942,7 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     if (messages.length < prefixLength)
         return null;
     for (let i = 0; i < prefixLength; i++) {
-        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i])) {
+        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i], route.originalPortableMediaFreeHashes?.[i])) {
             return null;
         }
     }

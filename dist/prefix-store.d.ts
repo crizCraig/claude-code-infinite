@@ -6,6 +6,8 @@ export interface PersistedPrefix {
     originalMediaFreeHashes?: string[];
     /** Rendering-independent identities (route-identity portableHash); absent before them. */
     originalPortableHashes?: string[];
+    /** The same without media (Claude Code's eviction beside a re-render); absent before them. */
+    originalPortableMediaFreeHashes?: string[];
     compressedMessages: any[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;

@@ -221,3 +221,46 @@ test("a reminder moved beside unchanged media still matches; replaced media does
     assert.ok(!matches(after("BBBB")), `${kind}: another image`);
   }
 });
+
+test("a stored JSON string stands only for its parse, never for another string (Codex r2)", () => {
+  const use = (input) => ({ role: "assistant",
+    content: [{ type: "tool_use", id: "u", name: "Write", input }] });
+  for (const kind of ["route", "stable"]) {
+    const all = (stored, message) => {
+      const id = prefixIdentity([stored], kind);
+      return prefixMessageMatches(message, kind, id.originalPrefixHashes[0],
+        id.originalMediaFreeHashes[0], id.originalPortableHashes[0],
+        id.originalPortableMediaFreeHashes[0]);
+    };
+    for (const [a, b] of [['{"a":1}', '{ "a": 1 }'], ['{"a":1,"b":2}', '{"b":2,"a":1}'],
+      ['[1, 2]', '[1,2]']]) {
+      assert.ok(!all(use({ content: a }), use({ content: b })), `${kind}: ${a} -> ${b}`);
+      assert.ok(!all(use({ content: b }), use({ content: a })), `${kind}: ${b} -> ${a}`);
+    }
+    assert.ok(all(use({ content: '{ "a": [1, 2] }' }), use({ content: { a: [1, 2] } })),
+      `${kind}: the string Claude Code parsed`);
+    assert.ok(!all(use({ content: { a: [1, 2] } }), use({ content: '{"a":[1,2]}' })),
+      `${kind}: a parsed value never stands for a string`);
+  }
+});
+
+test("a reminder moved while Claude Code evicted the image beside it still matches (Codex r2)", () => {
+  const reminder = "<system-reminder>\nAttribution lines\n</system-reminder>";
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const before = { role: "user", content: [{ type: "tool_result", tool_use_id: "t",
+    content: [{ type: "text", text: `shot.\n\n${reminder}` }, image("AAAA")] }] };
+  const after = (media) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: "t",
+    content: [{ type: "text", text: "shot." }, media] }, { type: "text", text: `${reminder}\n` }] });
+  const evicted = after({ type: "text", text: "[media removed: request limit]" });
+  for (const kind of ["route", "stable"]) {
+    const id = prefixIdentity([before], kind);
+    const matches = (message) => prefixMessageMatches(message, kind, id.originalPrefixHashes[0],
+      id.originalMediaFreeHashes[0], id.originalPortableHashes[0],
+      id.originalPortableMediaFreeHashes[0]);
+    assert.ok(matches(evicted), `${kind}: moved and evicted`);
+    assert.ok(!matches(after(image("BBBB"))), `${kind}: replaced`);
+    const edited = structuredClone(evicted);
+    edited.content[0].content[0].text = "other shot.";
+    assert.ok(!matches(edited), `${kind}: edited text`);
+  }
+});

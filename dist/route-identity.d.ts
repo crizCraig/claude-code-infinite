@@ -10,6 +10,7 @@ export declare function prefixIdentity(messages: Message[], kind: PrefixIdentity
     originalPrefixHashes: string[];
     originalMediaFreeHashes: string[];
     originalPortableHashes: string[];
+    originalPortableMediaFreeHashes: string[];
 };
 /**
  * Whether `message` still stands where a prefix's message stood: unchanged, or the same
@@ -19,10 +20,10 @@ export declare function prefixIdentity(messages: Message[], kind: PrefixIdentity
  * placeholder. That counts only when the message has no media left, so an attachment
  * replaced by another never matches; a removed one is indistinguishable from eviction.
  * A newer Claude Code can also render the same history differently on resume (see
- * portableHash), media kept: an attachment replaced by another never matches there either.
+ * portableHash), with media kept or (no media left) evicted the same way.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
-export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined, portable?: string): boolean;
+export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined, portable?: string, portableMediaFree?: string): boolean;
 /**
  * Whether `newer` carries everything `older` does: every message of `older` after the
  * system prompt (whose billing line changes per call), in place and unchanged apart from

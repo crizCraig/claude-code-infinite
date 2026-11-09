@@ -2,19 +2,16 @@ import { createHash } from "node:crypto";
 import { stripSystemReminderText } from "./turns.js";
 // Request messages are immutable snapshots. Weak keys retain no completed request.
 // Route installation stores these digests, not the original megabytes of history.
-const routeHashes = new WeakMap();
-const stableHashes = new WeakMap();
-const routeMediaFreeHashes = new WeakMap();
-const stableMediaFreeHashes = new WeakMap();
-const routePortableHashes = new WeakMap();
-const stablePortableHashes = new WeakMap();
+const hashCaches = new Map();
+const EXACT = { media: "keep" };
+const MEDIA_FREE = { media: "drop" };
 /** Hash each incoming message once, then reuse it across route candidates/checks. */
 export function routeMessageHash(message) {
-    return messageHash(message, false, "exact");
+    return messageHash(message, false, EXACT);
 }
 /** Stable prefixes span turns in which Claude can omit earlier thinking blocks. */
 export function stablePrefixMessageHash(message) {
-    return messageHash(message, stableShape(message), "exact");
+    return messageHash(message, stableShape(message), EXACT);
 }
 /** The identities a prefix stores for the messages it stands for. */
 export function prefixIdentity(messages, kind) {
@@ -22,7 +19,8 @@ export function prefixIdentity(messages, kind) {
     return {
         originalPrefixHashes: messages.map(exact),
         originalMediaFreeHashes: messages.map((m) => mediaFreeHash(m, kind)),
-        originalPortableHashes: messages.map((m) => portableHash(m, kind)),
+        originalPortableHashes: messages.map((m) => portableHash(m, kind, "keep", "stored")),
+        originalPortableMediaFreeHashes: messages.map((m) => portableHash(m, kind, "drop", "stored")),
     };
 }
 /**
@@ -33,17 +31,21 @@ export function prefixIdentity(messages, kind) {
  * placeholder. That counts only when the message has no media left, so an attachment
  * replaced by another never matches; a removed one is indistinguishable from eviction.
  * A newer Claude Code can also render the same history differently on resume (see
- * portableHash), media kept: an attachment replaced by another never matches there either.
+ * portableHash), with media kept or (no media left) evicted the same way.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
-export function prefixMessageMatches(message, kind, exact, mediaFree, portable) {
+export function prefixMessageMatches(message, kind, exact, mediaFree, portable, portableMediaFree) {
     const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
     if (hash === exact)
         return true;
-    if (portable !== undefined && portableHash(message, kind) === portable)
+    if (portable !== undefined && portableHash(message, kind, "keep", "incoming") === portable) {
         return true;
-    return mediaFree !== undefined && !carriesMedia(message.content) &&
-        mediaFreeHash(message, kind) === mediaFree;
+    }
+    if (carriesMedia(message.content))
+        return false;
+    return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
+        (portableMediaFree !== undefined &&
+            portableHash(message, kind, "drop", "incoming") === portableMediaFree);
 }
 /**
  * Whether `newer` carries everything `older` does: every message of `older` after the
@@ -62,26 +64,27 @@ export function mediaFreeMessageHash(message) {
     return mediaFreeHash(message, "route");
 }
 function mediaFreeHash(message, kind) {
-    return messageHash(message, kind === "stable" && stableShape(message), "media-free");
+    return messageHash(message, kind === "stable" && stableShape(message), MEDIA_FREE);
 }
 /**
- * An identity (media kept) that also ignores how Claude Code renders unchanged history,
- * which differs between versions (2.1.302 -> 2.1.319 on 2026-11-09): a reminder inside
- * a tool result's text or in a block of its own, a tool result's text as a string or a
- * text block, a tool input value as the JSON string the model sent or parsed.
+ * An identity that also ignores how Claude Code renders unchanged history, which differs
+ * between versions (2.1.302 -> 2.1.319 on 2026-11-09): a reminder inside a tool result's
+ * text or in a block of its own, a tool result's text as a string or a text block. And a
+ * tool input value the model sent as a JSON string that a newer Claude Code parsed: one
+ * way only, a stored string standing for its parse, so two different strings never match.
  */
-function portableHash(message, kind) {
-    return messageHash(message, kind === "stable" && stableShape(message), "portable");
+function portableHash(message, kind, media, side) {
+    return messageHash(message, kind === "stable" && stableShape(message), { media, portable: side });
 }
 function stableShape(message) {
     return message.role === "assistant" && Array.isArray(message.content);
 }
 function hashCache(stable, mode) {
-    if (mode === "portable")
-        return stable ? stablePortableHashes : routePortableHashes;
-    if (mode === "media-free")
-        return stable ? stableMediaFreeHashes : routeMediaFreeHashes;
-    return stable ? stableHashes : routeHashes;
+    const key = `${stable}:${mode.media}:${mode.portable ?? ""}`;
+    let cache = hashCaches.get(key);
+    if (!cache)
+        hashCaches.set(key, cache = new WeakMap());
+    return cache;
 }
 function messageHash(message, stable, mode) {
     const cache = hashCache(stable, mode);
@@ -94,9 +97,10 @@ function messageHash(message, stable, mode) {
     }
     const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
     const reminded = normalizeReminders(blocks);
-    const kept = mode === "media-free" ? withoutMedia(reminded) : reminded;
+    const kept = mode.media === "drop" ? withoutMedia(reminded) : reminded;
     const normalized = {
-        ...message, content: stripBlockCache(mode === "portable" ? portableContent(kept) : kept),
+        ...message, content: stripBlockCache(mode.portable
+            ? portableContent(kept, mode.portable === "stored") : kept),
     };
     const hash = createHash("sha256");
     updateCanonical(hash, normalized);
@@ -126,10 +130,10 @@ function normalizeReminders(content) {
 }
 /**
  * Content with rendering choices canonicalized (portableHash): text blocks left empty by
- * reminder removal dropped, a tool result's string as one text block, and tool input
- * values that are JSON strings of an object or array parsed.
+ * reminder removal dropped, a tool result's string as one text block, and (`parseInputs`,
+ * the stored side) tool input values that are JSON strings of an object or array parsed.
  */
-function portableContent(content) {
+function portableContent(content, parseInputs) {
     if (!Array.isArray(content))
         return content;
     return content.filter((part) => !isEmptyText(part)).map((part) => {
@@ -138,9 +142,9 @@ function portableContent(content) {
         if (part.type === "tool_result") {
             const inner = typeof part.content === "string"
                 ? [{ type: "text", text: part.content }] : part.content;
-            return { ...part, content: portableContent(inner) };
+            return { ...part, content: portableContent(inner, parseInputs) };
         }
-        if (part.type === "tool_use" && isPlainObject(part.input)) {
+        if (parseInputs && part.type === "tool_use" && isPlainObject(part.input)) {
             return { ...part, input: parsedJsonValues(part.input) };
         }
         return part;

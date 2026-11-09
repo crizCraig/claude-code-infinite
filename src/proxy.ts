@@ -682,6 +682,8 @@ interface MemoryRoute {
   originalMediaFreeHashes?: string[];
   /** Rendering-independent identities of the same messages; absent on old stores. */
   originalPortableHashes?: string[];
+  /** The same without media; absent on old stores. */
+  originalPortableMediaFreeHashes?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -714,6 +716,8 @@ interface StablePrefix {
   originalMediaFreeHashes?: string[];
   /** Rendering-independent identities of the same messages; absent on old stores. */
   originalPortableHashes?: string[];
+  /** The same without media; absent on old stores. */
+  originalPortableMediaFreeHashes?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -3988,6 +3992,7 @@ function persistStablePrefix(state: ProxyState, sessionId: string, prefix: Stabl
       originalPrefixHashes: prefix.originalPrefixHashes,
       originalMediaFreeHashes: prefix.originalMediaFreeHashes,
       originalPortableHashes: prefix.originalPortableHashes,
+      originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
       compressedMessages: prefix.compressedMessages,
       compressedSystem: prefix.compressedSystem,
       hasCompressedSystem: prefix.hasCompressedSystem,
@@ -4081,6 +4086,7 @@ type PrefixLike = Pick<
   | "originalPrefixHashes"
   | "originalMediaFreeHashes"
   | "originalPortableHashes"
+  | "originalPortableMediaFreeHashes"
   | "compressedMessages"
   | "compressedSystem"
   | "hasCompressedSystem"
@@ -4114,7 +4120,8 @@ function firstPrefixMiss(
   const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
   for (let i = 0; i < length; i++) {
     if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i],
-      prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i])) {
+      prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i],
+      prefix.originalPortableMediaFreeHashes?.[i])) {
       return i;
     }
   }
@@ -5399,7 +5406,8 @@ function memoryRoutedToolBody(
   if (messages.length < prefixLength) return null;
   for (let i = 0; i < prefixLength; i++) {
     if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i],
-      route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i])) {
+      route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i],
+      route.originalPortableMediaFreeHashes?.[i])) {
       return null;
     }
   }
