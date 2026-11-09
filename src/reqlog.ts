@@ -258,6 +258,8 @@ export interface MessagesRecord {
    * because this history no longer validates against it.
    */
   storedPrefix?: "adopted" | "discarded";
+  /** For a discarded prefix: the first covered message that no longer matched. */
+  storedPrefixMissAt?: number;
   /**
    * Stable-prefix (edge) compaction: the budget the turn was measured
    * against, the size estimate, and, when it compacted, why. Recorded on

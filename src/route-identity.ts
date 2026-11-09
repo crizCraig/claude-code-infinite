@@ -7,28 +7,37 @@ const routeHashes = new WeakMap<Message, string>();
 const stableHashes = new WeakMap<Message, string>();
 const routeMediaFreeHashes = new WeakMap<Message, string>();
 const stableMediaFreeHashes = new WeakMap<Message, string>();
+const routePortableHashes = new WeakMap<Message, string>();
+const stablePortableHashes = new WeakMap<Message, string>();
+
+/** How much of a message an identity keeps (messageHash). */
+type HashMode = "exact" | "media-free" | "portable";
 
 /** Which identity a compressed prefix uses: a route's, or a stable prefix's. */
 export type PrefixIdentity = "route" | "stable";
 
 /** Hash each incoming message once, then reuse it across route candidates/checks. */
 export function routeMessageHash(message: Message): string {
-  return messageHash(message, false, false);
+  return messageHash(message, false, "exact");
 }
 
 /** Stable prefixes span turns in which Claude can omit earlier thinking blocks. */
 export function stablePrefixMessageHash(message: Message): string {
-  return messageHash(message, stableShape(message), false);
+  return messageHash(message, stableShape(message), "exact");
 }
 
 /** The identities a prefix stores for the messages it stands for. */
 export function prefixIdentity(
   messages: Message[], kind: PrefixIdentity
-): { originalPrefixHashes: string[]; originalMediaFreeHashes: string[] } {
+): {
+  originalPrefixHashes: string[]; originalMediaFreeHashes: string[];
+  originalPortableHashes: string[];
+} {
   const exact = kind === "stable" ? stablePrefixMessageHash : routeMessageHash;
   return {
     originalPrefixHashes: messages.map(exact),
     originalMediaFreeHashes: messages.map((m) => mediaFreeHash(m, kind)),
+    originalPortableHashes: messages.map((m) => portableHash(m, kind)),
   };
 }
 
@@ -39,15 +48,19 @@ export function prefixIdentity(
  * becomes a placeholder, a top-level one is dropped, an emptied message becomes the
  * placeholder. That counts only when the message has no media left, so an attachment
  * replaced by another never matches; a removed one is indistinguishable from eviction.
- * Prefixes stored before media-free hashes existed match exactly only.
+ * A newer Claude Code can also render the same history differently on resume (see
+ * portableHash); with media evicted too, that matches as well.
+ * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
 export function prefixMessageMatches(
-  message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined
+  message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined,
+  portable?: string
 ): boolean {
   const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
   if (hash === exact) return true;
-  return mediaFree !== undefined && !carriesMedia(message.content) &&
-    mediaFreeHash(message, kind) === mediaFree;
+  if (carriesMedia(message.content)) return false;
+  return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
+    (portable !== undefined && portableHash(message, kind) === portable);
 }
 
 /**
@@ -70,17 +83,31 @@ export function mediaFreeMessageHash(message: Message): string {
 }
 
 function mediaFreeHash(message: Message, kind: PrefixIdentity): string {
-  return messageHash(message, kind === "stable" && stableShape(message), true);
+  return messageHash(message, kind === "stable" && stableShape(message), "media-free");
+}
+
+/**
+ * A media-free identity that also ignores how Claude Code renders unchanged history,
+ * which differs between versions (2.1.302 -> 2.1.319 on 2026-11-09): a reminder inside
+ * a tool result's text or in a block of its own, a tool result's text as a string or a
+ * text block, a tool input value as the JSON string the model sent or parsed.
+ */
+function portableHash(message: Message, kind: PrefixIdentity): string {
+  return messageHash(message, kind === "stable" && stableShape(message), "portable");
 }
 
 function stableShape(message: Message): boolean {
   return message.role === "assistant" && Array.isArray(message.content);
 }
 
-function messageHash(message: Message, stable: boolean, mediaFree: boolean): string {
-  const cache = mediaFree
-    ? (stable ? stableMediaFreeHashes : routeMediaFreeHashes)
-    : (stable ? stableHashes : routeHashes);
+function hashCache(stable: boolean, mode: HashMode): WeakMap<Message, string> {
+  if (mode === "portable") return stable ? stablePortableHashes : routePortableHashes;
+  if (mode === "media-free") return stable ? stableMediaFreeHashes : routeMediaFreeHashes;
+  return stable ? stableHashes : routeHashes;
+}
+
+function messageHash(message: Message, stable: boolean, mode: HashMode): string {
+  const cache = hashCache(stable, mode);
   const cached = cache.get(message);
   if (cached !== undefined) return cached;
   let content = message.content;
@@ -91,8 +118,9 @@ function messageHash(message: Message, stable: boolean, mediaFree: boolean): str
   }
   const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
   const reminded = normalizeReminders(blocks);
+  const kept = mode === "exact" ? reminded : withoutMedia(reminded);
   const normalized = {
-    ...message, content: stripBlockCache(mediaFree ? withoutMedia(reminded) : reminded),
+    ...message, content: stripBlockCache(mode === "portable" ? portableContent(kept) : kept),
   };
   const hash = createHash("sha256");
   updateCanonical(hash, normalized);
@@ -116,6 +144,53 @@ function normalizeReminders(content: unknown): unknown {
     }
     return part;
   });
+}
+
+/**
+ * Content with rendering choices canonicalized (portableHash): text blocks left empty by
+ * reminder removal dropped, a tool result's string as one text block, and tool input
+ * values that are JSON strings of an object or array parsed.
+ */
+function portableContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.filter((part) => !isEmptyText(part)).map((part) => {
+    if (!part || typeof part !== "object") return part;
+    if (part.type === "tool_result") {
+      const inner = typeof part.content === "string"
+        ? [{ type: "text", text: part.content }] : part.content;
+      return { ...part, content: portableContent(inner) };
+    }
+    if (part.type === "tool_use" && isPlainObject(part.input)) {
+      return { ...part, input: parsedJsonValues(part.input) };
+    }
+    return part;
+  });
+}
+
+function isEmptyText(part: any): boolean {
+  return typeof part === "string" ? part === "" :
+    part?.type === "text" && part.text === "" && Object.keys(part).length === 2;
+}
+
+function parsedJsonValues(input: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) out[key] = parsedJson(value);
+  return out;
+}
+
+/** A string holding a JSON object or array, parsed; any other value as it is. */
+function parsedJson(value: unknown): unknown {
+  if (typeof value !== "string" || !/^\s*[[{]/.test(value)) return value;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 /**

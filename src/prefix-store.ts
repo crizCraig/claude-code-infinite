@@ -33,6 +33,8 @@ export interface PersistedPrefix {
   originalPrefixHashes: string[];
   /** Media-free identities of the same messages; absent in entries stored before them. */
   originalMediaFreeHashes?: string[];
+  /** Rendering-independent identities (route-identity portableHash); absent before them. */
+  originalPortableHashes?: string[];
   compressedMessages: any[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -282,15 +284,19 @@ function isEntry(v: PersistedEntry): boolean {
     (v.source === undefined || isPageSource(v.source));
 }
 
+/** Absent, or one non-empty hash per covered message. */
+function optionalHashes(hashes: unknown, length: number): boolean {
+  return hashes === undefined ||
+    (Array.isArray(hashes) && hashes.length === length && hashes.every(nonEmptyString));
+}
+
 /** The prefix's invariants: the identity of a covered history, and well-formed bytes. */
 function isPrefix(p: PersistedPrefix): boolean {
   return isObject(p) && nonEmptyString(p.originalSystemHash) &&
     Array.isArray(p.originalPrefixHashes) && p.originalPrefixHashes.length > 0 &&
     p.originalPrefixHashes.every(nonEmptyString) &&
-    (p.originalMediaFreeHashes === undefined ||
-      (Array.isArray(p.originalMediaFreeHashes) &&
-        p.originalMediaFreeHashes.length === p.originalPrefixHashes.length &&
-        p.originalMediaFreeHashes.every(nonEmptyString))) &&
+    optionalHashes(p.originalMediaFreeHashes, p.originalPrefixHashes.length) &&
+    optionalHashes(p.originalPortableHashes, p.originalPrefixHashes.length) &&
     Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
     p.compressedMessages.every(isMessage) &&
     typeof p.hasCompressedSystem === "boolean" &&

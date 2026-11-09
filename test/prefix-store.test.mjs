@@ -158,8 +158,11 @@ async function afterRestart(dir, conv, memoryPort) {
   const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort });
   try {
     assert.equal(await after.post(conv), 200);
+    const first = after.records.find((r) => r.kind === "messages" && r.storedPrefix);
     return { turnType: after.lastRecord().turnType, compressCalls: after.compressCalls,
-      prefixMiss: after.lastRecord().compaction?.prefixMiss };
+      prefixMiss: after.lastRecord().compaction?.prefixMiss,
+      ...(first?.storedPrefixMissAt !== undefined
+        ? { storedPrefixMissAt: first.storedPrefixMissAt } : {}) };
   } finally { after.close(); }
 }
 
@@ -169,10 +172,50 @@ test("a changed history discards the persisted prefix and behaves as today", asy
   let conv;
   try { conv = await compactOnce(before); } finally { before.close(); }
   assert.equal((await waitForFile(dir)).length, 1);
-  const edited = [user("q1 (edited)"), ...conv.slice(1), assistant("a3"), user("q4")];
-  assert.deepEqual(await afterRestart(dir, edited, before.memoryPort), await baseline(edited));
+  const edited = [user("q1"), assistant("a1 (edited)"), ...conv.slice(2), assistant("a3"),
+    user("q4")];
+  const after = await afterRestart(dir, edited, before.memoryPort);
+  assert.equal(after.storedPrefixMissAt, 1, "the log names the first changed message");
+  delete after.storedPrefixMissAt;
+  assert.deepEqual(after, await baseline(edited));
   assert.equal((await waitForFile(dir)).length, 1, "the new compaction replaced it");
 });
+
+test("a resume under a Claude Code that renders old messages differently adopts the prefix",
+  async () => {
+    // 2026-11-09: a session moved to another machine (Claude Code 2.1.302 -> 2.1.319)
+    // lost its persisted prefix to two re-rendered messages, then 413'd compressing 2.2M
+    // tokens. The newer Claude Code moved a reminder out of a tool result into its own
+    // block, and parsed a tool input the model had sent as a JSON string.
+    const reminder = "<system-reminder>\nAttribution\n</system-reminder>";
+    const edits = [{ old_str: "a", new_str: "b" }];
+    const use = (input) => ({ role: "assistant", content: [{ type: "tool_use", id: "u1",
+      name: "Edit", input }] });
+    const result = (content, extra = []) => ({ role: "user", content: [
+      { type: "tool_result", tool_use_id: "u1", content }, ...extra] });
+    const old = [user("q1"), use({ edits: JSON.stringify(edits) }),
+      result(`done\n\n${reminder}`), assistant("a1"), user("q2")];
+    const rendered = [user("q1"), use({ edits }),
+      result("done", [{ type: "text", text: `${reminder}\n` }]), assistant("a1"), user("q2")];
+    const dir = tempDir();
+    const before = await proxyProcess(new StablePrefixStore(dir));
+    const conv = old;
+    try {
+      assert.equal(await before.post(conv), 200);
+      conv.push(assistant("a2"), user(BIG("q3")));
+      assert.equal(await before.post(conv), 200);
+      assert.equal(before.lastRecord().turnType, "followup-compressed");
+    } finally { before.close(); }
+    assert.equal((await waitForFile(dir)).length, 1);
+    const resumed = [...rendered, ...conv.slice(rendered.length), assistant("a3"), user("q4")];
+    const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort: before.memoryPort });
+    try {
+      assert.equal(await after.post(resumed), 200);
+      assert.equal(after.lastRecord().storedPrefix, "adopted");
+      assert.equal(after.compressCalls, 0, "no blocking compress");
+      assert.equal(after.lastRecord().turnType, "followup-prefix");
+    } finally { after.close(); }
+  });
 
 test("a corrupt persisted prefix is discarded and the turn behaves as today", async () => {
   const dir = tempDir();

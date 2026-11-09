@@ -2908,6 +2908,7 @@ function persistStablePrefix(state, sessionId, prefix) {
             originalSystemHash: prefix.originalSystemHash,
             originalPrefixHashes: prefix.originalPrefixHashes,
             originalMediaFreeHashes: prefix.originalMediaFreeHashes,
+            originalPortableHashes: prefix.originalPortableHashes,
             compressedMessages: prefix.compressedMessages,
             compressedSystem: prefix.compressedSystem,
             hasCompressedSystem: prefix.hasCompressedSystem,
@@ -2948,6 +2949,7 @@ function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelCon
     if (verdict === "discard") {
         store.delete(sessionId, owner);
         rec.storedPrefix = "discarded";
+        rec.storedPrefixMissAt = firstPrefixMiss(messages, prefix, "stable");
         return;
     }
     boundedSet(state.stablePrefixes, sessionId, prefix);
@@ -2996,15 +2998,19 @@ function prefixMismatch(body, messages, prefix, sessionId, kind = "route") {
     if (routeValueHash(normalizeRouteSystem(body.system)) !== prefix.originalSystemHash) {
         return "system";
     }
-    const prefixLength = prefix.originalPrefixHashes.length;
-    if (messages.length < prefixLength)
+    if (messages.length < prefix.originalPrefixHashes.length)
         return "prefix";
-    for (let i = 0; i < prefixLength; i++) {
-        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i])) {
-            return "prefix";
+    return firstPrefixMiss(messages, prefix, kind) === undefined ? null : "prefix";
+}
+/** The first message the prefix covers that no longer matches it, if any. */
+function firstPrefixMiss(messages, prefix, kind) {
+    const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
+    for (let i = 0; i < length; i++) {
+        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i])) {
+            return i;
         }
     }
-    return null;
+    return undefined;
 }
 /**
  * Message identity for a stable prefix: routeMessageHash without assistant
@@ -3935,7 +3941,7 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     if (messages.length < prefixLength)
         return null;
     for (let i = 0; i < prefixLength; i++) {
-        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i])) {
+        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i])) {
             return null;
         }
     }

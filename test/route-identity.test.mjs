@@ -130,3 +130,52 @@ test("a newer history extends an older one across Claude Code's media eviction, 
   const edited = evicted.map((m, i) => i === 1 ? { role: "user", content: "other task" } : m);
   assert.ok(!extendsHistory(edited, older), "an edited message is new content");
 });
+
+test("a prefix still covers messages a newer Claude Code renders differently on resume", () => {
+  // 2026-11-09: a session built under Claude Code 2.1.302 and resumed under 2.1.319
+  // lost its persisted prefix (then 413'd on a 2.2M-token compress): 2.1.319 moved a
+  // reminder out of a tool result's text into its own block, and parsed a tool input
+  // the model had sent as a JSON string. Two of 3,294 covered messages; same content.
+  const reminder = "<system-reminder>\nAttribution lines\n</system-reminder>";
+  const oldResult = { role: "user", content: [
+    { type: "tool_result", tool_use_id: "t", content: `moved to background.\n\n${reminder}`, is_error: false },
+    { type: "text", text: "[Request interrupted by user]\n" }] };
+  const newResult = { role: "user", content: [
+    { type: "tool_result", tool_use_id: "t", content: "moved to background.", is_error: false },
+    { type: "text", text: `${reminder}\n` },
+    { type: "text", text: "[Request interrupted by user]\n" }] };
+  const edits = [{ old_str: "a\n</ul>", new_str: "b \"q\"" }];
+  const oldUse = { role: "assistant", content: [{ type: "tool_use", id: "u", name: "Artifact",
+    input: { action: "publish", edits: JSON.stringify(edits, null, 1) } }] };
+  const newUse = { role: "assistant", content: [{ type: "tool_use", id: "u", name: "Artifact",
+    input: { action: "publish", edits } }] };
+  for (const kind of ["route", "stable"]) {
+    for (const [before, after] of [[oldResult, newResult], [oldUse, newUse]]) {
+      const id = prefixIdentity([before], kind);
+      const matches = (message, stored = true) => prefixMessageMatches(message, kind,
+        id.originalPrefixHashes[0], id.originalMediaFreeHashes[0],
+        stored ? id.originalPortableHashes[0] : undefined);
+      assert.ok(matches(after), `${kind}: ${JSON.stringify(after)}`);
+      assert.ok(!matches(after, false), `${kind}: stored without portable hashes: exact only`);
+    }
+    const id = prefixIdentity([oldResult], kind);
+    const matches = (message) => prefixMessageMatches(message, kind, id.originalPrefixHashes[0],
+      id.originalMediaFreeHashes[0], id.originalPortableHashes[0]);
+    const withText = structuredClone(newResult);
+    withText.content[1].text = `${reminder} but real text`;
+    assert.ok(!matches(withText), "a block with real text left is content");
+    const otherResult = structuredClone(newResult);
+    otherResult.content[0].content = "moved elsewhere.";
+    assert.ok(!matches(otherResult), "different tool output");
+    const useId = prefixIdentity([oldUse], kind);
+    const otherUse = structuredClone(newUse);
+    otherUse.content[0].input.edits[0].new_str = "c";
+    assert.ok(!prefixMessageMatches(otherUse, kind, useId.originalPrefixHashes[0],
+      useId.originalMediaFreeHashes[0], useId.originalPortableHashes[0]), "different tool input");
+    const plainString = { role: "assistant", content: [{ type: "tool_use", id: "u", name: "Write",
+      input: { content: "not json" } }] };
+    const plainId = prefixIdentity([plainString], kind);
+    assert.ok(prefixMessageMatches(plainString, kind, plainId.originalPrefixHashes[0],
+      plainId.originalMediaFreeHashes[0], plainId.originalPortableHashes[0]));
+  }
+});

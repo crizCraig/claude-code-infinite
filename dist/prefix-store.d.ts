@@ -4,6 +4,8 @@ export interface PersistedPrefix {
     originalPrefixHashes: string[];
     /** Media-free identities of the same messages; absent in entries stored before them. */
     originalMediaFreeHashes?: string[];
+    /** Rendering-independent identities (route-identity portableHash); absent before them. */
+    originalPortableHashes?: string[];
     compressedMessages: any[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;
