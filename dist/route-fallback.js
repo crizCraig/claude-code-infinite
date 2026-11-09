@@ -228,6 +228,15 @@ export function pausedRefusal(message) {
     return { ...refusal(0), body: { type: "error",
             error: { type: "invalid_request_error", message } } };
 }
+/**
+ * The refusal while MemTree can't be reached (network-failure.ts): nothing says the request
+ * can't fit, so it is retryable and outside the strike episode (attempt 0). No retry-after:
+ * Claude Code backs off as for its own connection errors, giving the network time to return.
+ */
+export function unreachableRefusal(message) {
+    return { status: 503, attempt: 0, headers: { "x-should-retry": "true" },
+        body: { type: "error", error: { type: "api_error", message } } };
+}
 function retryError(attempt, retryAfter, message) {
     return {
         status: 503,

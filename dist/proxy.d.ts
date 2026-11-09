@@ -41,6 +41,7 @@
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
+import { type NetworkFailure } from "./network-failure.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
 import { PreparedCompressions } from "./prepared-compression.js";
@@ -322,6 +323,10 @@ interface ProxyState {
     pausedReason: () => string | null;
     /** Whether MemTree's latest answer was a success (MemtreeClient.answering). */
     memtreeAnswering: () => boolean | undefined;
+    /** MemtreeClient.unreachable: MemTree's latest call could not connect. */
+    memtreeUnreachable: () => NetworkFailure | undefined;
+    /** Upstream.unreachable: Anthropic's latest forward could not connect. */
+    anthropicUnreachable: () => NetworkFailure | undefined;
     /** What each session's model was told about MemTree's state; blocked /compacts. */
     modelNotices: ModelContextNotices;
     /** polychat's usage dashboard for the MemTree environment, if known. */

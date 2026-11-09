@@ -297,6 +297,11 @@ export interface MessagesRecord {
         paused?: true;
         /** MemTree refused the key (401, or 403 with its detail): the refusal said so, outside the strike episode. */
         keyInvalid?: true;
+        /**
+         * MemTree's latest call could not connect ("internet": Anthropic's latest forward
+         * could not either): a retryable refusal saying so, outside the strike episode.
+         */
+        unreachable?: "memtree" | "internet";
     };
     /** Searchable flag explaining a forward above the advisory compression budget. */
     overBudgetForward?: {

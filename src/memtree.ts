@@ -28,6 +28,7 @@ import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { indexWaitFrom413 } from "./index-wait-413.js";
+import { networkFailureOf, type NetworkFailure } from "./network-failure.js";
 import {
   IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs,
 } from "./image-refs.js";
@@ -1067,6 +1068,8 @@ export class MemtreeClient {
   private lastAnswerKeyInvalid = false;
   /** Whether the latest such call succeeded; undefined before any answer. */
   private lastAnswerOk: boolean | undefined;
+  /** The latest call's connection failure, until a later call gets any answer. */
+  private lastUnreachable: NetworkFailure | undefined;
   /** Complete compression request key → whether its latest failure arms fuse. */
   private compressFailureArming = new Map<string, boolean>();
   /** HTTP status of each key's latest failed compress (absent: no response). */
@@ -1126,6 +1129,14 @@ export class MemtreeClient {
    */
   get answering(): boolean | undefined {
     return this.lastAnswerOk;
+  }
+
+  /**
+   * The connection failure (DNS, connect, dropped socket) of the latest MemTree call that
+   * got no answer, while no later call got one; undefined once MemTree answers anything.
+   */
+  get unreachable(): NetworkFailure | undefined {
+    return this.lastUnreachable;
   }
 
   /** Where to get a new key for this client's environment (its base URL). */
@@ -1988,8 +1999,10 @@ export class MemtreeClient {
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
     try {
-      const response = await this.postRetryingDrop(payload, opts, controller.signal);
+      const response = await this.postRetryingDrop(payload, opts, controller.signal)
+        .catch((err: unknown) => { this.noteUnreachable(err); throw err; });
       status = response.status;
+      this.lastUnreachable = undefined;
       if (planned.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
         if (this.refusedRefs(response.status, refusalText, planned.refs)) {
@@ -2110,6 +2123,13 @@ export class MemtreeClient {
         ...diagnostics,
       });
     }
+  }
+
+  /** Remember a call's connection failure (memtree.unreachable); other errors are no news. */
+  private noteUnreachable(err: unknown): void {
+    const failure = networkFailureOf(err, URL.canParse(this.baseUrl)
+      ? new URL(this.baseUrl).host : this.baseUrl);
+    if (failure) this.lastUnreachable = failure;
   }
 
   /**

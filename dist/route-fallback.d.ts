@@ -130,6 +130,12 @@ export declare function timeLeftText(seconds: number): string;
  * strike episode (attempt 0). Paying lets the very next request compress.
  */
 export declare function pausedRefusal(message: string): RouteFallbackError;
+/**
+ * The refusal while MemTree can't be reached (network-failure.ts): nothing says the request
+ * can't fit, so it is retryable and outside the strike episode (attempt 0). No retry-after:
+ * Claude Code backs off as for its own connection errors, giving the network time to return.
+ */
+export declare function unreachableRefusal(message: string): RouteFallbackError;
 /** Refusals of one lane further apart than this start a new streak. */
 export declare const SLOW_RETRY_WINDOW_MS: number;
 /** Consecutive refusals in a streak before the "slow to answer" notice. */

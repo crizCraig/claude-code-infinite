@@ -20,6 +20,7 @@ import { type FinalReplyReader } from "./final-index.js";
 import type { MessageTimes, MessageUsage } from "./transcript-usage.js";
 import type { RequestLogSink } from "./reqlog.js";
 import type { PaymentLinkCache } from "./payment-link.js";
+import { type NetworkFailure } from "./network-failure.js";
 import { type Message } from "./turns.js";
 export declare const CLIENT_NAME = "cc-infinite";
 /**
@@ -394,6 +395,8 @@ export declare class MemtreeClient {
     private lastAnswerKeyInvalid;
     /** Whether the latest such call succeeded; undefined before any answer. */
     private lastAnswerOk;
+    /** The latest call's connection failure, until a later call gets any answer. */
+    private lastUnreachable;
     /** Complete compression request key → whether its latest failure arms fuse. */
     private compressFailureArming;
     /** HTTP status of each key's latest failed compress (absent: no response). */
@@ -432,6 +435,11 @@ export declare class MemtreeClient {
      * failure: false, no answer yet: undefined. Positive evidence that it works.
      */
     get answering(): boolean | undefined;
+    /**
+     * The connection failure (DNS, connect, dropped socket) of the latest MemTree call that
+     * got no answer, while no later call got one; undefined once MemTree answers anything.
+     */
+    get unreachable(): NetworkFailure | undefined;
     /** Where to get a new key for this client's environment (its base URL). */
     get keyPageUrl(): string;
     /** polychat's usage dashboard for this client's environment (its base URL). */
@@ -644,6 +652,8 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
+    /** Remember a call's connection failure (memtree.unreachable); other errors are no news. */
+    private noteUnreachable;
     /**
      * A compress or prepare call's POST, sent once more (within the same budget) when its
      * connection dropped while the body was still uploading: a Wi-Fi switch cut a 24 MB

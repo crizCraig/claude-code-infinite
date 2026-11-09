@@ -42,8 +42,11 @@
 import { UNKNOWN_INDEX_WAIT_SECONDS } from "./index-wait-413.js";
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal }
-  from "./route-fallback.js";
+import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal,
+  unreachableRefusal } from "./route-fallback.js";
+import {
+  freshFailure, networkFailureOf, unreachableMessage, type NetworkFailure,
+} from "./network-failure.js";
 import {
   createCountTokensSession,
   CountTokensCooldowns,
@@ -451,6 +454,8 @@ interface Upstream {
   module: typeof http | typeof https;
   host: string;
   port: number;
+  /** The latest forward's connection failure, until a later forward gets any answer. */
+  unreachable?: NetworkFailure;
 }
 
 /**
@@ -497,6 +502,10 @@ interface ProxyState {
   pausedReason: () => string | null;
   /** Whether MemTree's latest answer was a success (MemtreeClient.answering). */
   memtreeAnswering: () => boolean | undefined;
+  /** MemtreeClient.unreachable: MemTree's latest call could not connect. */
+  memtreeUnreachable: () => NetworkFailure | undefined;
+  /** Upstream.unreachable: Anthropic's latest forward could not connect. */
+  anthropicUnreachable: () => NetworkFailure | undefined;
   /** What each session's model was told about MemTree's state; blocked /compacts. */
   modelNotices: ModelContextNotices;
   /** polychat's usage dashboard for the MemTree environment, if known. */
@@ -1077,6 +1086,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     pausedDetail: () => opts.memtree.pausedDetail,
     pausedReason: () => opts.memtree.pausedReason,
     memtreeAnswering: () => opts.memtree.answering,
+    memtreeUnreachable: () => opts.memtree.unreachable,
+    anthropicUnreachable: () => upstream.unreachable,
     modelNotices: new ModelContextNotices(),
     usageUrl: opts.memtree.usageDashboardUrl,
     sessionStartNotice: opts.sessionStartNotice,
@@ -7331,8 +7342,11 @@ function refuseWholeRequest(
   // A refused key or a paused one: a retry cannot fix either, so it is final at once.
   const keyInvalid = args.state.keyInvalid();
   const unpaid = keyInvalid ? null : args.state.pausedDetail();
+  // MemTree can't be reached: nothing says the request can't fit, so no strike (2026-11-09).
+  const offline = keyInvalid || unpaid !== null ? undefined : unreachableNow(args.state);
   const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
     : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
+    : offline ? unreachableRefusal(offline.message)
     : args.state.fallbackFailures.fail(args.routeKey,
       { awaitingIndex: args.rec.indexBehind === true,
         indexSecondsLeft: activeIndexWaits.get(args.rec) });
@@ -7347,7 +7361,8 @@ function refuseWholeRequest(
     delete args.rec.compaction?.keptPrefix;
   }
   delete args.rec.degradedNotice;
-  if (unpaid === null && !keyInvalid) noteSlowRetry(args, failure);
+  // An unreachable MemTree's 503 says why itself: not "slow to answer".
+  if (unpaid === null && !keyInvalid && !offline) noteSlowRetry(args, failure);
   args.state.diagnostics?.record("refusal", {
     status: failure.status, attempt: failure.attempt,
     input_ktokens: Math.round(inputTokens / 1000), budget_ktokens: Math.round(budgetTokens / 1000),
@@ -7359,6 +7374,7 @@ function refuseWholeRequest(
     outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
     budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
     ...(keyInvalid ? { keyInvalid: true } : {}),
+    ...(offline ? { unreachable: offline.what } : {}),
   };
   if (unpaid !== null || keyInvalid) cancelPausedNotice(args.state, args.rec);
   if (args.res.headersSent || args.res.destroyed) return false;
@@ -7370,6 +7386,20 @@ function refuseWholeRequest(
   // The refusal named the key: it counts as the key notice on the user's screen.
   if (keyInvalid && args.rec.routeLane === "main") args.state.keyNotice.markShown();
   return false;
+}
+
+/**
+ * Why a request only MemTree could fit can't go now, when MemTree's latest call could not
+ * connect (recently): the internet when Anthropic's latest forward could not either.
+ */
+function unreachableNow(
+  state: ProxyState
+): { message: string; what: "memtree" | "internet" } | undefined {
+  const memtree = freshFailure(state.memtreeUnreachable());
+  if (!memtree) return undefined;
+  const anthropic = freshFailure(state.anthropicUnreachable());
+  return { message: unreachableMessage(memtree, anthropic),
+    what: anthropic ? "internet" : "memtree" };
 }
 
 /**
@@ -7675,6 +7705,7 @@ function forwardAccepted(
         headers,
       },
       (upstreamRes) => {
+        upstream.unreachable = undefined;
         activeUpstreamRes = upstreamRes;
         const contentType = String(upstreamRes.headers["content-type"] ?? "");
         const isSse = contentType.includes("text/event-stream");
@@ -7937,9 +7968,7 @@ function forwardAccepted(
     );
 
     upstreamReq.on("error", (err) => {
-      if (!shutdownCancelled) {
-        sendAnthropicError(res, `upstream connection failed: ${err.message}`);
-      }
+      if (!shutdownCancelled) sendAnthropicError(res, upstreamFailureMessage(upstream, err));
       settle(false);
     });
 
@@ -8095,6 +8124,7 @@ function passThroughStreaming(
           upstreamRes.destroy();
           return;
         }
+        upstream.unreachable = undefined;
         activeUpstreamRes = upstreamRes;
         const onUpstreamResponseEnd = () => {
           upstreamResponseEnded = true;
@@ -8140,7 +8170,7 @@ function passThroughStreaming(
       pendingErrorResponse = true;
       if (upstreamReq) req.unpipe(upstreamReq);
       activeUpstreamRes?.unpipe(res);
-      sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+      sendAnthropicError(res, upstreamFailureMessage(upstream, err));
       if (res.writableFinished) onDownstreamFinish();
     });
     try {
@@ -8173,6 +8203,17 @@ function forwardableResponseHeaders(
     out[key] = value;
   }
   return out;
+}
+
+/**
+ * The 502 text for a forward that got no answer: plainly that ccc can't reach Anthropic
+ * when it could not connect (noted on `upstream`), else the error as it came.
+ */
+function upstreamFailureMessage(upstream: Upstream, err: Error): string {
+  const failure = networkFailureOf(err, upstream.host);
+  if (!failure) return `upstream connection failed: ${err.message}`;
+  upstream.unreachable = failure;
+  return unreachableMessage(undefined, failure);
 }
 
 /** Well-formed Anthropic-shaped error body so Claude Code fails fast, not weird. */

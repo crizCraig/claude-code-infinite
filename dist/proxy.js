@@ -41,7 +41,8 @@
 import { UNKNOWN_INDEX_WAIT_SECONDS } from "./index-wait-413.js";
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
-import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal } from "./route-fallback.js";
+import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
+import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
 import { extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, } from "./route-identity.js";
@@ -352,6 +353,8 @@ export function startProxy(opts) {
         pausedDetail: () => opts.memtree.pausedDetail,
         pausedReason: () => opts.memtree.pausedReason,
         memtreeAnswering: () => opts.memtree.answering,
+        memtreeUnreachable: () => opts.memtree.unreachable,
+        anthropicUnreachable: () => upstream.unreachable,
         modelNotices: new ModelContextNotices(),
         usageUrl: opts.memtree.usageDashboardUrl,
         sessionStartNotice: opts.sessionStartNotice,
@@ -5538,10 +5541,13 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     // A refused key or a paused one: a retry cannot fix either, so it is final at once.
     const keyInvalid = args.state.keyInvalid();
     const unpaid = keyInvalid ? null : args.state.pausedDetail();
+    // MemTree can't be reached: nothing says the request can't fit, so no strike (2026-11-09).
+    const offline = keyInvalid || unpaid !== null ? undefined : unreachableNow(args.state);
     const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
         : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
-            : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
-                indexSecondsLeft: activeIndexWaits.get(args.rec) });
+            : offline ? unreachableRefusal(offline.message)
+                : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
+                    indexSecondsLeft: activeIndexWaits.get(args.rec) });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -5553,7 +5559,8 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         delete args.rec.compaction?.keptPrefix;
     }
     delete args.rec.degradedNotice;
-    if (unpaid === null && !keyInvalid)
+    // An unreachable MemTree's 503 says why itself: not "slow to answer".
+    if (unpaid === null && !keyInvalid && !offline)
         noteSlowRetry(args, failure);
     args.state.diagnostics?.record("refusal", {
         status: failure.status, attempt: failure.attempt,
@@ -5566,6 +5573,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         outputReservation: bodyOutputReservation(args.body), indexBehind: args.rec.indexBehind === true,
         budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
         ...(keyInvalid ? { keyInvalid: true } : {}),
+        ...(offline ? { unreachable: offline.what } : {}),
     };
     if (unpaid !== null || keyInvalid)
         cancelPausedNotice(args.state, args.rec);
@@ -5580,6 +5588,18 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     if (keyInvalid && args.rec.routeLane === "main")
         args.state.keyNotice.markShown();
     return false;
+}
+/**
+ * Why a request only MemTree could fit can't go now, when MemTree's latest call could not
+ * connect (recently): the internet when Anthropic's latest forward could not either.
+ */
+function unreachableNow(state) {
+    const memtree = freshFailure(state.memtreeUnreachable());
+    if (!memtree)
+        return undefined;
+    const anthropic = freshFailure(state.anthropicUnreachable());
+    return { message: unreachableMessage(memtree, anthropic),
+        what: anthropic ? "internet" : "memtree" };
 }
 /**
  * A repeated retryable refusal on the main thread: say once per streak that
@@ -5857,6 +5877,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             path: req.url, // path + query string verbatim (?beta=true etc.)
             headers,
         }, (upstreamRes) => {
+            upstream.unreachable = undefined;
             activeUpstreamRes = upstreamRes;
             const contentType = String(upstreamRes.headers["content-type"] ?? "");
             const isSse = contentType.includes("text/event-stream");
@@ -6114,9 +6135,8 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             });
         });
         upstreamReq.on("error", (err) => {
-            if (!shutdownCancelled) {
-                sendAnthropicError(res, `upstream connection failed: ${err.message}`);
-            }
+            if (!shutdownCancelled)
+                sendAnthropicError(res, upstreamFailureMessage(upstream, err));
             settle(false);
         });
         upstreamReq.end(bodyBuffer);
@@ -6267,6 +6287,7 @@ function passThroughStreaming(req, res, upstream, shutdownSignal) {
                 upstreamRes.destroy();
                 return;
             }
+            upstream.unreachable = undefined;
             activeUpstreamRes = upstreamRes;
             const onUpstreamResponseEnd = () => {
                 upstreamResponseEnded = true;
@@ -6312,7 +6333,7 @@ function passThroughStreaming(req, res, upstream, shutdownSignal) {
             if (upstreamReq)
                 req.unpipe(upstreamReq);
             activeUpstreamRes?.unpipe(res);
-            sendAnthropicError(res, `upstream connection failed: ${err.message}`);
+            sendAnthropicError(res, upstreamFailureMessage(upstream, err));
             if (res.writableFinished)
                 onDownstreamFinish();
         });
@@ -6345,6 +6366,17 @@ function forwardableResponseHeaders(upstreamRes) {
         out[key] = value;
     }
     return out;
+}
+/**
+ * The 502 text for a forward that got no answer: plainly that ccc can't reach Anthropic
+ * when it could not connect (noted on `upstream`), else the error as it came.
+ */
+function upstreamFailureMessage(upstream, err) {
+    const failure = networkFailureOf(err, upstream.host);
+    if (!failure)
+        return `upstream connection failed: ${err.message}`;
+    upstream.unreachable = failure;
+    return unreachableMessage(undefined, failure);
 }
 /** Well-formed Anthropic-shaped error body so Claude Code fails fast, not weird. */
 function sendAnthropicError(res, message) {
