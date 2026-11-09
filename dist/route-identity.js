@@ -148,7 +148,8 @@ function portableContent(content) {
 }
 function isEmptyText(part) {
     return typeof part === "string" ? part === "" :
-        part?.type === "text" && part.text === "" && Object.keys(part).length === 2;
+        part?.type === "text" && part.text === "" &&
+            Object.keys(part).every((key) => key === "type" || key === "text" || key === "cache_control");
 }
 function parsedJsonValues(input) {
     const out = {};

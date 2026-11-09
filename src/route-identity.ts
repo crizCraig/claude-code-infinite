@@ -169,7 +169,8 @@ function portableContent(content: unknown): unknown {
 
 function isEmptyText(part: any): boolean {
   return typeof part === "string" ? part === "" :
-    part?.type === "text" && part.text === "" && Object.keys(part).length === 2;
+    part?.type === "text" && part.text === "" &&
+    Object.keys(part).every((key) => key === "type" || key === "text" || key === "cache_control");
 }
 
 function parsedJsonValues(input: Record<string, unknown>): Record<string, unknown> {
