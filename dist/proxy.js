@@ -365,7 +365,7 @@ export function startProxy(opts) {
         mainNoticePending: false,
         mainPromptGeneration: 0,
         promptAccounting: new PromptAccounting(),
-        fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs),
+        fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs, opts.indexWaitMaxMs),
         refusalStreaks: new RefusalStreaks(),
         activeSubagents: new Set(),
         deferredAgentIndexes: new Map(),
@@ -1158,6 +1158,8 @@ async function handleMessages(req, res, opts, upstream, state) {
     };
     // The prompt this request was made for, before any await (Codex r2 P2).
     noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
+    // An index wait may hold this request (runBlockingCompression) until Claude Code leaves.
+    indexHolds.set(rec, { started: received, closed: closedSignal(res) });
     const logged = async (forward) => {
         try {
             await forward;
@@ -4307,6 +4309,87 @@ function cloneJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
 /**
+ * A compress call that, while MemTree answers that its index is still catching up on
+ * this conversation (an indexing 413, index-wait-413.ts), holds the request and asks
+ * again at the server's pace instead of refusing at once: up to INDEX_HOLD_MS per
+ * request, below Claude Code's wait for a first byte. A wait it cannot finish here is
+ * left to the refusal (rec.indexBehind), whose 503 says how long is left and has Claude
+ * Code retry, until the lane's deadline (route-fallback.ts). Only when nothing else could
+ * be sent (longBudget): a ride on an earlier prefix, or a request that fits, goes at once.
+ * Never for a background call (its record is a copy) or a 413 that waiting cannot fix.
+ */
+async function runBlockingCompression(args) {
+    for (;;) {
+        const outcome = await runBlockingCompressionOnce(args);
+        if (outcome.indexWaitSeconds === undefined)
+            return outcome;
+        noteIndexWait413(args.rec, outcome.indexWaitSeconds);
+        if (!(await holdForIndex(args, outcome.indexWaitSeconds)))
+            return outcome;
+    }
+}
+/** One request's index hold: when it arrived, and a signal for Claude Code leaving. */
+const indexHolds = new WeakMap();
+/** The most one request is held for an index (Claude Code 2.1.319 waits 180 s for headers). */
+const INDEX_HOLD_MS = 120_000;
+/** The longest pause between asks while held (the server's Retry-After, when shorter). */
+const INDEX_POLL_MAX_MS = 30_000;
+/** An indexing 413: refusing this request waits for the index, saying how long is left. */
+function noteIndexWait413(rec, seconds) {
+    rec.indexBehind = true;
+    rec.indexWait = { secondsLeft: seconds, asks: (rec.indexWait?.asks ?? 0) + 1,
+        heldMs: rec.indexWait?.heldMs ?? 0 };
+}
+/**
+ * Pause before asking MemTree again, when another ask fits this request's hold; false when
+ * it does not (or the estimate is past the cap, or Claude Code or the proxy left).
+ */
+async function holdForIndex(args, seconds) {
+    const hold = indexHolds.get(args.rec);
+    if (!hold || args.longBudget !== true)
+        return false;
+    if (args.state.fallbackFailures.hopeless(seconds))
+        return false;
+    const pause = Math.min(seconds * 1000, args.opts.indexPollMaxMs ?? INDEX_POLL_MAX_MS);
+    const nextAsk = args.rec.compress?.ms ?? 0;
+    if (Date.now() + pause + nextAsk - hold.started > (args.opts.indexHoldMs ?? INDEX_HOLD_MS)) {
+        return false;
+    }
+    const signals = [hold.closed, args.state.shutdownSignal, args.signal]
+        .filter((signal) => signal !== undefined);
+    const paused = Date.now();
+    const waited = await abortableDelay(pause, signals);
+    if (args.rec.indexWait)
+        args.rec.indexWait.heldMs += Date.now() - paused;
+    return waited;
+}
+/** Wait `ms`; false at once if any signal aborts first (or already has). */
+function abortableDelay(ms, signals) {
+    if (signals.some((signal) => signal.aborted))
+        return Promise.resolve(false);
+    return new Promise((resolve) => {
+        const done = (waited) => {
+            clearTimeout(timer);
+            for (const signal of signals)
+                signal.removeEventListener("abort", aborted);
+            resolve(waited);
+        };
+        const aborted = () => done(false);
+        // Unref'd: a hold never keeps the process open.
+        const timer = setTimeout(() => done(true), ms);
+        timer.unref();
+        for (const signal of signals)
+            signal.addEventListener("abort", aborted, { once: true });
+    });
+}
+/** Aborted when Claude Code closes this response before it finished. */
+function closedSignal(res) {
+    const controller = new AbortController();
+    res.once("close", () => { if (!res.writableFinished)
+        controller.abort(); });
+    return controller.signal;
+}
+/**
  * The blocking-compression step, shared by the main followup path and
  * tool-route miss recovery: the compress call plus the `compress` telemetry
  * record. Callers own downstream-close tracking (compression promises are
@@ -4316,7 +4399,7 @@ function cloneJson(value) {
  * `checkCompressedHistory(result, msgsForMemtree).usable` must hold before
  * the result may be forwarded or become a route.
  */
-async function runBlockingCompression(args) {
+async function runBlockingCompressionOnce(args) {
     const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } = args;
     const compaction = args.compaction ??
         laneCompaction(opts, state, args.sessionId, body.model, modelContextLimit);
@@ -4392,6 +4475,8 @@ async function runBlockingCompression(args) {
         opts.memtree.lastCompressFailureArming(hash, modelContextLimit, compressMeta);
     const failureStatus = result === null
         ? opts.memtree.lastCompressFailureStatus?.(hash, modelContextLimit, compressMeta) : undefined;
+    const indexWaitSeconds = !cached && failureStatus === OVER_CONTEXT_STATUS
+        ? opts.memtree.lastCompressIndexWait?.(hash, modelContextLimit, compressMeta) : undefined;
     const hadLiveSuccess = !cached && result !== null;
     // Only arming-class live failures (network error, timeout, 5xx, 402) are
     // fuse evidence. A responsive server's other 4xx failed THIS call but says
@@ -4424,6 +4509,7 @@ async function runBlockingCompression(args) {
             : hadLiveFailure
                 ? "failure"
                 : "none",
+        ...(indexWaitSeconds !== undefined ? { indexWaitSeconds } : {}),
     };
 }
 /**
@@ -4663,6 +4749,10 @@ async function recoverToolRouteMiss(args) {
     if (!result) {
         rec.routeRecovery = { conversationBytes, outcome: "failed" };
         releaseOwnReservation();
+        // MemTree's 413 for an index still catching up (runBlockingCompression held for it):
+        // its call started that index, and growth cannot help, so the next turn asks again.
+        if (rec.indexWait)
+            return forwardOriginal(false);
         // An ordinary server/network failure or timeout retains the background
         // submission: its longer independent budget can still warm the index for
         // a later turn. An unpaid key (402, possibly set by this very compress)
@@ -5365,7 +5455,8 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const unpaid = keyInvalid ? null : args.state.pausedDetail();
     const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
         : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
-            : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true });
+            : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
+                indexSecondsLeft: args.rec.indexWait?.secondsLeft });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).

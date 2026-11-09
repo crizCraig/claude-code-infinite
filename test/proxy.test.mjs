@@ -11532,7 +11532,7 @@ test("while the tree builds, an uncounted over-bound original waits for the inde
       assert.equal(rec.routeRecovery.outcome, "awaiting-index", id);
       assert.equal(answer.status, 503, id);
       assert.equal(answer.retryAfter, "30", id);
-      assert.match(answer.body.error.message, /still indexing/, id);
+      assert.match(answer.body.error.message, /catching up on this session.s index/, id);
     }
     assert.equal(blockingCalls(), 1, "no compress call while the tree is building");
     assert.equal(upstream.seen.filter((c) => !c.isCount).length, 0);

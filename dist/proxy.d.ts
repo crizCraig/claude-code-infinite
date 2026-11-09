@@ -128,6 +128,15 @@ export interface ProxyOptions {
     awaitedIndexWaitTimeoutMs?: number;
     /** Bound on retrying an unfit request while MemTree indexes (route-fallback.ts). */
     indexWaitDeadlineMs?: number;
+    /** Cap on waiting for an index whose time left MemTree stated (default 15 min). */
+    indexWaitMaxMs?: number;
+    /**
+     * How long one request is held, re-asking MemTree, while its index catches up before
+     * Claude Code is told to retry (default INDEX_HOLD_MS); test-only overrides.
+     */
+    indexHoldMs?: number;
+    /** Longest pause between those re-asks (default INDEX_POLL_MAX_MS). */
+    indexPollMaxMs?: number;
     /**
      * How long a compress answer from a lagging index keeps answering identical
      * retries before MemTree is asked again (default: the 503 retry-after).
@@ -666,7 +675,20 @@ interface BlockingCompressionOutcome {
     result: CompressResult | null;
     /** Current server-health evidence contributed by this blocking operation. */
     liveHealth: "success" | "failure" | "none";
+    /** MemTree's 413 said its index is catching up: the seconds of indexing it stated. */
+    indexWaitSeconds?: number;
 }
+/**
+ * A compress call that, while MemTree answers that its index is still catching up on
+ * this conversation (an indexing 413, index-wait-413.ts), holds the request and asks
+ * again at the server's pace instead of refusing at once: up to INDEX_HOLD_MS per
+ * request, below Claude Code's wait for a first byte. A wait it cannot finish here is
+ * left to the refusal (rec.indexBehind), whose 503 says how long is left and has Claude
+ * Code retry, until the lane's deadline (route-fallback.ts). Only when nothing else could
+ * be sent (longBudget): a ride on an earlier prefix, or a request that fits, goes at once.
+ * Never for a background call (its record is a copy) or a 413 that waiting cannot fix.
+ */
+declare function runBlockingCompression(args: Parameters<typeof runBlockingCompressionOnce>[0]): Promise<BlockingCompressionOutcome>;
 /**
  * The blocking-compression step, shared by the main followup path and
  * tool-route miss recovery: the compress call plus the `compress` telemetry
@@ -677,7 +699,7 @@ interface BlockingCompressionOutcome {
  * `checkCompressedHistory(result, msgsForMemtree).usable` must hold before
  * the result may be forwarded or become a route.
  */
-declare function runBlockingCompression(args: {
+declare function runBlockingCompressionOnce(args: {
     opts: ProxyOptions;
     state: ProxyState;
     body: Record<string, any>;

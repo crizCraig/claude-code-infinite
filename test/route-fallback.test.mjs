@@ -48,7 +48,7 @@ test("an index wait answers 503 with a longer retry-after and spends no strikes"
     assert.equal(error.status, 503);
     assert.equal(error.headers["x-should-retry"], "true");
     assert.equal(error.headers["retry-after"], "30");
-    assert.match(error.body.error.message, /indexing/);
+    assert.match(error.body.error.message, /catching up on this session.s index/);
   }
   // The strike budget is untouched by the wait.
   assert.equal(failures.fail("session/main", { now: 1_000 }).status, 503);

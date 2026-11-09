@@ -26,6 +26,14 @@ export interface RouteFallbackError {
 
 /** How long a lane may wait for MemTree to finish indexing before refusing. */
 export const INDEX_WAIT_DEADLINE_MS = 10 * 60_000;
+/**
+ * The most a lane waits for an index whose time left the server stated (a 413's
+ * Retry-After): longer estimates refuse at once, and later ones extend a wait only to here.
+ */
+export const INDEX_WAIT_MAX_MS = 15 * 60_000;
+/** A stated time left is waited for this much longer (estimates run over: 2026-11-09). */
+export const INDEX_WAIT_MARGIN_RATIO = 0.5;
+export const INDEX_WAIT_MARGIN_MS = 2 * 60_000;
 /** Seconds Claude Code waits between retries while the index catches up. */
 export const INDEX_WAIT_RETRY_AFTER_SECONDS = 30;
 
@@ -42,6 +50,8 @@ export interface FallbackFailureContext {
    * for indexing instead of spending the strike budget.
    */
   awaitingIndex?: boolean;
+  /** The server's estimate of the indexing left (seconds), when it stated one. */
+  indexSecondsLeft?: number;
   now?: number;
 }
 
@@ -54,20 +64,27 @@ export interface FallbackFailureContext {
  */
 export class RouteFallbackFailures {
   private readonly failures = new Map<string, number>();
-  /** Lane -> when its index wait began (its deadline is fixed from then). */
-  private readonly indexWaits = new Map<string, number>();
+  /** Lane -> when its index wait began and when it ends. */
+  private readonly indexWaits = new Map<string, { started: number; deadline: number }>();
 
   constructor(
     private readonly capacity = 128,
+    /** A wait's length when the server stated no time left. */
     private readonly indexWaitMs = INDEX_WAIT_DEADLINE_MS,
+    private readonly indexWaitMaxMs = INDEX_WAIT_MAX_MS,
   ) {}
 
   fail(lane: string, context: FallbackFailureContext = {}): RouteFallbackError {
     if (context.awaitingIndex) {
-      const waiting = this.waitForIndex(lane, context.now ?? Date.now());
+      const waiting = this.waitForIndex(lane, context.now ?? Date.now(), context.indexSecondsLeft);
       if (waiting) return waiting;
     }
     return this.strike(lane);
+  }
+
+  /** Whether a stated time left is too long to wait for at all (refused at once). */
+  hopeless(secondsLeft: number | undefined): boolean {
+    return secondsLeft !== undefined && secondsLeft * 1000 > this.indexWaitMaxMs;
   }
 
   succeeded(lane: string): void {
@@ -89,35 +106,59 @@ export class RouteFallbackFailures {
   }
 
   /**
-   * A 503 while the lane's wait is within its deadline; a 400 once it passes.
-   * The deadline is fixed when the wait starts and only a delivery clears it:
-   * an expired wait becomes a terminal strike state, and an active wait is
-   * never evicted. A lane already refused, or arriving while every wait slot
-   * is active, gets no wait (undefined) and falls back to the strikes.
+   * A 503 while the lane's wait is within its deadline; a 400 once it passes, or at once
+   * for a stated time left past the cap. The deadline is set when the wait starts (the
+   * stated time plus a margin, else indexWaitMs); a later stated time may extend it up to
+   * indexWaitMaxMs from the start, and only a delivery clears it: an expired wait becomes
+   * a terminal strike state, and an active wait is never evicted. A lane already refused,
+   * or arriving while every wait slot is active, gets no wait (undefined) and falls back
+   * to the strikes.
    */
-  private waitForIndex(lane: string, now: number): RouteFallbackError | undefined {
+  private waitForIndex(
+    lane: string, now: number, secondsLeft: number | undefined
+  ): RouteFallbackError | undefined {
     const wait = this.indexWaits.get(lane);
     if (wait === undefined) {
       if ((this.failures.get(lane) ?? 0) >= 3) return undefined;
+      if (this.hopeless(secondsLeft)) return this.refuseHopeless(lane);
       this.retireExpiredWaits(now);
       if (this.indexWaits.size >= this.capacity) return undefined;
-      this.indexWaits.set(lane, now);
-      return this.indexWaitError(lane);
+      this.indexWaits.set(lane, { started: now, deadline: this.deadline(now, now, secondsLeft) });
+      return this.indexWaitError(lane, secondsLeft);
     }
-    if (now - wait < this.indexWaitMs) return this.indexWaitError(lane);
+    if (secondsLeft !== undefined) {
+      wait.deadline = Math.max(wait.deadline, this.deadline(wait.started, now, secondsLeft));
+    }
+    if (now < wait.deadline) return this.indexWaitError(lane, secondsLeft);
     this.retire(lane);
     return refusal(3);
   }
 
-  private indexWaitError(lane: string): RouteFallbackError {
-    return retryError(this.failures.get(lane) ?? 0, String(INDEX_WAIT_RETRY_AFTER_SECONDS),
-      INDEX_WAIT_MESSAGE);
+  /** When a wait begun at `started` ends, given the time left stated at `now`. */
+  private deadline(started: number, now: number, secondsLeft: number | undefined): number {
+    if (secondsLeft === undefined) return started + this.indexWaitMs;
+    const ms = secondsLeft * 1000;
+    return Math.min(started + this.indexWaitMaxMs,
+      now + ms + ms * INDEX_WAIT_MARGIN_RATIO + INDEX_WAIT_MARGIN_MS);
+  }
+
+  /** The final refusal, at once: the strike state, so no retry waits again. */
+  private refuseHopeless(lane: string): RouteFallbackError {
+    if (this.failures.has(lane) || this.failures.size < this.capacity) this.failures.set(lane, 3);
+    return refusal(3);
+  }
+
+  private indexWaitError(lane: string, secondsLeft: number | undefined): RouteFallbackError {
+    const retryAfter = secondsLeft === undefined ? INDEX_WAIT_RETRY_AFTER_SECONDS
+      : Math.max(1, Math.min(INDEX_WAIT_RETRY_AFTER_SECONDS, Math.ceil(secondsLeft)));
+    return retryError(this.failures.get(lane) ?? 0, String(retryAfter),
+      indexWaitStatus(secondsLeft));
   }
 
   /** Free the slots of waits past their deadline, keeping them refused. */
   private retireExpiredWaits(now: number): void {
-    for (const [lane, started] of this.indexWaits) {
-      if (now - started >= this.indexWaitMs) this.retire(lane);
+    for (const [lane, wait] of this.indexWaits) {
+      if (now >= wait.deadline) this.retire(lane);
     }
   }
 
@@ -135,9 +176,21 @@ export class RouteFallbackFailures {
 
 const RETRY_MESSAGE =
   "MemTree could not produce a usable compressed request; retrying within a bounded limit.";
-const INDEX_WAIT_MESSAGE =
-  "MemTree is still indexing this conversation, so it does not fit the model's context " +
-  "window yet; retrying once indexing catches up.";
+/**
+ * The one-line status a waiting turn shows (Claude Code prints a 503's message on its
+ * retry line): how long the server expects, when it said.
+ */
+export function indexWaitStatus(secondsLeft: number | undefined): string {
+  const left = secondsLeft === undefined ? "" : `, ${timeLeftText(secondsLeft)} left`;
+  return `MemTree is catching up on this session's index${left}. ` +
+    "This turn continues on its own once it's ready.";
+}
+
+/** "about 1 minute", "about 5 minutes" (whole minutes, rounded up). */
+export function timeLeftText(seconds: number): string {
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  return minutes === 1 ? "about 1 minute" : `about ${minutes} minutes`;
+}
 
 /**
  * The refusal while MemTree is paused (402): only compression could fit the

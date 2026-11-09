@@ -158,6 +158,12 @@ export interface MessagesRecord {
    * its page). If the request then cannot fit, the refusal waits for indexing.
    */
   indexBehind?: true;
+  /**
+   * MemTree answered 413 because its index is still catching up (index-wait-413.ts):
+   * the seconds of indexing it said were left (the latest), how many compress calls got
+   * that answer, and how long the request was held between them.
+   */
+  indexWait?: { secondsLeft: number; asks: number; heldMs: number };
   /** Body bytes actually sent to Anthropic (after notice strip / compression). */
   forwardedBytes?: number;
   /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */

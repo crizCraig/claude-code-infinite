@@ -16,6 +16,14 @@ export interface RouteFallbackError {
 }
 /** How long a lane may wait for MemTree to finish indexing before refusing. */
 export declare const INDEX_WAIT_DEADLINE_MS: number;
+/**
+ * The most a lane waits for an index whose time left the server stated (a 413's
+ * Retry-After): longer estimates refuse at once, and later ones extend a wait only to here.
+ */
+export declare const INDEX_WAIT_MAX_MS: number;
+/** A stated time left is waited for this much longer (estimates run over: 2026-11-09). */
+export declare const INDEX_WAIT_MARGIN_RATIO = 0.5;
+export declare const INDEX_WAIT_MARGIN_MS: number;
 /** Seconds Claude Code waits between retries while the index catches up. */
 export declare const INDEX_WAIT_RETRY_AFTER_SECONDS = 30;
 export declare const FINAL_REFUSAL_MESSAGE: string;
@@ -26,6 +34,8 @@ export interface FallbackFailureContext {
      * for indexing instead of spending the strike budget.
      */
     awaitingIndex?: boolean;
+    /** The server's estimate of the indexing left (seconds), when it stated one. */
+    indexSecondsLeft?: number;
     now?: number;
 }
 /**
@@ -37,23 +47,35 @@ export interface FallbackFailureContext {
  */
 export declare class RouteFallbackFailures {
     private readonly capacity;
+    /** A wait's length when the server stated no time left. */
     private readonly indexWaitMs;
+    private readonly indexWaitMaxMs;
     private readonly failures;
-    /** Lane -> when its index wait began (its deadline is fixed from then). */
+    /** Lane -> when its index wait began and when it ends. */
     private readonly indexWaits;
-    constructor(capacity?: number, indexWaitMs?: number);
+    constructor(capacity?: number, 
+    /** A wait's length when the server stated no time left. */
+    indexWaitMs?: number, indexWaitMaxMs?: number);
     fail(lane: string, context?: FallbackFailureContext): RouteFallbackError;
+    /** Whether a stated time left is too long to wait for at all (refused at once). */
+    hopeless(secondsLeft: number | undefined): boolean;
     succeeded(lane: string): void;
     /** The bounded three-strike episode: 503, 503, then 400 until delivery. */
     private strike;
     /**
-     * A 503 while the lane's wait is within its deadline; a 400 once it passes.
-     * The deadline is fixed when the wait starts and only a delivery clears it:
-     * an expired wait becomes a terminal strike state, and an active wait is
-     * never evicted. A lane already refused, or arriving while every wait slot
-     * is active, gets no wait (undefined) and falls back to the strikes.
+     * A 503 while the lane's wait is within its deadline; a 400 once it passes, or at once
+     * for a stated time left past the cap. The deadline is set when the wait starts (the
+     * stated time plus a margin, else indexWaitMs); a later stated time may extend it up to
+     * indexWaitMaxMs from the start, and only a delivery clears it: an expired wait becomes
+     * a terminal strike state, and an active wait is never evicted. A lane already refused,
+     * or arriving while every wait slot is active, gets no wait (undefined) and falls back
+     * to the strikes.
      */
     private waitForIndex;
+    /** When a wait begun at `started` ends, given the time left stated at `now`. */
+    private deadline;
+    /** The final refusal, at once: the strike state, so no retry waits again. */
+    private refuseHopeless;
     private indexWaitError;
     /** Free the slots of waits past their deadline, keeping them refused. */
     private retireExpiredWaits;
@@ -64,6 +86,13 @@ export declare class RouteFallbackFailures {
      */
     private retire;
 }
+/**
+ * The one-line status a waiting turn shows (Claude Code prints a 503's message on its
+ * retry line): how long the server expects, when it said.
+ */
+export declare function indexWaitStatus(secondsLeft: number | undefined): string;
+/** "about 1 minute", "about 5 minutes" (whole minutes, rounded up). */
+export declare function timeLeftText(seconds: number): string;
 /**
  * The refusal while MemTree is paused (402): only compression could fit the
  * request, and a retry cannot pay, so it is final at once and outside the

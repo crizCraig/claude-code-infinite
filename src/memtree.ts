@@ -27,6 +27,7 @@ import { extendsHistory, mediaFreeMessageHash } from "./route-identity.js";
 import type { PaymentLinkCache } from "./payment-link.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
+import { indexWaitFrom413 } from "./index-wait-413.js";
 import {
   IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs,
 } from "./image-refs.js";
@@ -1070,6 +1071,8 @@ export class MemtreeClient {
   private compressFailureArming = new Map<string, boolean>();
   /** HTTP status of each key's latest failed compress (absent: no response). */
   private compressFailureStatus = new Map<string, number>();
+  /** Seconds of indexing left, for a key whose latest compress was an indexing 413. */
+  private compressFailureIndexWait = new Map<string, number>();
 
   /**
    * Non-null when the server last answered 402 (unpaid MemTree key): the
@@ -1289,6 +1292,19 @@ export class MemtreeClient {
   }
 
   /**
+   * When the latest failed compress of this request was MemTree's 413 for an index still
+   * catching up (index-wait-413.ts): the seconds of indexing it said were left. Sampled at
+   * its settle like lastCompressFailureStatus; undefined for any other failure.
+   */
+  lastCompressIndexWait(
+    hash: string,
+    modelContextLimit: number,
+    meta?: CompressRequestMeta
+  ): number | undefined {
+    return this.compressFailureIndexWait.get(this.compressKey(hash, modelContextLimit, meta));
+  }
+
+  /**
    * Blocking user-turn compression. Returns null on ANY failure (timeout,
    * network, 4xx/5xx including 402) — the caller must degrade to passthrough.
    * On 402 the failure is additionally recorded in paymentRequiredDetail so
@@ -1354,6 +1370,7 @@ export class MemtreeClient {
         const first = this.compressFailureStatus.keys().next().value;
         if (first !== undefined) this.compressFailureStatus.delete(first);
       }
+      noteIndexWait(this.compressFailureIndexWait, cacheKey, err?.indexWaitSeconds);
       // Don't cache failures — drop the entry so retries (e.g. Claude Code's
       // automatic retry of an identical request) hit the server again.
       if (this.compressCache.get(cacheKey) === promise) {
@@ -2003,7 +2020,9 @@ export class MemtreeClient {
         // failure for the fuse without parsing message text.
         throw Object.assign(
           new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`),
-          { status: response.status }
+          { status: response.status,
+            indexWaitSeconds: indexWaitFrom413(response.status, text,
+              response.headers.get("retry-after")) }
         );
       }
 
@@ -2373,4 +2392,15 @@ function scaledTimeout(baseMs: number, bytes: number, perKiB: number): number {
 function indexLaneKey(sessionId: string | undefined, messages: Message[]): string {
   const first = messages.find((message) => message.role !== "system");
   return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
+}
+
+/** Record (or clear) a key's indexing-413 wait, bounded like the other failure maps. */
+function noteIndexWait(map: Map<string, number>, key: string, seconds: unknown): void {
+  map.delete(key);
+  if (typeof seconds !== "number") return;
+  map.set(key, seconds);
+  if (map.size > DEDUPE_CACHE_MAX) {
+    const first = map.keys().next().value;
+    if (first !== undefined) map.delete(first);
+  }
 }
