@@ -140,7 +140,8 @@ async function harness(refusal, options = {}) {
     if (req.method === "GET") { res.statusCode = 202; return res.end("{}"); }
     if (body.index_only) return res.end(JSON.stringify({ messages: [], index_only: true }));
     h.compressCalls++;
-    const delay = h.delays?.[h.compressCalls - 1] ?? 0;
+    const slow = h.slowWhen?.(body) ?? 0;
+    const delay = slow || (h.delays?.[h.compressCalls - 1] ?? 0);
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     if (res.destroyed) return;
     if (h.answers?.[h.compressCalls - 1]) {
@@ -327,4 +328,19 @@ test("indexWaitDeadline: the lane's deadline while open, undefined once closed",
   const failures = new RouteFallbackFailures();
   assert.equal(failures.indexWaitDeadline("l", 10, 0), 135_000);
   assert.equal(failures.indexWaitDeadline("l", undefined, 135_000), undefined);
+});
+
+test("a turn arriving while its lane waits for the index asks within its own hold (Codex r3)", async () => {
+  const h = await harness(indexing(240), { indexHoldMs: 600 });
+  const other = [...humanMessages.slice(0, 2), { role: "user", content: "slow" }];
+  h.slowWhen = (body) => JSON.stringify(body.messages ?? []).includes('"slow"') ? 5_000 : 0;
+  try {
+    const first = post(h, humanMessages);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const started = Date.now();
+    const second = await post(h, other);
+    assert.ok(Date.now() - started < 1_500, `${Date.now() - started} ms`);
+    assert.equal(second.status, 503);
+    assert.equal((await first).status, 503);
+  } finally { h.close(); }
 });

@@ -5865,7 +5865,7 @@ interface BlockingCompressionOutcome {
 async function runBlockingCompression(
   args: Parameters<typeof runBlockingCompressionOnce>[0]
 ): Promise<BlockingCompressionOutcome> {
-  let capMs: number | undefined;
+  let capMs = laneHeldCap(args);
   for (;;) {
     const outcome = await runBlockingCompressionOnce(capMs === undefined ? args
       : { ...args, capMs });
@@ -5881,6 +5881,18 @@ async function runBlockingCompression(
     capMs = await holdForIndex(args, outcome.indexWaitSeconds);
     if (capMs === undefined) return outcome;
   }
+}
+
+/**
+ * While the lane waits for its index (another request held it, likely this one's wait
+ * too), a request's first ask gets only what is left of its own hold: its time waiting
+ * for the lane already counts toward Claude Code's first-byte wait.
+ */
+function laneHeldCap(args: Parameters<typeof runBlockingCompressionOnce>[0]): number | undefined {
+  const hold = indexHolds.get(args.rec);
+  if (!hold || hold.lane === undefined) return undefined;
+  if (!args.state.fallbackFailures.indexWaiting(hold.lane)) return undefined;
+  return Math.max(1, (args.opts.indexHoldMs ?? INDEX_HOLD_MS) - (Date.now() - hold.started));
 }
 
 /** One request's index hold: when it arrived, its lane, and a signal for Claude Code leaving. */
@@ -7112,7 +7124,8 @@ async function truncatedToFit(
  */
 function compressionSettled(rec: MessagesRecord): boolean {
   // An indexing 413 is MemTree's refusal too: the safety net may still fit the request.
-  if (rec.indexBehind === true && !activeIndexWaits.has(rec)) return false;
+  if (activeIndexWaits.has(rec)) return true;
+  if (rec.indexBehind === true) return false;
   if (rec.compress?.refused === true || rec.compaction?.prepared === "used") return true;
   return rec.compress?.ok === true && rec.routeRecovery?.outcome !== "noop" &&
     rec.turnType !== "followup-noop";

@@ -108,6 +108,12 @@ export class RouteFallbackFailures {
     return state === "untracked" ? Infinity : this.indexWaits.get(lane)!.deadline;
   }
 
+  /** Whether the lane is waiting for its index (a wait started, not yet ended). */
+  indexWaiting(lane: string): boolean {
+    const wait = this.indexWaits.get(lane);
+    return wait !== undefined && !wait.over;
+  }
+
   /** Whether a stated time left is too long to wait for at all (refused at once). */
   hopeless(secondsLeft: number | undefined): boolean {
     return secondsLeft !== undefined && secondsLeft * 1000 > this.indexWaitMaxMs;

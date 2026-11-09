@@ -220,6 +220,36 @@ test("a failed compress's ride that delivery cannot send, sent whole instead, wa
   }
 });
 
+test("an indexing wait whose last ask timed out may still truncate (Codex r3)", async () => {
+  const outputs = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-refused-notice-"));
+  const quarter = (body) => Math.floor(JSON.stringify(body).length / 4);
+  let calls = 0;
+  const h = await harness({ count: (body) => ({ input_tokens: quarter(body) }), usage: quarter,
+    toolOutputs: new ToolOutputStore(outputs),
+    proxyOptions: { indexHoldMs: 300, indexPollMaxMs: 10 },
+    compress: async () => {
+      if (++calls > 1) await new Promise((resolve) => setTimeout(resolve, 2_000));
+      return { status: 413, body: { detail: "Memory for this conversation is being " +
+        "compressed in the background. Estimated indexing time left: about 4 minutes." } };
+    } });
+  try {
+    await h.armMainTurn("next question");
+    assert.equal(await h.post([
+      { role: "user", content: "first question" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1",
+        content: "line\n".repeat(200_000) }] },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "next question" },
+    ]), 200);
+    assert.ok(calls >= 2, `${calls} asks`);
+    assert.ok(h.lastRecord().truncatedToolResult);
+  } finally {
+    h.close();
+    fs.rmSync(outputs, { recursive: true, force: true });
+  }
+});
+
 for (const [kind, detail] of [
   ["MemTree 413", "Request exceeds the context window after compression"],
   // An indexing 413 too (review r1 P2): the safety net still fits it before any wait.
