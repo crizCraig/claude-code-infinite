@@ -33,17 +33,17 @@ export function prefixIdentity(messages, kind) {
  * placeholder. That counts only when the message has no media left, so an attachment
  * replaced by another never matches; a removed one is indistinguishable from eviction.
  * A newer Claude Code can also render the same history differently on resume (see
- * portableHash); with media evicted too, that matches as well.
+ * portableHash), media kept: an attachment replaced by another never matches there either.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
 export function prefixMessageMatches(message, kind, exact, mediaFree, portable) {
     const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
     if (hash === exact)
         return true;
-    if (carriesMedia(message.content))
-        return false;
-    return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
-        (portable !== undefined && portableHash(message, kind) === portable);
+    if (portable !== undefined && portableHash(message, kind) === portable)
+        return true;
+    return mediaFree !== undefined && !carriesMedia(message.content) &&
+        mediaFreeHash(message, kind) === mediaFree;
 }
 /**
  * Whether `newer` carries everything `older` does: every message of `older` after the
@@ -65,7 +65,7 @@ function mediaFreeHash(message, kind) {
     return messageHash(message, kind === "stable" && stableShape(message), "media-free");
 }
 /**
- * A media-free identity that also ignores how Claude Code renders unchanged history,
+ * An identity (media kept) that also ignores how Claude Code renders unchanged history,
  * which differs between versions (2.1.302 -> 2.1.319 on 2026-11-09): a reminder inside
  * a tool result's text or in a block of its own, a tool result's text as a string or a
  * text block, a tool input value as the JSON string the model sent or parsed.
@@ -94,7 +94,7 @@ function messageHash(message, stable, mode) {
     }
     const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
     const reminded = normalizeReminders(blocks);
-    const kept = mode === "exact" ? reminded : withoutMedia(reminded);
+    const kept = mode === "media-free" ? withoutMedia(reminded) : reminded;
     const normalized = {
         ...message, content: stripBlockCache(mode === "portable" ? portableContent(kept) : kept),
     };
@@ -151,23 +151,52 @@ function isEmptyText(part) {
         part?.type === "text" && part.text === "" &&
             Object.keys(part).every((key) => key === "type" || key === "text" || key === "cache_control");
 }
+/** Defined properties only (Object.fromEntries keeps an own `__proto__` key as data). */
 function parsedJsonValues(input) {
-    const out = {};
-    for (const [key, value] of Object.entries(input))
-        out[key] = parsedJson(value);
-    return out;
+    return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, parsedJson(value)]));
 }
-/** A string holding a JSON object or array, parsed; any other value as it is. */
+/**
+ * A string holding a JSON object or array, parsed, when parsing loses nothing: the string
+ * is the parse's own serialization apart from whitespace between tokens. Anything lossy
+ * (duplicate keys, numbers past double precision or written another way, escapes
+ * JSON.stringify would not write) stays the string it is, so it matches only itself.
+ */
 function parsedJson(value) {
     if (typeof value !== "string" || !/^\s*[[{]/.test(value))
         return value;
+    let parsed;
     try {
-        const parsed = JSON.parse(value);
-        return parsed && typeof parsed === "object" ? parsed : value;
+        parsed = JSON.parse(value);
     }
     catch {
         return value;
     }
+    if (!parsed || typeof parsed !== "object")
+        return value;
+    return JSON.stringify(parsed) === withoutJsonWhitespace(value) ? parsed : value;
+}
+/** JSON text without the whitespace between its tokens (strings kept as written). */
+function withoutJsonWhitespace(text) {
+    let out = "";
+    let inString = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            out += ch;
+            if (ch === "\\")
+                out += text[++i] ?? "";
+            else if (ch === '"')
+                inString = false;
+        }
+        else if (ch === '"') {
+            inString = true;
+            out += ch;
+        }
+        else if (ch !== " " && ch !== "\n" && ch !== "\r" && ch !== "\t") {
+            out += ch;
+        }
+    }
+    return out;
 }
 function isPlainObject(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);

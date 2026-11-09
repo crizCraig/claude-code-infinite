@@ -19,7 +19,7 @@ export declare function prefixIdentity(messages: Message[], kind: PrefixIdentity
  * placeholder. That counts only when the message has no media left, so an attachment
  * replaced by another never matches; a removed one is indistinguishable from eviction.
  * A newer Claude Code can also render the same history differently on resume (see
- * portableHash); with media evicted too, that matches as well.
+ * portableHash), media kept: an attachment replaced by another never matches there either.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
 export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined, portable?: string): boolean;

@@ -179,3 +179,45 @@ test("a prefix still covers messages a newer Claude Code renders differently on 
       plainId.originalMediaFreeHashes[0], plainId.originalPortableHashes[0]));
   }
 });
+
+test("a portable match never equates different content (Codex r1)", () => {
+  for (const kind of ["route", "stable"]) {
+    const ids = (message) => prefixIdentity([message], kind);
+    const matches = (message, id) => prefixMessageMatches(message, kind,
+      id.originalPrefixHashes[0], id.originalMediaFreeHashes[0], id.originalPortableHashes[0]);
+    const use = (input) => ({ role: "assistant",
+      content: [{ type: "tool_use", id: "u", name: "Write", input }] });
+    // JSON.parse is lossy: these strings would parse to the same value.
+    for (const [a, b] of [
+      ['{"n":9007199254740992}', '{"n":9007199254740993}'],
+      ['{"a":1,"a":2}', '{"a":2}'],
+      ['{"a":1.0}', '{"a":1}'],
+      ['{"a":"\\u0041"}', '{"a":"A"}'],
+    ]) {
+      assert.ok(!matches(use({ content: b }), ids(use({ content: a }))), `${kind}: ${a} vs ${b}`);
+    }
+    const lossy = '{"n":9007199254740993}';
+    assert.ok(!matches(use({ content: JSON.parse(lossy) }), ids(use({ content: lossy }))),
+      `${kind}: a lossy string is not its parse`);
+    // An own __proto__ key is data, not the prototype.
+    const proto = (value) => use(JSON.parse(`{"__proto__":{"v":"${value}"},"content":"same"}`));
+    assert.ok(!matches(proto("new"), ids(proto("old"))), `${kind}: own __proto__ keys differ`);
+    assert.ok(matches(proto("old"), ids(proto("old"))), `${kind}: same __proto__ data`);
+  }
+});
+
+test("a reminder moved beside unchanged media still matches; replaced media does not", () => {
+  const reminder = "<system-reminder>\nAttribution lines\n</system-reminder>";
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const before = { role: "user", content: [{ type: "tool_result", tool_use_id: "t",
+    content: [{ type: "text", text: `shot.\n\n${reminder}` }, image("AAAA")] }] };
+  const after = (data) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: "t",
+    content: [{ type: "text", text: "shot." }, image(data)] }, { type: "text", text: `${reminder}\n` }] });
+  for (const kind of ["route", "stable"]) {
+    const id = prefixIdentity([before], kind);
+    const matches = (message) => prefixMessageMatches(message, kind, id.originalPrefixHashes[0],
+      id.originalMediaFreeHashes[0], id.originalPortableHashes[0]);
+    assert.ok(matches(after("AAAA")), `${kind}: same image, reminder moved`);
+    assert.ok(!matches(after("BBBB")), `${kind}: another image`);
+  }
+});
