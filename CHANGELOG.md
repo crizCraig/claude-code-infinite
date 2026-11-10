@@ -1,5 +1,50 @@
 # Changelog
 
+## [1.0.34](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.33...v1.0.34) (2026-11-10)
+
+
+### Features
+
+* cross-session search shows each hit's summary and matching lines ([a32d420](https://github.com/crizCraig/claude-code-infinite/commit/a32d4202ea2fbfef63ff34c165a104fc8d8595bd))
+* MemTree tools say which sessions they cover and why a search came back empty ([#61](https://github.com/crizCraig/claude-code-infinite/issues/61)) ([42b4dc0](https://github.com/crizCraig/claude-code-infinite/commit/42b4dc02619e8ca7b0e15effefa54ccd1db2006b))
+* MemTree tools show when each message was written ([#59](https://github.com/crizCraig/claude-code-infinite/issues/59)) ([158daa2](https://github.com/crizCraig/claude-code-infinite/commit/158daa262feb5755a3edb4cf4de50025163f7adf))
+* MemTree user_messages and handover tools ([58d3dc0](https://github.com/crizCraig/claude-code-infinite/commit/58d3dc02aa088e489eb2efc5eeb397cb82b13976))
+* point headless agents at other sessions' MemTree work ([#62](https://github.com/crizCraig/claude-code-infinite/issues/62)) ([1f6e33f](https://github.com/crizCraig/claude-code-infinite/commit/1f6e33fbb228fd423e00b6c20f2287594aea96ce))
+* X-Polychat-Index-Pending: true on a 413 is an index wait; the status says it is an estimate ([7c680d8](https://github.com/crizCraig/claude-code-infinite/commit/7c680d865e242f8176694c6983eab2cf351c71d7))
+
+
+### Bug Fixes
+
+* a backed-off turn's own late compress that can't connect is a network refusal (Codex r2 P2) ([797d447](https://github.com/crizCraig/claude-code-infinite/commit/797d44707223ce005e483da3d27c5c02c3539077))
+* a happy-eyeballs connect failure counts as a failed connect (review r2 P3) ([5ef268f](https://github.com/crizCraig/claude-code-infinite/commit/5ef268f8e4634314f3e14decead46d8deaf4a4aa))
+* a lane backing off after MemTree's misfit answer keeps the fit refusal (Codex r1 P2) ([bce5964](https://github.com/crizCraig/claude-code-infinite/commit/bce5964a6d04a19ef82db5afa72182f51448ba15))
+* a lane's backoff or cooldown armed while MemTree was unreachable ends once it answers ([b0a5174](https://github.com/crizCraig/claude-code-infinite/commit/b0a5174d2dd07c5e158c9d17f4ceddfa1714f8b5))
+* a request queued before its lane's index wait began keeps its bound after a delivery (Codex r5) ([eb78b96](https://github.com/crizCraig/claude-code-infinite/commit/eb78b9600fa4c4e76dc4dd2300aeac48d2d460af))
+* a stored JSON string matches only its parse; re-render plus eviction composes (Codex r2) ([873af48](https://github.com/crizCraig/claude-code-infinite/commit/873af48a65a27cee687327cae368575a2495c424))
+* a stored prefix survives a model switch that drops ToolSearch's "Tool loaded." note ([d43d482](https://github.com/crizCraig/claude-code-infinite/commit/d43d482de8137a46877e2b7541e79525418e2aaa))
+* a turn on an index-waiting lane asks within its own hold; a timed-out re-ask may truncate (Codex r3) ([804ea96](https://github.com/crizCraig/claude-code-infinite/commit/804ea968829dcc92755ee57eb9eba877db32f6d6))
+* a turn that arrived during an index wait keeps its bound; its cut-short ask is that wait (Codex r4) ([7feadad](https://github.com/crizCraig/claude-code-infinite/commit/7feadad092f4c193a6f2f5d60dcfb11ba51048e5))
+* a vector group ranked over only the newest trees warns even with no hits (Codex r1 P2) ([e99435d](https://github.com/crizCraig/claude-code-infinite/commit/e99435d6c38435c69c84e5d0a296758eccf1d0b2))
+* an empty charged search says it was charged; README states the search price (review r1) ([58bf125](https://github.com/crizCraig/claude-code-infinite/commit/58bf12519d619c5f669cd6e5debd7fee94a46497))
+* an empty text block with a cache marker is still a rendering choice (review r1 P3) ([2c2bb5b](https://github.com/crizCraig/claude-code-infinite/commit/2c2bb5ba90bdc9dab87a27a68994478147dc01bf))
+* drop a stale comment: a vector 422 is no longer charged (review r1) ([43cd922](https://github.com/crizCraig/claude-code-infinite/commit/43cd92257df20575620edb2339ce32de15083b65))
+* handover waits for a first pack, page notes, follow-up arguments (review r1) ([3f848db](https://github.com/crizCraig/claude-code-infinite/commit/3f848db293328c9476da07ba45a03d527cb26d55))
+* hold a turn while MemTree's index catches up instead of refusing it ([f4e8f78](https://github.com/crizCraig/claude-code-infinite/commit/f4e8f78abab11020cd1b5a01755b38295273c49a))
+* index holds end with the lane's wait; a joined indexing 413 may truncate (Codex r2) ([d2803e5](https://github.com/crizCraig/claude-code-infinite/commit/d2803e5dc3b24a39b75f8ca82f3f481a54ab6629))
+* index holds stay within their bound and end when MemTree answers otherwise (review r1) ([c754cdf](https://github.com/crizCraig/claude-code-infinite/commit/c754cdf513417a19e5d4f55d63e5c2db8c7ad486))
+* keep a persisted prefix across Claude Code re-rendering old messages on resume ([9ffea5e](https://github.com/crizCraig/claude-code-infinite/commit/9ffea5e52c609d07ac29bbe70d7a3c13cc280200))
+* MemTree "current" fallback re-checks a served index, and a failed or unusable lookup is unknown (Codex r1 P2s) ([abce372](https://github.com/crizCraig/claude-code-infinite/commit/abce372610fe0875cd2050d650d25ab2d97f986d))
+* MemTree "current" falls back to the server's tree for this session when the proxy has none ([8c1435e](https://github.com/crizCraig/claude-code-infinite/commit/8c1435e6d68f86dd52744ad45db9fc8a70d47437))
+* MemTree "current" says unknown, not "no tree", for an expired answer it cannot refresh or a server without the sessions endpoint (Codex r2 P2s) ([0fd3b24](https://github.com/crizCraig/claude-code-infinite/commit/0fd3b24313cb9072ae33db7c02b300b1795f7d12))
+* MemTree search guidance says a search costs $0.0005 in either mode ([6bef954](https://github.com/crizCraig/claude-code-infinite/commit/6bef954956b4a8a7e0d842dc9069fe5b8d80d7fa))
+* only a request's own unanswered compress, and only a failed connect, reads as offline (review r1) ([8ea09f2](https://github.com/crizCraig/claude-code-infinite/commit/8ea09f21981db81967948832111344132176b970))
+* portable identity keeps media and parses only lossless JSON inputs (Codex r1) ([c9815e8](https://github.com/crizCraig/claude-code-infinite/commit/c9815e8b08ad1a52222803dce2fbea2bf5145b67))
+* portable matching holds each still-string JSON input to its stored string (Codex r3) ([d10f1ca](https://github.com/crizCraig/claude-code-infinite/commit/d10f1caf00ba946dd63282d9d417af6714a1cadd))
+* say ccc can't reach MemTree or the internet instead of blaming the context fit ([8d0fdc4](https://github.com/crizCraig/claude-code-infinite/commit/8d0fdc44369288f08298c5be2fced2e708cd66be))
+* send an oversized compress with unconfirmed image references instead of not sending it ([e32ee21](https://github.com/crizCraig/claude-code-infinite/commit/e32ee2161a4f7c94e146832ef2761d16acf73e01))
+* the memtree tools follow the session their Claude Code process is on ([3f6b22c](https://github.com/crizCraig/claude-code-infinite/commit/3f6b22c554d287256d862f87cda2fb1a78ec6bed))
+* two ToolSearch calls in one turn leave two "Tool loaded." notes (review r1 P2) ([7b61bfa](https://github.com/crizCraig/claude-code-infinite/commit/7b61bfa715a028f3930716b8a9fef61f4e84d9b1))
+
 ## [1.0.33](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.32...v1.0.33) (2026-10-31)
 
 
