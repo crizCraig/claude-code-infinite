@@ -268,12 +268,12 @@ test("production transport uses the bearer key and aborts a stalled response bod
 test("current tells a server with no tree apart from a lookup that failed", async () => {
   const replies = [500, { sessions: [item("session-1", null)] }, 500];
   const { lookup, clock } = scripted((_q, call) => replies[call]);
-  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: false });
+  assert.deepEqual(await lookup.current("session-1"), { answered: false });
   clock.t += NEWEST_TREE_TTL_MS;
-  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: true });
+  assert.deepEqual(await lookup.current("session-1"), { answered: true });
   clock.t += NEWEST_TREE_TTL_MS;
   // A failed refresh does not keep "none": the tree may exist by now.
-  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: false });
+  assert.deepEqual(await lookup.current("session-1"), { answered: false });
 });
 
 test("current keeps a known tree through a failed refresh", async () => {
@@ -285,14 +285,25 @@ test("current keeps a known tree through a failed refresh", async () => {
   assert.deepEqual(await lookup.current("session-1"), known);
 });
 
-test("current: an unusable tree is unknown, a server without the endpoint has none", async () => {
+test("current: an unusable tree, or a server without the endpoint, is unknown", async () => {
   const broken = { ...item("session-1", NEW_ID), latest_tree: { request_id: NEW_ID, links: { url: "javascript:x" } } };
   const { lookup } = scripted(() => ({ sessions: [broken] }));
-  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: false });
+  assert.deepEqual(await lookup.current("session-1"), { answered: false });
+  // Without the endpoint the server may still hold a tree: unknown, not "none".
   const old = scripted(() => 404);
-  assert.deepEqual(await old.lookup.current("session-1"), { answered: true });
-  assert.deepEqual(await old.lookup.current("session-2"), { answered: true });
+  assert.deepEqual(await old.lookup.current("session-1"), { answered: false });
+  assert.deepEqual(await old.lookup.current("session-2"), { answered: false });
   assert.equal(old.asked.length, 1, "not asked again while unsupported");
+});
+
+test("current: an expired \"none\" that cannot be refreshed is unknown", async () => {
+  const replies = [{ sessions: [item("session-1", null)] }, 404];
+  const { lookup, clock, asked } = scripted((_q, call) => replies[call]);
+  assert.deepEqual(await lookup.current("session-1"), { answered: true });
+  clock.t += NEWEST_TREE_TTL_MS;
+  assert.deepEqual(await lookup.current("session-1"), { answered: false }, "refresh failed: 404");
+  assert.deepEqual(await lookup.current("session-1"), { answered: false }, "unsupported: no refresh");
+  assert.equal(asked.length, 2);
 });
 
 test("current answers this session's tree and never another's", async () => {
@@ -300,6 +311,6 @@ test("current answers this session's tree and never another's", async () => {
   assert.deepEqual(await lookup.current("session-1"), {
     tree: { url: NEW_URL, key: `${NEW_ID}-v1-own` }, answered: true,
   });
-  assert.deepEqual(await lookup.current("session-3"), { tree: undefined, answered: true });
-  assert.deepEqual(await lookup.current("../x"), { tree: undefined, answered: false });
+  assert.deepEqual(await lookup.current("session-3"), { answered: true });
+  assert.deepEqual(await lookup.current("../x"), { answered: false });
 });

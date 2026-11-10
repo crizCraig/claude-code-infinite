@@ -65,8 +65,10 @@ export declare class NewestTreeLookup {
     settle(sessionId: string | undefined, waitMs?: number): Promise<NewestTree | undefined>;
     /**
      * `settle`, saying whether the server answered for this session, so "no
-     * tree" is told apart from "could not ask" (`/memtree/current`). A server
-     * without the sessions endpoint has no tree to offer: answered, none.
+     * tree" is told apart from "could not ask" (`/memtree/current`). Only a
+     * fresh answer says "none": an expired one that could not be refreshed
+     * (capacity, a server without the endpoint) is unknown, while a known tree
+     * is kept. Waits at most twice `waitMs` (once more after an invalidation).
      */
     current(sessionId: string, waitMs?: number): Promise<NewestTreeAnswer>;
     /**

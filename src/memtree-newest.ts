@@ -112,8 +112,10 @@ export class NewestTreeLookup {
 
   /**
    * `settle`, saying whether the server answered for this session, so "no
-   * tree" is told apart from "could not ask" (`/memtree/current`). A server
-   * without the sessions endpoint has no tree to offer: answered, none.
+   * tree" is told apart from "could not ask" (`/memtree/current`). Only a
+   * fresh answer says "none": an expired one that could not be refreshed
+   * (capacity, a server without the endpoint) is unknown, while a known tree
+   * is kept. Waits at most twice `waitMs` (once more after an invalidation).
    */
   async current(sessionId: string, waitMs = NEWEST_TREE_CURRENT_WAIT_MS): Promise<NewestTreeAnswer> {
     await this.settle(sessionId, waitMs);
@@ -122,8 +124,9 @@ export class NewestTreeLookup {
       await this.settle(sessionId, waitMs);
     }
     const entry = this.entries.get(sessionId);
-    if (!entry && this.now() < this.unsupportedUntil) return { answered: true };
-    return { tree: entry?.tree, answered: entry?.answered ?? false };
+    if (!entry) return { answered: false };
+    if (entry.tree) return { tree: entry.tree, answered: entry.answered };
+    return { answered: entry.answered && this.now() - entry.fetchedAt < this.ttlMs };
   }
 
   /**
@@ -207,9 +210,9 @@ export class NewestTreeLookup {
           (s: { session_id?: unknown } | null) => s?.session_id === sessionId
         ) as { latest_tree?: unknown } | undefined;
         if (exact) {
-          // An unusable tree is not "none": keep what was known, like a failure.
           if (exact.latest_tree === null || exact.latest_tree === undefined) return answer();
           const tree = newestTreeFrom(body, sessionId);
+          // An unusable tree is not "none": keep what was known, like a failure.
           return tree ? answer(tree) : entry();
         }
         const cursor = body.next_cursor;

@@ -692,7 +692,8 @@ async function handleMemTreeFinder(req, res, opts, upstreamPath, url) {
  * MCP server can keep its cached tree until the page changes; `current.json`
  * relays the page JSON itself, like `/memtree/<id>.json`. With no page here,
  * the server's newest tree for the session (currentPageOrServerTree): that
- * costs at most one bounded lookup, cached; 503 when it could not be asked.
+ * waits a bounded time (NewestTreeLookup.current), cached; 503 when the
+ * server could not be asked.
  *
  * Every pointer is scoped to the caller's exact session id. Missing session
  * ids never fall back to another conversation served by the same proxy.
