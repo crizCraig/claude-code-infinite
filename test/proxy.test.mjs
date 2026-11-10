@@ -11161,7 +11161,64 @@ test("the newest-tree link never shows another session's tree", async () => {
     for (const s of ["session-1", "session-3", "session-4"]) {
       assert.ok(!(await view(s)).body.reason.includes(OTHER_URL), s);
     }
-    assert.equal(await getCurrentId(proxy, "session-3"), 404, "the MCP pointer is not the newest tree");
+    // With no page of its own here, "current" falls back to the server's tree for
+    // exactly this session (never session-2's); none on the server stays a 404.
+    assert.equal(await getCurrentId(proxy, "session-3"), `${NEWEST_REQUEST_ID}-v3-own`);
+    assert.equal(await getCurrentId(proxy, "session-4"), 404);
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+// After a ccc restart, a long session whose history goes only as index-only calls
+// (or rides a stored prefix) has no served index in this process: "current" must
+// still name the session's own tree on the server (staging session e32c1f3e).
+test("/memtree/current falls back to the server's newest tree of exactly this session", async () => {
+  const { lookup, asked } = await newestLookup((q) => {
+    if (q === "restarted") return { sessions: [sessionsItem("restarted", NEWEST_REQUEST_ID)] };
+    if (q === "quoted") return { sessions: [sessionsItem("other", OTHER_REQUEST_ID)], next_cursor: null };
+    if (q === "empty") return { sessions: [{ session_id: "empty", latest_tree: null }] };
+    return 500;
+  });
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }), newestTrees: lookup,
+  });
+  const current = (s) => fetch(`http://127.0.0.1:${proxy.port}/memtree/current?session=${s}`);
+  try {
+    const res = await current("restarted");
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      id: `${NEWEST_REQUEST_ID}-v3-own`, url: NEWEST_URL, index: `${NEWEST_REQUEST_ID}-v3-own`,
+      session_id: "restarted", compressed: false,
+    });
+    assert.equal(await getCurrentId(proxy, "restarted"), `${NEWEST_REQUEST_ID}-v3-own`);
+    assert.equal(asked.filter((q) => q === "restarted").length, 1, "the answer is cached");
+    // Another session that merely quotes this id is never this session's tree.
+    const quoted = await current("quoted");
+    assert.equal(quoted.status, 404);
+    assert.match((await quoted.json()).detail, /No MemTree page for this session yet/);
+    assert.equal(await getCurrentId(proxy, "empty"), 404);
+    // A lookup that failed is not "no tree": the MCP tools say MemTree is unavailable.
+    const down = await current("down");
+    assert.equal(down.status, 503);
+    assert.match((await down.json()).detail, /could not ask the MemTree server/);
+    assert.equal(await getCurrentId(proxy, ""), 404, "no session id: never a fallback");
+  } finally { proxy.close(); }
+});
+
+test("/memtree/current leaves the server's fallback tree once a real served index arrives", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup });
+  try {
+    assert.equal(await getCurrentId(proxy, "session-1"), `${NEWEST_REQUEST_ID}-v3-own`);
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    assert.equal(await getCurrentId(proxy, "session-1"), "ea18af90658b", "the served page wins");
   } finally {
     proxy.close();
     upstream.close();
@@ -11373,6 +11430,7 @@ test("a stalled newest-tree lookup does not delay messages or cross clear/fork s
     })));
     assert.ok(views[0].body.reason.includes(NEWEST_URL));
     for(const view of views.slice(1)) assert.match(view.body.reason,/no page yet/);
+    // The server has no tree for them (q answers only session-1): still no "current".
     assert.equal(await getCurrentId(proxy,'cleared'),404);
     assert.equal(await getCurrentId(proxy,'forked'),404);
   } finally { release(); proxy.close(); upstream.close(); memtreeSrv.close(); }

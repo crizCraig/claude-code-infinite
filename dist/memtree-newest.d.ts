@@ -11,9 +11,12 @@
  * sessions can quote that id. The older exact-session pages endpoint excludes
  * index-only calls and does not identify completed trees, so cannot answer this.
  *
- * Only the user-facing link uses this. The memory's source page stays what
- * `/memtree/current` (the MCP tools' `tree: "current"`) answers, since the
- * node ids in the memory message belong to that tree.
+ * The user-facing link uses this. `/memtree/current` (the MCP tools' `tree:
+ * "current"`) keeps answering the memory's source page, since the node ids in
+ * the memory message belong to that tree, and falls back to this (`current`)
+ * only when this process has no page for the session: after a restart, a
+ * session whose history goes as index-only calls has a tree on the server but
+ * no served index here.
  *
  * Never blocks a request: `peek` answers from the cache and refreshes in the
  * background; `settle` waits a bounded time, for hooks that can afford it.
@@ -27,6 +30,8 @@ export declare const NEWEST_TREE_UNSUPPORTED_MS: number;
 export declare const NEWEST_TREE_WAIT_MS = 2500;
 /** A lookup that has not answered by then is dropped; the next peek retries. */
 export declare const NEWEST_TREE_FETCH_TIMEOUT_MS = 10000;
+/** Most `/memtree/current` waits: an MCP tool call can afford one whole lookup. */
+export declare const NEWEST_TREE_CURRENT_WAIT_MS = 10000;
 export declare const SESSION_ID: RegExp;
 export interface NewestTree {
     /** The server-selected page, including its pinned namespace and source. */
@@ -39,6 +44,11 @@ export type NewestTreeFetch = (pathAndQuery: string, signal: AbortSignal) => Pro
     status: number;
     body: Buffer;
 }>;
+/** `answered`: the server listed this session's tree or its absence (not a failure). */
+export interface NewestTreeAnswer {
+    tree?: NewestTree;
+    answered: boolean;
+}
 export declare class NewestTreeLookup {
     private readonly fetchPath;
     private readonly now;
@@ -53,6 +63,11 @@ export declare class NewestTreeLookup {
     peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
     settle(sessionId: string | undefined, waitMs?: number): Promise<NewestTree | undefined>;
+    /**
+     * `settle`, saying whether the server ever answered for this session, so
+     * "no tree" is told apart from "could not ask" (`/memtree/current`).
+     */
+    current(sessionId: string, waitMs?: number): Promise<NewestTreeAnswer>;
     /**
      * Forget a session's answer and ask again: a newer compress page just
      * arrived, so a cached or in-flight answer may predate it.

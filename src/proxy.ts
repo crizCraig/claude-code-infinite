@@ -1476,7 +1476,9 @@ async function handleMemTreeFinder(
  * reads (memtree-mcp.ts). Bare `current` answers the pointer
  * `{id, url, index, session_id, compressed}` without an upstream call, so the
  * MCP server can keep its cached tree until the page changes; `current.json`
- * relays the page JSON itself, like `/memtree/<id>.json`.
+ * relays the page JSON itself, like `/memtree/<id>.json`. With no page here,
+ * the server's newest tree for the session (currentPageOrServerTree): that
+ * costs at most one bounded lookup, cached; 503 when it could not be asked.
  *
  * Every pointer is scoped to the caller's exact session id. Missing session
  * ids never fall back to another conversation served by the same proxy.
@@ -1489,11 +1491,13 @@ async function handleMemTreeCurrent(
   url: URL
 ): Promise<void> {
   const sessionId = url.searchParams.get("session") || undefined;
-  const page = currentMemorySourcePage(state, sessionId);
+  const found = await currentPageOrServerTree(state, sessionId);
+  const page = "page" in found ? found.page : undefined;
   const id = page ? memtreePageId(page.url) : undefined;
   if (!page || !id) {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ detail: "No MemTree page for this session yet" }));
+    const unknown = "unknown" in found;
+    res.writeHead(unknown ? 503 : 404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ detail: unknown ? CURRENT_LOOKUP_FAILED : "No MemTree page for this session yet" }));
     return;
   }
   if (!url.pathname.endsWith(".json")) {
@@ -1528,6 +1532,33 @@ async function handleMemTreeCurrent(
 }
 
 const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+const CURRENT_LOOKUP_FAILED =
+  "This process has no MemTree page for this session and could not ask the MemTree server for one";
+
+type CurrentPage = { url: string; index: string; compressed: boolean; sessionId?: string };
+
+/**
+ * The session's page here (currentMemorySourcePage), else its newest completed
+ * tree on the server (`/v1/memtree/sessions`, this account's own sessions,
+ * exact session id only; cached by NewestTreeLookup and superseded as soon as
+ * a served index is noted). After a restart, a session whose history goes as
+ * index-only calls or rides a stored prefix gets no served index here, while
+ * the server has its whole tree. `unknown`: the server could not be asked.
+ */
+async function currentPageOrServerTree(
+  state: ProxyState,
+  sessionId: string | undefined
+): Promise<{ page?: CurrentPage } | { unknown: true }> {
+  const page = currentMemorySourcePage(state, sessionId);
+  if (page || !sessionId || !state.newestTrees || !SESSION_ID_HEADER_VALUE.test(sessionId)) {
+    return { page };
+  }
+  const answer = await state.newestTrees.current(sessionId);
+  if (answer.tree) {
+    return { page: { url: answer.tree.url, index: answer.tree.key, compressed: false, sessionId } };
+  }
+  return answer.answered ? {} : { unknown: true };
+}
 
 /** The page whose memory is in the prompt, else (none adopted yet) the newest page. */
 function currentMemorySourcePage(

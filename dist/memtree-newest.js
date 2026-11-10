@@ -11,9 +11,12 @@
  * sessions can quote that id. The older exact-session pages endpoint excludes
  * index-only calls and does not identify completed trees, so cannot answer this.
  *
- * Only the user-facing link uses this. The memory's source page stays what
- * `/memtree/current` (the MCP tools' `tree: "current"`) answers, since the
- * node ids in the memory message belong to that tree.
+ * The user-facing link uses this. `/memtree/current` (the MCP tools' `tree:
+ * "current"`) keeps answering the memory's source page, since the node ids in
+ * the memory message belong to that tree, and falls back to this (`current`)
+ * only when this process has no page for the session: after a restart, a
+ * session whose history goes as index-only calls has a tree on the server but
+ * no served index here.
  *
  * Never blocks a request: `peek` answers from the cache and refreshes in the
  * background; `settle` waits a bounded time, for hooks that can afford it.
@@ -27,6 +30,8 @@ export const NEWEST_TREE_UNSUPPORTED_MS = 30 * 60_000;
 export const NEWEST_TREE_WAIT_MS = 2_500;
 /** A lookup that has not answered by then is dropped; the next peek retries. */
 export const NEWEST_TREE_FETCH_TIMEOUT_MS = 10_000;
+/** Most `/memtree/current` waits: an MCP tool call can afford one whole lookup. */
+export const NEWEST_TREE_CURRENT_WAIT_MS = NEWEST_TREE_FETCH_TIMEOUT_MS;
 /** `q` also matches titles/snippets that quote the id; follow bounded pages. */
 const SESSIONS_LIMIT = 10;
 const MAX_SESSIONS = 200;
@@ -75,6 +80,19 @@ export class NewestTreeLookup {
         if (timer)
             clearTimeout(timer);
         return answer ? this.entries.get(sessionId)?.tree : cached;
+    }
+    /**
+     * `settle`, saying whether the server ever answered for this session, so
+     * "no tree" is told apart from "could not ask" (`/memtree/current`).
+     */
+    async current(sessionId, waitMs = NEWEST_TREE_CURRENT_WAIT_MS) {
+        await this.settle(sessionId, waitMs);
+        // A newer page invalidated the lookup it waited on: wait for its replacement.
+        if (!this.entries.has(sessionId) && this.inFlight.has(sessionId)) {
+            await this.settle(sessionId, waitMs);
+        }
+        const entry = this.entries.get(sessionId);
+        return { tree: entry?.tree, answered: entry?.answered ?? false };
     }
     /**
      * Forget a session's answer and ask again: a newer compress page just
@@ -140,8 +158,11 @@ export class NewestTreeLookup {
     }
     /** All pages share one deadline; failures retain the last known answer. */
     async ask(sessionId, signal) {
-        const previous = this.entries.get(sessionId)?.tree;
-        const entry = (tree = previous) => ({ tree, fetchedAt: this.now() });
+        const known = this.entries.get(sessionId);
+        const entry = () => ({
+            tree: known?.tree, fetchedAt: this.now(), answered: known?.answered ?? false,
+        });
+        const answer = (tree) => ({ tree, fetchedAt: this.now(), answered: true });
         const query = new URLSearchParams({ q: sessionId, limit: String(SESSIONS_LIMIT) });
         const cursors = new Set();
         try {
@@ -158,11 +179,10 @@ export class NewestTreeLookup {
                     return entry();
                 const exact = body.sessions.some((s) => s?.session_id === sessionId);
                 if (exact)
-                    return { tree: newestTreeFrom(body, sessionId), fetchedAt: this.now() };
+                    return answer(newestTreeFrom(body, sessionId));
                 const cursor = body.next_cursor;
-                if (cursor === null || cursor === undefined || cursor === "") {
-                    return { fetchedAt: this.now() };
-                }
+                if (cursor === null || cursor === undefined || cursor === "")
+                    return answer();
                 if (typeof cursor !== "string" || cursors.has(cursor))
                     return entry();
                 cursors.add(cursor);

@@ -264,3 +264,23 @@ test("production transport uses the bearer key and aborts a stalled response bod
     await new Promise(resolve=>server.close(resolve));
   }
 });
+
+test("current tells a server with no tree apart from a lookup that failed", async () => {
+  const replies = [500, { sessions: [item("session-1", null)] }, 500];
+  const { lookup, clock } = scripted((_q, call) => replies[call]);
+  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: false });
+  clock.t += NEWEST_TREE_TTL_MS;
+  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: true });
+  clock.t += NEWEST_TREE_TTL_MS;
+  // A later failure keeps the last definite answer.
+  assert.deepEqual(await lookup.current("session-1"), { tree: undefined, answered: true });
+});
+
+test("current answers this session's tree and never another's", async () => {
+  const { lookup } = scripted((q) => ({ sessions: [item("session-2", OLD_ID), ...(q === "session-1" ? [item("session-1", NEW_ID)] : [])] }));
+  assert.deepEqual(await lookup.current("session-1"), {
+    tree: { url: NEW_URL, key: `${NEW_ID}-v1-own` }, answered: true,
+  });
+  assert.deepEqual(await lookup.current("session-3"), { tree: undefined, answered: true });
+  assert.deepEqual(await lookup.current("../x"), { tree: undefined, answered: false });
+});

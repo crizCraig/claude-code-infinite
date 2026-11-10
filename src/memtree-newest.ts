@@ -11,9 +11,12 @@
  * sessions can quote that id. The older exact-session pages endpoint excludes
  * index-only calls and does not identify completed trees, so cannot answer this.
  *
- * Only the user-facing link uses this. The memory's source page stays what
- * `/memtree/current` (the MCP tools' `tree: "current"`) answers, since the
- * node ids in the memory message belong to that tree.
+ * The user-facing link uses this. `/memtree/current` (the MCP tools' `tree:
+ * "current"`) keeps answering the memory's source page, since the node ids in
+ * the memory message belong to that tree, and falls back to this (`current`)
+ * only when this process has no page for the session: after a restart, a
+ * session whose history goes as index-only calls has a tree on the server but
+ * no served index here.
  *
  * Never blocks a request: `peek` answers from the cache and refreshes in the
  * background; `settle` waits a bounded time, for hooks that can afford it.
@@ -28,6 +31,8 @@ export const NEWEST_TREE_UNSUPPORTED_MS = 30 * 60_000;
 export const NEWEST_TREE_WAIT_MS = 2_500;
 /** A lookup that has not answered by then is dropped; the next peek retries. */
 export const NEWEST_TREE_FETCH_TIMEOUT_MS = 10_000;
+/** Most `/memtree/current` waits: an MCP tool call can afford one whole lookup. */
+export const NEWEST_TREE_CURRENT_WAIT_MS = NEWEST_TREE_FETCH_TIMEOUT_MS;
 /** `q` also matches titles/snippets that quote the id; follow bounded pages. */
 const SESSIONS_LIMIT = 10;
 const MAX_SESSIONS = 200;
@@ -48,9 +53,17 @@ export type NewestTreeFetch = (
   signal: AbortSignal
 ) => Promise<{ status: number; body: Buffer }>;
 
+/** `answered`: the server listed this session's tree or its absence (not a failure). */
+export interface NewestTreeAnswer {
+  tree?: NewestTree;
+  answered: boolean;
+}
+
 interface Entry {
   tree?: NewestTree;
   fetchedAt: number;
+  /** Some lookup got a definite answer; failures keep the last one. */
+  answered: boolean;
 }
 
 export class NewestTreeLookup {
@@ -92,6 +105,20 @@ export class NewestTreeLookup {
     ]);
     if (timer) clearTimeout(timer);
     return answer ? this.entries.get(sessionId!)?.tree : cached;
+  }
+
+  /**
+   * `settle`, saying whether the server ever answered for this session, so
+   * "no tree" is told apart from "could not ask" (`/memtree/current`).
+   */
+  async current(sessionId: string, waitMs = NEWEST_TREE_CURRENT_WAIT_MS): Promise<NewestTreeAnswer> {
+    await this.settle(sessionId, waitMs);
+    // A newer page invalidated the lookup it waited on: wait for its replacement.
+    if (!this.entries.has(sessionId) && this.inFlight.has(sessionId)) {
+      await this.settle(sessionId, waitMs);
+    }
+    const entry = this.entries.get(sessionId);
+    return { tree: entry?.tree, answered: entry?.answered ?? false };
   }
 
   /**
@@ -154,8 +181,11 @@ export class NewestTreeLookup {
 
   /** All pages share one deadline; failures retain the last known answer. */
   private async ask(sessionId: string, signal: AbortSignal): Promise<Entry | undefined> {
-    const previous = this.entries.get(sessionId)?.tree;
-    const entry = (tree = previous): Entry => ({ tree, fetchedAt: this.now() });
+    const known = this.entries.get(sessionId);
+    const entry = (): Entry => ({
+      tree: known?.tree, fetchedAt: this.now(), answered: known?.answered ?? false,
+    });
+    const answer = (tree?: NewestTree): Entry => ({ tree, fetchedAt: this.now(), answered: true });
     const query = new URLSearchParams({ q: sessionId, limit: String(SESSIONS_LIMIT) });
     const cursors = new Set<string>();
     try {
@@ -169,11 +199,9 @@ export class NewestTreeLookup {
         const body = JSON.parse(res.body.toString("utf-8"));
         if (!Array.isArray(body?.sessions)) return entry();
         const exact = body.sessions.some((s: { session_id?: unknown } | null) => s?.session_id === sessionId);
-        if (exact) return { tree: newestTreeFrom(body, sessionId), fetchedAt: this.now() };
+        if (exact) return answer(newestTreeFrom(body, sessionId));
         const cursor = body.next_cursor;
-        if (cursor === null || cursor === undefined || cursor === "") {
-          return { fetchedAt: this.now() };
-        }
+        if (cursor === null || cursor === undefined || cursor === "") return answer();
         if (typeof cursor !== "string" || cursors.has(cursor)) return entry();
         cursors.add(cursor);
         query.set("cursor", cursor);
