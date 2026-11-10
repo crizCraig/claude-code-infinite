@@ -5,12 +5,12 @@ export declare const MEMTREE_ALLOWED_TOOLS: string[];
 export declare const MEMTREE_MCP_SCRIPT: string;
 export declare function memtreeMcpEnabledByEnv(env: NodeJS.ProcessEnv): boolean;
 /** The `--mcp-config` JSON for this ccc's server, bound to its proxy. */
-export declare function memtreeMcpConfig(proxyUrl: string): object;
+export declare function memtreeMcpConfig(proxyUrl: string, hostToken?: string): object;
 export interface MemtreeMcpConfigFile {
     path: string;
     close(): void;
 }
-export declare function writeMemtreeMcpConfig(proxyUrl: string, tempRoot?: string): MemtreeMcpConfigFile;
+export declare function writeMemtreeMcpConfig(proxyUrl: string, tempRoot?: string, hostToken?: string): MemtreeMcpConfigFile;
 export interface MemtreeMcpPlan {
     /** ccc registers its own server (`--mcp-config` + `--allowedTools`). */
     register: boolean;

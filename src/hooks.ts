@@ -8,6 +8,7 @@
  * that never render text (for example, a tool-only response).
  */
 
+import { CLAUDE_PID_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -133,13 +134,16 @@ export function isMemtreeViewCommand(prompt: string): boolean {
  * and prints the proxy's JSON answer, if any. Always exits 0 with no output
  * on failure: a missing link must never surface as a hook error.
  */
+// CLAUDE_PID: Claude Code sets it for hook commands; the proxy uses it to tell its own
+// Claude Code's session starts from a teammate process's (host-session.ts).
 const RESUME_RELAY_SOURCE = `let input = "";
 process.stdin.on("data", (c) => (input += c));
 process.stdin.on("end", async () => {
   try {
     const res = await fetch(process.argv[2], {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json",
+        "${CLAUDE_PID_HEADER}": process.env.CLAUDE_PID || "" },
       body: input,
       signal: AbortSignal.timeout(4000),
     });

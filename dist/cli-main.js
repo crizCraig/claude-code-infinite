@@ -732,7 +732,7 @@ async function main() {
     let memtreeMcpConfig = null;
     if (memtreeMcpPlan.register) {
         try {
-            memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`);
+            memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`, undefined, proxy.hostToken);
             childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path, memtreeMcpPlan.tools);
         }
         catch (err) {
@@ -754,6 +754,8 @@ async function main() {
         env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`), claude),
         stdio: "inherit",
     });
+    // Its memtree MCP server asks the proxy which session this process is on.
+    proxy.setHostPid(child.pid);
     let shuttingDown = false;
     /** When the Windows console window was closed (SIGHUP): the exit drain counts from it. */
     let consoleClosedAt;

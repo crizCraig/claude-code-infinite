@@ -279,6 +279,14 @@ export interface RunningProxy {
      * then, and again after /clear until its first turn.
      */
     mainSessionId: () => string | undefined;
+    /**
+     * The pid of the Claude Code process this ccc launched. Its memtree MCP server (a
+     * child of that process) is then told which session the process is on
+     * (`/memtree/host-session`); no other caller is.
+     */
+    setHostPid: (pid: number | undefined) => void;
+    /** The secret this ccc's memtree MCP server sends to `/memtree/host-session`. */
+    hostToken: string;
 }
 /**
  * A MemTree page the server stamped on a main-conversation compress, with
@@ -350,6 +358,12 @@ interface ProxyState {
     notices: NoticeDeliveryQueue;
     /** RunningProxy.mainSessionId. */
     resumableMainSession?: string;
+    /** The session ccc's own Claude Code process is on (its newest SessionStart hook). */
+    hostSession?: string;
+    /** RunningProxy.setHostPid. */
+    hostPid?: number;
+    /** RunningProxy.hostToken. */
+    hostToken: string;
     /** Hook state affects notices only, never routing. */
     mainNoticePending: boolean;
     mainPromptId?: string;

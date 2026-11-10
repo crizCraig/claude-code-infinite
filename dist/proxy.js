@@ -50,14 +50,15 @@ import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions, p
 import { truncateToolResults } from "./tool-result-truncation.js";
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, losesMedia, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, SLOW_RETRY_NOTICE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
-import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH, } from "./hooks.js";
+import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
@@ -386,6 +387,7 @@ export function startProxy(opts) {
         routeInstallFault: opts.routeInstallFault,
         memtreePages: new Map(),
         memorySourcePages: new Map(),
+        hostToken: randomBytes(24).toString("hex"),
         memtreeCallSeq: 0,
         memtreeLinkStore: opts.memtreeLinkStore,
         stablePrefixStore: opts.stablePrefixStore,
@@ -496,6 +498,8 @@ export function startProxy(opts) {
                 },
                 drain,
                 mainSessionId: () => state.resumableMainSession,
+                setHostPid: (pid) => { state.hostPid = pid; },
+                hostToken: state.hostToken,
             });
         });
     });
@@ -535,6 +539,9 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return handleNoticeHook(req, res, state, opts.reqlog, (sessionId) => opts.memtree.scheduleFinalIndex(sessionId, (signal) => opts.transcriptUsage?.finalReplyAsync
             ? opts.transcriptUsage.finalReplyAsync(sessionId, signal)
             : opts.transcriptUsage?.finalReply?.(sessionId)));
+    }
+    if (req.method === "GET" && url.pathname === MEMTREE_HOST_SESSION_PATH) {
+        return handleMemTreeHostSession(req, res, state, url);
     }
     if (req.method === "GET" &&
         (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)) {
@@ -734,6 +741,36 @@ async function handleMemTreeCurrent(req, res, opts, state, url) {
     }
 }
 const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+const MEMTREE_HOST_SESSION_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}host-session`;
+/**
+ * `GET /memtree/host-session?host_pid=<pid>`: the session ccc's own Claude Code process
+ * is on, for that process's memtree MCP server (memtree-mcp.ts: refreshHostSession),
+ * which is started with the launch session id and not restarted when the process
+ * resumes or clears. Answered only to a caller that names that process's pid (the
+ * server's parent) and carries the token from this ccc's MCP config, and only once a
+ * SessionStart hook from that process has named the session; 404 otherwise. The pid is
+ * not a secret and the token alone is not enough: a teammate Claude Code replays the
+ * same MCP config, with another parent. So neither a Claude Code started from inside
+ * the session nor a teammate is handed this process's conversation.
+ */
+function handleMemTreeHostSession(req, res, state, url) {
+    const known = isHostPid(state, url.searchParams.get("host_pid")) &&
+        sameSecret(req.headers[HOST_TOKEN_HEADER], state.hostToken);
+    res.writeHead(known && state.hostSession ? 200 : 404, { "content-type": "application/json" });
+    res.end(JSON.stringify(known && state.hostSession
+        ? { session_id: state.hostSession } : { detail: "No session for this process" }));
+}
+/** Whether `pid` (a header or query value) is the Claude Code process ccc launched. */
+function isHostPid(state, pid) {
+    return state.hostPid !== undefined && typeof pid === "string" && /^\d+$/.test(pid) &&
+        Number(pid) === state.hostPid;
+}
+function sameSecret(given, secret) {
+    if (typeof given !== "string")
+        return false;
+    const a = Buffer.from(given), b = Buffer.from(secret);
+    return a.length === b.length && timingSafeEqual(a, b);
+}
 const CURRENT_LOOKUP_FAILED = "This process has no MemTree page for this session and could not ask the MemTree server for one";
 /**
  * The session's page here (currentMemorySourcePage), else its newest completed
@@ -971,6 +1008,12 @@ onlyEvent) {
         if (parsed.agent_id === undefined) {
             recordSessionStart(state, parsed.source);
             noteMainSessionStart(state, parsed.source, parsed.session_id);
+            // Only ccc's own Claude Code moves the host session: a teammate process loads
+            // the same plugin and posts its own session starts here.
+            if (isHostPid(state, req.headers[CLAUDE_PID_HEADER]) &&
+                typeof parsed.session_id === "string" && parsed.session_id) {
+                state.hostSession = parsed.session_id;
+            }
             // Claude Code's compaction dropped any MemTree notice from the transcript.
             if (parsed.source === "compact")
                 state.modelNotices.forget(parsed.session_id);

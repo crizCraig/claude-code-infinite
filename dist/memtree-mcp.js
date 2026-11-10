@@ -18,8 +18,9 @@
  * tree the current request was compressed against. The session id is the
  * `CLAUDE_CODE_SESSION_ID` Claude Code sets for MCP servers. Reads of this
  * session's current tree require that exact session on both the proxy's pointer
- * and the page; missing or mismatched identity fails closed, and the host must
- * restart this server with the current id when switching sessions. The page JSON
+ * and the page; missing or mismatched identity fails closed. Claude Code does not
+ * restart this server when its process switches sessions, so each tool call first
+ * asks the proxy which session that process is on (`refreshHostSession`). The page JSON
  * is fetched through the proxy's key-free `/memtree/<id>.json` relay and cached
  * once complete.
  *
@@ -32,6 +33,7 @@
  * and falls back to searching the page JSON locally on a server without that
  * endpoint.
  */
+import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, RECENT_SEARCH_WINDOWS_DAYS, recentSearchArgs, recentSearchFailedNote, recentSearchNote, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
@@ -356,6 +358,28 @@ export function toolHeaders(tool, deps) {
         headers["x-claude-code-session-id"] = deps.sessionId;
     return headers;
 }
+/** How long a tool call waits to learn its process's session before using its own id. */
+const HOST_SESSION_TIMEOUT_MS = 2_000;
+/**
+ * Point `deps.sessionId` at the session this server's Claude Code process is on now.
+ * Claude Code starts the server with the session id it had at launch and does not
+ * restart it when the process moves to another session (a resume through the picker,
+ * /resume, /clear), so that id can name a session with no page ("no MemTree yet",
+ * 2026-11-09). The proxy of the ccc that launched this Claude Code knows the process's
+ * session from its SessionStart hook and answers only that process (`hostPid`: this
+ * server's parent, with the token from ccc's MCP config). Without a token (an older
+ * ccc's config: its proxy has no such route) nothing is asked; any other answer
+ * (another process, no session start seen) leaves the id as it is.
+ */
+export async function refreshHostSession(deps, hostPid = process.ppid) {
+    const base = deps.proxyUrl?.replace(/\/$/, "");
+    if (!base || !deps.hostToken)
+        return;
+    const answer = await proxyGetJson(deps.fetch ?? fetch, `${base}/memtree/host-session?host_pid=${hostPid}`, { [HOST_TOKEN_HEADER]: deps.hostToken }, HOST_SESSION_TIMEOUT_MS);
+    const sessionId = answer.ok ? answer.body?.session_id : undefined;
+    if (typeof sessionId === "string" && sessionId)
+        deps.sessionId = sessionId;
+}
 function proxyBase(deps) {
     const base = deps.proxyUrl?.replace(/\/$/, "");
     if (!base) {
@@ -378,6 +402,8 @@ function checkTreeId(tree) {
 export class CurrentTree {
     deps;
     cached;
+    /** The session `cached` was read for: a page is never reused across sessions. */
+    cachedSession;
     /** Temporary prefix pages: when each may be fetched again. */
     prefixRetryAt = new Map();
     /** The last fetched temporary prefix per page, served during its cooldown. */
@@ -537,6 +563,10 @@ export class CurrentTree {
         const sessionId = this.deps.sessionId;
         if (!sessionId)
             throw new ToolInputError("MemTree unavailable: the calling session id is missing");
+        if (this.cachedSession !== sessionId) {
+            this.cached = undefined; // the process moved to another session (refreshHostSession)
+            this.cachedSession = sessionId;
+        }
         return sessionId;
     }
     /** The proxy's current page for the calling session; fails closed on any other session. */
@@ -960,6 +990,7 @@ export function runMemtreeMcpServer(env = process.env) {
     const deps = {
         proxyUrl: env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
         sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+        hostToken: env[HOST_TOKEN_ENV] || undefined,
     };
     const tree = new CurrentTree(deps);
     const finder = new SessionFinder(deps);
@@ -989,6 +1020,9 @@ export function runMemtreeMcpServer(env = process.env) {
                 continue;
             }
             queue = queue.then(async () => {
+                // Calls run one at a time, so each reads the session its process is on now.
+                if (isToolCall(message))
+                    await refreshHostSession(deps);
                 const response = await handleMcpMessage(message, tree, finder, versionNote, notice).catch((err) => ({
                     jsonrpc: "2.0",
                     id: isRpcRequest(message) ? message.id ?? null : null,
@@ -1002,6 +1036,9 @@ export function runMemtreeMcpServer(env = process.env) {
     process.stdin.on("end", () => {
         void queue.then(() => process.exit(0));
     });
+}
+function isToolCall(message) {
+    return isRpcRequest(message) && message.method === "tools/call";
 }
 function isMainModule() {
     try {

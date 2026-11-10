@@ -920,7 +920,8 @@ async function main() {
   let memtreeMcpConfig: MemtreeMcpConfigFile | null = null;
   if (memtreeMcpPlan.register) {
     try {
-      memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`);
+      memtreeMcpConfig = writeMemtreeMcpConfig(`http://127.0.0.1:${proxy.port}`, undefined,
+        proxy.hostToken);
       childArgs = withMemtreeMcpArgs(childArgs, memtreeMcpConfig.path, memtreeMcpPlan.tools);
     } catch (err) {
       // Optional like the notice plugin; without it MemTree must not name
@@ -945,6 +946,8 @@ async function main() {
     ),
     stdio: "inherit",
   });
+  // Its memtree MCP server asks the proxy which session this process is on.
+  proxy.setHostPid(child.pid);
 
   let shuttingDown = false;
   /** When the Windows console window was closed (SIGHUP): the exit drain counts from it. */

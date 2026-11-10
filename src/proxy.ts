@@ -65,7 +65,8 @@ import { truncateToolResults } from "./tool-result-truncation.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
 import type { Transform } from "node:stream";
 import {
   brotliDecompressSync,
@@ -131,7 +132,7 @@ import {
   type FirstTreeIntro,
   type NoticeHookInput,
   type SessionStartHookInput,
-  type SuccessLink,
+  type SuccessLink
 } from "./hooks.js";
 import { USAGE_LABEL, USAGE_SIGN_IN_NOTE } from "./usage-link.js";
 import { hyperlink } from "./payment-gate.js";
@@ -448,6 +449,14 @@ export interface RunningProxy {
    * then, and again after /clear until its first turn.
    */
   mainSessionId: () => string | undefined;
+  /**
+   * The pid of the Claude Code process this ccc launched. Its memtree MCP server (a
+   * child of that process) is then told which session the process is on
+   * (`/memtree/host-session`); no other caller is.
+   */
+  setHostPid: (pid: number | undefined) => void;
+  /** The secret this ccc's memtree MCP server sends to `/memtree/host-session`. */
+  hostToken: string;
 }
 
 interface Upstream {
@@ -529,6 +538,12 @@ interface ProxyState {
   notices: NoticeDeliveryQueue;
   /** RunningProxy.mainSessionId. */
   resumableMainSession?: string;
+  /** The session ccc's own Claude Code process is on (its newest SessionStart hook). */
+  hostSession?: string;
+  /** RunningProxy.setHostPid. */
+  hostPid?: number;
+  /** RunningProxy.hostToken. */
+  hostToken: string;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
   mainPromptId?: string;
@@ -1128,6 +1143,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     routeInstallFault: opts.routeInstallFault,
     memtreePages: new Map(),
     memorySourcePages: new Map(),
+    hostToken: randomBytes(24).toString("hex"),
     memtreeCallSeq: 0,
     memtreeLinkStore: opts.memtreeLinkStore,
     stablePrefixStore: opts.stablePrefixStore,
@@ -1242,6 +1258,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
         },
         drain,
         mainSessionId: () => state.resumableMainSession,
+        setHostPid: (pid) => { state.hostPid = pid; },
+        hostToken: state.hostToken,
       });
     });
   });
@@ -1296,6 +1314,9 @@ async function handleRequest(
         : opts.transcriptUsage?.finalReply?.(sessionId!)));
   }
 
+  if (req.method === "GET" && url.pathname === MEMTREE_HOST_SESSION_PATH) {
+    return handleMemTreeHostSession(req, res, state, url);
+  }
   if (
     req.method === "GET" &&
     (url.pathname === MEMTREE_CURRENT_PATH || url.pathname === `${MEMTREE_CURRENT_PATH}.json`)
@@ -1533,6 +1554,41 @@ async function handleMemTreeCurrent(
 }
 
 const MEMTREE_CURRENT_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}current`;
+const MEMTREE_HOST_SESSION_PATH = `${MEMTREE_PASSTHROUGH_PREFIX}host-session`;
+
+/**
+ * `GET /memtree/host-session?host_pid=<pid>`: the session ccc's own Claude Code process
+ * is on, for that process's memtree MCP server (memtree-mcp.ts: refreshHostSession),
+ * which is started with the launch session id and not restarted when the process
+ * resumes or clears. Answered only to a caller that names that process's pid (the
+ * server's parent) and carries the token from this ccc's MCP config, and only once a
+ * SessionStart hook from that process has named the session; 404 otherwise. The pid is
+ * not a secret and the token alone is not enough: a teammate Claude Code replays the
+ * same MCP config, with another parent. So neither a Claude Code started from inside
+ * the session nor a teammate is handed this process's conversation.
+ */
+function handleMemTreeHostSession(
+  req: http.IncomingMessage, res: http.ServerResponse, state: ProxyState, url: URL
+): void {
+  const known = isHostPid(state, url.searchParams.get("host_pid")) &&
+    sameSecret(req.headers[HOST_TOKEN_HEADER], state.hostToken);
+  res.writeHead(known && state.hostSession ? 200 : 404, { "content-type": "application/json" });
+  res.end(JSON.stringify(known && state.hostSession
+    ? { session_id: state.hostSession } : { detail: "No session for this process" }));
+}
+
+/** Whether `pid` (a header or query value) is the Claude Code process ccc launched. */
+function isHostPid(state: ProxyState, pid: string | string[] | null | undefined): boolean {
+  return state.hostPid !== undefined && typeof pid === "string" && /^\d+$/.test(pid) &&
+    Number(pid) === state.hostPid;
+}
+
+function sameSecret(given: string | string[] | undefined, secret: string): boolean {
+  if (typeof given !== "string") return false;
+  const a = Buffer.from(given), b = Buffer.from(secret);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 const CURRENT_LOOKUP_FAILED =
   "This process has no MemTree page for this session and could not ask the MemTree server for one";
 
@@ -1800,6 +1856,12 @@ async function handleNoticeHook(
     if (parsed.agent_id === undefined) {
       recordSessionStart(state, parsed.source);
       noteMainSessionStart(state, parsed.source, parsed.session_id);
+      // Only ccc's own Claude Code moves the host session: a teammate process loads
+      // the same plugin and posts its own session starts here.
+      if (isHostPid(state, req.headers[CLAUDE_PID_HEADER]) &&
+          typeof parsed.session_id === "string" && parsed.session_id) {
+        state.hostSession = parsed.session_id;
+      }
       // Claude Code's compaction dropped any MemTree notice from the transcript.
       if (parsed.source === "compact") state.modelNotices.forget(parsed.session_id);
     }

@@ -350,6 +350,8 @@ export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
     proxyUrl?: string;
     sessionId?: string;
+    /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */
+    hostToken?: string;
     fetch?: typeof fetch;
     now?: () => number;
 }
@@ -361,6 +363,18 @@ export interface MemtreeMcpDeps {
  */
 export declare const MEMTREE_TOOL_HEADER = "x-memtree-tool";
 export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string>;
+/**
+ * Point `deps.sessionId` at the session this server's Claude Code process is on now.
+ * Claude Code starts the server with the session id it had at launch and does not
+ * restart it when the process moves to another session (a resume through the picker,
+ * /resume, /clear), so that id can name a session with no page ("no MemTree yet",
+ * 2026-11-09). The proxy of the ccc that launched this Claude Code knows the process's
+ * session from its SessionStart hook and answers only that process (`hostPid`: this
+ * server's parent, with the token from ccc's MCP config). Without a token (an older
+ * ccc's config: its proxy has no such route) nothing is asked; any other answer
+ * (another process, no session start seen) leaves the id as it is.
+ */
+export declare function refreshHostSession(deps: MemtreeMcpDeps, hostPid?: number): Promise<void>;
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
@@ -382,6 +396,8 @@ export type TreeRoute = "user_messages" | "handover";
 export declare class CurrentTree implements TreeSource {
     private readonly deps;
     private cached?;
+    /** The session `cached` was read for: a page is never reused across sessions. */
+    private cachedSession?;
     /** Temporary prefix pages: when each may be fetched again. */
     private readonly prefixRetryAt;
     /** The last fetched temporary prefix per page, served during its cooldown. */

@@ -31,6 +31,7 @@
  *   with all of them disallowed ccc registers nothing. Claude Code applies a
  *   deny over an allow in any case.
  */
+import { HOST_TOKEN_ENV } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,7 +47,7 @@ export function memtreeMcpEnabledByEnv(env) {
     return env.CCC_MEMTREE_MCP !== "0";
 }
 /** The `--mcp-config` JSON for this ccc's server, bound to its proxy. */
-export function memtreeMcpConfig(proxyUrl) {
+export function memtreeMcpConfig(proxyUrl, hostToken) {
     return {
         mcpServers: {
             [MEMTREE_MCP_SERVER_NAME]: {
@@ -54,16 +55,18 @@ export function memtreeMcpConfig(proxyUrl) {
                 command: process.execPath,
                 args: [MEMTREE_MCP_SCRIPT],
                 // The proxy's version, so a server started after an update can tell.
-                env: { CCC_MEMTREE_PROXY: proxyUrl, [PROXY_VERSION_ENV]: CLIENT_VERSION },
+                // The host token lets this server ask which session its process is on.
+                env: { CCC_MEMTREE_PROXY: proxyUrl, [PROXY_VERSION_ENV]: CLIENT_VERSION,
+                    ...(hostToken ? { [HOST_TOKEN_ENV]: hostToken } : {}) },
                 alwaysLoad: true,
             },
         },
     };
 }
-export function writeMemtreeMcpConfig(proxyUrl, tempRoot = os.tmpdir()) {
+export function writeMemtreeMcpConfig(proxyUrl, tempRoot = os.tmpdir(), hostToken) {
     const dir = fs.mkdtempSync(path.join(tempRoot, "ccc-memtree-mcp-"));
     const file = path.join(dir, "mcp.json");
-    fs.writeFileSync(file, JSON.stringify(memtreeMcpConfig(proxyUrl)), { mode: 0o600 });
+    fs.writeFileSync(file, JSON.stringify(memtreeMcpConfig(proxyUrl, hostToken)), { mode: 0o600 });
     let closed = false;
     return {
         path: file,
