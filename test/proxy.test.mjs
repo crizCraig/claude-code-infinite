@@ -11208,6 +11208,34 @@ test("/memtree/current falls back to the server's newest tree of exactly this se
   } finally { proxy.close(); }
 });
 
+test("/memtree/current prefers a served index noted while the server lookup was pending", async () => {
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const { NewestTreeLookup } = await import("../dist/memtree-newest.js");
+  const lookup = new NewestTreeLookup(async (path) => {
+    await gate;
+    const q = new URL(path, "http://x").searchParams.get("q");
+    return { status: 200, body: Buffer.from(JSON.stringify({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] })) };
+  });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup });
+  try {
+    const pending = getCurrentId(proxy, "session-1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    release();
+    assert.equal(await pending, "ea18af90658b", "the served page wins over the pending lookup");
+  } finally {
+    release();
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 test("/memtree/current leaves the server's fallback tree once a real served index arrives", async () => {
   const upstream = await mockUpstream();
   const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));

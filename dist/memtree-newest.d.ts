@@ -64,8 +64,9 @@ export declare class NewestTreeLookup {
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
     settle(sessionId: string | undefined, waitMs?: number): Promise<NewestTree | undefined>;
     /**
-     * `settle`, saying whether the server ever answered for this session, so
-     * "no tree" is told apart from "could not ask" (`/memtree/current`).
+     * `settle`, saying whether the server answered for this session, so "no
+     * tree" is told apart from "could not ask" (`/memtree/current`). A server
+     * without the sessions endpoint has no tree to offer: answered, none.
      */
     current(sessionId: string, waitMs?: number): Promise<NewestTreeAnswer>;
     /**

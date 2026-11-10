@@ -1554,6 +1554,9 @@ async function currentPageOrServerTree(
     return { page };
   }
   const answer = await state.newestTrees.current(sessionId);
+  // A served index noted during the wait takes precedence.
+  const served = currentMemorySourcePage(state, sessionId);
+  if (served) return { page: served };
   if (answer.tree) {
     return { page: { url: answer.tree.url, index: answer.tree.key, compressed: false, sessionId } };
   }

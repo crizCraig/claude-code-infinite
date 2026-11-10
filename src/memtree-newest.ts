@@ -62,7 +62,10 @@ export interface NewestTreeAnswer {
 interface Entry {
   tree?: NewestTree;
   fetchedAt: number;
-  /** Some lookup got a definite answer; failures keep the last one. */
+  /**
+   * The server said what this session's tree is, or that it has none. A failed
+   * refresh keeps a known tree but not a known absence: the tree may exist now.
+   */
   answered: boolean;
 }
 
@@ -108,8 +111,9 @@ export class NewestTreeLookup {
   }
 
   /**
-   * `settle`, saying whether the server ever answered for this session, so
-   * "no tree" is told apart from "could not ask" (`/memtree/current`).
+   * `settle`, saying whether the server answered for this session, so "no
+   * tree" is told apart from "could not ask" (`/memtree/current`). A server
+   * without the sessions endpoint has no tree to offer: answered, none.
    */
   async current(sessionId: string, waitMs = NEWEST_TREE_CURRENT_WAIT_MS): Promise<NewestTreeAnswer> {
     await this.settle(sessionId, waitMs);
@@ -118,6 +122,7 @@ export class NewestTreeLookup {
       await this.settle(sessionId, waitMs);
     }
     const entry = this.entries.get(sessionId);
+    if (!entry && this.now() < this.unsupportedUntil) return { answered: true };
     return { tree: entry?.tree, answered: entry?.answered ?? false };
   }
 
@@ -183,7 +188,7 @@ export class NewestTreeLookup {
   private async ask(sessionId: string, signal: AbortSignal): Promise<Entry | undefined> {
     const known = this.entries.get(sessionId);
     const entry = (): Entry => ({
-      tree: known?.tree, fetchedAt: this.now(), answered: known?.answered ?? false,
+      tree: known?.tree, fetchedAt: this.now(), answered: known?.tree !== undefined,
     });
     const answer = (tree?: NewestTree): Entry => ({ tree, fetchedAt: this.now(), answered: true });
     const query = new URLSearchParams({ q: sessionId, limit: String(SESSIONS_LIMIT) });
@@ -198,8 +203,15 @@ export class NewestTreeLookup {
         if (res.status !== 200) return entry();
         const body = JSON.parse(res.body.toString("utf-8"));
         if (!Array.isArray(body?.sessions)) return entry();
-        const exact = body.sessions.some((s: { session_id?: unknown } | null) => s?.session_id === sessionId);
-        if (exact) return answer(newestTreeFrom(body, sessionId));
+        const exact = body.sessions.find(
+          (s: { session_id?: unknown } | null) => s?.session_id === sessionId
+        ) as { latest_tree?: unknown } | undefined;
+        if (exact) {
+          // An unusable tree is not "none": keep what was known, like a failure.
+          if (exact.latest_tree === null || exact.latest_tree === undefined) return answer();
+          const tree = newestTreeFrom(body, sessionId);
+          return tree ? answer(tree) : entry();
+        }
         const cursor = body.next_cursor;
         if (cursor === null || cursor === undefined || cursor === "") return answer();
         if (typeof cursor !== "string" || cursors.has(cursor)) return entry();
