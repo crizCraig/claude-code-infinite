@@ -14,7 +14,7 @@ import {
   userClaudeJsonPath, userMcpOwner, workingDirectoryFromBody,
 } from "../dist/desktop-service.js";
 import { desktopClaudeBinaries } from "../dist/desktop-command.js";
-import { desktopMcpTarget, handleMcpMessage } from "../dist/memtree-mcp.js";
+import { CurrentTree, desktopMcpTarget, handleMcpMessage } from "../dist/memtree-mcp.js";
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 
@@ -195,6 +195,18 @@ test("MCP ownership reads the config Claude Code would edit, and an unreadable o
   assert.equal(userMcpOwner(file), "ccc-desktop");
   fs.writeFileSync(file, "{ not json");
   assert.equal(userMcpOwner(file), "other");
+});
+
+test("the current-tree lookup carries the desktop service's token (found live after Codex r3)", async () => {
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    calls.push({ url: String(url), headers: { ...(init?.headers ?? {}) } });
+    return new Response(JSON.stringify({ detail: "none" }), { status: 404 });
+  };
+  const tree = new CurrentTree({ proxyUrl: "http://127.0.0.1:1", sessionId: "sess-1", token: "t".repeat(48), fetch: fakeFetch });
+  await tree.currentId().catch(() => {});
+  assert.ok(calls[0].url.endsWith("/memtree/current?session=sess-1"));
+  assert.equal(calls[0].headers["x-ccc-proxy-token"], "t".repeat(48));
 });
 
 test("inner proxies refuse requests without the service's inner token (Codex r1 P1)", async (t) => {

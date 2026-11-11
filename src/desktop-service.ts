@@ -541,11 +541,13 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
         const known = sessions.get(sessionId)?.cwd;
         const text = body.toString("utf8");
         const entry = sessionProxy(sessionId, known ?? workingDirectoryFromBody(text));
-        // Say the memory tools exist only when this session's model call carries them
-        // (an inert or disabled MCP server sends none); count_tokens and side calls say nothing.
-        if (url.pathname === "/v1/messages" && opts.state.mcpRegistered) {
-          const offered = toolsOffered(text);
-          if (offered !== undefined) entry.memtree.setMemtreeTools(offered ? MEMTREE_TOOLS_HEADER_VALUE : undefined);
+        // Say the memory tools exist once this session's model calls carry them (an inert or
+        // disabled MCP server never sends them). Sticky per session: a concurrent side call
+        // with another tool list (WebSearch helper, a restricted subagent) must not clear it
+        // under the main conversation's compress (Codex r3). The client holds one value per
+        // session, so per-call precision would need it carried with each compress call.
+        if (url.pathname === "/v1/messages" && toolsOffered(text) === true) {
+          entry.memtree.setMemtreeTools(MEMTREE_TOOLS_HEADER_VALUE);
         }
         entry.inFlight++;
         try {
@@ -578,7 +580,9 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
       res.end(JSON.stringify({ detail: "ccc desktop service: not found" }));
       return;
     }
-    const entry = sessionId ? sessions.get(sessionId) : undefined;
+    // The MCP server names the session in a header, or as `?session=` (/memtree/current).
+    const forSession = sessionId ?? (url.searchParams.get("session") || undefined);
+    const entry = forSession ? sessions.get(forSession) : undefined;
     const port = entry ? (await entry.proxy).port : fallback.port;
     if (gone) return;
     return forward(req, res, port, innerToken, false);
@@ -590,6 +594,8 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
   });
   log(`ccc desktop service (${opts.state.mode}) listening on 127.0.0.1:${opts.state.port}`);
 
+  // Idle closes in progress, so shutdown waits for their final indexes too (Codex r3).
+  const idleClosing = new Set<Promise<void>>();
   const closeIdle = async (idleMs = SESSION_IDLE_MS): Promise<void> => {
     const now = Date.now();
     const closing: Promise<void>[] = [];
@@ -597,7 +603,10 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
       if (entry.inFlight > 0 || now - entry.lastUsed < idleMs) continue;
       sessions.delete(id);
       log(`session ${id.slice(0, 8)} idle: closing (final index)`);
-      closing.push(closeSession(entry, 30_000).catch((err) => log(`session ${id.slice(0, 8)} close: ${String(err)}`)));
+      const done = closeSession(entry, 30_000).catch((err) => log(`session ${id.slice(0, 8)} close: ${String(err)}`));
+      idleClosing.add(done);
+      void done.finally(() => idleClosing.delete(done));
+      closing.push(done);
     }
     await Promise.all(closing);
   };
@@ -613,12 +622,18 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
       closing = true;
       server.close();
       tunnels.blind();
-      // Requests already being routed finish (or fail) before the sessions are snapshotted.
-      await Promise.allSettled([...pendingRoutes]);
+      // Requests already being routed get a moment to reach their session proxy before the
+      // snapshot. Bounded: a long stream or long-poll is cut by the proxies' own drain
+      // deadline below, not waited for here (Codex r3).
+      await Promise.race([
+        Promise.allSettled([...pendingRoutes]),
+        new Promise((resolve) => setTimeout(resolve, 3_000).unref()),
+      ]);
       const all = [...sessions.values()];
       sessions.clear();
       await Promise.allSettled([
         ...all.map((e) => closeSession(e, 10_000)),
+        ...idleClosing,
         (async () => {
           await fallback.drain(10_000);
           await fallbackMemtree.drainBackground(FINAL_DRAIN_MS);

@@ -507,7 +507,8 @@ export class CurrentTree {
         const base = proxyBase(this.deps);
         const sessionId = this.requireSessionId();
         const query = `?session=${encodeURIComponent(sessionId)}`;
-        const pointer = await proxyGetJson(this.fetchImpl, `${base}/memtree/current${query}`);
+        // PROTOTYPE (desktop): the desktop service needs its token here too (it routes by `?session=`).
+        const pointer = await proxyGetJson(this.fetchImpl, `${base}/memtree/current${query}`, this.deps.token ? { [PROXY_TOKEN_HEADER]: this.deps.token } : {});
         if (pointer.status === 404) {
             throw new ToolInputError("This session has no MemTree yet: nothing has been indexed or compressed so far, so everything is still in your context.");
         }
