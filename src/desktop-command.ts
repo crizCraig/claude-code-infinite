@@ -18,7 +18,7 @@ import { getConfigDir } from "./config.js";
 import { locateClaude } from "./claude-locate.js";
 import {
   desktopEnvLines, desktopPaths, installLaunchAgent, readDesktopState, registerDesktopMcp,
-  setupDesktopFiles, startDesktopService, uninstallLaunchAgent, unregisterDesktopMcp,
+  setupDesktopFiles, startDesktopService, uninstallLaunchAgent, unregisterDesktopMcp, writeDesktopState,
   type DesktopMode,
 } from "./desktop-service.js";
 
@@ -30,19 +30,40 @@ export interface DesktopCommandDeps {
 
 const CLI_PATH = fileURLToPath(new URL("./cli.js", import.meta.url));
 
-/** A `claude` for `claude mcp ...`: the terminal one, else the desktop app's own copy. */
-export function claudeForConfig(): string | undefined {
+/**
+ * A `claude` for `claude mcp ...`: the terminal one, else the desktop app's own copy.
+ * Desktop keeps verified installs at `<version>/<checksum prefix>/claude`
+ * (`.../claude.app/Contents/MacOS/claude` on macOS); older layouts had `<version>/claude`.
+ */
+export function claudeForConfig(
+  root = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude-code")
+): string | undefined {
   const terminal = locateClaude();
   if (terminal) return terminal.command;
-  const root = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude-code");
-  try {
-    const versions = fs.readdirSync(root).filter((v) => fs.existsSync(path.join(root, v, "claude")));
-    versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    const newest = versions.at(-1);
-    return newest ? path.join(root, newest, "claude") : undefined;
-  } catch {
-    return undefined;
+  return desktopClaudeBinaries(root).at(-1);
+}
+
+/** Desktop's downloaded Claude Code binaries, oldest version first. */
+export function desktopClaudeBinaries(root: string): string[] {
+  const isExe = (f: string): boolean => {
+    try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; }
+  };
+  const dirs = (d: string): string[] => {
+    try { return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
+  };
+  const found: { version: string; file: string }[] = [];
+  for (const version of dirs(root)) {
+    const vdir = path.join(root, version);
+    const candidates = [path.join(vdir, "claude"),
+      ...dirs(vdir).flatMap((sub) => [
+        path.join(vdir, sub, "claude"),
+        path.join(vdir, sub, "claude.app", "Contents", "MacOS", "claude"),
+      ])];
+    const file = candidates.find(isExe);
+    if (file) found.push({ version, file });
   }
+  found.sort((a, b) => a.version.localeCompare(b.version, undefined, { numeric: true }));
+  return found.map((f) => f.file);
 }
 
 export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps): Promise<number> {
@@ -57,15 +78,28 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
       console.error("ccc desktop: no MemTree API key saved yet: run `ccc` in a terminal once first.");
       return 1;
     }
-    const state = await setupDesktopFiles(paths, deps.mode, { rotateToken: args.includes("--rotate-token") });
-    if (!args.includes("--no-launchd")) installLaunchAgent(deps.mode, paths, CLI_PATH);
+    const state = await setupDesktopFiles(paths, deps.mode, {
+      rotateToken: args.includes("--rotate-token"), rotateCa: args.includes("--rotate-ca"),
+    });
+    let mcpFailure: string | undefined;
     if (!args.includes("--no-mcp")) {
       const claude = claudeForConfig();
-      if (!claude || !registerDesktopMcp(claude)) {
-        console.error("ccc desktop: could not register the MemTree MCP server (no `claude` found); memory tools will be missing.");
-      }
+      const result = claude ? registerDesktopMcp(claude) : { ok: false, reason: "no `claude` found (terminal or the desktop app's copy)" };
+      if (!result.ok) mcpFailure = result.reason;
+      state.mcpRegistered = result.ok;
+      writeDesktopState(paths, state);
+    }
+    // After the state is final: the service reads it at start.
+    if (!args.includes("--no-launchd")) installLaunchAgent(deps.mode, paths, CLI_PATH);
+    if (state.caRotated) {
+      console.log("A new CA was made: Desktop sessions started before now must be restarted.\n");
     }
     console.log(setupText(paths, state));
+    if (mcpFailure) {
+      console.error(`\nccc desktop: the MemTree MCP server was NOT registered: ${mcpFailure}. ` +
+        "Compression works, but the memory tools will be missing.");
+      return 2;
+    }
     return 0;
   }
   if (sub === "env") {
@@ -77,10 +111,15 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
   if (sub === "status") {
     const state = readDesktopState(paths);
     if (!state) { console.log("not set up"); return 1; }
-    const up = await fetch(`http://127.0.0.1:${state.port}/ccc-desktop/status`, {
-      headers: { "x-ccc-proxy-token": state.token },
-    }).then(() => true, () => false);
-    console.log(`service ${up ? "listening" : "NOT listening"} on 127.0.0.1:${state.port}; CA valid until ${state.notAfter}`);
+    const answer = await fetch(`http://127.0.0.1:${state.port}/ccc-desktop/status`, {
+      headers: { "x-ccc-proxy-token": state.token }, signal: AbortSignal.timeout(2_000),
+    }).then(async (r) => (r.ok ? await r.json() as { service?: string; sessions?: number } : { status: r.status }),
+      (err) => ({ error: String(err?.name ?? err) }));
+    const up = "service" in answer && answer.service === "ccc-desktop" && typeof answer.sessions === "number";
+    console.log(up
+      ? `service up on 127.0.0.1:${state.port}, ${(answer as { sessions: number }).sessions} active session(s); CA valid until ${state.notAfter}`
+      : `service NOT answering correctly on 127.0.0.1:${state.port} (${JSON.stringify(answer)}): ` +
+        "not running, or another program has the port, or its token differs from service.json");
     return up ? 0 : 1;
   }
   if (sub === "serve") {
@@ -95,6 +134,8 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
       ...(process.env.CCC_PROXY_TRACE ? { tracePath: process.env.CCC_PROXY_TRACE } : {}),
       ...(process.env.CCC_ANTHROPIC_UPSTREAM ? { upstreamOrigin: process.env.CCC_ANTHROPIC_UPSTREAM } : {}),
     });
+    // A stray rejection must not take down every routed session: log it and carry on.
+    process.on("unhandledRejection", (err) => console.error(`${new Date().toISOString()} unhandled rejection: ${String(err)}`));
     const stop = (): void => { void service.close().then(() => process.exit(0)); };
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
@@ -102,9 +143,11 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
   }
   if (sub === "uninstall") {
     uninstallLaunchAgent(deps.mode, paths);
-    const claude = claudeForConfig();
-    if (claude) unregisterDesktopMcp(claude);
     fs.rmSync(paths.dir, { recursive: true, force: true });
+    const others = (["production", "staging", "local"] as const).some((m) =>
+      m !== deps.mode && fs.existsSync(desktopPaths(getConfigDir(), m).state));
+    const claude = claudeForConfig();
+    if (claude) unregisterDesktopMcp(claude, others);
     console.log("Removed the ccc desktop service, its files and the MemTree MCP entry.\n" +
       "In the Claude desktop app, remove the ccc lines from your environment (or switch sessions to another environment).");
     return 0;

@@ -21,8 +21,15 @@ import { INTERCEPT_HOST, type SessionCa } from "./mitm-ca.js";
 /** Decrypted api.anthropic.com streams: their requests skip the loopback-only routes. */
 const intercepted = new WeakSet<net.Socket>();
 
+/** PROTOTYPE (desktop): requests the desktop service decrypted and forwarded to an inner proxy. */
+const interceptedRequests = new WeakSet<http.IncomingMessage>();
+
+export function markInterceptedRequest(req: http.IncomingMessage): void {
+  interceptedRequests.add(req);
+}
+
 export function isInterceptedRequest(req: http.IncomingMessage): boolean {
-  return intercepted.has(req.socket);
+  return intercepted.has(req.socket) || interceptedRequests.has(req);
 }
 
 export interface HttpsProxyModeOptions {

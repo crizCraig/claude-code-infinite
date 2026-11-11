@@ -40,7 +40,7 @@ remote-control) and from reading the app's bundled JS. Nothing was patched or ru
 
 | Question | Finding | Evidence |
 |---|---|---|
-| What runs a Code-tab session | Desktop's own Claude Code binary, downloaded to `~/Library/Application Support/Claude/claude-code/<version>/claude`, driven through the Agent SDK (stream-json). It is versioned separately from the terminal `claude`. | Docs ("runs its own copy of Claude Code, which has its own version number"); bundle: `path.join(app.getPath("userData"),"claude-code")` |
+| What runs a Code-tab session | Desktop's own Claude Code binary, downloaded to `~/Library/Application Support/Claude/claude-code/<version>/<sha256 prefix>/claude` (on macOS `.../claude.app/Contents/MacOS/claude`; corrected in review r1), driven through the Agent SDK (stream-json). It is versioned separately from the terminal `claude`. | Docs ("runs its own copy of Claude Code, which has its own version number"); bundle: `path.join(app.getPath("userData"),"claude-code")` |
 | Launch env (Desktop's builder, local sessions) | Starts from Desktop's process env plus login-shell parity variables (PATH, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_*`, `CLAUDE_CONFIG_DIR`, ...). Then the user's saved env vars and the session environment's vars are applied. Last, Desktop's own block **wins**: `ANTHROPIC_BASE_URL=<apiHost>`, `CLAUDE_CODE_OAUTH_TOKEN=<Desktop's token>`, `CLAUDE_CODE_OAUTH_SCOPES`, `ANTHROPIC_API_KEY=""`, `ANTHROPIC_AUTH_TOKEN=""`, `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, `API_TIMEOUT_MS=900000` and others. | Bundle (the `Veo`/`jeo` env builder in `index.chunk-C6mgT-OL.js`); docs ("Moving yours to a settings file doesn't help, because Claude Code ignores that value in a local session") |
 | `HTTPS_PROXY` / `NODE_EXTRA_CA_CERTS` | **Honoured.** Desktop doesn't set them. A saved local environment's vars are passed through unfiltered for local sessions. The filter list that does name the proxy and CA vars applies only when the CLI runs off this host (Cowork VM). Docs: "In a local, SSH, or WSL Code tab session signed in through claude.ai, you can set these variables and the proxy variables in any settings file" and "To use your own proxy or certificate value in a local session, add it to a saved local environment." | Bundle (`cliRunsOnThisHost ? e=>e : e.mp`); docs |
 | Where saved environment vars live | Desktop's environment editor, stored encrypted with Electron `safeStorage` (Keychain key) in `ccd-environment-config` (`envVars`, `scopedEnvVars`). **ccc can't write them**, so the user pastes. | Bundle |
@@ -90,8 +90,15 @@ the terminal prototype without changes.
    CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000
    CLAUDE_ENV_FILE=~/.claude-code-infinite/desktop/bash-env.sh
    ```
-   (The real lines carry absolute paths.) A re-run keeps the port and token, so the pasted
-   lines stay valid, and rotates the CA at the same path.
+   (The real lines carry absolute paths.) A re-run keeps the port, the token (so the pasted
+   lines stay valid) and the CA (live sessions trust only the CA they started with). It
+   rotates the CA only with `--rotate-ca`, when it's missing, or within 30 days of expiry,
+   and then says that open sessions must be restarted. The port is picked in 41000-47999,
+   below the macOS ephemeral range. If the MCP registration fails, setup exits 2 and says
+   so; `service.json` records `mcpRegistered`, and only then does the service send
+   `x-memtree-tools` on compress calls. A user-scope `memtree` server that ccc didn't add is
+   left alone (setup reports it). The plist sets `PATH`, and `bootstrap` is retried while a
+   just-booted-out job finishes leaving.
 2. **serve** is the service. It is one loopback `http.Server` on the fixed port, with
    `attachHttpsProxyMode` from the terminal prototype:
    - CONNECT without the token gets 407.
@@ -105,31 +112,48 @@ the terminal prototype without changes.
      on its own loopback port, made on the session's first request. The service forwards to
      it as plain HTTP, so each Desktop session gets exactly what a terminal ccc session gets.
      The session's project (git repo, branch, commit) comes from the "Primary working
-     directory" line of Claude Code's system prompt. It is set once a request carries it
-     (often not the first: title and quota calls lack it); `proxy.ts` reads
-     `opts.projectMeta` per request.
+     directory" line of Claude Code's environment block. That block is in the top-level
+     `system` text or, in Claude Code 2.1.322, in a `role: "system"` entry of `messages`.
+     The JSON is decoded and only those are read, never user or assistant text. The project
+     is set once a request carries it (often not the first: title and quota calls lack it);
+     `proxy.ts` reads `opts.projectMeta` per request.
    - Everything else (bridge and Remote Control, OAuth, telemetry, files, session-less model
      calls) goes to one shared "fallback" `startProxy()`, which passes it through verbatim
      (session-less model calls are `foreign`).
    - Loopback (not intercepted) requests need the token in `x-ccc-proxy-token`, and only
      `/memtree/*` (the MCP server's reads, routed by session id) and `/ccc-desktop/status`
      exist. The terminal ccc's other loopback routes (hooks, notices) aren't exposed.
-   - A session with no request for 6 h is drained and closed. Its final index runs as at a
-     terminal ccc exit.
+   - The inner proxies (per-session and fallback) are ordinary loopback listeners, so they
+     answer only the service: every request must carry a per-service-process secret
+     (`x-ccc-inner`, `ProxyOptions.innerToken`, else 403). `x-ccc-intercepted: 1` (trusted
+     only with that secret) makes an inner proxy route the request as intercepted, so a
+     decrypted request for a loopback-only path (`/memtree/*`, the hook paths) goes to
+     api.anthropic.com verbatim, never to the local relay, and a browser-like `Origin`
+     header doesn't get it refused (Codex r1).
+   - Each session has its own MemTree client and transcript reader (as one terminal ccc
+     process has). A session with no request for 30 min, and every session at service
+     shutdown, is drained, then final-indexed (`flushFinalIndexes`, the reply read from the
+     transcript), then its background calls finish, as at a terminal ccc exit. A session
+     seen again afterwards gets a fresh proxy after its transcript is caught up, like
+     `ccc --resume`. There are no ccc hooks in Desktop, so nothing schedules the 10-minute
+     Stop-hook final index: the 30-minute close stands in for it.
 3. **The MCP server** is registered once at user scope. Every Claude Code on the account
    sees that entry, so it is **inert unless the session is routed through ccc**. It has
    `CCC_MEMTREE_MCP_DESKTOP=1`, and `desktopMcpTarget` picks its target in this order:
    - the ccc proxy named by its own `HTTPS_PROXY` (with the token);
    - else `CCC_MEMTREE_PROXY`;
-   - else a loopback `ANTHROPIC_BASE_URL` (terminal ccc in base-URL mode);
+   - else a loopback `ANTHROPIC_BASE_URL` together with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`
+     (terminal ccc in base-URL mode, the same test as `insideCccSession`; a local API router
+     such as claude-code-router is not ccc);
    - else no tools and no instructions.
 
-   Every compress call sends `x-memtree-tools`, since the server is registered.
+   `CCC_MEMTREE_MCP=0` makes it inert too. Uninstall removes the entry only if ccc added it
+   and no other ccc desktop mode (production/staging/local) is still set up.
 4. **Bash tool**: `CLAUDE_ENV_FILE=bash-env.sh` unsets `HTTPS_PROXY`/`https_proxy` and
    `NODE_EXTRA_CA_CERTS` while they hold ccc's values, so curl and Python reach
    api.anthropic.com directly. The token is never in the file: it is matched by pattern.
-5. **uninstall** runs `launchctl bootout`, removes the plist, `claude mcp remove --scope user
-   memtree` and the directory, then tells the user to delete the lines in Desktop. Until they
+5. **uninstall** runs `launchctl bootout`, removes the plist and the directory, runs `claude mcp
+   remove --scope user memtree` (only for ccc's own entry, as above), then tells the user to delete the lines in Desktop. Until they
    do, those sessions can't reach the API (section 6).
 
 ## 4. Security
@@ -161,7 +185,9 @@ the terminal prototype without changes.
   pasted environment.
 - **Local access.** The port is fixed and long-lived, so every route needs the token.
   CONNECT without the token gets 407. Loopback routes without the `x-ccc-proxy-token` header
-  get 403. Both were measured; see section 5.
+  get 403. The inner per-session and fallback proxies refuse anything without the service's
+  in-process secret (403), so they can't be used to reach MemTree or Anthropic with the
+  user's key either (Codex r1 P1). All three were measured; see section 5.
   - The token sits in Desktop's encrypted environment store and in `service.json` (0600).
   - Desktop's sessions, their MCP servers and hooks see it in their env, same as the
     terminal design.
@@ -195,7 +221,8 @@ not by launchd (below).
 | Remote Control gate | `claude remote-control` under the Desktop env plus the ccc lines got past the first-party check to "Remote Control requires a full-scope login token" (expected with the mini's setup-token). |
 | Token checks | CONNECT without the token → 407. `/memtree/sessions` without the token → 403. A non-`/memtree` loopback path with the token → 404. |
 | launchd | The plist is generated and passes `plutil -lint`. **Not bootstrapped live**: the worker's permission classifier denied installing a launch agent on the mini, which is a persistence change. It needs Craig's go-ahead or his own run (section 7). |
-| Tests | Full `npm test`: 1333 pass, 9 fail. The same 9 (`resume-repair`, `memtree-cache`) fail on the untouched `proto/https-proxy-rc` base on this machine. `test/desktop-service.test.mjs` (4 tests, all pass): cwd parsing, MCP target and inert mode, and an end-to-end service test against a fake upstream (407, TLS with the pinned CA, session routing with the original `Authorization`, verbatim passthrough, 403/404). |
+| Final index | At service shutdown (SIGTERM) the session's proxy was drained and one more index call went out after its last turn (01:54:00, 3.7 s, reading the reply from the transcript). The unit test checks that this call carries `final_index: true`, both for an idle close and at shutdown. |
+| Tests | Full `npm test`: 1333 pass, 9 fail. The same 9 (`resume-repair`, `memtree-cache`) fail on the untouched `proto/https-proxy-rc` base on this machine. `test/desktop-service.test.mjs` (9 tests after review r1, all pass: cwd parsing including quotes, system-role messages and decoys; MCP target, opt-out and inert mode; the service end to end; the Bash env file with an apostrophe; setup re-runs; the inner-proxy secret; Desktop's binary layouts): cwd parsing, MCP target and inert mode, and an end-to-end service test against a fake upstream (407, TLS with the pinned CA, session routing with the original `Authorization`, verbatim passthrough, 403/404). |
 
 Not checked yet, because they need Craig's signed-in Desktop: the real Desktop app running its
 own downloaded binary through the service; Desktop's Remote Control switch; the
@@ -208,7 +235,10 @@ environment-editor UX; and a session started without the lines staying unchanged
 | Service not running (crash, uninstall without removing the lines, node removed or upgraded) | Opted-in sessions fail every API call ("Unable to connect"); other sessions are unaffected | launchd KeepAlive. The plist pins the node path, so after an nvm/Homebrew node upgrade, `ccc` (terminal) should notice and rewrite it. `ccc desktop status`. The off switch is to pick a different environment in Desktop. |
 | Sessions not started from the ccc environment | Unchanged; the MCP entry is inert | — |
 | Terminal `claude` (plain) | Unchanged: it gets the inert MCP entry (no tools, a tiny node process per session) | Could be avoided only with a Desktop-only config path, and there isn't one besides `claude_desktop_config.json` (which also reaches Desktop chat). |
-| Terminal ccc | Its own `--mcp-config` `memtree` and the user-scope one have the same name. Whichever Claude Code keeps, it reaches the same proxy (`desktopMcpTarget` falls back to `CCC_MEMTREE_PROXY` or the loopback base URL) | Check which wins when building, and keep ccc's flag config authoritative. |
+| Terminal ccc | Its own `--mcp-config` `memtree` and the user-scope one have the same name. If the user-scope one wins, it still reaches the session's proxy (`desktopMcpTarget`: the loopback base URL plus the first-party marker), but ccc's version-mismatch note (`PROXY_VERSION_ENV`) is lost | Check which wins when building, and keep ccc's flag config authoritative (or have terminal ccc pass `--strict-mcp-config`-free precedence). |
+| The user-scope MCP entry pins setup's node binary and ccc `dist` path (Claude r1) | After a node upgrade, an npx-cache clean or a moved install, every `claude` on the machine shows a failed `memtree` server | Build: point the entry at a stable launcher (the installed `ccc` bin, resolved at run time), and have `ccc` re-register when it finds the entry stale. |
+| Desktop's own CA bundle (Claude r1) | Desktop gives Node children its primed bundle of system/keychain CAs as `NODE_EXTRA_CA_CERTS` (or `NODE_USE_SYSTEM_CA=1`). Whether that reaches Code-tab sessions next to a saved environment's value is unverified; if ours replaces it, a corporate TLS-inspection CA in the keychain is no longer trusted and those users' sessions fail TLS | Check in Craig's session (`/status` or the service trace). Build: setup appends the keychain's extra trusted roots (`security find-certificate -a -p` on the admin and user trust domains) to `ca.pem`, or offers the mode only when no such CA exists. |
+| Memory of the always-on service (Claude r1) | Each active session holds a proxy and a MemTree client with its conversations | Sessions close after 30 idle minutes (and are final-indexed). Measure RSS with many real sessions before shipping. |
 | User already has a proxy or corporate CA | The pasted `HTTPS_PROXY` replaces theirs for those sessions: blind tunnels and ccc's upstream go direct | Same as terminal v1: setup detects a proxy in the env, settings or shell, warns, and doesn't offer the mode. The corporate CA can be bundled into `ca.pem` at setup. |
 | MCP servers and hooks launched by the session | They inherit the proxy and CA: Node ones work; non-Node ones calling api.anthropic.com fail TLS (same as the terminal design, section 5 of the 2026-11-08 plan) | The same decision as the terminal design (a full CA bundle via `SSL_CERT_FILE`, or document it). |
 | Claude Code's Bash sandbox | Same issue as terminal proxy mode: the sandbox's proxy forwards through ours with the token | Same handling as terminal v1 (detect and refuse at setup; later `sandbox.network.parentProxy`). |
@@ -244,8 +274,9 @@ Desktop is the same Electron app with the same env builder. Saved environments a
 - `npm install`: +0 s (nothing at install).
 - `ccc desktop setup`: 0.05 s for the files, 0.5-0.6 s for `claude mcp` (measured), and one
   `launchctl bootstrap`.
-- The service's memory: 103 MB RSS measured after serving ~10 test sessions (Node baseline
-  plus one in-process proxy per session; idle sessions are closed after 6 h).
+- The service's memory: 103 MB RSS measured after ~10 tiny test sessions (Node baseline plus
+  one in-process proxy per session). Real sessions hold much larger conversations until they
+  close after 30 idle minutes; measure with real use before shipping.
 - One manual step: paste six lines into Desktop's environment editor (Code tab →
   environment menu → add or edit a local environment). After that, new sessions in that
   environment get MemTree.
@@ -254,6 +285,9 @@ Desktop is the same Electron app with the same env builder. Saved environments a
   `ccc desktop setup` instead. A first-run `npx claude-code-infinite desktop` path lets
   Desktop-only users skip the terminal `claude` entirely, since setup can use Desktop's
   downloaded CLI for `claude mcp`.
+- A Desktop-only user has no MemTree key yet: today the key is saved by the first terminal
+  `ccc` run, which stops without a terminal `claude`. `ccc desktop setup` must ask for the
+  key itself (the same sign-in page flow) instead of requiring a prior `ccc` run.
 - Notices (the payment gate, "update available", session banners) have no terminal in
   Desktop. They should come through the SessionStart hook's `additionalContext` or the MCP
   instructions. This isn't in the prototype; the prototype skips ccc's key and payment check
@@ -274,8 +308,7 @@ Desktop is the same Electron app with the same env builder. Saved environments a
    - a "no intercepted `/v1/messages` while Desktop is active" warning;
    - a stale-session sweep.
 
-   Also, forward intercepted requests to the session proxies with a marker, so they route
-   like intercepted ones and never as loopback callers.
+   (The intercepted marker and the inner-proxy secret are already in the prototype.)
 3. Setup checks:
    - an existing proxy, CA or sandbox (as terminal v1);
    - Desktop installed;
@@ -292,6 +325,13 @@ Desktop is the same Electron app with the same env builder. Saved environments a
 6. Windows (section 7), then dogfood, then announce.
 
 ## 10. What Craig needs to do to test it (needs his GUI login on the mini, or his laptop)
+
+**What this changes on that machine:** a launchd agent (`co.polychat.ccc-desktop-staging`),
+`~/.claude-code-infinite/desktop-staging/`, and a user-scope `memtree` MCP server in
+`~/.claude.json` that points at this worktree's `dist/`. Every `claude` and terminal `ccc` on
+the machine sees that entry (inert outside routed sessions, by design). If a `memtree` server
+ccc didn't add is already there, setup leaves it and exits 2. Uninstall (step 7) removes all
+of it.
 
 On the Mac where Desktop is signed in:
 
@@ -324,9 +364,14 @@ node dist/cli.js staging desktop status       # "service listening on 127.0.0.1:
    the phone or claude.ai/code and send a message that uses a tool. Leave it idle for 5+
    minutes and send another. Note anything that fails.
 5. Start a session from Desktop's default environment: it should behave as before, with no
-   memtree tools.
-6. Undo: `node dist/cli.js staging desktop uninstall`, then delete the "ccc" environment in
-   Desktop.
+   memtree tools. In a terminal, `claude` then `/mcp`: `memtree` connected with no tools.
+   In terminal `ccc`: the memtree tools work as before.
+6. Resilience: `launchctl kickstart -k gui/$(id -u)/co.polychat.ccc-desktop-staging` in the
+   middle of a routed session, then send another message (it should work, with a fresh
+   session proxy). Leave the session idle 30+ minutes: `service.log` should say `idle:
+   closing (final index)`.
+7. Undo: `node dist/cli.js staging desktop uninstall` (and `launchctl unsetenv
+   CCC_PROXY_TRACE` if you set it below), then delete the "ccc" environment in Desktop.
 
 To trace /rc: before step 1, run `launchctl setenv CCC_PROXY_TRACE /tmp/ccc-desktop-trace.jsonl`,
 then `launchctl kickstart -k gui/$(id -u)/co.polychat.ccc-desktop-staging` (or run

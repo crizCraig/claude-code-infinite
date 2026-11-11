@@ -39,7 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
-import { attachHttpsProxyMode, isInterceptedRequest } from "./https-proxy-mode.js";
+import { attachHttpsProxyMode, isInterceptedRequest, markInterceptedRequest } from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal } from "./route-fallback.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
@@ -49,7 +49,7 @@ import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions, p
 import { truncateToolResults } from "./tool-result-truncation.js";
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -407,6 +407,11 @@ export function startProxy(opts) {
     installMemtreeLink(state, state.memtreeLinkPlacement);
     state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
     const server = http.createServer((req, res) => {
+        if (opts.innerToken !== undefined && !acceptInnerRequest(req, opts.innerToken)) {
+            res.writeHead(403, { "content-type": "application/json" });
+            res.end(JSON.stringify({ detail: "ccc inner proxy: not for direct use" }));
+            return;
+        }
         const accepted = { req, res };
         acceptedRequests.add(accepted);
         const task = handleRequest(req, res, opts, upstream, state, hookPath).catch((err) => {
@@ -6318,4 +6323,21 @@ function transcriptTimesFor(opts, sessionId, agentId) {
     return (messages) => source.timesFor(sessionId, messages, agentId);
 }
 export const __testHoldingLane = holdingLane;
+/** PROTOTYPE (desktop service): check and strip the inner-proxy headers (ProxyOptions.innerToken). */
+function acceptInnerRequest(req, token) {
+    const got = Buffer.from(String(req.headers["x-ccc-inner"] ?? ""));
+    const want = Buffer.from(token);
+    if (got.length !== want.length || !timingSafeEqual(got, want))
+        return false;
+    if (req.headers["x-ccc-intercepted"] === "1")
+        markInterceptedRequest(req);
+    delete req.headers["x-ccc-inner"];
+    delete req.headers["x-ccc-intercepted"];
+    for (let i = req.rawHeaders.length - 2; i >= 0; i -= 2) {
+        const name = req.rawHeaders[i].toLowerCase();
+        if (name === "x-ccc-inner" || name === "x-ccc-intercepted")
+            req.rawHeaders.splice(i, 2);
+    }
+    return true;
+}
 //# sourceMappingURL=proxy.js.map

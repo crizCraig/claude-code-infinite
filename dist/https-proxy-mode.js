@@ -19,8 +19,13 @@ import { timingSafeEqual } from "node:crypto";
 import { INTERCEPT_HOST } from "./mitm-ca.js";
 /** Decrypted api.anthropic.com streams: their requests skip the loopback-only routes. */
 const intercepted = new WeakSet();
+/** PROTOTYPE (desktop): requests the desktop service decrypted and forwarded to an inner proxy. */
+const interceptedRequests = new WeakSet();
+export function markInterceptedRequest(req) {
+    interceptedRequests.add(req);
+}
 export function isInterceptedRequest(req) {
-    return intercepted.has(req.socket);
+    return intercepted.has(req.socket) || interceptedRequests.has(req);
 }
 export function attachHttpsProxyMode(server, opts) {
     const raw = new Set();

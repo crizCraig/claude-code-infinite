@@ -40,7 +40,7 @@
  */
 
 import { capCacheBreakpoints } from "./route-cache.js";
-import { attachHttpsProxyMode, isInterceptedRequest, type HttpsProxyModeOptions }
+import { attachHttpsProxyMode, isInterceptedRequest, markInterceptedRequest, type HttpsProxyModeOptions }
   from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal }
@@ -63,7 +63,7 @@ import { truncateToolResults } from "./tool-result-truncation.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Transform } from "node:stream";
 import {
   brotliDecompressSync,
@@ -408,6 +408,13 @@ export interface ProxyOptions {
   upstreamOrigin?: string;
   /** PROTOTYPE: also act as Claude Code's HTTPS_PROXY (https-proxy-mode.ts). */
   httpsProxyMode?: HttpsProxyModeOptions;
+  /**
+   * PROTOTYPE (desktop service): this proxy serves only the desktop service in the same
+   * process. Every request must carry `x-ccc-inner: <innerToken>` (else 403), and
+   * `x-ccc-intercepted: 1` (trusted only with the token) marks one the service decrypted
+   * from api.anthropic.com, so it is routed as intercepted, never as a loopback caller.
+   */
+  innerToken?: string;
   /** Test-only: dump each forwarded /v1/messages body to this directory. */
   captureDir?: string;
   /**
@@ -1118,6 +1125,11 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   installMemtreeLink(state, state.memtreeLinkPlacement);
   state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
   const server = http.createServer((req, res) => {
+    if (opts.innerToken !== undefined && !acceptInnerRequest(req, opts.innerToken)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ detail: "ccc inner proxy: not for direct use" }));
+      return;
+    }
     const accepted = { req, res };
     acceptedRequests.add(accepted);
     const task = handleRequest(req, res, opts, upstream, state, hookPath).catch(
@@ -8123,3 +8135,18 @@ function transcriptTimesFor(
   return (messages) => source.timesFor!(sessionId, messages, agentId);
 }
 export const __testHoldingLane = holdingLane;
+
+/** PROTOTYPE (desktop service): check and strip the inner-proxy headers (ProxyOptions.innerToken). */
+function acceptInnerRequest(req: http.IncomingMessage, token: string): boolean {
+  const got = Buffer.from(String(req.headers["x-ccc-inner"] ?? ""));
+  const want = Buffer.from(token);
+  if (got.length !== want.length || !timingSafeEqual(got, want)) return false;
+  if (req.headers["x-ccc-intercepted"] === "1") markInterceptedRequest(req);
+  delete req.headers["x-ccc-inner"];
+  delete req.headers["x-ccc-intercepted"];
+  for (let i = req.rawHeaders.length - 2; i >= 0; i -= 2) {
+    const name = req.rawHeaders[i].toLowerCase();
+    if (name === "x-ccc-inner" || name === "x-ccc-intercepted") req.rawHeaders.splice(i, 2);
+  }
+  return true;
+}

@@ -242,6 +242,13 @@ export interface ProxyOptions {
     upstreamOrigin?: string;
     /** PROTOTYPE: also act as Claude Code's HTTPS_PROXY (https-proxy-mode.ts). */
     httpsProxyMode?: HttpsProxyModeOptions;
+    /**
+     * PROTOTYPE (desktop service): this proxy serves only the desktop service in the same
+     * process. Every request must carry `x-ccc-inner: <innerToken>` (else 403), and
+     * `x-ccc-intercepted: 1` (trusted only with the token) marks one the service decrypted
+     * from api.anthropic.com, so it is routed as intercepted, never as a loopback caller.
+     */
+    innerToken?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
     captureDir?: string;
     /**

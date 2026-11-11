@@ -13,6 +13,7 @@
  */
 import http from "node:http";
 import { type SessionCa } from "./mitm-ca.js";
+export declare function markInterceptedRequest(req: http.IncomingMessage): void;
 export declare function isInterceptedRequest(req: http.IncomingMessage): boolean;
 export interface HttpsProxyModeOptions {
     ca: SessionCa;

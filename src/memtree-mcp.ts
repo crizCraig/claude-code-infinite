@@ -391,10 +391,15 @@ export function cccProxyFromEnv(env: NodeJS.ProcessEnv): { url: string; token: s
  * it is inert: no tools, no instructions.
  */
 export function desktopMcpTarget(env: NodeJS.ProcessEnv): { proxyUrl: string; token?: string } | undefined {
+  // The user turned ccc's memory tools off (as for the --mcp-config server).
+  if (env.CCC_MEMTREE_MCP === "0") return undefined;
   const viaProxy = cccProxyFromEnv(env);
   if (viaProxy) return { proxyUrl: env.CCC_MEMTREE_PROXY || viaProxy.url, token: viaProxy.token };
   if (env.CCC_MEMTREE_PROXY) return { proxyUrl: env.CCC_MEMTREE_PROXY };
-  if (/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(env.ANTHROPIC_BASE_URL ?? "")) {
+  // Terminal ccc in base-URL mode: its loopback base URL together with the first-party
+  // override it sets (paused-session.ts insideCccSession), not any local API proxy.
+  if (env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL === "1" &&
+      /^http:\/\/127\.0\.0\.1:\d+\/?$/.test(env.ANTHROPIC_BASE_URL ?? "")) {
     return { proxyUrl: env.ANTHROPIC_BASE_URL! };
   }
   return undefined;
