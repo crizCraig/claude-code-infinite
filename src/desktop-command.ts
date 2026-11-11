@@ -90,7 +90,15 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
       writeDesktopState(paths, state);
     }
     // After the state is final: the service reads it at start.
-    if (!args.includes("--no-launchd")) installLaunchAgent(deps.mode, paths, CLI_PATH);
+    if (!args.includes("--no-launchd")) {
+      try {
+        installLaunchAgent(deps.mode, paths, CLI_PATH);
+      } catch (err) {
+        console.error(`ccc desktop: the service could not be started: ${String((err as Error)?.message ?? err)}. ` +
+          `Try again, or run \`ccc desktop serve\` in a terminal to see why.`);
+        return 1;
+      }
+    }
     if (state.caRotated) {
       console.log("A new CA was made: Desktop sessions started before now must be restarted.\n");
     }

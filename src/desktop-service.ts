@@ -39,6 +39,8 @@ import { MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { readProjectMeta } from "./project-meta.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
+import { StablePrefixStore } from "./prefix-store.js";
+import { ToolOutputStore } from "./tool-output-store.js";
 import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { MEMTREE_TOOLS_HEADER_VALUE, MEMTREE_MCP_SCRIPT } from "./memtree-mcp-config.js";
 import { MEMTREE_MCP_SERVER_NAME, PROXY_TOKEN_HEADER } from "./memtree-mcp.js";
@@ -113,7 +115,13 @@ function bashEnvScript(paths: DesktopPaths, state: DesktopState): string {
     "# ccc desktop: written by `ccc desktop setup`; sourced by Claude Code before each Bash command.",
     `case "\${HTTPS_PROXY-}" in http://ccc:*@127.0.0.1:${state.port}) unset HTTPS_PROXY https_proxy ;; esac`,
     `case "\${NODE_EXTRA_CA_CERTS-}" in ${shellQuote(paths.caPem)}) unset NODE_EXTRA_CA_CERTS ;; esac`,
+    // Programs started from Bash (a nested `claude -p`, an SDK script) aren't routed through
+    // ccc, so they get Claude Code's own compaction back.
+    `[ "\${DISABLE_AUTO_COMPACT-}" = 1 ] && unset DISABLE_AUTO_COMPACT`,
+    `[ "\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-}" = ${UNREACHABLE_BLOCKING_LIMIT} ] && unset CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE`,
+    `[ "\${CLAUDE_CODE_RESUME_TOKEN_THRESHOLD-}" = 1000000000 ] && unset CLAUDE_CODE_RESUME_TOKEN_THRESHOLD`,
     `unset CLAUDE_ENV_FILE`,
+    "true",
     "",
   ].join("\n");
 }
@@ -142,12 +150,7 @@ export function readDesktopState(paths: DesktopPaths): DesktopState | undefined 
   }
 }
 
-/**
- * Make (or rotate) the CA and leaf, the token, the port and the Bash env file.
- * A re-run keeps the port and token (the pasted lines stay valid) unless
- * `rotateToken`; the CA always rotates, at the same file path.
- */
-/** Rotate the CA this long before it expires (setup and the service's notice). */
+/** Setup rotates the CA when it expires within this. */
 export const CA_ROTATE_BEFORE_MS = 30 * 24 * 3600_000;
 
 /**
@@ -235,6 +238,7 @@ ${args.map((a) => `    <string>${esc(a)}</string>`).join("\n")}
     <key>PATH</key><string>${esc(`${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`)}</string>
   </dict>
   <key>RunAtLoad</key><true/>
+  <key>ExitTimeOut</key><integer>45</integer>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${esc(paths.log)}</string>
@@ -249,9 +253,13 @@ export function installLaunchAgent(mode: DesktopMode, paths: DesktopPaths, cliPa
   fs.writeFileSync(paths.plist, launchdPlist(mode, paths, cliPath), { mode: 0o644 });
   const domain = `gui/${process.getuid?.() ?? 501}`;
   spawnSync("launchctl", ["bootout", `${domain}/${launchdLabel(mode)}`], { stdio: "ignore" });
-  // bootout returns before the job is fully gone; bootstrap right after can fail (5/37). Retry.
+  // bootout returns before the job is fully gone (it may take its ExitTimeOut to final-index);
+  // wait for it to leave, then bootstrap, retrying the transient 5/37 errors.
+  for (let i = 0; i < 200 && spawnSync("launchctl", ["print", `${domain}/${launchdLabel(mode)}`], { stdio: "ignore" }).status === 0; i++) {
+    spawnSync("sleep", ["0.25"]);
+  }
   let last = "";
-  for (let attempt = 0; attempt < 20; attempt++) {
+  for (let attempt = 0; attempt < 40; attempt++) {
     const r = spawnSync("launchctl", ["bootstrap", domain, paths.plist], { encoding: "utf8" });
     if (r.status === 0) return;
     last = `${r.status}: ${(r.stderr || "").trim()}`;
@@ -283,13 +291,21 @@ export function desktopMcpServerJson(): string {
   });
 }
 
-/** Who owns the user-scope `memtree` entry in ~/.claude.json (read only; never written here). */
-export function userMcpOwner(claudeJsonPath = path.join(os.homedir(), ".claude.json")): "none" | "ccc-desktop" | "other" {
+/** The file `claude mcp --scope user` edits: `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`. */
+export function userClaudeJsonPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.CLAUDE_CONFIG_DIR ? path.join(env.CLAUDE_CONFIG_DIR, ".claude.json") : path.join(os.homedir(), ".claude.json");
+}
+
+/**
+ * Who owns the user-scope `memtree` entry (read only; never written here). A file that
+ * exists but can't be read or parsed is "other": ccc then touches nothing.
+ */
+export function userMcpOwner(claudeJsonPath = userClaudeJsonPath()): "none" | "ccc-desktop" | "other" {
   let config: { mcpServers?: Record<string, { env?: Record<string, string> }> };
   try {
     config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
-  } catch {
-    return "none";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "none" : "other";
   }
   const entry = config.mcpServers?.[MEMTREE_MCP_SERVER_NAME];
   if (!entry) return "none";
@@ -303,7 +319,7 @@ export function userMcpOwner(claudeJsonPath = path.join(os.homedir(), ".claude.j
 export function registerDesktopMcp(
   claudeCommand: string, env: NodeJS.ProcessEnv = process.env
 ): { ok: boolean; reason?: string } {
-  const owner = userMcpOwner();
+  const owner = userMcpOwner(userClaudeJsonPath(env));
   if (owner === "other") {
     return { ok: false, reason: "a user-scope MCP server named `memtree` that ccc didn't add already exists" };
   }
@@ -320,7 +336,7 @@ export function registerDesktopMcp(
 export function unregisterDesktopMcp(
   claudeCommand: string, otherModesInstalled: boolean, env: NodeJS.ProcessEnv = process.env
 ): void {
-  if (otherModesInstalled || userMcpOwner() !== "ccc-desktop") return;
+  if (otherModesInstalled || userMcpOwner(userClaudeJsonPath(env)) !== "ccc-desktop") return;
   spawnSync(claudeCommand, ["mcp", "remove", "--scope", "user", MEMTREE_MCP_SERVER_NAME], { stdio: "ignore", env });
 }
 
@@ -399,13 +415,15 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
     apiKey: opts.apiKey,
     debug: opts.debug,
     reqlog,
-    // Only when setup registered the user-scope MCP entry (registerDesktopMcp).
-    memtreeTools: opts.state.mcpRegistered ? MEMTREE_TOOLS_HEADER_VALUE : undefined,
+    // Set per session from its model calls' tool list (toolsOffered).
+    memtreeTools: undefined,
   });
   const proxyOptions = (memtree: MemtreeClient, transcriptUsage?: ClaudeTranscriptUsage): ProxyOptions => ({
     memtree,
     reqlog,
     innerToken,
+    stablePrefixStore,
+    toolOutputs,
     debug: opts.debug,
     nativeOneMillionContext: true,
     toolRouteRecovery: true,
@@ -417,6 +435,11 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
     // Test-only, as in terminal ccc: a small budget so a cheap session crosses it.
     ...(Number(process.env.CCC_BUDGET_TOKENS) > 0 ? { budgetTokensOverride: Number(process.env.CCC_BUDGET_TOKENS) } : {}),
   } as ProxyOptions);
+  // As in terminal ccc (cli-main.ts): a session's adopted compressed prefix, so a fresh
+  // proxy for it (after an idle close or a restart) rides it instead of blocking on a
+  // compress; and full copies of tool results shortened to fit the window (the safety net).
+  const stablePrefixStore = new StablePrefixStore();
+  const toolOutputs = new ToolOutputStore();
   const fallbackMemtree = newMemtree();
   const fallback = await startProxy(proxyOptions(fallbackMemtree));
   const sessions = new Map<string, SessionEntry>();
@@ -446,6 +469,12 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
           return proxy;
         }),
       };
+      const created = entry;
+      // A failed start (EMFILE, ...) must not stick: the next request retries.
+      created.proxy.catch((err) => {
+        if (sessions.get(id) === created) sessions.delete(id);
+        log(`session ${id.slice(0, 8)} proxy failed to start: ${String(err)}`);
+      });
       sessions.set(id, entry);
     }
     if (cwd && entry.cwd === undefined) {
@@ -485,7 +514,20 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
     ...(opts.tracePath ? { tracePath: opts.tracePath } : {}),
   });
 
+  let closing = false;
+  const pendingRoutes = new Set<Promise<void>>();
   async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (closing) {
+      res.writeHead(503, { "content-type": "application/json", connection: "close" });
+      res.end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "ccc desktop service is restarting" } }));
+      return;
+    }
+    const task = routeInner(req, res);
+    pendingRoutes.add(task);
+    try { await task; } finally { pendingRoutes.delete(task); }
+  }
+
+  async function routeInner(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     // A client that goes away while we wait (body, git, proxy start) must not still be sent upstream.
     let gone = false;
     res.on("close", () => { if (!res.writableFinished) gone = true; });
@@ -497,7 +539,14 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
       if (isModelCall && sessionId) {
         const body = await readBody(req);
         const known = sessions.get(sessionId)?.cwd;
-        const entry = sessionProxy(sessionId, known ?? workingDirectoryFromBody(body.toString("utf8")));
+        const text = body.toString("utf8");
+        const entry = sessionProxy(sessionId, known ?? workingDirectoryFromBody(text));
+        // Say the memory tools exist only when this session's model call carries them
+        // (an inert or disabled MCP server sends none); count_tokens and side calls say nothing.
+        if (url.pathname === "/v1/messages" && opts.state.mcpRegistered) {
+          const offered = toolsOffered(text);
+          if (offered !== undefined) entry.memtree.setMemtreeTools(offered ? MEMTREE_TOOLS_HEADER_VALUE : undefined);
+        }
         entry.inFlight++;
         try {
           // A few ms of git on the session's first request with a directory, so its MemTree calls carry the project.
@@ -561,18 +610,40 @@ export async function startDesktopService(opts: DesktopServiceOptions): Promise<
     closeIdle,
     close: async () => {
       clearInterval(sweep);
+      closing = true;
       server.close();
       tunnels.blind();
+      // Requests already being routed finish (or fail) before the sessions are snapshotted.
+      await Promise.allSettled([...pendingRoutes]);
       const all = [...sessions.values()];
       sessions.clear();
-      await Promise.allSettled(all.map((e) => closeSession(e, 10_000)));
-      await fallback.drain(10_000);
-      await fallbackMemtree.drainBackground(FINAL_DRAIN_MS);
-      fallback.close();
+      await Promise.allSettled([
+        ...all.map((e) => closeSession(e, 10_000)),
+        (async () => {
+          await fallback.drain(10_000);
+          await fallbackMemtree.drainBackground(FINAL_DRAIN_MS);
+          fallback.close();
+        })(),
+      ]);
       tunnels.all();
       await reqlog.flush(2_000);
     },
   };
+}
+
+/**
+ * Whether a /v1/messages body offers the memtree tools: true / false when it has a
+ * `tools` list with or without them, undefined when it has none (a side call: no change).
+ */
+export function toolsOffered(body: string): boolean | undefined {
+  if (!body.includes('"tools"')) return undefined;
+  try {
+    const tools = (JSON.parse(body) as { tools?: { name?: unknown }[] }).tools;
+    if (!Array.isArray(tools) || tools.length === 0) return undefined;
+    return tools.some((t) => typeof t?.name === "string" && t.name.startsWith(`mcp__${MEMTREE_MCP_SERVER_NAME}__`));
+  } catch {
+    return undefined;
+  }
 }
 
 function header(req: http.IncomingMessage, name: string): string | undefined {

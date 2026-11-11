@@ -26,12 +26,7 @@ export declare function desktopEnvLines(paths: DesktopPaths, state: DesktopState
 /** One shell word, literal (also as a `case` pattern: quoted, so no glob). */
 export declare function shellQuote(value: string): string;
 export declare function readDesktopState(paths: DesktopPaths): DesktopState | undefined;
-/**
- * Make (or rotate) the CA and leaf, the token, the port and the Bash env file.
- * A re-run keeps the port and token (the pasted lines stay valid) unless
- * `rotateToken`; the CA always rotates, at the same file path.
- */
-/** Rotate the CA this long before it expires (setup and the service's notice). */
+/** Setup rotates the CA when it expires within this. */
 export declare const CA_ROTATE_BEFORE_MS: number;
 /**
  * Make the CA and leaf, the token, the port and the Bash env file. A re-run keeps
@@ -58,7 +53,12 @@ export declare function uninstallLaunchAgent(mode: DesktopMode, paths: DesktopPa
  * `claude mcp add-json --scope user`, never by editing ~/.claude.json directly.
  */
 export declare function desktopMcpServerJson(): string;
-/** Who owns the user-scope `memtree` entry in ~/.claude.json (read only; never written here). */
+/** The file `claude mcp --scope user` edits: `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`. */
+export declare function userClaudeJsonPath(env?: NodeJS.ProcessEnv): string;
+/**
+ * Who owns the user-scope `memtree` entry (read only; never written here). A file that
+ * exists but can't be read or parsed is "other": ccc then touches nothing.
+ */
 export declare function userMcpOwner(claudeJsonPath?: string): "none" | "ccc-desktop" | "other";
 /**
  * Register (or refresh) ccc's entry. Someone else's `memtree` entry is left alone
@@ -95,4 +95,9 @@ export interface RunningDesktopService {
  */
 export declare function workingDirectoryFromBody(body: string): string | undefined;
 export declare function startDesktopService(opts: DesktopServiceOptions): Promise<RunningDesktopService>;
+/**
+ * Whether a /v1/messages body offers the memtree tools: true / false when it has a
+ * `tools` list with or without them, undefined when it has none (a side call: no change).
+ */
+export declare function toolsOffered(body: string): boolean | undefined;
 //# sourceMappingURL=desktop-service.d.ts.map

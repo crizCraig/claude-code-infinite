@@ -10,7 +10,8 @@ import path from "node:path";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
-  desktopEnvLines, desktopPaths, setupDesktopFiles, startDesktopService, workingDirectoryFromBody,
+  desktopEnvLines, desktopPaths, setupDesktopFiles, startDesktopService, toolsOffered,
+  userClaudeJsonPath, userMcpOwner, workingDirectoryFromBody,
 } from "../dist/desktop-service.js";
 import { desktopClaudeBinaries } from "../dist/desktop-command.js";
 import { desktopMcpTarget, handleMcpMessage } from "../dist/memtree-mcp.js";
@@ -146,9 +147,14 @@ test("setup's Bash env file is valid with an apostrophe in the path (Codex r1 P2
   const paths = desktopPaths(dir, "local");
   await setupDesktopFiles(paths, "local");
   execFileSync("bash", ["-n", paths.bashEnv]);
-  const out = execFileSync("bash", ["-c", `. "$1"; echo "ca=\${NODE_EXTRA_CA_CERTS-unset}"`, "x", paths.bashEnv],
-    { env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: paths.caPem } }).toString();
-  assert.equal(out.trim(), "ca=unset");
+  const out = execFileSync("bash", ["-c", `. "$1"; echo "ca=\${NODE_EXTRA_CA_CERTS-unset} dac=\${DISABLE_AUTO_COMPACT-unset} bl=\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-unset}"`, "x", paths.bashEnv],
+    { env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: paths.caPem, DISABLE_AUTO_COMPACT: "1",
+      CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000" } }).toString();
+  // Bash children get Claude Code's own compaction back (Claude r2 P2).
+  assert.equal(out.trim(), "ca=unset dac=unset bl=unset");
+  const kept = execFileSync("bash", ["-c", `. "$1"; echo "bl=\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-unset} rc=$?"`, "x", paths.bashEnv],
+    { env: { PATH: process.env.PATH, CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "5000" } }).toString();
+  assert.equal(kept.trim(), "bl=5000 rc=0");
 });
 
 test("re-running setup keeps the CA, token and port unless asked (Claude r1 P2)", async (t) => {
@@ -168,6 +174,27 @@ test("re-running setup keeps the CA, token and port unless asked (Claude r1 P2)"
   assert.ok(rotated.caRotated);
   assert.notEqual(fs.readFileSync(paths.caPem, "utf8"), ca);
   assert.equal(rotated.token, first.token);
+});
+
+test("the tools header follows the session's own tool list (Codex r2 P2)", () => {
+  assert.equal(toolsOffered(JSON.stringify({ tools: [{ name: "Bash" }, { name: "mcp__memtree__search" }] })), true);
+  assert.equal(toolsOffered(JSON.stringify({ tools: [{ name: "Bash" }] })), false);
+  assert.equal(toolsOffered(JSON.stringify({ messages: [] })), undefined);
+  assert.equal(toolsOffered(JSON.stringify({ tools: [] })), undefined);
+});
+
+test("MCP ownership reads the config Claude Code would edit, and an unreadable one is not ours (Codex r2 P2)", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-owner-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.equal(userClaudeJsonPath({ CLAUDE_CONFIG_DIR: dir }), path.join(dir, ".claude.json"));
+  const file = path.join(dir, ".claude.json");
+  assert.equal(userMcpOwner(file), "none");
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { memtree: { command: "x" } } }));
+  assert.equal(userMcpOwner(file), "other");
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { memtree: { env: { CCC_MEMTREE_MCP_DESKTOP: "1" } } } }));
+  assert.equal(userMcpOwner(file), "ccc-desktop");
+  fs.writeFileSync(file, "{ not json");
+  assert.equal(userMcpOwner(file), "other");
 });
 
 test("inner proxies refuse requests without the service's inner token (Codex r1 P1)", async (t) => {
