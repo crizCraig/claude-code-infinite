@@ -196,7 +196,7 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "ccc sessions on any machine (not Codex or plain claude sessions), and list shows those sessions by time and " +
   "project. Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
   "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
-  "re-embedded, as is a text search of one tree. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
+  "re-embedded. Reads (list, a one-tree text search, a tree's download) cost $0.0005 too once the read price starts. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
   "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
   "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
   "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
@@ -238,7 +238,8 @@ export const MEMTREE_TOOLS = [
       "Use it before re-deriving or guessing something from earlier work. " +
       "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
       "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
-      "first page is charged even when cached; cursor continuation and a text search of one tree are free. Cursors page over live results, not a frozen snapshot. " +
+      "first page is charged even when cached; cursor continuation is free; a text search of one tree is a read, free until " +
+      "the read price starts. Cursors page over live results, not a frozen snapshot. " +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
       "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
       "Results show when the messages were written, each matched line its own message's time where recorded. " +
@@ -250,7 +251,7 @@ export const MEMTREE_TOOLS = [
       properties: {
         query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions) or a question (vector)." },
         tree: { type: "string", description: `Optional. ${TREE_DESC} Omit to search all sessions.` },
-        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words) or vector (meaning); first page charged, except text in one tree." },
+        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words) or vector (meaning); first page charged (text in one tree: a read)." },
         project: { type: "string", description: "Without tree: only sessions in this working directory or git repository (owner/repo, or just repo)." },
         since: { type: "string", description: "Without tree: only requests at or after this ISO 8601 time or date." },
         until: { type: "string", description: "Without tree: only requests before this ISO 8601 time or date." },
@@ -304,7 +305,7 @@ export const MEMTREE_TOOLS = [
       "account (this one marked; Codex and plain claude sessions are not included). Each: title (the tree's root summary), " +
       "first message, how it ended (last user message, the tools after it and the last reply, with the time), times, " +
       "project (directory, git repo, branch, commit), models, request count and the latest tree's reference. " +
-      "Filter by time, project or words in the title. Free. Open a session's tree with read_node {\"tree\": <ref>, \"id\": 0} or search {\"tree\": <ref>, ...}.",
+      "Filter by time, project or words in the title. A first page is a read: free until MemTree's read price starts, then $0.0005. Open a session's tree with read_node {\"tree\": <ref>, \"id\": 0} or search {\"tree\": <ref>, ...}.",
     inputSchema: {
       type: "object",
       properties: {
