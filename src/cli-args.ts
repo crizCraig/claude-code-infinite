@@ -42,7 +42,7 @@ export function isVersionRequest(args: readonly string[]): boolean {
 }
 
 /** ccc's own subcommands, which start no Claude session. */
-const SUBCOMMANDS = ["fetch", "memtree-mcp", "link"] as const;
+const SUBCOMMANDS = ["fetch", "memtree-mcp", "link", "desktop"] as const;
 const ENVIRONMENT_WORDS = ["local", "staging"];
 
 export type CccEnvironment = "production" | "staging" | "local";

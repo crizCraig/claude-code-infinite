@@ -246,6 +246,8 @@ export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
     proxyUrl?: string;
     sessionId?: string;
+    /** PROTOTYPE (desktop): the ccc desktop service's proxy token, sent as x-ccc-proxy-token. */
+    token?: string;
     fetch?: typeof fetch;
     now?: () => number;
 }
@@ -256,6 +258,26 @@ export interface MemtreeMcpDeps {
  * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
  */
 export declare const MEMTREE_TOOL_HEADER = "x-memtree-tool";
+/** PROTOTYPE (desktop): the desktop service's loopback routes require its proxy token. */
+export declare const PROXY_TOKEN_HEADER = "x-ccc-proxy-token";
+/**
+ * PROTOTYPE (desktop): a ccc proxy named by Claude Code's own HTTPS_PROXY
+ * (`http://ccc:<token>@127.0.0.1:<port>`, the desktop service or a proxy-mode ccc).
+ */
+export declare function cccProxyFromEnv(env: NodeJS.ProcessEnv): {
+    url: string;
+    token: string;
+} | undefined;
+/**
+ * PROTOTYPE (desktop): where the server registered in ~/.claude.json for the
+ * Claude desktop app (CCC_MEMTREE_MCP_DESKTOP=1) reads from. The same entry is
+ * seen by every Claude Code on this account, so outside a ccc-routed session
+ * it is inert: no tools, no instructions.
+ */
+export declare function desktopMcpTarget(env: NodeJS.ProcessEnv): {
+    proxyUrl: string;
+    token?: string;
+} | undefined;
 export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string>;
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
@@ -357,7 +379,9 @@ versionNote?: string,
 /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
 notice?: {
     next(): string | undefined;
-}): Promise<object | undefined>;
+}, 
+/** PROTOTYPE (desktop): not in a ccc-routed session: no tools, no instructions. */
+inert?: boolean): Promise<object | undefined>;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

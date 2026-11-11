@@ -303,6 +303,8 @@ export interface MemtreeMcpDeps {
   /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
   proxyUrl?: string;
   sessionId?: string;
+  /** PROTOTYPE (desktop): the ccc desktop service's proxy token, sent as x-ccc-proxy-token. */
+  token?: string;
   fetch?: typeof fetch;
   now?: () => number;
 }
@@ -370,9 +372,37 @@ async function proxyGetJson(
  * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
  */
 export const MEMTREE_TOOL_HEADER = "x-memtree-tool";
+/** PROTOTYPE (desktop): the desktop service's loopback routes require its proxy token. */
+export const PROXY_TOKEN_HEADER = "x-ccc-proxy-token";
+
+/**
+ * PROTOTYPE (desktop): a ccc proxy named by Claude Code's own HTTPS_PROXY
+ * (`http://ccc:<token>@127.0.0.1:<port>`, the desktop service or a proxy-mode ccc).
+ */
+export function cccProxyFromEnv(env: NodeJS.ProcessEnv): { url: string; token: string } | undefined {
+  const m = /^http:\/\/ccc:([0-9a-f]{32,128})@127\.0\.0\.1:(\d{1,5})\/?$/.exec(env.HTTPS_PROXY ?? "");
+  return m ? { url: `http://127.0.0.1:${m[2]}`, token: m[1] } : undefined;
+}
+
+/**
+ * PROTOTYPE (desktop): where the server registered in ~/.claude.json for the
+ * Claude desktop app (CCC_MEMTREE_MCP_DESKTOP=1) reads from. The same entry is
+ * seen by every Claude Code on this account, so outside a ccc-routed session
+ * it is inert: no tools, no instructions.
+ */
+export function desktopMcpTarget(env: NodeJS.ProcessEnv): { proxyUrl: string; token?: string } | undefined {
+  const viaProxy = cccProxyFromEnv(env);
+  if (viaProxy) return { proxyUrl: env.CCC_MEMTREE_PROXY || viaProxy.url, token: viaProxy.token };
+  if (env.CCC_MEMTREE_PROXY) return { proxyUrl: env.CCC_MEMTREE_PROXY };
+  if (/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(env.ANTHROPIC_BASE_URL ?? "")) {
+    return { proxyUrl: env.ANTHROPIC_BASE_URL! };
+  }
+  return undefined;
+}
 export function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string> {
   const headers: Record<string, string> = { [MEMTREE_TOOL_HEADER]: tool };
   if (deps.sessionId) headers["x-claude-code-session-id"] = deps.sessionId;
+  if (deps.token) headers[PROXY_TOKEN_HEADER] = deps.token;
   return headers;
 }
 
@@ -801,7 +831,9 @@ export async function handleMcpMessage(
   /** versionMismatchNote: appended to failed tool calls. */
   versionNote?: string,
   /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
-  notice?: { next(): string | undefined }
+  notice?: { next(): string | undefined },
+  /** PROTOTYPE (desktop): not in a ccc-routed session: no tools, no instructions. */
+  inert = false
 ): Promise<object | undefined> {
   if (!isRpcRequest(input)) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
@@ -821,13 +853,13 @@ export async function handleMcpMessage(
         protocolVersion: typeof requested === "string" ? requested : LATEST_PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: MEMTREE_MCP_SERVER_NAME, version: CLIENT_VERSION },
-        instructions: MEMTREE_MCP_INSTRUCTIONS,
+        ...(inert ? {} : { instructions: MEMTREE_MCP_INSTRUCTIONS }),
       });
     }
     case "ping":
       return isRequest ? reply({}) : undefined;
     case "tools/list":
-      return reply({ tools: MEMTREE_TOOLS });
+      return reply({ tools: inert ? [] : MEMTREE_TOOLS });
     case "tools/call": {
       const name = message.params?.name;
       const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
@@ -1000,9 +1032,13 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
 
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void {
+  const desktop = env.CCC_MEMTREE_MCP_DESKTOP === "1";
+  const target = desktop ? desktopMcpTarget(env) : undefined;
+  const inert = desktop && !target;
   const deps: MemtreeMcpDeps = {
-    proxyUrl: env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
+    proxyUrl: desktop ? target?.proxyUrl : env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    ...(target?.token ? { token: target.token } : {}),
   };
   const tree = new CurrentTree(deps);
   const finder = new SessionFinder(deps);
@@ -1029,7 +1065,7 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
         continue;
       }
       queue = queue.then(async () => {
-        const response = await handleMcpMessage(message, tree, finder, versionNote, notice).catch((err) => ({
+        const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert).catch((err) => ({
           jsonrpc: "2.0",
           id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },

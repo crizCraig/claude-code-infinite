@@ -169,6 +169,7 @@ import { exitResumeHint } from "./resume-hint.js";
 import { createSessionCa, writeCaBundle, type SessionCa, type SessionCaFiles } from "./mitm-ca.js";
 import { readFileSync as readCaFile, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { runDesktopCommand } from "./desktop-command.js";
 import { urlOpenerFor } from "./open-url.js";
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
@@ -518,6 +519,18 @@ async function main() {
   if (subcommand?.name === "link") {
     // exitCode, not exit(): a piped stdout (async on macOS) gets its line out first.
     process.exitCode = await runLinkCommand(subcommand.args, linkDeps(mode));
+    return;
+  }
+
+  // PROTOTYPE: `ccc [staging|local] desktop ...` (desktop-command.ts).
+  if (subcommand?.name === "desktop") {
+    process.exitCode = await runDesktopCommand(subcommand.args, {
+      mode,
+      memtreeBaseUrl: mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
+        mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
+      apiKey: () => mode === "local" ? getLocalPolychatApiKey() :
+        mode === "staging" ? getStagingPolychatApiKey() : getPolychatApiKey(),
+    });
     return;
   }
 
