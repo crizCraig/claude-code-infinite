@@ -124,19 +124,31 @@ function blockImageChars(blocks, shape) {
         if (!block || typeof block !== "object")
             continue;
         const source = block.source;
-        if (block.type === "image") {
-            if (source?.type === "base64" && typeof source.data === "string") {
-                total += source.data.length;
-                shape.imageDims.push(imageDimensions(source.data));
-            }
-            else {
-                shape.otherImages = true;
-            }
+        if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
+            total += source.data.length;
+            shape.imageDims.push(imageDimensions(source.data));
+        }
+        else if (externallyResolved(block)) {
+            shape.otherImages = true;
         }
         else if (block.type === "tool_result" && Array.isArray(block.content)) {
             total += blockImageChars(block.content, shape);
         }
     }
     return total;
+}
+/** Inline sources: their content is in the body, so the digest covers it. */
+const INLINE_SOURCES = new Set(["base64", "text", "content"]);
+/**
+ * A block Anthropic resolves from outside the body (an image or document by URL or file
+ * id, a container upload): it can change under the same digest (Codex r4 and r5 P1s).
+ */
+function externallyResolved(block) {
+    if (block.type === "container_upload")
+        return true;
+    const source = block.source;
+    if (block.type === "image")
+        return true;
+    return !!source && typeof source === "object" && !INLINE_SOURCES.has(String(source.type));
 }
 //# sourceMappingURL=body-shape.js.map

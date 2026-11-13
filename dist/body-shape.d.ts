@@ -17,8 +17,9 @@ export interface BodyShape {
     /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
     imageDims: Array<[number, number] | undefined>;
     /**
-     * The messages hold an image that is not inline base64 (a URL or file): its content can
-     * change under an unchanged digest, so the body never anchors a size (Codex r4 P1).
+     * The messages hold an image, document or upload resolved from outside the body (a URL
+     * or file id): its content can change under an unchanged digest, so the body never
+     * anchors a size (Codex r4/r5 P1s).
      */
     otherImages: boolean;
 }

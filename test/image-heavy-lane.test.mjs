@@ -240,6 +240,22 @@ test('a URL image in the body: no anchor (its content can change, Codex r4 P1)',
     .conservativeTokens, conservativeBodyTokens(body, MODEL));
 });
 
+test('a document by URL, even inside a tool result: no anchor (Codex r5 P1)', () => {
+  for (const block of [
+    { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } },
+    { type: 'tool_result', tool_use_id: 'u', content: [
+      { type: 'document', source: { type: 'file', file_id: 'file_1' } }] },
+  ]) {
+    const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+    messages.splice(1, 0, { role: 'user', content: [block] },
+      { role: 'assistant', content: [{ type: 'text', text: 'read' }] });
+    const sample = sampleOf(bodyOf(messages.slice(0, -2)), 200_000);
+    const body = bodyOf(messages);
+    assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+      .conservativeTokens, conservativeBodyTokens(body, MODEL));
+  }
+});
+
 test('a standalone JPEG marker (TEM) before a large segment is walked over (Codex r4 P2)', () => {
   const sheet = Buffer.from(jpeg(1999, 1354, { iccBytes: 120_000 }), 'base64');
   const withTem = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0x01]), sheet.subarray(2)]);

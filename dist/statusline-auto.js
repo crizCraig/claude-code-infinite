@@ -101,8 +101,11 @@ export function onPath(name, env = process.env) {
         if (!dir)
             continue;
         try {
-            fs.accessSync(path.join(dir, name), fs.constants.X_OK);
-            return true;
+            const candidate = path.join(dir, name);
+            // A directory is "executable" (searchable) too; Codex r5 P2.
+            fs.accessSync(candidate, fs.constants.X_OK);
+            if (fs.statSync(candidate).isFile())
+                return true;
         }
         catch {
             // Not here.

@@ -37,8 +37,9 @@ export interface BodyShape {
   /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
   imageDims: Array<[number, number] | undefined>;
   /**
-   * The messages hold an image that is not inline base64 (a URL or file): its content can
-   * change under an unchanged digest, so the body never anchors a size (Codex r4 P1).
+   * The messages hold an image, document or upload resolved from outside the body (a URL
+   * or file id): its content can change under an unchanged digest, so the body never
+   * anchors a size (Codex r4/r5 P1s).
    */
   otherImages: boolean;
 }
@@ -148,16 +149,28 @@ function blockImageChars(blocks: unknown[], shape: BodyShape): number {
     const block = item as Record<string, unknown> | null;
     if (!block || typeof block !== "object") continue;
     const source = block.source as Record<string, unknown> | undefined;
-    if (block.type === "image") {
-      if (source?.type === "base64" && typeof source.data === "string") {
-        total += source.data.length;
-        shape.imageDims.push(imageDimensions(source.data));
-      } else {
-        shape.otherImages = true;
-      }
+    if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
+      total += source.data.length;
+      shape.imageDims.push(imageDimensions(source.data));
+    } else if (externallyResolved(block)) {
+      shape.otherImages = true;
     } else if (block.type === "tool_result" && Array.isArray(block.content)) {
       total += blockImageChars(block.content, shape);
     }
   }
   return total;
+}
+
+/** Inline sources: their content is in the body, so the digest covers it. */
+const INLINE_SOURCES = new Set(["base64", "text", "content"]);
+
+/**
+ * A block Anthropic resolves from outside the body (an image or document by URL or file
+ * id, a container upload): it can change under the same digest (Codex r4 and r5 P1s).
+ */
+function externallyResolved(block: Record<string, unknown>): boolean {
+  if (block.type === "container_upload") return true;
+  const source = block.source as Record<string, unknown> | undefined;
+  if (block.type === "image") return true;
+  return !!source && typeof source === "object" && !INLINE_SOURCES.has(String(source.type));
 }

@@ -110,4 +110,7 @@ test("PATH search finds an executable and ignores a missing one",
     assert.equal(onPath("ccc", { PATH: `/nonexistent${path.delimiter}${dir}` }), true);
     assert.equal(onPath("ccc", { PATH: "/nonexistent" }), false);
     assert.equal(onPath("ccc", {}), false);
+    const dirOnly = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-path-"));
+    fs.mkdirSync(path.join(dirOnly, "ccc"));
+    assert.equal(onPath("ccc", { PATH: dirOnly }), false, "a directory named ccc is no command");
   });

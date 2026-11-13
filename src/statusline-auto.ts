@@ -112,8 +112,10 @@ export function onPath(name: string, env: NodeJS.ProcessEnv = process.env): bool
   for (const dir of (env.PATH ?? "").split(path.delimiter)) {
     if (!dir) continue;
     try {
-      fs.accessSync(path.join(dir, name), fs.constants.X_OK);
-      return true;
+      const candidate = path.join(dir, name);
+      // A directory is "executable" (searchable) too; Codex r5 P2.
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return true;
     } catch {
       // Not here.
     }
