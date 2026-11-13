@@ -25,8 +25,9 @@ import { MEMTREE_COMPACT_COMMAND, MEMTREE_VIEW_COMMAND, SESSION_PLUGIN_NAME } fr
 export const INDEX_TOKENS_PER_MINUTE = 40_000;
 /** Which cause explains this refusal (first match wins). */
 export function refusalCause(rec, facts) {
-    const serverSeconds = facts.indexSecondsLeft ?? rec.indexWait?.secondsLeft ??
-        rec.indexLag?.etaSeconds;
+    // The caller's stated time left (an indexing 413's, never its 60 s stand-in), else this
+    // request's own compress answer. Not rec.indexWait: it holds the stand-in too.
+    const serverSeconds = facts.indexSecondsLeft ?? rec.indexLag?.etaSeconds;
     if (rec.indexBehind) {
         return { kind: "indexing", ...defined({ secondsLeft: serverSeconds,
                 unindexedTokens: rec.indexLag?.unindexedTokens }) };
@@ -41,7 +42,8 @@ export function refusalCause(rec, facts) {
         return { kind: "slow-answer", ms: compress.ms };
     const failed = compress !== undefined && !compress.ok && !compress.refused;
     if (failed && rec.compaction?.reason === "prefix-mismatch") {
-        return { kind: "rebuilding", ...defined({ secondsLeft: serverSeconds }) };
+        // Only this request's own answer: a lane's index wait may be long over.
+        return { kind: "rebuilding", ...defined({ secondsLeft: rec.indexLag?.etaSeconds }) };
     }
     if (failed)
         return { kind: "compress-failed", ...defined({ status: compress.status }) };

@@ -52,10 +52,11 @@ export class StatusLinkFiles {
     write(sessionId, url) {
         if (!sessionId || !SESSION_ID.test(sessionId) || !url || !/^https?:\/\/\S+$/.test(url))
             return;
-        const file = path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`);
-        // Unchanged and still there (another ccc process may have pruned it).
-        if (this.written.get(sessionId) === url && fs.existsSync(file))
+        // Unchanged and still on disk as written (another ccc process may have pruned it, or
+        // written an older link for the same resumed session).
+        if (this.written.get(sessionId) === url && readStatusLink(sessionId, this.dir) === url)
             return;
+        const file = path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`);
         try {
             fs.mkdirSync(this.dir, { recursive: true });
             const tmp = `${file}.${process.pid}.tmp`;

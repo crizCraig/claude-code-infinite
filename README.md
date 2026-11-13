@@ -238,7 +238,8 @@ ends).
 - **Opt in:** `ccc statusline install`. It points `statusLine` in `~/.claude/settings.json`
   (or `$CLAUDE_CONFIG_DIR/settings.json`) at `ccc statusline`, which runs your existing
   status-line command with the same input and appends ` | 🌿 tree`. Your original command is
-  saved in `~/.claude-code-infinite/statusline.json` and settings.json is backed up first.
+  saved in `~/.claude-code-infinite/statusline-<id>.json` (one per settings file) and settings.json
+  is backed up first. A `statusLine` in a project's `.claude/settings*.json` overrides yours.
   `ccc statusline uninstall` puts the original back; run it before uninstalling ccc. Restart
   `ccc` to see it. Not on Windows yet (Claude Code runs status lines in Git Bash there): use
   the snippet.

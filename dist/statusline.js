@@ -36,11 +36,12 @@ export const WRAPPED_ENV = "CCC_STATUSLINE_WRAPPED";
 /** A command that runs ccc's status line, however ccc is spelled (path, npx, a shell). */
 const CCC_STATUSLINE = /(^|[\s/\\'"])(ccc|claude-code-infinite)(\.cmd|\.js)?['"]?\s+statusline\b/;
 export function statuslinePaths(env = process.env) {
-    const custom = env.CLAUDE_CONFIG_DIR?.trim();
-    const settings = path.join(custom || path.join(os.homedir(), ".claude"), "settings.json");
-    // One saved original per settings file (a CLAUDE_CONFIG_DIR has its own).
-    const key = custom ? `-${createHash("sha256").update(settings).digest("hex").slice(0, 12)}` : "";
-    return { settings, saved: path.join(getConfigDir(), `statusline${key}.json`) };
+    const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+    const settings = path.join(dir, "settings.json");
+    // One saved original per settings file, however its directory is spelled (symlinks too).
+    const resolved = path.join(realTarget(dir), "settings.json");
+    const key = createHash("sha256").update(resolved).digest("hex").slice(0, 12);
+    return { settings, saved: path.join(getConfigDir(), `statusline-${key}.json`) };
 }
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
 export async function statuslineMain(args, paths = statuslinePaths(), out = (text) => process.stdout.write(text)) {
@@ -93,15 +94,23 @@ export function installStatusline(paths, platform = process.platform) {
     if (isOurs(current)) {
         return { ok: true, message: "ccc statusline is already installed. Restart Claude Code to see it." };
     }
+    if (runsCccStatusline(current)) {
+        return { ok: false, message: `${paths.settings}: your statusLine already runs ccc statusline; ` +
+                "left unchanged." };
+    }
     if (current !== undefined && (typeof current !== "object" || current.type !== "command" ||
         typeof current.command !== "string")) {
         return { ok: false, message: `${paths.settings}: statusLine is not a command; left unchanged.` };
     }
-    writeJson(paths.saved, { statusLine: current ?? null });
-    backup(paths.settings);
-    const padding = typeof current?.padding === "number" ? { padding: current.padding } : {};
-    settings.value.statusLine = { type: "command", command: STATUSLINE_COMMAND, ...padding };
-    writeJson(paths.settings, settings.value);
+    const failed = attempt(() => {
+        writeJson(paths.saved, { statusLine: current ?? null });
+        backup(paths.settings);
+        // Its other options (padding, refreshInterval, hideVimModeIndicator, ...) stay.
+        settings.value.statusLine = { ...current, type: "command", command: STATUSLINE_COMMAND };
+        writeJson(paths.settings, settings.value);
+    });
+    if (failed)
+        return { ok: false, message: `Could not install: ${failed}` };
     const kept = current ? " It runs your existing status line and adds the link." : "";
     return { ok: true, message: `Installed: ${paths.settings} statusLine is now ` +
             `"${STATUSLINE_COMMAND}".${kept} Undo: ccc statusline uninstall.` };
@@ -115,25 +124,45 @@ export function uninstallStatusline(paths) {
         return { ok: true, message: "ccc statusline is not installed; nothing changed." };
     }
     const saved = readJson(paths.saved);
-    backup(paths.settings);
-    if (saved?.statusLine && typeof saved.statusLine === "object") {
-        settings.value.statusLine = saved.statusLine;
+    // No record of what install replaced: guessing could delete the user's own status line.
+    if (!saved || !("statusLine" in saved)) {
+        return { ok: false, message: `No saved original for ${paths.settings} (${paths.saved}); ` +
+                "set statusLine yourself." };
     }
-    else {
-        delete settings.value.statusLine;
-    }
-    writeJson(paths.settings, settings.value);
-    try {
+    const failed = attempt(() => {
+        backup(paths.settings);
+        if (saved.statusLine && typeof saved.statusLine === "object") {
+            settings.value.statusLine = saved.statusLine;
+        }
+        else {
+            delete settings.value.statusLine;
+        }
+        writeJson(paths.settings, settings.value);
         fs.unlinkSync(paths.saved);
-    }
-    catch {
-        // Nothing saved.
-    }
+    });
+    if (failed)
+        return { ok: false, message: `Could not uninstall: ${failed}` };
     return { ok: true, message: `Restored ${paths.settings} statusLine.` };
 }
+/** Exactly what install writes: only this is ccc's to replace or remove. */
 function isOurs(statusLine) {
     const command = statusLine?.command;
+    return typeof command === "string" && command.trim() === STATUSLINE_COMMAND;
+}
+/** Any command that runs ccc's status line (never wrapped: it would recurse). */
+function runsCccStatusline(statusLine) {
+    const command = statusLine?.command;
     return typeof command === "string" && CCC_STATUSLINE.test(command.trim());
+}
+/** `run`'s error message, or undefined when it succeeded. */
+function attempt(run) {
+    try {
+        run();
+        return undefined;
+    }
+    catch (error) {
+        return error instanceof Error ? error.message : String(error);
+    }
 }
 /** The statusLine install saved, when it was a command to wrap (never ccc's own). */
 function savedStatusLine(file) {

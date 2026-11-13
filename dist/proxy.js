@@ -2791,10 +2791,11 @@ function noteMemtreePage(state, seq, sessionId, result) {
     if (latest && latest.seq >= seq)
         return;
     const compressed = didMemtreeCompress(result);
+    // A cached newest tree may predate this page; ask again (first, so the status line's
+    // link is this page until the lookup answers).
+    state.newestTrees?.invalidate(sessionId);
     rememberMemtreePage(state, sessionId, { sessionId, url, index, compressed, seq });
     state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
-    // A cached newest tree may predate this page; ask again.
-    state.newestTrees?.invalidate(sessionId);
 }
 /**
  * Record a compress answer's page as the source of the memory now forwarded

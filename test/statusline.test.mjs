@@ -77,41 +77,43 @@ function setup(statusLine) {
 }
 
 test("install wraps the existing command; the status line keeps it and adds the link", () => {
-  const original = { type: "command", command: OWN_COMMAND, padding: 0 };
+  const original = { type: "command", command: OWN_COMMAND, padding: 0, refreshInterval: 5,
+    hideVimModeIndicator: true };
   const { dir, paths } = setup(original);
-  const result = installStatusline(paths);
+  const result = installStatusline(paths, "darwin");
   assert.equal(result.ok, true);
   const settings = JSON.parse(fs.readFileSync(paths.settings, "utf-8"));
-  assert.deepEqual(settings.statusLine, { type: "command", command: STATUSLINE_COMMAND, padding: 0 });
+  assert.deepEqual(settings.statusLine, { type: "command", command: STATUSLINE_COMMAND, padding: 0,
+    refreshInterval: 5, hideVimModeIndicator: true }, "its other options stay");
   assert.equal(settings.model, "opus", "other settings kept");
   assert.ok(fs.readdirSync(dir).some((name) => name.startsWith("settings.json.ccc-backup-")));
   const input = JSON.stringify({ session_id: SESSION, model: { display_name: "Opus" } });
   if (process.platform !== "win32") {
     assert.equal(renderStatusline(input, paths, APPLE_TERMINAL), `494k (49%) | model | ${URL1}`);
   }
-  assert.equal(installStatusline(paths).ok, true, "again: harmless");
+  assert.equal(installStatusline(paths, "darwin").ok, true, "again: harmless");
   assert.equal(JSON.parse(fs.readFileSync(paths.saved, "utf-8")).statusLine.command, OWN_COMMAND,
     "a second install never saves ccc's own command as the one to wrap");
-  assert.equal(uninstallStatusline(paths).ok, true);
+  assert.equal(uninstallStatusline(paths, "darwin").ok, true);
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine, original);
   assert.equal(fs.existsSync(paths.saved), false);
 });
 
 test("install with no status line: the link alone; uninstall removes it", () => {
   const { paths } = setup(undefined);
-  assert.equal(installStatusline(paths).ok, true);
+  assert.equal(installStatusline(paths, "darwin").ok, true);
   assert.equal(renderStatusline(JSON.stringify({ session_id: SESSION }), paths, APPLE_TERMINAL), URL1);
   assert.equal(renderStatusline("not json", paths, APPLE_TERMINAL), "");
-  uninstallStatusline(paths);
+  uninstallStatusline(paths, "darwin");
   assert.equal(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine, undefined);
 });
 
 test("install leaves invalid settings and non-command status lines alone", () => {
   const { paths } = setup({ type: "static", text: "x" });
-  assert.equal(installStatusline(paths).ok, false);
+  assert.equal(installStatusline(paths, "darwin").ok, false);
   const bad = setup(undefined);
   fs.writeFileSync(bad.paths.settings, "{ not json");
-  assert.equal(installStatusline(bad.paths).ok, false);
+  assert.equal(installStatusline(bad.paths, "darwin").ok, false);
   assert.equal(fs.readFileSync(bad.paths.settings, "utf-8"), "{ not json");
 });
 
@@ -142,15 +144,15 @@ test("newest-tree lookups run in the background long enough for the slow session
 
 test("a wrapped command that itself runs ccc's status line prints nothing inside, never recurses", () => {
   const { paths } = setup({ type: "command", command: "/opt/homebrew/bin/ccc statusline" });
-  const result = installStatusline(paths);
-  assert.equal(result.ok, true);
-  assert.match(result.message, /already installed/, "another spelling of ccc's is ccc's");
+  const result = installStatusline(paths, "darwin");
+  assert.equal(result.ok, false, "a command that already runs ccc's is never wrapped");
+  assert.match(result.message, /already runs ccc statusline/);
   const input = JSON.stringify({ session_id: SESSION });
   assert.equal(renderStatusline(input, paths, { ...APPLE_TERMINAL, [WRAPPED_ENV]: "1" }), "");
   for (const command of ["npx claude-code-infinite statusline", "bash -c 'ccc statusline'",
     "ccc.cmd statusline"]) {
     const other = setup({ type: "command", command });
-    installStatusline(other.paths);
+    installStatusline(other.paths, "darwin");
     assert.equal(fs.existsSync(other.paths.saved), false, `${command} is never wrapped`);
   }
 });
@@ -161,11 +163,11 @@ test("install keeps a symlinked settings file a symlink, and its mode", { skip: 
   fs.renameSync(paths.settings, real);
   fs.chmodSync(real, 0o600);
   fs.symlinkSync(real, paths.settings);
-  installStatusline(paths);
+  installStatusline(paths, "darwin");
   assert.equal(fs.lstatSync(paths.settings).isSymbolicLink(), true);
   assert.equal(fs.statSync(real).mode & 0o777, 0o600);
   assert.equal(JSON.parse(fs.readFileSync(real, "utf-8")).statusLine.command, STATUSLINE_COMMAND);
-  uninstallStatusline(paths);
+  uninstallStatusline(paths, "darwin");
   assert.equal(fs.lstatSync(paths.settings).isSymbolicLink(), true);
   assert.equal(fs.statSync(real).mode & 0o777, 0o600);
   assert.equal(JSON.parse(fs.readFileSync(real, "utf-8")).statusLine.command, OWN_COMMAND);
@@ -202,4 +204,39 @@ test("a link file another process pruned is written again on the next refresh", 
   fs.unlinkSync(path.join(dir, `${SESSION}.url`));
   files.write(SESSION, URL1);
   assert.equal(readStatusLink(SESSION, dir), URL1);
+});
+
+test("uninstall only touches what install wrote, and needs its saved original", () => {
+  const custom = { type: "command", command: "printf custom; ccc statusline" };
+  const { paths } = setup(custom);
+  assert.equal(installStatusline(paths, "darwin").ok, false);
+  assert.equal(uninstallStatusline(paths).ok, true, "not installed: nothing changed");
+  assert.deepEqual(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine, custom);
+  const lost = setup({ type: "command", command: STATUSLINE_COMMAND });
+  const result = uninstallStatusline(lost.paths);
+  assert.equal(result.ok, false, "no saved original: no guess");
+  assert.equal(JSON.parse(fs.readFileSync(lost.paths.settings, "utf-8")).statusLine.command,
+    STATUSLINE_COMMAND);
+});
+
+test("the saved original follows the settings file, however its directory is spelled",
+  { skip: process.platform === "win32" }, () => {
+  const home = os.homedir();
+  assert.equal(statuslinePaths({ CLAUDE_CONFIG_DIR: path.join(home, ".claude") }).saved,
+    statuslinePaths({}).saved);
+  const dir = tmp();
+  const alias = path.join(tmp(), "alias");
+  fs.symlinkSync(dir, alias);
+  assert.equal(statuslinePaths({ CLAUDE_CONFIG_DIR: alias }).saved,
+    statuslinePaths({ CLAUDE_CONFIG_DIR: dir }).saved);
+});
+
+test("a newer link is written again after another process wrote an older one", () => {
+  const dir = tmp();
+  const a = new StatusLinkFiles(dir);
+  const b = new StatusLinkFiles(dir);
+  b.write(SESSION, URL2);
+  a.write(SESSION, URL1);
+  b.write(SESSION, URL2);
+  assert.equal(readStatusLink(SESSION, dir), URL2);
 });

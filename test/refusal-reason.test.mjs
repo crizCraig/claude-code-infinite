@@ -99,7 +99,9 @@ test("prefix mismatch whose compress failed: MemTree is rebuilding the compresse
   assert.equal(refusalMessage(cause, LINK),
     "MemTree is rebuilding this session's compressed history (Claude Code resent earlier " +
     `messages changed). Retry in a minute. Session: ${LINK}`);
-  const timed = refusalCause(rec, facts(rec, { indexSecondsLeft: 90 }));
+  assert.deepEqual(refusalCause(rec, facts(rec, { indexSecondsLeft: 600 })), { kind: "rebuilding" },
+    "a lane's index wait says nothing about this rebuild");
+  const timed = refusalCause({ ...rec, indexLag: { etaSeconds: 90 } }, facts(rec));
   assert.equal(refusalMessage(timed, LINK),
     "MemTree is rebuilding this session's compressed history (Claude Code resent earlier " +
     `messages changed) (~2 min). Retry then. Session: ${LINK}`);
@@ -171,4 +173,11 @@ test("a timeout that was not a large upload's whole long budget: MemTree was slo
   assert.equal(refusalMessage(cause, LINK),
     "MemTree didn't answer within 20 s. Retry in a minute; if it keeps happening, run " +
     `/ccc:memtree-compact or /clear. Session: ${LINK}`);
+});
+
+test("an indexing 413 that stated no time (its 60 s stand-in) is no ETA", () => {
+  const rec = { ...REFUSED_413, indexBehind: true, indexWait: { secondsLeft: 60, asks: 1, heldMs: 0 },
+    indexLag: { unindexedTokens: 1_200_000 } };
+  assert.equal(refusalMessage(refusalCause(rec, facts(rec)), LINK),
+    `MemTree is still indexing ~1.2M new tokens (~30 min). Retry then. Session: ${LINK}`);
 });
