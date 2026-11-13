@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.36](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.35...v1.0.36) (2026-11-13)
+
+
+### Bug Fixes
+
+* anchor charges images from the parsed body, never with URL images; JPEG walk handles standalone markers (Codex r4 P1s, P2) ([734256e](https://github.com/crizCraig/claude-code-infinite/commit/734256e843a02bf516e256abc17c529e98004fdd))
+* anchor only bodies made of blocks it can bound (allowlist); tool references only where already counted (Codex r6 P1s) ([72edeb9](https://github.com/crizCraig/claude-code-infinite/commit/72edeb9af7a93353f3194aceb8d7fe6fd4203347))
+* anchor only requests whose fields and tools are all in the body (no mcp_servers, server tools); Claude Code's no-op thinking edit allowed; log anchoredBound (Codex r7 P1) ([29eb65e](https://github.com/crizCraig/claude-code-infinite/commit/29eb65e4dcfc4f68b6f78d070729628a9289ec9d))
+* anchor sizes only on a body this one extends, same model (Codex r1 P1s, review r1) ([16c39e5](https://github.com/crizCraig/claude-code-infinite/commit/16c39e561b46e60c895ba0f3c5c89befb1a31c93))
+* auto-mode safeguards and data_flow charged in full each turn instead of hashed, so auto-mode lanes anchor; diagnostics stripped only when it is just the previous message id; message fields allowlisted (review r4) ([850d7a0](https://github.com/crizCraig/claude-code-infinite/commit/850d7a031b597c8827804ab08318e4a3d6a8296d))
+* image-heavy agent sessions (anchored sizing, heavy-upload and agent-result notices); status line on by default ([128af49](https://github.com/crizCraig/claude-code-infinite/commit/128af49abdd81d443bd20ee6f4168a3818fc2d61))
+* image-heavy sessions: anchored size bound, image-aware jumps, heavy-request and agent-result notices; status line on by default ([71419e9](https://github.com/crizCraig/claude-code-infinite/commit/71419e95a6bd55012c380f07544ec0237e38ca27))
+* lineage sizes appended messages by canonical bytes; cache_control stripped only where the API puts it; no anchor under server input edits (Codex r2 P1s, review r2) ([fbd2927](https://github.com/crizCraig/claude-code-infinite/commit/fbd29271eb80ad5da7b46db0d55766b6c1049d44))
+* no anchored size when the byte scan and the parsed body disagree on images (Codex r3 P1) ([27ee85c](https://github.com/crizCraig/claude-code-infinite/commit/27ee85c4bfbf37b30c844d5c24e7a37e87640d02))
+* no anchored size with any externally resolved block (URL/file document, upload); PATH check needs a file (Codex r5 P1, P2) ([f427f00](https://github.com/crizCraig/claude-code-infinite/commit/f427f00724c08bbb55c30962555546a73dcae8c5))
+* real Claude Code frames anchor: diagnostics stripped, auto-mode safeguards and the versioned advisor tool allowed (review r3 P1) ([4be3e90](https://github.com/crizCraig/claude-code-infinite/commit/4be3e90fbd4696271be306f209efa77561b3beb7))
+
 ## [1.0.35](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.34...v1.0.35) (2026-11-13)
 
 
