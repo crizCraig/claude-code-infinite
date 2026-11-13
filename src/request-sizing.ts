@@ -325,7 +325,8 @@ export function anchoredBound(
   if (sampled < ANCHOR_MIN_COVERAGE * (sampled + appended)) return undefined;
   const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
   return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
-    conservativeTokensFromBytes(appended, model) + shapeImageTokens(shape, model);
+    conservativeTokensFromBytes(appended + shape.unhashedBytes, model) +
+    shapeImageTokens(shape, model);
 }
 
 /** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */

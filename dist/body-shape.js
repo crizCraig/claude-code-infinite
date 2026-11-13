@@ -66,15 +66,21 @@ function computeShape(body) {
     const { messages, ...frame } = parsed;
     if (!Array.isArray(messages))
         return null;
+    const unhashed = UNHASHED_FIELDS.filter((key) => frame[key] !== undefined)
+        .map((key) => JSON.stringify(frame[key])).join("");
     const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
         messages: [], sizes: [], imageChars: [],
         serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
-        imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1 };
+        imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
+        unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
     for (const message of messages) {
         const text = JSON.stringify(canonicalMessage(message)) ?? "";
         shape.messages.push(hash(text));
         shape.sizes.push(Buffer.byteLength(text, "utf-8"));
         shape.imageChars.push(imageCharsOf(message, shape));
+        if (!message || typeof message !== "object" ||
+            !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key)))
+            shape.unanchorable = true;
         if (text.includes('"type":"tool_reference"'))
             shape.lastExpanding = shape.messages.length - 1;
     }
@@ -88,8 +94,11 @@ function canonicalFrame(frame) {
     const rest = { ...frame };
     delete rest.cache_control;
     // Claude Code's cache-diagnosis metadata names the previous message id: it changes every
-    // turn and costs no prompt tokens (review r3 P1).
-    delete rest.diagnostics;
+    // turn and costs no prompt tokens (review r3 P1). Anything else under it stays hashed.
+    if (onlyPreviousMessageId(rest.diagnostics))
+        delete rest.diagnostics;
+    for (const key of UNHASHED_FIELDS)
+        delete rest[key];
     if (Array.isArray(rest.system))
         rest.system = rest.system.map(withoutMarker);
     if (Array.isArray(rest.tools))
@@ -159,8 +168,7 @@ function blockImageChars(blocks, shape, nested = false) {
  * (tool definitions fetched remotely, Codex r7 P1), disables the anchor. compaction, and a
  * context_management that edits anything, are refused too (serverEdits, noOpEdits).
  * Fields stay in the frame hash, so whatever they cost was in the sample's count too and a
- * change to them breaks the lineage: auto mode's `safeguards` (Claude Code sends it in auto
- * mode) is allowed on that basis. Claude Code features that turn the anchor off (safe, just
+ * change to them breaks the lineage, except UNHASHED_FIELDS, charged in full instead. Claude Code features that turn the anchor off (safe, just
  * no anchor; a request log without compaction.anchoredBound): message `thread`s,
  * `program_use_case_id`/`fallbacks`, tool-result clearing after idle, an advisor call's
  * result blocks in the messages.
@@ -168,7 +176,7 @@ function blockImageChars(blocks, shape, nested = false) {
 const FRAME_FIELDS = new Set(["model", "max_tokens", "stream", "system", "tools", "tool_choice",
     "metadata", "thinking", "temperature", "top_p", "top_k", "stop_sequences", "output_config",
     "output_format", "speed", "service_tier", "cache_control", "context_management",
-    "diagnostics", "safeguards"]);
+    "diagnostics", "safeguards", "data_flow"]);
 /**
  * Whether `context_management` edits nothing: absent, or only Claude Code's
  * `clear_thinking_20251015` with `keep: "all"`, which it sends whenever thinking is on.
@@ -192,6 +200,19 @@ function noOpEdits(management) {
  * (review r3); its results arrive as message blocks, which MESSAGE_BLOCKS refuses.
  */
 const VERSIONED_TOOL = /^advisor_\d{8}$/;
+/**
+ * Fields Claude Code rebuilds every turn from the conversation (auto mode's classifier
+ * context, data-flow tracking; both outside its own prompt-identity hash): hashed, they
+ * would break lineage on every turn (review r4 P2), so they are charged instead
+ * (BodyShape.unhashedBytes).
+ */
+const UNHASHED_FIELDS = ["safeguards", "data_flow"];
+function onlyPreviousMessageId(diagnostics) {
+    return !!diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics) &&
+        Object.keys(diagnostics).every((key) => key === "previous_message_id");
+}
+/** Message fields an anchor can bound (Claude Code's turn-scoped system messages included). */
+const MESSAGE_FIELDS = new Set(["role", "content", "clear_at", "output_config"]);
 /** Whether the frame's cost is all in the body: known fields, custom or versioned tools. */
 function frameAnchorable(frame) {
     if (!Object.keys(frame).every((key) => FRAME_FIELDS.has(key)))

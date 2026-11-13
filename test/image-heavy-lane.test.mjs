@@ -172,7 +172,7 @@ test('no anchor for a body that does not extend the sampled one, or on another m
 
 test('the anchor sizes appended messages by their own canonical bytes, under 75% coverage none', () => {
   const shape = { frame: 'f', messages: ['a', 'b', 'c'], sizes: [400_000, 50_000, 50_000],
-    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], unanchorable: false, lastExpanding: -1 };
+    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], unanchorable: false, lastExpanding: -1, unhashedBytes: 0 };
   const sample = { tokens: 100_000, forwardedBytes: 450_000, imageBytes: 0, imageTokens: 0,
     messageCount: 2 };
   assert.equal(anchoredBound(sample, shape, MODEL),
@@ -289,12 +289,23 @@ test('a Claude Code 2.1.32x frame (auto mode, advisor) anchors, diagnostics chan
   const candidate = new RequestSizing(fakeCounts(), true, MODEL).register(next, 'original', sample);
   assert.equal(candidate.anchored, true);
   assert.ok(candidate.conservativeTokens + 128_000 <= 1_000_000, `${candidate.conservativeTokens}`);
-  // Safeguards changed since the sample (say, the cwd): no longer the counted body.
-  const moved = Buffer.from(JSON.stringify({ ...frame('msg_2'), safeguards: [{
-    type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'default' } }],
-    messages }));
-  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(moved, 'original', sample)
+  // Auto mode rewrites safeguards every turn (its prior tool-use ids grow): still anchored,
+  // with the new classifier context charged in full (review r4 P2).
+  const context = 'tool_use_ids:' + 't,'.repeat(20_000);
+  const turned = Buffer.from(JSON.stringify({ ...frame('msg_2'), safeguards: [{
+    type: 'dangerous_tool_use', classifier_context: { v: 1, prior: context } }], messages }));
+  const rewritten = new RequestSizing(fakeCounts(), true, MODEL).register(turned, 'original', sample);
+  assert.equal(rewritten.anchored, true);
+  assert.ok(rewritten.conservativeTokens >= candidate.conservativeTokens + Math.floor(context.length / 1.9) - 100);
+  // Diagnostics carrying more than the previous message id stays hashed.
+  const extra = Buffer.from(JSON.stringify({ ...frame('msg_2'),
+    diagnostics: { previous_message_id: 'msg_2', other: 1 }, messages }));
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(extra, 'original', sample)
     .anchored, undefined);
+  // An unknown message-level field: no anchor.
+  const odd = bodyOf([...messages.slice(0, -1), { ...messages.at(-1), extra: 1 }]);
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(odd, 'original',
+    sampleOf(bodyOf(messages.slice(0, -2)), 480_000)).anchored, undefined);
 });
 
 test('remote MCP servers or server tools in the request: no anchor (Codex r7 P1)', () => {

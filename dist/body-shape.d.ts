@@ -29,6 +29,12 @@ export interface BodyShape {
      * Anthropic counted expanded; one appended disables the anchor.
      */
     lastExpanding: number;
+    /**
+     * Canonical bytes of the frame fields left out of the hash because Claude Code rewrites
+     * them every turn (UNHASHED_FIELDS): an anchored bound charges them in full each time, on
+     * top of the sample's count, which already held their earlier version (errs high).
+     */
+    unhashedBytes: number;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
 export declare function bodyShape(body: Buffer): BodyShape | undefined;
