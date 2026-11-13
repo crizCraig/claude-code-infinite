@@ -2078,8 +2078,13 @@ export class MemtreeClient {
           // (all bytes would be over the limit again), once.
           const keepRefs = unconfirmed !== undefined && !opts.unconfirmedRetry &&
             namesMissingImages(response.status, refusalText);
+          // A delta body: sent again as this turn's ordinary body (no message refs, the
+          // images it lacks now forgotten), so the usual size fallbacks plan it.
+          const plain = delta.refs.length > 0;
           return await this.callContextMemory(messages, modelContextLimit, {
-            ...opts, ...(keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
+            ...opts,
+            ...(plain ? { messageRefs: false }
+              : keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
             get timeoutMs() { return callDeadline - Date.now(); },
           });
         }

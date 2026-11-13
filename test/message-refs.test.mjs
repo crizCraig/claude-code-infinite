@@ -175,6 +175,29 @@ test("a client with deltas on names stored messages; a 409 sends that call in fu
   }
 });
 
+test("an image-ref 409 on a delta body is sent again as the turn's ordinary body", async () => {
+  const server = await fakeMemtree();
+  try {
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true });
+    const meta = { sessionId: "sess-3" };
+    const messages = conversation(2);
+    server.storedImages = [imageSha];
+    await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000, undefined, meta);
+    const again = { role: "user", content: [{ type: "image",
+      source: { type: "base64", media_type: "image/png", data: PNG } }, { type: "text", text: "same" }] };
+    const next = [...messages, { role: "assistant", content: "look" }, again];
+    server.imageMissingNext = true;
+    assert.ok(await client.compress(MemtreeClient.hashMessages(next), next, 200_000, undefined, meta));
+    assert.ok(server.bodies[1].refs > 0 && server.bodies[1].imageRefs > 0);
+    assert.equal(server.bodies[1].status, 409);
+    assert.equal(server.bodies[2].refs, 0, "no message refs on the resend");
+    assert.equal(server.bodies[2].imageRefs, 0, "the image it lacked goes as bytes");
+    assert.deepEqual(server.bodies[2].rebuilt, next);
+  } finally {
+    await server.close();
+  }
+});
+
 test("off by default: no feature declared, nothing named", async () => {
   const server = await fakeMemtree();
   try {
@@ -193,7 +216,8 @@ test("off by default: no feature declared, nothing named", async () => {
 
 /** A MemTree that stores every message it is sent and serves refs back from them. */
 async function fakeMemtree() {
-  const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false };
+  const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false,
+    storedImages: [], imageMissingNext: false };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -208,6 +232,13 @@ async function fakeMemtree() {
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(body));
       };
+      const imageRefs = raw.match(/memtree-image:sha256:[0-9a-f]{64}/g) ?? [];
+      entry.imageRefs = imageRefs.length;
+      if (imageRefs.length && state.imageMissingNext) {
+        state.imageMissingNext = false;
+        return reply(409, { detail: { message: "x",
+          missing_image_sha256s: imageRefs.map((r) => r.slice(-64)) } });
+      }
       if (refs.length && state.imageLimitNext) {
         state.imageLimitNext = false;
         return reply(400, { detail: "Image references expand past the request size limit." });
@@ -226,6 +257,7 @@ async function fakeMemtree() {
       }
       reply(200, { messages: rebuilt, compressed: false,
         usage: { prompt_tokens: 10, completion_tokens: 1 },
+        memtree_image_sha256s: state.storedImages,
         [STORED_MESSAGES_FIELD]: { stored: true, messages: rebuilt.length, tools: false,
           unservable: [], unserved_images: [] } });
     });

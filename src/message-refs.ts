@@ -112,7 +112,8 @@ export class MessageRefs {
     const missing = status === MISSING_MESSAGES_STATUS ? missingMessageHashes(bodyText) : undefined;
     if (missing === undefined) return false;
     this.forget(lane, missing);
-    if (refs.every((ref) => missing.includes(ref))) {
+    const named = new Set(missing);
+    if (refs.every((ref) => named.has(ref))) {
       const inRow = (this.allMissing.get(lane) ?? 0) + 1;
       this.allMissing.set(lane, inRow);
       if (inRow >= ALL_MISSING_MAX) this.off.add(lane);
