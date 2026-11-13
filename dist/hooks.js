@@ -269,6 +269,10 @@ export class NoticeDeliveryQueue {
         const pending = this.freshPending();
         return pending !== null && this.promptMatches(pending, promptId);
     }
+    /** Whether `handle` (from queueSuffix) is the notice still waiting. */
+    pendingIs(handle) {
+        return handle !== undefined && this.freshPending() === handle;
+    }
     /** Withdraw a queued notice that is still pending; a newer one is kept. */
     cancel(handle) {
         if (handle !== undefined && this.pending === handle)

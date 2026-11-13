@@ -43,6 +43,7 @@ import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage } from "./refusal-reason.js";
+import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { SlowUploads } from "./slow-upload.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
@@ -73,6 +74,7 @@ import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemory
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
+import { bodyShape, prefixDigest } from "./body-shape.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
@@ -382,6 +384,7 @@ export function startProxy(opts) {
         fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs, opts.indexWaitMaxMs),
         refusalStreaks: new RefusalStreaks(),
         activeSubagents: new Set(),
+        laneActivity: new LaneActivity(),
         deferredAgentIndexes: new Map(),
         adoptingPrepared: new Map(),
         memoryRoutes: new Map(),
@@ -1256,6 +1259,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         finally {
             if (rec.totalMs === undefined)
                 rec.totalMs = Date.now() - received;
+            noteForwardedSize(state, rec, requestSessionId(req));
             opts.reqlog?.log(rec);
         }
     };
@@ -1431,6 +1435,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         }
     }
     rec.routeLane = requestRouteLane;
+    noteLaneActivity(state, rec, requestSessionId(req));
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
     const clientMeta = memtreeClientMeta({
@@ -3326,8 +3331,16 @@ function reportedSample(rec, sent) {
 }
 /** A size sample of `sent` carrying its inline images (estimateRequestTokens). */
 function sizeSampleOf(sent, tokens, model) {
-    const { imageBytes, imageTokens } = bodyImages(sent, typeof model === "string" ? model : undefined);
-    return { tokens, forwardedBytes: sent.length, imageBytes, imageTokens };
+    const id = typeof model === "string" ? model : undefined;
+    const { imageBytes, imageTokens } = bodyImages(sent, id);
+    return { tokens, forwardedBytes: sent.length, imageBytes, imageTokens, ...sampleLineage(sent, id) };
+}
+/** The sampled body's lineage (body-shape.ts) for anchoredBound; none for a small body. */
+function sampleLineage(sent, model) {
+    const shape = bodyShape(sent);
+    const digest = shape && prefixDigest(shape, shape.messages.length);
+    return shape && digest && model
+        ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
 }
 /**
  * Anthropic's input tokens for the body this request forwarded, when its usage
@@ -4112,6 +4125,8 @@ const exactSizedRecords = new WeakSet();
  * it is over the window for planning and takes the normal gated compression.
  */
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
+    if (candidate.anchored)
+        record.anchoredBound = true;
     if (sizing.isExact(candidate)) {
         exactSizedRecords.add(record);
         return;
@@ -5227,7 +5242,23 @@ async function recoverToolRouteMiss(args) {
 function recordTurn(rec, turnType, forwardBody) {
     rec.turnType = turnType;
     rec.forwardedBytes = forwardBody.length;
-    rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
+    rec.approxInputTokens = approxBodyTokens(forwardBody, rec.model);
+    forwardedImageBytes.set(rec, bodyImages(forwardBody, typeof rec.model === "string" ? rec.model : undefined).imageBytes);
+}
+/** The forwarded body's inline image bytes (recordTurn), for the heavy-request notice. */
+const forwardedImageBytes = new WeakMap();
+/** What this request uploaded to Anthropic, for the session's heavy-request notice. */
+function noteForwardedSize(state, rec, sessionId) {
+    const bytes = rec.forwardedBytes ?? 0;
+    if (bytes > 0) {
+        state.laneActivity.sent(sessionId, { bytes, imageBytes: forwardedImageBytes.get(rec) ?? 0 });
+    }
+}
+/** A body's text at bytes/4 plus its inline images at their visual tokens (log only):
+ * bytes/4 alone logged a 22 MB contact-sheet lane at 5.5M tokens (Anthropic: 491k). */
+function approxBodyTokens(body, model) {
+    const images = bodyImages(body, typeof model === "string" ? model : undefined);
+    return approxTokensFromBytes(body.length - images.imageBytes) + images.imageTokens;
 }
 function headerText(headers, name) {
     const value = headers[name];
@@ -5707,7 +5738,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
             : offline ? unreachableRefusal(offline.message)
                 : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
                     indexSecondsLeft: activeIndexWaits.get(args.rec),
-                    refusalMessage: refusalMessage(cause, currentSessionLink(args.state, requestSessionId(args.req))) });
+                    refusalMessage: refusalMessage(cause, currentSessionLink(args.state, requestSessionId(args.req)), agentResultNote(args)) });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -5750,6 +5781,17 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         args.state.keyNotice.markShown();
     return false;
 }
+/**
+ * A main-lane refusal while an agent lane of this session was recently active: a
+ * background agent's finished result reaches the main session only as part of its
+ * next turn, so say it may be waiting (2026-11-13: a refused main lane held one back).
+ */
+function agentResultNote(args) {
+    // This session's own agent traffic only: activeSubagents is process-wide (review r1 P3).
+    return args.rec.routeLane === "main" &&
+        args.state.laneActivity.agentRecent(requestSessionId(args.req))
+        ? AGENT_RESULT_WAITING_LINE : undefined;
+}
 /** Requests held back by a lane backoff whose attempt MemTree answered (unreachableNow). */
 const answeredBackoffs = new WeakSet();
 /**
@@ -5782,6 +5824,25 @@ function unreachableNow(state, rec) {
         what: anthropic ? "internet" : "memtree" };
 }
 /**
+ * Note this request's lane (lane-activity.ts) and, on a main-lane request of the current
+ * prompt, queue the session's one heavy-request warning when an earlier upload passed the
+ * size and no other notice waits. It is the lowest priority (otherNoticePending): any
+ * other notice may replace it, which leaves it due for a later turn.
+ */
+function noteLaneActivity(state, rec, sessionId) {
+    state.laneActivity.seen(sessionId, rec.routeLane);
+    const heavy = state.laneActivity.heavyDue(sessionId);
+    const prompt = noticeContexts.get(rec);
+    if (!heavy || sessionId === undefined || rec.routeLane !== "main" || prompt === undefined ||
+        prompt.generation !== state.mainPromptGeneration || state.notices.hasPending())
+        return;
+    state.heavyNotice = state.notices.queueSuffix(heavyRequestNoticeText(heavy), () => state.laneActivity.markWarned(sessionId), prompt.promptId);
+}
+/** Whether a notice other than the heavy-request one (the lowest priority) waits. */
+function otherNoticePending(state, promptId) {
+    return state.notices.hasPending(promptId) && !state.notices.pendingIs(state.heavyNotice);
+}
+/**
  * A repeated retryable refusal on the main thread: say once per streak that
  * MemTree is slow and Claude Code is retrying, unless another notice waits.
  */
@@ -5793,7 +5854,7 @@ function noteSlowRetry(args, failure) {
     const canShow = failure.status === 503 && rec.routeLane === "main" &&
         rec.indexBehind !== true && prompt !== undefined &&
         prompt.generation === state.mainPromptGeneration && !args.res.destroyed &&
-        !state.notices.hasPending();
+        !otherNoticePending(state);
     if (!state.refusalStreaks.refused(args.routeKey, Date.now(), canShow))
         return;
     state.notices.queueSuffix(SLOW_RETRY_NOTICE, undefined, prompt.promptId);
@@ -5844,7 +5905,7 @@ function warnPausedNearWindow(state, rec, sessionId) {
     // Never replace another queued notice (or this one again): a later request tries.
     if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
         pausedNotices.has(rec) || nearWindowWarned(state, sessionId) ||
-        state.notices.hasPending(state.mainPromptId))
+        otherNoticePending(state, state.mainPromptId))
         return;
     state.nearWindowNotice = state.notices.queueSuffix(paymentNoticeText(detail, undefined, { overBudget: true }), () => {
         state.paymentNotice.markShown();

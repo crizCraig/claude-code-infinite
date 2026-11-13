@@ -89,7 +89,12 @@ export function imageTier(model: string | undefined): typeof HIGH_RES {
   return major > 4 || (major === 4 && minor >= 7) ? HIGH_RES : STANDARD;
 }
 
-/** Width and height from a PNG, GIF, WebP or JPEG header; undefined when unreadable. */
+/**
+ * Width and height from a PNG, GIF, WebP or JPEG header; undefined when unreadable.
+ * Only the header is decoded (the first HEADER_BASE64_CHARS characters); a JPEG whose
+ * frame header sits past that (large EXIF or ICC segments) is walked segment by
+ * segment, decoding a few bytes at each marker (jpegSizeAt), never the whole image.
+ */
 export function imageDimensions(base64: string): [number, number] | undefined {
   let bytes: Buffer;
   try {
@@ -97,7 +102,8 @@ export function imageDimensions(base64: string): [number, number] | undefined {
   } catch {
     return undefined;
   }
-  return pngSize(bytes) ?? gifSize(bytes) ?? webpSize(bytes) ?? jpegSize(bytes);
+  return pngSize(bytes) ?? gifSize(bytes) ?? webpSize(bytes) ?? jpegSize(bytes) ??
+    (isJpeg(bytes) ? jpegSizeAt(base64) : undefined);
 }
 
 function addImages(blocks: unknown[], tier: typeof HIGH_RES, totals: ImageTotals): void {
@@ -145,15 +151,72 @@ function webpSize(b: Buffer): [number, number] | undefined {
 const JPEG_FRAME_MARKERS = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb,
   0xcd, 0xce, 0xcf]);
 
+function isJpeg(b: Buffer): boolean {
+  return b.length >= 4 && b[0] === 0xff && b[1] === 0xd8;
+}
+
 function jpegSize(b: Buffer): [number, number] | undefined {
-  if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return undefined;
+  if (!isJpeg(b)) return undefined;
   let i = 2;
-  for (let steps = 0; steps < 2_048 && i + 9 < b.length; steps++) {
-    if (b[i] !== 0xff) return undefined;
-    const marker = b[i + 1];
-    if (marker === 0xff) { i++; continue; }
-    if (JPEG_FRAME_MARKERS.has(marker)) return [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
-    i += 2 + b.readUInt16BE(i + 2);
+  for (let steps = 0; steps < 2_048 && i + 9 <= b.length; steps++) {
+    const step = jpegStep(b.subarray(i, i + 9));
+    if (step === undefined || Array.isArray(step)) return step;
+    i += step;
   }
   return undefined;
+}
+
+/**
+ * The same walk as jpegSize over the whole base64 image, decoding 9 bytes per segment.
+ * Only for plain base64 throughout: one whitespace character inside a skipped segment
+ * would shift every later offset and read wrong bytes as a frame header (Codex r1 P2).
+ */
+function jpegSizeAt(base64: string): [number, number] | undefined {
+  if (!BASE64_RE.test(base64)) return undefined;
+  const total = Math.floor(base64.length / 4) * 3;
+  let i = 2;
+  for (let steps = 0; steps < 2_048 && i + 9 <= total; steps++) {
+    const b = base64Slice(base64, i, 9);
+    const step = b && jpegStep(b);
+    if (step === undefined || Array.isArray(step)) return step;
+    i += step;
+  }
+  return undefined;
+}
+
+/**
+ * One marker of a JPEG walk, from the 9 bytes at it: the frame's [width, height], the
+ * bytes to the next marker, or undefined when the walk must stop. Standalone markers
+ * (TEM, RST0-7) carry no length (Codex r4 P2); SOI, EOI and SOS before any frame header,
+ * a length under 2, or a zero dimension end the walk unreadable (the tier cap applies).
+ */
+function jpegStep(b: Buffer): [number, number] | number | undefined {
+  if (b.length < 9 || b[0] !== 0xff) return undefined;
+  const marker = b[1];
+  if (marker === 0xff) return 1;
+  if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) return 2;
+  if (marker === 0x00 || marker === 0xd8 || marker === 0xd9 || marker === 0xda) return undefined;
+  if (JPEG_FRAME_MARKERS.has(marker)) {
+    const width = b.readUInt16BE(7);
+    const height = b.readUInt16BE(5);
+    return width > 0 && height > 0 ? [width, height] : undefined;
+  }
+  const length = b.readUInt16BE(2);
+  return length >= 2 ? 2 + length : undefined;
+}
+
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * `length` bytes of the image from byte `offset`, decoded from only the base64 quads that
+ * hold them; undefined when those characters are not plain base64 (whitespace would shift
+ * every later offset, so the walk stops rather than read the wrong bytes).
+ */
+function base64Slice(base64: string, offset: number, length: number): Buffer | undefined {
+  const start = Math.floor(offset / 3) * 4;
+  const chars = base64.slice(start, Math.ceil((offset + length) / 3) * 4);
+  if (!BASE64_RE.test(chars)) return undefined;
+  const skip = offset - (start / 4) * 3;
+  const bytes = Buffer.from(chars, "base64").subarray(skip, skip + length);
+  return bytes.length === length ? bytes : undefined;
 }

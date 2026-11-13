@@ -206,7 +206,7 @@ From a shell or script (no session needed):
 | --- | --- |
 | `ccc link <session-id>` | Prints the session's newest MemTree page URL on stdout, one line and nothing else. `--json` prints `{session_id, url, tree, updated_at}` instead (`updated_at` is the session's last activity). Exit status 0 printed, 1 no saved key or the server could not be reached (5 s timeout), 2 bad invocation, 3 the session has no MemTree yet (or no session with that id on your key; stderr says which). Only your own sessions (those of your saved key) are found. `ccc staging link` / `ccc local link` use that environment's key. |
 | `ccc fetch <memtree-url>` | Prints one of your MemTree pages as JSON, using your saved key. |
-| `ccc statusline install` | Adds this session's MemTree link to Claude Code's status line ([details](#memtree-link-in-the-status-line)). `ccc statusline uninstall` undoes it. |
+| `ccc statusline install` | Adds this session's MemTree link to Claude Code's status line (on by default: [details](#memtree-link-in-the-status-line)). `ccc statusline uninstall` undoes it. |
 
 Environment variables, set when launching `ccc`:
 
@@ -235,14 +235,19 @@ line only reads that file, so it never waits on the server. While the status lin
 settings.json, set `CCC_STATUSLINE_REFRESH=1` (otherwise it refreshes at prompts and turn
 ends).
 
-- **Opt in:** `ccc statusline install`. It points `statusLine` in `~/.claude/settings.json`
-  (or `$CLAUDE_CONFIG_DIR/settings.json`) at `ccc statusline`, which runs your existing
-  status-line command with the same input and appends ` | 🌿 tree`. Your original command is
-  saved in `~/.claude-code-infinite/statusline-<id>.json` (one per settings file) and settings.json
-  is backed up first. A `statusLine` in a project's `.claude/settings*.json` overrides yours.
-  `ccc statusline uninstall` puts the original back; run it before uninstalling ccc. Restart
-  `ccc` to see it. Not on Windows yet (Claude Code runs status lines in Git Bash there): use
-  the snippet.
+- **On by default:** the first interactive `ccc` run (after installing or upgrading) runs
+  `ccc statusline install` once and says so in the session's first message. It points
+  `statusLine` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) at
+  `ccc statusline`, which runs your existing status-line command with the same input and
+  appends ` | 🌿 tree`. Your original command is saved in
+  `~/.claude-code-infinite/statusline-<id>.json` (one per settings file) and settings.json is
+  backed up first. When that can't be done safely (settings.json is not valid JSON, your
+  `statusLine` is not a command, or `ccc` is not on PATH) it changes nothing and tells you.
+  It is done once (`~/.claude-code-infinite/statusline-auto.json`), so after
+  `ccc statusline uninstall` it stays off; `CCC_STATUSLINE_AUTO=0` skips it. A `statusLine`
+  in a project's `.claude/settings*.json` overrides yours. `ccc statusline uninstall` puts the
+  original back; run it before uninstalling ccc. `ccc statusline install` adds it again. Not
+  on Windows yet (Claude Code runs status lines in Git Bash there): use the snippet.
 - **Manage it yourself:** add this to the end of your own status-line command (it reads
   Claude Code's JSON from `$input`, as most status lines do; needs `jq`):
 

@@ -1,0 +1,381 @@
+// Image-heavy agent lanes (2026-11-12, ai-safety-sim session cf649598): a video agent
+// sent 15-27 MB requests that were almost all base64 JPEG contact sheets (~470 KB,
+// ~2000x1354 each). Anthropic counted the lane at 491k tokens, but the conservative
+// bound read every non-image byte at 1.9 bytes per token, so it sat over the 1M window:
+// every turn was counted (a second 22 MB upload), and when a count timed out the lane
+// was compressed half full. These tests use real-sized payloads.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { bodyImages, imageDimensions, visualTokens } from '../dist/image-tokens.js';
+import { RequestSizing, anchoredBound, extendsSample, ANCHOR_MARGIN } from '../dist/request-sizing.js';
+import { shouldCountTokens } from '../dist/count-tokens.js';
+import { conservativeBodyTokens } from '../dist/token-estimate.js';
+import { bodyShape, prefixDigest } from '../dist/body-shape.js';
+
+const MODEL = 'claude-opus-5-5';
+const SHEET_BASE64_CHARS = 470_000;
+
+/** A baseline JPEG of `width` x `height`: APP0, then `iccBytes` of APP2 ICC segments
+ * (up to 64 KB each, so the frame header can sit past the first 48 KB), DQT, SOF0,
+ * then random scan data up to `chars` base64 characters. */
+function jpeg(width, height, { chars = SHEET_BASE64_CHARS, iccBytes = 0 } = {}) {
+  const parts = [Buffer.from([0xff, 0xd8])];
+  parts.push(segment(0xe0, Buffer.from('JFIF\0\x01\x01\0\0\x01\0\x01\0\0', 'latin1')));
+  for (let left = iccBytes; left > 0; left -= 65_000) {
+    parts.push(segment(0xe2, Buffer.concat([Buffer.from('ICC_PROFILE\0', 'latin1'),
+      randomBytes(Math.min(left, 65_000))])));
+  }
+  parts.push(segment(0xdb, Buffer.alloc(65, 1)));
+  const sof = Buffer.from([0x08, 0, 0, 0, 0, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+  sof.writeUInt16BE(height, 1);
+  sof.writeUInt16BE(width, 3);
+  parts.push(segment(0xc0, sof));
+  const head = Buffer.concat(parts);
+  const scan = randomBytes(Math.max(0, Math.ceil(chars * 3 / 4) - head.length));
+  return Buffer.concat([head, scan]).toString('base64').slice(0, chars);
+}
+
+function segment(marker, payload) {
+  const header = Buffer.from([0xff, marker, 0, 0]);
+  header.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([header, payload]);
+}
+
+/** A Claude Code-shaped agent conversation: `images` contact sheets in tool results,
+ * assistant turns carrying thinking signatures (base64 that is not an image), and text. */
+function agentMessages({ images = 46, textChars = 800_000, signatureChars = 800_000, sheet } = {}) {
+  const data = sheet ?? jpeg(1999, 1354);
+  const messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(textChars) }] }];
+  const perTurn = Math.ceil(signatureChars / Math.max(1, images));
+  for (let i = 0; i < images; i++) {
+    messages.push({ role: 'assistant', content: [
+      { type: 'thinking', thinking: '', signature: randomBytes(perTurn * 3 / 4).toString('base64') },
+      { type: 'tool_use', id: `t${i}`, name: 'Read', input: { file_path: `/tmp/sheet${i}.jpg` } }] });
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }] }] });
+  }
+  return messages;
+}
+
+function bodyOf(messages, model = MODEL) {
+  return Buffer.from(JSON.stringify({ model, max_tokens: 128_000, messages }));
+}
+
+function agentBody(options) {
+  return bodyOf(agentMessages(options));
+}
+
+/** What the proxy records after Anthropic answers `body` with `tokens` (sizeSampleOf). */
+function sampleOf(body, tokens, model = MODEL) {
+  const shape = bodyShape(body);
+  return { tokens, forwardedBytes: body.length, ...bodyImages(body, model), model,
+    messageCount: shape.messages.length, prefixDigest: prefixDigest(shape, shape.messages.length) };
+}
+
+/** The lane's last two turns: `previous` (counted by Anthropic) and `body`, one round on. */
+function laneTurns() {
+  const messages = agentMessages();
+  return { previous: bodyOf(messages.slice(0, -2)), body: bodyOf(messages), messages };
+}
+
+function fakeCounts() {
+  const calls = [];
+  return { calls, peek: () => undefined, async count(body) {
+    calls.push(body.length);
+    return { outcome: 'timeout', ms: 25_000 };
+  } };
+}
+
+const WINDOW = { budget: 960_000, context: 1_000_000, output: 16_000, recountOutput: 128_000 };
+
+test('a real-sized contact sheet is sized by its dimensions, even past large ICC segments', () => {
+  const sheet = jpeg(1999, 1354);
+  assert.ok(sheet.length >= 469_000, 'a ~470 KB base64 image');
+  assert.deepEqual(imageDimensions(sheet), [1999, 1354]);
+  // 200 KB of ICC profile puts the frame header well past the decoded header window.
+  const late = jpeg(1940, 1320, { iccBytes: 200_000 });
+  assert.deepEqual(imageDimensions(late), [1940, 1320]);
+  const body = agentBody({ images: 3, sheet: late, textChars: 10, signatureChars: 0 });
+  assert.equal(bodyImages(body, MODEL).imageTokens, 3 * visualTokens(1940, 1320));
+  assert.ok(visualTokens(1999, 1354) < 4_000, `${visualTokens(1999, 1354)} tokens, not ~117k`);
+});
+
+test('a JPEG walk that meets non-base64 characters stops rather than read shifted bytes', () => {
+  const late = jpeg(1940, 1320, { iccBytes: 200_000 });
+  const broken = late.slice(0, 70_000) + '\n' + late.slice(70_000);
+  assert.equal(imageDimensions(broken), undefined, 'unreadable: the tier cap applies');
+  // Inside the decoded header window, in a segment the walk skips (Codex r1 P2).
+  const early = late.slice(0, 30_000) + '\n\n\n\n' + late.slice(30_000);
+  assert.equal(imageDimensions(early), undefined);
+});
+
+test('the 2026-11-12 lane: anchored on its last count the bound fits, so no re-upload', async () => {
+  const { previous, body } = laneTurns();
+  assert.ok(body.length > 20_000_000, `${body.length} bytes`);
+  const images = bodyImages(body, MODEL);
+  assert.equal(images.imageTokens, 46 * visualTokens(1999, 1354));
+  // The plain bound: over the window with max_tokens, though the lane is about half full.
+  assert.ok(conservativeBodyTokens(body, MODEL) + 128_000 > 1_000_000,
+    `${conservativeBodyTokens(body, MODEL)}: the plain bound is over the window`);
+  // The previous turn of the lane, one round smaller, counted by Anthropic.
+  const counts = fakeCounts();
+  const sizing = new RequestSizing(counts, true, MODEL);
+  const candidate = sizing.register(body, 'original', sampleOf(previous, 480_000));
+  assert.ok(candidate.conservativeTokens + 128_000 <= 1_000_000,
+    `${candidate.conservativeTokens}: the anchored bound fits`);
+  assert.equal(sizing.boundFits(candidate, WINDOW), true);
+  await sizing.countIfOverBound(candidate, WINDOW);
+  const measured = await sizing.measure(candidate, WINDOW);
+  assert.equal(counts.calls.length, 0, 'no Count Tokens upload of the 22 MB body');
+  assert.ok(measured.tokens < WINDOW.budget, `${measured.tokens}: under the budget, not compressed`);
+});
+
+test('near the window the anchored bound no longer fits and the body is counted', async () => {
+  const { previous, body } = laneTurns();
+  const counts = fakeCounts();
+  const sizing = new RequestSizing(counts, true, MODEL);
+  const candidate = sizing.register(body, 'original', sampleOf(previous, 820_000));
+  assert.equal(sizing.boundFits(candidate, WINDOW), false);
+  await sizing.countIfOverBound(candidate, WINDOW);
+  assert.equal(counts.calls.length, 1, 'counted once when it may not fit');
+});
+
+test('no anchor for a body that does not extend the sampled one, or on another model', () => {
+  const { previous, messages } = laneTurns();
+  const sample = sampleOf(previous, 480_000);
+  const plain = (body) => conservativeBodyTokens(body, MODEL);
+  const anchored = (body, model = MODEL) =>
+    new RequestSizing(fakeCounts(), true, model).register(body, 'original', sample).conservativeTokens;
+  // Claude Code drops the old thinking signatures (nearly free) and adds as many bytes of
+  // dense tool output: the byte totals grow, the tokens grow far more (Codex r1 P1).
+  const swapped = messages.map((m) => m.role !== 'assistant' ? m
+    : { ...m, content: m.content.filter((block) => block.type !== 'thinking') });
+  swapped.push({ role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: '{"k":1}'.repeat(130_000) }] });
+  const swappedBody = bodyOf(swapped);
+  assert.equal(anchored(swappedBody), plain(swappedBody), 'the plain bound, not the anchor');
+  // An earlier message edited in place (same length): no anchor either.
+  const edited = structuredClone(messages);
+  edited[0].content[0].text = 'y'.repeat(800_000);
+  assert.equal(anchored(bodyOf(edited)), plain(bodyOf(edited)));
+  // The same body on another tokenizer (a route or prefix sample survives /model).
+  const other = bodyOf(messages, 'claude-sonnet-4-5');
+  assert.equal(new RequestSizing(fakeCounts(), true, 'claude-sonnet-4-5')
+    .register(other, 'original', sample).conservativeTokens,
+  conservativeBodyTokens(other, 'claude-sonnet-4-5'));
+  // Moved cache_control markers are not an edit.
+  const marked = structuredClone(messages);
+  marked.at(-3).content[0].cache_control = { type: 'ephemeral' };
+  assert.ok(anchored(bodyOf(marked)) < plain(bodyOf(marked)), 'still anchored');
+});
+
+test('the anchor sizes appended messages by their own canonical bytes, under 75% coverage none', () => {
+  const shape = { frame: 'f', messages: ['a', 'b', 'c'], sizes: [400_000, 50_000, 50_000],
+    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], unanchorable: false, lastExpanding: -1, unhashedBytes: 0 };
+  const sample = { tokens: 100_000, forwardedBytes: 450_000, imageBytes: 0, imageTokens: 0,
+    messageCount: 2 };
+  assert.equal(anchoredBound(sample, shape, MODEL),
+    Math.ceil(100_000 * (1 + ANCHOR_MARGIN)) + Math.ceil(50_000 / 1.9));
+  assert.equal(anchoredBound({ ...sample, messageCount: 1 },
+    { ...shape, sizes: [400_000, 100_000, 100_000] }, MODEL), undefined,
+  'the sample measured under 75% of the text');
+  assert.equal(anchoredBound({ tokens: 100_000, forwardedBytes: 450_000, messageCount: 2 }, shape,
+    MODEL), undefined, 'a sample without its images cannot anchor');
+  assert.equal(anchoredBound(undefined, shape, MODEL), undefined);
+  assert.equal(anchoredBound(sample, { ...shape, unanchorable: true }, MODEL), undefined,
+    'a URL image can change under the same digest');
+});
+
+test('a re-encoded prefix cannot hide appended content (Codex r2 P1)', () => {
+  // The sampled body wrote its text as \u escapes (6 bytes a character); the next one
+  // writes the same text literally and appends ~0.9 MB of dense text: fewer bytes in all.
+  const text = 'é'.repeat(1_500_000);
+  const escaped = Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000, messages: [
+    { role: 'user', content: [{ type: 'text', text }] }] }).replace(/é/g, '\\u00e9'));
+  const sample = sampleOf(escaped, 200_000);
+  const grown = bodyOf([{ role: 'user', content: [{ type: 'text', text }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: '{"k":1}'.repeat(100_000) }] }]);
+  assert.equal(extendsSample(sample, grown, MODEL), true, 'the same prefix, re-encoded');
+  const bound = new RequestSizing(fakeCounts(), true, MODEL).register(grown, 'original', sample)
+    .conservativeTokens;
+  assert.ok(grown.length < escaped.length, 'the raw bytes shrank');
+  assert.ok(bound >= 220_000 + Math.ceil(900_000 / 1.9), `${bound}: the appended text is charged in full`);
+  assert.ok(bound < conservativeBodyTokens(grown, MODEL), 'and the anchor applied');
+});
+
+test('cache_control inside a tool input is data, not a moved marker (Codex r2 P1)', () => {
+  const input = (value) => [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(300_000) }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Write',
+      input: { cache_control: value } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] }];
+  const sample = sampleOf(bodyOf(input('a'.repeat(2_400_000))), 300_000);
+  const changed = bodyOf([...input('{"z":9}'.repeat(342_857)),
+    { role: 'assistant', content: [{ type: 'text', text: 'done' }] }]);
+  assert.equal(extendsSample(sample, changed, MODEL), false);
+});
+
+test('an image the byte scan misses (escaped "type") is still charged (Codex r3 P1)', () => {
+  const { previous, messages } = laneTurns();
+  const sample = sampleOf(previous, 480_000);
+  const plainBody = bodyOf(messages);
+  const escaped = Buffer.from(plainBody.toString('utf-8')
+    .replaceAll('"type":"image"', '"type":"\\u0069mage"'));
+  assert.equal(bodyImages(escaped, MODEL).imageBytes, 0, 'the byte scan misses them');
+  const bound = (body) => new RequestSizing(fakeCounts(), true, MODEL)
+    .register(body, 'original', sample).conservativeTokens;
+  assert.ok(bound(plainBody) < conservativeBodyTokens(plainBody, MODEL), 'anchored');
+  assert.equal(bound(escaped), bound(plainBody), 'the same images charged either way');
+});
+
+test('control: the fixture used below anchors without the extra block', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  messages.splice(1, 0, { role: 'user', content: [{ type: 'text', text: 'see' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'seen' }] });
+  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
+  const body = bodyOf(messages);
+  assert.ok(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+    .conservativeTokens < conservativeBodyTokens(body, MODEL));
+});
+
+test('a URL image in the body: no anchor (its content can change, Codex r4 P1)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  messages.splice(1, 0, { role: 'user', content: [{ type: 'image',
+    source: { type: 'url', url: 'https://example.com/a.png' } }] },
+  { role: 'assistant', content: [{ type: 'text', text: 'seen' }] });
+  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
+  const body = bodyOf(messages);
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+    .conservativeTokens, conservativeBodyTokens(body, MODEL));
+});
+
+test('documents (URL, file, content, inline PDF), even in a tool result: no anchor (Codex r5-r6 P1s)', () => {
+  for (const block of [
+    { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } },
+    { type: 'tool_result', tool_use_id: 'u', content: [
+      { type: 'document', source: { type: 'file', file_id: 'file_1' } }] },
+    // Nested URL images in a content-source document (Codex r6 P1).
+    { type: 'document', source: { type: 'content', content: [
+      { type: 'image', source: { type: 'url', url: 'https://example.com/b.png' } }] } },
+    // An appended inline PDF expands far past its bytes (Codex r6 P1).
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0x' } },
+  ]) {
+    const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+    messages.splice(1, 0, { role: 'user', content: [block] },
+      { role: 'assistant', content: [{ type: 'text', text: 'read' }] });
+    const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
+    const body = bodyOf(messages);
+    assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+      .conservativeTokens, conservativeBodyTokens(body, MODEL));
+  }
+});
+
+test('a Claude Code 2.1.32x frame (auto mode, advisor) anchors, diagnostics changing per turn (review r3 P1)', () => {
+  const messages = agentMessages();
+  const frame = (previous) => ({ model: MODEL, max_tokens: 128_000, stream: true,
+    system: [{ type: 'text', text: 'You are a Claude agent.', cache_control: { type: 'ephemeral' } }],
+    tools: [{ name: 'Read', description: 'Read a file', input_schema: { type: 'object' } },
+      { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5-5' }],
+    tool_choice: { type: 'auto' }, metadata: { user_id: 'u' },
+    safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }],
+    thinking: { type: 'adaptive' }, output_config: { effort: 'high' },
+    context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+    diagnostics: { previous_message_id: previous } });
+  const body = (list, previous) => Buffer.from(JSON.stringify({ ...frame(previous), messages: list }));
+  const sample = sampleOf(body(messages.slice(0, -2), 'msg_1'), 480_000);
+  const next = body(messages, 'msg_2');
+  const candidate = new RequestSizing(fakeCounts(), true, MODEL).register(next, 'original', sample);
+  assert.equal(candidate.anchored, true);
+  assert.ok(candidate.conservativeTokens + 128_000 <= 1_000_000, `${candidate.conservativeTokens}`);
+  // Auto mode rewrites safeguards every turn (its prior tool-use ids grow): still anchored,
+  // with the new classifier context charged in full (review r4 P2).
+  const context = 'tool_use_ids:' + 't,'.repeat(20_000);
+  const turned = Buffer.from(JSON.stringify({ ...frame('msg_2'), safeguards: [{
+    type: 'dangerous_tool_use', classifier_context: { v: 1, prior: context } }], messages }));
+  const rewritten = new RequestSizing(fakeCounts(), true, MODEL).register(turned, 'original', sample);
+  assert.equal(rewritten.anchored, true);
+  assert.ok(rewritten.conservativeTokens >= candidate.conservativeTokens + Math.floor(context.length / 1.9) - 100);
+  // Diagnostics carrying more than the previous message id stays hashed.
+  const extra = Buffer.from(JSON.stringify({ ...frame('msg_2'),
+    diagnostics: { previous_message_id: 'msg_2', other: 1 }, messages }));
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(extra, 'original', sample)
+    .anchored, undefined);
+  // An unknown message-level field: no anchor.
+  const odd = bodyOf([...messages.slice(0, -1), { ...messages.at(-1), extra: 1 }]);
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(odd, 'original',
+    sampleOf(bodyOf(messages.slice(0, -2)), 480_000)).anchored, undefined);
+});
+
+test('remote MCP servers or server tools in the request: no anchor (Codex r7 P1)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  for (const extra of [
+    { mcp_servers: [{ type: 'url', url: 'https://mcp.example.com', name: 'x' }] },
+    { tools: [{ type: 'mcp_toolset', mcp_server_name: 'x' }] },
+    { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+    { some_future_field: true },
+  ]) {
+    const body = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+      ...extra, messages: list }));
+    const sample = sampleOf(body(messages.slice(0, -2)), 100_000);
+    assert.equal(new RequestSizing(fakeCounts(), true, MODEL)
+      .register(body(messages), 'original', sample).conservativeTokens,
+    conservativeBodyTokens(body(messages), MODEL), JSON.stringify(extra));
+  }
+  const custom = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    tools: [{ name: 'Read', input_schema: { type: 'object' } }], messages: list }));
+  const sample = sampleOf(custom(messages.slice(0, -2)), 100_000);
+  assert.ok(new RequestSizing(fakeCounts(), true, MODEL).register(custom(messages), 'original',
+    sample).conservativeTokens < conservativeBodyTokens(custom(messages), MODEL), 'custom tools anchor');
+});
+
+test('tool references: counted in the prefix they anchor; appended they do not (expanded)', () => {
+  const ref = (name) => [{ role: 'assistant', content: [{ type: 'tool_use', id: name,
+    name: 'ToolSearch', input: {} }] }, { role: 'user', content: [{ type: 'tool_result',
+    tool_use_id: name, content: [{ type: 'tool_reference', tool_name: name }] }] }];
+  const base = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  const bound = (sampled, body) => new RequestSizing(fakeCounts(), true, MODEL)
+    .register(bodyOf(body), 'original', sampleOf(bodyOf(sampled), 100_000)).conservativeTokens;
+  const inPrefix = [...base.slice(0, 1), ...ref('WebSearch'), ...base.slice(1)];
+  assert.ok(bound(inPrefix.slice(0, -2), inPrefix) < conservativeBodyTokens(bodyOf(inPrefix), MODEL));
+  const appended = [...base, ...ref('WebFetch')];
+  assert.equal(bound(base, appended), conservativeBodyTokens(bodyOf(appended), MODEL));
+});
+
+test('a standalone JPEG marker (TEM) before a large segment is walked over (Codex r4 P2)', () => {
+  const sheet = Buffer.from(jpeg(1999, 1354, { iccBytes: 120_000 }), 'base64');
+  const withTem = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0x01]), sheet.subarray(2)]);
+  assert.deepEqual(imageDimensions(withTem.toString('base64')), [1999, 1354]);
+  const rst = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0xd3]), sheet.subarray(2)]);
+  assert.deepEqual(imageDimensions(rst.toString('base64')), [1999, 1354]);
+  const sos = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0xda, 0, 4, 0, 0]),
+    sheet.subarray(2)]);
+  assert.equal(imageDimensions(sos.toString('base64')), undefined, 'scan data before a frame');
+});
+
+test('a body that asks Anthropic to edit its input never anchors (review r2 P3)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  const edited = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    context_management: { edits: [{ type: 'clear_tool_uses_20250919' }] }, messages: list }));
+  const sample = sampleOf(edited(messages.slice(0, -2)), 200_000);
+  assert.equal(extendsSample(sample, edited(messages), MODEL), false);
+  // Claude Code's own no-op edit (sent whenever thinking is on) still anchors.
+  const noOp = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    messages: list }));
+  assert.equal(extendsSample(sampleOf(noOp(messages.slice(0, -2)), 200_000), noOp(messages), MODEL),
+    true);
+});
+
+test('adding a contact sheet is not a jump of new content: its tokens are visual', () => {
+  const sample = { tokens: 850_000, forwardedBytes: 21_000_000, imageBytes: 20_000_000,
+    imageTokens: 150_000 };
+  const images = { imageBytes: 20_470_000, imageTokens: 153_500 };
+  assert.equal(shouldCountTokens(sample, 21_475_000, 880_000, 960_000, images), false);
+  // Without image totals the 470 KB of base64 reads as ~117k new tokens: a jump.
+  assert.equal(shouldCountTokens(sample, 21_475_000, 880_000, 960_000), true);
+  // A real jump of text is still counted near the budget.
+  assert.equal(shouldCountTokens(sample, 21_475_000 + 400_000, 880_000, 960_000,
+    { imageBytes: 20_470_000, imageTokens: 153_500 }), true);
+});

@@ -1,5 +1,6 @@
 import { type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
 import { type ImageTotals } from "./image-tokens.js";
+import { type BodyShape } from "./body-shape.js";
 /** Output room kept free on models that accept input + max_tokens over the
  * window, so the model can still answer a request that barely fits. */
 export declare const OUTPUT_FLOOR_TOKENS = 16000;
@@ -34,9 +35,11 @@ export interface RequestCandidate {
     readonly kind: CandidateKind;
     readonly sample?: Readonly<SizeSample>;
     readonly estimate: Readonly<PlannedSize>;
-    /** Per-model conservative bound (token-estimate.ts): what delivery may rely
-     * on without an exact count. */
+    /** Per-model conservative bound (token-estimate.ts), tightened by an anchored
+     * sample (anchoredBound): what delivery may rely on without an exact count. */
     readonly conservativeTokens: number;
+    /** The bound came from anchoredBound (logged as CompactionRecord.anchoredBound). */
+    readonly anchored?: true;
 }
 export declare class RequestSizing {
     private readonly counts;
@@ -111,4 +114,37 @@ export declare function fitsNative(input: number, limits: SizingLimits): boolean
  * put an ~850k request at 892k and it was refused.
  */
 export declare function estimateRequestTokens(sample: SizeSample | undefined, bytes: number, images?: ImageTotals): PlannedSize;
+/**
+ * Share of a body's text its sample must already have measured for anchoredBound,
+ * and the margin added on the sample's own tokens. See anchoredBound.
+ */
+export declare const ANCHOR_MIN_COVERAGE = 0.75;
+export declare const ANCHOR_MARGIN = 0.1;
+/**
+ * An upper bound anchored on Anthropic's own count of an earlier body (`sample`) that this
+ * one extends (extendsSample, checked by the caller): the sample's text tokens plus
+ * ANCHOR_MARGIN, the messages appended since sized from their own canonical text bytes
+ * (body-shape.ts) at the conservative per-model ratio, and every image at its visual
+ * tokens. Undefined without a sample that recorded its images and lineage, or when the
+ * sample measured under ANCHOR_MIN_COVERAGE of the body's text.
+ *
+ * Why: the plain bound reads all non-image bytes at 1.9 bytes per token. Base64 that
+ * is not an image (thinking signatures, JSON escapes) is far cheaper, so an
+ * image-heavy agent lane Anthropic counted at 491k tokens had a plain bound over its
+ * 1M window (2026-11-12, ai-safety-sim): every turn was counted (a 22 MB re-upload,
+ * 2.0 GB on that lane) and a timed-out count compressed a half-full lane. The margin
+ * covers tokenizer variance and fields the frame hash treats as equal; the appended part
+ * is bounded at the conservative ratio like before. Appended bytes come from the
+ * canonical messages, never a raw byte difference, which a re-encoded prefix (escapes
+ * written literally) could shrink to hide new content (Codex r2 P1).
+ */
+export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined): number | undefined;
+/**
+ * Whether `body` extends the body `sample` measured, on the same model: the sample's
+ * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only
+ * then is the sample's count a count of part of this body (review r1, Codex r1 P1s:
+ * net byte growth admitted swapped content; route and prefix samples survive a model
+ * switch).
+ */
+export declare function extendsSample(sample: SizeSample | undefined, body: Buffer, model: string | undefined): boolean;
 //# sourceMappingURL=request-sizing.d.ts.map

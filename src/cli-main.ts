@@ -25,7 +25,8 @@ import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { StatusLinkFiles } from "./status-link.js";
-import { statusLineWantsLink } from "./statusline.js";
+import { statusLineWantsLink, statuslinePaths } from "./statusline.js";
+import { autoInstallStatusline } from "./statusline-auto.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import {
   createSessionNoticePlugin,
@@ -427,7 +428,7 @@ async function showSignInNotice(
 
 /** The SessionStart extra line: the update notice and the sign-in line, each once. */
 function sessionStartLines(
-  autoUpdate: AutoUpdateSetup | null, signIn: { text?: string }
+  autoUpdate: AutoUpdateSetup | null, signIn: { text?: string }, statusline: { text?: string } = {}
 ): (() => string | undefined) | undefined {
   return () => {
     const lines = [autoUpdate?.notices.sessionStartLine()];
@@ -435,6 +436,10 @@ function sessionStartLines(
       const color = terminalSupportsColor();
       lines.push(color ? `\x1b[33m${signIn.text}\x1b[39m` : signIn.text);
       signIn.text = undefined;
+    }
+    if (statusline.text) {
+      lines.push(statusline.text);
+      statusline.text = undefined;
     }
     const shown = lines.filter((l): l is string => typeof l === "string");
     return shown.length ? shown.join("\n") : undefined;
@@ -708,6 +713,12 @@ async function main() {
   const creditMemory = new CreditRefusalMemory(getConfigDir());
   // The API-billing message again inside Claude Code, at its first SessionStart.
   const signInSessionLine: { text?: string } = {};
+  // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
+  // Claude Code reads its settings; what changed is said at the first SessionStart.
+  const statuslineSessionLine: { text?: string } = {
+    text: interactiveUi && !mayBePrintInvocation(claudeArgs)
+      ? autoInstallStatusline(statuslinePaths()) : undefined,
+  };
   // A sign-in completed after ccc's warning, between launches or mid-session.
   const signInTracker = new SignInTracker(getConfigDir(),
     (event) => diagnostics.record("sign_in_completed", { ...event }));
@@ -826,7 +837,7 @@ async function main() {
     projectMeta,
     // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
     // install) on a later SessionStart of this session, once.
-    sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine),
+    sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine, statuslineSessionLine),
     promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
     // `/memtree-view` opens its link only where a browser would appear in
     // front of the user: interactive (also not `-pc`-style print), not SSH

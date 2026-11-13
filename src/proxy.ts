@@ -45,6 +45,7 @@ import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal,
   unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage, type RefusalCause } from "./refusal-reason.js";
+import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { SlowUploads } from "./slow-upload.js";
 import type { StatusLinkFiles } from "./status-link.js";
 import {
@@ -178,6 +179,7 @@ import {
 } from "./hooks.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
+import { bodyShape, prefixDigest } from "./body-shape.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
@@ -571,6 +573,10 @@ interface ProxyState {
   refusalStreaks: RefusalStreaks;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
+  /** Heavy request bodies and recent agent lanes per session (lane-activity.ts). */
+  laneActivity: LaneActivity;
+  /** The queued heavy-request notice: the lowest priority, any other may replace it. */
+  heavyNotice?: object;
   /**
    * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
    * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
@@ -1155,6 +1161,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       opts.indexWaitMaxMs),
     refusalStreaks: new RefusalStreaks(),
     activeSubagents: new Set(),
+    laneActivity: new LaneActivity(),
     deferredAgentIndexes: new Map(),
     adoptingPrepared: new Map(),
     memoryRoutes: new Map(),
@@ -2140,6 +2147,7 @@ async function handleMessages(
       await forward;
     } finally {
       if (rec.totalMs === undefined) rec.totalMs = Date.now() - received;
+      noteForwardedSize(state, rec, requestSessionId(req));
       opts.reqlog?.log(rec);
     }
   };
@@ -2321,6 +2329,7 @@ async function handleMessages(
     }
   }
   rec.routeLane = requestRouteLane;
+  noteLaneActivity(state, rec, requestSessionId(req));
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
   const clientMeta = memtreeClientMeta({
@@ -4592,8 +4601,17 @@ function reportedSample(rec: MessagesRecord, sent: Buffer): SizeSample | undefin
 
 /** A size sample of `sent` carrying its inline images (estimateRequestTokens). */
 function sizeSampleOf(sent: Buffer, tokens: number, model: unknown): SizeSample {
-  const { imageBytes, imageTokens } = bodyImages(sent, typeof model === "string" ? model : undefined);
-  return { tokens, forwardedBytes: sent.length, imageBytes, imageTokens };
+  const id = typeof model === "string" ? model : undefined;
+  const { imageBytes, imageTokens } = bodyImages(sent, id);
+  return { tokens, forwardedBytes: sent.length, imageBytes, imageTokens, ...sampleLineage(sent, id) };
+}
+
+/** The sampled body's lineage (body-shape.ts) for anchoredBound; none for a small body. */
+function sampleLineage(sent: Buffer, model: string | undefined): Partial<SizeSample> {
+  const shape = bodyShape(sent);
+  const digest = shape && prefixDigest(shape, shape.messages.length);
+  return shape && digest && model
+    ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
 }
 
 /**
@@ -5650,6 +5668,7 @@ function noteUncountedBound(
   record: CompactionRecord, sizing: RequestSizing, candidate: RequestCandidate,
   body: Record<string, any>, modelContextLimit: number,
 ): void {
+  if (candidate.anchored) record.anchoredBound = true;
   if (sizing.isExact(candidate)) {
     exactSizedRecords.add(record);
     return;
@@ -6987,7 +7006,29 @@ function recordTurn(
 ): void {
   rec.turnType = turnType;
   rec.forwardedBytes = forwardBody.length;
-  rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
+  rec.approxInputTokens = approxBodyTokens(forwardBody, rec.model);
+  forwardedImageBytes.set(rec, bodyImages(forwardBody,
+    typeof rec.model === "string" ? rec.model : undefined).imageBytes);
+}
+
+/** The forwarded body's inline image bytes (recordTurn), for the heavy-request notice. */
+const forwardedImageBytes = new WeakMap<MessagesRecord, number>();
+
+/** What this request uploaded to Anthropic, for the session's heavy-request notice. */
+function noteForwardedSize(
+  state: ProxyState, rec: MessagesRecord, sessionId: string | undefined,
+): void {
+  const bytes = rec.forwardedBytes ?? 0;
+  if (bytes > 0) {
+    state.laneActivity.sent(sessionId, { bytes, imageBytes: forwardedImageBytes.get(rec) ?? 0 });
+  }
+}
+
+/** A body's text at bytes/4 plus its inline images at their visual tokens (log only):
+ * bytes/4 alone logged a 22 MB contact-sheet lane at 5.5M tokens (Anthropic: 491k). */
+function approxBodyTokens(body: Buffer, model: unknown): number {
+  const images = bodyImages(body, typeof model === "string" ? model : undefined);
+  return approxTokensFromBytes(body.length - images.imageBytes) + images.imageTokens;
 }
 
 function headerText(
@@ -7563,7 +7604,8 @@ function refuseWholeRequest(
     : args.state.fallbackFailures.fail(args.routeKey,
       { awaitingIndex: args.rec.indexBehind === true,
         indexSecondsLeft: activeIndexWaits.get(args.rec),
-        refusalMessage: refusalMessage(cause!, currentSessionLink(args.state, requestSessionId(args.req))) });
+        refusalMessage: refusalMessage(cause!,
+          currentSessionLink(args.state, requestSessionId(args.req)), agentResultNote(args)) });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -7603,6 +7645,20 @@ function refuseWholeRequest(
   return false;
 }
 
+/**
+ * A main-lane refusal while an agent lane of this session was recently active: a
+ * background agent's finished result reaches the main session only as part of its
+ * next turn, so say it may be waiting (2026-11-13: a refused main lane held one back).
+ */
+function agentResultNote(
+  args: { state: ProxyState; rec: MessagesRecord; req: http.IncomingMessage },
+): string | undefined {
+  // This session's own agent traffic only: activeSubagents is process-wide (review r1 P3).
+  return args.rec.routeLane === "main" &&
+    args.state.laneActivity.agentRecent(requestSessionId(args.req))
+    ? AGENT_RESULT_WAITING_LINE : undefined;
+}
+
 /** Requests held back by a lane backoff whose attempt MemTree answered (unreachableNow). */
 const answeredBackoffs = new WeakSet<MessagesRecord>();
 
@@ -7638,6 +7694,29 @@ function unreachableNow(
 }
 
 /**
+ * Note this request's lane (lane-activity.ts) and, on a main-lane request of the current
+ * prompt, queue the session's one heavy-request warning when an earlier upload passed the
+ * size and no other notice waits. It is the lowest priority (otherNoticePending): any
+ * other notice may replace it, which leaves it due for a later turn.
+ */
+function noteLaneActivity(
+  state: ProxyState, rec: MessagesRecord, sessionId: string | undefined,
+): void {
+  state.laneActivity.seen(sessionId, rec.routeLane);
+  const heavy = state.laneActivity.heavyDue(sessionId);
+  const prompt = noticeContexts.get(rec);
+  if (!heavy || sessionId === undefined || rec.routeLane !== "main" || prompt === undefined ||
+      prompt.generation !== state.mainPromptGeneration || state.notices.hasPending()) return;
+  state.heavyNotice = state.notices.queueSuffix(heavyRequestNoticeText(heavy),
+    () => state.laneActivity.markWarned(sessionId), prompt.promptId);
+}
+
+/** Whether a notice other than the heavy-request one (the lowest priority) waits. */
+function otherNoticePending(state: ProxyState, promptId?: string): boolean {
+  return state.notices.hasPending(promptId) && !state.notices.pendingIs(state.heavyNotice);
+}
+
+/**
  * A repeated retryable refusal on the main thread: say once per streak that
  * MemTree is slow and Claude Code is retrying, unless another notice waits.
  */
@@ -7652,7 +7731,7 @@ function noteSlowRetry(
   const canShow = failure.status === 503 && rec.routeLane === "main" &&
     rec.indexBehind !== true && prompt !== undefined &&
     prompt.generation === state.mainPromptGeneration && !args.res.destroyed &&
-    !state.notices.hasPending();
+    !otherNoticePending(state);
   if (!state.refusalStreaks.refused(args.routeKey, Date.now(), canShow)) return;
   state.notices.queueSuffix(SLOW_RETRY_NOTICE, undefined, prompt!.promptId);
   rec.slowRetryNotice = true;
@@ -7706,7 +7785,7 @@ function warnPausedNearWindow(
   // Never replace another queued notice (or this one again): a later request tries.
   if (detail === null || rec.routeLane !== "main" || sessionId === undefined ||
       pausedNotices.has(rec) || nearWindowWarned(state, sessionId) ||
-      state.notices.hasPending(state.mainPromptId)) return;
+      otherNoticePending(state, state.mainPromptId)) return;
   state.nearWindowNotice = state.notices.queueSuffix(
     paymentNoticeText(detail, undefined, { overBudget: true }), () => {
     state.paymentNotice.markShown();

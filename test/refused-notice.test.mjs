@@ -15,6 +15,7 @@ import { MemtreeClient } from "../dist/memtree.js";
 import { DEGRADED_NOTICE, SLOW_RETRY_NOTICE } from "../dist/notices.js";
 import { RefusalStreaks, SLOW_RETRY_WINDOW_MS } from "../dist/route-fallback.js";
 import { ToolOutputStore } from "../dist/tool-output-store.js";
+import { ANCHOR_MIN_COVERAGE } from "../dist/request-sizing.js";
 
 const HANG = Symbol("hang");
 /** A count answered 500: failed, not timed out, so delivery does not retry it. */
@@ -22,6 +23,19 @@ const COUNT_ERROR = Symbol("count error");
 /** A count whose connection dropped (a network error): retried like a timeout. */
 const COUNT_DROP = Symbol("count drop");
 const SESSION = "session-1";
+/**
+ * The answer since the prefix's last reported size: 155 KB on the prefix's 450 KB, so its
+ * report covers under ANCHOR_MIN_COVERAGE of the ride's text, the size anchored on it
+ * (request-sizing.ts anchoredBound) does not apply, and only the ride's plain conservative
+ * bound, over the window, speaks for it (asserted below). Kept small enough that the ride's
+ * reported estimate stays under the 100k budget.
+ */
+const NEXT_ANSWER = "next answer " + "a".repeat(155_000);
+
+test("the fixture's next answer keeps the ride's report under the anchor's coverage", () => {
+  const prefix = 450_000;
+  assert.ok(prefix / (prefix + NEXT_ANSWER.length) < ANCHOR_MIN_COVERAGE, "a fixture change would silently anchor the ride");
+});
 
 test("a refused degraded turn shows no degraded notice and is followup-refused", async () => {
   const h = await harness({ compress: () => ({ status: 500, body: { detail: "boom" } }) });
@@ -90,7 +104,7 @@ test("a prefix over the window only by its uncounted bound stays the failed comp
     // The ride's planning count times out; delivery's retry of it answers.
     hangNext = 1;
     await h.armMainTurn("next question");
-    const next = [...original, { role: "assistant", content: "next answer" },
+    const next = [...original, { role: "assistant", content: NEXT_ANSWER },
       { role: "user", content: "next question" }];
     assert.equal(await h.post(next), 200);
     const rec = h.lastRecord();
@@ -138,7 +152,7 @@ async function prefixTurn({ originalTokens = 300_000, originalChars = 600_000, c
   hangNext = 1;
   hangRides = rideAlwaysHangs;
   await h.armMainTurn("next question");
-  const next = [...original, { role: "assistant", content: "next answer" },
+  const next = [...original, { role: "assistant", content: NEXT_ANSWER },
     { role: "user", content: "next question" }];
   return { h, status: await h.post(next), rec: h.lastRecord(), compressions: () => compressions };
 }

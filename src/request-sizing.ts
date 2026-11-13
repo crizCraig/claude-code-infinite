@@ -5,8 +5,11 @@ import { createHash } from "node:crypto";
 import { RETRYABLE_COUNT_OUTCOMES, exceedsRequestLimit, plausibleSample, shouldCountTokens,
   type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
-import { bodyImages, rememberImages, type ImageTotals } from "./image-tokens.js";
-import { conservativeBodyTokens } from "./token-estimate.js";
+import { bodyImages, imageTier, rememberImages, visualTokens, type ImageTotals }
+  from "./image-tokens.js";
+import { bodyShape, knownShape, prefixDigest, rememberShape, textBytes, type BodyShape }
+  from "./body-shape.js";
+import { conservativeBodyTokens, conservativeTokensFromBytes } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
 
 /** Output room kept free on models that accept input + max_tokens over the
@@ -41,9 +44,11 @@ export interface RequestCandidate {
   readonly kind: CandidateKind;
   readonly sample?: Readonly<SizeSample>;
   readonly estimate: Readonly<PlannedSize>;
-  /** Per-model conservative bound (token-estimate.ts): what delivery may rely
-   * on without an exact count. */
+  /** Per-model conservative bound (token-estimate.ts), tightened by an anchored
+   * sample (anchoredBound): what delivery may rely on without an exact count. */
   readonly conservativeTokens: number;
+  /** The bound came from anchoredBound (logged as CompactionRecord.anchoredBound). */
+  readonly anchored?: true;
 }
 
 export class RequestSizing {
@@ -60,15 +65,19 @@ export class RequestSizing {
     const existing = this.candidates.get(key);
     if (existing) return existing;
     const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
-    const conservativeTokens = conservativeBodyTokens(body, this.model);
     const images = bodyImages(body, this.model);
+    const plain = conservativeBodyTokens(body, this.model);
+    const conservativeTokens = Math.min(plain,
+      (extendsSample(snapshot, body, this.model) &&
+        anchoredBound(snapshot, bodyShape(body)!, this.model)) || Infinity);
     const owned = Buffer.from(body);
-    // The same totals answer for the owned copy (reportedSample of the sent bytes).
+    // The same totals and shape answer for the owned copy (reportedSample of the sent bytes).
     rememberImages(owned, this.model, images);
+    rememberShape(owned, knownShape(body));
     const candidate = Object.freeze({ key, body: owned, kind, sample: snapshot,
       estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length, images),
         conservativeTokens)),
-      conservativeTokens });
+      conservativeTokens, ...(conservativeTokens < plain ? { anchored: true as const } : {}) });
     this.candidates.set(key, candidate);
     return candidate;
   }
@@ -146,7 +155,8 @@ export class RequestSizing {
     };
     // Delivery counts whenever an estimate is all that says the body fits: the
     // learned estimate, or the conservative bound, does not fit on its own.
-    const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
+    const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget,
+      bodyImages(candidate.body, this.model)) ||
       (phase === "delivery" && !(fitsNative(estimate, estimateLimits(limits)) &&
         fitsNative(candidate.conservativeTokens, estimateLimits(limits))));
     if (!count && this.enabled && needed) count = await this.counts.count(candidate.body);
@@ -274,6 +284,73 @@ export function estimateRequestTokens(
     Math.max(approxTokensFromBytes(textBytes - sampleBytes),
       Math.round((textBytes - sampleBytes) * ratio));
   return { tokens: text + images.imageTokens, source: "reported" };
+}
+
+/**
+ * Share of a body's text its sample must already have measured for anchoredBound,
+ * and the margin added on the sample's own tokens. See anchoredBound.
+ */
+export const ANCHOR_MIN_COVERAGE = 0.75;
+export const ANCHOR_MARGIN = 0.1;
+
+/**
+ * An upper bound anchored on Anthropic's own count of an earlier body (`sample`) that this
+ * one extends (extendsSample, checked by the caller): the sample's text tokens plus
+ * ANCHOR_MARGIN, the messages appended since sized from their own canonical text bytes
+ * (body-shape.ts) at the conservative per-model ratio, and every image at its visual
+ * tokens. Undefined without a sample that recorded its images and lineage, or when the
+ * sample measured under ANCHOR_MIN_COVERAGE of the body's text.
+ *
+ * Why: the plain bound reads all non-image bytes at 1.9 bytes per token. Base64 that
+ * is not an image (thinking signatures, JSON escapes) is far cheaper, so an
+ * image-heavy agent lane Anthropic counted at 491k tokens had a plain bound over its
+ * 1M window (2026-11-12, ai-safety-sim): every turn was counted (a 22 MB re-upload,
+ * 2.0 GB on that lane) and a timed-out count compressed a half-full lane. The margin
+ * covers tokenizer variance and fields the frame hash treats as equal; the appended part
+ * is bounded at the conservative ratio like before. Appended bytes come from the
+ * canonical messages, never a raw byte difference, which a re-encoded prefix (escapes
+ * written literally) could shrink to hide new content (Codex r2 P1).
+ */
+export function anchoredBound(
+  sample: SizeSample | undefined, shape: BodyShape, model: string | undefined,
+): number | undefined {
+  if (!plausibleSample(sample) || sample.imageBytes === undefined ||
+      sample.imageTokens === undefined || sample.messageCount === undefined) return undefined;
+  // Documents, URL images and other blocks it cannot bound never anchor (Codex r4-r6 P1s);
+  // every inline image is charged from the
+  // same parse that left it out of the text, so none escapes both (Codex r3 P1).
+  if (shape.unanchorable || shape.lastExpanding >= sample.messageCount) return undefined;
+  const sampled = textBytes(shape, 0, sample.messageCount);
+  const appended = textBytes(shape, sample.messageCount);
+  if (sampled < ANCHOR_MIN_COVERAGE * (sampled + appended)) return undefined;
+  const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
+  return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
+    conservativeTokensFromBytes(appended + shape.unhashedBytes, model) +
+    shapeImageTokens(shape, model);
+}
+
+/** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */
+function shapeImageTokens(shape: BodyShape, model: string | undefined): number {
+  const tier = imageTier(model);
+  return shape.imageDims.reduce((sum, size) =>
+    sum + (size ? visualTokens(size[0], size[1], tier) : tier.maxTokens), 0);
+}
+
+/**
+ * Whether `body` extends the body `sample` measured, on the same model: the sample's
+ * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only
+ * then is the sample's count a count of part of this body (review r1, Codex r1 P1s:
+ * net byte growth admitted swapped content; route and prefix samples survive a model
+ * switch).
+ */
+export function extendsSample(
+  sample: SizeSample | undefined, body: Buffer, model: string | undefined,
+): boolean {
+  if (!sample?.prefixDigest || sample.messageCount === undefined || !model ||
+      sample.model !== model) return false;
+  const shape = bodyShape(body);
+  return shape !== undefined && !shape.serverEdits &&
+    prefixDigest(shape, sample.messageCount) === sample.prefixDigest;
 }
 
 const NO_IMAGE_TOTALS: ImageTotals = Object.freeze({ imageBytes: 0, imageTokens: 0 });

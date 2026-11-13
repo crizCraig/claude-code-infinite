@@ -238,6 +238,8 @@ export declare class NoticeDeliveryQueue {
     queueSuffix(text: NoticeText, onDelivered?: () => void, promptId?: string): object;
     /** Whether a notice for `promptId` (or for any prompt) is queued and undelivered. */
     hasPending(promptId?: string): boolean;
+    /** Whether `handle` (from queueSuffix) is the notice still waiting. */
+    pendingIs(handle: object | undefined): boolean;
     /** Withdraw a queued notice that is still pending; a newer one is kept. */
     cancel(handle: object | undefined): void;
     /**

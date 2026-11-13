@@ -6,8 +6,9 @@
  *   input, and appends ` | 🌿 tree` (an OSC 8 link to the session's newest MemTree page;
  *   the bare URL where the terminal has no hyperlinks). It only reads the cached link the
  *   proxy writes (status-link.ts): never a server call, so the status line stays fast.
- * - `ccc statusline install` (opt-in) points Claude Code's `statusLine` at it, keeping the
- *   existing command, which it wraps rather than replaces; settings.json is backed up first.
+ * - `ccc statusline install` points Claude Code's `statusLine` at it, keeping the existing
+ *   command, which it wraps rather than replaces; settings.json is backed up first. The
+ *   first interactive run does it once by default (statusline-auto.ts).
  * - `ccc statusline uninstall` puts the original back.
  *
  * Loaded straight from cli.ts (no proxy, no update check): Claude Code runs a status line
