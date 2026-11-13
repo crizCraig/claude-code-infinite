@@ -541,7 +541,8 @@ async function main() {
     // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
     // Claude Code reads its settings; what changed is said at the first SessionStart.
     const statuslineSessionLine = {
-        text: interactiveUi ? autoInstallStatusline(statuslinePaths()) : undefined,
+        text: interactiveUi && !mayBePrintInvocation(claudeArgs)
+            ? autoInstallStatusline(statuslinePaths()) : undefined,
     };
     // A sign-in completed after ccc's warning, between launches or mid-session.
     const signInTracker = new SignInTracker(getConfigDir(), (event) => diagnostics.record("sign_in_completed", { ...event }));

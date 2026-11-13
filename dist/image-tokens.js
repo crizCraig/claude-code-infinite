@@ -164,8 +164,14 @@ function jpegSize(b) {
     }
     return undefined;
 }
-/** The same walk as jpegSize over the whole base64 image, decoding 9 bytes per segment. */
+/**
+ * The same walk as jpegSize over the whole base64 image, decoding 9 bytes per segment.
+ * Only for plain base64 throughout: one whitespace character inside a skipped segment
+ * would shift every later offset and read wrong bytes as a frame header (Codex r1 P2).
+ */
 function jpegSizeAt(base64) {
+    if (!BASE64_RE.test(base64))
+        return undefined;
     const total = Math.floor(base64.length / 4) * 3;
     let i = 2;
     for (let steps = 0; steps < 2_048 && i + 9 <= total; steps++) {

@@ -6,6 +6,7 @@ import { RETRYABLE_COUNT_OUTCOMES, exceedsRequestLimit, plausibleSample, shouldC
   type CountTokensSession, type CountTokensResult, type SizeSample } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
 import { bodyImages, rememberImages, type ImageTotals } from "./image-tokens.js";
+import { bodyShape, knownShape, prefixDigest, rememberShape } from "./body-shape.js";
 import { conservativeBodyTokens, conservativeTokensFromBytes } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
 
@@ -61,11 +62,14 @@ export class RequestSizing {
     if (existing) return existing;
     const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
     const images = bodyImages(body, this.model);
-    const conservativeTokens = Math.min(conservativeBodyTokens(body, this.model),
-      anchoredBound(snapshot, body.length, images, this.model) ?? Infinity);
+    const plain = conservativeBodyTokens(body, this.model);
+    const conservativeTokens = Math.min(plain,
+      (extendsSample(snapshot, body, this.model) &&
+        anchoredBound(snapshot, body.length, images, this.model)) || Infinity);
     const owned = Buffer.from(body);
-    // The same totals answer for the owned copy (reportedSample of the sent bytes).
+    // The same totals and shape answer for the owned copy (reportedSample of the sent bytes).
     rememberImages(owned, this.model, images);
+    rememberShape(owned, knownShape(body));
     const candidate = Object.freeze({ key, body: owned, kind, sample: snapshot,
       estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length, images),
         conservativeTokens)),
@@ -286,8 +290,8 @@ export const ANCHOR_MIN_COVERAGE = 0.75;
 export const ANCHOR_MARGIN = 0.1;
 
 /**
- * An upper bound anchored on Anthropic's own count of an earlier body of the same
- * lane and shape (`sample`), for a body that grew from it: the sample's text tokens
+ * An upper bound anchored on Anthropic's own count of an earlier body (`sample`) that this
+ * one extends (extendsSample, checked by the caller): the sample's text tokens
  * plus ANCHOR_MARGIN, the text added since at the conservative per-model ratio, and
  * every image at its visual tokens. Undefined without a sample that recorded its
  * images, when the body's text shrank (not a growth of the sampled body), or when the
@@ -313,6 +317,22 @@ export function anchoredBound(
   const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
   return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
     conservativeTokensFromBytes(text - sampleText, model) + images.imageTokens;
+}
+
+/**
+ * Whether `body` extends the body `sample` measured, on the same model: the sample's
+ * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only
+ * then is the sample's count a count of part of this body (review r1, Codex r1 P1s:
+ * net byte growth admitted swapped content; route and prefix samples survive a model
+ * switch).
+ */
+export function extendsSample(
+  sample: SizeSample | undefined, body: Buffer, model: string | undefined,
+): boolean {
+  if (!sample?.prefixDigest || sample.messageCount === undefined || !model ||
+      sample.model !== model) return false;
+  const shape = bodyShape(body);
+  return shape !== undefined && prefixDigest(shape, sample.messageCount) === sample.prefixDigest;
 }
 
 const NO_IMAGE_TOTALS: ImageTotals = Object.freeze({ imageBytes: 0, imageTokens: 0 });

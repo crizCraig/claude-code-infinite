@@ -43,6 +43,14 @@ export interface SizeSample {
      */
     imageBytes?: number;
     imageTokens?: number;
+    /**
+     * What the sampled body was (body-shape.ts), so a size anchored on it is used only for
+     * a body that extends it on the same model: its model, its message count and the digest
+     * of its frame and messages. Absent on a small body or one recorded without them.
+     */
+    model?: string;
+    messageCount?: number;
+    prefixDigest?: string;
 }
 /** Where a count call goes: the proxy's upstream. */
 export interface CountTokensUpstream {

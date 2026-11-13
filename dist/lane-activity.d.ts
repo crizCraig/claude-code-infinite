@@ -4,8 +4,9 @@
  * all base64 contact sheets, 97-217 s to first byte on home wifi; when the main lane
  * was then refused, the agent's finished result could not reach the main session):
  *
- * - heavy requests: once per session, when a request body passes HEAVY_REQUEST_BYTES,
- *   say images (or the session's history) make each turn that many MB to upload;
+ * - heavy requests: once per session, when a body sent to Anthropic passes
+ *   HEAVY_REQUEST_BYTES, say images (or the session's history) make each turn that many MB
+ *   to upload;
  * - agent activity: whether an agent lane of the session sent a request recently, so a
  *   main-lane refusal can say a background agent's result may be waiting.
  */
@@ -23,8 +24,10 @@ export declare class LaneActivity {
     private readonly warned;
     private readonly agentSeen;
     constructor(now?: () => number);
-    /** Note a request of the session: its body size and image bytes, and its lane. */
-    note(sessionId: string | undefined, lane: string | undefined, request: HeavyRequest): void;
+    /** Note a request of the session on `lane` (an agent lane counts as recent activity). */
+    seen(sessionId: string | undefined, lane: string | undefined): void;
+    /** Note what a request of the session uploaded: its body size and image bytes. */
+    sent(sessionId: string | undefined, request: HeavyRequest): void;
     /** The session's largest heavy request when it has not been warned about yet. */
     heavyDue(sessionId: string | undefined): HeavyRequest | undefined;
     /** The warning was shown: never again for this session. */

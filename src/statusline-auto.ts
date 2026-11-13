@@ -13,7 +13,8 @@
  *   quietly (`ccc statusline install` is not supported there yet).
  *
  * Done once per ccc config dir, recorded in AUTO_MARKER whatever the outcome, so an
- * uninstall is never undone by a later run. CCC_STATUSLINE_AUTO=0 turns it off.
+ * uninstall is never undone by a later run; nor is one made with an older ccc (settings.json
+ * has ccc backups but no saved original). CCC_STATUSLINE_AUTO=0 turns it off.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -51,6 +52,8 @@ function decide(
 ): { outcome: string; notice?: string } {
   if ((options.platform ?? process.platform) === "win32") return { outcome: "skipped-windows" };
   if (statusLineWantsLink(paths.settings)) return { outcome: "already" };
+  // Installed with an older ccc and uninstalled (which kept only the backups): stays off.
+  if (!fs.existsSync(paths.saved) && hasBackups(paths.settings)) return { outcome: "uninstalled" };
   const current = readStatusLine(paths.settings);
   if (current === "unreadable") {
     return { outcome: "skipped-invalid", notice: skipped(`${paths.settings} is not valid JSON`) };
@@ -72,8 +75,18 @@ function decide(
 }
 
 function skipped(why: string): string {
-  return `ccc left your status line unchanged: ${why}. To add the MemTree link yourself: ` +
-    "ccc statusline install.";
+  return `ccc left your status line unchanged: ${why.replace(/\.+$/, "")}. To add the ` +
+    "MemTree link yourself: ccc statusline install.";
+}
+
+/** Whether `ccc statusline install` or `uninstall` ever backed up this settings file. */
+function hasBackups(settings: string): boolean {
+  try {
+    const name = `${path.basename(settings)}.ccc-backup-`;
+    return fs.readdirSync(path.dirname(settings)).some((entry) => entry.startsWith(name));
+  } catch {
+    return false;
+  }
 }
 
 /** The statusLine setting, undefined when there is none, "unreadable" for bad JSON. */

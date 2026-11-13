@@ -118,8 +118,8 @@ export declare function estimateRequestTokens(sample: SizeSample | undefined, by
 export declare const ANCHOR_MIN_COVERAGE = 0.75;
 export declare const ANCHOR_MARGIN = 0.1;
 /**
- * An upper bound anchored on Anthropic's own count of an earlier body of the same
- * lane and shape (`sample`), for a body that grew from it: the sample's text tokens
+ * An upper bound anchored on Anthropic's own count of an earlier body (`sample`) that this
+ * one extends (extendsSample, checked by the caller): the sample's text tokens
  * plus ANCHOR_MARGIN, the text added since at the conservative per-model ratio, and
  * every image at its visual tokens. Undefined without a sample that recorded its
  * images, when the body's text shrank (not a growth of the sampled body), or when the
@@ -135,4 +135,12 @@ export declare const ANCHOR_MARGIN = 0.1;
  * cannot vouch for is bounded at the conservative ratio like before.
  */
 export declare function anchoredBound(sample: SizeSample | undefined, bytes: number, images: ImageTotals, model: string | undefined): number | undefined;
+/**
+ * Whether `body` extends the body `sample` measured, on the same model: the sample's
+ * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only
+ * then is the sample's count a count of part of this body (review r1, Codex r1 P1s:
+ * net byte growth admitted swapped content; route and prefix samples survive a model
+ * switch).
+ */
+export declare function extendsSample(sample: SizeSample | undefined, body: Buffer, model: string | undefined): boolean;
 //# sourceMappingURL=request-sizing.d.ts.map

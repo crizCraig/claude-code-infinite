@@ -391,6 +391,8 @@ interface ProxyState {
     activeSubagents: Set<string>;
     /** Heavy request bodies and recent agent lanes per session (lane-activity.ts). */
     laneActivity: LaneActivity;
+    /** The queued heavy-request notice: the lowest priority, any other may replace it. */
+    heavyNotice?: object;
     /**
      * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
      * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its

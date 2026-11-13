@@ -74,6 +74,13 @@ for (const [name, settings, why] of [
   });
 }
 
+test("installed and uninstalled with an older ccc (backups, no saved original): stays off", () => {
+  const { dir, file, paths, options } = setup({ statusLine: OWN });
+  fs.writeFileSync(path.join(dir, "settings.json.ccc-backup-2026-11-12T00-00-00-000Z"), "{}");
+  assert.equal(autoInstallStatusline(paths, options), undefined);
+  assert.deepEqual(read(file).statusLine, OWN);
+});
+
 test("skipped and said when ccc is not on PATH (the status line would print nothing)", () => {
   const { file, paths, options } = setup({ statusLine: OWN });
   const notice = autoInstallStatusline(paths, { ...options, cccOnPath: () => false });

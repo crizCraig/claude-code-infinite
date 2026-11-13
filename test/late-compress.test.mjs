@@ -412,13 +412,11 @@ test('replay: 849k + a 295 KB screenshot, cooldown armed, Count Tokens slow: del
     assert.equal(shot.record.refusal, undefined);
     assert.ok(shot.record.compaction.estimatedTokens < 860_000,
       `the image is 420 tokens, not ~74k (${shot.record.compaction.estimatedTokens})`);
-    const outcomes = shot.record.countTokens.map(c => c.statusClass);
-    assert.ok(outcomes.includes('success') && outcomes.some(o => o === 'timeout' || o === 'deadline'),
-      `the timed-out count was retried (${outcomes})`);
-    // In the cooldown it still compressed: over the window by its uncounted
-    // bound with no prefix to ride, a skip could only have refused it.
-    assert.notEqual(shot.record.routeRecovery?.outcome, 'cooldown');
-    assert.ok(blocking >= 2, `${blocking} compress calls`);
+    // Anchored on the previous turn's reported size (request-sizing.ts anchoredBound),
+    // the screenshot turn fits the window without a count: not uploaded again, not marked
+    // over the window by its uncounted bound, so the cooldown has nothing to refuse.
+    assert.equal(shot.record.countTokens, undefined, JSON.stringify(shot.record.countTokens));
+    assert.equal(shot.record.compaction.uncountedOverWindow, undefined);
     assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
   } finally { h.close(); }
 });

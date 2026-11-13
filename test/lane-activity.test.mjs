@@ -26,13 +26,16 @@ test("heavy-request text names images when they are most of the body", () => {
 test("lane activity: heavy once per session, agents recent for a while", () => {
   let now = 0;
   const lanes = new LaneActivity(() => now);
-  lanes.note("s", "main", { bytes: HEAVY_REQUEST_BYTES - 1, imageBytes: 0 });
+  lanes.seen("s", "main");
+  lanes.sent("s", { bytes: HEAVY_REQUEST_BYTES - 1, imageBytes: 0 });
   assert.equal(lanes.heavyDue("s"), undefined);
-  lanes.note("s", "agent", { bytes: 22_000_000, imageBytes: 21_000_000 });
-  lanes.note("s", "agent", { bytes: 21_000_000, imageBytes: 20_000_000 });
+  assert.equal(lanes.agentRecent("s"), false, "a main-lane request is no agent activity");
+  lanes.seen("s", "agent");
+  lanes.sent("s", { bytes: 22_000_000, imageBytes: 21_000_000 });
+  lanes.sent("s", { bytes: 21_000_000, imageBytes: 20_000_000 });
   assert.deepEqual(lanes.heavyDue("s"), { bytes: 22_000_000, imageBytes: 21_000_000 });
   lanes.markWarned("s");
-  lanes.note("s", "agent", { bytes: 27_000_000, imageBytes: 26_000_000 });
+  lanes.sent("s", { bytes: 27_000_000, imageBytes: 26_000_000 });
   assert.equal(lanes.heavyDue("s"), undefined, "never twice");
   assert.equal(lanes.agentRecent("s"), true);
   assert.equal(lanes.agentRecent("other"), false);
@@ -44,11 +47,7 @@ test("lane activity: heavy once per session, agents recent for a while", () => {
 test("a heavy agent request warns once, on the session's next main turn", async () => {
   const h = await harness({ compress: () => ({ status: 500, body: { detail: "boom" } }) });
   try {
-    // 21 small-dimension JPEGs of 1 MB each: ~21 MB, a few hundred visual tokens.
-    const image = { type: "image", source: { type: "base64", media_type: "image/jpeg",
-      data: jpeg(100, 100, 1_000_000) } };
-    const big = [{ role: "user", content: [{ type: "text", text: "look" },
-      ...Array.from({ length: 21 }, () => image)] }];
+    const big = heavyImages();
     assert.equal(await h.post(big, AGENT), 200);
     await h.armMainTurn("next question");
     assert.equal(await h.post([{ role: "user", content: "next question" }]), 200);
@@ -60,6 +59,27 @@ test("a heavy agent request warns once, on the session's next main turn", async 
     assert.equal(await h.post(big, AGENT), 200);
     assert.equal(await h.post([{ role: "user", content: "another question" }]), 200);
     assert.equal((await h.display()).status, 204, "once per session");
+  } finally {
+    h.close();
+  }
+});
+
+test("the heavy notice is the lowest priority: the slow-retry notice replaces it", async () => {
+  const h = await harness({ compress: () => ({ status: 500, body: { detail: "boom" } }) });
+  try {
+    assert.equal(await h.post(heavyImages(), AGENT), 200);
+    await h.armMainTurn("next question");
+    const messages = followup("h".repeat(1_000_000), "next question");
+    assert.equal(await h.post(messages), 503);
+    assert.equal(await h.post(messages), 503);
+    const text = (await h.display()).body.hookSpecificOutput.displayContent;
+    assert.ok(text.includes("MemTree is slow to answer"), text);
+    assert.ok(!text.includes("Images are making"), text);
+    // Still due: the next turn that has nothing else to say shows it.
+    await h.armMainTurn("third question");
+    assert.equal(await h.post([{ role: "user", content: "third question" }]), 200);
+    const later = (await h.display()).body.hookSpecificOutput.displayContent;
+    assert.ok(later.includes("Images are making each turn"), later);
   } finally {
     h.close();
   }
@@ -81,6 +101,14 @@ test("a refused main turn says an agent's result may be waiting, only after agen
       }
     }
   });
+
+/** 21 small-dimension JPEGs of 1 MB each: ~21 MB, a few hundred visual tokens. */
+function heavyImages() {
+  const image = { type: "image", source: { type: "base64", media_type: "image/jpeg",
+    data: jpeg(100, 100, 1_000_000) } };
+  return [{ role: "user", content: [{ type: "text", text: "look" },
+    ...Array.from({ length: 21 }, () => image)] }];
+}
 
 function jpeg(width, height, chars) {
   const head = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0, 0, 0, 0, 0x03,

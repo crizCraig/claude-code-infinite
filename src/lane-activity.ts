@@ -4,8 +4,9 @@
  * all base64 contact sheets, 97-217 s to first byte on home wifi; when the main lane
  * was then refused, the agent's finished result could not reach the main session):
  *
- * - heavy requests: once per session, when a request body passes HEAVY_REQUEST_BYTES,
- *   say images (or the session's history) make each turn that many MB to upload;
+ * - heavy requests: once per session, when a body sent to Anthropic passes
+ *   HEAVY_REQUEST_BYTES, say images (or the session's history) make each turn that many MB
+ *   to upload;
  * - agent activity: whether an agent lane of the session sent a request recently, so a
  *   main-lane refusal can say a background agent's result may be waiting.
  */
@@ -25,10 +26,14 @@ export class LaneActivity {
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  /** Note a request of the session: its body size and image bytes, and its lane. */
-  note(sessionId: string | undefined, lane: string | undefined, request: HeavyRequest): void {
+  /** Note a request of the session on `lane` (an agent lane counts as recent activity). */
+  seen(sessionId: string | undefined, lane: string | undefined): void {
+    if (sessionId !== undefined && lane === "agent") bounded(this.agentSeen, sessionId, this.now());
+  }
+
+  /** Note what a request of the session uploaded: its body size and image bytes. */
+  sent(sessionId: string | undefined, request: HeavyRequest): void {
     if (sessionId === undefined) return;
-    if (lane === "agent") bounded(this.agentSeen, sessionId, this.now());
     if (request.bytes < HEAVY_REQUEST_BYTES || this.warned.has(sessionId)) return;
     const known = this.heavy.get(sessionId);
     if (!known || request.bytes > known.bytes) bounded(this.heavy, sessionId, request);

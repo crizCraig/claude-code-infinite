@@ -11,6 +11,7 @@ import { bodyImages, imageDimensions, visualTokens } from '../dist/image-tokens.
 import { RequestSizing, anchoredBound, ANCHOR_MARGIN } from '../dist/request-sizing.js';
 import { shouldCountTokens } from '../dist/count-tokens.js';
 import { conservativeBodyTokens } from '../dist/token-estimate.js';
+import { bodyShape, prefixDigest } from '../dist/body-shape.js';
 
 const MODEL = 'claude-opus-5-5';
 const SHEET_BASE64_CHARS = 470_000;
@@ -41,9 +42,9 @@ function segment(marker, payload) {
   return Buffer.concat([header, payload]);
 }
 
-/** A Claude Code-shaped agent body: `images` contact sheets in tool results, assistant
- * turns carrying thinking signatures (base64 that is not an image), and plain text. */
-function agentBody({ images = 46, textChars = 800_000, signatureChars = 800_000, sheet } = {}) {
+/** A Claude Code-shaped agent conversation: `images` contact sheets in tool results,
+ * assistant turns carrying thinking signatures (base64 that is not an image), and text. */
+function agentMessages({ images = 46, textChars = 800_000, signatureChars = 800_000, sheet } = {}) {
   const data = sheet ?? jpeg(1999, 1354);
   const messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(textChars) }] }];
   const perTurn = Math.ceil(signatureChars / Math.max(1, images));
@@ -54,7 +55,28 @@ function agentBody({ images = 46, textChars = 800_000, signatureChars = 800_000,
     messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: [
       { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }] }] });
   }
-  return Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000, messages }));
+  return messages;
+}
+
+function bodyOf(messages, model = MODEL) {
+  return Buffer.from(JSON.stringify({ model, max_tokens: 128_000, messages }));
+}
+
+function agentBody(options) {
+  return bodyOf(agentMessages(options));
+}
+
+/** What the proxy records after Anthropic answers `body` with `tokens` (sizeSampleOf). */
+function sampleOf(body, tokens, model = MODEL) {
+  const shape = bodyShape(body);
+  return { tokens, forwardedBytes: body.length, ...bodyImages(body, model), model,
+    messageCount: shape.messages.length, prefixDigest: prefixDigest(shape, shape.messages.length) };
+}
+
+/** The lane's last two turns: `previous` (counted by Anthropic) and `body`, one round on. */
+function laneTurns() {
+  const messages = agentMessages();
+  return { previous: bodyOf(messages.slice(0, -2)), body: bodyOf(messages), messages };
 }
 
 function fakeCounts() {
@@ -83,23 +105,23 @@ test('a JPEG walk that meets non-base64 characters stops rather than read shifte
   const late = jpeg(1940, 1320, { iccBytes: 200_000 });
   const broken = late.slice(0, 70_000) + '\n' + late.slice(70_000);
   assert.equal(imageDimensions(broken), undefined, 'unreadable: the tier cap applies');
+  // Inside the decoded header window, in a segment the walk skips (Codex r1 P2).
+  const early = late.slice(0, 30_000) + '\n\n\n\n' + late.slice(30_000);
+  assert.equal(imageDimensions(early), undefined);
 });
 
 test('the 2026-11-12 lane: anchored on its last count the bound fits, so no re-upload', async () => {
-  const body = agentBody();
+  const { previous, body } = laneTurns();
   assert.ok(body.length > 20_000_000, `${body.length} bytes`);
   const images = bodyImages(body, MODEL);
   assert.equal(images.imageTokens, 46 * visualTokens(1999, 1354));
   // The plain bound: over the window with max_tokens, though the lane is about half full.
   assert.ok(conservativeBodyTokens(body, MODEL) + 128_000 > 1_000_000,
     `${conservativeBodyTokens(body, MODEL)}: the plain bound is over the window`);
-  // The previous turn of the lane, 1 image and some text smaller, counted by Anthropic.
-  const previous = agentBody({ images: 45, textChars: 790_000, signatureChars: 790_000 });
-  const prevImages = bodyImages(previous, MODEL);
-  const sample = { tokens: 480_000, forwardedBytes: previous.length, ...prevImages };
+  // The previous turn of the lane, one round smaller, counted by Anthropic.
   const counts = fakeCounts();
   const sizing = new RequestSizing(counts, true, MODEL);
-  const candidate = sizing.register(body, 'original', sample);
+  const candidate = sizing.register(body, 'original', sampleOf(previous, 480_000));
   assert.ok(candidate.conservativeTokens + 128_000 <= 1_000_000,
     `${candidate.conservativeTokens}: the anchored bound fits`);
   assert.equal(sizing.boundFits(candidate, WINDOW), true);
@@ -110,15 +132,42 @@ test('the 2026-11-12 lane: anchored on its last count the bound fits, so no re-u
 });
 
 test('near the window the anchored bound no longer fits and the body is counted', async () => {
-  const body = agentBody();
-  const previous = agentBody({ images: 45, textChars: 790_000, signatureChars: 790_000 });
-  const sample = { tokens: 820_000, forwardedBytes: previous.length, ...bodyImages(previous, MODEL) };
+  const { previous, body } = laneTurns();
   const counts = fakeCounts();
   const sizing = new RequestSizing(counts, true, MODEL);
-  const candidate = sizing.register(body, 'original', sample);
+  const candidate = sizing.register(body, 'original', sampleOf(previous, 820_000));
   assert.equal(sizing.boundFits(candidate, WINDOW), false);
   await sizing.countIfOverBound(candidate, WINDOW);
   assert.equal(counts.calls.length, 1, 'counted once when it may not fit');
+});
+
+test('no anchor for a body that does not extend the sampled one, or on another model', () => {
+  const { previous, messages } = laneTurns();
+  const sample = sampleOf(previous, 480_000);
+  const plain = (body) => conservativeBodyTokens(body, MODEL);
+  const anchored = (body, model = MODEL) =>
+    new RequestSizing(fakeCounts(), true, model).register(body, 'original', sample).conservativeTokens;
+  // Claude Code drops the old thinking signatures (nearly free) and adds as many bytes of
+  // dense tool output: the byte totals grow, the tokens grow far more (Codex r1 P1).
+  const swapped = messages.map((m) => m.role !== 'assistant' ? m
+    : { ...m, content: m.content.filter((block) => block.type !== 'thinking') });
+  swapped.push({ role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: '{"k":1}'.repeat(130_000) }] });
+  const swappedBody = bodyOf(swapped);
+  assert.equal(anchored(swappedBody), plain(swappedBody), 'the plain bound, not the anchor');
+  // An earlier message edited in place (same length): no anchor either.
+  const edited = structuredClone(messages);
+  edited[0].content[0].text = 'y'.repeat(800_000);
+  assert.equal(anchored(bodyOf(edited)), plain(bodyOf(edited)));
+  // The same body on another tokenizer (a route or prefix sample survives /model).
+  const other = bodyOf(messages, 'claude-sonnet-4-5');
+  assert.equal(new RequestSizing(fakeCounts(), true, 'claude-sonnet-4-5')
+    .register(other, 'original', sample).conservativeTokens,
+  conservativeBodyTokens(other, 'claude-sonnet-4-5'));
+  // Moved cache_control markers are not an edit.
+  const marked = structuredClone(messages);
+  marked.at(-3).content[0].cache_control = { type: 'ephemeral' };
+  assert.ok(anchored(bodyOf(marked)) < plain(bodyOf(marked)), 'still anchored');
 });
 
 test('the anchor applies only to a grown body its sample mostly measured', () => {
