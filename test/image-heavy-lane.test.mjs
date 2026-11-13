@@ -215,6 +215,19 @@ test('cache_control inside a tool input is data, not a moved marker (Codex r2 P1
   assert.equal(extendsSample(sample, changed, MODEL), false);
 });
 
+test('an image the byte scan misses (escaped "type") gets no anchor (Codex r3 P1)', () => {
+  const { previous, messages } = laneTurns();
+  const sample = sampleOf(previous, 480_000);
+  const plainBody = bodyOf(messages);
+  const escaped = Buffer.from(plainBody.toString('utf-8')
+    .replaceAll('"type":"image"', '"type":"\\u0069mage"'));
+  const sizing = new RequestSizing(fakeCounts(), true, MODEL);
+  assert.ok(sizing.register(plainBody, 'original', sample).conservativeTokens <
+    conservativeBodyTokens(plainBody, MODEL), 'anchored when the images are seen');
+  assert.equal(sizing.register(escaped, 'original', sample).conservativeTokens,
+    conservativeBodyTokens(escaped, MODEL), 'the plain bound (its images read as text)');
+});
+
 test('a body that asks Anthropic to edit its input never anchors (review r2 P3)', () => {
   const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
   const edited = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,

@@ -313,6 +313,9 @@ export function anchoredBound(
 ): number | undefined {
   if (!plausibleSample(sample) || sample.imageBytes === undefined ||
       sample.imageTokens === undefined || sample.messageCount === undefined) return undefined;
+  // Images the shape left out of the text must be the images charged below; a body whose
+  // JSON hides an image from the byte scan (an escaped "type") gets no anchor (Codex r3 P1).
+  if (shape.imageChars.reduce((sum, chars) => sum + chars, 0) !== images.imageBytes) return undefined;
   const sampled = textBytes(shape, 0, sample.messageCount);
   const appended = textBytes(shape, sample.messageCount);
   if (sampled < ANCHOR_MIN_COVERAGE * (sampled + appended)) return undefined;
