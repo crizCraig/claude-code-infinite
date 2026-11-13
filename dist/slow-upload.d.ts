@@ -31,7 +31,10 @@ export declare class SlowUploads {
     budgetMs(sessionId: string | undefined, bytes: number, budgetMs: number): number;
     /** Whether the session's next compress of `bytes` gets the longer budget. */
     extended(sessionId: string | undefined, bytes: number): boolean;
-    /** Note how a long-budget compress of `bytes` ended; true when it was a slow upload. */
+    /**
+     * Note how a compress of `bytes` ended (a timeout only counts on an uncapped long budget,
+     * which the caller checks); true when it was a slow upload.
+     */
     settled(sessionId: string | undefined, bytes: number, outcome: "ok" | "timeout" | "other"): boolean;
 }
 //# sourceMappingURL=slow-upload.d.ts.map

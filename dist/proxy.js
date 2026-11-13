@@ -4692,7 +4692,7 @@ async function runBlockingCompressionOnce(args) {
     // A carried call has not failed: it is still running (its answer reports its health).
     const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
     // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
-    // Any answer ends a slow-upload episode (Codex r3 P2).
+    // A large upload's live answer (any budget, not a cache hit) ends a slow-upload episode.
     if (result !== null && !cached)
         state.slowUploads.settled(args.sessionId, rec.requestBytes, "ok");
     const uploadTimeout = result === null && args.longBudget === true &&

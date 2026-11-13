@@ -105,7 +105,8 @@ export function installStatusline(paths, platform = process.platform) {
         return { ok: false, message: `${paths.settings}: statusLine is not a command; left unchanged.` };
     }
     const failed = attempt(() => {
-        writeJson(paths.saved, { settings: paths.settings, resolved: resolvedPath(paths.settings),
+        writeJson(paths.saved, { settings: path.resolve(paths.settings),
+            resolved: resolvedPath(paths.settings),
             statusLine: current ?? null });
         backup(paths.settings);
         // Its other options (padding, refreshInterval, hideVimModeIndicator, ...) stay.
@@ -232,7 +233,9 @@ export function runWrapped(command, input, timeoutMs = WRAPPED_TIMEOUT_MS) {
         }, timeoutMs);
         child.stdout.on("data", (chunk) => chunks.push(chunk));
         child.on("error", () => finish(""));
-        child.on("close", () => finish(Buffer.concat(chunks).toString("utf-8").replace(/[\r\n]+$/, "")));
+        // As Claude Code does: a failed or killed command shows nothing (the link still shows).
+        child.on("close", (code, signal) => finish(code === 0 && !signal
+            ? Buffer.concat(chunks).toString("utf-8").replace(/[\r\n]+$/, "") : ""));
         child.stdin.on("error", () => { });
         child.stdin.end(input);
     });

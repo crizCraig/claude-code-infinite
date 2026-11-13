@@ -46,7 +46,10 @@ export class SlowUploads {
     return at !== undefined && this.now() - at < SLOW_UPLOAD_MEMORY_MS;
   }
 
-  /** Note how a long-budget compress of `bytes` ended; true when it was a slow upload. */
+  /**
+   * Note how a compress of `bytes` ended (a timeout only counts on an uncapped long budget,
+   * which the caller checks); true when it was a slow upload.
+   */
   settled(
     sessionId: string | undefined, bytes: number, outcome: "ok" | "timeout" | "other"
   ): boolean {

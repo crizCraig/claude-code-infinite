@@ -294,3 +294,9 @@ test("the saved original is found after settings.json became a symlink", { skip:
   assert.equal(uninstallStatusline(tmpSaved).ok, true);
   assert.equal(JSON.parse(fs.readFileSync(moved, "utf-8")).statusLine.command, OWN_COMMAND);
 });
+
+test("a wrapped command that fails or is killed shows nothing of its own", { skip: process.platform === "win32" }, async () => {
+  assert.equal(await runWrapped("printf ok", "{}"), "ok");
+  assert.equal(await runWrapped("printf partial; exit 1", "{}"), "");
+  assert.equal(await runWrapped("printf partial; kill -TERM $$", "{}"), "");
+});
