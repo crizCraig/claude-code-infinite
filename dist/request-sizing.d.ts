@@ -38,6 +38,8 @@ export interface RequestCandidate {
     /** Per-model conservative bound (token-estimate.ts), tightened by an anchored
      * sample (anchoredBound): what delivery may rely on without an exact count. */
     readonly conservativeTokens: number;
+    /** The bound came from anchoredBound (logged as CompactionRecord.anchoredBound). */
+    readonly anchored?: true;
 }
 export declare class RequestSizing {
     private readonly counts;

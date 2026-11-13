@@ -271,6 +271,28 @@ test('documents (URL, file, content, inline PDF), even in a tool result: no anch
   }
 });
 
+test('remote MCP servers or server tools in the request: no anchor (Codex r7 P1)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  for (const extra of [
+    { mcp_servers: [{ type: 'url', url: 'https://mcp.example.com', name: 'x' }] },
+    { tools: [{ type: 'mcp_toolset', mcp_server_name: 'x' }] },
+    { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+    { some_future_field: true },
+  ]) {
+    const body = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+      ...extra, messages: list }));
+    const sample = sampleOf(body(messages.slice(0, -2)), 100_000);
+    assert.equal(new RequestSizing(fakeCounts(), true, MODEL)
+      .register(body(messages), 'original', sample).conservativeTokens,
+    conservativeBodyTokens(body(messages), MODEL), JSON.stringify(extra));
+  }
+  const custom = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    tools: [{ name: 'Read', input_schema: { type: 'object' } }], messages: list }));
+  const sample = sampleOf(custom(messages.slice(0, -2)), 100_000);
+  assert.ok(new RequestSizing(fakeCounts(), true, MODEL).register(custom(messages), 'original',
+    sample).conservativeTokens < conservativeBodyTokens(custom(messages), MODEL), 'custom tools anchor');
+});
+
 test('tool references: counted in the prefix they anchor; appended they do not (expanded)', () => {
   const ref = (name) => [{ role: 'assistant', content: [{ type: 'tool_use', id: name,
     name: 'ToolSearch', input: {} }] }, { role: 'user', content: [{ type: 'tool_result',
@@ -301,6 +323,12 @@ test('a body that asks Anthropic to edit its input never anchors (review r2 P3)'
     context_management: { edits: [{ type: 'clear_tool_uses_20250919' }] }, messages: list }));
   const sample = sampleOf(edited(messages.slice(0, -2)), 200_000);
   assert.equal(extendsSample(sample, edited(messages), MODEL), false);
+  // Claude Code's own no-op edit (sent whenever thinking is on) still anchors.
+  const noOp = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    messages: list }));
+  assert.equal(extendsSample(sampleOf(noOp(messages.slice(0, -2)), 200_000), noOp(messages), MODEL),
+    true);
 });
 
 test('adding a contact sheet is not a jump of new content: its tokens are visual', () => {

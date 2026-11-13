@@ -4125,6 +4125,8 @@ const exactSizedRecords = new WeakSet();
  * it is over the window for planning and takes the normal gated compression.
  */
 function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) {
+    if (candidate.anchored)
+        record.anchoredBound = true;
     if (sizing.isExact(candidate)) {
         exactSizedRecords.add(record);
         return;

@@ -5668,6 +5668,7 @@ function noteUncountedBound(
   record: CompactionRecord, sizing: RequestSizing, candidate: RequestCandidate,
   body: Record<string, any>, modelContextLimit: number,
 ): void {
+  if (candidate.anchored) record.anchoredBound = true;
   if (sizing.isExact(candidate)) {
     exactSizedRecords.add(record);
     return;

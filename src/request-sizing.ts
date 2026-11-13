@@ -47,6 +47,8 @@ export interface RequestCandidate {
   /** Per-model conservative bound (token-estimate.ts), tightened by an anchored
    * sample (anchoredBound): what delivery may rely on without an exact count. */
   readonly conservativeTokens: number;
+  /** The bound came from anchoredBound (logged as CompactionRecord.anchoredBound). */
+  readonly anchored?: true;
 }
 
 export class RequestSizing {
@@ -75,7 +77,7 @@ export class RequestSizing {
     const candidate = Object.freeze({ key, body: owned, kind, sample: snapshot,
       estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length, images),
         conservativeTokens)),
-      conservativeTokens });
+      conservativeTokens, ...(conservativeTokens < plain ? { anchored: true as const } : {}) });
     this.candidates.set(key, candidate);
     return candidate;
   }

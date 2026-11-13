@@ -17,9 +17,10 @@ export interface BodyShape {
     /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
     imageDims: Array<[number, number] | undefined>;
     /**
-     * The messages hold a block the anchor cannot bound (MESSAGE_BLOCKS): a document, a URL
-     * or file image, search results, server tool blocks, an upload. Such a body never
-     * anchors a size (Codex r4-r6 P1s).
+     * The body holds something the anchor cannot bound: a message block outside
+     * MESSAGE_BLOCKS (a document, a URL or file image, search results, server tool blocks, an
+     * upload), a request field outside FRAME_FIELDS (mcp_servers) or a tool that is not a
+     * custom one. Such a body never anchors a size (Codex r4-r7 P1s).
      */
     unanchorable: boolean;
     /**

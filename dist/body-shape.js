@@ -68,8 +68,8 @@ function computeShape(body) {
         return null;
     const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
         messages: [], sizes: [], imageChars: [],
-        serverEdits: frame.context_management !== undefined || frame.compaction !== undefined,
-        imageDims: [], unanchorable: false, lastExpanding: -1 };
+        serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
+        imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1 };
     for (const message of messages) {
         const text = JSON.stringify(canonicalMessage(message)) ?? "";
         shape.messages.push(hash(text));
@@ -151,6 +151,43 @@ function blockImageChars(blocks, shape, nested = false) {
  * search results; server tool blocks; uploads) disables the anchor, so its size is the
  * plain bound or a count as before (Codex r4-r6 P1s).
  */
+/**
+ * Request fields whose cost is in the body (or none): anything else, such as mcp_servers
+ * (tool definitions fetched remotely, Codex r7 P1), disables the anchor. compaction, and a
+ * context_management that edits anything, are refused too (serverEdits, noOpEdits).
+ */
+const FRAME_FIELDS = new Set(["model", "max_tokens", "stream", "system", "tools", "tool_choice",
+    "metadata", "thinking", "temperature", "top_p", "top_k", "stop_sequences", "output_config",
+    "output_format", "speed", "service_tier", "cache_control", "context_management"]);
+/**
+ * Whether `context_management` edits nothing: absent, or only Claude Code's
+ * `clear_thinking_20251015` with `keep: "all"`, which it sends whenever thinking is on.
+ * Any other edit (clearing tool uses, or thinking past some turns) may make a count
+ * describe edited input (review r2 P3).
+ */
+function noOpEdits(management) {
+    if (management === undefined)
+        return true;
+    const edits = management?.edits;
+    return Array.isArray(edits) && Object.keys(management).every((k) => k === "edits") &&
+        edits.every((edit) => {
+            const e = edit;
+            return !!e && e.type === "clear_thinking_20251015" && e.keep === "all" &&
+                Object.keys(e).every((k) => k === "type" || k === "keep");
+        });
+}
+/** Whether the frame's cost is all in the body: known fields, custom tools only. */
+function frameAnchorable(frame) {
+    if (!Object.keys(frame).every((key) => FRAME_FIELDS.has(key)))
+        return false;
+    const tools = frame.tools;
+    if (tools === undefined)
+        return true;
+    return Array.isArray(tools) && tools.every((tool) => {
+        const type = tool?.type;
+        return tool !== null && typeof tool === "object" && (type === undefined || type === "custom");
+    });
+}
 const MESSAGE_BLOCKS = new Set(["text", "tool_use", "tool_result", "thinking",
     "redacted_thinking", "tool_addition", "tool_reference"]);
 const NESTED_BLOCKS = new Set(["text", "tool_reference"]);

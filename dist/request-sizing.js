@@ -40,7 +40,7 @@ export class RequestSizing {
         rememberShape(owned, knownShape(body));
         const candidate = Object.freeze({ key, body: owned, kind, sample: snapshot,
             estimate: Object.freeze(capByteEstimate(estimateRequestTokens(snapshot, body.length, images), conservativeTokens)),
-            conservativeTokens });
+            conservativeTokens, ...(conservativeTokens < plain ? { anchored: true } : {}) });
         this.candidates.set(key, candidate);
         return candidate;
     }

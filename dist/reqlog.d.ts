@@ -493,6 +493,9 @@ export interface CompactionRecord {
      * the normal gated path.
      */
     uncountedOverWindow?: true;
+    /** The planned candidate's conservative bound was anchored on an earlier count of the
+     * body it extends (request-sizing.ts anchoredBound), not the plain bytes bound. */
+    anchoredBound?: true;
     /** Set when the turn compressed (or tried to) for one of these reasons. */
     reason?: RecompressReason;
     /** For "prefix-mismatch": which check failed. */
