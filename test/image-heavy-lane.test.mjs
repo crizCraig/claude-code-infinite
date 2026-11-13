@@ -271,6 +271,32 @@ test('documents (URL, file, content, inline PDF), even in a tool result: no anch
   }
 });
 
+test('a Claude Code 2.1.32x frame (auto mode, advisor) anchors, diagnostics changing per turn (review r3 P1)', () => {
+  const messages = agentMessages();
+  const frame = (previous) => ({ model: MODEL, max_tokens: 128_000, stream: true,
+    system: [{ type: 'text', text: 'You are a Claude agent.', cache_control: { type: 'ephemeral' } }],
+    tools: [{ name: 'Read', description: 'Read a file', input_schema: { type: 'object' } },
+      { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5-5' }],
+    tool_choice: { type: 'auto' }, metadata: { user_id: 'u' },
+    safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }],
+    thinking: { type: 'adaptive' }, output_config: { effort: 'high' },
+    context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+    diagnostics: { previous_message_id: previous } });
+  const body = (list, previous) => Buffer.from(JSON.stringify({ ...frame(previous), messages: list }));
+  const sample = sampleOf(body(messages.slice(0, -2), 'msg_1'), 480_000);
+  const next = body(messages, 'msg_2');
+  const candidate = new RequestSizing(fakeCounts(), true, MODEL).register(next, 'original', sample);
+  assert.equal(candidate.anchored, true);
+  assert.ok(candidate.conservativeTokens + 128_000 <= 1_000_000, `${candidate.conservativeTokens}`);
+  // Safeguards changed since the sample (say, the cwd): no longer the counted body.
+  const moved = Buffer.from(JSON.stringify({ ...frame('msg_2'), safeguards: [{
+    type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'default' } }],
+    messages }));
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(moved, 'original', sample)
+    .anchored, undefined);
+});
+
 test('remote MCP servers or server tools in the request: no anchor (Codex r7 P1)', () => {
   const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
   for (const extra of [

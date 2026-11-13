@@ -83,10 +83,13 @@ function computeShape(body) {
 function hash(text) {
     return createHash("sha256").update(text).digest("hex");
 }
-/** The frame without cache_control at the top level, on system blocks and on tools. */
+/** The frame without cache_control (top level, system blocks, tools) and diagnostics. */
 function canonicalFrame(frame) {
     const rest = { ...frame };
     delete rest.cache_control;
+    // Claude Code's cache-diagnosis metadata names the previous message id: it changes every
+    // turn and costs no prompt tokens (review r3 P1).
+    delete rest.diagnostics;
     if (Array.isArray(rest.system))
         rest.system = rest.system.map(withoutMarker);
     if (Array.isArray(rest.tools))
@@ -155,10 +158,17 @@ function blockImageChars(blocks, shape, nested = false) {
  * Request fields whose cost is in the body (or none): anything else, such as mcp_servers
  * (tool definitions fetched remotely, Codex r7 P1), disables the anchor. compaction, and a
  * context_management that edits anything, are refused too (serverEdits, noOpEdits).
+ * Fields stay in the frame hash, so whatever they cost was in the sample's count too and a
+ * change to them breaks the lineage: auto mode's `safeguards` (Claude Code sends it in auto
+ * mode) is allowed on that basis. Claude Code features that turn the anchor off (safe, just
+ * no anchor; a request log without compaction.anchoredBound): message `thread`s,
+ * `program_use_case_id`/`fallbacks`, tool-result clearing after idle, an advisor call's
+ * result blocks in the messages.
  */
 const FRAME_FIELDS = new Set(["model", "max_tokens", "stream", "system", "tools", "tool_choice",
     "metadata", "thinking", "temperature", "top_p", "top_k", "stop_sequences", "output_config",
-    "output_format", "speed", "service_tier", "cache_control", "context_management"]);
+    "output_format", "speed", "service_tier", "cache_control", "context_management",
+    "diagnostics", "safeguards"]);
 /**
  * Whether `context_management` edits nothing: absent, or only Claude Code's
  * `clear_thinking_20251015` with `keep: "all"`, which it sends whenever thinking is on.
@@ -176,7 +186,13 @@ function noOpEdits(management) {
                 Object.keys(e).every((k) => k === "type" || k === "keep");
         });
 }
-/** Whether the frame's cost is all in the body: known fields, custom tools only. */
+/**
+ * Server tools whose definition is fixed by their versioned type (no remote content): the
+ * hash covers them like any field. Claude Code 2.1.32x adds an advisor tool to every request
+ * (review r3); its results arrive as message blocks, which MESSAGE_BLOCKS refuses.
+ */
+const VERSIONED_TOOL = /^advisor_\d{8}$/;
+/** Whether the frame's cost is all in the body: known fields, custom or versioned tools. */
 function frameAnchorable(frame) {
     if (!Object.keys(frame).every((key) => FRAME_FIELDS.has(key)))
         return false;
@@ -185,7 +201,8 @@ function frameAnchorable(frame) {
         return true;
     return Array.isArray(tools) && tools.every((tool) => {
         const type = tool?.type;
-        return tool !== null && typeof tool === "object" && (type === undefined || type === "custom");
+        return tool !== null && typeof tool === "object" && (type === undefined ||
+            type === "custom" || (typeof type === "string" && VERSIONED_TOOL.test(type)));
     });
 }
 const MESSAGE_BLOCKS = new Set(["text", "tool_use", "tool_result", "thinking",
