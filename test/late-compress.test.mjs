@@ -380,7 +380,7 @@ function addScreenshot(conv, id, data) {
     { type: 'image', source: { type: 'base64', media_type: 'image/png', data } }] }] });
 }
 
-test('replay: 849k + a 295 KB screenshot, cooldown armed, Count Tokens slow: delivered, not refused', async () => {
+test('replay: 849k + a 295 KB screenshot, cooldown armed: anchored, delivered, not refused', async () => {
   // The coordinator's staging 400 (agent-bus image-overflow-400/REPORT.md):
   // ~850k real, the 574x551 PNG (420 tokens) estimated as ~74k of text, the
   // count timed out, and the tool-recovery cooldown (armed by compress
@@ -417,6 +417,53 @@ test('replay: 849k + a 295 KB screenshot, cooldown armed, Count Tokens slow: del
     // over the window by its uncounted bound, so the cooldown has nothing to refuse.
     assert.equal(shot.record.countTokens, undefined, JSON.stringify(shot.record.countTokens));
     assert.equal(shot.record.compaction.uncountedOverWindow, undefined);
+    assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
+  } finally { h.close(); }
+});
+
+test('replay, lineage broken: 849k + a screenshot, cooldown armed, count slow: still compressed', async () => {
+  // As above, but Claude Code edited an earlier message before the screenshot turn, so
+  // no earlier count anchors its size (extendsSample): the uncounted bound is over the
+  // window and the cooldown must still compress it (src/proxy.ts uncountedOverWindowOnly).
+  // The coordinator's staging 400 (agent-bus image-overflow-400/REPORT.md):
+  // ~850k real, the 574x551 PNG (420 tokens) estimated as ~74k of text, the
+  // count timed out, and the tool-recovery cooldown (armed by compress
+  // timeouts while MemTree was healthy) skipped compression.
+  let blocking = 0;
+  let hung = 0;
+  const h = await harness({ compressTimeoutMs: 200,
+    countHangs: body => JSON.stringify(body).includes('"image"') && hung++ === 0,
+    compress: body => body.prepare ? { status: 500, body: { error: 'prepare down' } }
+      : ++blocking === 1 ? { delayMs: 20_000, body: compressedReply(480_000) }
+        : { body: compressedReply(480_000) } });
+  try {
+    const conv = session(845_000);
+    assert.equal((await h.post(conv)).status, 200);
+    await growTo(h, conv, 849_000);
+    // A human turn's compress times out (MemTree slow to reply): the cooldown arms.
+    await h.command('/memtree-compact');
+    conv.push({ role: 'assistant', content: 'Done.' },
+      { role: 'user', content: 'Now look at the screenshot.' });
+    const human = await h.post(conv);
+    assert.equal(human.status, 200);
+    assert.equal(human.record.compress.timedOut, true);
+    assert.ok(human.record.compress.ms > 200 + 3_000,
+      `the budget grew with the upload (${human.record.compress.ms}ms)`);
+
+    conv[0] = { role: 'user', content: `${conv[0].content} (edited)` };
+    addScreenshot(conv, 'shot', screenshot(574, 551, 295_000));
+    const shot = await h.post(conv);
+    assert.equal(shot.status, 200, 'delivered, not refused');
+    assert.equal(shot.record.refusal, undefined);
+    assert.ok(shot.record.compaction.estimatedTokens < 860_000,
+      `the image is 420 tokens, not ~74k (${shot.record.compaction.estimatedTokens})`);
+    const outcomes = shot.record.countTokens.map(c => c.statusClass);
+    assert.ok(outcomes.includes('success') && outcomes.some(o => o === 'timeout' || o === 'deadline'),
+      `the timed-out count was retried (${outcomes})`);
+    // In the cooldown it still compressed: over the window by its uncounted
+    // bound with no prefix to ride, a skip could only have refused it.
+    assert.notEqual(shot.record.routeRecovery?.outcome, 'cooldown');
+    assert.ok(blocking >= 2, `${blocking} compress calls`);
     assert.ok(tokensOf(h.forwards.at(-1)) <= 960_000, `${tokensOf(h.forwards.at(-1))} sent`);
   } finally { h.close(); }
 });

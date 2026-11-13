@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { bodyImages, imageDimensions, visualTokens } from '../dist/image-tokens.js';
-import { RequestSizing, anchoredBound, ANCHOR_MARGIN } from '../dist/request-sizing.js';
+import { RequestSizing, anchoredBound, extendsSample, ANCHOR_MARGIN } from '../dist/request-sizing.js';
 import { shouldCountTokens } from '../dist/count-tokens.js';
 import { conservativeBodyTokens } from '../dist/token-estimate.js';
 import { bodyShape, prefixDigest } from '../dist/body-shape.js';
@@ -170,19 +170,57 @@ test('no anchor for a body that does not extend the sampled one, or on another m
   assert.ok(anchored(bodyOf(marked)) < plain(bodyOf(marked)), 'still anchored');
 });
 
-test('the anchor applies only to a grown body its sample mostly measured', () => {
-  const images = { imageBytes: 1_000_000, imageTokens: 3_000 };
-  const sample = { tokens: 103_000, forwardedBytes: 1_400_000, imageBytes: 1_000_000,
-    imageTokens: 3_000 };
-  // 400 KB of text measured at 100k; 100 KB more is bounded at 1.9 bytes per token.
-  assert.equal(anchoredBound(sample, 1_500_000, images, MODEL),
-    Math.ceil(100_000 * (1 + ANCHOR_MARGIN)) + Math.ceil(100_000 / 1.9) + 3_000);
-  assert.equal(anchoredBound(sample, 1_300_000, images, MODEL), undefined, 'text shrank');
-  assert.equal(anchoredBound(sample, 1_000_000 + 600_000, images, MODEL), undefined,
-    'the sample measured under 75% of the text');
-  assert.equal(anchoredBound({ tokens: 103_000, forwardedBytes: 1_400_000 }, 1_500_000, images,
-    MODEL), undefined, 'a sample without its images cannot anchor');
-  assert.equal(anchoredBound(undefined, 1_500_000, images, MODEL), undefined);
+test('the anchor sizes appended messages by their own canonical bytes, under 75% coverage none', () => {
+  const images = { imageBytes: 0, imageTokens: 0 };
+  const shape = { frame: 'f', messages: ['a', 'b', 'c'], sizes: [400_000, 50_000, 50_000],
+    imageChars: [0, 0, 0], serverEdits: false };
+  const sample = { tokens: 100_000, forwardedBytes: 450_000, imageBytes: 0, imageTokens: 0,
+    messageCount: 2 };
+  assert.equal(anchoredBound(sample, shape, images, MODEL),
+    Math.ceil(100_000 * (1 + ANCHOR_MARGIN)) + Math.ceil(50_000 / 1.9));
+  assert.equal(anchoredBound({ ...sample, messageCount: 1 },
+    { ...shape, sizes: [400_000, 100_000, 100_000] }, images, MODEL), undefined,
+  'the sample measured under 75% of the text');
+  assert.equal(anchoredBound({ tokens: 100_000, forwardedBytes: 450_000, messageCount: 2 }, shape,
+    images, MODEL), undefined, 'a sample without its images cannot anchor');
+  assert.equal(anchoredBound(undefined, shape, images, MODEL), undefined);
+});
+
+test('a re-encoded prefix cannot hide appended content (Codex r2 P1)', () => {
+  // The sampled body wrote its text as \u escapes (6 bytes a character); the next one
+  // writes the same text literally and appends ~0.9 MB of dense text: fewer bytes in all.
+  const text = 'é'.repeat(1_500_000);
+  const escaped = Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000, messages: [
+    { role: 'user', content: [{ type: 'text', text }] }] }).replace(/é/g, '\\u00e9'));
+  const sample = sampleOf(escaped, 200_000);
+  const grown = bodyOf([{ role: 'user', content: [{ type: 'text', text }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: '{"k":1}'.repeat(100_000) }] }]);
+  assert.equal(extendsSample(sample, grown, MODEL), true, 'the same prefix, re-encoded');
+  const bound = new RequestSizing(fakeCounts(), true, MODEL).register(grown, 'original', sample)
+    .conservativeTokens;
+  assert.ok(grown.length < escaped.length, 'the raw bytes shrank');
+  assert.ok(bound >= 220_000 + Math.ceil(900_000 / 1.9), `${bound}: the appended text is charged in full`);
+  assert.ok(bound < conservativeBodyTokens(grown, MODEL), 'and the anchor applied');
+});
+
+test('cache_control inside a tool input is data, not a moved marker (Codex r2 P1)', () => {
+  const input = (value) => [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(300_000) }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Write',
+      input: { cache_control: value } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] }];
+  const sample = sampleOf(bodyOf(input('a'.repeat(2_400_000))), 300_000);
+  const changed = bodyOf([...input('{"z":9}'.repeat(342_857)),
+    { role: 'assistant', content: [{ type: 'text', text: 'done' }] }]);
+  assert.equal(extendsSample(sample, changed, MODEL), false);
+});
+
+test('a body that asks Anthropic to edit its input never anchors (review r2 P3)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  const edited = (list) => Buffer.from(JSON.stringify({ model: MODEL, max_tokens: 128_000,
+    context_management: { edits: [{ type: 'clear_tool_uses_20250919' }] }, messages: list }));
+  const sample = sampleOf(edited(messages.slice(0, -2)), 200_000);
+  assert.equal(extendsSample(sample, edited(messages), MODEL), false);
 });
 
 test('adding a contact sheet is not a jump of new content: its tokens are visual', () => {

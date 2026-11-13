@@ -1,10 +1,19 @@
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
 export declare const SHAPE_MIN_BYTES: number;
 export interface BodyShape {
-    /** Hash of the body without `messages` (system, tools, thinking, ...; cache_control out). */
+    /** Hash of the body without `messages` (system, tools, thinking, ...). */
     frame: string;
     /** One hash per message, in order. */
     messages: string[];
+    /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
+    sizes: number[];
+    /** Each message's inline image base64 characters (within its size). */
+    imageChars: number[];
+    /**
+     * The body asks Anthropic to edit its input (context_management, compaction): a count or
+     * usage may describe the edited input, so it never anchors a size (review r2 P3).
+     */
+    serverEdits: boolean;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
 export declare function bodyShape(body: Buffer): BodyShape | undefined;
@@ -14,4 +23,6 @@ export declare function knownShape(body: Buffer): BodyShape | undefined;
 export declare function rememberShape(body: Buffer, shape: BodyShape | undefined): void;
 /** Digest of the frame and the first `count` messages; undefined past the end. */
 export declare function prefixDigest(shape: BodyShape, count: number): string | undefined;
+/** Canonical text bytes (images left out) of messages [from, to). */
+export declare function textBytes(shape: BodyShape, from: number, to?: number): number;
 //# sourceMappingURL=body-shape.d.ts.map

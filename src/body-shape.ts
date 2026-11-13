@@ -6,9 +6,13 @@
  * thinking signatures (base64, nearly free) while adding as many bytes of dense tool output
  * keeps the totals and changes the tokens.
  *
- * Each message is hashed on its own (cache_control markers left out: Claude Code moves them
- * to the newest messages every turn), and the prefix digest is the hash of the first
- * `count` message hashes plus the hash of everything outside `messages`.
+ * Each message is hashed on its own in a canonical form: JSON.stringify of the message with
+ * the cache_control markers Claude Code moves every turn removed, only where the API puts
+ * them (a content block, a tool_result's inner block; in the frame, a system block, a tool,
+ * the top level), never inside tool inputs or schemas (Codex r2 P1). The canonical length
+ * and image characters of each message are kept too, so what was appended is sized from its
+ * own canonical bytes, not from a raw byte difference a re-encoded prefix could hide
+ * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
 
@@ -16,10 +20,19 @@ import { createHash } from "node:crypto";
 export const SHAPE_MIN_BYTES = 256 * 1024;
 
 export interface BodyShape {
-  /** Hash of the body without `messages` (system, tools, thinking, ...; cache_control out). */
+  /** Hash of the body without `messages` (system, tools, thinking, ...). */
   frame: string;
   /** One hash per message, in order. */
   messages: string[];
+  /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
+  sizes: number[];
+  /** Each message's inline image base64 characters (within its size). */
+  imageChars: number[];
+  /**
+   * The body asks Anthropic to edit its input (context_management, compaction): a count or
+   * usage may describe the edited input, so it never anchors a size (review r2 P3).
+   */
+  serverEdits: boolean;
 }
 
 const shapes = new WeakMap<Buffer, BodyShape | null>();
@@ -49,6 +62,15 @@ export function prefixDigest(shape: BodyShape, count: number): string | undefine
   return hash.digest("hex");
 }
 
+/** Canonical text bytes (images left out) of messages [from, to). */
+export function textBytes(shape: BodyShape, from: number, to = shape.messages.length): number {
+  let total = 0;
+  for (let i = Math.max(0, from); i < Math.min(to, shape.sizes.length); i++) {
+    total += Math.max(0, shape.sizes[i] - shape.imageChars[i]);
+  }
+  return total;
+}
+
 function computeShape(body: Buffer): BodyShape | null {
   let parsed: unknown;
   try {
@@ -59,13 +81,68 @@ function computeShape(body: Buffer): BodyShape | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const { messages, ...frame } = parsed as Record<string, unknown>;
   if (!Array.isArray(messages)) return null;
-  return { frame: hashOf(frame), messages: messages.map(hashOf) };
+  const shape: BodyShape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
+    messages: [], sizes: [], imageChars: [],
+    serverEdits: frame.context_management !== undefined || frame.compaction !== undefined };
+  for (const message of messages) {
+    const text = JSON.stringify(canonicalMessage(message)) ?? "";
+    shape.messages.push(hash(text));
+    shape.sizes.push(Buffer.byteLength(text, "utf-8"));
+    shape.imageChars.push(imageCharsOf(message));
+  }
+  return shape;
 }
 
-function hashOf(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value, withoutCacheControl) ?? "").digest("hex");
+function hash(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
-function withoutCacheControl(key: string, value: unknown): unknown {
-  return key === "cache_control" ? undefined : value;
+/** The frame without cache_control at the top level, on system blocks and on tools. */
+function canonicalFrame(frame: Record<string, unknown>): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...frame };
+  delete rest.cache_control;
+  if (Array.isArray(rest.system)) rest.system = rest.system.map(withoutMarker);
+  if (Array.isArray(rest.tools)) rest.tools = rest.tools.map(withoutMarker);
+  return rest;
+}
+
+/** A message without cache_control on its content blocks (and tool results' blocks). */
+function canonicalMessage(message: unknown): unknown {
+  const content = (message as { content?: unknown } | null)?.content;
+  if (!Array.isArray(content)) return message;
+  return { ...(message as object), content: content.map((block) => {
+    const bare = withoutMarker(block) as Record<string, unknown> | null;
+    if (bare && bare.type === "tool_result" && Array.isArray(bare.content)) {
+      return { ...bare, content: bare.content.map(withoutMarker) };
+    }
+    return bare;
+  }) };
+}
+
+function withoutMarker(block: unknown): unknown {
+  if (!block || typeof block !== "object" || Array.isArray(block)) return block;
+  const rest: Record<string, unknown> = { ...(block as Record<string, unknown>) };
+  delete rest.cache_control;
+  return rest;
+}
+
+/** Base64 characters of the message's inline images (content and tool results). */
+function imageCharsOf(message: unknown): number {
+  const content = (message as { content?: unknown } | null)?.content;
+  return Array.isArray(content) ? blockImageChars(content) : 0;
+}
+
+function blockImageChars(blocks: unknown[]): number {
+  let total = 0;
+  for (const item of blocks) {
+    const block = item as Record<string, unknown> | null;
+    if (!block || typeof block !== "object") continue;
+    const source = block.source as Record<string, unknown> | undefined;
+    if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
+      total += source.data.length;
+    } else if (block.type === "tool_result" && Array.isArray(block.content)) {
+      total += blockImageChars(block.content);
+    }
+  }
+  return total;
 }

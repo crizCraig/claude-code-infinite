@@ -6,9 +6,13 @@
  * thinking signatures (base64, nearly free) while adding as many bytes of dense tool output
  * keeps the totals and changes the tokens.
  *
- * Each message is hashed on its own (cache_control markers left out: Claude Code moves them
- * to the newest messages every turn), and the prefix digest is the hash of the first
- * `count` message hashes plus the hash of everything outside `messages`.
+ * Each message is hashed on its own in a canonical form: JSON.stringify of the message with
+ * the cache_control markers Claude Code moves every turn removed, only where the API puts
+ * them (a content block, a tool_result's inner block; in the frame, a system block, a tool,
+ * the top level), never inside tool inputs or schemas (Codex r2 P1). The canonical length
+ * and image characters of each message are kept too, so what was appended is sized from its
+ * own canonical bytes, not from a raw byte difference a re-encoded prefix could hide
+ * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
@@ -40,6 +44,14 @@ export function prefixDigest(shape, count) {
         hash.update(shape.messages[i]);
     return hash.digest("hex");
 }
+/** Canonical text bytes (images left out) of messages [from, to). */
+export function textBytes(shape, from, to = shape.messages.length) {
+    let total = 0;
+    for (let i = Math.max(0, from); i < Math.min(to, shape.sizes.length); i++) {
+        total += Math.max(0, shape.sizes[i] - shape.imageChars[i]);
+    }
+    return total;
+}
 function computeShape(body) {
     let parsed;
     try {
@@ -53,12 +65,69 @@ function computeShape(body) {
     const { messages, ...frame } = parsed;
     if (!Array.isArray(messages))
         return null;
-    return { frame: hashOf(frame), messages: messages.map(hashOf) };
+    const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
+        messages: [], sizes: [], imageChars: [],
+        serverEdits: frame.context_management !== undefined || frame.compaction !== undefined };
+    for (const message of messages) {
+        const text = JSON.stringify(canonicalMessage(message)) ?? "";
+        shape.messages.push(hash(text));
+        shape.sizes.push(Buffer.byteLength(text, "utf-8"));
+        shape.imageChars.push(imageCharsOf(message));
+    }
+    return shape;
 }
-function hashOf(value) {
-    return createHash("sha256").update(JSON.stringify(value, withoutCacheControl) ?? "").digest("hex");
+function hash(text) {
+    return createHash("sha256").update(text).digest("hex");
 }
-function withoutCacheControl(key, value) {
-    return key === "cache_control" ? undefined : value;
+/** The frame without cache_control at the top level, on system blocks and on tools. */
+function canonicalFrame(frame) {
+    const rest = { ...frame };
+    delete rest.cache_control;
+    if (Array.isArray(rest.system))
+        rest.system = rest.system.map(withoutMarker);
+    if (Array.isArray(rest.tools))
+        rest.tools = rest.tools.map(withoutMarker);
+    return rest;
+}
+/** A message without cache_control on its content blocks (and tool results' blocks). */
+function canonicalMessage(message) {
+    const content = message?.content;
+    if (!Array.isArray(content))
+        return message;
+    return { ...message, content: content.map((block) => {
+            const bare = withoutMarker(block);
+            if (bare && bare.type === "tool_result" && Array.isArray(bare.content)) {
+                return { ...bare, content: bare.content.map(withoutMarker) };
+            }
+            return bare;
+        }) };
+}
+function withoutMarker(block) {
+    if (!block || typeof block !== "object" || Array.isArray(block))
+        return block;
+    const rest = { ...block };
+    delete rest.cache_control;
+    return rest;
+}
+/** Base64 characters of the message's inline images (content and tool results). */
+function imageCharsOf(message) {
+    const content = message?.content;
+    return Array.isArray(content) ? blockImageChars(content) : 0;
+}
+function blockImageChars(blocks) {
+    let total = 0;
+    for (const item of blocks) {
+        const block = item;
+        if (!block || typeof block !== "object")
+            continue;
+        const source = block.source;
+        if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
+            total += source.data.length;
+        }
+        else if (block.type === "tool_result" && Array.isArray(block.content)) {
+            total += blockImageChars(block.content);
+        }
+    }
+    return total;
 }
 //# sourceMappingURL=body-shape.js.map
