@@ -17,7 +17,9 @@
 // - ssn: NNN-NN-NNNN outside never-issued ranges; dashless/spaced only with SSN context.
 //
 // A number never counts inside a longer token (next to a letter, digit or "_", or joined to
-// one by ".-/:+@"). Every pattern is bounded.
+// one by ".-/:+@"). Every pattern is bounded. A non-ASCII neighbour is a letter by the running
+// Node's Unicode tables (Python 3.12 uses Unicode 15.0): only characters assigned after 15.0
+// (e.g. CJK Extension I) can make the two disagree.
 import { asciiLower, decodeIgnore } from "./utf8-bytes.js";
 export const CARD = "card_number";
 export const ROUTING = "bank_routing";
@@ -121,10 +123,10 @@ export function financialSpans(data) {
     if (!TWO_DIGITS.test(data))
         return [];
     const low = blankMarkers(asciiLower(data));
-    const spans = [...cardSpans(data), ...ibanSpans(data), ...ssnDashedSpans(data)];
     const routing = nineDigitSpans(data, low); // before accounts: a proven routing number wins
-    spans.push(...routing, ...accountContextSpans(data, low));
-    spans.push(...routingLineSpans(data, routing.filter((s) => s[2] === ROUTING)));
+    // concat, not push(...spread): a multi-MB text can hold more spans than call arguments.
+    const lines = routingLineSpans(data, routing.filter((s) => s[2] === ROUTING));
+    const spans = cardSpans(data).concat(ibanSpans(data), ssnDashedSpans(data), routing, accountContextSpans(data, low), lines);
     return nonOverlapping(spans);
 }
 /** financialSpans of a field value whose key ("routing_number"...) is context. */

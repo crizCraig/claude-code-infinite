@@ -77,7 +77,8 @@ test("secret-free values come back as the same objects (payloads and hashes unch
     { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash",
       input: { command: "grep -rn password_hash src/ # pid 48213 at 1730000000123" } }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "t1",
-      content: "src/a.py:1: password_hash = hash_pw(pw)\nuuid 123e4567-e89b-12d3-a456-426614174000" }] },
+      content: "src/a.py:1: password_hash = hash_pw(pw)\n"
+        + "uuid 123e4567-e89b-12d3-a456-426614174000" }] },
   ];
   const before = JSON.stringify(messages);
   const counts = {};
@@ -90,7 +91,8 @@ test("a real-shaped session (all of src/ and test/) has no financial hits", () =
   const messages = [{ role: "system", content: "You are Claude Code." }];
   for (const dir of ["../src/", "../test/"]) {
     const base = new URL(dir, import.meta.url);
-    readdirSync(base).filter((f) => /\.(ts|mjs)$/.test(f) && !/^(secret|financial)-redaction/.test(f))
+    readdirSync(base)
+      .filter((f) => /\.(ts|mjs)$/.test(f) && !/^(secret|financial)-redaction/.test(f))
       .forEach((f, i) => {
         messages.push({ role: "assistant", content: [{ type: "tool_use", id: `t${dir}${i}`,
           name: "Read", input: { file_path: `/repo/${dir.slice(3)}${f}` } }] });
@@ -129,6 +131,26 @@ test("multi-MB bodies redact quickly and adversarial inputs stay linear", () => 
     assert.ok(full < 4 * half + 200, `${JSON.stringify(unit)} grows faster than linear: `
       + `${half.toFixed(0)} -> ${full.toFixed(0)} ms`);
   }
+});
+
+test("hundreds of thousands of spans in one text do not overflow the stack (review r1)", () => {
+  for (const text of [("routing 021000021 " + "12345678 ".repeat(20)).repeat(8000),
+    "account: 3829105567\n".repeat(128000), "routing 021000021\n".repeat(128000)]) {
+    const out = redact(text);
+    assert.ok(Object.values(out.counts).reduce((a, b) => a + b, 0) >= 128000);
+  }
+});
+
+test("an empty or non-string media_type falls back to mime_type (Python truthiness)", () => {
+  const data = "QUJDREVGR0g0NTMy\n" + card("453201", 16);
+  for (const mediaType of [{}, [], 0, "", null, false]) {
+    const part = { type: "image", media_type: mediaType, mime_type: "image/png", data };
+    assert.equal(redactValue(part), part, JSON.stringify(mediaType));
+  }
+  const text = { type: "image", media_type: [], mime_type: "text/plain", data };
+  assert.ok(redactValue(text).data.endsWith("[REDACTED:card_number]"));
+  const truthy = { type: "image", media_type: { a: 1 }, data };
+  assert.ok(redactValue(truthy).data.endsWith("[REDACTED:card_number]"));
 });
 
 test("financialSpans finds nothing in text without two digits in a row", () => {

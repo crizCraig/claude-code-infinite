@@ -192,7 +192,7 @@ function isBinaryPayload(parent, key, value, media) {
         const head = BASE64_DATA_URI.exec(value);
         return head !== null && BASE64_TEXT.test(value.slice(head[0].length));
     }
-    const kind = parent.media_type || parent.mime_type;
+    const kind = pyTruthy(parent.media_type) ? parent.media_type : parent.mime_type;
     const declared = parent.type === "base64"
         || (typeof kind === "string" && !kind.startsWith("text/"));
     return declared && BINARY_PAYLOAD_KEYS.has(key) && BASE64_TEXT.test(value);
@@ -466,6 +466,14 @@ function base64Chars(body) {
         if (B64.test(body[i]))
             n += 1;
     return n;
+}
+/** Python's bool(value) for JSON values: null, false, 0, "", [] and {} are false. */
+function pyTruthy(value) {
+    if (Array.isArray(value))
+        return value.length > 0;
+    if (isRecord(value))
+        return Object.keys(value).length > 0;
+    return Boolean(value);
 }
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
