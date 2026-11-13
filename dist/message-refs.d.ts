@@ -32,6 +32,8 @@ export declare class MessageRefs {
     private off;
     private disabled;
     constructor(enabled: boolean);
+    /** Whether calls declare message-refs (on, and not refused by the server for good). */
+    get active(): boolean;
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId: string | undefined, messages: Message[]): Delta;
     /**
@@ -73,7 +75,7 @@ export declare function buildDelta(messages: Message[], acked: ReadonlySet<strin
  */
 export declare function refFor(message: Message, stripHeader?: boolean): Ref | undefined;
 /** The digests an answer's acks allow for `messages`, in the request's header order. */
-export declare function ackedDigests(messages: Message[], acks: Record<string, unknown>): string[];
+export declare function ackedDigests(messages: Message[], acks: Record<string, unknown>, known?: ReadonlySet<string>): string[];
 /** The hashes a 409 names, or undefined when it names none. */
 export declare function missingMessageHashes(bodyText: string): string[] | undefined;
 //# sourceMappingURL=message-refs.d.ts.map

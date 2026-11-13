@@ -2084,7 +2084,7 @@ export class MemtreeClient {
           const plain = delta.refs.length > 0;
           return await this.callContextMemory(messages, modelContextLimit, {
             ...opts,
-            ...(plain ? { messageRefs: false }
+            ...(plain ? { messageRefs: false, refusedMessageRefs: response.status }
               : keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
             get timeoutMs() { return callDeadline - Date.now(); },
           });
@@ -2268,7 +2268,7 @@ export class MemtreeClient {
         ...(streamed ? { "content-length": String(bytes.length) } : {}),
         "x-client": CLIENT_NAME,
         "x-client-version": CLIENT_VERSION,
-        "x-client-features": this.messageRefs.enabled
+        "x-client-features": this.messageRefs.active
           ? `${CLIENT_FEATURES},${MESSAGE_REFS_FEATURE}` : CLIENT_FEATURES,
         ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
         ...(opts.clientMeta && Object.keys(opts.clientMeta).length

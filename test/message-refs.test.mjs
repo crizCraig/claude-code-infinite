@@ -46,6 +46,25 @@ test("golden vectors: the store's hash of each message and tool set, byte for by
   }
 });
 
+test("keys JSON drops do not count toward a cache mark's position", () => {
+  const block = { type: "text", text: "x".repeat(300), extra: undefined,
+    cache_control: { type: "ephemeral" } };
+  const message = { role: "user", content: [block] };
+  const ref = refFor(message);
+  assert.deepEqual(ref.marks, [[["content", 0], 2, { type: "ephemeral" }]]);
+  assert.equal(ref.digest, refFor(JSON.parse(JSON.stringify(message))).digest);
+});
+
+test("an acked message's images are not decoded again on later acks", () => {
+  const messages = conversation();
+  const all = messages.map((m, i) => refFor(m, i === 0).digest);
+  const acks = { stored: true, messages: messages.length, unservable: [],
+    unserved_images: [imageSha] };
+  assert.ok(!ackedDigests(messages, acks).includes(all[4]), "unserved image: not acked");
+  assert.ok(ackedDigests(messages, acks, new Set([all[4]])).includes(all[4]),
+    "already acked: kept without a second look");
+});
+
 test("only the request's first billing header is split", () => {
   const sys = conversation()[0];
   assert.ok(refFor(sys, true).header);

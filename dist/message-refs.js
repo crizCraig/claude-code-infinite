@@ -54,6 +54,10 @@ export class MessageRefs {
     constructor(enabled) {
         this.enabled = enabled;
     }
+    /** Whether calls declare message-refs (on, and not refused by the server for good). */
+    get active() {
+        return this.enabled && !this.disabled;
+    }
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId, messages) {
         const lane = this.laneFor(sessionId, messages);
@@ -82,7 +86,7 @@ export class MessageRefs {
         const acks = field;
         if (!acks || acks.stored !== true || acks.messages !== messages.length)
             return;
-        this.remember(lane, ackedDigests(messages, acks));
+        this.remember(lane, ackedDigests(messages, acks, this.acked.get(lane)));
     }
     /**
      * A refusal of a call that sent `messages` naming `refs` (hex): true when the call should
@@ -134,6 +138,7 @@ export class MessageRefs {
         for (const hash of missing)
             acked?.delete(hash);
         const inRow = (this.allMissing.get(lane) ?? 0) + 1;
+        this.allMissing.delete(lane);
         this.allMissing.set(lane, inRow);
         boundMap(this.allMissing, SESSIONS_MAX);
         if (inRow >= ALL_MISSING_MAX) {
@@ -148,6 +153,7 @@ export class MessageRefs {
     }
     forget(lane, hashes) {
         const never = this.never.get(lane) ?? new Set();
+        this.never.delete(lane);
         this.never.set(lane, never);
         for (const hash of hashes) {
             never.add(hash);
@@ -216,7 +222,7 @@ export function refFor(message, stripHeader = true) {
         ...(header !== undefined ? { header } : {}) };
 }
 /** The digests an answer's acks allow for `messages`, in the request's header order. */
-export function ackedDigests(messages, acks) {
+export function ackedDigests(messages, acks, known = new Set()) {
     const unservable = new Set(stringsOf(acks.unservable));
     const images = new Set(stringsOf(acks.unserved_images));
     const out = [];
@@ -226,7 +232,9 @@ export function ackedDigests(messages, acks) {
         headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
         if (!ref || unservable.has(ref.digest))
             continue;
-        if (images.size && imageShas(message).some((sha) => images.has(sha)))
+        // Images are checked once, when a message is first acked (a served image stays served).
+        if (images.size && !known.has(ref.digest) &&
+            imageShas(message).some((sha) => images.has(sha)))
             continue;
         out.push(ref.digest);
     }
@@ -276,12 +284,17 @@ function withoutCacheControl(value, path, marks) {
     const entries = Object.entries(value);
     const out = {};
     let changed = false;
-    entries.forEach(([key, item], position) => {
-        if (key === "cache_control") {
+    let position = 0; // among the keys JSON keeps (it drops undefined and functions)
+    entries.forEach(([key, item]) => {
+        const kept = item !== undefined && typeof item !== "function" && typeof item !== "symbol";
+        if (key === "cache_control" && kept) {
             marks.push([path, position, item]);
             changed = true;
+            position += 1;
             return;
         }
+        if (kept)
+            position += 1;
         const next = withoutCacheControl(item, [...path, key], marks);
         if (next !== item)
             changed = true;
