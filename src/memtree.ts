@@ -1923,6 +1923,8 @@ export class MemtreeClient {
       unconfirmedRetry?: boolean;
       /** False: name no message by ref (the resend after a refused one). */
       messageRefs?: boolean;
+      /** The status that refused this call's refs (logged on its full resend). */
+      refusedMessageRefs?: number;
       signal?: AbortSignal;
       model?: string;
       tools?: unknown[];
@@ -2015,6 +2017,9 @@ export class MemtreeClient {
     opts.signal?.throwIfAborted();
 
     const started = Date.now();
+    // Resends draw on what is left of this call's budget: one absolute deadline, so a
+    // resend of a resend never counts the same time twice.
+    const callDeadline = started + opts.timeoutMs;
     let status: number | undefined;
     let ok = false;
     let keyRefused = false;
@@ -2050,15 +2055,14 @@ export class MemtreeClient {
       this.lastUnreachable = undefined;
       if (delta.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
-        if (this.messageRefs.noteRefusal(opts.sessionId, delta.refs, response.status,
+        if (this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs, response.status,
           refusalText)) {
           // Sent again in full as its own call, within what is left of this call's budget.
           resent = true;
-          const budget = opts.timeoutMs;
           this.log(`context_memory ${response.status} on message refs: sending in full`);
           return await this.callContextMemory(messages, modelContextLimit, {
-            ...opts, messageRefs: false,
-            get timeoutMs() { return budget - (Date.now() - started); },
+            ...opts, messageRefs: false, refusedMessageRefs: response.status,
+            get timeoutMs() { return callDeadline - Date.now(); },
           });
         }
       }
@@ -2070,14 +2074,13 @@ export class MemtreeClient {
           // its timer starts, after its body is built, and never clamped: a size-scaled
           // budget adds its allowance to what is left, however negative.
           resent = true;
-          const budget = opts.timeoutMs;
           // Unconfirmed references the server named as missing: only those go as bytes
           // (all bytes would be over the limit again), once.
           const keepRefs = unconfirmed !== undefined && !opts.unconfirmedRetry &&
             namesMissingImages(response.status, refusalText);
           return await this.callContextMemory(messages, modelContextLimit, {
             ...opts, ...(keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
-            get timeoutMs() { return budget - (Date.now() - started); },
+            get timeoutMs() { return callDeadline - Date.now(); },
           });
         }
       }
@@ -2108,7 +2111,11 @@ export class MemtreeClient {
         throw new Error("context_memory answer does not show it resolves image references");
       }
       this.imageRefs.noteAnswer(json);
-      this.messageRefs.noteAnswer(opts.sessionId, messages, json);
+      // A trimmed body stored other messages than these: nothing is acked from it.
+      if (planned.limit?.action !== "trimmed") {
+        this.messageRefs.noteAnswer(opts.sessionId, messages, json,
+          { finalIndex: opts.finalIndex === true, sentRefs: delta.refs.length });
+      }
       // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
       // true }` by contract: the server skips compression and returns no
       // messages. Only a compress call needs a non-empty conversation back.
@@ -2183,6 +2190,7 @@ export class MemtreeClient {
         ...(planned.limit ? { bodyLimit: planned.limit } : {}),
         ...(unconfirmed ? { unconfirmedImageRefs: unconfirmed.refs.length } : {}),
         ...(delta.refs.length ? { messageRefs: delta.refs.length } : {}),
+        ...(opts.refusedMessageRefs ? { messageRefsRefused: opts.refusedMessageRefs } : {}),
         // Aborted by an exit drain that ran out: a known cut, not a server failure.
         ...(!ok && this.drainCutting && controller.signal.aborted
           ? { exitCut: true, finalIndex: opts.finalIndex === true }

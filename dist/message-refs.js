@@ -29,16 +29,23 @@ export const REF_KEY = "memtree_ref";
 const MARKS_KEY = "cache_marks";
 const HEADER_KEY = "billing_header";
 const BILLING_HEADER_PREFIX = "x-anthropic-billing-header";
-/** Sessions whose acks are remembered, and hashes per session (memory bound). */
+/** Conversations whose acks are remembered, and hashes per conversation (memory bound). */
 const SESSIONS_MAX = 32;
 const ACKED_PER_SESSION_MAX = 200_000;
-/** 409s in one session before it goes back to full uploads for the process. */
-const SESSION_MISSES_MAX = 3;
+/** 409s in a row naming every ref before a conversation goes back to full uploads. */
+const ALL_MISSING_MAX = 2;
 const HEX_RE = /^[0-9a-f]{64}$/;
+/** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
+const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
     enabled;
+    /** Per conversation (session and opening, as the server's scope): acked digests. */
     acked = new Map();
-    misses = new Map();
+    /** Per conversation: digests a 409 named (a hash the server never had, or computes
+     *  differently): never acked again, so a mismatch costs one 409, not one per turn. */
+    never = new Map();
+    /** Per conversation: 409s in a row that named every ref sent. */
+    allMissing = new Map();
     off = new Set();
     disabled = false;
     constructor(enabled) {
@@ -46,84 +53,96 @@ export class MessageRefs {
     }
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId, messages) {
-        const acked = sessionId ? this.ackedFor(sessionId) : undefined;
+        const lane = this.laneFor(sessionId, messages);
+        const acked = lane ? this.acked.get(lane) : undefined;
         if (!acked || acked.size === 0)
             return { messages, refs: [] };
         return buildDelta(messages, acked);
     }
-    /** Learn what an answer to a call that sent `messages` (in full) lets the next one name. */
-    noteAnswer(sessionId, messages, json) {
-        if (!this.enabled || this.disabled || !sessionId)
+    /**
+     * Learn what an answer to a call that sent `messages` (in full) lets the next one name.
+     * `finalIndex`: the early answer to an exit index, which never carries the field.
+     */
+    noteAnswer(sessionId, messages, json, opts = {}) {
+        const lane = this.laneFor(sessionId, messages);
+        if (!lane)
             return;
         const field = json?.[STORED_MESSAGES_FIELD];
         if (field === undefined) {
             // A server that takes no refs (off, or never had them): name nothing until it does.
-            this.acked.delete(sessionId);
+            if (!opts.finalIndex)
+                this.acked.delete(lane);
             return;
         }
+        if (opts.sentRefs)
+            this.allMissing.delete(lane);
         const acks = field;
         if (!acks || acks.stored !== true || acks.messages !== messages.length)
             return;
-        this.remember(sessionId, ackedDigests(messages, acks));
+        this.remember(lane, ackedDigests(messages, acks));
     }
     /**
-     * A refusal of a call that named `refs` (hex): true when the call should go again in
-     * full. A 409 forgets what it names; one naming every ref, or the session's
-     * SESSION_MISSES_MAX-th, ends refs for the session; a 400 about refs ends them all.
+     * A refusal of a call that sent `messages` naming `refs` (hex): true when the call should
+     * go again in full. A 409 names what is never named again in this conversation; two in a
+     * row naming every ref end refs for it; a 400 about refs ends them all; a 400 about the
+     * images the refs brought back only resends.
      */
-    noteRefusal(sessionId, refs, status, bodyText) {
-        if (!sessionId || refs.length === 0)
+    noteRefusal(sessionId, messages, refs, status, bodyText) {
+        const lane = this.laneFor(sessionId, messages);
+        if (!lane || refs.length === 0)
             return false;
         if (status === 400 && /message refs/i.test(bodyText)) {
             this.disabled = true;
             this.acked.clear();
             return true;
         }
+        if (status === 400 && /image references expand/i.test(bodyText))
+            return true;
         const missing = status === MISSING_MESSAGES_STATUS ? missingMessageHashes(bodyText) : undefined;
         if (missing === undefined)
             return false;
-        const misses = (this.misses.get(sessionId) ?? 0) + 1;
-        this.misses.set(sessionId, misses);
-        const all = refs.every((ref) => missing.includes(ref));
-        if (all || misses >= SESSION_MISSES_MAX) {
-            this.off.add(sessionId);
-            this.acked.delete(sessionId);
-        }
-        else {
-            const acked = this.acked.get(sessionId);
-            for (const hash of missing)
-                acked?.delete(hash);
+        this.forget(lane, missing);
+        if (refs.every((ref) => missing.includes(ref))) {
+            const inRow = (this.allMissing.get(lane) ?? 0) + 1;
+            this.allMissing.set(lane, inRow);
+            if (inRow >= ALL_MISSING_MAX)
+                this.off.add(lane);
         }
         return true;
     }
-    ackedFor(sessionId) {
-        if (!this.enabled || this.disabled || this.off.has(sessionId))
+    /** The conversation `messages` belong to, while refs may be named for it. */
+    laneFor(sessionId, messages) {
+        if (!this.enabled || this.disabled || !sessionId)
             return undefined;
-        return this.acked.get(sessionId);
+        const opening = messages.find(isOpening);
+        if (!opening)
+            return undefined;
+        const lane = `${sessionId}\n${laneDigest(opening)}`;
+        return this.off.has(lane) ? undefined : lane;
     }
-    remember(sessionId, digests) {
-        if (this.off.has(sessionId))
-            return;
-        let set = this.acked.get(sessionId);
+    forget(lane, hashes) {
+        const never = this.never.get(lane) ?? new Set();
+        this.never.set(lane, never);
+        for (const hash of hashes) {
+            never.add(hash);
+            this.acked.get(lane)?.delete(hash);
+        }
+        bound(never, ACKED_PER_SESSION_MAX);
+        boundMap(this.never, SESSIONS_MAX);
+    }
+    remember(lane, digests) {
+        let set = this.acked.get(lane);
         if (set)
-            this.acked.delete(sessionId);
+            this.acked.delete(lane);
         else
             set = new Set();
-        this.acked.set(sessionId, set);
+        this.acked.set(lane, set);
+        const never = this.never.get(lane);
         for (const digest of digests)
-            set.add(digest);
-        while (set.size > ACKED_PER_SESSION_MAX) {
-            const first = set.values().next().value;
-            if (first === undefined)
-                break;
-            set.delete(first);
-        }
-        while (this.acked.size > SESSIONS_MAX) {
-            const oldest = this.acked.keys().next().value;
-            if (oldest === undefined)
-                break;
-            this.acked.delete(oldest);
-        }
+            if (!never?.has(digest))
+                set.add(digest);
+        bound(set, ACKED_PER_SESSION_MAX);
+        boundMap(this.acked, SESSIONS_MAX);
     }
 }
 /**
@@ -234,8 +253,47 @@ function withoutCacheControl(value, path, marks) {
     });
     return changed ? out : value;
 }
+/**
+ * The server's opening rule (the first message not system/developer that is not only
+ * <system-reminder> blocks), erring toward "not yet": a message left with only
+ * whitespace either side may count as such (JS trim and Python strip differ on a few
+ * characters) is not the opening, so it and the real one both stay inline.
+ */
 function isOpening(message) {
-    return !isSkipped(message) && stripCcSystemReminders([message]).length > 0;
+    if (isSkipped(message))
+        return false;
+    const stripped = stripCcSystemReminders([message])[0];
+    return stripped !== undefined && substantive(stripped.content);
+}
+function substantive(content) {
+    if (typeof content === "string")
+        return SUBSTANCE_RE.test(content);
+    if (!Array.isArray(content))
+        return content !== undefined;
+    return content.some((part) => typeof part === "string" ? SUBSTANCE_RE.test(part)
+        : part?.type === "text" ? typeof part.text === "string" && SUBSTANCE_RE.test(part.text)
+            : true);
+}
+/** A conversation's key: its opening without reminders and cache marks (both call kinds). */
+function laneDigest(opening) {
+    const stripped = stripCcSystemReminders([opening])[0] ?? opening;
+    return hashOf(withoutCacheControl(stripped, [], []));
+}
+function bound(set, max) {
+    while (set.size > max) {
+        const first = set.values().next().value;
+        if (first === undefined)
+            break;
+        set.delete(first);
+    }
+}
+function boundMap(map, max) {
+    while (map.size > max) {
+        const first = map.keys().next().value;
+        if (first === undefined)
+            break;
+        map.delete(first);
+    }
 }
 function isSkipped(message) {
     return message?.role === "system" || message?.role === "developer";

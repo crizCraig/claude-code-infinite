@@ -20,22 +20,36 @@ export interface Delta {
 }
 export declare class MessageRefs {
     readonly enabled: boolean;
+    /** Per conversation (session and opening, as the server's scope): acked digests. */
     private acked;
-    private misses;
+    /** Per conversation: digests a 409 named (a hash the server never had, or computes
+     *  differently): never acked again, so a mismatch costs one 409, not one per turn. */
+    private never;
+    /** Per conversation: 409s in a row that named every ref sent. */
+    private allMissing;
     private off;
     private disabled;
     constructor(enabled: boolean);
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId: string | undefined, messages: Message[]): Delta;
-    /** Learn what an answer to a call that sent `messages` (in full) lets the next one name. */
-    noteAnswer(sessionId: string | undefined, messages: Message[], json: unknown): void;
     /**
-     * A refusal of a call that named `refs` (hex): true when the call should go again in
-     * full. A 409 forgets what it names; one naming every ref, or the session's
-     * SESSION_MISSES_MAX-th, ends refs for the session; a 400 about refs ends them all.
+     * Learn what an answer to a call that sent `messages` (in full) lets the next one name.
+     * `finalIndex`: the early answer to an exit index, which never carries the field.
      */
-    noteRefusal(sessionId: string | undefined, refs: readonly string[], status: number, bodyText: string): boolean;
-    private ackedFor;
+    noteAnswer(sessionId: string | undefined, messages: Message[], json: unknown, opts?: {
+        finalIndex?: boolean;
+        sentRefs?: number;
+    }): void;
+    /**
+     * A refusal of a call that sent `messages` naming `refs` (hex): true when the call should
+     * go again in full. A 409 names what is never named again in this conversation; two in a
+     * row naming every ref end refs for it; a 400 about refs ends them all; a 400 about the
+     * images the refs brought back only resends.
+     */
+    noteRefusal(sessionId: string | undefined, messages: Message[], refs: readonly string[], status: number, bodyText: string): boolean;
+    /** The conversation `messages` belong to, while refs may be named for it. */
+    private laneFor;
+    private forget;
     private remember;
 }
 /**

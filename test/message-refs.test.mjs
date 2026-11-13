@@ -87,23 +87,59 @@ test("answers decide what is named: acks, no field, 409s, a 400", () => {
   assert.equal(refs.delta("s", messages).refs.length, messages.length - 2, "a count mismatch adds nothing");
   const sent = refs.delta("s", messages).refs;
   const body = (hashes) => JSON.stringify({ detail: { missing_message_hashes: hashes } });
-  assert.ok(refs.noteRefusal("s", sent, 409, body([sent[1]])));
+  assert.ok(refs.noteRefusal("s", messages, sent, 409, body([sent[1]])));
   assert.equal(refs.delta("s", messages).refs.length, sent.length - 1, "the named one is forgotten");
-  assert.equal(refs.noteRefusal("s", sent, 500, "boom"), false);
+  refs.noteAnswer("s", messages, answer);
+  assert.equal(refs.delta("s", messages).refs.length, sent.length - 1,
+    "and never acked again (a hash the server computes differently costs one 409)");
+  assert.equal(refs.noteRefusal("s", messages, sent, 500, "boom"), false);
+  assert.ok(refs.noteRefusal("s", messages, sent, 400,
+    '{"detail":"Image references expand past the request size limit."}'), "resend only");
+  assert.ok(refs.delta("s", messages).refs.length > 0);
   const next = refs.delta("s", messages).refs;
-  assert.ok(refs.noteRefusal("s", next, 409, body(next)), "every ref missing (kill switch)");
-  assert.equal(refs.delta("s", messages).refs.length, 0, "the session sends in full from then on");
+  assert.ok(refs.noteRefusal("s", messages, next, 409, body(next)), "every ref missing (kill switch)");
+  refs.noteAnswer("s", messages, answer);
+  assert.equal(refs.delta("s", messages).refs.length, 0, "none of them is named again");
   refs.noteAnswer("t", messages, answer);
+  refs.noteAnswer("t", messages, { messages: [] }, { finalIndex: true });
+  assert.ok(refs.delta("t", messages).refs.length > 0, "an exit index's early answer clears nothing");
   refs.noteAnswer("t", messages, { messages: [] });
   assert.equal(refs.delta("t", messages).refs.length, 0, "an answer without the field clears");
   refs.noteAnswer("u", messages, answer);
-  assert.ok(refs.noteRefusal("u", ["a".repeat(64)], 400, '{"detail":"Malformed message refs: x"}'));
+  assert.ok(refs.noteRefusal("u", messages, ["a".repeat(64)], 400,
+    '{"detail":"Malformed message refs: x"}'));
   refs.noteAnswer("u", messages, answer);
   assert.equal(refs.delta("u", messages).refs.length, 0, "a 400 ends refs for the process");
   const off = new MessageRefs(false);
   off.noteAnswer("s", messages, answer);
   assert.equal(off.delta("s", messages).refs.length, 0, "off unless enabled");
   assert.equal(missingMessageHashes("not json"), undefined);
+});
+
+test("acks are per conversation: a subagent lane's 409 leaves the main lane alone", () => {
+  const refs = new MessageRefs(true);
+  const main = conversation();
+  const lane = [main[0], { role: "user", content: "Subagent task" }, ...main.slice(3)];
+  const ack = (messages) => ({ [STORED_MESSAGES_FIELD]: { stored: true,
+    messages: messages.length, unservable: [], unserved_images: [] } });
+  refs.noteAnswer("s", main, ack(main));
+  assert.equal(refs.delta("s", lane).refs.length, 0, "another opening names nothing");
+  refs.noteAnswer("s", lane, ack(lane));
+  const sent = refs.delta("s", lane).refs;
+  const missing = JSON.stringify({ detail: { missing_message_hashes: sent } });
+  refs.noteRefusal("s", lane, sent, 409, missing);
+  refs.noteRefusal("s", lane, sent, 409, missing);
+  assert.equal(refs.delta("s", lane).refs.length, 0);
+  assert.equal(refs.delta("s", main).refs.length, main.length - 2, "the main lane goes on");
+});
+
+test("an opening that may be only whitespace to the server stays inline with the next", () => {
+  const messages = conversation();
+  messages.splice(1, 1, { role: "user", content: "<system-reminder>x</system-reminder>\u0085" });
+  const acked = new Set(messages.map((m, i) => refFor(m, i === 0).digest));
+  const delta = buildDelta(messages, acked);
+  assert.equal(delta.messages[1], messages[1]);
+  assert.equal(delta.messages[2], messages[2], "the server's opening is inline");
 });
 
 test("a client with deltas on names stored messages; a 409 sends that call in full", async () => {
@@ -126,8 +162,14 @@ test("a client with deltas on names stored messages; a 409 sends that call in fu
     assert.ok(await client.compress(MemtreeClient.hashMessages(third), third, 200_000, undefined, meta));
     assert.equal(server.bodies[2].status, 409);
     assert.equal(server.bodies[3].refs, 0, "the resend is in full");
-    assert.deepEqual(records.map((r) => r.ok), [true, true, true]);
     assert.ok(records[1].messageRefs > 0);
+    assert.equal(records[2].messageRefsRefused, 409, "the resend's record says why");
+    server.imageLimitNext = true;
+    const fourth = [...third, { role: "assistant", content: "ok" }];
+    assert.ok(await client.compress(MemtreeClient.hashMessages(fourth), fourth, 200_000, undefined, meta));
+    assert.equal(server.bodies[4].status, 400);
+    assert.equal(server.bodies[5].refs, 0, "served images over the cap: sent in full");
+    assert.deepEqual(records.map((r) => r.ok), [true, true, true, true]);
   } finally {
     await server.close();
   }
@@ -151,7 +193,7 @@ test("off by default: no feature declared, nothing named", async () => {
 
 /** A MemTree that stores every message it is sent and serves refs back from them. */
 async function fakeMemtree() {
-  const state = { bodies: [], store: new Map(), missingNext: false };
+  const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -166,6 +208,10 @@ async function fakeMemtree() {
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(body));
       };
+      if (refs.length && state.imageLimitNext) {
+        state.imageLimitNext = false;
+        return reply(400, { detail: "Image references expand past the request size limit." });
+      }
       if (refs.length && state.missingNext) {
         state.missingNext = false;
         return reply(409, { detail: { missing_message_hashes: [refs[0][REF_KEY]] } });
