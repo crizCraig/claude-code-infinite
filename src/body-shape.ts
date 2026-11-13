@@ -15,6 +15,7 @@
  * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
+import { imageDimensions } from "./image-tokens.js";
 
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
 export const SHAPE_MIN_BYTES = 256 * 1024;
@@ -33,6 +34,13 @@ export interface BodyShape {
    * usage may describe the edited input, so it never anchors a size (review r2 P3).
    */
   serverEdits: boolean;
+  /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
+  imageDims: Array<[number, number] | undefined>;
+  /**
+   * The messages hold an image that is not inline base64 (a URL or file): its content can
+   * change under an unchanged digest, so the body never anchors a size (Codex r4 P1).
+   */
+  otherImages: boolean;
 }
 
 const shapes = new WeakMap<Buffer, BodyShape | null>();
@@ -83,12 +91,13 @@ function computeShape(body: Buffer): BodyShape | null {
   if (!Array.isArray(messages)) return null;
   const shape: BodyShape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
     messages: [], sizes: [], imageChars: [],
-    serverEdits: frame.context_management !== undefined || frame.compaction !== undefined };
+    serverEdits: frame.context_management !== undefined || frame.compaction !== undefined,
+    imageDims: [], otherImages: false };
   for (const message of messages) {
     const text = JSON.stringify(canonicalMessage(message)) ?? "";
     shape.messages.push(hash(text));
     shape.sizes.push(Buffer.byteLength(text, "utf-8"));
-    shape.imageChars.push(imageCharsOf(message));
+    shape.imageChars.push(imageCharsOf(message, shape));
   }
   return shape;
 }
@@ -126,22 +135,28 @@ function withoutMarker(block: unknown): unknown {
   return rest;
 }
 
-/** Base64 characters of the message's inline images (content and tool results). */
-function imageCharsOf(message: unknown): number {
+/** Base64 characters of the message's inline images (content and tool results); each
+ * image's dimensions, and any image that is not inline, are noted on `shape`. */
+function imageCharsOf(message: unknown, shape: BodyShape): number {
   const content = (message as { content?: unknown } | null)?.content;
-  return Array.isArray(content) ? blockImageChars(content) : 0;
+  return Array.isArray(content) ? blockImageChars(content, shape) : 0;
 }
 
-function blockImageChars(blocks: unknown[]): number {
+function blockImageChars(blocks: unknown[], shape: BodyShape): number {
   let total = 0;
   for (const item of blocks) {
     const block = item as Record<string, unknown> | null;
     if (!block || typeof block !== "object") continue;
     const source = block.source as Record<string, unknown> | undefined;
-    if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
-      total += source.data.length;
+    if (block.type === "image") {
+      if (source?.type === "base64" && typeof source.data === "string") {
+        total += source.data.length;
+        shape.imageDims.push(imageDimensions(source.data));
+      } else {
+        shape.otherImages = true;
+      }
     } else if (block.type === "tool_result" && Array.isArray(block.content)) {
-      total += blockImageChars(block.content);
+      total += blockImageChars(block.content, shape);
     }
   }
   return total;

@@ -171,19 +171,20 @@ test('no anchor for a body that does not extend the sampled one, or on another m
 });
 
 test('the anchor sizes appended messages by their own canonical bytes, under 75% coverage none', () => {
-  const images = { imageBytes: 0, imageTokens: 0 };
   const shape = { frame: 'f', messages: ['a', 'b', 'c'], sizes: [400_000, 50_000, 50_000],
-    imageChars: [0, 0, 0], serverEdits: false };
+    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], otherImages: false };
   const sample = { tokens: 100_000, forwardedBytes: 450_000, imageBytes: 0, imageTokens: 0,
     messageCount: 2 };
-  assert.equal(anchoredBound(sample, shape, images, MODEL),
+  assert.equal(anchoredBound(sample, shape, MODEL),
     Math.ceil(100_000 * (1 + ANCHOR_MARGIN)) + Math.ceil(50_000 / 1.9));
   assert.equal(anchoredBound({ ...sample, messageCount: 1 },
-    { ...shape, sizes: [400_000, 100_000, 100_000] }, images, MODEL), undefined,
+    { ...shape, sizes: [400_000, 100_000, 100_000] }, MODEL), undefined,
   'the sample measured under 75% of the text');
   assert.equal(anchoredBound({ tokens: 100_000, forwardedBytes: 450_000, messageCount: 2 }, shape,
-    images, MODEL), undefined, 'a sample without its images cannot anchor');
-  assert.equal(anchoredBound(undefined, shape, images, MODEL), undefined);
+    MODEL), undefined, 'a sample without its images cannot anchor');
+  assert.equal(anchoredBound(undefined, shape, MODEL), undefined);
+  assert.equal(anchoredBound(sample, { ...shape, otherImages: true }, MODEL), undefined,
+    'a URL image can change under the same digest');
 });
 
 test('a re-encoded prefix cannot hide appended content (Codex r2 P1)', () => {
@@ -215,17 +216,39 @@ test('cache_control inside a tool input is data, not a moved marker (Codex r2 P1
   assert.equal(extendsSample(sample, changed, MODEL), false);
 });
 
-test('an image the byte scan misses (escaped "type") gets no anchor (Codex r3 P1)', () => {
+test('an image the byte scan misses (escaped "type") is still charged (Codex r3 P1)', () => {
   const { previous, messages } = laneTurns();
   const sample = sampleOf(previous, 480_000);
   const plainBody = bodyOf(messages);
   const escaped = Buffer.from(plainBody.toString('utf-8')
     .replaceAll('"type":"image"', '"type":"\\u0069mage"'));
-  const sizing = new RequestSizing(fakeCounts(), true, MODEL);
-  assert.ok(sizing.register(plainBody, 'original', sample).conservativeTokens <
-    conservativeBodyTokens(plainBody, MODEL), 'anchored when the images are seen');
-  assert.equal(sizing.register(escaped, 'original', sample).conservativeTokens,
-    conservativeBodyTokens(escaped, MODEL), 'the plain bound (its images read as text)');
+  assert.equal(bodyImages(escaped, MODEL).imageBytes, 0, 'the byte scan misses them');
+  const bound = (body) => new RequestSizing(fakeCounts(), true, MODEL)
+    .register(body, 'original', sample).conservativeTokens;
+  assert.ok(bound(plainBody) < conservativeBodyTokens(plainBody, MODEL), 'anchored');
+  assert.equal(bound(escaped), bound(plainBody), 'the same images charged either way');
+});
+
+test('a URL image in the body: no anchor (its content can change, Codex r4 P1)', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  messages.splice(1, 0, { role: 'user', content: [{ type: 'image',
+    source: { type: 'url', url: 'https://example.com/a.png' } }] },
+  { role: 'assistant', content: [{ type: 'text', text: 'seen' }] });
+  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 200_000);
+  const body = bodyOf(messages);
+  assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+    .conservativeTokens, conservativeBodyTokens(body, MODEL));
+});
+
+test('a standalone JPEG marker (TEM) before a large segment is walked over (Codex r4 P2)', () => {
+  const sheet = Buffer.from(jpeg(1999, 1354, { iccBytes: 120_000 }), 'base64');
+  const withTem = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0x01]), sheet.subarray(2)]);
+  assert.deepEqual(imageDimensions(withTem.toString('base64')), [1999, 1354]);
+  const rst = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0xd3]), sheet.subarray(2)]);
+  assert.deepEqual(imageDimensions(rst.toString('base64')), [1999, 1354]);
+  const sos = Buffer.concat([sheet.subarray(0, 2), Buffer.from([0xff, 0xda, 0, 4, 0, 0]),
+    sheet.subarray(2)]);
+  assert.equal(imageDimensions(sos.toString('base64')), undefined, 'scan data before a frame');
 });
 
 test('a body that asks Anthropic to edit its input never anchors (review r2 P3)', () => {

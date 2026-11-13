@@ -136,7 +136,7 @@ export declare const ANCHOR_MARGIN = 0.1;
  * canonical messages, never a raw byte difference, which a re-encoded prefix (escapes
  * written literally) could shrink to hide new content (Codex r2 P1).
  */
-export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, images: ImageTotals, model: string | undefined): number | undefined;
+export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined): number | undefined;
 /**
  * Whether `body` extends the body `sample` measured, on the same model: the sample's
  * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only

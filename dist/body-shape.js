@@ -15,6 +15,7 @@
  * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
+import { imageDimensions } from "./image-tokens.js";
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
 export const SHAPE_MIN_BYTES = 256 * 1024;
 const shapes = new WeakMap();
@@ -67,12 +68,13 @@ function computeShape(body) {
         return null;
     const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
         messages: [], sizes: [], imageChars: [],
-        serverEdits: frame.context_management !== undefined || frame.compaction !== undefined };
+        serverEdits: frame.context_management !== undefined || frame.compaction !== undefined,
+        imageDims: [], otherImages: false };
     for (const message of messages) {
         const text = JSON.stringify(canonicalMessage(message)) ?? "";
         shape.messages.push(hash(text));
         shape.sizes.push(Buffer.byteLength(text, "utf-8"));
-        shape.imageChars.push(imageCharsOf(message));
+        shape.imageChars.push(imageCharsOf(message, shape));
     }
     return shape;
 }
@@ -109,23 +111,30 @@ function withoutMarker(block) {
     delete rest.cache_control;
     return rest;
 }
-/** Base64 characters of the message's inline images (content and tool results). */
-function imageCharsOf(message) {
+/** Base64 characters of the message's inline images (content and tool results); each
+ * image's dimensions, and any image that is not inline, are noted on `shape`. */
+function imageCharsOf(message, shape) {
     const content = message?.content;
-    return Array.isArray(content) ? blockImageChars(content) : 0;
+    return Array.isArray(content) ? blockImageChars(content, shape) : 0;
 }
-function blockImageChars(blocks) {
+function blockImageChars(blocks, shape) {
     let total = 0;
     for (const item of blocks) {
         const block = item;
         if (!block || typeof block !== "object")
             continue;
         const source = block.source;
-        if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
-            total += source.data.length;
+        if (block.type === "image") {
+            if (source?.type === "base64" && typeof source.data === "string") {
+                total += source.data.length;
+                shape.imageDims.push(imageDimensions(source.data));
+            }
+            else {
+                shape.otherImages = true;
+            }
         }
         else if (block.type === "tool_result" && Array.isArray(block.content)) {
-            total += blockImageChars(block.content);
+            total += blockImageChars(block.content, shape);
         }
     }
     return total;

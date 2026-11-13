@@ -14,6 +14,13 @@ export interface BodyShape {
      * usage may describe the edited input, so it never anchors a size (review r2 P3).
      */
     serverEdits: boolean;
+    /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
+    imageDims: Array<[number, number] | undefined>;
+    /**
+     * The messages hold an image that is not inline base64 (a URL or file): its content can
+     * change under an unchanged digest, so the body never anchors a size (Codex r4 P1).
+     */
+    otherImages: boolean;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
 export declare function bodyShape(body: Buffer): BodyShape | undefined;

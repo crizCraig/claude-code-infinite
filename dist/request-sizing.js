@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { RETRYABLE_COUNT_OUTCOMES, exceedsRequestLimit, plausibleSample, shouldCountTokens } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
-import { bodyImages, rememberImages } from "./image-tokens.js";
+import { bodyImages, imageTier, rememberImages, visualTokens } from "./image-tokens.js";
 import { bodyShape, knownShape, prefixDigest, rememberShape, textBytes } from "./body-shape.js";
 import { conservativeBodyTokens, conservativeTokensFromBytes } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
@@ -33,7 +33,7 @@ export class RequestSizing {
         const images = bodyImages(body, this.model);
         const plain = conservativeBodyTokens(body, this.model);
         const conservativeTokens = Math.min(plain, (extendsSample(snapshot, body, this.model) &&
-            anchoredBound(snapshot, bodyShape(body), images, this.model)) || Infinity);
+            anchoredBound(snapshot, bodyShape(body), this.model)) || Infinity);
         const owned = Buffer.from(body);
         // The same totals and shape answer for the owned copy (reportedSample of the sent bytes).
         rememberImages(owned, this.model, images);
@@ -249,13 +249,13 @@ export const ANCHOR_MARGIN = 0.1;
  * canonical messages, never a raw byte difference, which a re-encoded prefix (escapes
  * written literally) could shrink to hide new content (Codex r2 P1).
  */
-export function anchoredBound(sample, shape, images, model) {
+export function anchoredBound(sample, shape, model) {
     if (!plausibleSample(sample) || sample.imageBytes === undefined ||
         sample.imageTokens === undefined || sample.messageCount === undefined)
         return undefined;
-    // Images the shape left out of the text must be the images charged below; a body whose
-    // JSON hides an image from the byte scan (an escaped "type") gets no anchor (Codex r3 P1).
-    if (shape.imageChars.reduce((sum, chars) => sum + chars, 0) !== images.imageBytes)
+    // Mutable (URL) images never anchor (Codex r4 P1); every inline image is charged from the
+    // same parse that left it out of the text, so none escapes both (Codex r3 P1).
+    if (shape.otherImages)
         return undefined;
     const sampled = textBytes(shape, 0, sample.messageCount);
     const appended = textBytes(shape, sample.messageCount);
@@ -263,7 +263,12 @@ export function anchoredBound(sample, shape, images, model) {
         return undefined;
     const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
     return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
-        conservativeTokensFromBytes(appended, model) + images.imageTokens;
+        conservativeTokensFromBytes(appended, model) + shapeImageTokens(shape, model);
+}
+/** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */
+function shapeImageTokens(shape, model) {
+    const tier = imageTier(model);
+    return shape.imageDims.reduce((sum, size) => sum + (size ? visualTokens(size[0], size[1], tier) : tier.maxTokens), 0);
 }
 /**
  * Whether `body` extends the body `sample` measured, on the same model: the sample's
