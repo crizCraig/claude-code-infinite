@@ -12,6 +12,8 @@ export interface Ref {
     digest: string;
     marks: unknown[][];
     header?: unknown;
+    /** Length of the hashed JSON (the message without its marks and header). */
+    chars: number;
 }
 /** A body as sent, and the hashes it names by ref (hex, in order). */
 export interface Delta {

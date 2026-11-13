@@ -47,6 +47,8 @@ export interface Ref {
   digest: string;
   marks: unknown[][];
   header?: unknown;
+  /** Length of the hashed JSON (the message without its marks and header). */
+  chars: number;
 }
 
 /** A body as sent, and the hashes it names by ref (hex, in order). */
@@ -144,7 +146,14 @@ export class MessageRefs {
     const inRow = (this.allMissing.get(lane) ?? 0) + 1;
     this.allMissing.set(lane, inRow);
     boundMap(this.allMissing, SESSIONS_MAX);
-    if (inRow >= ALL_MISSING_MAX) this.off.add(lane);
+    if (inRow >= ALL_MISSING_MAX) {
+      this.off.add(lane);
+      while (this.off.size > SESSIONS_MAX) {
+        const first = this.off.values().next().value;
+        if (first === undefined) break;
+        this.off.delete(first);
+      }
+    }
   }
 
   private forget(lane: string, hashes: readonly string[]): void {
@@ -186,9 +195,12 @@ export function buildDelta(messages: Message[], acked: ReadonlySet<string>): Del
     const ref = eligible ? refFor(message, !headerSeen) : undefined;
     headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
     if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS) return message;
+    const named = refJson(ref);
+    // A short message is smaller than its ref: sent as it is.
+    if (JSON.stringify(named).length >= ref.chars) return message;
     marks += ref.marks.length;
     refs.push(ref.digest);
-    return refJson(ref);
+    return named;
   });
   return refs.length ? { messages: out, refs } : { messages, refs: [] };
 }
@@ -204,8 +216,9 @@ export function refFor(message: Message, stripHeader = true): Ref | undefined {
   const form = header === undefined ? message
     : { ...message, content: (message.content as unknown[]).slice(1) };
   const marks: unknown[][] = [];
-  const stripped = withoutCacheControl(form, [], marks);
-  return { digest: hashOf(stripped), marks, ...(header !== undefined ? { header } : {}) };
+  const text = JSON.stringify(withoutCacheControl(form, [], marks));
+  return { digest: hashText(text), marks, chars: text.length,
+    ...(header !== undefined ? { header } : {}) };
 }
 
 /** The digests an answer's acks allow for `messages`, in the request's header order. */
@@ -246,7 +259,11 @@ function refJson(ref: Ref): Message {
 }
 
 function hashOf(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+  return hashText(JSON.stringify(value));
+}
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 function billingHeaderOf(message: Message): unknown {

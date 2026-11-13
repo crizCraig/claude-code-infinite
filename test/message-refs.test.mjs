@@ -18,12 +18,13 @@ function conversation(turns = 3) {
   const out = [
     { role: "system", content: [
       { type: "text", text: "x-anthropic-billing-header: cc_version=2; cch=1;" },
-      { type: "text", text: "You are Claude Code.", cache_control: { type: "ephemeral" } }] },
+      { type: "text", text: "You are Claude Code. ".repeat(20), cache_control: { type: "ephemeral" } }] },
     { role: "user", content: [{ type: "text", text: "<system-reminder>ctx</system-reminder>" }] },
     { role: "user", content: "Fix the bug" },
   ];
   for (let i = 0; i < turns; i++) {
-    out.push({ role: "assistant", content: [{ type: "tool_use", id: `t${i}`, name: "Read", input: {} }] });
+    out.push({ role: "assistant", content: [{ type: "tool_use", id: `t${i}`, name: "Read",
+      input: { path: `/src/${"dir/".repeat(30)}file${i}.ts` } }] });
     out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `t${i}`,
       content: i === 0 ? [{ type: "image", source: { type: "base64", media_type: "image/png", data: PNG } }]
         : `output ${i} `.repeat(200) }] });
@@ -63,6 +64,10 @@ test("a delta names acked messages after the opening; the opening and reminders 
   assert.ok(delta.messages.slice(3).every((m) => REF_KEY in m));
   assert.equal(delta.refs.length, messages.length - 2);
   assert.deepEqual(buildDelta(messages, new Set()), { messages, refs: [] });
+  const short = [...messages, { role: "assistant", content: "ok" }];
+  const shortAcked = new Set([...acked, refFor(short.at(-1)).digest]);
+  assert.equal(buildDelta(short, shortAcked).messages.at(-1), short.at(-1),
+    "a message shorter than its ref is sent as it is");
   const noOpening = [messages[0], messages[1]];
   assert.deepEqual(buildDelta(noOpening, acked).refs, [], "no opening: everything inline");
 });
