@@ -60,8 +60,9 @@ export interface RefusalFacts {
 }
 /** Which cause explains this refusal (first match wins). */
 export declare function refusalCause(rec: RefusalEvidence, facts: RefusalFacts): RefusalCause;
-/** The refusal's one line, ending with where the session's MemTree page is. */
-export declare function refusalMessage(cause: RefusalCause, sessionLink?: string): string;
+/** The refusal's one line, ending with where the session's MemTree page is; `note`
+ * (a sentence, e.g. that an agent's result waits) goes before the link. */
+export declare function refusalMessage(cause: RefusalCause, sessionLink?: string, note?: string): string;
 /** "1.2M", "480k", "900": rounded for a one-line message. */
 export declare function tokensText(tokens: number): string;
 /** "3 min", "1.5 h": minutes rounded up, hours from two on. */

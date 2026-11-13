@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { RETRYABLE_COUNT_OUTCOMES, exceedsRequestLimit, plausibleSample, shouldCountTokens } from "./count-tokens.js";
 import { approxTokensFromBytes } from "./reqlog.js";
 import { bodyImages, rememberImages } from "./image-tokens.js";
-import { conservativeBodyTokens } from "./token-estimate.js";
+import { conservativeBodyTokens, conservativeTokensFromBytes } from "./token-estimate.js";
 import { acceptsContextOverflow } from "./turns.js";
 /** Output room kept free on models that accept input + max_tokens over the
  * window, so the model can still answer a request that barely fits. */
@@ -29,8 +29,8 @@ export class RequestSizing {
         if (existing)
             return existing;
         const snapshot = plausibleSample(sample) ? Object.freeze({ ...sample }) : undefined;
-        const conservativeTokens = conservativeBodyTokens(body, this.model);
         const images = bodyImages(body, this.model);
+        const conservativeTokens = Math.min(conservativeBodyTokens(body, this.model), anchoredBound(snapshot, body.length, images, this.model) ?? Infinity);
         const owned = Buffer.from(body);
         // The same totals answer for the owned copy (reportedSample of the sent bytes).
         rememberImages(owned, this.model, images);
@@ -103,7 +103,7 @@ export class RequestSizing {
             };
         // Delivery counts whenever an estimate is all that says the body fits: the
         // learned estimate, or the conservative bound, does not fit on its own.
-        const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget) ||
+        const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget, bodyImages(candidate.body, this.model)) ||
             (phase === "delivery" && !(fitsNative(estimate, estimateLimits(limits)) &&
                 fitsNative(candidate.conservativeTokens, estimateLimits(limits))));
         if (!count && this.enabled && needed)
@@ -220,6 +220,41 @@ export function estimateRequestTokens(sample, bytes, images = NO_IMAGE_TOTALS) {
     const text = textBytes <= sampleBytes ? Math.round(textBytes * ratio) : sampleTokens +
         Math.max(approxTokensFromBytes(textBytes - sampleBytes), Math.round((textBytes - sampleBytes) * ratio));
     return { tokens: text + images.imageTokens, source: "reported" };
+}
+/**
+ * Share of a body's text its sample must already have measured for anchoredBound,
+ * and the margin added on the sample's own tokens. See anchoredBound.
+ */
+export const ANCHOR_MIN_COVERAGE = 0.75;
+export const ANCHOR_MARGIN = 0.1;
+/**
+ * An upper bound anchored on Anthropic's own count of an earlier body of the same
+ * lane and shape (`sample`), for a body that grew from it: the sample's text tokens
+ * plus ANCHOR_MARGIN, the text added since at the conservative per-model ratio, and
+ * every image at its visual tokens. Undefined without a sample that recorded its
+ * images, when the body's text shrank (not a growth of the sampled body), or when the
+ * sample measured under ANCHOR_MIN_COVERAGE of it.
+ *
+ * Why: the plain bound reads all non-image bytes at 1.9 bytes per token. Base64 that
+ * is not an image (thinking signatures, JSON escapes) is far cheaper, so an
+ * image-heavy agent lane Anthropic counted at 491k tokens had a plain bound over its
+ * 1M window (2026-11-12, ai-safety-sim): every turn was counted (a 22 MB re-upload,
+ * 2.0 GB on that lane) and a timed-out count compressed a half-full lane. The margin
+ * covers what growth does not: Claude Code editing earlier messages (it only drops
+ * content in practice) and tokenizer variance within the measured part; the part it
+ * cannot vouch for is bounded at the conservative ratio like before.
+ */
+export function anchoredBound(sample, bytes, images, model) {
+    if (!plausibleSample(sample) || sample.imageBytes === undefined ||
+        sample.imageTokens === undefined)
+        return undefined;
+    const sampleText = sample.forwardedBytes - sample.imageBytes;
+    const text = bytes - images.imageBytes;
+    if (text < sampleText || sampleText < ANCHOR_MIN_COVERAGE * text)
+        return undefined;
+    const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
+    return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
+        conservativeTokensFromBytes(text - sampleText, model) + images.imageTokens;
 }
 const NO_IMAGE_TOTALS = Object.freeze({ imageBytes: 0, imageTokens: 0 });
 //# sourceMappingURL=request-sizing.js.map

@@ -31,7 +31,12 @@ export declare function visualTokens(width: number, height: number, tier?: {
 }): number;
 /** Claude before 4.7 is standard; 4.7+, other and unknown models are high-res. */
 export declare function imageTier(model: string | undefined): typeof HIGH_RES;
-/** Width and height from a PNG, GIF, WebP or JPEG header; undefined when unreadable. */
+/**
+ * Width and height from a PNG, GIF, WebP or JPEG header; undefined when unreadable.
+ * Only the header is decoded (the first HEADER_BASE64_CHARS characters); a JPEG whose
+ * frame header sits past that (large EXIF or ICC segments) is walked segment by
+ * segment, decoding a few bytes at each marker (jpegSizeAt), never the whole image.
+ */
 export declare function imageDimensions(base64: string): [number, number] | undefined;
 export {};
 //# sourceMappingURL=image-tokens.d.ts.map

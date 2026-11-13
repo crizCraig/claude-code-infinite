@@ -50,11 +50,12 @@ export function refusalCause(rec, facts) {
     return { kind: "over-budget", inputTokens: facts.inputTokens,
         contextTokens: facts.modelContextLimit };
 }
-/** The refusal's one line, ending with where the session's MemTree page is. */
-export function refusalMessage(cause, sessionLink) {
+/** The refusal's one line, ending with where the session's MemTree page is; `note`
+ * (a sentence, e.g. that an agent's result waits) goes before the link. */
+export function refusalMessage(cause, sessionLink, note) {
     const where = sessionLink ? ` Session: ${sessionLink}`
         : ` Session link: /${SESSION_PLUGIN_NAME}:${MEMTREE_VIEW_COMMAND}.`;
-    return `${causeText(cause)}${where}`;
+    return `${causeText(cause)}${note ? ` ${note}` : ""}${where}`;
 }
 const COMPACT_OR_CLEAR = `/${SESSION_PLUGIN_NAME}:${MEMTREE_COMPACT_COMMAND} or /clear`;
 function causeText(cause) {

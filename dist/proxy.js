@@ -43,6 +43,7 @@ import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage } from "./refusal-reason.js";
+import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { SlowUploads } from "./slow-upload.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
@@ -382,6 +383,7 @@ export function startProxy(opts) {
         fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs, opts.indexWaitMaxMs),
         refusalStreaks: new RefusalStreaks(),
         activeSubagents: new Set(),
+        laneActivity: new LaneActivity(),
         deferredAgentIndexes: new Map(),
         adoptingPrepared: new Map(),
         memoryRoutes: new Map(),
@@ -1431,6 +1433,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         }
     }
     rec.routeLane = requestRouteLane;
+    noteLaneActivity(state, rec, requestSessionId(req), rawBody, body.model);
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
     const clientMeta = memtreeClientMeta({
@@ -5227,7 +5230,13 @@ async function recoverToolRouteMiss(args) {
 function recordTurn(rec, turnType, forwardBody) {
     rec.turnType = turnType;
     rec.forwardedBytes = forwardBody.length;
-    rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
+    rec.approxInputTokens = approxBodyTokens(forwardBody, rec.model);
+}
+/** A body's text at bytes/4 plus its inline images at their visual tokens (log only):
+ * bytes/4 alone logged a 22 MB contact-sheet lane at 5.5M tokens (Anthropic: 491k). */
+function approxBodyTokens(body, model) {
+    const images = bodyImages(body, typeof model === "string" ? model : undefined);
+    return approxTokensFromBytes(body.length - images.imageBytes) + images.imageTokens;
 }
 function headerText(headers, name) {
     const value = headers[name];
@@ -5707,7 +5716,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
             : offline ? unreachableRefusal(offline.message)
                 : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
                     indexSecondsLeft: activeIndexWaits.get(args.rec),
-                    refusalMessage: refusalMessage(cause, currentSessionLink(args.state, requestSessionId(args.req))) });
+                    refusalMessage: refusalMessage(cause, currentSessionLink(args.state, requestSessionId(args.req)), agentResultNote(args)) });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -5750,6 +5759,16 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         args.state.keyNotice.markShown();
     return false;
 }
+/**
+ * A main-lane refusal while an agent lane of the session was recently active: a
+ * background agent's finished result reaches the main session only as part of its
+ * next turn, so say it may be waiting (2026-11-13: a refused main lane held one back).
+ */
+function agentResultNote(args) {
+    const agents = args.state.laneActivity.agentRecent(requestSessionId(args.req)) ||
+        args.state.activeSubagents.size > 0;
+    return args.rec.routeLane === "main" && agents ? AGENT_RESULT_WAITING_LINE : undefined;
+}
 /** Requests held back by a lane backoff whose attempt MemTree answered (unreachableNow). */
 const answeredBackoffs = new WeakSet();
 /**
@@ -5780,6 +5799,21 @@ function unreachableNow(state, rec) {
     const anthropic = freshFailure(state.anthropicUnreachable());
     return { message: unreachableMessage(memtree, anthropic),
         what: anthropic ? "internet" : "memtree" };
+}
+/**
+ * Note this request's size and lane (lane-activity.ts) and, on a main-lane request of
+ * the current prompt, queue the session's one heavy-request warning when one is due
+ * and no other notice waits (a later notice replacing it undelivered leaves it due).
+ */
+function noteLaneActivity(state, rec, sessionId, rawBody, model) {
+    const { imageBytes } = bodyImages(rawBody, typeof model === "string" ? model : undefined);
+    state.laneActivity.note(sessionId, rec.routeLane, { bytes: rawBody.length, imageBytes });
+    const heavy = state.laneActivity.heavyDue(sessionId);
+    const prompt = noticeContexts.get(rec);
+    if (!heavy || sessionId === undefined || rec.routeLane !== "main" || prompt === undefined ||
+        prompt.generation !== state.mainPromptGeneration || state.notices.hasPending())
+        return;
+    state.notices.queueSuffix(heavyRequestNoticeText(heavy), () => state.laneActivity.markWarned(sessionId), prompt.promptId);
 }
 /**
  * A repeated retryable refusal on the main thread: say once per streak that

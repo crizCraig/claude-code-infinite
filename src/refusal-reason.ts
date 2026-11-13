@@ -82,11 +82,12 @@ export function refusalCause(rec: RefusalEvidence, facts: RefusalFacts): Refusal
     contextTokens: facts.modelContextLimit };
 }
 
-/** The refusal's one line, ending with where the session's MemTree page is. */
-export function refusalMessage(cause: RefusalCause, sessionLink?: string): string {
+/** The refusal's one line, ending with where the session's MemTree page is; `note`
+ * (a sentence, e.g. that an agent's result waits) goes before the link. */
+export function refusalMessage(cause: RefusalCause, sessionLink?: string, note?: string): string {
   const where = sessionLink ? ` Session: ${sessionLink}`
     : ` Session link: /${SESSION_PLUGIN_NAME}:${MEMTREE_VIEW_COMMAND}.`;
-  return `${causeText(cause)}${where}`;
+  return `${causeText(cause)}${note ? ` ${note}` : ""}${where}`;
 }
 
 const COMPACT_OR_CLEAR = `/${SESSION_PLUGIN_NAME}:${MEMTREE_COMPACT_COMMAND} or /clear`;

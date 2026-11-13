@@ -74,9 +74,14 @@ export declare function plausibleSample(sample: SizeSample | undefined): sample 
  * Whether to count a request of `bytes` before deciding on it: with no usable
  * sample once its estimate is a real share of the budget, and with one only
  * after a jump of new content brings it near the budget. Small growth on a
- * calibrated sample is estimated well and is not counted.
+ * calibrated sample is estimated well and is not counted. `images` are the
+ * body's inline images: added images jump by their visual tokens, not by their
+ * base64 read as text (a 470 KB contact sheet is ~3.5k tokens, not ~117k).
  */
-export declare function shouldCountTokens(sample: SizeSample | undefined, bytes: number, estimateTokens: number, budgetTokens: number): boolean;
+export declare function shouldCountTokens(sample: SizeSample | undefined, bytes: number, estimateTokens: number, budgetTokens: number, images?: {
+    imageBytes: number;
+    imageTokens: number;
+}): boolean;
 /** Shared per proxy; only hashes of account/upstream identity are stored. */
 export declare class CountTokensCooldowns {
     private readonly capacity;

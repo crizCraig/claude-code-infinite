@@ -136,20 +136,33 @@ export function plausibleSample(sample: SizeSample | undefined): sample is SizeS
  * Whether to count a request of `bytes` before deciding on it: with no usable
  * sample once its estimate is a real share of the budget, and with one only
  * after a jump of new content brings it near the budget. Small growth on a
- * calibrated sample is estimated well and is not counted.
+ * calibrated sample is estimated well and is not counted. `images` are the
+ * body's inline images: added images jump by their visual tokens, not by their
+ * base64 read as text (a 470 KB contact sheet is ~3.5k tokens, not ~117k).
  */
 export function shouldCountTokens(
   sample: SizeSample | undefined,
   bytes: number,
   estimateTokens: number,
-  budgetTokens: number
+  budgetTokens: number,
+  images?: { imageBytes: number; imageTokens: number }
 ): boolean {
   if (!(budgetTokens > 0)) return false;
   if (!plausibleSample(sample)) return estimateTokens >= UNCALIBRATED_COUNT_SHARE * budgetTokens;
   if (bytes <= sample.forwardedBytes) return false;
-  const addedTokens = approxTokensFromBytes(bytes - sample.forwardedBytes);
-  return addedTokens >= JUMP_BUDGET_SHARE * budgetTokens &&
+  return addedTokens(sample, bytes, images) >= JUMP_BUDGET_SHARE * budgetTokens &&
     estimateTokens >= NEAR_BUDGET_SHARE * budgetTokens;
+}
+
+/** New content since `sample`: text at bytes/4, images at their visual tokens. */
+function addedTokens(
+  sample: SizeSample, bytes: number, images?: { imageBytes: number; imageTokens: number }
+): number {
+  if (!images || sample.imageBytes === undefined || sample.imageTokens === undefined) {
+    return approxTokensFromBytes(bytes - sample.forwardedBytes);
+  }
+  const text = Math.max(0, (bytes - images.imageBytes) - (sample.forwardedBytes - sample.imageBytes));
+  return approxTokensFromBytes(text) + Math.max(0, images.imageTokens - sample.imageTokens);
 }
 
 /** Shared per proxy; only hashes of account/upstream identity are stored. */

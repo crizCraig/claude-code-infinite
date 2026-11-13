@@ -14,7 +14,7 @@
  * One JSON object per line. `ts` (ISO 8601) and `pid` (the ccc process, which
  * tells apart concurrent ccc sessions sharing this file) are stamped here so
  * callers only supply event fields. Token counts under `approxInputTokens` are a rough
- * bytes/4 chars→tokens proxy, NOT real tokenizer output — exact usage, when
+ * proxy (text bytes/4, images by their dimensions), NOT real tokenizer output — exact usage, when
  * the response format lets us extract it cheaply, lands under `usage`.
  */
 import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
@@ -157,7 +157,8 @@ export interface MessagesRecord {
     };
     /** Body bytes actually sent to Anthropic (after notice strip / compression). */
     forwardedBytes?: number;
-    /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
+    /** Text bytes/4 plus inline images at their visual tokens — a rough proxy, not a
+     * tokenizer count. */
     approxInputTokens?: number;
     /**
      * A failed compress on a visible turn: "shown" queued the degraded notice

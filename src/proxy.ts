@@ -45,6 +45,7 @@ import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal,
   unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage, type RefusalCause } from "./refusal-reason.js";
+import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { SlowUploads } from "./slow-upload.js";
 import type { StatusLinkFiles } from "./status-link.js";
 import {
@@ -571,6 +572,8 @@ interface ProxyState {
   refusalStreaks: RefusalStreaks;
   /** Suppress producer-side state changes while agent API traffic is active. */
   activeSubagents: Set<string>;
+  /** Heavy request bodies and recent agent lanes per session (lane-activity.ts). */
+  laneActivity: LaneActivity;
   /**
    * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
    * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
@@ -1155,6 +1158,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       opts.indexWaitMaxMs),
     refusalStreaks: new RefusalStreaks(),
     activeSubagents: new Set(),
+    laneActivity: new LaneActivity(),
     deferredAgentIndexes: new Map(),
     adoptingPrepared: new Map(),
     memoryRoutes: new Map(),
@@ -2321,6 +2325,7 @@ async function handleMessages(
     }
   }
   rec.routeLane = requestRouteLane;
+  noteLaneActivity(state, rec, requestSessionId(req), rawBody, body.model);
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
   const clientMeta = memtreeClientMeta({
@@ -6987,7 +6992,14 @@ function recordTurn(
 ): void {
   rec.turnType = turnType;
   rec.forwardedBytes = forwardBody.length;
-  rec.approxInputTokens = approxTokensFromBytes(forwardBody.length);
+  rec.approxInputTokens = approxBodyTokens(forwardBody, rec.model);
+}
+
+/** A body's text at bytes/4 plus its inline images at their visual tokens (log only):
+ * bytes/4 alone logged a 22 MB contact-sheet lane at 5.5M tokens (Anthropic: 491k). */
+function approxBodyTokens(body: Buffer, model: unknown): number {
+  const images = bodyImages(body, typeof model === "string" ? model : undefined);
+  return approxTokensFromBytes(body.length - images.imageBytes) + images.imageTokens;
 }
 
 function headerText(
@@ -7563,7 +7575,8 @@ function refuseWholeRequest(
     : args.state.fallbackFailures.fail(args.routeKey,
       { awaitingIndex: args.rec.indexBehind === true,
         indexSecondsLeft: activeIndexWaits.get(args.rec),
-        refusalMessage: refusalMessage(cause!, currentSessionLink(args.state, requestSessionId(args.req))) });
+        refusalMessage: refusalMessage(cause!,
+          currentSessionLink(args.state, requestSessionId(args.req)), agentResultNote(args)) });
   args.rec.forwardedBytes = 0;
   args.rec.approxInputTokens = 0;
   // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -7603,6 +7616,19 @@ function refuseWholeRequest(
   return false;
 }
 
+/**
+ * A main-lane refusal while an agent lane of the session was recently active: a
+ * background agent's finished result reaches the main session only as part of its
+ * next turn, so say it may be waiting (2026-11-13: a refused main lane held one back).
+ */
+function agentResultNote(
+  args: { state: ProxyState; rec: MessagesRecord; req: http.IncomingMessage },
+): string | undefined {
+  const agents = args.state.laneActivity.agentRecent(requestSessionId(args.req)) ||
+    args.state.activeSubagents.size > 0;
+  return args.rec.routeLane === "main" && agents ? AGENT_RESULT_WAITING_LINE : undefined;
+}
+
 /** Requests held back by a lane backoff whose attempt MemTree answered (unreachableNow). */
 const answeredBackoffs = new WeakSet<MessagesRecord>();
 
@@ -7635,6 +7661,25 @@ function unreachableNow(
   const anthropic = freshFailure(state.anthropicUnreachable());
   return { message: unreachableMessage(memtree, anthropic),
     what: anthropic ? "internet" : "memtree" };
+}
+
+/**
+ * Note this request's size and lane (lane-activity.ts) and, on a main-lane request of
+ * the current prompt, queue the session's one heavy-request warning when one is due
+ * and no other notice waits (a later notice replacing it undelivered leaves it due).
+ */
+function noteLaneActivity(
+  state: ProxyState, rec: MessagesRecord, sessionId: string | undefined, rawBody: Buffer,
+  model: unknown,
+): void {
+  const { imageBytes } = bodyImages(rawBody, typeof model === "string" ? model : undefined);
+  state.laneActivity.note(sessionId, rec.routeLane, { bytes: rawBody.length, imageBytes });
+  const heavy = state.laneActivity.heavyDue(sessionId);
+  const prompt = noticeContexts.get(rec);
+  if (!heavy || sessionId === undefined || rec.routeLane !== "main" || prompt === undefined ||
+      prompt.generation !== state.mainPromptGeneration || state.notices.hasPending()) return;
+  state.notices.queueSuffix(heavyRequestNoticeText(heavy),
+    () => state.laneActivity.markWarned(sessionId), prompt.promptId);
 }
 
 /**

@@ -41,6 +41,7 @@
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
+import { LaneActivity } from "./lane-activity.js";
 import { SlowUploads } from "./slow-upload.js";
 import type { StatusLinkFiles } from "./status-link.js";
 import { type NetworkFailure } from "./network-failure.js";
@@ -388,6 +389,8 @@ interface ProxyState {
     refusalStreaks: RefusalStreaks;
     /** Suppress producer-side state changes while agent API traffic is active. */
     activeSubagents: Set<string>;
+    /** Heavy request bodies and recent agent lanes per session (lane-activity.ts). */
+    laneActivity: LaneActivity;
     /**
      * Per subagent conversation (deferredIndexKey), its newest index call not yet sent: a subagent is indexed
      * once, when it ends (SubagentStop), until it passes AGENT_PER_TURN_INDEX_SHARE of its
