@@ -9,7 +9,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { StatusLinkFiles, readStatusLink } from "../dist/status-link.js";
 import {
-  STATUSLINE_COMMAND, installStatusline, linkSegment, renderStatusline, uninstallStatusline,
+  STATUSLINE_COMMAND, WRAPPED_ENV, installStatusline, linkSegment, renderStatusline,
+  statusLineWantsLink, statuslinePaths, uninstallStatusline,
 } from "../dist/statusline.js";
 import {
   NEWEST_TREE_CURRENT_WAIT_MS, NEWEST_TREE_FETCH_TIMEOUT_MS, NewestTreeLookup,
@@ -137,4 +138,68 @@ test("newest-tree lookups run in the background long enough for the slow session
   lookup.onTree((id, tree) => seen.push([id, tree.url]));
   await lookup.settle(SESSION, 1_000);
   assert.deepEqual(seen, [[SESSION, URL2]]);
+});
+
+test("a wrapped command that itself runs ccc's status line prints nothing inside, never recurses", () => {
+  const { paths } = setup({ type: "command", command: "/opt/homebrew/bin/ccc statusline" });
+  const result = installStatusline(paths);
+  assert.equal(result.ok, true);
+  assert.match(result.message, /already installed/, "another spelling of ccc's is ccc's");
+  const input = JSON.stringify({ session_id: SESSION });
+  assert.equal(renderStatusline(input, paths, { ...APPLE_TERMINAL, [WRAPPED_ENV]: "1" }), "");
+  for (const command of ["npx claude-code-infinite statusline", "bash -c 'ccc statusline'",
+    "ccc.cmd statusline"]) {
+    const other = setup({ type: "command", command });
+    installStatusline(other.paths);
+    assert.equal(fs.existsSync(other.paths.saved), false, `${command} is never wrapped`);
+  }
+});
+
+test("install keeps a symlinked settings file a symlink, and its mode", { skip: process.platform === "win32" }, () => {
+  const { dir, paths } = setup({ type: "command", command: OWN_COMMAND });
+  const real = path.join(dir, "dotfiles-settings.json");
+  fs.renameSync(paths.settings, real);
+  fs.chmodSync(real, 0o600);
+  fs.symlinkSync(real, paths.settings);
+  installStatusline(paths);
+  assert.equal(fs.lstatSync(paths.settings).isSymbolicLink(), true);
+  assert.equal(fs.statSync(real).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(fs.readFileSync(real, "utf-8")).statusLine.command, STATUSLINE_COMMAND);
+  uninstallStatusline(paths);
+  assert.equal(fs.lstatSync(paths.settings).isSymbolicLink(), true);
+  assert.equal(fs.statSync(real).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(fs.readFileSync(real, "utf-8")).statusLine.command, OWN_COMMAND);
+});
+
+test("install is refused on Windows (Claude Code runs status lines in Git Bash there)", () => {
+  const { paths } = setup({ type: "command", command: OWN_COMMAND });
+  assert.equal(installStatusline(paths, "win32").ok, false);
+  assert.equal(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine.command, OWN_COMMAND);
+});
+
+test("each Claude config dir saves its own original", () => {
+  const a = statuslinePaths({ CLAUDE_CONFIG_DIR: "/tmp/a" });
+  const b = statuslinePaths({ CLAUDE_CONFIG_DIR: "/tmp/b" });
+  assert.notEqual(a.saved, b.saved);
+  assert.notEqual(a.saved, statuslinePaths({}).saved);
+});
+
+test("the proxy refreshes per request only for a status line that shows the link", () => {
+  const check = (command) => {
+    const { paths } = setup(command ? { type: "command", command } : undefined);
+    return statusLineWantsLink(paths.settings);
+  };
+  assert.equal(check("ccc statusline"), true);
+  assert.equal(check(`${OWN_COMMAND}; cat ~/.claude-code-infinite/statusline/x.url`), true);
+  assert.equal(check(OWN_COMMAND), false);
+  assert.equal(check(undefined), false);
+});
+
+test("a link file another process pruned is written again on the next refresh", () => {
+  const dir = tmp();
+  const files = new StatusLinkFiles(dir);
+  files.write(SESSION, URL1);
+  fs.unlinkSync(path.join(dir, `${SESSION}.url`));
+  files.write(SESSION, URL1);
+  assert.equal(readStatusLink(SESSION, dir), URL1);
 });

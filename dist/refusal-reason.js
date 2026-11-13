@@ -32,10 +32,13 @@ export function refusalCause(rec, facts) {
                 unindexedTokens: rec.indexLag?.unindexedTokens }) };
     }
     const compress = rec.compress;
-    if (compress?.timedOut) {
+    if (compress?.timedOut && compress.uploadTimeout) {
         return { kind: "upload-timeout", bytes: rec.requestBytes ?? 0, ms: compress.ms,
             ...defined({ nextBudgetMs: facts.nextCompressBudgetMs }) };
     }
+    // Small, short-budget or cut short by a hold: MemTree was slow, not the upload.
+    if (compress?.timedOut)
+        return { kind: "slow-answer", ms: compress.ms };
     const failed = compress !== undefined && !compress.ok && !compress.refused;
     if (failed && rec.compaction?.reason === "prefix-mismatch") {
         return { kind: "rebuilding", ...defined({ secondsLeft: serverSeconds }) };
@@ -56,6 +59,9 @@ function causeText(cause) {
     switch (cause.kind) {
         case "indexing": return indexingText(cause.secondsLeft, cause.unindexedTokens);
         case "upload-timeout": return uploadTimeoutText(cause);
+        case "slow-answer":
+            return `MemTree didn't answer within ${secondsText(cause.ms)}. Retry in a minute; if it ` +
+                `keeps happening, run ${COMPACT_OR_CLEAR}.`;
         case "rebuilding": return rebuildingText(cause.secondsLeft);
         case "compress-failed":
             return `MemTree couldn't compress this turn${cause.status ? ` (HTTP ${cause.status})` : ""}. ` +
@@ -76,14 +82,15 @@ function indexingText(secondsLeft, unindexedTokens) {
         ? `MemTree is still indexing ${what}. Retry in a few minutes.`
         : `MemTree is still indexing ${what} (~${durationText(seconds)}). Retry then.`;
 }
-/** "MemTree timed out after 139 s receiving this 51 MB request (slow upload?). ..." */
+/** "MemTree timed out after 139 s on this 51 MB request (likely a slow upload). ..." */
 function uploadTimeoutText(cause) {
-    const size = cause.bytes > 0 ? ` receiving this ${megabytesText(cause.bytes)} request` : "";
-    const next = cause.nextBudgetMs !== undefined && cause.nextBudgetMs > cause.ms
+    const size = cause.bytes > 0 ? ` on this ${megabytesText(cause.bytes)} request` : "";
+    // Only a clearly longer wait is worth naming (this try may already have had it).
+    const next = cause.nextBudgetMs !== undefined && cause.nextBudgetMs > cause.ms * 1.2
         ? `Retry: the next try waits up to ${secondsText(cause.nextBudgetMs)}. `
-        : "Retry on a faster connection. ";
-    return `MemTree timed out after ${secondsText(cause.ms)}${size} (slow upload?). ${next}` +
-        "CCC_COMPRESS_TIMEOUT_MS (ms) allows longer.";
+        : "Retry, ideally on a faster connection. ";
+    return `MemTree timed out after ${secondsText(cause.ms)}${size} (likely a slow upload). ${next}` +
+        "CCC_COMPRESS_TIMEOUT_MS (ms) raises the base wait.";
 }
 function rebuildingText(secondsLeft) {
     const when = secondsLeft === undefined ? "Retry in a minute."

@@ -301,7 +301,7 @@ test("an upload that keeps timing out is refused saying so, not \"couldn't fit\"
     assert.deepEqual(statuses, [503, 503, 400]);
     assert.deepEqual(h.budgets, [200, 400, 400], "one longer budget, then no more");
     const message = JSON.parse(last.text).error.message;
-    assert.match(message, /^MemTree timed out after 1 s receiving this 1 MB request \(slow upload\?\)\. Retry on a faster connection\. CCC_COMPRESS_TIMEOUT_MS/);
+    assert.match(message, /^MemTree timed out after 1 s on this 1 MB request \(likely a slow upload\)\. Retry, ideally on a faster connection\. CCC_COMPRESS_TIMEOUT_MS/);
     assert.equal(h.lastRecord().refusal.cause, "upload-timeout");
   } finally { h.close(); }
 });

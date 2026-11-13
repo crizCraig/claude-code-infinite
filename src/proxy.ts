@@ -375,6 +375,11 @@ export interface ProxyOptions {
   /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
   /**
+   * The status line shows that link (statusline.ts statusLineWantsLink): refresh the newest
+   * tree on every request, not only at prompts and turn ends.
+   */
+  statusLinkRefresh?: boolean;
+  /**
    * Per-response token usage (thinking share on the MemTree page), read from
    * Claude Code's transcript. Omitted means none is sent (tests); the CLI
    * passes the reader for ~/.claude/projects.
@@ -624,6 +629,7 @@ interface ProxyState {
   newestTrees?: NewestTreeLookup;
   /** The session's link for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
+  statusLinkRefresh: boolean;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
    * `/memtree-compact` targets by Claude Code session: every compression for
@@ -1172,6 +1178,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       ? opts.memtree.storageIdentity : undefined,
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
+    statusLinkRefresh: opts.statusLinkRefresh === true,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
     defaultCompactOff: opts.defaultCompactTarget === null,
@@ -2244,7 +2251,7 @@ async function handleMessages(
       const link = recapLink(state, sessionId);
       return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
     });
-  } else if (state.statusLinks) {
+  } else if (state.statusLinks && state.statusLinkRefresh) {
     // Keeps the status line's link fresh through long tool runs: answers from the cache,
     // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS).
     state.newestTrees?.peek(requestSessionId(req));
@@ -6327,16 +6334,16 @@ async function runBlockingCompressionOnce(args: {
   // A carried call has not failed: it is still running (its answer reports its health).
   const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
   // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
-  if (args.longBudget && args.capMs === undefined && !carried) {
+  const uploadTimeout = args.longBudget === true && args.capMs === undefined && !carried &&
     state.slowUploads.settled(args.sessionId, rec.requestBytes,
       result !== null ? "ok" : timedOut ? "timeout" : "other");
-  }
   rec.compress = {
     ms: compressMs,
     ok: result !== null,
     timedOut,
     budgetMs,
     ...(extendedBudget ? { extendedBudget: true as const } : {}),
+    ...(uploadTimeout ? { uploadTimeout: true as const } : {}),
     ...(failureStatus !== undefined ? { status: failureStatus } : {}),
     ...(carried ? { carriedOver: true as const } : {}),
     // A joined call's indexing 413 is MemTree's refusal of this request too.
@@ -7501,23 +7508,22 @@ async function wholeRequestRefused(
 
 /** What explains refusing this request (refusal-reason.ts), from its record and the lane. */
 function refusalCauseFor(
-  args: { state: ProxyState; rec: MessagesRecord; modelContextLimit: number; routeKey: string;
-    req: http.IncomingMessage },
+  args: { opts: ProxyOptions; state: ProxyState; rec: MessagesRecord; modelContextLimit: number;
+    routeKey: string; req: http.IncomingMessage },
   inputTokens: number
 ): RefusalCause {
   const { state, rec } = args;
   const sessionId = requestSessionId(args.req);
   const bytes = rec.requestBytes;
-  // After a slow upload: what the session's next try gets, unless this one already had it.
-  const nextCompressBudgetMs = rec.compress?.timedOut && !rec.compress.extendedBudget &&
-    state.slowUploads.extended(sessionId, bytes)
-    ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, state.slowUploads.budgetMs(sessionId, bytes,
-      rec.compress.budgetMs ?? 0))
+  // After a slow upload: what the session's next long-budget try gets.
+  const nextCompressBudgetMs = rec.compress?.uploadTimeout
+    ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, longCompressBudgetFor(args.opts, state, sessionId, bytes))
     : undefined;
+  const stated = activeIndexWaits.get(rec) ?? state.fallbackFailures.indexSecondsLeft(args.routeKey);
   return refusalCause(rec, {
     inputTokens, modelContextLimit: args.modelContextLimit,
-    indexSecondsLeft: activeIndexWaits.get(rec) ??
-      state.fallbackFailures.indexSecondsLeft(args.routeKey),
+    // The 60 s stand-in for an indexing 413 that stated no time is no estimate.
+    indexSecondsLeft: stated === UNKNOWN_INDEX_WAIT_SECONDS ? undefined : stated,
     nextCompressBudgetMs,
   });
 }
@@ -7530,7 +7536,7 @@ function currentSessionLink(state: ProxyState, sessionId: string | undefined): s
 
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(
-  args: { state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
+  args: { opts: ProxyOptions; state: ProxyState; res: http.ServerResponse; rec: MessagesRecord;
     body: Record<string, any>; modelContextLimit: number; routeKey: string;
     req: http.IncomingMessage },
   inputTokens: number,

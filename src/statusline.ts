@@ -14,6 +14,7 @@
  * after every message.
  */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +29,13 @@ export const STATUSLINE_LABEL = "🌿 tree";
 export const STATUSLINE_SEPARATOR = " | ";
 /** The wrapped command gets this long; Claude Code drops a slow status line anyway. */
 const WRAPPED_TIMEOUT_MS = 5_000;
+/**
+ * Set for the wrapped command: a `ccc statusline` inside it (a wrapped command that itself
+ * calls ccc's, under another spelling) prints nothing instead of recursing.
+ */
+export const WRAPPED_ENV = "CCC_STATUSLINE_WRAPPED";
+/** A command that runs ccc's status line, however ccc is spelled (path, npx, a shell). */
+const CCC_STATUSLINE = /(^|[\s/\\'"])(ccc|claude-code-infinite)(\.cmd|\.js)?['"]?\s+statusline\b/;
 
 export interface StatuslinePaths {
   /** Claude Code's user settings (CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json). */
@@ -39,9 +47,11 @@ export interface StatuslinePaths {
 }
 
 export function statuslinePaths(env: NodeJS.ProcessEnv = process.env): StatuslinePaths {
-  const claudeDir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
-  return { settings: path.join(claudeDir, "settings.json"),
-    saved: path.join(getConfigDir(), "statusline.json") };
+  const custom = env.CLAUDE_CONFIG_DIR?.trim();
+  const settings = path.join(custom || path.join(os.homedir(), ".claude"), "settings.json");
+  // One saved original per settings file (a CLAUDE_CONFIG_DIR has its own).
+  const key = custom ? `-${createHash("sha256").update(settings).digest("hex").slice(0, 12)}` : "";
+  return { settings, saved: path.join(getConfigDir(), `statusline${key}.json`) };
 }
 
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
@@ -63,6 +73,7 @@ export async function statuslineMain(
 export function renderStatusline(
   input: string, paths: StatuslinePaths, env: NodeJS.ProcessEnv = process.env
 ): string {
+  if (env[WRAPPED_ENV]) return "";
   const wrapped = savedStatusLine(paths.saved);
   const base = wrapped ? runWrapped(wrapped.command, input) : "";
   const segment = linkSegment(sessionIdOf(input), env, paths.links);
@@ -85,7 +96,14 @@ export function linkSegment(
  * Point Claude Code's statusLine at `ccc statusline`, saving the current one to wrap.
  * Re-running is harmless; a statusLine that is not a command is left alone.
  */
-export function installStatusline(paths: StatuslinePaths): { ok: boolean; message: string } {
+export function installStatusline(
+  paths: StatuslinePaths, platform: NodeJS.Platform = process.platform
+): { ok: boolean; message: string } {
+  // Claude Code runs a statusLine through Git Bash there; ccc would run it under cmd.exe.
+  if (platform === "win32") {
+    return { ok: false, message: "ccc statusline install is not supported on Windows yet. " +
+      "Add the link with the snippet in ccc's README instead." };
+  }
   const settings = readSettings(paths.settings);
   if (!settings.ok) return { ok: false, message: settings.message };
   const current = settings.value.statusLine as Record<string, unknown> | undefined;
@@ -131,20 +149,21 @@ export function uninstallStatusline(paths: StatuslinePaths): { ok: boolean; mess
 
 function isOurs(statusLine: unknown): boolean {
   const command = (statusLine as { command?: unknown } | undefined)?.command;
-  return typeof command === "string" && command.trim() === STATUSLINE_COMMAND;
+  return typeof command === "string" && CCC_STATUSLINE.test(command.trim());
 }
 
-/** The statusLine install saved, when it was a command to wrap (never ours). */
+/** The statusLine install saved, when it was a command to wrap (never ccc's own). */
 function savedStatusLine(file: string): { command: string } | undefined {
   const saved = (readJson(file) as { statusLine?: { command?: unknown } } | undefined)?.statusLine;
-  return typeof saved?.command === "string" && saved.command.trim() !== STATUSLINE_COMMAND
+  return typeof saved?.command === "string" && !CCC_STATUSLINE.test(saved.command)
     ? { command: saved.command } : undefined;
 }
 
 /** The wrapped command's stdout, trailing newlines trimmed ("" if it fails). */
 function runWrapped(command: string, input: string): string {
   const result = spawnSync(command, { input, shell: true, encoding: "utf-8",
-    timeout: WRAPPED_TIMEOUT_MS, stdio: ["pipe", "pipe", "ignore"] });
+    timeout: WRAPPED_TIMEOUT_MS, stdio: ["pipe", "pipe", "ignore"],
+    env: { ...process.env, [WRAPPED_ENV]: "1" } });
   return typeof result.stdout === "string" ? result.stdout.replace(/[\r\n]+$/, "") : "";
 }
 
@@ -174,18 +193,54 @@ function readJson(file: string): unknown {
   }
 }
 
-/** Write-then-rename, so Claude Code never reads a half-written settings file. */
+/**
+ * Write-then-rename, so Claude Code never reads a half-written settings file. A symlink
+ * (dotfile managers) is followed so the link stays, and the file keeps its mode (it can
+ * hold secrets in `env`); a new file is owner-only.
+ */
 function writeJson(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  const target = realTarget(file);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const mode = fileMode(target) ?? 0o600;
+  const tmp = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode });
+  fs.chmodSync(tmp, mode);
+  fs.renameSync(tmp, target);
+}
+
+function realTarget(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+function fileMode(file: string): number | undefined {
+  try {
+    return fs.statSync(file).mode & 0o777;
+  } catch {
+    return undefined;
+  }
 }
 
 function backup(file: string): void {
   if (!fs.existsSync(file)) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  fs.copyFileSync(file, `${file}.ccc-backup-${stamp}`);
+  const copy = `${file}.ccc-backup-${stamp}`;
+  fs.copyFileSync(file, copy);
+  fs.chmodSync(copy, fileMode(realTarget(file)) ?? 0o600);
+}
+
+/**
+ * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
+ * only then does the proxy keep the link fresh in the background. Read at startup.
+ */
+export function statusLineWantsLink(settingsFile = statuslinePaths().settings): boolean {
+  const command = ((readJson(settingsFile) as { statusLine?: { command?: unknown } } | undefined)
+    ?.statusLine)?.command;
+  return typeof command === "string" &&
+    (CCC_STATUSLINE.test(command) || command.includes(".claude-code-infinite/statusline"));
 }
 
 function report(result: { ok: boolean; message: string }, out: (text: string) => void): number {

@@ -15,6 +15,9 @@ export type RefusalCause = {
     ms: number;
     nextBudgetMs?: number;
 } | {
+    kind: "slow-answer";
+    ms: number;
+} | {
     kind: "rebuilding";
     secondsLeft?: number;
 } | {
@@ -36,6 +39,8 @@ export interface RefusalEvidence {
         ms: number;
         refused?: true;
         status?: number;
+        /** A large upload that spent its whole long budget (slow-upload.ts), not just slow. */
+        uploadTimeout?: true;
     };
     indexBehind?: true;
     indexWait?: {

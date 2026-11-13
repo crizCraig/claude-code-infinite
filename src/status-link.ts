@@ -50,10 +50,11 @@ export class StatusLinkFiles {
   /** Record `url` as the session's link; writes only when it changed. Never throws. */
   write(sessionId: string | undefined, url: string | undefined): void {
     if (!sessionId || !SESSION_ID.test(sessionId) || !url || !/^https?:\/\/\S+$/.test(url)) return;
-    if (this.written.get(sessionId) === url) return;
+    const file = path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`);
+    // Unchanged and still there (another ccc process may have pruned it).
+    if (this.written.get(sessionId) === url && fs.existsSync(file)) return;
     try {
       fs.mkdirSync(this.dir, { recursive: true });
-      const file = path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`);
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, `${url}\n`, { mode: 0o600 });
       fs.renameSync(tmp, file);

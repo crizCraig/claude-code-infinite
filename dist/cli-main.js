@@ -23,6 +23,7 @@ import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { StatusLinkFiles } from "./status-link.js";
+import { statusLineWantsLink } from "./statusline.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
@@ -641,6 +642,8 @@ async function main() {
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
         // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
         statusLinks: new StatusLinkFiles(),
+        // Per-request refreshes (a sessions lookup a minute) only for status lines that show it.
+        statusLinkRefresh: process.env.CCC_STATUSLINE_REFRESH === "1" || statusLineWantsLink(),
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed

@@ -16,7 +16,7 @@ const LINK = "https://memtree.ai/m/a8f362de";
 const BUDGET_TIMEOUT = {
   turnType: "followup-refused", requestBytes: 50572609,
   compaction: { mode: "auto", reason: "budget", estimatedTokens: 802854 },
-  compress: { ms: 138617, ok: false, timedOut: true },
+  compress: { ms: 138617, ok: false, timedOut: true, uploadTimeout: true },
   refusal: { attempt: 3, status: 400, inputTokens: 1400455, indexBehind: false,
     budgetTokens: 960000, modelContextLimit: 1000000 },
 };
@@ -24,7 +24,7 @@ const BUDGET_TIMEOUT = {
 const PREFIX_TIMEOUT = {
   turnType: "followup-refused", requestBytes: 50559997,
   compaction: { mode: "auto", reason: "prefix-mismatch", prefixMiss: "prefix" },
-  compress: { ms: 138613, ok: false, timedOut: true },
+  compress: { ms: 138613, ok: false, timedOut: true, uploadTimeout: true },
   refusal: { attempt: 3, status: 400, inputTokens: 20231969, indexBehind: false,
     budgetTokens: 960000, modelContextLimit: 1000000 },
 };
@@ -79,8 +79,8 @@ test("upload timeout (2026-11-12, reason budget): size, time, the next try's bud
   assert.deepEqual(cause, { kind: "upload-timeout", bytes: 50572609, ms: 138617,
     nextBudgetMs: 277_234 });
   assert.equal(refusalMessage(cause, LINK),
-    "MemTree timed out after 139 s receiving this 51 MB request (slow upload?). Retry: the " +
-    "next try waits up to 277 s. CCC_COMPRESS_TIMEOUT_MS (ms) allows longer. " +
+    "MemTree timed out after 139 s on this 51 MB request (likely a slow upload). Retry: the " +
+    "next try waits up to 277 s. CCC_COMPRESS_TIMEOUT_MS (ms) raises the base wait. " +
     `Session: ${LINK}`);
 });
 
@@ -88,7 +88,7 @@ test("upload timeout after a prefix mismatch is still the upload; no longer budg
   const cause = refusalCause(PREFIX_TIMEOUT, facts(PREFIX_TIMEOUT));
   assert.equal(cause.kind, "upload-timeout");
   const message = refusalMessage(cause, LINK);
-  assert.match(message, /^MemTree timed out after 139 s receiving this 51 MB request \(slow upload\?\)\. Retry on a faster connection\. CCC_COMPRESS_TIMEOUT_MS/);
+  assert.match(message, /^MemTree timed out after 139 s on this 51 MB request \(likely a slow upload\)\. Retry, ideally on a faster connection\. CCC_COMPRESS_TIMEOUT_MS/);
   assert.doesNotMatch(message, /couldn't fit|memtree-compact|\/clear/);
 });
 
@@ -160,4 +160,15 @@ test("number formats", () => {
   assert.equal(durationText(119 * 60), "119 min");
   assert.equal(durationText(90 * 60 * 2), "3 h");
   assert.equal(durationText(150 * 60), "2.5 h");
+});
+
+test("a timeout that was not a large upload's whole long budget: MemTree was slow", () => {
+  // A short-budget call, a small body, or one cut short by an index hold (no uploadTimeout).
+  const rec = { ...BUDGET_TIMEOUT, requestBytes: 2_000_000,
+    compress: { ms: 20_000, ok: false, timedOut: true } };
+  const cause = refusalCause(rec, facts(rec, { nextCompressBudgetMs: 999_000 }));
+  assert.deepEqual(cause, { kind: "slow-answer", ms: 20_000 });
+  assert.equal(refusalMessage(cause, LINK),
+    "MemTree didn't answer within 20 s. Retry in a minute; if it keeps happening, run " +
+    `/ccc:memtree-compact or /clear. Session: ${LINK}`);
 });

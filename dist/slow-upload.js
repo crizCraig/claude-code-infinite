@@ -14,6 +14,12 @@
 export const SLOW_UPLOAD_MIN_BYTES = 20 * 1024 * 1024;
 /** How much longer the next try may take. */
 export const SLOW_UPLOAD_BUDGET_FACTOR = 2;
+/**
+ * The raised budget never goes past this (unless the normal one already does): Claude Code
+ * waits ~180 s for response headers by the proxy's notes (2.1.319), though 2026-11-12's
+ * refusals reached the user after 176-199 s. 240 s keeps the raise modest.
+ */
+export const SLOW_UPLOAD_MAX_BUDGET_MS = 240_000;
 /** A timeout this old no longer raises the budget. */
 export const SLOW_UPLOAD_MEMORY_MS = 30 * 60_000;
 const MAX_SESSIONS = 128;
@@ -27,7 +33,9 @@ export class SlowUploads {
     }
     /** The budget for a compress of `bytes` in `sessionId`, given its normal `budgetMs`. */
     budgetMs(sessionId, bytes, budgetMs) {
-        return this.extended(sessionId, bytes) ? budgetMs * SLOW_UPLOAD_BUDGET_FACTOR : budgetMs;
+        if (!this.extended(sessionId, bytes))
+            return budgetMs;
+        return Math.max(budgetMs, Math.min(budgetMs * SLOW_UPLOAD_BUDGET_FACTOR, SLOW_UPLOAD_MAX_BUDGET_MS));
     }
     /** Whether the session's next compress of `bytes` gets the longer budget. */
     extended(sessionId, bytes) {
@@ -36,21 +44,22 @@ export class SlowUploads {
         const at = this.timedOutAt.get(sessionId);
         return at !== undefined && this.now() - at < SLOW_UPLOAD_MEMORY_MS;
     }
-    /** Note how a long-budget compress of `bytes` ended. */
+    /** Note how a long-budget compress of `bytes` ended; true when it was a slow upload. */
     settled(sessionId, bytes, outcome) {
         if (sessionId === undefined)
-            return;
+            return false;
         if (outcome === "ok") {
             this.timedOutAt.delete(sessionId);
-            return;
+            return false;
         }
         if (outcome !== "timeout" || bytes < this.minBytes)
-            return;
+            return false;
         this.timedOutAt.delete(sessionId);
         this.timedOutAt.set(sessionId, this.now());
         while (this.timedOutAt.size > MAX_SESSIONS) {
             this.timedOutAt.delete(this.timedOutAt.keys().next().value);
         }
+        return true;
     }
 }
 //# sourceMappingURL=slow-upload.js.map

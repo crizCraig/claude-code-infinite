@@ -3,6 +3,11 @@ export declare const STATUSLINE_COMMAND = "ccc statusline";
 /** The link's text where the terminal shows OSC 8 hyperlinks. */
 export declare const STATUSLINE_LABEL = "\uD83C\uDF3F tree";
 export declare const STATUSLINE_SEPARATOR = " | ";
+/**
+ * Set for the wrapped command: a `ccc statusline` inside it (a wrapped command that itself
+ * calls ccc's, under another spelling) prints nothing instead of recursing.
+ */
+export declare const WRAPPED_ENV = "CCC_STATUSLINE_WRAPPED";
 export interface StatuslinePaths {
     /** Claude Code's user settings (CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json). */
     settings: string;
@@ -22,7 +27,7 @@ export declare function linkSegment(sessionId: unknown, env?: NodeJS.ProcessEnv,
  * Point Claude Code's statusLine at `ccc statusline`, saving the current one to wrap.
  * Re-running is harmless; a statusLine that is not a command is left alone.
  */
-export declare function installStatusline(paths: StatuslinePaths): {
+export declare function installStatusline(paths: StatuslinePaths, platform?: NodeJS.Platform): {
     ok: boolean;
     message: string;
 };
@@ -31,4 +36,9 @@ export declare function uninstallStatusline(paths: StatuslinePaths): {
     ok: boolean;
     message: string;
 };
+/**
+ * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
+ * only then does the proxy keep the link fresh in the background. Read at startup.
+ */
+export declare function statusLineWantsLink(settingsFile?: string): boolean;
 //# sourceMappingURL=statusline.d.ts.map

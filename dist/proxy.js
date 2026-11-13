@@ -405,6 +405,7 @@ export function startProxy(opts) {
             ? opts.memtree.storageIdentity : undefined,
         newestTrees: opts.newestTrees,
         statusLinks: opts.statusLinks,
+        statusLinkRefresh: opts.statusLinkRefresh === true,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
         defaultCompactOff: opts.defaultCompactTarget === null,
@@ -1366,7 +1367,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
     }
-    else if (state.statusLinks) {
+    else if (state.statusLinks && state.statusLinkRefresh) {
         // Keeps the status line's link fresh through long tool runs: answers from the cache,
         // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS).
         state.newestTrees?.peek(requestSessionId(req));
@@ -4687,15 +4688,15 @@ async function runBlockingCompressionOnce(args) {
     // A carried call has not failed: it is still running (its answer reports its health).
     const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
     // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
-    if (args.longBudget && args.capMs === undefined && !carried) {
+    const uploadTimeout = args.longBudget === true && args.capMs === undefined && !carried &&
         state.slowUploads.settled(args.sessionId, rec.requestBytes, result !== null ? "ok" : timedOut ? "timeout" : "other");
-    }
     rec.compress = {
         ms: compressMs,
         ok: result !== null,
         timedOut,
         budgetMs,
         ...(extendedBudget ? { extendedBudget: true } : {}),
+        ...(uploadTimeout ? { uploadTimeout: true } : {}),
         ...(failureStatus !== undefined ? { status: failureStatus } : {}),
         ...(carried ? { carriedOver: true } : {}),
         // A joined call's indexing 413 is MemTree's refusal of this request too.
@@ -5665,15 +5666,15 @@ function refusalCauseFor(args, inputTokens) {
     const { state, rec } = args;
     const sessionId = requestSessionId(args.req);
     const bytes = rec.requestBytes;
-    // After a slow upload: what the session's next try gets, unless this one already had it.
-    const nextCompressBudgetMs = rec.compress?.timedOut && !rec.compress.extendedBudget &&
-        state.slowUploads.extended(sessionId, bytes)
-        ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, state.slowUploads.budgetMs(sessionId, bytes, rec.compress.budgetMs ?? 0))
+    // After a slow upload: what the session's next long-budget try gets.
+    const nextCompressBudgetMs = rec.compress?.uploadTimeout
+        ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, longCompressBudgetFor(args.opts, state, sessionId, bytes))
         : undefined;
+    const stated = activeIndexWaits.get(rec) ?? state.fallbackFailures.indexSecondsLeft(args.routeKey);
     return refusalCause(rec, {
         inputTokens, modelContextLimit: args.modelContextLimit,
-        indexSecondsLeft: activeIndexWaits.get(rec) ??
-            state.fallbackFailures.indexSecondsLeft(args.routeKey),
+        // The 60 s stand-in for an indexing 413 that stated no time is no estimate.
+        indexSecondsLeft: stated === UNKNOWN_INDEX_WAIT_SECONDS ? undefined : stated,
         nextCompressBudgetMs,
     });
 }

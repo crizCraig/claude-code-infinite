@@ -14,6 +14,12 @@
 export declare const SLOW_UPLOAD_MIN_BYTES: number;
 /** How much longer the next try may take. */
 export declare const SLOW_UPLOAD_BUDGET_FACTOR = 2;
+/**
+ * The raised budget never goes past this (unless the normal one already does): Claude Code
+ * waits ~180 s for response headers by the proxy's notes (2.1.319), though 2026-11-12's
+ * refusals reached the user after 176-199 s. 240 s keeps the raise modest.
+ */
+export declare const SLOW_UPLOAD_MAX_BUDGET_MS = 240000;
 /** A timeout this old no longer raises the budget. */
 export declare const SLOW_UPLOAD_MEMORY_MS: number;
 export declare class SlowUploads {
@@ -25,7 +31,7 @@ export declare class SlowUploads {
     budgetMs(sessionId: string | undefined, bytes: number, budgetMs: number): number;
     /** Whether the session's next compress of `bytes` gets the longer budget. */
     extended(sessionId: string | undefined, bytes: number): boolean;
-    /** Note how a long-budget compress of `bytes` ended. */
-    settled(sessionId: string | undefined, bytes: number, outcome: "ok" | "timeout" | "other"): void;
+    /** Note how a long-budget compress of `bytes` ended; true when it was a slow upload. */
+    settled(sessionId: string | undefined, bytes: number, outcome: "ok" | "timeout" | "other"): boolean;
 }
 //# sourceMappingURL=slow-upload.d.ts.map

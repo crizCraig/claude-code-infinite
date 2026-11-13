@@ -28,6 +28,7 @@ export const INDEX_TOKENS_PER_MINUTE = 40_000;
 export type RefusalCause =
   | { kind: "indexing"; secondsLeft?: number; unindexedTokens?: number }
   | { kind: "upload-timeout"; bytes: number; ms: number; nextBudgetMs?: number }
+  | { kind: "slow-answer"; ms: number }
   | { kind: "rebuilding"; secondsLeft?: number }
   | { kind: "compress-failed"; status?: number }
   | { kind: "over-budget"; inputTokens: number; contextTokens: number };
@@ -35,7 +36,11 @@ export type RefusalCause =
 /** The parts of a request's log record (reqlog MessagesRecord) a refusal is judged by. */
 export interface RefusalEvidence {
   compaction?: { reason?: string };
-  compress?: { ok: boolean; timedOut: boolean; ms: number; refused?: true; status?: number };
+  compress?: {
+    ok: boolean; timedOut: boolean; ms: number; refused?: true; status?: number;
+    /** A large upload that spent its whole long budget (slow-upload.ts), not just slow. */
+    uploadTimeout?: true;
+  };
   indexBehind?: true;
   indexWait?: { secondsLeft: number };
   /** The compress answer's index lag: the server's memory ETA and the un-indexed tokens. */
@@ -61,10 +66,12 @@ export function refusalCause(rec: RefusalEvidence, facts: RefusalFacts): Refusal
       unindexedTokens: rec.indexLag?.unindexedTokens }) };
   }
   const compress = rec.compress;
-  if (compress?.timedOut) {
+  if (compress?.timedOut && compress.uploadTimeout) {
     return { kind: "upload-timeout", bytes: rec.requestBytes ?? 0, ms: compress.ms,
       ...defined({ nextBudgetMs: facts.nextCompressBudgetMs }) };
   }
+  // Small, short-budget or cut short by a hold: MemTree was slow, not the upload.
+  if (compress?.timedOut) return { kind: "slow-answer", ms: compress.ms };
   const failed = compress !== undefined && !compress.ok && !compress.refused;
   if (failed && rec.compaction?.reason === "prefix-mismatch") {
     return { kind: "rebuilding", ...defined({ secondsLeft: serverSeconds }) };
@@ -87,6 +94,9 @@ function causeText(cause: RefusalCause): string {
   switch (cause.kind) {
     case "indexing": return indexingText(cause.secondsLeft, cause.unindexedTokens);
     case "upload-timeout": return uploadTimeoutText(cause);
+    case "slow-answer":
+      return `MemTree didn't answer within ${secondsText(cause.ms)}. Retry in a minute; if it ` +
+        `keeps happening, run ${COMPACT_OR_CLEAR}.`;
     case "rebuilding": return rebuildingText(cause.secondsLeft);
     case "compress-failed":
       return `MemTree couldn't compress this turn${cause.status ? ` (HTTP ${cause.status})` : ""}. ` +
@@ -109,14 +119,15 @@ function indexingText(secondsLeft: number | undefined, unindexedTokens: number |
     : `MemTree is still indexing ${what} (~${durationText(seconds)}). Retry then.`;
 }
 
-/** "MemTree timed out after 139 s receiving this 51 MB request (slow upload?). ..." */
+/** "MemTree timed out after 139 s on this 51 MB request (likely a slow upload). ..." */
 function uploadTimeoutText(cause: { bytes: number; ms: number; nextBudgetMs?: number }): string {
-  const size = cause.bytes > 0 ? ` receiving this ${megabytesText(cause.bytes)} request` : "";
-  const next = cause.nextBudgetMs !== undefined && cause.nextBudgetMs > cause.ms
+  const size = cause.bytes > 0 ? ` on this ${megabytesText(cause.bytes)} request` : "";
+  // Only a clearly longer wait is worth naming (this try may already have had it).
+  const next = cause.nextBudgetMs !== undefined && cause.nextBudgetMs > cause.ms * 1.2
     ? `Retry: the next try waits up to ${secondsText(cause.nextBudgetMs)}. `
-    : "Retry on a faster connection. ";
-  return `MemTree timed out after ${secondsText(cause.ms)}${size} (slow upload?). ${next}` +
-    "CCC_COMPRESS_TIMEOUT_MS (ms) allows longer.";
+    : "Retry, ideally on a faster connection. ";
+  return `MemTree timed out after ${secondsText(cause.ms)}${size} (likely a slow upload). ${next}` +
+    "CCC_COMPRESS_TIMEOUT_MS (ms) raises the base wait.";
 }
 
 function rebuildingText(secondsLeft: number | undefined): string {
