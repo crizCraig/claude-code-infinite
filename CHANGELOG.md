@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.35](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.34...v1.0.35) (2026-11-13)
+
+
+### Features
+
+* refusals say why (indexing ETA, slow upload, rebuilding); MemTree link in the status line ([#66](https://github.com/crizCraig/claude-code-infinite/issues/66)) ([71b937e](https://github.com/crizCraig/claude-code-infinite/commit/71b937ee6378019b3640b1f3dcab4665d945e8ce))
+
 ## [1.0.34](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.33...v1.0.34) (2026-11-10)
 
 
