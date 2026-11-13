@@ -1619,7 +1619,8 @@ export class MemtreeClient {
         }
         // Stored messages named by hash (message-refs.ts), stored images as references, and
         // never a body over the HTTP/1 limit (memtree-body.ts).
-        const delta = opts.messageRefs === false ? { messages, refs: [] }
+        // Not on the final index: its body is prepared cooperatively (final-index.ts).
+        const delta = opts.messageRefs === false || opts.finalIndex ? { messages, refs: [] }
             : this.messageRefs.delta(opts.sessionId, messages);
         const sentMessages = delta.messages;
         const plan = (refs) => planMemtreeBody({

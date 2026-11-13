@@ -35,6 +35,9 @@ const ACKED_PER_SESSION_MAX = 200_000;
 /** 409s in a row naming every ref before a conversation goes back to full uploads. */
 const ALL_MISSING_MAX = 2;
 const HEX_RE = /^[0-9a-f]{64}$/;
+/** The server's limits per request: ref entries, and cache marks on refs (past them, inline). */
+const MAX_REFS = 50_000;
+const MAX_MARKS = 64;
 /** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
 const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
@@ -88,8 +91,7 @@ export class MessageRefs {
      * images the refs brought back only resends.
      */
     noteRefusal(sessionId, messages, refs, status, bodyText) {
-        const lane = this.laneFor(sessionId, messages);
-        if (!lane || refs.length === 0)
+        if (refs.length === 0)
             return false;
         if (status === 400 && /message refs/i.test(bodyText)) {
             this.disabled = true;
@@ -101,14 +103,10 @@ export class MessageRefs {
         const missing = status === MISSING_MESSAGES_STATUS ? missingMessageHashes(bodyText) : undefined;
         if (missing === undefined)
             return false;
-        this.forget(lane, missing);
-        const named = new Set(missing);
-        if (refs.every((ref) => named.has(ref))) {
-            const inRow = (this.allMissing.get(lane) ?? 0) + 1;
-            this.allMissing.set(lane, inRow);
-            if (inRow >= ALL_MISSING_MAX)
-                this.off.add(lane);
-        }
+        // Resent whatever the lane's state (a call in flight when it went off still resends).
+        const lane = this.laneFor(sessionId, messages);
+        if (lane)
+            this.noteMissing(lane, refs, missing);
         return true;
     }
     /** The conversation `messages` belong to, while refs may be named for it. */
@@ -120,6 +118,26 @@ export class MessageRefs {
             return undefined;
         const lane = `${sessionId}\n${laneDigest(opening)}`;
         return this.off.has(lane) ? undefined : lane;
+    }
+    /**
+     * A partial 409 names hashes the server lacks or computes differently: never named
+     * again. One naming every ref (a lookup that failed, the kill switch) only drops them
+     * from the acks; two in a row end refs for the conversation.
+     */
+    noteMissing(lane, refs, missing) {
+        const named = new Set(missing);
+        if (!refs.every((ref) => named.has(ref))) {
+            this.forget(lane, missing);
+            return;
+        }
+        const acked = this.acked.get(lane);
+        for (const hash of missing)
+            acked?.delete(hash);
+        const inRow = (this.allMissing.get(lane) ?? 0) + 1;
+        this.allMissing.set(lane, inRow);
+        boundMap(this.allMissing, SESSIONS_MAX);
+        if (inRow >= ALL_MISSING_MAX)
+            this.off.add(lane);
     }
     forget(lane, hashes) {
         const never = this.never.get(lane) ?? new Set();
@@ -156,13 +174,15 @@ export function buildDelta(messages, acked) {
     if (opening < 0)
         return { messages, refs: [] };
     let headerSeen = false;
+    let marks = 0;
     const refs = [];
     const out = messages.map((message, index) => {
-        const eligible = index > opening || isSkipped(message);
+        const eligible = (index > opening || isSkipped(message)) && refs.length < MAX_REFS;
         const ref = eligible ? refFor(message, !headerSeen) : undefined;
         headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
-        if (!ref || !acked.has(ref.digest))
+        if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS)
             return message;
+        marks += ref.marks.length;
         refs.push(ref.digest);
         return refJson(ref);
     });

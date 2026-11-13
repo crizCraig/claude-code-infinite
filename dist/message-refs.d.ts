@@ -49,6 +49,12 @@ export declare class MessageRefs {
     noteRefusal(sessionId: string | undefined, messages: Message[], refs: readonly string[], status: number, bodyText: string): boolean;
     /** The conversation `messages` belong to, while refs may be named for it. */
     private laneFor;
+    /**
+     * A partial 409 names hashes the server lacks or computes differently: never named
+     * again. One naming every ref (a lookup that failed, the kill switch) only drops them
+     * from the acks; two in a row end refs for the conversation.
+     */
+    private noteMissing;
     private forget;
     private remember;
 }

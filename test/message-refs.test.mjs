@@ -99,7 +99,12 @@ test("answers decide what is named: acks, no field, 409s, a 400", () => {
   const next = refs.delta("s", messages).refs;
   assert.ok(refs.noteRefusal("s", messages, next, 409, body(next)), "every ref missing (kill switch)");
   refs.noteAnswer("s", messages, answer);
-  assert.equal(refs.delta("s", messages).refs.length, 0, "none of them is named again");
+  assert.equal(refs.delta("s", messages).refs.length, next.length,
+    "an all-missing 409 bans nothing: the next answer acks them again");
+  assert.ok(refs.noteRefusal("s", messages, next, 409, body(next)));
+  assert.equal(refs.delta("s", messages).refs.length, 0, "two in a row: the conversation goes in full");
+  assert.ok(refs.noteRefusal("s", messages, next, 409, body(next)),
+    "a call in flight when it went off is still resent");
   refs.noteAnswer("t", messages, answer);
   refs.noteAnswer("t", messages, { messages: [] }, { finalIndex: true });
   assert.ok(refs.delta("t", messages).refs.length > 0, "an exit index's early answer clears nothing");
@@ -110,6 +115,8 @@ test("answers decide what is named: acks, no field, 409s, a 400", () => {
     '{"detail":"Malformed message refs: x"}'));
   refs.noteAnswer("u", messages, answer);
   assert.equal(refs.delta("u", messages).refs.length, 0, "a 400 ends refs for the process");
+  assert.ok(refs.noteRefusal("u", messages, ["b".repeat(64)], 409, body(["b".repeat(64)])),
+    "a concurrent 409 after the 400 is still resent");
   const off = new MessageRefs(false);
   off.noteAnswer("s", messages, answer);
   assert.equal(off.delta("s", messages).refs.length, 0, "off unless enabled");
