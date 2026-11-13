@@ -83,6 +83,8 @@ export interface MemtreeOptions {
      * place of the 402 detail's long `/payment?…` link in every paused notice.
      */
     paymentLinks?: PaymentLinkCache;
+    /** Delta uploads (message-refs.ts); default: CCC_MEMTREE_DELTA=1. */
+    messageRefs?: boolean;
 }
 /**
  * Request metadata forwarded to the server so it can resolve a model-based
@@ -388,6 +390,8 @@ export declare class MemtreeClient {
     private drainCutting;
     /** Images MemTree stores, sent as references instead of their bytes. */
     private readonly imageRefs;
+    /** Messages MemTree stores, named by hash instead of sent (CCC_MEMTREE_DELTA=1). */
+    private readonly messageRefs;
     /** Session → its main lane's latest conversation, for the final index. */
     private readonly mainConversations;
     /** Session → its final index waiting for the session to stay idle. */

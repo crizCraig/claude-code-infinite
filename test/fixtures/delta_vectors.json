@@ -1,0 +1,174 @@
+[
+ {
+  "name": "user string",
+  "message": {
+   "role": "user",
+   "content": "hello"
+  },
+  "ref": {
+   "memtree_ref": "b5344ebd07750817371cf4670e556b15a4babb975bde955ff4ce24bca09731ef"
+  }
+ },
+ {
+  "name": "key order as sent",
+  "message": {
+   "content": "hello",
+   "role": "user"
+  },
+  "ref": {
+   "memtree_ref": "f4f7e767b9a1966921d93f1818bb0238c1633ed715f29a789b4e3a624ab16512"
+  }
+ },
+ {
+  "name": "non-ASCII and escapes",
+  "message": {
+   "role": "user",
+   "content": "é ✓ 😀 tab\t nl\n nul\u0000 quote\" back\\ slash/"
+  },
+  "ref": {
+   "memtree_ref": "e3e37b5f001007e20a734e11acb19a7368bb82b710c376fb480f6057654f79f7"
+  }
+ },
+ {
+  "name": "numbers",
+  "message": {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "tool_use",
+     "id": "t1",
+     "name": "Edit",
+     "input": {
+      "n": 3,
+      "neg": -12,
+      "f": 0.5,
+      "big": 12345678901234,
+      "b": true,
+      "z": null
+     }
+    }
+   ]
+  },
+  "ref": {
+   "memtree_ref": "c25fcac3f2734fd25e535d320bee15555e1c70739558183dde4264eea37627ca"
+  }
+ },
+ {
+  "name": "system with billing header and cache mark",
+  "message": {
+   "role": "system",
+   "content": [
+    {
+     "type": "text",
+     "text": "x-anthropic-billing-header: cc_version=2.1.0; cch=abc;"
+    },
+    {
+     "type": "text",
+     "text": "You are Claude Code.",
+     "cache_control": {
+      "type": "ephemeral"
+     }
+    }
+   ]
+  },
+  "ref": {
+   "memtree_ref": "6a18e7dd119bba21d63b629f51ecfc3da5760f307d04c5cc7637bb43b71ee10a",
+   "cache_marks": [
+    [
+     [
+      "content",
+      0
+     ],
+     2,
+     {
+      "type": "ephemeral"
+     }
+    ]
+   ],
+   "billing_header": {
+    "type": "text",
+    "text": "x-anthropic-billing-header: cc_version=2.1.0; cch=abc;"
+   }
+  }
+ },
+ {
+  "name": "nested cache mark in a tool result",
+  "message": {
+   "role": "user",
+   "content": [
+    {
+     "type": "tool_result",
+     "tool_use_id": "t1",
+     "content": [
+      {
+       "type": "text",
+       "text": "ok",
+       "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "ref": {
+   "memtree_ref": "41e67d162d45affd08773f77a29e6af2a671005da1c4e998ff676f9587a64afb",
+   "cache_marks": [
+    [
+     [
+      "content",
+      0,
+      "content",
+      0
+     ],
+     2,
+     {
+      "type": "ephemeral",
+      "ttl": "1h"
+     }
+    ]
+   ]
+  }
+ },
+ {
+  "name": "image bytes, not a ref",
+  "message": {
+   "role": "user",
+   "content": [
+    {
+     "type": "image",
+     "source": {
+      "type": "base64",
+      "media_type": "image/png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  },
+  "ref": {
+   "memtree_ref": "8899399d3a4307e9abff131bdcd1442c597411c785b88ddbbcd3116dbbe4bdeb"
+  }
+ },
+ {
+  "name": "tool set (hashed as sent, cache marks included)",
+  "tools": [
+   {
+    "name": "Read",
+    "description": "Read a file",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      }
+     }
+    },
+    "cache_control": {
+     "type": "ephemeral"
+    }
+   }
+  ],
+  "memtree_ref": "6cdbbcfdc38b8eecca3b540be75da6e53d270d1de3c81655cf906557c42ed7c2"
+ }
+]

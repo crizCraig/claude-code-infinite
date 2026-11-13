@@ -538,6 +538,8 @@ export interface MemtreeRecord {
      * images as references the server had not listed (image-refs.ts: referenceUnconfirmed).
      */
     unconfirmedImageRefs?: number;
+    /** Messages named by hash instead of sent (delta uploads, message-refs.ts). */
+    messageRefs?: number;
     /** Aborted because the exit drain ran out of time (diagnostics: exit_index_cut). */
     exitCut?: boolean;
     /** With exitCut: the call was the session's final index. */
