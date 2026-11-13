@@ -51,11 +51,11 @@ export class RouteFallbackFailures {
     }
     fail(lane, context = {}) {
         if (context.awaitingIndex) {
-            const waiting = this.waitForIndex(lane, context.now ?? Date.now(), context.indexSecondsLeft);
+            const waiting = this.waitForIndex(lane, context.now ?? Date.now(), context.indexSecondsLeft, context.refusalMessage);
             if (waiting)
                 return waiting;
         }
-        return this.strike(lane);
+        return this.strike(lane, context.refusalMessage);
     }
     /**
      * Note MemTree saying the lane's index is still catching up (a held request's 413):
@@ -98,7 +98,7 @@ export class RouteFallbackFailures {
         this.indexWaits.delete(lane);
     }
     /** The bounded three-strike episode: 503, 503, then 400 until delivery. */
-    strike(lane) {
+    strike(lane, message) {
         const previous = this.failures.get(lane);
         // Fail closed when full rather than evicting a lane and granting it
         // another retry budget. A successful lane frees its slot.
@@ -107,7 +107,7 @@ export class RouteFallbackFailures {
         if (previous !== undefined || this.failures.size < this.capacity) {
             this.failures.set(lane, attempt);
         }
-        return attempt <= 2 ? retryError(attempt, "1", RETRY_MESSAGE) : refusal(attempt);
+        return attempt <= 2 ? retryError(attempt, "1", RETRY_MESSAGE) : refusal(attempt, message);
     }
     /**
      * A 503 while the lane's wait is within its deadline; a 400 once it passes, or at once
@@ -118,11 +118,11 @@ export class RouteFallbackFailures {
      * or arriving while every wait slot is active, gets no wait (undefined) and falls back
      * to the strikes.
      */
-    waitForIndex(lane, now, secondsLeft) {
+    waitForIndex(lane, now, secondsLeft, message) {
         const state = this.track(lane, now, secondsLeft);
         if (state === "untracked")
             return undefined;
-        return state === "open" ? this.indexWaitError(lane, secondsLeft) : refusal(3);
+        return state === "open" ? this.indexWaitError(lane, secondsLeft) : refusal(3, message);
     }
     /**
      * Start or extend the lane's wait: "open" while the index may still land in time,
@@ -245,14 +245,14 @@ function retryError(attempt, retryAfter, message) {
         body: { type: "error", error: { type: "api_error", message } },
     };
 }
-function refusal(attempt) {
+function refusal(attempt, message = FINAL_REFUSAL_MESSAGE) {
     return {
         status: 400,
         attempt,
         headers: { "x-should-retry": "false" },
         body: {
             type: "error",
-            error: { type: "invalid_request_error", message: FINAL_REFUSAL_MESSAGE },
+            error: { type: "invalid_request_error", message },
         },
     };
 }

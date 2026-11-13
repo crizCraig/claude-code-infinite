@@ -199,8 +199,8 @@ for (const [lane, send] of [["human", () => body("x".repeat(900_000))], ["tool",
       await new Promise(resolve => setTimeout(resolve, 200));
       const response = await request(h.proxy, send());
       assert.equal(response.status, 400);
-      assert.match(JSON.parse(response.body).error.message,
-        /couldn't fit this request in the model's context window.*\/ccc:memtree-compact or \/clear/);
+      // The index is what is behind: the refusal says so (refusal-reason.ts).
+      assert.match(JSON.parse(response.body).error.message, /^MemTree is still indexing /);
     } finally { h.close(); }
   });
 

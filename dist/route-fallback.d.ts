@@ -36,6 +36,8 @@ export interface FallbackFailureContext {
     awaitingIndex?: boolean;
     /** The server's estimate of the indexing left (seconds), when it stated one. */
     indexSecondsLeft?: number;
+    /** The final refusal's text (refusal-reason.ts); FINAL_REFUSAL_MESSAGE when absent. */
+    refusalMessage?: string;
     now?: number;
 }
 /**

@@ -52,6 +52,8 @@ export interface FallbackFailureContext {
   awaitingIndex?: boolean;
   /** The server's estimate of the indexing left (seconds), when it stated one. */
   indexSecondsLeft?: number;
+  /** The final refusal's text (refusal-reason.ts); FINAL_REFUSAL_MESSAGE when absent. */
+  refusalMessage?: string;
   now?: number;
 }
 
@@ -83,10 +85,11 @@ export class RouteFallbackFailures {
 
   fail(lane: string, context: FallbackFailureContext = {}): RouteFallbackError {
     if (context.awaitingIndex) {
-      const waiting = this.waitForIndex(lane, context.now ?? Date.now(), context.indexSecondsLeft);
+      const waiting = this.waitForIndex(lane, context.now ?? Date.now(), context.indexSecondsLeft,
+        context.refusalMessage);
       if (waiting) return waiting;
     }
-    return this.strike(lane);
+    return this.strike(lane, context.refusalMessage);
   }
 
   /**
@@ -138,7 +141,7 @@ export class RouteFallbackFailures {
   }
 
   /** The bounded three-strike episode: 503, 503, then 400 until delivery. */
-  private strike(lane: string): RouteFallbackError {
+  private strike(lane: string, message?: string): RouteFallbackError {
     const previous = this.failures.get(lane);
     // Fail closed when full rather than evicting a lane and granting it
     // another retry budget. A successful lane frees its slot.
@@ -147,7 +150,7 @@ export class RouteFallbackFailures {
     if (previous !== undefined || this.failures.size < this.capacity) {
       this.failures.set(lane, attempt);
     }
-    return attempt <= 2 ? retryError(attempt, "1", RETRY_MESSAGE) : refusal(attempt);
+    return attempt <= 2 ? retryError(attempt, "1", RETRY_MESSAGE) : refusal(attempt, message);
   }
 
   /**
@@ -160,11 +163,11 @@ export class RouteFallbackFailures {
    * to the strikes.
    */
   private waitForIndex(
-    lane: string, now: number, secondsLeft: number | undefined
+    lane: string, now: number, secondsLeft: number | undefined, message?: string
   ): RouteFallbackError | undefined {
     const state = this.track(lane, now, secondsLeft);
     if (state === "untracked") return undefined;
-    return state === "open" ? this.indexWaitError(lane, secondsLeft) : refusal(3);
+    return state === "open" ? this.indexWaitError(lane, secondsLeft) : refusal(3, message);
   }
 
   /**
@@ -298,14 +301,14 @@ function retryError(attempt: number, retryAfter: string, message: string): Route
   };
 }
 
-function refusal(attempt: number): RouteFallbackError {
+function refusal(attempt: number, message = FINAL_REFUSAL_MESSAGE): RouteFallbackError {
   return {
     status: 400,
     attempt,
     headers: { "x-should-retry": "false" },
     body: {
       type: "error",
-      error: { type: "invalid_request_error", message: FINAL_REFUSAL_MESSAGE },
+      error: { type: "invalid_request_error", message },
     },
   };
 }

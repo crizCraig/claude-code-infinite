@@ -42,6 +42,8 @@ import { UNKNOWN_INDEX_WAIT_SECONDS } from "./index-wait-413.js";
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
+import { refusalCause, refusalMessage } from "./refusal-reason.js";
+import { SlowUploads } from "./slow-upload.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
@@ -55,7 +57,7 @@ import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, losesMedia, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, } from "./memtree.js";
+import { cachedPromptTokenCount, checkCompressedHistory, didMemtreeCompress, indexLagEvidence, losesMedia, MemtreeClient, modelBudgetTokens, normalizeMessagesForMemtree, serverFlattenedMessages, rawPromptTokenCount, memoryReadySeconds, unindexedTokenCount, } from "./memtree.js";
 import { contextLimitForModel, hasEarlierNonToolUserMessage, isAwaySummaryUserMessage, isLocalBashCommandTurn, isNonToolUserMessage, isToolResultUserMessage, lastNonSystemMessage, messagesWithSystem, modelForMemtree, stripSystemReminderText, } from "./turns.js";
 import { COMPRESSED_NOTICE, compressedTotalsText, DEGRADED_NOTICE, NOT_COMPRESSED_NOTE, SLOW_RETRY_NOTICE, recapLinkText, SseNoticeRewriter, stripNoticeBlocks, stripNoticeSystem, } from "./notices.js";
 import { NoticeDeliveryQueue, MEMTREE_COMPACT_COMMAND, MEMTREE_HELP_COMMAND, TRAILER_LABEL, LINK_LABEL, linkLines, terminalSupportsHyperlinks, isMemtreeViewCommand, sessionCommandArgs, parseNoticeHookInput, PRECOMPACT_HOOK_PATH } from "./hooks.js";
@@ -229,6 +231,12 @@ function noteIndexLag(opts, rec, result) {
     if (!indexLagEvidence(result))
         return false;
     rec.indexBehind = true;
+    const etaSeconds = memoryReadySeconds(result);
+    const unindexedTokens = unindexedTokenCount(result);
+    if (etaSeconds !== undefined || unindexedTokens !== undefined) {
+        rec.indexLag = { ...(etaSeconds !== undefined ? { etaSeconds } : {}),
+            ...(unindexedTokens !== undefined ? { unindexedTokens } : {}) };
+    }
     opts.memtree.expireCompressResult?.(result, opts.indexWaitRefreshMs ?? INDEX_WAIT_RETRY_AFTER_SECONDS * 1000);
     return true;
 }
@@ -370,6 +378,7 @@ export function startProxy(opts) {
         mainNoticePending: false,
         mainPromptGeneration: 0,
         promptAccounting: new PromptAccounting(),
+        slowUploads: new SlowUploads(undefined, opts.slowUploadMinBytes),
         fallbackFailures: new RouteFallbackFailures(undefined, opts.indexWaitDeadlineMs, opts.indexWaitMaxMs),
         refusalStreaks: new RefusalStreaks(),
         activeSubagents: new Set(),
@@ -395,6 +404,8 @@ export function startProxy(opts) {
         storageOwner: typeof opts.memtree.storageIdentity === "string"
             ? opts.memtree.storageIdentity : undefined,
         newestTrees: opts.newestTrees,
+        statusLinks: opts.statusLinks,
+        statusLinkRefresh: opts.statusLinkRefresh === true,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
         defaultCompactOff: opts.defaultCompactTarget === null,
@@ -410,6 +421,8 @@ export function startProxy(opts) {
         laneSizes: new Map(),
     };
     installMemtreeLink(state, state.memtreeLinkPlacement);
+    // A newer tree from the background lookup reaches the status line without a turn ending.
+    opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
     state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
     const server = http.createServer((req, res) => {
         const accepted = { req, res };
@@ -1353,6 +1366,11 @@ async function handleMessages(req, res, opts, upstream, state) {
             const link = recapLink(state, sessionId);
             return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
+    }
+    else if (state.statusLinks && state.statusLinkRefresh) {
+        // Keeps the status line's link fresh through long tool runs: answers from the cache,
+        // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS).
+        state.newestTrees?.peek(requestSessionId(req));
     }
     const isLocalBashCommand = isLocalBashCommandTurn(messages);
     // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
@@ -2773,10 +2791,11 @@ function noteMemtreePage(state, seq, sessionId, result) {
     if (latest && latest.seq >= seq)
         return;
     const compressed = didMemtreeCompress(result);
+    // A cached newest tree may predate this page; ask again (first, so the status line's
+    // link is this page until the lookup answers).
+    state.newestTrees?.invalidate(sessionId);
     rememberMemtreePage(state, sessionId, { sessionId, url, index, compressed, seq });
     state.memtreeLinkStore?.put(sessionId, { url, index, compressed });
-    // A cached newest tree may predate this page; ask again.
-    state.newestTrees?.invalidate(sessionId);
 }
 /**
  * Record a compress answer's page as the source of the memory now forwarded
@@ -2795,6 +2814,13 @@ function noteMemorySource(state, seq, sessionId, result) {
 }
 function rememberMemtreePage(state, sessionId, page) {
     rememberPage(state.memtreePages, sessionId, page);
+    publishStatusLink(state, sessionId);
+}
+/** Write the session's current link (as the trailers would show it) for the status line. */
+function publishStatusLink(state, sessionId) {
+    if (!state.statusLinks)
+        return;
+    state.statusLinks.write(sessionId, currentSessionLink(state, sessionId));
 }
 /** Bound optional page state independently of how many sessions use the proxy. */
 function rememberPage(pages, sessionId, page) {
@@ -3966,7 +3992,7 @@ function carryFor(args) {
  * one beside it: 2026-10-30, eleven 26 MB compressions in ten minutes, each billed, none
  * used. False when the session already has a preparation in flight (it serves instead).
  */
-function carryOverCompression(state, carry, pending) {
+function carryOverCompression(state, carry, pending, bytes = 0) {
     const { sessionId, base } = carry;
     // A prefix installed since the call started (another turn's) supersedes it already.
     if (state.backgroundSignal.aborted || state.preparing.has(sessionId) ||
@@ -3979,6 +4005,9 @@ function carryOverCompression(state, carry, pending) {
         // refusal or a slow server's timeout must not arm it, as runBlockingCompression).
         if (result)
             noteMemtreeHealth(state, { result, liveHealth: "success" });
+        // Its upload got through: a slow-upload episode is over (Codex r4 P2).
+        if (result)
+            state.slowUploads.settled(sessionId, bytes, "ok");
         return result ? preparedFromResult(carry, result) : undefined;
     })
         .catch(() => undefined)
@@ -3995,6 +4024,14 @@ function carryOverCompression(state, carry, pending) {
 /** How long a carried compaction may run: the long budget, or its upload's if longer. */
 /** How much longer than its turn's wait a carried call must be allowed to run. */
 const CARRY_MIN_EXTRA_MS = 5_000;
+/**
+ * The long compress budget for an upload of `bytes`: the long budget or the upload's
+ * scaled one if longer, raised after the session's last large upload timed out.
+ */
+function longCompressBudgetFor(opts, state, sessionId, bytes) {
+    const longMs = Math.max(opts.memtree.longCompressBudgetMs, opts.memtree.compressBudgetForBytes(bytes));
+    return state.slowUploads.budgetMs(sessionId, bytes, longMs);
+}
 function carriedBudgetMs(opts, scaledMs) {
     return Math.min(MAX_LONG_COMPRESS_WAIT_MS, Math.max(opts.memtree.longCompressBudgetMs, scaledMs));
 }
@@ -4567,7 +4604,11 @@ async function runBlockingCompressionOnce(args) {
     // The upload is about the request's size: the budget grows with it (the long one
     // too, never below the short one's).
     const scaledMs = opts.memtree.compressBudgetForBytes(rec.requestBytes);
-    const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, args.longBudget ? Math.max(opts.memtree.longCompressBudgetMs, scaledMs) : scaledMs, args.capMs ?? Infinity);
+    // A session whose last large upload ran out of the long budget gets more (slow-upload.ts).
+    const extendedBudget = args.longBudget === true &&
+        state.slowUploads.extended(args.sessionId, rec.requestBytes);
+    const budgetMs = Math.min(args.longBudget ? MAX_LONG_COMPRESS_WAIT_MS : MAX_COMPRESS_WAIT_MS, args.longBudget ? longCompressBudgetFor(opts, state, args.sessionId, rec.requestBytes)
+        : scaledMs, args.capMs ?? Infinity);
     // Carried only when running on gives it meaningfully more time than this wait.
     const carry = args.carry && args.capMs === undefined &&
         carriedBudgetMs(opts, scaledMs) >= budgetMs + CARRY_MIN_EXTRA_MS ? args.carry : undefined;
@@ -4623,7 +4664,7 @@ async function runBlockingCompressionOnce(args) {
     const compressMs = Date.now() - compressStarted;
     // Given up on but still running: the session's next turn waits for it, not a new call.
     const carried = result === null && !settled && carry !== undefined &&
-        carryOverCompression(state, carry, call);
+        carryOverCompression(state, carry, call, rec.requestBytes);
     noteServerBudget(state, body.model, modelContextLimit, result);
     // Sampled at this call's settle, before a concurrent same-request failure of
     // another class can overwrite the complete-key entry.
@@ -4650,10 +4691,21 @@ async function runBlockingCompressionOnce(args) {
     const othersAnswered = timedOut && (opts.memtree.lastCompressSuccessAt ?? 0) >= compressStarted;
     // A carried call has not failed: it is still running (its answer reports its health).
     const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
+    // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
+    // A large upload's live answer (any budget, not a cache hit) ends a slow-upload episode.
+    if (result !== null && !cached)
+        state.slowUploads.settled(args.sessionId, rec.requestBytes, "ok");
+    const uploadTimeout = result === null && args.longBudget === true &&
+        args.capMs === undefined && !carried &&
+        state.slowUploads.settled(args.sessionId, rec.requestBytes, timedOut ? "timeout" : "other");
     rec.compress = {
         ms: compressMs,
         ok: result !== null,
         timedOut,
+        budgetMs,
+        ...(extendedBudget ? { extendedBudget: true } : {}),
+        ...(uploadTimeout ? { uploadTimeout: true } : {}),
+        ...(failureStatus !== undefined ? { status: failureStatus } : {}),
         ...(carried ? { carriedOver: true } : {}),
         // A joined call's indexing 413 is MemTree's refusal of this request too.
         ...((!cached && failureStatus === OVER_CONTEXT_STATUS) || indexWaitSeconds !== undefined
@@ -5617,6 +5669,30 @@ async function wholeRequestRefused(sizing, candidate, limits) {
         return false;
     return !fitsMeasured(await sizing.measure(candidate, limits), limits);
 }
+/** What explains refusing this request (refusal-reason.ts), from its record and the lane. */
+function refusalCauseFor(args, inputTokens) {
+    const { state, rec } = args;
+    const sessionId = requestSessionId(args.req);
+    const bytes = rec.requestBytes;
+    // After a slow upload: what the session's next long-budget try gets.
+    const nextCompressBudgetMs = rec.compress?.uploadTimeout
+        ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, longCompressBudgetFor(args.opts, state, sessionId, bytes))
+        : undefined;
+    // This request's own 413, then its own answer's ETA, then the lane's last stated time.
+    const known = (seconds) => seconds === UNKNOWN_INDEX_WAIT_SECONDS ? undefined : seconds;
+    return refusalCause(rec, {
+        inputTokens, modelContextLimit: args.modelContextLimit,
+        // The 60 s stand-in for an indexing 413 that stated no time is no estimate.
+        indexSecondsLeft: known(activeIndexWaits.get(rec)) ?? rec.indexLag?.etaSeconds ??
+            known(state.fallbackFailures.indexSecondsLeft(args.routeKey)),
+        nextCompressBudgetMs,
+    });
+}
+/** The session's MemTree page (refusal line, status line), as the trailers would show it. */
+function currentSessionLink(state, sessionId) {
+    return sessionId === undefined ? undefined
+        : sessionLink(state, sessionId, currentMemtreePage(state, sessionId))?.link;
+}
 /** Write the bounded fallback refusal (route-fallback.ts); always false. */
 function refuseWholeRequest(args, inputTokens, budgetTokens) {
     // A refused key or a paused one: a retry cannot fix either, so it is final at once.
@@ -5624,11 +5700,14 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
     const unpaid = keyInvalid ? null : args.state.pausedDetail();
     // MemTree can't be reached: nothing says the request can't fit, so no strike (2026-11-09).
     const offline = keyInvalid || unpaid !== null ? undefined : unreachableNow(args.state, args.rec);
+    const cause = keyInvalid || unpaid !== null || offline ? undefined
+        : refusalCauseFor(args, inputTokens);
     const failure = keyInvalid ? pausedRefusal(keyInvalidRefusalMessage(args.state.keyPageUrl))
         : unpaid !== null ? pausedRefusal(pausedRefusalMessage(unpaid))
             : offline ? unreachableRefusal(offline.message)
                 : args.state.fallbackFailures.fail(args.routeKey, { awaitingIndex: args.rec.indexBehind === true,
-                    indexSecondsLeft: activeIndexWaits.get(args.rec) });
+                    indexSecondsLeft: activeIndexWaits.get(args.rec),
+                    refusalMessage: refusalMessage(cause, currentSessionLink(args.state, requestSessionId(args.req))) });
     args.rec.forwardedBytes = 0;
     args.rec.approxInputTokens = 0;
     // Nothing went out uncompressed: Claude Code retries it (2026-10-28).
@@ -5655,6 +5734,7 @@ function refuseWholeRequest(args, inputTokens, budgetTokens) {
         budgetTokens, modelContextLimit: args.modelContextLimit, ...(unpaid !== null ? { paused: true } : {}),
         ...(keyInvalid ? { keyInvalid: true } : {}),
         ...(offline ? { unreachable: offline.what } : {}),
+        ...(cause && failure.status === 400 ? { cause: cause.kind } : {}),
     };
     if (unpaid !== null || keyInvalid)
         cancelPausedNotice(args.state, args.rec);
