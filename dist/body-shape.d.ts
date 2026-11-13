@@ -17,11 +17,17 @@ export interface BodyShape {
     /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
     imageDims: Array<[number, number] | undefined>;
     /**
-     * The messages hold an image, document or upload resolved from outside the body (a URL
-     * or file id): its content can change under an unchanged digest, so the body never
-     * anchors a size (Codex r4/r5 P1s).
+     * The messages hold a block the anchor cannot bound (MESSAGE_BLOCKS): a document, a URL
+     * or file image, search results, server tool blocks, an upload. Such a body never
+     * anchors a size (Codex r4-r6 P1s).
      */
-    otherImages: boolean;
+    unanchorable: boolean;
+    /**
+     * Index of the last message holding a tool_reference (Anthropic expands it into the
+     * tool's definition, past its bytes); -1 when none. Fine in the sampled part, which
+     * Anthropic counted expanded; one appended disables the anchor.
+     */
+    lastExpanding: number;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
 export declare function bodyShape(body: Buffer): BodyShape | undefined;

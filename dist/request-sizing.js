@@ -253,9 +253,10 @@ export function anchoredBound(sample, shape, model) {
     if (!plausibleSample(sample) || sample.imageBytes === undefined ||
         sample.imageTokens === undefined || sample.messageCount === undefined)
         return undefined;
-    // Mutable (URL) images never anchor (Codex r4 P1); every inline image is charged from the
+    // Documents, URL images and other blocks it cannot bound never anchor (Codex r4-r6 P1s);
+    // every inline image is charged from the
     // same parse that left it out of the text, so none escapes both (Codex r3 P1).
-    if (shape.otherImages)
+    if (shape.unanchorable || shape.lastExpanding >= sample.messageCount)
         return undefined;
     const sampled = textBytes(shape, 0, sample.messageCount);
     const appended = textBytes(shape, sample.messageCount);

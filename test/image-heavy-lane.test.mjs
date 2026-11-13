@@ -172,7 +172,7 @@ test('no anchor for a body that does not extend the sampled one, or on another m
 
 test('the anchor sizes appended messages by their own canonical bytes, under 75% coverage none', () => {
   const shape = { frame: 'f', messages: ['a', 'b', 'c'], sizes: [400_000, 50_000, 50_000],
-    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], otherImages: false };
+    imageChars: [0, 0, 0], serverEdits: false, imageDims: [], unanchorable: false, lastExpanding: -1 };
   const sample = { tokens: 100_000, forwardedBytes: 450_000, imageBytes: 0, imageTokens: 0,
     messageCount: 2 };
   assert.equal(anchoredBound(sample, shape, MODEL),
@@ -183,7 +183,7 @@ test('the anchor sizes appended messages by their own canonical bytes, under 75%
   assert.equal(anchoredBound({ tokens: 100_000, forwardedBytes: 450_000, messageCount: 2 }, shape,
     MODEL), undefined, 'a sample without its images cannot anchor');
   assert.equal(anchoredBound(undefined, shape, MODEL), undefined);
-  assert.equal(anchoredBound(sample, { ...shape, otherImages: true }, MODEL), undefined,
+  assert.equal(anchoredBound(sample, { ...shape, unanchorable: true }, MODEL), undefined,
     'a URL image can change under the same digest');
 });
 
@@ -229,31 +229,59 @@ test('an image the byte scan misses (escaped "type") is still charged (Codex r3 
   assert.equal(bound(escaped), bound(plainBody), 'the same images charged either way');
 });
 
+test('control: the fixture used below anchors without the extra block', () => {
+  const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  messages.splice(1, 0, { role: 'user', content: [{ type: 'text', text: 'see' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'seen' }] });
+  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
+  const body = bodyOf(messages);
+  assert.ok(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
+    .conservativeTokens < conservativeBodyTokens(body, MODEL));
+});
+
 test('a URL image in the body: no anchor (its content can change, Codex r4 P1)', () => {
   const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
   messages.splice(1, 0, { role: 'user', content: [{ type: 'image',
     source: { type: 'url', url: 'https://example.com/a.png' } }] },
   { role: 'assistant', content: [{ type: 'text', text: 'seen' }] });
-  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 200_000);
+  const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
   const body = bodyOf(messages);
   assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
     .conservativeTokens, conservativeBodyTokens(body, MODEL));
 });
 
-test('a document by URL, even inside a tool result: no anchor (Codex r5 P1)', () => {
+test('documents (URL, file, content, inline PDF), even in a tool result: no anchor (Codex r5-r6 P1s)', () => {
   for (const block of [
     { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } },
     { type: 'tool_result', tool_use_id: 'u', content: [
       { type: 'document', source: { type: 'file', file_id: 'file_1' } }] },
+    // Nested URL images in a content-source document (Codex r6 P1).
+    { type: 'document', source: { type: 'content', content: [
+      { type: 'image', source: { type: 'url', url: 'https://example.com/b.png' } }] } },
+    // An appended inline PDF expands far past its bytes (Codex r6 P1).
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0x' } },
   ]) {
     const messages = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
     messages.splice(1, 0, { role: 'user', content: [block] },
       { role: 'assistant', content: [{ type: 'text', text: 'read' }] });
-    const sample = sampleOf(bodyOf(messages.slice(0, -2)), 200_000);
+    const sample = sampleOf(bodyOf(messages.slice(0, -2)), 100_000);
     const body = bodyOf(messages);
     assert.equal(new RequestSizing(fakeCounts(), true, MODEL).register(body, 'original', sample)
       .conservativeTokens, conservativeBodyTokens(body, MODEL));
   }
+});
+
+test('tool references: counted in the prefix they anchor; appended they do not (expanded)', () => {
+  const ref = (name) => [{ role: 'assistant', content: [{ type: 'tool_use', id: name,
+    name: 'ToolSearch', input: {} }] }, { role: 'user', content: [{ type: 'tool_result',
+    tool_use_id: name, content: [{ type: 'tool_reference', tool_name: name }] }] }];
+  const base = agentMessages({ images: 2, textChars: 400_000, signatureChars: 0 });
+  const bound = (sampled, body) => new RequestSizing(fakeCounts(), true, MODEL)
+    .register(bodyOf(body), 'original', sampleOf(bodyOf(sampled), 100_000)).conservativeTokens;
+  const inPrefix = [...base.slice(0, 1), ...ref('WebSearch'), ...base.slice(1)];
+  assert.ok(bound(inPrefix.slice(0, -2), inPrefix) < conservativeBodyTokens(bodyOf(inPrefix), MODEL));
+  const appended = [...base, ...ref('WebFetch')];
+  assert.equal(bound(base, appended), conservativeBodyTokens(bodyOf(appended), MODEL));
 });
 
 test('a standalone JPEG marker (TEM) before a large segment is walked over (Codex r4 P2)', () => {

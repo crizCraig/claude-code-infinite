@@ -37,11 +37,17 @@ export interface BodyShape {
   /** Each inline base64 image's dimensions (undefined when unreadable), in order. */
   imageDims: Array<[number, number] | undefined>;
   /**
-   * The messages hold an image, document or upload resolved from outside the body (a URL
-   * or file id): its content can change under an unchanged digest, so the body never
-   * anchors a size (Codex r4/r5 P1s).
+   * The messages hold a block the anchor cannot bound (MESSAGE_BLOCKS): a document, a URL
+   * or file image, search results, server tool blocks, an upload. Such a body never
+   * anchors a size (Codex r4-r6 P1s).
    */
-  otherImages: boolean;
+  unanchorable: boolean;
+  /**
+   * Index of the last message holding a tool_reference (Anthropic expands it into the
+   * tool's definition, past its bytes); -1 when none. Fine in the sampled part, which
+   * Anthropic counted expanded; one appended disables the anchor.
+   */
+  lastExpanding: number;
 }
 
 const shapes = new WeakMap<Buffer, BodyShape | null>();
@@ -93,12 +99,13 @@ function computeShape(body: Buffer): BodyShape | null {
   const shape: BodyShape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
     messages: [], sizes: [], imageChars: [],
     serverEdits: frame.context_management !== undefined || frame.compaction !== undefined,
-    imageDims: [], otherImages: false };
+    imageDims: [], unanchorable: false, lastExpanding: -1 };
   for (const message of messages) {
     const text = JSON.stringify(canonicalMessage(message)) ?? "";
     shape.messages.push(hash(text));
     shape.sizes.push(Buffer.byteLength(text, "utf-8"));
     shape.imageChars.push(imageCharsOf(message, shape));
+    if (text.includes('"type":"tool_reference"')) shape.lastExpanding = shape.messages.length - 1;
   }
   return shape;
 }
@@ -143,7 +150,7 @@ function imageCharsOf(message: unknown, shape: BodyShape): number {
   return Array.isArray(content) ? blockImageChars(content, shape) : 0;
 }
 
-function blockImageChars(blocks: unknown[], shape: BodyShape): number {
+function blockImageChars(blocks: unknown[], shape: BodyShape, nested = false): number {
   let total = 0;
   for (const item of blocks) {
     const block = item as Record<string, unknown> | null;
@@ -152,25 +159,26 @@ function blockImageChars(blocks: unknown[], shape: BodyShape): number {
     if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
       total += source.data.length;
       shape.imageDims.push(imageDimensions(source.data));
-    } else if (externallyResolved(block)) {
-      shape.otherImages = true;
-    } else if (block.type === "tool_result" && Array.isArray(block.content)) {
-      total += blockImageChars(block.content, shape);
+    } else if (block.type === "tool_result" && !nested) {
+      if (Array.isArray(block.content)) total += blockImageChars(block.content, shape, true);
+      else if (block.content !== undefined && typeof block.content !== "string") {
+        shape.unanchorable = true;
+      }
+    } else if (!(nested ? NESTED_BLOCKS : MESSAGE_BLOCKS).has(String(block.type))) {
+      shape.unanchorable = true;
     }
   }
   return total;
 }
 
-/** Inline sources: their content is in the body, so the digest covers it. */
-const INLINE_SOURCES = new Set(["base64", "text", "content"]);
-
 /**
- * A block Anthropic resolves from outside the body (an image or document by URL or file
- * id, a container upload): it can change under the same digest (Codex r4 and r5 P1s).
+ * Blocks whose cost the anchor can bound: text (by its bytes), inline base64 images (by
+ * their dimensions), tool calls and results, thinking, tool additions (their definition
+ * is inline), tool references (only where already counted: BodyShape.lastExpanding). Anything else (a document, which
+ * Anthropic expands into page images and text far past its bytes; a URL or file image;
+ * search results; server tool blocks; uploads) disables the anchor, so its size is the
+ * plain bound or a count as before (Codex r4-r6 P1s).
  */
-function externallyResolved(block: Record<string, unknown>): boolean {
-  if (block.type === "container_upload") return true;
-  const source = block.source as Record<string, unknown> | undefined;
-  if (block.type === "image") return true;
-  return !!source && typeof source === "object" && !INLINE_SOURCES.has(String(source.type));
-}
+const MESSAGE_BLOCKS = new Set(["text", "tool_use", "tool_result", "thinking",
+  "redacted_thinking", "tool_addition", "tool_reference"]);
+const NESTED_BLOCKS = new Set(["text", "tool_reference"]);

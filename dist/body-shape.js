@@ -69,12 +69,14 @@ function computeShape(body) {
     const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
         messages: [], sizes: [], imageChars: [],
         serverEdits: frame.context_management !== undefined || frame.compaction !== undefined,
-        imageDims: [], otherImages: false };
+        imageDims: [], unanchorable: false, lastExpanding: -1 };
     for (const message of messages) {
         const text = JSON.stringify(canonicalMessage(message)) ?? "";
         shape.messages.push(hash(text));
         shape.sizes.push(Buffer.byteLength(text, "utf-8"));
         shape.imageChars.push(imageCharsOf(message, shape));
+        if (text.includes('"type":"tool_reference"'))
+            shape.lastExpanding = shape.messages.length - 1;
     }
     return shape;
 }
@@ -117,7 +119,7 @@ function imageCharsOf(message, shape) {
     const content = message?.content;
     return Array.isArray(content) ? blockImageChars(content, shape) : 0;
 }
-function blockImageChars(blocks, shape) {
+function blockImageChars(blocks, shape, nested = false) {
     let total = 0;
     for (const item of blocks) {
         const block = item;
@@ -128,27 +130,28 @@ function blockImageChars(blocks, shape) {
             total += source.data.length;
             shape.imageDims.push(imageDimensions(source.data));
         }
-        else if (externallyResolved(block)) {
-            shape.otherImages = true;
+        else if (block.type === "tool_result" && !nested) {
+            if (Array.isArray(block.content))
+                total += blockImageChars(block.content, shape, true);
+            else if (block.content !== undefined && typeof block.content !== "string") {
+                shape.unanchorable = true;
+            }
         }
-        else if (block.type === "tool_result" && Array.isArray(block.content)) {
-            total += blockImageChars(block.content, shape);
+        else if (!(nested ? NESTED_BLOCKS : MESSAGE_BLOCKS).has(String(block.type))) {
+            shape.unanchorable = true;
         }
     }
     return total;
 }
-/** Inline sources: their content is in the body, so the digest covers it. */
-const INLINE_SOURCES = new Set(["base64", "text", "content"]);
 /**
- * A block Anthropic resolves from outside the body (an image or document by URL or file
- * id, a container upload): it can change under the same digest (Codex r4 and r5 P1s).
+ * Blocks whose cost the anchor can bound: text (by its bytes), inline base64 images (by
+ * their dimensions), tool calls and results, thinking, tool additions (their definition
+ * is inline), tool references (only where already counted: BodyShape.lastExpanding). Anything else (a document, which
+ * Anthropic expands into page images and text far past its bytes; a URL or file image;
+ * search results; server tool blocks; uploads) disables the anchor, so its size is the
+ * plain bound or a count as before (Codex r4-r6 P1s).
  */
-function externallyResolved(block) {
-    if (block.type === "container_upload")
-        return true;
-    const source = block.source;
-    if (block.type === "image")
-        return true;
-    return !!source && typeof source === "object" && !INLINE_SOURCES.has(String(source.type));
-}
+const MESSAGE_BLOCKS = new Set(["text", "tool_use", "tool_result", "thinking",
+    "redacted_thinking", "tool_addition", "tool_reference"]);
+const NESTED_BLOCKS = new Set(["text", "tool_reference"]);
 //# sourceMappingURL=body-shape.js.map
