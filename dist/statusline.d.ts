@@ -20,7 +20,7 @@ export declare function statuslinePaths(env?: NodeJS.ProcessEnv): StatuslinePath
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
 export declare function statuslineMain(args: string[], paths?: StatuslinePaths, out?: (text: string) => boolean): Promise<number>;
 /** The status line: the wrapped command's output, then the session's link. */
-export declare function renderStatusline(input: string, paths: StatuslinePaths, env?: NodeJS.ProcessEnv): string;
+export declare function renderStatusline(input: string, paths: StatuslinePaths, env?: NodeJS.ProcessEnv): Promise<string>;
 /** ` 🌿 tree` linked to the session's page, or the URL; "" with no cached link. */
 export declare function linkSegment(sessionId: unknown, env?: NodeJS.ProcessEnv, dir?: string): string;
 /**
@@ -36,6 +36,11 @@ export declare function uninstallStatusline(paths: StatuslinePaths): {
     ok: boolean;
     message: string;
 };
+/**
+ * The wrapped command's stdout, trailing newlines trimmed ("" if it fails). Run in its own
+ * process group, so a timeout kills everything it started (no pile-up across refreshes).
+ */
+export declare function runWrapped(command: string, input: string, timeoutMs?: number): Promise<string>;
 /**
  * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
  * only then does the proxy keep the link fresh in the background. Read at startup.

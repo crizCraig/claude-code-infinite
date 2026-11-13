@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { StatusLinkFiles, readStatusLink } from "../dist/status-link.js";
 import {
-  STATUSLINE_COMMAND, WRAPPED_ENV, installStatusline, linkSegment, renderStatusline,
+  STATUSLINE_COMMAND, WRAPPED_ENV, installStatusline, linkSegment, renderStatusline, runWrapped,
   statusLineWantsLink, statuslinePaths, uninstallStatusline,
 } from "../dist/statusline.js";
 import {
@@ -76,7 +76,7 @@ function setup(statusLine) {
   return { dir, paths: { settings, saved: path.join(dir, "statusline.json"), links } };
 }
 
-test("install wraps the existing command; the status line keeps it and adds the link", () => {
+test("install wraps the existing command; the status line keeps it and adds the link", async () => {
   const original = { type: "command", command: OWN_COMMAND, padding: 0, refreshInterval: 5,
     hideVimModeIndicator: true };
   const { dir, paths } = setup(original);
@@ -89,7 +89,7 @@ test("install wraps the existing command; the status line keeps it and adds the 
   assert.ok(fs.readdirSync(dir).some((name) => name.startsWith("settings.json.ccc-backup-")));
   const input = JSON.stringify({ session_id: SESSION, model: { display_name: "Opus" } });
   if (process.platform !== "win32") {
-    assert.equal(renderStatusline(input, paths, APPLE_TERMINAL), `494k (49%) | model | ${URL1}`);
+    assert.equal(await renderStatusline(input, paths, APPLE_TERMINAL), `494k (49%) | model | ${URL1}`);
   }
   assert.equal(installStatusline(paths, "darwin").ok, true, "again: harmless");
   assert.equal(JSON.parse(fs.readFileSync(paths.saved, "utf-8")).statusLine.command, OWN_COMMAND,
@@ -99,11 +99,11 @@ test("install wraps the existing command; the status line keeps it and adds the 
   assert.equal(fs.existsSync(paths.saved), false);
 });
 
-test("install with no status line: the link alone; uninstall removes it", () => {
+test("install with no status line: the link alone; uninstall removes it", async () => {
   const { paths } = setup(undefined);
   assert.equal(installStatusline(paths, "darwin").ok, true);
-  assert.equal(renderStatusline(JSON.stringify({ session_id: SESSION }), paths, APPLE_TERMINAL), URL1);
-  assert.equal(renderStatusline("not json", paths, APPLE_TERMINAL), "");
+  assert.equal(await renderStatusline(JSON.stringify({ session_id: SESSION }), paths, APPLE_TERMINAL), URL1);
+  assert.equal(await renderStatusline("not json", paths, APPLE_TERMINAL), "");
   uninstallStatusline(paths, "darwin");
   assert.equal(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine, undefined);
 });
@@ -142,13 +142,13 @@ test("newest-tree lookups run in the background long enough for the slow session
   assert.deepEqual(seen, [[SESSION, URL2]]);
 });
 
-test("a wrapped command that itself runs ccc's status line prints nothing inside, never recurses", () => {
+test("a wrapped command that itself runs ccc's status line prints nothing inside, never recurses", async () => {
   const { paths } = setup({ type: "command", command: "/opt/homebrew/bin/ccc statusline" });
   const result = installStatusline(paths, "darwin");
   assert.equal(result.ok, false, "a command that already runs ccc's is never wrapped");
   assert.match(result.message, /already runs ccc statusline/);
   const input = JSON.stringify({ session_id: SESSION });
-  assert.equal(renderStatusline(input, paths, { ...APPLE_TERMINAL, [WRAPPED_ENV]: "1" }), "");
+  assert.equal(await renderStatusline(input, paths, { ...APPLE_TERMINAL, [WRAPPED_ENV]: "1" }), "");
   for (const command of ["npx claude-code-infinite statusline", "bash -c 'ccc statusline'",
     "ccc.cmd statusline"]) {
     const other = setup({ type: "command", command });
@@ -239,4 +239,44 @@ test("a newer link is written again after another process wrote an older one", (
   a.write(SESSION, URL1);
   b.write(SESSION, URL2);
   assert.equal(readStatusLink(SESSION, dir), URL2);
+});
+
+test("a wrapped command that hangs is killed with everything it started", { skip: process.platform === "win32" }, async () => {
+  const marker = path.join(tmp(), "late");
+  const started = Date.now();
+  const out = await runWrapped(`sh -c 'sleep 1; touch ${marker}'; echo never`, "{}", 200);
+  assert.equal(out, "");
+  assert.ok(Date.now() - started < 1_000);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(fs.existsSync(marker), false, "the grandchild was killed too");
+});
+
+test("two config dirs sharing one settings file share its saved original", { skip: process.platform === "win32" }, () => {
+  const shared = path.join(tmp(), "settings.json");
+  fs.writeFileSync(shared, "{}");
+  const a = tmp();
+  const b = tmp();
+  fs.symlinkSync(shared, path.join(a, "settings.json"));
+  fs.symlinkSync(shared, path.join(b, "settings.json"));
+  assert.equal(statuslinePaths({ CLAUDE_CONFIG_DIR: a }).saved,
+    statuslinePaths({ CLAUDE_CONFIG_DIR: b }).saved);
+  // A config dir install creates (under a symlinked parent): the same key before and after.
+  const parent = tmp();
+  const link = path.join(tmp(), "link");
+  fs.symlinkSync(parent, link);
+  const missing = path.join(link, "new", "dir");
+  const before = statuslinePaths({ CLAUDE_CONFIG_DIR: missing }).saved;
+  fs.mkdirSync(missing, { recursive: true });
+  assert.equal(statuslinePaths({ CLAUDE_CONFIG_DIR: missing }).saved, before);
+});
+
+test("uninstall keeps option changes made while installed", () => {
+  const { paths } = setup({ type: "command", command: OWN_COMMAND, padding: 0 });
+  installStatusline(paths, "darwin");
+  const settings = JSON.parse(fs.readFileSync(paths.settings, "utf-8"));
+  settings.statusLine.padding = 2;
+  fs.writeFileSync(paths.settings, JSON.stringify(settings));
+  uninstallStatusline(paths);
+  assert.deepEqual(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine,
+    { type: "command", command: OWN_COMMAND, padding: 2 });
 });

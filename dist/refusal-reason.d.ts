@@ -43,9 +43,6 @@ export interface RefusalEvidence {
         uploadTimeout?: true;
     };
     indexBehind?: true;
-    indexWait?: {
-        secondsLeft: number;
-    };
     /** The compress answer's index lag: the server's memory ETA and the un-indexed tokens. */
     indexLag?: {
         etaSeconds?: number;

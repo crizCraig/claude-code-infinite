@@ -13,7 +13,7 @@
  * Loaded straight from cli.ts (no proxy, no update check): Claude Code runs a status line
  * after every message.
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -29,6 +29,8 @@ export const STATUSLINE_LABEL = "🌿 tree";
 export const STATUSLINE_SEPARATOR = " | ";
 /** The wrapped command gets this long; Claude Code drops a slow status line anyway. */
 const WRAPPED_TIMEOUT_MS = 5_000;
+/** After SIGTERM, how long the wrapped command's group gets before SIGKILL. */
+const KILL_GRACE_MS = 500;
 /**
  * Set for the wrapped command: a `ccc statusline` inside it (a wrapped command that itself
  * calls ccc's, under another spelling) prints nothing instead of recursing.
@@ -49,8 +51,8 @@ export interface StatuslinePaths {
 export function statuslinePaths(env: NodeJS.ProcessEnv = process.env): StatuslinePaths {
   const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
   const settings = path.join(dir, "settings.json");
-  // One saved original per settings file, however its directory is spelled (symlinks too).
-  const resolved = path.join(realTarget(dir), "settings.json");
+  // One saved original per settings file, however it is reached (aliases, symlinks).
+  const resolved = resolvedPath(settings);
   const key = createHash("sha256").update(resolved).digest("hex").slice(0, 12);
   return { settings, saved: path.join(getConfigDir(), `statusline-${key}.json`) };
 }
@@ -66,17 +68,17 @@ export async function statuslineMain(
     out("Usage: ccc statusline [install|uninstall]\n");
     return 2;
   }
-  out(renderStatusline(await readStdin(), paths));
+  out(await renderStatusline(await readStdin(), paths));
   return 0;
 }
 
 /** The status line: the wrapped command's output, then the session's link. */
-export function renderStatusline(
+export async function renderStatusline(
   input: string, paths: StatuslinePaths, env: NodeJS.ProcessEnv = process.env
-): string {
+): Promise<string> {
   if (env[WRAPPED_ENV]) return "";
   const wrapped = savedStatusLine(paths.saved);
-  const base = wrapped ? runWrapped(wrapped.command, input) : "";
+  const base = wrapped ? await runWrapped(wrapped.command, input) : "";
   const segment = linkSegment(sessionIdOf(input), env, paths.links);
   if (!segment) return base;
   return base ? `${base}${STATUSLINE_SEPARATOR}${segment}` : segment;
@@ -148,7 +150,10 @@ export function uninstallStatusline(paths: StatuslinePaths): { ok: boolean; mess
   const failed = attempt(() => {
     backup(paths.settings);
     if (saved.statusLine && typeof saved.statusLine === "object") {
-      settings.value.statusLine = saved.statusLine;
+      // The original command back; options changed since install stay as they are now.
+      const original = saved.statusLine as Record<string, unknown>;
+      settings.value.statusLine = { ...(settings.value.statusLine as object),
+        type: original.type, command: original.command };
     } else {
       delete settings.value.statusLine;
     }
@@ -188,12 +193,46 @@ function savedStatusLine(file: string): { command: string } | undefined {
     ? { command: saved.command } : undefined;
 }
 
-/** The wrapped command's stdout, trailing newlines trimmed ("" if it fails). */
-function runWrapped(command: string, input: string): string {
-  const result = spawnSync(command, { input, shell: true, encoding: "utf-8",
-    timeout: WRAPPED_TIMEOUT_MS, stdio: ["pipe", "pipe", "ignore"],
-    env: { ...process.env, [WRAPPED_ENV]: "1" } });
-  return typeof result.stdout === "string" ? result.stdout.replace(/[\r\n]+$/, "") : "";
+/**
+ * The wrapped command's stdout, trailing newlines trimmed ("" if it fails). Run in its own
+ * process group, so a timeout kills everything it started (no pile-up across refreshes).
+ */
+export function runWrapped(
+  command: string, input: string, timeoutMs = WRAPPED_TIMEOUT_MS
+): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn(command, { shell: true, detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, [WRAPPED_ENV]: "1" } });
+    const chunks: Buffer[] = [];
+    let done = false;
+    const finish = (text: string) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(text);
+    };
+    const timer = setTimeout(() => {
+      killTree(child.pid, "SIGTERM");
+      // Kept referenced: ccc waits the grace out so the forced kill is sent.
+      setTimeout(() => killTree(child.pid, "SIGKILL"), KILL_GRACE_MS);
+      finish("");
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.on("error", () => finish(""));
+    child.on("close", () => finish(Buffer.concat(chunks).toString("utf-8").replace(/[\r\n]+$/, "")));
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
+  });
+}
+
+/** Signal the wrapped command's whole process group (its pid on Windows). */
+function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (pid === undefined) return;
+  try {
+    process.kill(process.platform === "win32" ? pid : -pid, signal);
+  } catch {
+    // Already gone.
+  }
 }
 
 function sessionIdOf(input: string): unknown {
@@ -235,6 +274,22 @@ function writeJson(file: string, value: unknown): void {
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode });
   fs.chmodSync(tmp, mode);
   fs.renameSync(tmp, target);
+}
+
+/** `file` with symlinks resolved, through its nearest existing ancestor if it is missing. */
+function resolvedPath(file: string): string {
+  const missing: string[] = [];
+  let current = path.resolve(file);
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...missing.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(file);
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 function realTarget(file: string): string {

@@ -4689,8 +4689,12 @@ async function runBlockingCompressionOnce(args) {
     // A carried call has not failed: it is still running (its answer reports its health).
     const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
     // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
-    const uploadTimeout = args.longBudget === true && args.capMs === undefined && !carried &&
-        state.slowUploads.settled(args.sessionId, rec.requestBytes, result !== null ? "ok" : timedOut ? "timeout" : "other");
+    // Any answer ends a slow-upload episode (Codex r3 P2).
+    if (result !== null)
+        state.slowUploads.settled(args.sessionId, rec.requestBytes, "ok");
+    const uploadTimeout = result === null && args.longBudget === true &&
+        args.capMs === undefined && !carried &&
+        state.slowUploads.settled(args.sessionId, rec.requestBytes, timedOut ? "timeout" : "other");
     rec.compress = {
         ms: compressMs,
         ok: result !== null,
@@ -5671,11 +5675,13 @@ function refusalCauseFor(args, inputTokens) {
     const nextCompressBudgetMs = rec.compress?.uploadTimeout
         ? Math.min(MAX_LONG_COMPRESS_WAIT_MS, longCompressBudgetFor(args.opts, state, sessionId, bytes))
         : undefined;
-    const stated = activeIndexWaits.get(rec) ?? state.fallbackFailures.indexSecondsLeft(args.routeKey);
+    // This request's own 413, then its own answer's ETA, then the lane's last stated time.
+    const known = (seconds) => seconds === UNKNOWN_INDEX_WAIT_SECONDS ? undefined : seconds;
     return refusalCause(rec, {
         inputTokens, modelContextLimit: args.modelContextLimit,
         // The 60 s stand-in for an indexing 413 that stated no time is no estimate.
-        indexSecondsLeft: stated === UNKNOWN_INDEX_WAIT_SECONDS ? undefined : stated,
+        indexSecondsLeft: known(activeIndexWaits.get(rec)) ?? rec.indexLag?.etaSeconds ??
+            known(state.fallbackFailures.indexSecondsLeft(args.routeKey)),
         nextCompressBudgetMs,
     });
 }
