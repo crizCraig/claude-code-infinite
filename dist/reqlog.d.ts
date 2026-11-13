@@ -146,6 +146,15 @@ export interface MessagesRecord {
         heldMs: number;
         ended?: true;
     };
+    /**
+     * With indexBehind: what the compress answer said about the lag, for the refusal's ETA
+     * (refusal-reason.ts): the server's `memory_ready_in_seconds`, and the tokens it has not
+     * indexed yet (its raw prompt tokens less the indexed ones).
+     */
+    indexLag?: {
+        etaSeconds?: number;
+        unindexedTokens?: number;
+    };
     /** Body bytes actually sent to Anthropic (after notice strip / compression). */
     forwardedBytes?: number;
     /** forwardedBytes/4 — rough chars→tokens proxy, not a tokenizer count. */
@@ -184,6 +193,12 @@ export interface MessagesRecord {
          * no room): MemTree has the conversation, unlike in an outage.
          */
         refused?: true;
+        /** The HTTP status MemTree answered a failed call with (absent: no answer). */
+        status?: number;
+        /** The budget this call had (ms): an upload timeout's message says what the next gets. */
+        budgetMs?: number;
+        /** The budget was raised because this session's previous upload timed out. */
+        extendedBudget?: true;
         /**
          * Timed out while still running: the call went on as the session's preparation,
          * which the next turn at the budget waits for (carryOverCompression).
@@ -302,6 +317,8 @@ export interface MessagesRecord {
          * could not either): a retryable refusal saying so, outside the strike episode.
          */
         unreachable?: "memtree" | "internet";
+        /** What the final refusal said was happening (refusal-reason.ts RefusalCause kind). */
+        cause?: "indexing" | "upload-timeout" | "rebuilding" | "compress-failed" | "over-budget";
     };
     /** Searchable flag explaining a forward above the advisory compression budget. */
     overBudgetForward?: {

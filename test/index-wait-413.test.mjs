@@ -238,7 +238,9 @@ for (const [lane, messages] of [["human", humanMessages], ["tool", toolMessages]
     try {
       const response = await post(h, messages);
       assert.equal(response.status, 400);
-      assert.equal(response.message, FINAL_REFUSAL_MESSAGE);
+      // Says how long MemTree expects, not the generic "couldn't fit" (refusal-reason.ts).
+      assert.match(response.message,
+        /^MemTree is still indexing this session's newest messages \(~60 min\)\. Retry then\./);
       assert.equal(h.compressCalls, 1);
     } finally { h.close(); }
   });

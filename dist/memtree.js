@@ -199,6 +199,20 @@ export function indexLagEvidence(result) {
     return !didMemtreeCompress(result) && !(cachedPromptTokenCount(result) ?? 0) &&
         typeof result.memtreeUrl === "string" && result.memtreeUrl.length > 0;
 }
+/** The server's `memory_ready_in_seconds`, when it is a positive number. */
+export function memoryReadySeconds(result) {
+    const seconds = result.memory_ready_in_seconds;
+    return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+        ? seconds : undefined;
+}
+/** Tokens of this request MemTree has not indexed yet (raw prompt less indexed), if known. */
+export function unindexedTokenCount(result) {
+    const raw = rawPromptTokenCount(result);
+    const indexed = cachedPromptTokenCount(result);
+    if (raw === undefined || indexed === undefined)
+        return undefined;
+    return Math.max(0, raw - indexed);
+}
 function nonNegativeCount(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0
         ? value

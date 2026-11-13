@@ -29,10 +29,15 @@ export const NEWEST_TREE_TTL_MS = 60_000;
 export const NEWEST_TREE_UNSUPPORTED_MS = 30 * 60_000;
 /** Most a hook waits for an answer (Claude Code's hook relay gives up at 4 s). */
 export const NEWEST_TREE_WAIT_MS = 2_500;
-/** A lookup that has not answered by then is dropped; the next peek retries. */
-export const NEWEST_TREE_FETCH_TIMEOUT_MS = 10_000;
-/** Most `/memtree/current` waits: an MCP tool call can afford one whole lookup. */
-export const NEWEST_TREE_CURRENT_WAIT_MS = NEWEST_TREE_FETCH_TIMEOUT_MS;
+/**
+ * A lookup that has not answered by then is dropped; the next peek retries. Lookups run
+ * in the background (callers wait at most their own bound), and the server's sessions
+ * query took 7-22 s on staging (2026-11-12), so at 10 s most of them were dropped and
+ * the link went stale.
+ */
+export const NEWEST_TREE_FETCH_TIMEOUT_MS = 30_000;
+/** Most `/memtree/current` waits: an MCP tool call can afford a typical lookup. */
+export const NEWEST_TREE_CURRENT_WAIT_MS = 10_000;
 /** `q` also matches titles/snippets that quote the id; follow bounded pages. */
 const SESSIONS_LIMIT = 10;
 const MAX_SESSIONS = 200;
@@ -78,6 +83,7 @@ export class NewestTreeLookup {
   // allow timed-out requests to accumulate behind new lookups.
   private activeFetches = 0;
   private unsupportedUntil = 0;
+  private readonly listeners: ((sessionId: string, tree: NewestTree) => void)[] = [];
 
   constructor(
     private readonly fetchPath: NewestTreeFetch,
@@ -85,6 +91,11 @@ export class NewestTreeLookup {
     private readonly ttlMs = NEWEST_TREE_TTL_MS,
     private readonly fetchTimeoutMs = NEWEST_TREE_FETCH_TIMEOUT_MS
   ) {}
+
+  /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
+  onTree(listener: (sessionId: string, tree: NewestTree) => void): void {
+    this.listeners.push(listener);
+  }
 
   /** The cached answer, refreshing in the background when stale. Never waits. */
   peek(sessionId: string | undefined): NewestTree | undefined {
@@ -232,6 +243,14 @@ export class NewestTreeLookup {
     this.entries.set(sessionId, entry);
     while (this.entries.size > MAX_SESSIONS) {
       this.entries.delete(this.entries.keys().next().value!);
+    }
+    if (!entry.tree) return;
+    for (const listener of this.listeners) {
+      try {
+        listener(sessionId, entry.tree);
+      } catch {
+        // A listener's failure never fails the lookup.
+      }
     }
   }
 }

@@ -212,6 +212,12 @@ export interface CompressResult {
      * current servers, which then report no lag (see indexBehind).
      */
     index_pending?: boolean;
+    /**
+     * When MemTree expects this conversation's memory to be ready (whole seconds), on an
+     * answer served without a usable tree while an index job is queued or running
+     * (polychat memory_eta.py, also `X-Polychat-Memory-ETA`). Absent otherwise.
+     */
+    memory_ready_in_seconds?: number;
 }
 /**
  * The server-flattened single user message of a compressed result, or null
@@ -256,6 +262,10 @@ export declare function indexBehind(result: CompressResult): boolean;
  * indexed and a page for the tree it is building.
  */
 export declare function indexLagEvidence(result: CompressResult): boolean;
+/** The server's `memory_ready_in_seconds`, when it is a positive number. */
+export declare function memoryReadySeconds(result: CompressResult): number | undefined;
+/** Tokens of this request MemTree has not indexed yet (raw prompt less indexed), if known. */
+export declare function unindexedTokenCount(result: CompressResult): number | undefined;
 /** The server-reported model budget, when present and sane. */
 export declare function modelBudgetTokens(result: CompressResult): number | undefined;
 /**

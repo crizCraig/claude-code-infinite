@@ -266,7 +266,8 @@ test("a connection reset mid-call is no network refusal: the strikes run as befo
       statuses.push(last.status);
     }
     assert.deepEqual(statuses, [503, 503, 400]);
-    assert.match(message(last), /couldn't fit this request/);
+    // A failed compress, not a fit: retry first (refusal-reason.ts).
+    assert.match(message(last), /^MemTree couldn't compress this turn\. Retry in a minute/);
   } finally { h.close(); }
 });
 

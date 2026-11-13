@@ -22,6 +22,7 @@ import { FirstTreeMarker } from "./first-tree.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
+import { StatusLinkFiles } from "./status-link.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
@@ -638,6 +639,8 @@ async function main() {
         toolOutputs: new ToolOutputStore(),
         // The link shown to the user follows the session's newest tree on the server.
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
+        // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
+        statusLinks: new StatusLinkFiles(),
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed

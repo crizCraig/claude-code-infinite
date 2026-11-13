@@ -41,6 +41,8 @@
 import { capCacheBreakpoints } from "./route-cache.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
+import { SlowUploads } from "./slow-upload.js";
+import type { StatusLinkFiles } from "./status-link.js";
 import { type NetworkFailure } from "./network-failure.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
@@ -129,6 +131,8 @@ export interface ProxyOptions {
     awaitedIndexWaitTimeoutMs?: number;
     /** Bound on retrying an unfit request while MemTree indexes (route-fallback.ts). */
     indexWaitDeadlineMs?: number;
+    /** Uploads at least this large get a longer budget after a timeout (slow-upload.ts); tests. */
+    slowUploadMinBytes?: number;
     /** Cap on waiting for an index whose time left MemTree stated (default 15 min). */
     indexWaitMaxMs?: number;
     /**
@@ -196,6 +200,8 @@ export interface ProxyOptions {
      * page (tests); the CLI passes a lookup over the user's key.
      */
     newestTrees?: NewestTreeLookup;
+    /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
+    statusLinks?: StatusLinkFiles;
     /**
      * Per-response token usage (thinking share on the MemTree page), read from
      * Claude Code's transcript. Omitted means none is sent (tests); the CLI
@@ -371,6 +377,8 @@ interface ProxyState {
     mainPromptGeneration: number;
     promptAccounting: PromptAccounting;
     fallbackFailures: RouteFallbackFailures;
+    /** Sessions whose last large upload timed out: their next compress waits longer. */
+    slowUploads: SlowUploads;
     /** Consecutive refusals per lane, for the "slow to answer" notice. */
     refusalStreaks: RefusalStreaks;
     /** Suppress producer-side state changes while agent API traffic is active. */
@@ -434,6 +442,8 @@ interface ProxyState {
     /** MemtreeClient.storageIdentity: whose persisted prefixes this process may use. */
     storageOwner?: string;
     newestTrees?: NewestTreeLookup;
+    /** The session's link for Claude Code's status line (status-link.ts). */
+    statusLinks?: StatusLinkFiles;
     memtreeLinkPlacement: MemtreeLinkPlacement;
     /**
      * `/memtree-compact` targets by Claude Code session: every compression for

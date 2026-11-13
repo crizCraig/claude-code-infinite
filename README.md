@@ -206,6 +206,7 @@ From a shell or script (no session needed):
 | --- | --- |
 | `ccc link <session-id>` | Prints the session's newest MemTree page URL on stdout, one line and nothing else. `--json` prints `{session_id, url, tree, updated_at}` instead (`updated_at` is the session's last activity). Exit status 0 printed, 1 no saved key or the server could not be reached (5 s timeout), 2 bad invocation, 3 the session has no MemTree yet (or no session with that id on your key; stderr says which). Only your own sessions (those of your saved key) are found. `ccc staging link` / `ccc local link` use that environment's key. |
 | `ccc fetch <memtree-url>` | Prints one of your MemTree pages as JSON, using your saved key. |
+| `ccc statusline install` | Adds this session's MemTree link to Claude Code's status line ([details](#memtree-link-in-the-status-line)). `ccc statusline uninstall` undoes it. |
 
 Environment variables, set when launching `ccc`:
 
@@ -222,6 +223,26 @@ Environment variables, set when launching `ccc`:
 
 Links are clickable in terminals that support OSC 8 hyperlinks (iTerm2, Ghostty, WezTerm,
 kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
+
+### MemTree link in the status line
+
+`ccc` keeps each session's newest MemTree link in
+`~/.claude-code-infinite/statusline/<session id>.url`, updated in the background as trees
+finish. Claude Code's status line can show it as a clickable `🌿 tree` (the plain URL in
+terminals without OSC 8 links; `CCC_STATUSLINE_LINK=url` or `osc8` forces either). The status
+line only reads that file, so it never waits on the server.
+
+- **Opt in:** `ccc statusline install`. It points `statusLine` in `~/.claude/settings.json`
+  (or `$CLAUDE_CONFIG_DIR/settings.json`) at `ccc statusline`, which runs your existing
+  status-line command with the same input and appends ` | 🌿 tree`. Your original command is
+  saved in `~/.claude-code-infinite/statusline.json` and settings.json is backed up first.
+  `ccc statusline uninstall` puts the original back. Restart Claude Code to see it.
+- **Manage it yourself:** add this to the end of your own status-line command (it reads
+  Claude Code's JSON from `$input`, as most status lines do; needs `jq`):
+
+  ```sh
+  link=$(cat ~/.claude-code-infinite/statusline/"$(echo "$input" | jq -r .session_id)".url 2>/dev/null); [ -n "$link" ] && printf ' | \033]8;;%s\033\\🌿 tree\033]8;;\033\\' "$link"
+  ```
 
 ## Claude Code auto-compaction
 
@@ -527,6 +548,26 @@ next launch until a request goes through. Sign in with a Claude Pro or Max plan:
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and an `apiKeyHelper` setting beat `/login`:
 with one of them set, Claude Code bills that key even when you're signed in with a plan.
 `ccc` prints a line before Claude Code starts when that happens; unset it to use your plan.
+
+### "MemTree couldn't …" / a refused turn
+
+When a turn can't be sent (too large for the window even after MemTree had its chance), the
+error says why and what to do:
+
+- **Still indexing:** `MemTree is still indexing ~1.2M new tokens (~3 min). Retry then.` The
+  time is MemTree's own estimate when it gives one, else the un-indexed size at ~40k tokens a
+  minute.
+- **Slow upload:** `MemTree timed out after 139 s receiving this 51 MB request (slow
+  upload?). Retry: the next try waits up to 277 s.` After such a timeout the session's next
+  large upload (20 MB+) gets twice the time. `CCC_COMPRESS_TIMEOUT_MS` raises the base budget.
+- **Rebuilding:** `MemTree is rebuilding this session's compressed history (Claude Code resent
+  earlier messages changed). Retry in a minute.`
+- **MemTree error:** `MemTree couldn't compress this turn (HTTP 500). Retry in a minute; …`
+- **Over the window:** `MemTree couldn't fit this request (~3M tokens) in the model's
+  1M-token context window. Run /ccc:memtree-compact or /clear.`
+
+Each ends with the session's MemTree link. `requests.jsonl` records the cause as
+`refusal.cause`.
 
 ### MemTree degraded / passthrough mode
 

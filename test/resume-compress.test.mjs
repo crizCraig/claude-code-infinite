@@ -88,12 +88,14 @@ function memtreeHandler(h) {
   };
 }
 
-async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
+async function harness({ countTokens = true, tokensPerByte = 0.25, longMs = LONG_MS,
+  perKiB, slowUploadMinBytes } = {}) {
   const h = { forwarded: [], records: [], compressCalls: 0, delayMs: SLOW_MS, tokensPerByte };
   const upstream = await listen(upstreamHandler(h));
   const memory = await listen(memtreeHandler(h));
   const memtree = new MemtreeClient({ baseUrl: memory.origin, apiKey: "k",
-    compressTimeoutMs: SHORT_MS, longCompressTimeoutMs: LONG_MS });
+    compressTimeoutMs: SHORT_MS, longCompressTimeoutMs: longMs,
+    ...(perKiB !== undefined ? { compressTimeoutMsPerKiB: perKiB } : {}) });
   // The budget each compress call was given (the proxy passes it as meta.timeoutMs).
   h.budgets = [];
   const compress = memtree.compress.bind(memtree);
@@ -105,6 +107,7 @@ async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
   h.shortBudget = () => memtree.compressBudgetForBytes(h.lastRecord().requestBytes);
   const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
     budgetTokensOverride: 20_000, countTokens,
+    ...(slowUploadMinBytes !== undefined ? { slowUploadMinBytes } : {}),
     reqlog: { log: (r) => h.records.push(structuredClone(r)) } });
   h.post = async (messages) => {
     const started = Date.now();
@@ -113,8 +116,8 @@ async function harness({ countTokens = true, tokensPerByte = 0.25 } = {}) {
       headers: { "content-type": "application/json", "x-claude-code-session-id": "s-resume" },
       body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages }),
     });
-    await response.text();
-    return { status: response.status, ms: Date.now() - started };
+    const text = await response.text();
+    return { status: response.status, ms: Date.now() - started, text };
   };
   h.lastRecord = () => h.records.filter((r) => r.kind === "messages").at(-1);
   h.close = () => { proxy.close(); upstream.close(); memory.close(); };
@@ -265,4 +268,40 @@ test("MemtreeClient: a compress with different tools never joins one in flight",
     ]);
     assert.equal(h.compressCalls, 2);
   } finally { memory.close(); }
+});
+
+test("a large upload that runs out of the long budget: the next try waits twice as long",
+  async () => {
+    // 2026-11-12: a ~50 MB body timed out at 138.6 s turn after turn, each retry with the same
+    // budget. Here 1 MB stands in for "large" (slowUploadMinBytes), with no per-KiB scaling.
+    const h = await harness({ longMs: 300, perKiB: 0, slowUploadMinBytes: 1 });
+    h.delayMs = 450;
+    try {
+      const first = await h.post(resumed());
+      assert.equal(first.status, 503, "Claude Code retries it");
+      assert.equal(h.budgets.at(-1), 300);
+      assert.equal(h.lastRecord().compress.timedOut, true);
+      const second = await h.post(resumed());
+      assert.equal(h.budgets.at(-1), 600, "twice the long budget");
+      assert.equal(h.lastRecord().compress.extendedBudget, true);
+      assert.equal(second.status, 200, "the longer try lands");
+    } finally { h.close(); }
+  });
+
+test("an upload that keeps timing out is refused saying so, not \"couldn't fit\"", async () => {
+  const h = await harness({ longMs: 200, perKiB: 0, slowUploadMinBytes: 1 });
+  h.delayMs = 5_000;
+  try {
+    const statuses = [];
+    let last;
+    for (let retry = 0; retry < 3; retry++) {
+      last = await h.post(resumed());
+      statuses.push(last.status);
+    }
+    assert.deepEqual(statuses, [503, 503, 400]);
+    assert.deepEqual(h.budgets, [200, 400, 400], "one longer budget, then no more");
+    const message = JSON.parse(last.text).error.message;
+    assert.match(message, /^MemTree timed out after 1 s receiving this 1 MB request \(slow upload\?\)\. Retry on a faster connection\. CCC_COMPRESS_TIMEOUT_MS/);
+    assert.equal(h.lastRecord().refusal.cause, "upload-timeout");
+  } finally { h.close(); }
 });

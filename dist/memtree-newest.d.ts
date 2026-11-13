@@ -28,9 +28,14 @@ export declare const NEWEST_TREE_TTL_MS = 60000;
 export declare const NEWEST_TREE_UNSUPPORTED_MS: number;
 /** Most a hook waits for an answer (Claude Code's hook relay gives up at 4 s). */
 export declare const NEWEST_TREE_WAIT_MS = 2500;
-/** A lookup that has not answered by then is dropped; the next peek retries. */
-export declare const NEWEST_TREE_FETCH_TIMEOUT_MS = 10000;
-/** Most `/memtree/current` waits: an MCP tool call can afford one whole lookup. */
+/**
+ * A lookup that has not answered by then is dropped; the next peek retries. Lookups run
+ * in the background (callers wait at most their own bound), and the server's sessions
+ * query took 7-22 s on staging (2026-11-12), so at 10 s most of them were dropped and
+ * the link went stale.
+ */
+export declare const NEWEST_TREE_FETCH_TIMEOUT_MS = 30000;
+/** Most `/memtree/current` waits: an MCP tool call can afford a typical lookup. */
 export declare const NEWEST_TREE_CURRENT_WAIT_MS = 10000;
 export declare const SESSION_ID: RegExp;
 export interface NewestTree {
@@ -58,7 +63,10 @@ export declare class NewestTreeLookup {
     private readonly inFlight;
     private activeFetches;
     private unsupportedUntil;
+    private readonly listeners;
     constructor(fetchPath: NewestTreeFetch, now?: () => number, ttlMs?: number, fetchTimeoutMs?: number);
+    /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
+    onTree(listener: (sessionId: string, tree: NewestTree) => void): void;
     /** The cached answer, refreshing in the background when stale. Never waits. */
     peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
