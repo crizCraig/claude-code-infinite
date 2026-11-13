@@ -73,7 +73,7 @@ function setup(statusLine) {
   fs.writeFileSync(settings, JSON.stringify({ model: "opus", ...(statusLine ? { statusLine } : {}) }));
   const links = path.join(dir, "links");
   new StatusLinkFiles(links).write(SESSION, URL1);
-  return { dir, paths: { settings, saved: path.join(dir, "statusline.json"), links } };
+  return { dir, paths: { settings, saved: path.join(dir, "statusline-aaaaaaaaaaaa.json"), links } };
 }
 
 test("install wraps the existing command; the status line keeps it and adds the link", async () => {
@@ -279,4 +279,18 @@ test("uninstall keeps option changes made while installed", () => {
   uninstallStatusline(paths);
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.settings, "utf-8")).statusLine,
     { type: "command", command: OWN_COMMAND, padding: 2 });
+});
+
+test("the saved original is found after settings.json became a symlink", { skip: process.platform === "win32" }, async () => {
+  const { dir, paths } = setup({ type: "command", command: OWN_COMMAND });
+  installStatusline(paths, "darwin");
+  const moved = path.join(dir, "dotfiles.json");
+  fs.renameSync(paths.settings, moved);
+  fs.symlinkSync(moved, paths.settings);
+  // The key moved with the file (a different `saved`); the recorded path still finds it.
+  const tmpSaved = { ...paths, saved: path.join(path.dirname(paths.saved), "statusline-ffffffffffff.json") };
+  const input = JSON.stringify({ session_id: SESSION, model: 1 });
+  assert.equal(await renderStatusline(input, tmpSaved, APPLE_TERMINAL), `494k (49%) | model | ${URL1}`);
+  assert.equal(uninstallStatusline(tmpSaved).ok, true);
+  assert.equal(JSON.parse(fs.readFileSync(moved, "utf-8")).statusLine.command, OWN_COMMAND);
 });

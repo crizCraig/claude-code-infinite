@@ -41,6 +41,8 @@ export declare function uninstallStatusline(paths: StatuslinePaths): {
  * process group, so a timeout kills everything it started (no pile-up across refreshes).
  */
 export declare function runWrapped(command: string, input: string, timeoutMs?: number): Promise<string>;
+/** `pid` and every descendant (from `ps`; just `pid` where there is none, e.g. Windows). */
+export declare function processTree(pid: number | undefined): number[];
 /**
  * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
  * only then does the proxy keep the link fresh in the background. Read at startup.

@@ -34,3 +34,12 @@ test("small uploads, other failures and unknown sessions raise nothing", () => {
   assert.equal(uploads.extended("t", BIG), false);
   assert.equal(uploads.extended(undefined, BIG), false);
 });
+
+test("only a large upload getting through ends the raise (not a subagent's small compress)", () => {
+  const uploads = new SlowUploads(() => 0);
+  uploads.settled("s", BIG, "timeout");
+  uploads.settled("s", 10_000, "ok");
+  assert.equal(uploads.extended("s", BIG), true, "a small success leaves it");
+  uploads.settled("s", BIG, "ok");
+  assert.equal(uploads.extended("s", BIG), false, "a large one, on any budget, ends it");
+});

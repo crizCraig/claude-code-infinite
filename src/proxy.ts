@@ -5510,7 +5510,7 @@ function carryFor(args: {
  * used. False when the session already has a preparation in flight (it serves instead).
  */
 function carryOverCompression(
-  state: ProxyState, carry: CarryOver, pending: Promise<CompressResult | null>
+  state: ProxyState, carry: CarryOver, pending: Promise<CompressResult | null>, bytes = 0
 ): boolean {
   const { sessionId, base } = carry;
   // A prefix installed since the call started (another turn's) supersedes it already.
@@ -5522,6 +5522,8 @@ function carryOverCompression(
       // A late answer clears the cooldown; a late failure is no new outage evidence (a
       // refusal or a slow server's timeout must not arm it, as runBlockingCompression).
       if (result) noteMemtreeHealth(state, { result, liveHealth: "success" });
+      // Its upload got through: a slow-upload episode is over (Codex r4 P2).
+      if (result) state.slowUploads.settled(sessionId, bytes, "ok");
       return result ? preparedFromResult(carry, result) : undefined;
     })
     .catch(() => undefined)
@@ -6306,7 +6308,7 @@ async function runBlockingCompressionOnce(args: {
   const compressMs = Date.now() - compressStarted;
   // Given up on but still running: the session's next turn waits for it, not a new call.
   const carried = result === null && !settled && carry !== undefined &&
-    carryOverCompression(state, carry, call);
+    carryOverCompression(state, carry, call, rec.requestBytes);
   noteServerBudget(state, body.model, modelContextLimit, result);
   // Sampled at this call's settle, before a concurrent same-request failure of
   // another class can overwrite the complete-key entry.
@@ -6336,7 +6338,7 @@ async function runBlockingCompressionOnce(args: {
   const hadLiveFailure = !cached && result === null && failureArming && !othersAnswered && !carried;
   // Only a whole long budget spent is the upload's slowness (a hold's cap is not).
   // Any answer ends a slow-upload episode (Codex r3 P2).
-  if (result !== null) state.slowUploads.settled(args.sessionId, rec.requestBytes, "ok");
+  if (result !== null && !cached) state.slowUploads.settled(args.sessionId, rec.requestBytes, "ok");
   const uploadTimeout = result === null && args.longBudget === true &&
     args.capMs === undefined && !carried &&
     state.slowUploads.settled(args.sessionId, rec.requestBytes, timedOut ? "timeout" : "other");

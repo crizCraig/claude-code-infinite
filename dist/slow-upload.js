@@ -48,7 +48,8 @@ export class SlowUploads {
     settled(sessionId, bytes, outcome) {
         if (sessionId === undefined)
             return false;
-        if (outcome === "ok") {
+        // Only a large upload getting through ends it (not a subagent's small one, nor a cache hit).
+        if (outcome === "ok" && bytes >= this.minBytes) {
             this.timedOutAt.delete(sessionId);
             return false;
         }

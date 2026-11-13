@@ -13,7 +13,7 @@
  * Loaded straight from cli.ts (no proxy, no update check): Claude Code runs a status line
  * after every message.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -77,7 +77,7 @@ export async function renderStatusline(
   input: string, paths: StatuslinePaths, env: NodeJS.ProcessEnv = process.env
 ): Promise<string> {
   if (env[WRAPPED_ENV]) return "";
-  const wrapped = savedStatusLine(paths.saved);
+  const wrapped = savedStatusLine(savedFile(paths));
   const base = wrapped ? await runWrapped(wrapped.command, input) : "";
   const segment = linkSegment(sessionIdOf(input), env, paths.links);
   if (!segment) return base;
@@ -122,7 +122,8 @@ export function installStatusline(
     return { ok: false, message: `${paths.settings}: statusLine is not a command; left unchanged.` };
   }
   const failed = attempt(() => {
-    writeJson(paths.saved, { statusLine: current ?? null });
+    writeJson(paths.saved, { settings: paths.settings, resolved: resolvedPath(paths.settings),
+      statusLine: current ?? null });
     backup(paths.settings);
     // Its other options (padding, refreshInterval, hideVimModeIndicator, ...) stay.
     settings.value.statusLine = { ...current, type: "command", command: STATUSLINE_COMMAND };
@@ -141,7 +142,8 @@ export function uninstallStatusline(paths: StatuslinePaths): { ok: boolean; mess
   if (!isOurs(settings.value.statusLine)) {
     return { ok: true, message: "ccc statusline is not installed; nothing changed." };
   }
-  const saved = readJson(paths.saved) as { statusLine?: unknown } | undefined;
+  const file = savedFile(paths);
+  const saved = readJson(file) as { statusLine?: unknown } | undefined;
   // No record of what install replaced: guessing could delete the user's own status line.
   if (!saved || !("statusLine" in saved)) {
     return { ok: false, message: `No saved original for ${paths.settings} (${paths.saved}); ` +
@@ -158,7 +160,7 @@ export function uninstallStatusline(paths: StatuslinePaths): { ok: boolean; mess
       delete settings.value.statusLine;
     }
     writeJson(paths.settings, settings.value);
-    fs.unlinkSync(paths.saved);
+    fs.unlinkSync(file);
   });
   if (failed) return { ok: false, message: `Could not uninstall: ${failed}` };
   return { ok: true, message: `Restored ${paths.settings} statusLine.` };
@@ -186,6 +188,28 @@ function attempt(run: () => void): string | undefined {
   }
 }
 
+/**
+ * The saved original for this settings file: under its key, else (the file was turned into
+ * a symlink, or replaced by a regular one, after install) the one that recorded its path.
+ */
+function savedFile(paths: StatuslinePaths): string {
+  if (fs.existsSync(paths.saved)) return paths.saved;
+  const dir = path.dirname(paths.saved);
+  const wanted = new Set([path.resolve(paths.settings), resolvedPath(paths.settings)]);
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!/^statusline-[0-9a-f]+\.json$/.test(name)) continue;
+      const saved = readJson(path.join(dir, name)) as { settings?: unknown; resolved?: unknown };
+      if ([saved?.settings, saved?.resolved].some((p) => typeof p === "string" && wanted.has(p))) {
+        return path.join(dir, name);
+      }
+    }
+  } catch {
+    // No config dir yet.
+  }
+  return paths.saved;
+}
+
 /** The statusLine install saved, when it was a command to wrap (never ccc's own). */
 function savedStatusLine(file: string): { command: string } | undefined {
   const saved = (readJson(file) as { statusLine?: { command?: unknown } } | undefined)?.statusLine;
@@ -201,8 +225,9 @@ export function runWrapped(
   command: string, input: string, timeoutMs = WRAPPED_TIMEOUT_MS
 ): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn(command, { shell: true, detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, [WRAPPED_ENV]: "1" } });
+    // Not detached: a new session would lose the controlling terminal (`stty size </dev/tty`).
+    const child = spawn(command, { shell: true, stdio: ["pipe", "pipe", "ignore"],
+      env: { ...process.env, [WRAPPED_ENV]: "1" } });
     const chunks: Buffer[] = [];
     let done = false;
     const finish = (text: string) => {
@@ -212,9 +237,14 @@ export function runWrapped(
       resolve(text);
     };
     const timer = setTimeout(() => {
-      killTree(child.pid, "SIGTERM");
+      const tree = processTree(child.pid);
+      killAll(tree, "SIGTERM");
       // Kept referenced: ccc waits the grace out so the forced kill is sent.
-      setTimeout(() => killTree(child.pid, "SIGKILL"), KILL_GRACE_MS);
+      setTimeout(() => {
+        killAll(tree, "SIGKILL");
+        child.stdout.destroy();
+        child.unref();
+      }, KILL_GRACE_MS);
       finish("");
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -225,13 +255,36 @@ export function runWrapped(
   });
 }
 
-/** Signal the wrapped command's whole process group (its pid on Windows). */
-function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
-  if (pid === undefined) return;
-  try {
-    process.kill(process.platform === "win32" ? pid : -pid, signal);
-  } catch {
-    // Already gone.
+/** `pid` and every descendant (from `ps`; just `pid` where there is none, e.g. Windows). */
+export function processTree(pid: number | undefined): number[] {
+  if (pid === undefined) return [];
+  const children = new Map<number, number[]>();
+  if (process.platform !== "win32") {
+    const listing = spawnSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf-8", timeout: 2_000 });
+    for (const line of (listing.stdout ?? "").split("\n")) {
+      const [child, parent] = line.trim().split(/\s+/).map(Number);
+      if (!Number.isFinite(child) || !Number.isFinite(parent)) continue;
+      children.set(parent, [...(children.get(parent) ?? []), child]);
+    }
+  }
+  const tree: number[] = [];
+  const queue = [pid];
+  while (queue.length) {
+    const next = queue.shift()!;
+    if (tree.includes(next)) continue;
+    tree.push(next);
+    queue.push(...(children.get(next) ?? []));
+  }
+  return tree;
+}
+
+function killAll(pids: number[], signal: NodeJS.Signals): void {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Already gone.
+    }
   }
 }
 
