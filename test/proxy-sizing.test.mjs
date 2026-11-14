@@ -23,7 +23,7 @@ async function until(condition, timeoutMs = 3_000) {
 
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
-  compressBudgetMs, longCompressBudgetMs } = {}) {
+  compressBudgetMs, longCompressBudgetMs, messageThreads } = {}) {
   const counts = [], forwards = [], compressions = [], records = [];
   const upstream = await listen((req, res) => {
     let raw = '';
@@ -71,18 +71,19 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     memtree,
     // budget null: no CCC_BUDGET_TOKENS, the proxy's own window-ratio fallback.
     upstreamOrigin: upstream.origin, budgetTokensOverride: budget ?? undefined, countTokens: enabled,
-    reqlog: { log: record => records.push(structuredClone(record)) },
+    reqlog: { log: record => records.push(structuredClone(record)) }, messageThreads,
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
-    session = 's', messages: suppliedMessages, model = 'claude-x', maxTokens = 64 } = {}) {
+    session = 's', messages: suppliedMessages, model = 'claude-x', maxTokens = 64,
+    thread } = {}) {
     const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json',
-        'x-claude-code-session-id': session, 'x-claude-code-agent-id': agent,
+        'x-claude-code-session-id': session, ...(agent ? { 'x-claude-code-agent-id': agent } : {}),
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages, ...(thread ? { thread } : {}) }),
     });
     await response.text();
     return response.status;
@@ -91,6 +92,26 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
     proxy.close();
     for (const { server } of [upstream, memory]) { server.closeAllConnections(); server.close(); }
   } };
+}
+
+for (const lane of ['main', 'agent']) {
+  test(`${lane} lane: a forwarded thread continue records no size sample`, async () => {
+    // A continue carries only the tail; its reported input is the whole thread's. Paired,
+    // they once anchored the next whole request at ~1 token/byte (plan 2.0 item 4).
+    const h = await harness({ budget: 100_000, enabled: false, messageThreads: 'passthrough',
+      usage: (body, bytes) => body.thread ? 300_000 : Math.floor(bytes * 0.25) });
+    const agent = lane === 'main' ? null : 'a';
+    try {
+      assert.equal(await h.post(10_000, { agent }), 200);
+      const thread = { type: 'continue', previous_message_id: 'msg_1' };
+      assert.equal(await h.post(300_000, { agent, thread }), 200);
+      // ~300 kB: ~75k on the whole request's own 0.25 sample (under the 100k budget);
+      // ~300k on the continue's tail-vs-thread ratio.
+      assert.equal(await h.post(300_000, { agent }), 200);
+      assert.equal(h.compressions.length, 0, 'sized by the whole request, not the continue');
+      assert.equal(h.forwards.length, 3);
+    } finally { h.close(); }
+  });
 }
 
 for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {

@@ -189,6 +189,9 @@ import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
 import type { UrlOpener } from "./open-url.js";
 import {
+  requestThreadType, threadUnsupportedBody, ThreadRefusals, type MessageThreadsMode,
+} from "./thread-backstop.js";
+import {
   approxTokensFromBytes,
   mergeUsageFromJsonBody,
   mergeUsageFromSseEvent,
@@ -298,6 +301,12 @@ export interface ProxyOptions {
    * cannot type the command; `/memtree-compact [N]` still turns it back on.
    */
   defaultCompactTarget?: number | null;
+  /**
+   * Requests carrying Claude Code's message `thread` (thread-backstop.ts): "off" (default)
+   * answers them with ccc's own 400 `thread_unsupported_request`, so Claude Code resends
+   * stateless for the session; "passthrough" forwards them as sent (tests).
+   */
+  messageThreads?: MessageThreadsMode;
   /**
    * Test-only whole-request budget (tokens) for every session:
    * `CCC_BUDGET_TOKENS`. Replaces the server-reported model budget (and the
@@ -523,6 +532,8 @@ interface MemtreePage {
 
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
+  /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
+  threadRefusals: ThreadRefusals;
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
   paymentNotice: PaymentNoticeThrottle;
   /** Invalid-key (401/403) notice throttle, on the payment notice's interval. */
@@ -1150,6 +1161,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const backgroundAbort = new AbortController();
   const state: ProxyState = {
+    threadRefusals: new ThreadRefusals(),
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyInvalid: () => opts.memtree.keyInvalid,
@@ -2247,6 +2259,9 @@ async function handleMessages(
       forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec)
     );
   }
+  if (opts.messageThreads !== "passthrough" && refuseThreadRequest(req, res, opts, state, body, rec)) {
+    return logged(Promise.resolve());
+  }
 
   // Defensive legacy strip pass first: old marker-wrapped notices (including
   // one copied into an away-summary or top-level system prompt) must never
@@ -2823,7 +2838,9 @@ async function handleMessages(
       ).then((delivered) => {
         toolForwarding.settle(delivered);
         if (toolRide) noteRideSize(toolRide.sizeHolder, rec, sendBody);
-        else {
+        // A fragment's bytes are not what its reported input counts (a continue's tail
+        // against the whole thread): it never sizes the conversation's next request.
+        else if (!notConversation) {
           noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec,
             sendBody);
         }
@@ -7108,6 +7125,31 @@ function recordTurn(
 const forwardedImageBytes = new WeakMap<MessagesRecord, number>();
 
 /** What this request uploaded to Anthropic, for the session's heavy-request notice. */
+/**
+ * A request carrying `thread` while threads are off: answer ccc's own 400 (Claude Code then
+ * resends stateless for the session) and forward nothing; log the first per session.
+ */
+function refuseThreadRequest(
+  req: http.IncomingMessage, res: http.ServerResponse, opts: ProxyOptions, state: ProxyState,
+  body: Record<string, any>, rec: MessagesRecord,
+): boolean {
+  const thread = requestThreadType(body);
+  if (thread === undefined) return false;
+  rec.turnType = "thread-refused";
+  rec.forwardedBytes = 0;
+  if (typeof body.model === "string") rec.model = body.model;
+  const sessionId = requestSessionId(req);
+  if (state.threadRefusals.first(sessionId)) {
+    opts.reqlog?.log({ kind: "thread-refused", sessionTag: sessionTag(sessionId), thread,
+      model: rec.model, lane: agentAttributionId(req) ? "agent" : "main" });
+  }
+  if (!res.headersSent) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(threadUnsupportedBody());
+  }
+  return true;
+}
+
 function noteForwardedSize(
   state: ProxyState, rec: MessagesRecord, sessionId: string | undefined,
 ): void {
