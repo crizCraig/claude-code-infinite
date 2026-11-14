@@ -11,7 +11,10 @@
  *
  * This module only measures: the time since each lane last sent a request upstream
  * (LaneCacheClock; an in-memory clock, so a fresh ccc process has no gap to judge) and the
- * TTL the request's own markers ask for (cacheTtlMs). proxy.ts decides.
+ * TTL the request's own markers ask for (cacheTtlMs). proxy.ts decides. The clock is per
+ * lane while Anthropic's cache is per prefix, so it approximates: a fork subagent that shares
+ * an uncompressed main thread's prefix warms that cache without stamping the main lane, and
+ * a refused (429/529) send still stamps it.
  */
 /** Anthropic's default prompt-cache TTL, and the one a `ttl: "1h"` marker asks for. */
 export const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
@@ -51,7 +54,8 @@ export class LaneCacheClock {
      * again on every retry. A send starts a new gap.
      */
     claim(lane, basis) {
-        if (this.claimed.get(lane) === basis)
+        // Another request of the lane went out since (a plan that waited): the cache is warm.
+        if (this.last.get(lane) !== basis || this.claimed.get(lane) === basis)
             return false;
         bounded(this.claimed, lane, basis);
         return true;

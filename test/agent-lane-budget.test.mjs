@@ -47,7 +47,10 @@ async function harness(options = {}, { failCompress = false, compressAdvanceMs =
   }));
   const memory = await listen((req, res) => readJson(req, (body) => {
     if (!body.index_only) compressions.push(body);
-    const forced = !body.index_only && body.compression_target_tokens !== undefined;
+    // Like the server: a target compresses unless a threshold says the request is under it.
+    const threshold = body.compression_threshold_tokens;
+    const forced = !body.index_only && body.compression_target_tokens !== undefined &&
+      (threshold === undefined || JSON.stringify(body.messages).length / 4 > threshold);
     if (forced) clock.offset += compressAdvanceMs;
     if (forced && failCompress) {
       res.writeHead(503, { 'content-type': 'application/json' });
@@ -153,6 +156,13 @@ test('lane cache clock: the gap since each lane last sent, claimed once per gap'
   clock.sent('main');
   assert.deepEqual(clock.gap('main'), { gapMs: 0, basis: 1_000 + 7 * MINUTE });
   assert.equal(clock.claim('main', 1_000 + 7 * MINUTE), true, 'a send starts a new gap');
+  const basis = clock.gap('agent')?.basis;
+  assert.equal(basis, undefined);
+  clock.sent('agent');
+  const first = clock.gap('agent').basis;
+  now += 1;
+  clock.sent('agent');
+  assert.equal(clock.claim('agent', first), false, 'another send since: the cache is warm');
   const body = { messages: toolLoop([['t', 10]], '5m') };
   assert.deepEqual(coldCacheSample(6 * MINUTE, body),
     { gapMs: 6 * MINUTE, ttlMs: DEFAULT_CACHE_TTL_MS, cold: true });
@@ -400,5 +410,19 @@ test('agent lane budget without a target: half the budget the window allows', as
     assert.ok(rec.compaction.budgetTokens < 200_000, `${rec.compaction.budgetTokens}`);
     assert.equal(rec.compaction.budgetSource, 'agent');
     assert.equal(rec.compaction.targetTokens, Math.floor(rec.compaction.budgetTokens / 2));
+  } finally { h.close(); }
+});
+
+test('agent lane budget: a subagent followup sends its threshold before the server reports one', async () => {
+  const h = await harness({ agentLaneBudget: { budget: 200_000, target: 100_000 } });
+  const followup = (chars) => [{ role: 'user', content: 'first' },
+    { role: 'assistant', content: 'answer' }, { role: 'user', content: 'x'.repeat(chars) }];
+  try {
+    // ~150k: under the agent budget. The server passes it through on the threshold.
+    assert.equal(await h.post(followup(600_000)), 200);
+    assert.equal(h.compressions.length, 1);
+    assert.equal(h.compressions[0].compression_threshold_tokens, 200_000);
+    assert.equal(h.compressions[0].compression_target_tokens, 100_000);
+    assert.doesNotMatch(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
   } finally { h.close(); }
 });

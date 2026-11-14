@@ -1492,7 +1492,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     }
     rec.routeLane = requestRouteLane;
     noteLaneActivity(state, rec, requestSessionId(req));
-    noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined, requestSessionKey);
+    noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined);
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
     const clientMeta = memtreeClientMeta({
@@ -1899,6 +1899,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             requestSendPolicies.get(req)?.allowed.add(fork.body);
             releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
             recordTurn(rec, "fork-memory", fork.body);
+            noteAwayWarmsMain(state, rec, requestSessionId(req));
             capture(opts, "anthropic-request-memory-fork", fork.body);
             return logged(forwardRaw(req, res, fork.body, opts, upstream, state.shutdownSignal, rec));
         }
@@ -5946,10 +5947,10 @@ function noteLaneActivity(state, rec, sessionId) {
 /**
  * `CCC_COMPRESS_ON_COLD_CACHE=1`: record whether this conversation request's lane has sent
  * nothing upstream for longer than its cache TTL (rec.coldCache), and stamp the lane's clock
- * when this request goes out (forwardAccepted). An away recap carries the main thread's
- * history, so sending it warms the main lane's cache too.
+ * when this request goes out (forwardAccepted). An away recap riding the main thread's
+ * prefix warms the main lane's cache too (noteAwayWarmsMain).
  */
-function noteLaneCache(opts, state, rec, routeKey, body, notConversation, sessionId) {
+function noteLaneCache(opts, state, rec, routeKey, body, notConversation) {
     if (opts.compressOnColdCache !== true || notConversation)
         return;
     const clock = state.laneCacheClock;
@@ -5959,10 +5960,15 @@ function noteLaneCache(opts, state, rec, routeKey, body, notConversation, sessio
         rec.coldCache = sample;
     if (sample?.cold && gap)
         coldGaps.set(rec, { lane: routeKey, basis: gap.basis });
-    const warms = rec.routeLane === "away" ? [routeKey, JSON.stringify([sessionId ?? "", "main"])]
-        : [routeKey];
-    laneSendStamps.set(rec, () => { for (const lane of warms)
-        clock.sent(lane); });
+    laneSendStamps.set(rec, () => clock.sent(routeKey));
+}
+/** An away recap sent on the main thread's prefix also refreshes the main lane's cache. */
+function noteAwayWarmsMain(state, rec, sessionId) {
+    const stamp = laneSendStamps.get(rec);
+    if (!stamp)
+        return;
+    const main = JSON.stringify([sessionId ?? "", "main"]);
+    laneSendStamps.set(rec, () => { stamp(); state.laneCacheClock.sent(main); });
 }
 /** Per request: stamps its lane's cache clock as it goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap();
