@@ -15,7 +15,7 @@ import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { MEMTREE_MCP_SCRIPT } from "./memtree-mcp-config.js";
 import { MEMTREE_MCP_SERVER_NAME } from "./memtree-mcp.js";
 import { proxyUrlFor } from "./https-proxy-mode.js";
-import { cccProxyRestoreLines, ifStill } from "./https-proxy-session.js";
+import { cccProxyRestoreLines, ifStill, shellQuote } from "./https-proxy-session.js";
 
 export type DesktopMode = "production" | "staging" | "local";
 
@@ -93,15 +93,29 @@ const PASTED_LIMITS: Record<string, string> = {
  * written). Programs started from Bash (a nested `claude -p`, an SDK script) aren't routed
  * through ccc, so they get Claude Code's own compaction back.
  */
-export function desktopBashEnvScript(paths: DesktopPaths, state: DesktopState): string {
+export function desktopBashEnvScript(
+  paths: DesktopPaths, state: DesktopState, userEnv: DesktopUserEnv = {}
+): string {
+  const userFile = userEnv.CLAUDE_ENV_FILE;
   return [
     "# ccc desktop: written by `ccc desktop setup`; sourced by Claude Code before each Bash command.",
-    ...cccProxyRestoreLines(state.port, paths.caPem, {}),
+    // The user's own CA file (seen at setup) comes back for Bash; ccc's bundle goes.
+    ...cccProxyRestoreLines(state.port, paths.caPem,
+      userEnv.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: userEnv.NODE_EXTRA_CA_CERTS } : {}),
     ...Object.entries(PASTED_LIMITS).map(([name, value]) => ifStill(name, value, `unset ${name}`)),
-    "unset CLAUDE_ENV_FILE",
+    userFile ? `export CLAUDE_ENV_FILE=${shellQuote(userFile)}` : "unset CLAUDE_ENV_FILE",
+    // An env file of the user's own, which the pasted line replaced, still runs (as in
+    // terminal proxy mode).
+    ...(userFile ? [`if [ -r ${shellQuote(userFile)} ]; then . ${shellQuote(userFile)}; fi`] : []),
     "true",
     "",
   ].join("\n");
+}
+
+/** The shell values setup saw that the pasted lines replace for the session. */
+export interface DesktopUserEnv {
+  NODE_EXTRA_CA_CERTS?: string;
+  CLAUDE_ENV_FILE?: string;
 }
 
 function freePort(): Promise<number> {
@@ -134,7 +148,9 @@ export const CA_ROTATE_BEFORE_MS = 30 * 24 * 3600_000;
  */
 export async function setupDesktopFiles(
   paths: DesktopPaths, mode: DesktopMode,
-  opts: { rotateToken?: boolean; rotateCa?: boolean; userExtraCaPem?: string } = {}
+  opts: {
+    rotateToken?: boolean; rotateCa?: boolean; userExtraCaPem?: string; userEnv?: DesktopUserEnv;
+  } = {}
 ): Promise<DesktopState & { caRotated: boolean }> {
   fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(paths.dir, 0o700);
@@ -173,7 +189,7 @@ export async function setupDesktopFiles(
     ...(previous?.mcpRegistered ? { mcpRegistered: true } : {}),
   };
   write(paths.state, `${JSON.stringify(state, null, 2)}\n`, 0o600);
-  write(paths.bashEnv, desktopBashEnvScript(paths, state), 0o600);
+  write(paths.bashEnv, desktopBashEnvScript(paths, state, opts.userEnv), 0o600);
   return { ...state, caRotated };
 }
 

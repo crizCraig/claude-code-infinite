@@ -397,6 +397,13 @@ export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<
  * (another process, no session start seen) leaves the id as it is.
  */
 export declare function refreshHostSession(deps: MemtreeMcpDeps, hostPid?: number): Promise<void>;
+/**
+ * The desktop service can't name a process's session the way terminal ccc's proxy does
+ * (refreshHostSession), so read Claude Code's own record of its process (`<config
+ * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
+ * Best effort: anything unreadable keeps the current id (review r1 P2).
+ */
+export declare function refreshSessionFromClaudePidFile(deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid?: number): void;
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;

@@ -398,8 +398,10 @@ environment get MemTree. Sessions in other environments are unchanged.
   dropped as soon as it signs it. Only the certificate's own key is kept, readable only by
   you. Nothing goes into your system or keychain trust store: only the sessions with the pasted
   `NODE_EXTRA_CA_CERTS` trust it. Setup keeps a corporate CA from your shell's
-  `NODE_EXTRA_CA_CERTS` in that bundle. `ccc desktop setup --rotate-ca` makes a new one (restart
-  open sessions); `--rotate-token` a new proxy token (paste the lines again).
+  `NODE_EXTRA_CA_CERTS` in that bundle. It lasts a year: `ccc desktop status` and a terminal
+  `ccc` say when it's due, and `ccc desktop setup` renews it (restart open sessions then).
+  `--rotate-ca` makes a new one at once; `--rotate-token` a new proxy token (paste the lines
+  again).
 - **If the service stops**, sessions in the ccc environment can't reach Claude ("Unable to
   connect to API") until it's back. launchd restarts it if it crashes. `ccc desktop status`
   says what's wrong and how to restart it, and a terminal `ccc` warns when it's down. To stop

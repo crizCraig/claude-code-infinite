@@ -30,4 +30,9 @@ export declare function serviceDownText(mode: DesktopMode, state: DesktopState, 
  * answering (undefined otherwise). A loopback check, bounded at 300 ms.
  */
 export declare function desktopServiceDownLine(mode: DesktopMode): Promise<string | undefined>;
+/**
+ * The certificate lasts a year and only `setup` renews it: say so once it's within the
+ * renewal window or past it (sessions then fail TLS). undefined while it's fine.
+ */
+export declare function certificateExpiryText(mode: DesktopMode, state: DesktopState, now?: number): string | undefined;
 //# sourceMappingURL=desktop-command.d.ts.map

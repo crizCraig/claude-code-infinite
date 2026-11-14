@@ -15,7 +15,7 @@ import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { MEMTREE_MCP_SCRIPT } from "./memtree-mcp-config.js";
 import { MEMTREE_MCP_SERVER_NAME } from "./memtree-mcp.js";
 import { proxyUrlFor } from "./https-proxy-mode.js";
-import { cccProxyRestoreLines, ifStill } from "./https-proxy-session.js";
+import { cccProxyRestoreLines, ifStill, shellQuote } from "./https-proxy-session.js";
 const LAUNCHD_LABEL = "co.polychat.ccc-desktop";
 export function desktopPaths(configDir, mode) {
     const dir = path.join(configDir, mode === "production" ? "desktop" : `desktop-${mode}`);
@@ -58,12 +58,17 @@ const PASTED_LIMITS = {
  * written). Programs started from Bash (a nested `claude -p`, an SDK script) aren't routed
  * through ccc, so they get Claude Code's own compaction back.
  */
-export function desktopBashEnvScript(paths, state) {
+export function desktopBashEnvScript(paths, state, userEnv = {}) {
+    const userFile = userEnv.CLAUDE_ENV_FILE;
     return [
         "# ccc desktop: written by `ccc desktop setup`; sourced by Claude Code before each Bash command.",
-        ...cccProxyRestoreLines(state.port, paths.caPem, {}),
+        // The user's own CA file (seen at setup) comes back for Bash; ccc's bundle goes.
+        ...cccProxyRestoreLines(state.port, paths.caPem, userEnv.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: userEnv.NODE_EXTRA_CA_CERTS } : {}),
         ...Object.entries(PASTED_LIMITS).map(([name, value]) => ifStill(name, value, `unset ${name}`)),
-        "unset CLAUDE_ENV_FILE",
+        userFile ? `export CLAUDE_ENV_FILE=${shellQuote(userFile)}` : "unset CLAUDE_ENV_FILE",
+        // An env file of the user's own, which the pasted line replaced, still runs (as in
+        // terminal proxy mode).
+        ...(userFile ? [`if [ -r ${shellQuote(userFile)} ]; then . ${shellQuote(userFile)}; fi`] : []),
         "true",
         "",
     ].join("\n");
@@ -134,7 +139,7 @@ export async function setupDesktopFiles(paths, mode, opts = {}) {
         ...(previous?.mcpRegistered ? { mcpRegistered: true } : {}),
     };
     write(paths.state, `${JSON.stringify(state, null, 2)}\n`, 0o600);
-    write(paths.bashEnv, desktopBashEnvScript(paths, state), 0o600);
+    write(paths.bashEnv, desktopBashEnvScript(paths, state, opts.userEnv), 0o600);
     return { ...state, caRotated };
 }
 export function writeDesktopState(paths, state) {

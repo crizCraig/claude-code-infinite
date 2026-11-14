@@ -35,6 +35,8 @@
  */
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, RECENT_SEARCH_WINDOWS_DAYS, recentSearchArgs, recentSearchFailedNote, recentSearchNote, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
 import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, serverTailHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
@@ -416,6 +418,22 @@ export async function refreshHostSession(deps, hostPid = process.ppid) {
     const sessionId = answer.ok ? answer.body?.session_id : undefined;
     if (typeof sessionId === "string" && sessionId)
         deps.sessionId = sessionId;
+}
+/**
+ * The desktop service can't name a process's session the way terminal ccc's proxy does
+ * (refreshHostSession), so read Claude Code's own record of its process (`<config
+ * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
+ * Best effort: anything unreadable keeps the current id (review r1 P2).
+ */
+export function refreshSessionFromClaudePidFile(deps, env, hostPid = process.ppid) {
+    const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+    try {
+        const record = JSON.parse(fs.readFileSync(path.join(dir, "sessions", `${hostPid}.json`), "utf8"));
+        if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
+            deps.sessionId = record.sessionId;
+        }
+    }
+    catch { /* no record: keep the launch id */ }
 }
 function proxyBase(deps) {
     const base = deps.proxyUrl?.replace(/\/$/, "");
@@ -1065,8 +1083,11 @@ export function runMemtreeMcpServer(env = process.env) {
             }
             queue = queue.then(async () => {
                 // Calls run one at a time, so each reads the session its process is on now.
-                if (isToolCall(message) && !inert)
+                if (isToolCall(message) && !inert) {
                     await refreshHostSession(deps);
+                    if (desktop)
+                        refreshSessionFromClaudePidFile(deps, env);
+                }
                 const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert)
                     .catch((err) => ({
                     jsonrpc: "2.0",

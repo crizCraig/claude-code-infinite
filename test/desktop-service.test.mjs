@@ -360,3 +360,42 @@ test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)
   assert.equal(fs.existsSync(paths.upstreamCa), false);
   assert.doesNotMatch(launchdPlist("local", paths, "/x/cli.js"), /NODE_EXTRA_CA_CERTS/);
 });
+
+test("the desktop MCP server follows its Claude Code's session file after /clear (review r1 P2)", async (t) => {
+  const { refreshSessionFromClaudePidFile } = await import("../dist/memtree-mcp.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-pidfile-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, "sessions"));
+  const deps = { sessionId: "launch-0" };
+  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
+  assert.equal(deps.sessionId, "launch-0", "no record: kept");
+  fs.writeFileSync(path.join(dir, "sessions", "4242.json"), JSON.stringify({ pid: 4242, sessionId: "cleared-1" }));
+  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
+  assert.equal(deps.sessionId, "cleared-1");
+  fs.writeFileSync(path.join(dir, "sessions", "4242.json"), JSON.stringify({ pid: 1, sessionId: "other" }));
+  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
+  assert.equal(deps.sessionId, "cleared-1", "a record for another pid is ignored");
+});
+
+test("status and terminal ccc flag a certificate near or past expiry (review r1 P2)", async () => {
+  const { certificateExpiryText } = await import("../dist/desktop-command.js");
+  const now = Date.parse("2027-01-01T00:00:00Z");
+  const state = (notAfter) => ({ mode: "production", port: 1, token: "", createdAt: "", notAfter });
+  assert.equal(certificateExpiryText("production", state("2027-06-01T00:00:00Z"), now), undefined);
+  assert.match(certificateExpiryText("production", state("2027-01-10T00:00:00Z"), now),
+    /expires on .*run `ccc desktop setup`/);
+  assert.match(certificateExpiryText("staging", state("2026-12-01T00:00:00Z"), now),
+    /expired .*`ccc staging desktop setup`/);
+});
+
+test("Bash gets the user's own CA file and env file back (review r1 P3)", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-userenv-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const paths = desktopPaths(dir, "local");
+  const userFile = path.join(dir, "user's env.sh");
+  fs.writeFileSync(userFile, "export FROM_USER=1\n");
+  await setupDesktopFiles(paths, "local", { userEnv: { NODE_EXTRA_CA_CERTS: "/corp/ca.pem", CLAUDE_ENV_FILE: userFile } });
+  const out = execFileSync("bash", ["-c", `. "$1"; echo "ca=\${NODE_EXTRA_CA_CERTS-unset} f=\${CLAUDE_ENV_FILE-unset} u=\${FROM_USER-unset}"`, "x", paths.bashEnv],
+    { env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: paths.caPem, CLAUDE_ENV_FILE: paths.bashEnv } }).toString();
+  assert.equal(out.trim(), `ca=/corp/ca.pem f=${userFile} u=1`);
+});

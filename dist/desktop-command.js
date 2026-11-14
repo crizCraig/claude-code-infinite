@@ -21,7 +21,7 @@ import { anthropicUpstreamFromEnv } from "./cli-args.js";
 import { sanitizedNoProxy } from "./https-proxy-session.js";
 import { HTTPS_PROXY_MODE_ENV, httpsProxyModeDecision } from "./https-proxy-eligibility.js";
 import { PROXY_TOKEN_HEADER } from "./memtree-mcp.js";
-import { desktopEnvLines, desktopPaths, installLaunchAgent, readDesktopState, registerDesktopMcp, setupDesktopFiles, uninstallLaunchAgent, unregisterDesktopMcp, writeDesktopState, desktopLaunchdLabel, } from "./desktop-setup.js";
+import { desktopEnvLines, desktopPaths, installLaunchAgent, readDesktopState, registerDesktopMcp, setupDesktopFiles, uninstallLaunchAgent, unregisterDesktopMcp, writeDesktopState, desktopLaunchdLabel, CA_ROTATE_BEFORE_MS, } from "./desktop-setup.js";
 import { startDesktopService } from "./desktop-service.js";
 const CLI_PATH = fileURLToPath(new URL("./cli.js", import.meta.url));
 /**
@@ -81,6 +81,10 @@ export async function runDesktopCommand(args, deps) {
         const state = await setupDesktopFiles(paths, deps.mode, {
             rotateToken: args.includes("--rotate-token"), rotateCa: args.includes("--rotate-ca"),
             userExtraCaPem: userExtraCaPem(process.env),
+            userEnv: {
+                ...(process.env.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS } : {}),
+                ...(process.env.CLAUDE_ENV_FILE ? { CLAUDE_ENV_FILE: process.env.CLAUDE_ENV_FILE } : {}),
+            },
         });
         let mcpFailure;
         if (!args.includes("--no-mcp")) {
@@ -103,7 +107,12 @@ export async function runDesktopCommand(args, deps) {
             }
         }
         if (state.caRotated) {
-            console.log("A new CA was made: Desktop sessions started before now must be restarted.\n");
+            console.log("A new certificate was made: Desktop sessions started before now must be " +
+                "restarted.\n");
+            if (args.includes("--no-launchd")) {
+                console.log("Restart the service too (it still serves the old one): " +
+                    `launchctl kickstart -k gui/$(id -u)/${desktopLaunchdLabel(deps.mode)}\n`);
+            }
         }
         console.log(setupText(paths, state));
         if (mcpFailure) {
@@ -129,11 +138,14 @@ export async function runDesktopCommand(args, deps) {
             return 1;
         }
         const health = await serviceHealth(state);
+        const expiry = certificateExpiryText(deps.mode, state);
         console.log(health.up
             ? `service up on 127.0.0.1:${state.port}, ${health.sessions} active session(s); ` +
                 `certificate valid until ${state.notAfter}`
             : serviceDownText(deps.mode, state, health.detail));
-        return health.up ? 0 : 1;
+        if (expiry)
+            console.log(expiry);
+        return health.up && !expiry ? 0 : 1;
     }
     if (sub === "serve") {
         const state = readDesktopState(paths);
@@ -237,6 +249,9 @@ export async function desktopServiceDownLine(mode) {
     const state = readDesktopState(paths(mode));
     if (!state)
         return undefined;
+    const expiry = certificateExpiryText(mode, state);
+    if (expiry)
+        return expiry;
     const health = await serviceHealth(state, 300);
     if (health.up)
         return undefined;
@@ -261,6 +276,21 @@ function trimServiceLog(log) {
             fs.truncateSync(log, 0);
     }
     catch { /* none yet */ }
+}
+/**
+ * The certificate lasts a year and only `setup` renews it: say so once it's within the
+ * renewal window or past it (sessions then fail TLS). undefined while it's fine.
+ */
+export function certificateExpiryText(mode, state, now = Date.now()) {
+    const left = Date.parse(state.notAfter) - now;
+    if (!(left <= CA_ROTATE_BEFORE_MS))
+        return undefined;
+    const cmd = mode === "production" ? "ccc" : `ccc ${mode}`;
+    return left <= 0
+        ? `ccc desktop's certificate expired on ${state.notAfter}: Desktop sessions in your ccc ` +
+            `environment fail to connect. Run \`${cmd} desktop setup\`, then restart those sessions.`
+        : `ccc desktop's certificate expires on ${state.notAfter}: run \`${cmd} desktop setup\` ` +
+            "to renew it (then restart open Desktop sessions).";
 }
 function paths(mode) {
     return desktopPaths(getConfigDir(), mode);

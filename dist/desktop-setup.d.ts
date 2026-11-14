@@ -35,7 +35,12 @@ export declare function desktopEnvLines(paths: DesktopPaths, state: DesktopState
  * written). Programs started from Bash (a nested `claude -p`, an SDK script) aren't routed
  * through ccc, so they get Claude Code's own compaction back.
  */
-export declare function desktopBashEnvScript(paths: DesktopPaths, state: DesktopState): string;
+export declare function desktopBashEnvScript(paths: DesktopPaths, state: DesktopState, userEnv?: DesktopUserEnv): string;
+/** The shell values setup saw that the pasted lines replace for the session. */
+export interface DesktopUserEnv {
+    NODE_EXTRA_CA_CERTS?: string;
+    CLAUDE_ENV_FILE?: string;
+}
 export declare function readDesktopState(paths: DesktopPaths): DesktopState | undefined;
 /** Setup rotates the CA when it expires within this. */
 export declare const CA_ROTATE_BEFORE_MS: number;
@@ -49,6 +54,7 @@ export declare function setupDesktopFiles(paths: DesktopPaths, mode: DesktopMode
     rotateToken?: boolean;
     rotateCa?: boolean;
     userExtraCaPem?: string;
+    userEnv?: DesktopUserEnv;
 }): Promise<DesktopState & {
     caRotated: boolean;
 }>;
