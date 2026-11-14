@@ -271,6 +271,14 @@ export interface ProxyOptions {
     httpsProxyMode?: HttpsProxyModeOptions & {
         onModelCall?: () => void;
     };
+    /**
+     * The desktop service's per-session proxies (desktop-service.ts): this proxy serves only
+     * the service in the same process. Every request must carry `x-ccc-inner: <innerToken>`
+     * (else 403), and `x-ccc-intercepted: 1` (trusted only with the token) marks one the
+     * service decrypted from api.anthropic.com, so it is routed as intercepted, never as a
+     * loopback caller.
+     */
+    innerToken?: string;
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
     captureDir?: string;
     /**
@@ -808,5 +816,7 @@ export declare const __testCapCacheBreakpoints: typeof capCacheBreakpoints;
 export declare const __testEstimateRequestTokens: typeof estimateRequestTokens;
 export declare const __testCompressedResultExceedsWindow: typeof compressedResultExceedsWindow;
 export declare const __testHoldingLane: typeof holdingLane;
+export declare const INNER_TOKEN_HEADER = "x-ccc-inner";
+export declare const INNER_INTERCEPTED_HEADER = "x-ccc-intercepted";
 export {};
 //# sourceMappingURL=proxy.d.ts.map

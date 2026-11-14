@@ -352,6 +352,8 @@ export interface MemtreeMcpDeps {
     sessionId?: string;
     /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */
     hostToken?: string;
+    /** The ccc desktop service's proxy token, sent as x-ccc-proxy-token on every call. */
+    token?: string;
     fetch?: typeof fetch;
     now?: () => number;
 }
@@ -362,6 +364,26 @@ export interface MemtreeMcpDeps {
  * confused with `x-memtree-tools`, the list of configured tools sent on compress calls.
  */
 export declare const MEMTREE_TOOL_HEADER = "x-memtree-tool";
+/** The desktop service's loopback routes require its proxy token. */
+export declare const PROXY_TOKEN_HEADER = "x-ccc-proxy-token";
+/**
+ * A ccc proxy named by Claude Code's own HTTPS_PROXY
+ * (`http://ccc:<token>@127.0.0.1:<port>`, the desktop service or a proxy-mode ccc).
+ */
+export declare function cccProxyFromEnv(env: NodeJS.ProcessEnv): {
+    url: string;
+    token: string;
+} | undefined;
+/**
+ * Where the server registered in ~/.claude.json for the
+ * Claude desktop app (CCC_MEMTREE_MCP_DESKTOP=1) reads from. The same entry is
+ * seen by every Claude Code on this account, so outside a ccc-routed session
+ * it is inert: no tools, no instructions.
+ */
+export declare function desktopMcpTarget(env: NodeJS.ProcessEnv): {
+    proxyUrl: string;
+    token?: string;
+} | undefined;
 export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<string, string>;
 /**
  * Point `deps.sessionId` at the session this server's Claude Code process is on now.
@@ -375,6 +397,13 @@ export declare function toolHeaders(tool: string, deps: MemtreeMcpDeps): Record<
  * (another process, no session start seen) leaves the id as it is.
  */
 export declare function refreshHostSession(deps: MemtreeMcpDeps, hostPid?: number): Promise<void>;
+/**
+ * The desktop service can't name a process's session the way terminal ccc's proxy does
+ * (refreshHostSession), so read Claude Code's own record of its process (`<config
+ * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
+ * Best effort: anything unreadable keeps the current id (review r1 P2).
+ */
+export declare function refreshSessionFromClaudePidFile(deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid?: number): void;
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
@@ -487,7 +516,9 @@ versionNote?: string,
 /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
 notice?: {
     next(): string | undefined;
-}): Promise<object | undefined>;
+}, 
+/** Not in a ccc-routed session: no tools, no instructions. */
+inert?: boolean): Promise<object | undefined>;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

@@ -37,7 +37,7 @@ export function isVersionRequest(args) {
     return rest.length === 1 && (rest[0] === "--version" || rest[0] === "-v");
 }
 /** ccc's own subcommands, which start no Claude session. */
-const SUBCOMMANDS = ["fetch", "memtree-mcp", "link"];
+const SUBCOMMANDS = ["fetch", "memtree-mcp", "link", "desktop"];
 const ENVIRONMENT_WORDS = ["local", "staging"];
 /** The environment a leading `local`/`staging` word selects (else production). */
 export function environmentOf(args) {

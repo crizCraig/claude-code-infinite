@@ -97,11 +97,8 @@ function noProxyCoversIntercept(entry) {
 export function bashEnvScript(input) {
     const { parentEnv, port, bundlePath, noProxy } = input;
     const restore = (name) => restoreLine(parentEnv, name);
-    const ours = `http://${PROXY_USER}:*@127.0.0.1:${port}`;
     const lines = [
-        // ccc removed https_proxy from Claude Code's env exactly when it set HTTPS_PROXY.
-        `case "\${HTTPS_PROXY-}" in ${ours}) ${restore("HTTPS_PROXY")}; ${restore("https_proxy")};; esac`,
-        ifStill("NODE_EXTRA_CA_CERTS", bundlePath, restore("NODE_EXTRA_CA_CERTS")),
+        ...cccProxyRestoreLines(port, bundlePath, parentEnv),
         ...NO_PROXY_VARS.filter((name) => noProxy[name] !== undefined)
             .map((name) => ifStill(name, noProxy[name], restore(name))),
         restore("CLAUDE_ENV_FILE"), restore("CCC_MEMTREE_PROXY"), restore(HTTPS_PROXY_MODE_ENV),
@@ -114,7 +111,23 @@ export function bashEnvScript(input) {
     }
     return `${lines.join("\n")}\n`;
 }
-function ifStill(name, value, then) {
+/**
+ * Bash env lines that put back `env`'s HTTPS_PROXY, https_proxy and NODE_EXTRA_CA_CERTS
+ * (or unset them), each only while it still holds ccc's value: the token proxy on `port`
+ * (matched by pattern, so the token is never written) and the CA file `caPath`. Values
+ * Claude Code's sandbox set before the file is sourced are left alone. Shared with the
+ * desktop service's env file (desktop-setup.ts).
+ */
+export function cccProxyRestoreLines(port, caPath, env) {
+    const restore = (name) => restoreLine(env, name);
+    const ours = `http://${PROXY_USER}:*@127.0.0.1:${port}`;
+    return [
+        // ccc removed https_proxy from Claude Code's env exactly when it set HTTPS_PROXY.
+        `case "\${HTTPS_PROXY-}" in ${ours}) ${restore("HTTPS_PROXY")}; ${restore("https_proxy")};; esac`,
+        ifStill("NODE_EXTRA_CA_CERTS", caPath, restore("NODE_EXTRA_CA_CERTS")),
+    ];
+}
+export function ifStill(name, value, then) {
     return `if [ "\${${name}-}" = ${shellQuote(value)} ]; then ${then}; fi`;
 }
 function restoreLine(env, name) {

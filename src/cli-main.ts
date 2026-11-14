@@ -171,6 +171,7 @@ import {
 } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
 import { urlOpenerFor } from "./open-url.js";
+import { desktopServiceDownLine, runDesktopCommand } from "./desktop-command.js";
 import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
 import {
   startHttpsProxySession, type HttpsProxyChild, type HttpsProxySession,
@@ -263,6 +264,10 @@ async function handleInvalidKey(
 function saveApiKey(mode: Mode, apiKey: string, diagnostics: Diagnostics): void {
   diagnostics.record("key_saved");
   diagnostics.setApiKey(apiKey);
+  saveKeyFor(mode, apiKey);
+}
+
+function saveKeyFor(mode: Mode, apiKey: string): void {
   if (mode === "local") setLocalPolychatApiKey(apiKey);
   else if (mode === "staging") setStagingPolychatApiKey(apiKey);
   else setPolychatApiKey(apiKey);
@@ -530,6 +535,22 @@ async function main() {
     return;
   }
 
+  // `ccc [staging|local] desktop ...`: the Claude desktop app's service (desktop-command.ts).
+  if (subcommand?.name === "desktop") {
+    process.exitCode = await runDesktopCommand(subcommand.args, {
+      mode,
+      memtreeBaseUrl: memtreeBaseUrlFor(mode),
+      apiKey: () => storedApiKey(mode),
+      promptForKey: async () => {
+        const key = await promptForApiKey(mode, process.stdout);
+        if (!key) return undefined;
+        saveKeyFor(mode, key);
+        return key;
+      },
+    });
+    return;
+  }
+
   const claudeArgs = mode !== "production" ? filteredArgs.slice(1) : filteredArgs;
 
   // Interactive UI only: print/non-TTY invocations are programmatic
@@ -550,6 +571,10 @@ async function main() {
     console.log("\x1b[1;36m🔍 DEBUG MODE\x1b[0m\n");
   }
 
+  // Set up for the desktop app but its service is down: those sessions are failing.
+  const desktopDown = interactiveUi ? await desktopServiceDownLine(mode) : undefined;
+  if (desktopDown) console.log(`\x1b[1;33m${desktopDown}\x1b[0m\n`);
+
   if (mode === "local") {
     console.log("\x1b[1;33m🏠 LOCAL MODE\x1b[0m\n");
   } else if (mode === "staging") {
@@ -557,16 +582,10 @@ async function main() {
   }
 
   // CCC_LOCAL_BASE_URL: local mode's server elsewhere than :8080 (tests use a free port).
-  const memtreeBaseUrl =
-    mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
-    mode === "staging" ? STAGING_BASE_URL :
-    POLYCHAT_BASE_URL;
+  const memtreeBaseUrl = memtreeBaseUrlFor(mode);
 
   // Get or prompt for the MemTree API key (separate keys per environment)
-  let polychatApiKey =
-    mode === "local" ? getLocalPolychatApiKey() :
-    mode === "staging" ? getStagingPolychatApiKey() :
-    getPolychatApiKey();
+  let polychatApiKey = storedApiKey(mode);
 
   // Client diagnostics (diagnostics.ts): versions, OS and errors, never content.
   // Started before the key prompt so a signup that stalls there is visible too.
@@ -1291,4 +1310,18 @@ function httpsProxyChild(
 function joinPromptLines(...lines: Array<string | null | undefined>): string | undefined {
   const present = lines.filter((line): line is string => typeof line === "string" && line !== "");
   return present.length ? present.join("\n") : undefined;
+}
+
+/** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
+function memtreeBaseUrlFor(mode: Mode): string {
+  return mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
+    mode === "staging" ? STAGING_BASE_URL :
+    POLYCHAT_BASE_URL;
+}
+
+/** The saved MemTree key for a mode (separate keys per environment). */
+function storedApiKey(mode: Mode): string | undefined {
+  return mode === "local" ? getLocalPolychatApiKey() :
+    mode === "staging" ? getStagingPolychatApiKey() :
+    getPolychatApiKey();
 }
