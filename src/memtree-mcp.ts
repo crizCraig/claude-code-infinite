@@ -43,6 +43,8 @@ import {
   FINDER_SEARCH_MAX_LIMIT,
   formatSearchResults,
   searchMode,
+  defaultSearchMode,
+  hybridSearchOn,
   formatSessions,
   RECENT_SEARCH_WINDOWS_DAYS,
   recentSearchArgs,
@@ -360,6 +362,22 @@ export const MEMTREE_TOOLS = [
     },
   },
 ].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
+
+/** HYBRID_SEARCH_ENV's search tool: `hybrid` listed and the default mode. */
+const HYBRID_MODE_DESCRIPTION =
+  "hybrid (default here: text and vector together, fused by rank; one page, no cursor), text (exact words) or " +
+  "vector (meaning); first page charged, except text in one tree.";
+
+/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+export function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS {
+  if (!hybridSearchOn(env)) return MEMTREE_TOOLS;
+  return MEMTREE_TOOLS.map((tool) => {
+    if (tool.name !== "search") return tool;
+    const properties = tool.inputSchema.properties as Record<string, unknown>;
+    const mode = { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION };
+    return { ...tool, inputSchema: { ...tool.inputSchema, properties: { ...properties, mode } } };
+  }) as typeof MEMTREE_TOOLS;
+}
 
 export interface MemtreeMcpDeps {
   /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
@@ -1013,7 +1031,7 @@ export async function handleMcpMessage(
     case "ping":
       return isRequest ? reply({}) : undefined;
     case "tools/list":
-      return reply({ tools: inert ? [] : MEMTREE_TOOLS });
+      return reply({ tools: inert ? [] : memtreeTools(process.env) });
     case "tools/call": {
       const name = message.params?.name;
       const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
@@ -1127,7 +1145,7 @@ async function searchTool(
   if (typeof args.query !== "string" || !args.query.trim()) {
     throw new ToolInputError("search: query must be a non-empty string");
   }
-  const mode = searchMode(args.mode);
+  const mode = searchMode(args.mode, defaultSearchMode(process.env));
   const current = args.tree === CURRENT_TREE;
   const named = current ? undefined : checkTreeId(args.tree);
   if (mode === "text" && (current || named)) {
@@ -1138,7 +1156,7 @@ async function searchTool(
   if (!finder) throw new ToolInputError("search across sessions is not available here");
   if (current && !tree.currentId) throw new ToolInputError("this session's tree is not available here");
   const scope = current ? await tree.currentId!(true) : named;
-  return finder.searchSessions(args, scope);
+  return finder.searchSessions({ ...args, mode }, scope);
 }
 
 /** `{tree, id}` from a node address, or from tree (optional) and the numeric field. */

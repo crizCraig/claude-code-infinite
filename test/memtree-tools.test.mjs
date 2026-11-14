@@ -21,6 +21,7 @@ import {
   handleMcpMessage,
   MEMTREE_MCP_INSTRUCTIONS,
   MEMTREE_TOOLS,
+  memtreeTools,
   SessionFinder,
 } from "../dist/memtree-mcp.js";
 import { formatSessions, formatSearchResults, searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
@@ -1304,4 +1305,46 @@ test("search and list say which sessions they cover; instructions ask hand-offs 
   assert.match(search.description, /without tree, all of the user's ccc sessions/);
   assert.match(list.description, /this one marked/);
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /hand-off or kickoff prompt .* names this session's id and MemTree link/);
+});
+
+test("hybrid search is opt-in: CCC_MEMTREE_HYBRID_SEARCH=1 lists it and makes it the default", async () => {
+  const seen = [];
+  const tree = { get: async () => index(), search: async () => (seen.push(["tree-search"]), "tree hits"), currentId: async () => "cur-id" };
+  const finder = { listSessions: async () => "", searchSessions: async (args, t) => (seen.push([args.mode, t]), "server hits") };
+  const call = async (name, args) =>
+    (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree, finder));
+  const listedModes = async () => (await handleMcpMessage({ jsonrpc: "2.0", id: 2, method: "tools/list" }, tree, finder))
+    .result.tools.find((t) => t.name === "search").inputSchema.properties.mode.enum;
+  const saved = process.env.CCC_MEMTREE_HYBRID_SEARCH;
+  try {
+    delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
+    assert.deepEqual(await listedModes(), ["text", "vector"], "off by default: the schema is unchanged");
+    assert.equal(memtreeTools(process.env), MEMTREE_TOOLS);
+    await call("search", { query: "x", tree: "current" });
+    assert.deepEqual(seen, [["tree-search"]], "off: a one-tree text search stays local and free");
+    seen.length = 0;
+    process.env.CCC_MEMTREE_HYBRID_SEARCH = "1";
+    assert.deepEqual(await listedModes(), ["hybrid", "text", "vector"]);
+    await call("search", { query: "x", tree: "current" });
+    await call("search", { query: "x" });
+    await call("search", { query: "x", mode: "text", tree: "current" });
+    assert.deepEqual(seen, [["hybrid", "cur-id"], ["hybrid", undefined], ["tree-search"]]);
+  } finally {
+    if (saved === undefined) delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
+    else process.env.CCC_MEMTREE_HYBRID_SEARCH = saved;
+  }
+});
+
+test("a hybrid page says it is fused and where each ranking placed each hit", () => {
+  const hit = { id: "s1", tree: { request_id: "r1", ref: "r1-v1-own" }, range: { block: 0, start: 1, end: 2 },
+    snippet: "x", score: 0.032, legs: { text: { rank: 3, score: 0.4 }, vector: { rank: 1, score: 0.8, embedding_model: "m" } } };
+  const text = formatSearchResults({ query: "q", mode: "hybrid", hits: [hit], charged: true, next_cursor: null }, { query: "q" });
+  assert.match(text, /^1 hybrid match for "q" \(charged: one search\):\n\(Text and vector matches fused by rank/);
+  assert.match(text, /found by: text #3 · vector #1/);
+  const plain = formatSearchResults({ query: "q", hits: [{ ...hit, legs: undefined }] }, { query: "q" });
+  assert.doesNotMatch(plain, /found by|fused/);
+  const empty = formatSearchResults({ query: "q", mode: "hybrid", hits: [] }, { query: "q", mode: "hybrid" });
+  assert.match(empty, /\(hybrid search\)\. .*Neither the words nor their meaning matched/);
+  assert.equal(searchQuery({ query: "x", mode: "hybrid" }, "t-v1-own"), "?q=x&mode=hybrid&tree=t-v1-own");
+  assert.throws(() => searchQuery({ query: "x", mode: "fuzzy" }), /"vector", "text" or "hybrid"/);
 });

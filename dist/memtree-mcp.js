@@ -38,7 +38,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, formatSessions, RECENT_SEARCH_WINDOWS_DAYS, recentSearchArgs, recentSearchFailedNote, recentSearchNote, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
+import { FINDER_SEARCH_DEFAULT_LIMIT, FINDER_SEARCH_MAX_LIMIT, formatSearchResults, searchMode, defaultSearchMode, hybridSearchOn, formatSessions, RECENT_SEARCH_WINDOWS_DAYS, recentSearchArgs, recentSearchFailedNote, recentSearchNote, searchQuery, SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT, sessionsQuery, } from "./memtree-finder.js";
 import { formatLines, formatNode, formatSearch, formatSearchHits, formatTail, MemtreeIndex, parseNodeAddress, serverSearchHits, serverTailHits, READ_LINES_MAX_CHARS, READ_LINES_MAX_LINES, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, ToolInputError, } from "./memtree-tools.js";
 import { CLIENT_VERSION } from "./memtree.js";
 import { formatHandover, formatUserMessages, HANDOVER_DEFAULT_DAYS, HANDOVER_MAX_DAYS, handoverQuery, USER_MESSAGES_MAX_LIMIT, userMessagesQuery, } from "./memtree-handover.js";
@@ -306,6 +306,21 @@ export const MEMTREE_TOOLS = [
         },
     },
 ].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
+/** HYBRID_SEARCH_ENV's search tool: `hybrid` listed and the default mode. */
+const HYBRID_MODE_DESCRIPTION = "hybrid (default here: text and vector together, fused by rank; one page, no cursor), text (exact words) or " +
+    "vector (meaning); first page charged, except text in one tree.";
+/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+export function memtreeTools(env) {
+    if (!hybridSearchOn(env))
+        return MEMTREE_TOOLS;
+    return MEMTREE_TOOLS.map((tool) => {
+        if (tool.name !== "search")
+            return tool;
+        const properties = tool.inputSchema.properties;
+        const mode = { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION };
+        return { ...tool, inputSchema: { ...tool.inputSchema, properties: { ...properties, mode } } };
+    });
+}
 /** A request id in either spelling (UUID or the short leading-hex form). */
 const TREE_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /** Pages of `list` results a session-id-as-tree lookup reads at most. */
@@ -877,7 +892,7 @@ inert = false) {
         case "ping":
             return isRequest ? reply({}) : undefined;
         case "tools/list":
-            return reply({ tools: inert ? [] : MEMTREE_TOOLS });
+            return reply({ tools: inert ? [] : memtreeTools(process.env) });
         case "tools/call": {
             const name = message.params?.name;
             const args = (message.params?.arguments ?? {});
@@ -974,7 +989,7 @@ async function searchTool(args, tree, finder) {
     if (typeof args.query !== "string" || !args.query.trim()) {
         throw new ToolInputError("search: query must be a non-empty string");
     }
-    const mode = searchMode(args.mode);
+    const mode = searchMode(args.mode, defaultSearchMode(process.env));
     const current = args.tree === CURRENT_TREE;
     const named = current ? undefined : checkTreeId(args.tree);
     if (mode === "text" && (current || named)) {
@@ -988,7 +1003,7 @@ async function searchTool(args, tree, finder) {
     if (current && !tree.currentId)
         throw new ToolInputError("this session's tree is not available here");
     const scope = current ? await tree.currentId(true) : named;
-    return finder.searchSessions(args, scope);
+    return finder.searchSessions({ ...args, mode }, scope);
 }
 /** `{tree, id}` from a node address, or from tree (optional) and the numeric field. */
 function nodeTarget(args, field) {

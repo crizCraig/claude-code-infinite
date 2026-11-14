@@ -2,7 +2,14 @@ export declare const SESSIONS_DEFAULT_LIMIT = 20;
 export declare const SESSIONS_MAX_LIMIT = 100;
 export declare const FINDER_SEARCH_DEFAULT_LIMIT = 10;
 export declare const FINDER_SEARCH_MAX_LIMIT = 50;
-export declare const FINDER_SEARCH_MODES: readonly ["vector", "text"];
+export declare const FINDER_SEARCH_MODES: readonly ["vector", "text", "hybrid"];
+export type FinderSearchMode = (typeof FINDER_SEARCH_MODES)[number];
+/**
+ * Opt-in (off by default): `1` makes `hybrid` (text and vector run together and fused by rank,
+ * polychat memtree_hybrid.py) the search tool's default mode and lists it in the tool's schema.
+ * The server serves it only while its MEMTREE_HYBRID_SEARCH setting is on.
+ */
+export declare const HYBRID_SEARCH_ENV = "CCC_MEMTREE_HYBRID_SEARCH";
 export interface FinderProject {
     dir?: string | null;
     repo?: string | null;
@@ -84,6 +91,12 @@ export interface FinderHit {
     }[];
     /** When the hit's messages were written, `[earliest, latest]` UTC (servers with block times). */
     times?: unknown;
+    /** A hybrid hit: its rank and own score in each ranking that found it (`text`, `vector`). */
+    legs?: Record<string, {
+        rank?: number;
+        score?: number;
+        embedding_model?: string;
+    }>;
 }
 export interface FinderSessionsResponse {
     sessions?: FinderSession[];
@@ -151,13 +164,19 @@ export declare function recentSearchFailedNote(triedDays: readonly number[], las
 }): string;
 /** Said first in a narrowed retry's answer, so the model knows what was left out. */
 export declare function recentSearchNote(since: string, days: number, pages?: boolean): string;
-export declare function searchMode(value: unknown): (typeof FINDER_SEARCH_MODES)[number];
+export declare function searchMode(value: unknown, fallback?: FinderSearchMode): FinderSearchMode;
+/** Whether this process opted in to hybrid search (HYBRID_SEARCH_ENV). */
+export declare function hybridSearchOn(env: NodeJS.ProcessEnv): boolean;
+/** The search tool's mode when the agent names none: hybrid once opted in, else text. */
+export declare function defaultSearchMode(env: NodeJS.ProcessEnv): FinderSearchMode;
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
 /** The calling Claude Code session: its entry is marked "(this session)". */
 currentSessionId?: string): string;
 /** Said after a charged first page's heading (the server's `charged`). */
 export declare const CHARGED_NOTE = "charged: one search";
 export declare function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string;
+/** Said under a hybrid page's heading. */
+export declare const HYBRID_NOTE = "(Text and vector matches fused by rank: each hit says where each search ranked it; one page, no cursor.)";
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
 export declare function formatPath(path: {
     id: number;

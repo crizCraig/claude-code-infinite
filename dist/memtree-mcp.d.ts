@@ -346,6 +346,8 @@ export declare const MEMTREE_TOOLS: ({
         required?: undefined;
     };
 })[];
+/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+export declare function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS;
 export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
     proxyUrl?: string;
