@@ -16,6 +16,9 @@ import { CurrentTree, desktopMcpTarget, handleMcpMessage } from "../dist/memtree
 import { startProxy } from "../dist/proxy.js";
 import { MemtreeClient } from "../dist/memtree.js";
 
+// Desktop mode is macOS-only; these use POSIX file modes, paths and shells.
+const MACOS_LIKE = { skip: process.platform === "win32" };
+
 test("the working directory comes from the decoded system prompt only (Codex r1 P2)", () => {
   const sys = (dir) => [{ type: "text", text: `env:\n - Primary working directory: ${dir}\n - Is a git repo` }];
   const body = (system, messages = []) => JSON.stringify({ system, messages });
@@ -60,7 +63,7 @@ test("an inert server lists no tools and gives no instructions", async () => {
   assert.ok(live.result.tools.length > 0);
 });
 
-test("the service: token on CONNECT and loopback routes, session calls reach the upstream", async (t) => {
+test("the service: token on CONNECT and loopback routes, session calls reach the upstream", MACOS_LIKE, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-test-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const seen = [];
@@ -139,7 +142,7 @@ test("the service: token on CONNECT and loopback routes, session calls reach the
   })).status, 404);
 });
 
-test("setup's Bash env file is valid with an apostrophe in the path (Codex r1 P2)", async (t) => {
+test("setup's Bash env file is valid with an apostrophe in the path (Codex r1 P2)", MACOS_LIKE, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-o'brien-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const paths = desktopPaths(dir, "local");
@@ -267,7 +270,7 @@ function viaProxy(port, auth, ca, method, reqPath, body, headers) {
   });
 }
 
-test("the pasted CA bundle keeps the user's own extra CAs first, and no key", async (t) => {
+test("the pasted CA bundle keeps the user's own extra CAs first, and no key", MACOS_LIKE, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-bundle-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const paths = desktopPaths(dir, "local");
@@ -348,7 +351,7 @@ test("a session whose project turns on the sandbox is refused, others served (Co
     assert.ok(plain === undefined || !plain.includes(root), String(plain));
   });
 
-test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)", async (t) => {
+test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)", MACOS_LIKE, async (t) => {
   const { launchdPlist } = await import("../dist/desktop-setup.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-upca-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -388,7 +391,7 @@ test("status and terminal ccc flag a certificate near or past expiry (review r1 
     /expired .*`ccc staging desktop setup`/);
 });
 
-test("Bash gets the user's own CA file and env file back (review r1 P3)", async (t) => {
+test("Bash gets the user's own CA file and env file back (review r1 P3)", MACOS_LIKE, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-userenv-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const paths = desktopPaths(dir, "local");
