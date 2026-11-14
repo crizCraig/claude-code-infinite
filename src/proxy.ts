@@ -2425,7 +2425,10 @@ async function handleMessages(
   const existingRide = rideableCandidate && memoryRoutedToolBody(
     body, messages, rideableCandidate, state.mainRouteEpoch, requestSessionId(req)
   );
-  const isFollowupUserTurn = isUserTurn && hasEarlierNonToolUserMessage(messages);
+  // A fragment is never a follow-up: it must not reserve a route decision (it would never
+  // release it, and an in-flight main compression could not install its route).
+  const isFollowupUserTurn =
+    !notConversation && isUserTurn && hasEarlierNonToolUserMessage(messages);
   const routeEpoch = state.mainRouteEpoch;
   let routeDecisionGeneration = state.mainRouteDecisionGeneration;
   let routeDecisionSettled = false;
