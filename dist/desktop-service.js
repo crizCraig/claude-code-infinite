@@ -32,6 +32,7 @@ import fs from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { attachHttpsProxyMode } from "./https-proxy-mode.js";
 import { INTERCEPT_HOST } from "./mitm-ca.js";
+import { HTTPS_PROXY_MODE_ENV, httpsProxyModeDecision } from "./https-proxy-eligibility.js";
 import { INNER_INTERCEPTED_HEADER, INNER_TOKEN_HEADER, startProxy, } from "./proxy.js";
 import { MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
@@ -151,6 +152,9 @@ export async function startDesktopService(opts) {
         if (cwd && entry.cwd === undefined) {
             const target = entry;
             target.cwd = cwd;
+            target.refused = projectRefusal(cwd);
+            if (target.refused)
+                log(`session ${id.slice(0, 8)} refused: ${target.refused}`);
             target.projectReady = readProjectMeta(cwd).then((meta) => {
                 target.opts.projectMeta = meta;
                 log(`session ${id.slice(0, 8)} project ${meta.git_repo ?? path.basename(cwd)}${meta.git_branch ? `@${meta.git_branch}` : ""}`);
@@ -226,6 +230,8 @@ export async function startDesktopService(opts) {
                 if (url.pathname === "/v1/messages" && toolsOffered(text) === true) {
                     entry.memtree.setMemtreeTools(MEMTREE_TOOLS_HEADER_VALUE);
                 }
+                if (entry.refused)
+                    return refuseSession(res, entry.refused);
                 entry.inFlight++;
                 try {
                     // A few ms of git on the session's first request with a directory, so its MemTree calls carry the project.
@@ -411,5 +417,25 @@ function interceptUpstream(origin) {
     const url = new URL(origin ?? `https://${INTERCEPT_HOST}`);
     const secure = url.protocol === "https:";
     return { host: url.hostname, port: url.port ? Number(url.port) : secure ? 443 : 80, secure };
+}
+/**
+ * Why a Desktop session in `cwd` must not run through ccc: its project's (or the user's,
+ * re-read now) Claude Code settings turn on the Bash sandbox, whose proxy would forward
+ * through this service with the token and lose its private-address check, or set a proxy,
+ * NO_PROXY, CA or env file that breaks the routing (Codex r1 P1). Setup checks only what
+ * it can see; each project is checked here, on its session's first model call.
+ */
+export function projectRefusal(cwd) {
+    const decision = httpsProxyModeDecision({
+        env: { [HTTPS_PROXY_MODE_ENV]: "1" }, platform: process.platform, claudeArgs: [], cwd,
+    });
+    return decision.mode === "base-url" && decision.requested ? decision.reason : undefined;
+}
+/** The session's model calls get an error it shows, instead of running unprotected. */
+function refuseSession(res, reason) {
+    const message = `ccc desktop can't serve this session: ${reason}. Start it from another ` +
+        "Desktop environment (without the ccc lines), or change that setting.";
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }));
 }
 //# sourceMappingURL=desktop-service.js.map

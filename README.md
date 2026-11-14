@@ -404,8 +404,10 @@ environment get MemTree. Sessions in other environments are unchanged.
   connect to API") until it's back. launchd restarts it if it crashes. `ccc desktop status`
   says what's wrong and how to restart it, and a terminal `ccc` warns when it's down. To stop
   using it, switch those sessions to another environment.
-- Setup refuses when your shell already uses a proxy or Claude Code's settings set a proxy,
-  `NO_PROXY`, `NODE_EXTRA_CA_CERTS` or the Bash sandbox, as HTTPS-proxy mode does.
+- Setup refuses when your shell already uses a proxy or a `NO_PROXY` that covers
+  `api.anthropic.com`, or when Claude Code's settings set a proxy, `NO_PROXY`,
+  `NODE_EXTRA_CA_CERTS`, `CLAUDE_ENV_FILE` or the Bash sandbox, as HTTPS-proxy mode does. A
+  session whose project's settings do so gets an error explaining why instead of running.
 - After upgrading Node or moving ccc, run `ccc desktop setup` again: the agent and the MCP server
   name the Node and ccc paths setup ran with.
 

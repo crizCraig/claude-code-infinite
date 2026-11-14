@@ -30,4 +30,12 @@ export declare function startDesktopService(opts: DesktopServiceOptions): Promis
  * `tools` list with or without them, undefined when it has none (a side call: no change).
  */
 export declare function toolsOffered(body: string): boolean | undefined;
+/**
+ * Why a Desktop session in `cwd` must not run through ccc: its project's (or the user's,
+ * re-read now) Claude Code settings turn on the Bash sandbox, whose proxy would forward
+ * through this service with the token and lose its private-address check, or set a proxy,
+ * NO_PROXY, CA or env file that breaks the routing (Codex r1 P1). Setup checks only what
+ * it can see; each project is checked here, on its session's first model call.
+ */
+export declare function projectRefusal(cwd: string): string | undefined;
 //# sourceMappingURL=desktop-service.d.ts.map

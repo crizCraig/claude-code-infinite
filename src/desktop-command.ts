@@ -17,6 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getConfigDir } from "./config.js";
 import { claudeDesktopInstalled, locateClaude } from "./claude-locate.js";
+import { anthropicUpstreamFromEnv } from "./cli-args.js";
+import { sanitizedNoProxy } from "./https-proxy-session.js";
 import { HTTPS_PROXY_MODE_ENV, httpsProxyModeDecision } from "./https-proxy-eligibility.js";
 import { PROXY_TOKEN_HEADER } from "./memtree-mcp.js";
 import {
@@ -144,7 +146,7 @@ export async function runDesktopCommand(args: string[], deps: DesktopCommandDeps
     const service = await startDesktopService({
       paths, state, memtreeBaseUrl: deps.memtreeBaseUrl, apiKey,
       ...(process.env.CCC_PROXY_TRACE ? { tracePath: process.env.CCC_PROXY_TRACE } : {}),
-      ...(process.env.CCC_ANTHROPIC_UPSTREAM ? { upstreamOrigin: process.env.CCC_ANTHROPIC_UPSTREAM } : {}),
+      ...upstreamOverride(process.env.CCC_ANTHROPIC_UPSTREAM),
     });
     // A stray rejection must not take down every routed session: log it and carry on.
     process.on("unhandledRejection", (err) => console.error(`${new Date().toISOString()} unhandled rejection: ${String(err)}`));
@@ -177,6 +179,13 @@ async function setupPreflight(deps: DesktopCommandDeps): Promise<string | undefi
   });
   if (blocked.mode === "base-url" && blocked.requested) {
     return `Desktop sessions can't be routed through ccc here: ${blocked.reason}.`;
+  }
+  // Desktop passes the login shell's NO_PROXY on: one covering api.anthropic.com would send
+  // those sessions straight to Anthropic, past MemTree, with compaction off (Codex r1 P2).
+  const noProxy = Object.keys(sanitizedNoProxy(process.env));
+  if (noProxy.length) {
+    return `your ${noProxy.join(" and ")} covers api.anthropic.com, so Desktop sessions would ` +
+      "skip ccc: remove that entry from your shell profile, then run setup again.";
   }
   if (!claudeDesktopInstalled()) {
     console.log("Note: the Claude desktop app wasn't found; setting up anyway.\n");
@@ -234,6 +243,16 @@ export async function desktopServiceDownLine(mode: DesktopMode): Promise<string 
   const cmd = mode === "production" ? "ccc" : `ccc ${mode}`;
   return `ccc: the desktop app service isn't running, so Desktop sessions in your ccc ` +
     `environment can't reach Claude: run \`${cmd} desktop status\` for how to fix it.`;
+}
+
+/**
+ * Test-only CCC_ANTHROPIC_UPSTREAM, held to the loopback as in terminal ccc: decrypted
+ * conversations and Desktop's OAuth bearer must never go anywhere else (Codex r1 P1).
+ */
+function upstreamOverride(raw: string | undefined): { upstreamOrigin?: string } {
+  const { value, warning } = anthropicUpstreamFromEnv(raw);
+  if (warning) console.error(warning);
+  return value ? { upstreamOrigin: value } : {};
 }
 
 /** launchd appends to service.log forever: past 10 MB, start it afresh at each service start. */

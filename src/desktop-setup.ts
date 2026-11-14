@@ -27,6 +27,8 @@ export interface DesktopPaths {
   caPem: string;
   /** ccc's CA certificate alone (public; its key was never kept). */
   caCert: string;
+  /** The user's own extra CAs, for the service's own upstream TLS (only when there are some). */
+  upstreamCa: string;
   leafPem: string;
   leafKey: string;
   state: string;
@@ -53,6 +55,7 @@ export function desktopPaths(configDir: string, mode: DesktopMode): DesktopPaths
     dir,
     caPem: path.join(dir, "ca.pem"),
     caCert: path.join(dir, "ccc-ca.pem"),
+    upstreamCa: path.join(dir, "upstream-ca.pem"),
     leafPem: path.join(dir, "leaf.pem"),
     leafKey: path.join(dir, "leaf-key.pem"),
     state: path.join(dir, "service.json"),
@@ -154,8 +157,13 @@ export async function setupDesktopFiles(
   }
   // The pasted NODE_EXTRA_CA_CERTS replaces any the session would have had (a corporate
   // CA from the login shell): keep those first, as terminal proxy mode does.
-  const parts = [opts.userExtraCaPem?.trim() ?? "", fs.readFileSync(paths.caCert, "utf8").trim()];
+  const extra = opts.userExtraCaPem?.trim() ?? "";
+  const parts = [extra, fs.readFileSync(paths.caCert, "utf8").trim()];
   write(paths.caPem, `${parts.filter(Boolean).join("\n")}\n`, 0o644);
+  // The service's own connections to Anthropic need those roots too (launchd gives it
+  // none of the shell's env): the plist names this file when it exists (Codex r1 P2).
+  if (extra) write(paths.upstreamCa, `${extra}\n`, 0o644);
+  else fs.rmSync(paths.upstreamCa, { force: true });
   const state: DesktopState = {
     mode,
     port: previous?.port ?? await pickServicePort(),
@@ -211,7 +219,9 @@ ${args.map((a) => `    <string>${esc(a)}</string>`).join("\n")}
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${esc(`${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`)}</string>
+    <key>PATH</key><string>${esc(`${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`)}</string>${
+  fs.existsSync(paths.upstreamCa)
+    ? `\n    <key>NODE_EXTRA_CA_CERTS</key><string>${esc(paths.upstreamCa)}</string>` : ""}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>ExitTimeOut</key><integer>45</integer>

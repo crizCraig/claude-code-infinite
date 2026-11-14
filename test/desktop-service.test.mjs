@@ -327,3 +327,36 @@ test("the launchd agent runs `desktop serve` for its mode, kept alive, and lints
   assert.doesNotMatch(launchdPlist("production", desktopPaths(dir, "production"), "/x/cli.js"),
     /<string>(staging|local)<\/string>/);
 });
+
+test("a session whose project turns on the sandbox is refused, others served (Codex r1 P1)",
+  { skip: process.platform === "win32" }, async (t) => {
+    const { projectRefusal } = await import("../dist/desktop-service.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-proj-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const mk = (name, settings) => {
+      const dir = path.join(root, name);
+      fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+      fs.mkdirSync(path.join(dir, ".claude"));
+      if (settings) fs.writeFileSync(path.join(dir, ".claude", "settings.local.json"), settings);
+      return dir;
+    };
+    assert.match(projectRefusal(mk("sandboxed", '{"sandbox":{"enabled":true}}')), /sandbox is on/);
+    assert.match(projectRefusal(mk("proxied", '{"env":{"HTTPS_PROXY":"http://corp:1"}}')),
+      /HTTPS_PROXY is set/);
+    // The user's own settings decide the rest; on a clean machine nothing refuses.
+    const plain = projectRefusal(mk("plain"));
+    assert.ok(plain === undefined || !plain.includes(root), String(plain));
+  });
+
+test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)", async (t) => {
+  const { launchdPlist } = await import("../dist/desktop-setup.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-upca-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const paths = desktopPaths(dir, "local");
+  await setupDesktopFiles(paths, "local", { userExtraCaPem: "-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----" });
+  assert.match(launchdPlist("local", paths, "/x/cli.js"),
+    new RegExp(`<key>NODE_EXTRA_CA_CERTS</key><string>${paths.upstreamCa.replace(/[.]/g, "\\.")}</string>`));
+  await setupDesktopFiles(paths, "local");
+  assert.equal(fs.existsSync(paths.upstreamCa), false);
+  assert.doesNotMatch(launchdPlist("local", paths, "/x/cli.js"), /NODE_EXTRA_CA_CERTS/);
+});

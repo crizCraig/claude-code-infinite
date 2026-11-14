@@ -5,6 +5,8 @@ export interface DesktopPaths {
     caPem: string;
     /** ccc's CA certificate alone (public; its key was never kept). */
     caCert: string;
+    /** The user's own extra CAs, for the service's own upstream TLS (only when there are some). */
+    upstreamCa: string;
     leafPem: string;
     leafKey: string;
     state: string;
