@@ -1,3 +1,4 @@
+import type { HttpsProxyChild } from "./https-proxy-session.js";
 /**
  * Environment for the Claude Code child process.
  *
@@ -40,7 +41,14 @@
  */
 /** Claude Code's local refusal limit under ccc: effectively never reached. */
 export declare const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
-export declare function claudeChildEnv(parentEnv: NodeJS.ProcessEnv, anthropicBaseUrl: string): NodeJS.ProcessEnv;
+/**
+ * `httpsProxy` (HTTPS-proxy mode, https-proxy-session.ts): Claude Code reaches ccc
+ * through HTTPS_PROXY instead, with no custom base URL (so Remote Control stays
+ * available and no first-party override is needed); the MemTree MCP server and agents
+ * find the loopback in CCC_MEMTREE_PROXY, and Bash commands get today's variables back
+ * from CLAUDE_ENV_FILE.
+ */
+export declare function claudeChildEnv(parentEnv: NodeJS.ProcessEnv, anthropicBaseUrl: string, httpsProxy?: HttpsProxyChild): NodeJS.ProcessEnv;
 /**
  * Keep the proxy's MemTree budget in lockstep with Claude Code's own context
  * accounting. This is the documented escape hatch for forcing native-1M

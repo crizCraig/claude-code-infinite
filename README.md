@@ -309,7 +309,7 @@ Code connects directly to Anthropic. The official
 
 ## Privacy & architecture: your Anthropic credentials never leave your machine
 
-`ccc` runs a small proxy on `127.0.0.1` and launches Claude Code with `ANTHROPIC_BASE_URL` pointed at it and automatic compaction disabled. Claude Code keeps its **native login** — token refresh, plan-default model selection, and rate-limit handling behave exactly like vanilla Claude Code, and your OAuth token is sent only to `api.anthropic.com` from your own machine.
+`ccc` runs a small proxy on `127.0.0.1` and launches Claude Code with `ANTHROPIC_BASE_URL` pointed at it (or, in the opt-in HTTPS-proxy mode below, `HTTPS_PROXY`) and automatic compaction disabled. Claude Code keeps its **native login** — token refresh, plan-default model selection, and rate-limit handling behave exactly like vanilla Claude Code, and your OAuth token is sent only to `api.anthropic.com` from your own machine.
 
 ```
 Claude Code ──▶ localhost proxy (ccc)
@@ -321,6 +321,56 @@ Claude Code ──▶ localhost proxy (ccc)
 - Only message content is sent to MemTree for indexing/compression — never credentials.
 - Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted. While MemTree is paused (usage limit reached), a request that still fits the model's context window (by Anthropic's token count, or ccc's conservative estimate when counting is unavailable) goes out unchanged, as plain Claude Code would send it, and once the session reaches the compression budget the paused notice suggests Claude Code's own `/compact` while it still fits. A request that no longer fits is refused at once with "MemTree is paused (usage limit reached), so this long conversation can't be compressed…", your subscribe link, and `/clear` to start fresh (`/memtree-compact` needs MemTree, so it is not offered then). After you subscribe, the next request compresses again with no restart.
+
+### Remote Control (`/remote-control`): HTTPS-proxy mode (opt-in, macOS and Linux)
+
+Claude Code offers Remote Control only when it talks to `api.anthropic.com` itself, so in the
+default mode above `/remote-control` is "Unknown command". HTTPS-proxy mode keeps Claude Code's
+base URL at `api.anthropic.com` and makes `ccc` its `HTTPS_PROXY` instead. Every model turn still
+goes through MemTree. Turn it on for one session, or for every session:
+
+```bash
+CCC_HTTPS_PROXY_MODE=1 ccc
+# or always: add "httpsProxyMode": true to ~/.claude-code-infinite/config.json
+# (CCC_HTTPS_PROXY_MODE=0 turns it off for one session)
+```
+
+How it works and what it changes:
+
+- **A certificate for `api.anthropic.com` only, new each session.** At each start `ccc` makes a
+  certificate authority in memory, signs one certificate for `api.anthropic.com` with it, and
+  drops its key. The key is never written to disk. The CA is name-constrained: it can't vouch for
+  any other host name, a subdomain or an IP address. Only Claude Code trusts it, through
+  `NODE_EXTRA_CA_CERTS` in its own environment. Nothing goes into your system or keychain trust
+  store. The public certificate sits in `~/.claude-code-infinite/https-proxy/` and is removed when
+  `ccc` exits.
+- **What `ccc` decrypts.** Only Claude Code's connections to `api.anthropic.com` that carry the
+  session's proxy token. Model calls get MemTree as before. Everything else Claude Code sends
+  there (Remote Control's bridge and session events, file uploads, settings, telemetry) is
+  relayed to Anthropic unchanged and never logged or sent to MemTree. Connections to any other
+  host go through a blind tunnel that `ccc` doesn't decrypt. A connection without the token (for
+  example from another user on the machine) is refused.
+- **Programs you run from Claude Code's Bash tool see what they see today.** `ccc` gives Claude
+  Code a `CLAUDE_ENV_FILE` that puts back your own proxy, CA and `NO_PROXY` settings and the
+  usual `ANTHROPIC_BASE_URL`, so scripts, SDK apps and a `ccc` started from Bash work as in the
+  default mode, and none of them sees the proxy token. A `CLAUDE_ENV_FILE` of your own is still
+  sourced.
+- **Hooks, status-line commands and MCP servers** that Claude Code starts aren't Bash commands,
+  so they inherit the proxy and the session CA. Node-based ones work. A non-Node one that calls
+  `api.anthropic.com` itself (for example a status line that curls Anthropic's usage endpoint, or
+  a Python MCP server using the Anthropic API) fails TLS. Run such sessions with
+  `CCC_HTTPS_PROXY_MODE=0`.
+- **When it stays off.** `ccc` uses the default mode for the session, and says so in one line,
+  on Windows; when you already use a proxy (`HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` in your
+  environment); when a Claude Code settings file (user, project, local, managed, or
+  `--settings`) sets a proxy, `NO_PROXY` or `NODE_EXTRA_CA_CERTS` in its `env`; and when Claude
+  Code's Bash sandbox is enabled. These are checked at startup. If you turn one on mid-session
+  and your prompts stop reaching `ccc`, it warns you once. Restart `ccc` then.
+- `CCC_PROXY_TRACE=<file>` writes a debug trace: connection targets, and the method, path,
+  status and User-Agent of each decrypted request. It holds no other header values and no bodies.
+
+Remote Control also needs a full-scope Claude login (`claude auth login`). A long-lived setup
+token isn't enough.
 
 ### Diagnostics
 

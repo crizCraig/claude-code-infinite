@@ -39,6 +39,7 @@
  * upstream response bytes pass through to the client unchanged.
  */
 import { capCacheBreakpoints } from "./route-cache.js";
+import { type HttpsProxyModeOptions } from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
 import { LaneActivity } from "./lane-activity.js";
@@ -261,6 +262,15 @@ export interface ProxyOptions {
     diagnostics?: DiagnosticsRecorder;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
+    /**
+     * Also act as Claude Code's HTTPS_PROXY (https-proxy-mode.ts): CONNECTs to
+     * api.anthropic.com are decrypted and routed here; other hosts are tunnelled blind.
+     * `onModelCall` hears each decrypted POST /v1/messages (https-proxy-session.ts warns
+     * when prompts go by without one).
+     */
+    httpsProxyMode?: HttpsProxyModeOptions & {
+        onModelCall?: () => void;
+    };
     /** Test-only: dump each forwarded /v1/messages body to this directory. */
     captureDir?: string;
     /**

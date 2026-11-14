@@ -40,6 +40,7 @@
  */
 import { UNKNOWN_INDEX_WAIT_SECONDS } from "./index-wait-413.js";
 import { capCacheBreakpoints } from "./route-cache.js";
+import { attachHttpsProxyMode, } from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage } from "./refusal-reason.js";
@@ -427,10 +428,12 @@ export function startProxy(opts) {
     // A newer tree from the background lookup reaches the status line without a turn ending.
     opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
     state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
-    const server = http.createServer((req, res) => {
+    // One handler for the loopback server and, in HTTPS-proxy mode, for the decrypted
+    // api.anthropic.com streams (`intercepted`): both are tracked, drained and cancelled alike.
+    const onRequest = (intercepted) => (req, res) => {
         const accepted = { req, res };
         acceptedRequests.add(accepted);
-        const task = handleRequest(req, res, opts, upstream, state, hookPath).catch((err) => {
+        const task = handleRequest(req, res, opts, upstream, state, hookPath, intercepted).catch((err) => {
             try {
                 sendAnthropicError(res, `local proxy error: ${err?.message ?? err}`);
             }
@@ -448,7 +451,11 @@ export function startProxy(opts) {
         });
         if (shutdownAbort.signal.aborted)
             cancelAcceptedRequest(accepted);
-    });
+    };
+    const server = http.createServer(onRequest(false));
+    const closeTunnels = opts.httpsProxyMode
+        ? attachHttpsProxyMode(server, onRequest(true), interceptUpstream(upstream), opts.httpsProxyMode)
+        : { blind: () => { }, all: () => { } };
     // Long-running SSE responses must not be cut by idle timeouts.
     server.requestTimeout = 0;
     server.headersTimeout = 60_000;
@@ -470,6 +477,9 @@ export function startProxy(opts) {
             ? Math.floor(timeoutMs)
             : 5_000;
         backgroundAbort.abort();
+        // CONNECT tunnels are raw sockets that keep server.close() waiting: the blind ones
+        // (and idle decrypted streams) carry no ccc work, so they go now.
+        closeTunnels.blind();
         const quiesced = (async () => {
             // Once close completes, every accepted request has entered the tracked
             // set.
@@ -498,6 +508,7 @@ export function startProxy(opts) {
         shutdownAbort.abort();
         for (const accepted of acceptedRequests)
             cancelAcceptedRequest(accepted);
+        closeTunnels.all();
         await quiesced;
         sendDeferredAgentIndexes(state);
         return false;
@@ -532,8 +543,10 @@ function cancelAcceptedRequest(accepted) {
     if (!res.destroyed && !res.writableEnded)
         res.destroy();
 }
-async function handleRequest(req, res, opts, upstream, state, hookPath) {
+async function handleRequest(req, res, opts, upstream, state, hookPath, intercepted) {
     const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+    if (intercepted)
+        return handleInterceptedRequest(req, res, url, opts, upstream, state);
     if (!isLocalCaller(req)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ detail: "The ccc proxy only serves programs on this machine" }));
@@ -577,6 +590,32 @@ async function handleRequest(req, res, opts, upstream, state, hookPath) {
         return handleCountTokens(req, res, opts, upstream, state);
     }
     return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+/**
+ * Claude Code's own api.anthropic.com traffic, decrypted (HTTPS-proxy mode): model calls
+ * get MemTree exactly as through the base URL; everything else (Remote Control's bridge,
+ * sessions, files, OAuth, telemetry) goes verbatim to api.anthropic.com. ccc's
+ * loopback-only routes (hooks, /memtree/*) are never answered here: such a path is
+ * Anthropic's.
+ */
+function handleInterceptedRequest(req, res, url, opts, upstream, state) {
+    if (req.method === "POST" && url.pathname === "/v1/messages") {
+        try {
+            opts.httpsProxyMode?.onModelCall?.();
+        }
+        catch {
+            // A notice hook must never fail a model call.
+        }
+        return handleMessages(req, res, opts, upstream, state);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+        return handleCountTokens(req, res, opts, upstream, state);
+    }
+    return passThroughStreaming(req, res, upstream, state.shutdownSignal);
+}
+/** Where a WebSocket upgrade on a decrypted stream is replayed: the same upstream. */
+function interceptUpstream(upstream) {
+    return { host: upstream.host, port: upstream.port, secure: upstream.module === https };
 }
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const BROWSER_SAME_SITE = new Set(["same-origin", "none"]);
