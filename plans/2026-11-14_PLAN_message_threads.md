@@ -1,6 +1,6 @@
 # Message threads: ccc and MemTree with Anthropic's server-held conversations
 
-Status: plan (2026-11-14), revised after review rounds 1-5 (Opus and Codex). Nothing here has
+Status: plan (2026-11-14), revised after review rounds 1-5 (Opus and Codex; both SHIP in round 5). Nothing here has
 shipped. The stop-gap that turns threads off is being built separately (worktree
 `proxy-threads-off`; coordination in `~/src/agent-bus/threads/ccc-message-threads/notes.md`).
 This plan starts from that stop-gap.
@@ -141,7 +141,7 @@ marked *(probed)*.
     `history_rewound` (rewind, /clear).
   - Create, forced: a missing or incomplete anchor, transcript drift, a presumed expiry, or
     citations the continue would drop.
-  - Stateless (no `thread`): server tool use or `search_result` citations in history; tools
+  - Stateless (no `thread`): server tool use in history (always); `search_result` citations in history (unless `tengu_modular_sketch` is on, in which case they stay threaded, subject to the citation check); tools
     added or removed mid-conversation (behind `tengu_lucid_anchor`); ephemeral messages; a
     model already held stateless.
 - **Expiry estimate.** Claude Code tracks idle time per thread on the client.
@@ -447,9 +447,12 @@ The harness measures the full payload (H2).
   for byte, as it does today. That holds only while the prefix is still compatible:
   `prefixMismatch` refuses a changed system prompt, so after a config change the create
   compresses again, as it does today.
-- What a forced create loses is that turn's TTFT and bandwidth gain. So threads on with
-  forced creates send at most what threads off sends today, and they avoid the full upload on
-  the other turns.
+- What a forced create loses is that turn's TTFT and bandwidth gain. Upstream, a forced
+  create sends no more than threads off does for that turn.
+  - Between Claude Code and ccc, an episode costs more: the rejected tail plus the full
+    replay, all on localhost.
+  - The total savings depend on the workload. The harness measures rejected-tail and replay
+    traffic separately (H2).
 
 **Rules ccc must keep on threaded requests:**
 
@@ -554,7 +557,7 @@ The harness measures the full payload (H2).
 | 0a | Stop-gap: `CLAUDE_CODE_TETHER_LIVE=0` in proxy and desktop mode (other agent, in flight). **Add base-URL mode.** | on | the agent's own tests |
 | 0b | Backstop: when threads are meant to be off, answer a request with `thread` with 400 `thread_unsupported_request`, in exactly the probed shape (re-probe before adding `x-should-retry`). No size sample from continues (2.0 item 4). | on | proxy unit tests; the probe as an e2e against the mock |
 | 1 | Telemetry: reqlog records `thread.type`, the anchor, tail length, whether the ledger matched, fake 404s with their reason, and upstream `thread_*` errors | always | unit |
-| 2 | Ledger with transactions, the stream reader and the three views, **shadow**: nothing reads the ledger. Score known replays (ccc's fake-404 answers, forced every N continues) and classify other creates as replays or reshapes by prefix. Shadow passes continues through, so it is **threads on for the user**, and it ships with a guard that doesn't read the ledger: at the budget (estimated from `anchor.tipUsage` plus the tail) a fake 404 when compression can run, otherwise forward; near the window, `thread_unsupported_request`. The final index stays today's (the last create plus the transcript), a known gap in shadow. Shadow runs only in the harness (H2, H5) and in opt-in dogfood sessions. | `CCC_MESSAGE_THREADS=shadow` | golden SSE fixtures: text, thinking + signature, tool_use, refusal, fallback, a tool call cut off by `max_tokens`, a dropped stream then the same continue resent, two requests in flight, a stale completion after a create, `pause_turn` with an empty tail, a non-streaming reply. Comparison fixtures: reshape creates after tool-result clearing, /compact and rewind (classified, not scored); joined text runs; rewritten tool input; moving cache markers; a changed nested `input.cache_control` (must mismatch). Guard tests: a crossing gives a fake 404; a crossing during in-flight or backoff forwards; near the window gives `thread_unsupported_request`. |
+| 2 | Ledger with transactions, the stream reader and the three views, **shadow**: nothing reads the ledger. Score known replays (ccc's fake-404 answers, forced every N continues) and classify other creates as replays or reshapes by prefix. Shadow passes continues through, so it is **threads on for the user**, and it ships with a guard that doesn't read the ledger: at the budget (estimated from `anchor.tipUsage` plus the tail) a fake 404 when compression can run, otherwise forward; near the window, `thread_unsupported_request`; step 4's episode bound (two unsuccessful replays, then `thread_unsupported_request`) applies here too. The final index stays today's (the last create plus the transcript), a known gap in shadow. Shadow runs only in the harness (H2, H5) and in opt-in dogfood sessions. | `CCC_MESSAGE_THREADS=shadow` | golden SSE fixtures: text, thinking + signature, tool_use, refusal, fallback, a tool call cut off by `max_tokens`, a dropped stream then the same continue resent, two requests in flight, a stale completion after a create, `pause_turn` with an empty tail, a non-streaming reply. Comparison fixtures: reshape creates after tool-result clearing, /compact and rewind (classified, not scored); joined text runs; rewritten tool input; moving cache markers; a changed nested `input.cache_control` (must mismatch). Guard tests: a crossing gives a fake 404; a crossing during in-flight or backoff forwards; near the window gives `thread_unsupported_request`. |
 | 3+4 | Land together, because step 3 alone lets the thread grow past the window. Step 3: continues pass through, and the ledger feeds MemTree and sizing. Step 4: the budget gate with the can-compress check, carried intent, the episode bound, the manual and policy controls, rule 2 counting, and rule 3 on every resend path. | `CCC_MESSAGE_THREADS=1` | proxy tests: a tool loop of continues indexes the full conversation; the final index includes the last loop; a crossing gives 404, then a compressed create, then continues on it; a crossing during in-flight, backoff or index-wait forwards; repeated crossings; compact, target change and off/on between turns; main and agent lanes |
 | 5 | Server S1 | polychat, on | `polychat_test` on the route |
 | 6 | Harness H1-H6 on staging, then a week of dogfooding with the flag on | | below |
