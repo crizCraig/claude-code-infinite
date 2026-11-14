@@ -142,4 +142,14 @@ test("side requests and thread continuations are not the session's conversation"
   const create = body(MAIN, { tools: [{ name: "Bash" }], thread: { type: "create" } });
   assert.equal(notSessionConversation(create, info(create)), undefined);
   assert.equal(notSessionConversation(main, undefined), undefined);
+  // An old release's main thread (no turn origin) run without tools sends its history.
+  const history = { ...side, messages: [{ role: "user", content: "a" },
+    { role: "assistant", content: "b" }, { role: "user", content: "c" }] };
+  assert.equal(notSessionConversation(history, info(history)), undefined);
+  // ...and its first turn too: before cc_turn_origin, only a recognised side request is one.
+  const OLD = "x-anthropic-billing-header: cc_version=2.1.250.abc; cc_entrypoint=cli; cch=1;";
+  const oldMain = body(OLD);
+  assert.equal(notSessionConversation(oldMain, info(oldMain)), undefined);
+  const oldTitle = body(OLD + " You are naming a coding session");
+  assert.equal(notSessionConversation(oldTitle, info(oldTitle)), "side-request");
 });

@@ -613,6 +613,12 @@ export declare class MemtreeClient {
      */
     noteMainConversation(sessionId: string | undefined, conversation: MainConversation): void;
     /**
+     * A main-lane request whose messages are not the conversation (a message-threads
+     * continuation) still shows the session did not end at the last Stop: its pending final
+     * index is cancelled, and the kept conversation stays.
+     */
+    noteMainActivity(sessionId: string | undefined): void;
+    /**
      * After a main-lane Stop: once the session has been idle `delayMs` (or at
      * shutdown, flushFinalIndexes), send its conversation plus the reply it
      * ended with as one index-only call flagged final_index, so the server

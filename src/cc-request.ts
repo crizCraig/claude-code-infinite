@@ -163,12 +163,33 @@ export function isClaudeCodeSideRequest(info: ClaudeCodeRequestInfo): boolean {
  */
 export type NotConversationKind = "side-request" | "thread-continue";
 
+/** Most messages a Claude Code one-off side request was seen to send (title, status summary). */
+const SIDE_REQUEST_MAX_MESSAGES = 2;
+
 export function notSessionConversation(
   body: Record<string, any>, info: ClaudeCodeRequestInfo | undefined
 ): NotConversationKind | undefined {
   if (isThreadContinuation(body)) return "thread-continue";
-  if (info && isClaudeCodeSideRequest(info)) return "side-request";
+  // One-off requests send one or two messages. A release from before cc_turn_origin sends
+  // its main thread without one too: there, only a recognised side request is one.
+  const messages = Array.isArray(body?.messages) ? body.messages.length : 0;
+  if (info && isClaudeCodeSideRequest(info) && messages <= SIDE_REQUEST_MAX_MESSAGES &&
+      (knownSideRequestKind(info) !== undefined || sendsTurnOrigin(info.ccVersion))) {
+    return "side-request";
+  }
   return undefined;
+}
+
+/** Claude Code releases from 2.1.281 on mark main-thread requests with cc_turn_origin. */
+const TURN_ORIGIN_SINCE = [2, 1, 281];
+
+function sendsTurnOrigin(ccVersion: string | undefined): boolean {
+  const parts = (ccVersion ?? "").split(".").slice(0, 3).map(Number);
+  if (parts.length < 3 || parts.some((n) => !Number.isInteger(n))) return false;
+  for (let i = 0; i < 3; i++) {
+    if (parts[i] !== TURN_ORIGIN_SINCE[i]) return parts[i] > TURN_ORIGIN_SINCE[i];
+  }
+  return true;
 }
 
 export function isThreadContinuation(body: Record<string, any>): boolean {

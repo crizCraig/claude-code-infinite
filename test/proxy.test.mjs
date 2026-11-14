@@ -624,9 +624,27 @@ test("side requests and thread continuations neither replace the final index's c
     await post({ system: [header(" cc_prompt_id=p; cc_turn_origin=human;")],
       thread: { type: "continue", previous_message_id: "msg_1" },
       messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "ok" }] }] });
+    // Shaped like a human follow-up (an earlier user message): still no compress call.
+    await post({ system: [header(""), { type: "text", text: "A user kicked off a Claude Code agent" }],
+      messages: [{ role: "user", content: "a" }, { role: "user", content: "b" }] });
+    await post({ system: [header(" cc_prompt_id=p; cc_turn_origin=human;")],
+      thread: { type: "continue", previous_message_id: "msg_1" },
+      messages: [{ role: "user", content: "next question" }, { role: "assistant", content: "ok" },
+        { role: "user", content: "and then" }] });
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.deepEqual(noted, [whole], "the final index keeps the whole conversation");
     assert.equal(memtreeSrv.calls.length, 1, "no fragment goes to MemTree as a conversation");
+    // A continuation is the session still at work: it cancels the pending final index; a
+    // status summary is not, and leaves it.
+    await postHook(proxy, { hook_event_name: "Stop", stop_hook_active: false, prompt_id: "prompt-main" });
+    assert.ok(memtree.pendingFinals.has("session-1"), "Stop schedules the final index");
+    await post({ system: [header(""), { type: "text", text: "A user kicked off a Claude Code agent" }],
+      messages: [{ role: "user", content: "Current state: idle" }] });
+    assert.ok(memtree.pendingFinals.has("session-1"), "a status summary is not activity");
+    await post({ system: [header(" cc_prompt_id=p; cc_turn_origin=task_notification;")],
+      thread: { type: "continue", previous_message_id: "msg_2" },
+      messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t3", content: "ok" }] }] });
+    assert.ok(!memtree.pendingFinals.has("session-1"), "a continuation cancels the final index");
   } finally {
     proxy.close();
     upstream.close();
