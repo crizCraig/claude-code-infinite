@@ -161,6 +161,7 @@ import {
   transcriptWarning,
   isClaudeCodeSideRequest,
   memtreeClientMeta,
+  notSessionConversation,
   sessionTag,
   type ClaudeCodeRequestInfo,
 } from "./cc-request.js";
@@ -2492,8 +2493,14 @@ async function handleMessages(
   // The main lane's latest conversation: what its final index sends, plus the
   // reply the session ends with (scheduleFinalIndex, on Stop).
   const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
-  if (mainSessionId !== undefined) {
-    if (isResumableSessionId(mainSessionId)) state.resumableMainSession = mainSessionId;
+  // A side request or a thread continuation carries a fragment, not the conversation.
+  // The away summary keeps its own lane and handling.
+  const notConversation = isAwaySummary ? undefined : notSessionConversation(body, clientInfo);
+  if (notConversation) rec.notConversation = notConversation;
+  if (mainSessionId !== undefined && isResumableSessionId(mainSessionId)) {
+    state.resumableMainSession = mainSessionId;
+  }
+  if (mainSessionId !== undefined && !notConversation) {
     opts.memtree.noteMainConversation(mainSessionId, {
       messages: msgsForMemtree,
       modelContextLimit,
@@ -2786,8 +2793,10 @@ async function handleMessages(
       toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool",
       sendBody
     );
-    indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
-      sessionId: toolSessionId, clientMeta });
+    if (!notConversation) {
+      indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
+        sessionId: toolSessionId, clientMeta });
+    }
     capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
     // The size Anthropic reports is the next budget check's anchor: a ride
     // reports to its prefix (or route), a whole request to the session's (or

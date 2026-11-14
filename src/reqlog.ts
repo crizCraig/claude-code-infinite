@@ -21,7 +21,7 @@
 import { appendFile, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getConfigDir } from "./config.js";
-import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
+import type { ClaudeCodeRequestInfo, NotConversationKind, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 import type { RateLimitInfo } from "./rate-limit.js";
 
@@ -150,6 +150,8 @@ export interface MessagesRecord {
    * the signal that Claude Code changed the format.
    */
   transcript?: TranscriptShape;
+  /** Why this request's messages were kept out of MemTree (cc-request.notSessionConversation). */
+  notConversation?: NotConversationKind;
   /** The request's max_tokens (output reservation counted against the window). */
   maxTokens?: number;
   /**

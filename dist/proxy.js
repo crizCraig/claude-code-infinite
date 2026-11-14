@@ -69,7 +69,7 @@ import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js"
 import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText, subscribeUrlFromDetail } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
@@ -1566,9 +1566,15 @@ async function handleMessages(req, res, opts, upstream, state) {
     // The main lane's latest conversation: what its final index sends, plus the
     // reply the session ends with (scheduleFinalIndex, on Stop).
     const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
-    if (mainSessionId !== undefined) {
-        if (isResumableSessionId(mainSessionId))
-            state.resumableMainSession = mainSessionId;
+    // A side request or a thread continuation carries a fragment, not the conversation.
+    // The away summary keeps its own lane and handling.
+    const notConversation = isAwaySummary ? undefined : notSessionConversation(body, clientInfo);
+    if (notConversation)
+        rec.notConversation = notConversation;
+    if (mainSessionId !== undefined && isResumableSessionId(mainSessionId)) {
+        state.resumableMainSession = mainSessionId;
+    }
+    if (mainSessionId !== undefined && !notConversation) {
         opts.memtree.noteMainConversation(mainSessionId, {
             messages: msgsForMemtree,
             modelContextLimit,
@@ -1851,8 +1857,10 @@ async function handleMessages(req, res, opts, upstream, state) {
             requestSendPolicies.get(req)?.allowed.add(toolRide.raw);
         const sendBody = toolRide?.raw ?? (toolNeedsOriginal ? rawBody : forwardBody);
         recordTurn(rec, toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool", sendBody);
-        indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
-            sessionId: toolSessionId, clientMeta });
+        if (!notConversation) {
+            indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
+                sessionId: toolSessionId, clientMeta });
+        }
         capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
         // The size Anthropic reports is the next budget check's anchor: a ride
         // reports to its prefix (or route), a whole request to the session's (or

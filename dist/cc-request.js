@@ -115,6 +115,17 @@ function oneLine(text) {
 export function isClaudeCodeSideRequest(info) {
     return info.billingHeader && info.turnOrigin === undefined && info.tools === 0;
 }
+export function notSessionConversation(body, info) {
+    if (isThreadContinuation(body))
+        return "thread-continue";
+    if (info && isClaudeCodeSideRequest(info))
+        return "side-request";
+    return undefined;
+}
+export function isThreadContinuation(body) {
+    const thread = body?.thread;
+    return thread !== null && typeof thread === "object" && thread.type === "continue";
+}
 export function knownSideRequestKind(info) {
     if (info.systemHead?.includes("You are naming a coding session"))
         return "session-title";

@@ -150,6 +150,33 @@ export function isClaudeCodeSideRequest(info: ClaudeCodeRequestInfo): boolean {
 }
 
 /**
+ * Why a request's messages are not its session's conversation; undefined when they are.
+ * Such a request must neither become the conversation the session's final index sends
+ * nor be uploaded to MemTree as a conversation of its own: either one builds a tree of a
+ * fragment, and the session's newest tree (the status line's link) becomes that fragment.
+ *
+ * - `side-request`: Claude Code's own one-off request on the session (title, Remote
+ *   Control's "user walked away" status summary, WebFetch summary, security monitor).
+ * - `thread-continue`: a message-threads continuation (`thread: {type: "continue"}`,
+ *   first-party API only, so in HTTPS-proxy mode): its messages are only those after
+ *   the reply it continues; the API holds the rest.
+ */
+export type NotConversationKind = "side-request" | "thread-continue";
+
+export function notSessionConversation(
+  body: Record<string, any>, info: ClaudeCodeRequestInfo | undefined
+): NotConversationKind | undefined {
+  if (isThreadContinuation(body)) return "thread-continue";
+  if (info && isClaudeCodeSideRequest(info)) return "side-request";
+  return undefined;
+}
+
+export function isThreadContinuation(body: Record<string, any>): boolean {
+  const thread = body?.thread;
+  return thread !== null && typeof thread === "object" && thread.type === "continue";
+}
+
+/**
  * Shape of the monitor's `<transcript>` block, checked on every side request
  * so a change in Claude Code's internal format shows up in the request log
  * before anything relies on it. Observed on 2.1.281: one user message holding
