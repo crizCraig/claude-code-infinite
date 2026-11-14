@@ -17,6 +17,9 @@ const MEMTREE_TURNS = new Set(["first-user", "tool", "tool-memory", "tool-prefix
   "followup-under-budget", "followup-empty-memory"]);
 /** Healthy requests that by design make no MemTree call (security monitor, away recap). */
 const AUXILIARY = new Set(["side-request", "fork-memory"]);
+// ccc's own 400 to a message-threads request (thread-backstop.ts): Claude Code resends the
+// turn stateless, and that resend is checked as a turn of its own.
+const NEGOTIATION = new Set(["thread-refused"]);
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, v, i, all) =>
   (v.startsWith("--") ? [...acc, [v.slice(2), all[i + 1]]] : acc), []));
@@ -35,7 +38,9 @@ const records = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l
 let failures = 0;
 let turns = 0;
 for (const r of records) {
-  if (r.kind === "messages") {
+  if (r.kind === "messages" && NEGOTIATION.has(r.turnType)) {
+    console.log(`neg  ${r.ts} turn turnType=${r.turnType} (ccc's 400; the resend follows)`);
+  } else if (r.kind === "messages") {
     const aux = AUXILIARY.has(r.turnType);
     const ok = (MEMTREE_TURNS.has(r.turnType) || aux) && r.upstreamStatus === 200;
     if (!aux) turns++;

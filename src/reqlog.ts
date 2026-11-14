@@ -24,6 +24,7 @@ import { getConfigDir } from "./config.js";
 import type { ClaudeCodeRequestInfo, NotConversationKind, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 import type { RateLimitInfo } from "./rate-limit.js";
+import type { ThreadRefusedRecord } from "./thread-backstop.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
 const APPROX_CHARS_PER_TOKEN = 4;
@@ -84,6 +85,11 @@ export type TurnType =
    * whole history did not fit, so Claude Code retries it (route-fallback.ts).
    */
   | "followup-refused"
+  /**
+   * A request carrying Claude Code's message `thread` while threads are off: ccc answered
+   * its own 400 thread_unsupported_request and forwarded nothing (thread-backstop.ts).
+   */
+  | "thread-refused"
   /**
    * A fork of the main conversation (the away recap) rode the main thread's
    * last compressed prefix: same bytes the main thread sent, so Anthropic's
@@ -609,7 +615,7 @@ export interface NoticeRecord {
   via: "MessageDisplay" | "Stop";
 }
 
-export type RequestRecord = MessagesRecord | MemtreeRecord | NoticeRecord;
+export type RequestRecord = MessagesRecord | MemtreeRecord | NoticeRecord | ThreadRefusedRecord;
 
 /** Structural logging seam retained for embedders and focused tests. */
 export interface RequestLogSink {
