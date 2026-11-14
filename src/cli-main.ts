@@ -70,8 +70,10 @@ import {
 import { UPDATE_CHECK_CACHE_FILE, checkForUpdate } from "./update-check.js";
 import { setupAutoUpdate, type AutoUpdateSetup } from "./auto-update-setup.js";
 import {
+  agentLaneBudgetFromEnv,
   anthropicUpstreamFromEnv,
   compactTargetFromEnv,
+  type AgentLaneBudget,
   isPrintInvocation,
   mayBePrintInvocation,
   parseWrapperArgs,
@@ -842,6 +844,10 @@ async function main() {
     ...(process.env.CCC_CAPTURE_DIR ? { captureDir: process.env.CCC_CAPTURE_DIR } : {}),
     // Test-only: a small budget so a cheap session crosses it in a few turns.
     budgetTokensOverride: budgetFromEnv(process.env.CCC_BUDGET_TOKENS),
+    // Off by default (benchmarks): subagent lanes' own budget/target, and compressing a
+    // lane above its target once its prompt cache has expired.
+    agentLaneBudget: agentLaneBudgetFromProcessEnv(),
+    compressOnColdCache: process.env.CCC_COMPRESS_ON_COLD_CACHE === "1",
     // Test-only: a loopback mock in place of api.anthropic.com (scripts/long-session).
     upstreamOrigin: upstreamFromEnv(process.env.CCC_ANTHROPIC_UPSTREAM),
     // CCC_MEMTREE_LINK=message|stop|success|off picks where the MemTree page
@@ -1247,6 +1253,14 @@ function budgetFromEnv(raw: string | undefined): number | undefined {
     return undefined;
   }
   return budget;
+}
+
+/** `CCC_AGENT_BUDGET_TOKENS` / `CCC_AGENT_TARGET_TOKENS` (see cli-args.ts), or undefined. */
+function agentLaneBudgetFromProcessEnv(): AgentLaneBudget | undefined {
+  const { value, warnings } = agentLaneBudgetFromEnv(process.env.CCC_AGENT_BUDGET_TOKENS,
+    process.env.CCC_AGENT_TARGET_TOKENS, parseTokenCount, MEMTREE_COMPACT_MIN_TOKENS);
+  for (const warning of warnings) console.error(warning);
+  return value;
 }
 
 /** `CCC_ANTHROPIC_UPSTREAM`: a test-only loopback upstream, or undefined (see cli-args.ts). */

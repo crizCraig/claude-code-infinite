@@ -214,6 +214,8 @@ Environment variables, set when launching `ccc`:
 | --- | --- |
 | `CCC_COMPACT_TARGET=500k` | Compaction target for every session (useful for headless `-p` runs); `off` starts every session with compaction off. |
 | `CCC_MEMTREE_MCP=0` | Turns off the `memtree` MCP tools ([details](#memory-tools)), in interactive and headless (`-p`) runs. |
+| `CCC_AGENT_BUDGET_TOKENS=200k` | Experimental, off by default: subagents compress at this budget instead of the model's, to `CCC_AGENT_TARGET_TOKENS` (default half of it). The main thread keeps its budget. `requests.jsonl` shows `budgetSource: "agent"`. |
+| `CCC_COMPRESS_ON_COLD_CACHE=1` | Experimental, off by default: when a lane (the main thread or a subagent) has been idle past its prompt cache's TTL (an hour for `ttl: "1h"` markers, else 5 minutes) and its context is more than 10% above its compaction target, compress it to the target first, since Anthropic writes the whole context again anyway. Logged as `coldCache` and `compaction.reason: "cold-cache"`. |
 | `CCC_PROJECT_TREES=0` | Interactive sessions in a git repository with an `origin` remote start with a short list of your earlier MemTree sessions in that repository (model context only); this turns it off. |
 | `CCC_MEMTREE_LINK` | Where the MemTree link appears: `turn` (default, end of a turn with a new page), `message` (under every reply), `stop` (end of every turn), `success` (only after an optimized turn), or `off`. |
 | `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction and idle compaction settings ([details](#claude-code-auto-compaction)). |

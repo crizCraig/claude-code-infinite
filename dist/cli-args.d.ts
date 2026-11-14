@@ -55,6 +55,22 @@ export declare function compactTargetFromEnv(raw: string | undefined, parseToken
     value: number | null | undefined;
     warning?: string;
 };
+/** A subagent lane's own budget and target (CCC_AGENT_BUDGET_TOKENS / CCC_AGENT_TARGET_TOKENS). */
+export interface AgentLaneBudget {
+    budget: number;
+    target: number;
+}
+/**
+ * `CCC_AGENT_BUDGET_TOKENS` ("200k") and `CCC_AGENT_TARGET_TOKENS` ("100k", default half the
+ * budget): subagent lanes compress at their own, smaller budget to their own target, while
+ * the main lane keeps the model budget. Off (undefined) unless the budget is set; the budget
+ * must be at least twice `minTokens`, and a target outside [minTokens, budget) falls back to
+ * half the budget. `warnings` explains anything ignored.
+ */
+export declare function agentLaneBudgetFromEnv(budgetRaw: string | undefined, targetRaw: string | undefined, parseTokens: (text: string) => number | undefined, minTokens: number): {
+    value: AgentLaneBudget | undefined;
+    warnings: string[];
+};
 /**
  * `CCC_ANTHROPIC_UPSTREAM` (test-only, e.g. "http://127.0.0.1:8123"): where the proxy sends
  * Anthropic traffic instead of api.anthropic.com, for a local mock (scripts/long-session).
