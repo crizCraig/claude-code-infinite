@@ -452,7 +452,16 @@ export function startProxy(opts) {
         if (shutdownAbort.signal.aborted)
             cancelAcceptedRequest(accepted);
     };
-    const server = http.createServer(onRequest(false));
+    const server = http.createServer(opts.innerToken === undefined ? onRequest(false)
+        : (req, res) => {
+            const inner = acceptInnerRequest(req, opts.innerToken);
+            if (inner === undefined) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ detail: "ccc inner proxy: not for direct use" }));
+                return;
+            }
+            onRequest(inner.intercepted)(req, res);
+        });
     const closeTunnels = opts.httpsProxyMode
         ? attachHttpsProxyMode(server, onRequest(true), interceptUpstream(upstream), opts.httpsProxyMode)
         : { blind: () => { }, all: () => { } };
@@ -6800,4 +6809,23 @@ function transcriptTimesFor(opts, sessionId, agentId) {
     return (messages) => source.timesFor(sessionId, messages, agentId);
 }
 export const __testHoldingLane = holdingLane;
+/**
+ * The inner-proxy headers (ProxyOptions.innerToken): checked, then stripped so nothing
+ * forwards them. undefined: not the service.
+ */
+function acceptInnerRequest(req, token) {
+    if (!sameSecret(req.headers[INNER_TOKEN_HEADER], token))
+        return undefined;
+    const intercepted = req.headers[INNER_INTERCEPTED_HEADER] === "1";
+    delete req.headers[INNER_TOKEN_HEADER];
+    delete req.headers[INNER_INTERCEPTED_HEADER];
+    for (let i = req.rawHeaders.length - 2; i >= 0; i -= 2) {
+        const name = req.rawHeaders[i].toLowerCase();
+        if (name === INNER_TOKEN_HEADER || name === INNER_INTERCEPTED_HEADER)
+            req.rawHeaders.splice(i, 2);
+    }
+    return { intercepted };
+}
+export const INNER_TOKEN_HEADER = "x-ccc-inner";
+export const INNER_INTERCEPTED_HEADER = "x-ccc-intercepted";
 //# sourceMappingURL=proxy.js.map

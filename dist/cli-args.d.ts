@@ -18,7 +18,7 @@ export declare function mayBePrintInvocation(args: string[]): boolean;
  */
 export declare function isVersionRequest(args: readonly string[]): boolean;
 /** ccc's own subcommands, which start no Claude session. */
-declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp", "link"];
+declare const SUBCOMMANDS: readonly ["fetch", "memtree-mcp", "link", "desktop"];
 export type CccEnvironment = "production" | "staging" | "local";
 /** The environment a leading `local`/`staging` word selects (else production). */
 export declare function environmentOf(args: readonly string[]): CccEnvironment;

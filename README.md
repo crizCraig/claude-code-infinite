@@ -372,6 +372,43 @@ How it works and what it changes:
 Remote Control also needs a full-scope Claude login (`claude auth login`). A long-lived setup
 token isn't enough.
 
+### The Claude desktop app (opt-in, macOS)
+
+The desktop app's Code tab runs its own copy of Claude Code, so `ccc` can't wrap it. Instead
+`ccc desktop setup` runs a small always-on `ccc` service (a launchd agent) that is the HTTPS
+proxy of the Desktop sessions you point at it, with the same interception as HTTPS-proxy mode
+above. Desktop keeps its own sign-in, plan and Remote Control.
+
+```bash
+ccc desktop setup       # service, certificate, memory tools; prints six lines
+ccc desktop env         # print the six lines again
+ccc desktop status      # is the service up, how many sessions it serves
+ccc desktop uninstall   # stop and remove it all
+```
+
+Paste the six lines into the desktop app once: Code tab > environment menu > add a local
+environment (for example "ccc") > **Environment variables**. New sessions started from that
+environment get MemTree. Sessions in other environments are unchanged.
+
+- **What setup installs:** `~/.claude-code-infinite/desktop/` (0700): the service's port and
+  token, its certificate, and a Bash env file; the launch agent
+  `~/Library/LaunchAgents/co.polychat.ccc-desktop.plist`; and a user-scope `memtree` MCP server
+  (through `claude mcp add-json`), which has no tools in sessions that don't go through `ccc`.
+- **The certificate** is for `api.anthropic.com` only, from a name-constrained CA whose key is
+  dropped as soon as it signs it. Only the certificate's own key is kept, readable only by
+  you. Nothing goes into your system or keychain trust store: only the sessions with the pasted
+  `NODE_EXTRA_CA_CERTS` trust it. Setup keeps a corporate CA from your shell's
+  `NODE_EXTRA_CA_CERTS` in that bundle. `ccc desktop setup --rotate-ca` makes a new one (restart
+  open sessions); `--rotate-token` a new proxy token (paste the lines again).
+- **If the service stops**, sessions in the ccc environment can't reach Claude ("Unable to
+  connect to API") until it's back. launchd restarts it if it crashes. `ccc desktop status`
+  says what's wrong and how to restart it, and a terminal `ccc` warns when it's down. To stop
+  using it, switch those sessions to another environment.
+- Setup refuses when your shell already uses a proxy or Claude Code's settings set a proxy,
+  `NO_PROXY`, `NODE_EXTRA_CA_CERTS` or the Bash sandbox, as HTTPS-proxy mode does.
+- After upgrading Node or moving ccc, run `ccc desktop setup` again: the agent and the MCP server
+  name the Node and ccc paths setup ran with.
+
 ### Diagnostics
 
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:

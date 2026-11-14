@@ -38,6 +38,15 @@ interface BashEnvInput {
 }
 /** The POSIX sh script Claude Code sources before each Bash command (see the header). */
 export declare function bashEnvScript(input: BashEnvInput): string;
+/**
+ * Bash env lines that put back `env`'s HTTPS_PROXY, https_proxy and NODE_EXTRA_CA_CERTS
+ * (or unset them), each only while it still holds ccc's value: the token proxy on `port`
+ * (matched by pattern, so the token is never written) and the CA file `caPath`. Values
+ * Claude Code's sandbox set before the file is sourced are left alone. Shared with the
+ * desktop service's env file (desktop-setup.ts).
+ */
+export declare function cccProxyRestoreLines(port: number, caPath: string, env: NodeJS.ProcessEnv): string[];
+export declare function ifStill(name: string, value: string, then: string): string;
 export declare function shellQuote(value: string): string;
 /**
  * Settings that change mid-session (a proxy in a settings `env`, the sandbox turned on)
