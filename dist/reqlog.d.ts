@@ -17,7 +17,7 @@
  * proxy (text bytes/4, images by their dimensions), NOT real tokenizer output — exact usage, when
  * the response format lets us extract it cheaply, lands under `usage`.
  */
-import type { ClaudeCodeRequestInfo, TranscriptShape } from "./cc-request.js";
+import type { ClaudeCodeRequestInfo, NotConversationKind, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 import type { RateLimitInfo } from "./rate-limit.js";
 /** Rough bytes→tokens estimate (bytes/4). Label the result approximate. */
@@ -126,6 +126,8 @@ export interface MessagesRecord {
      * the signal that Claude Code changed the format.
      */
     transcript?: TranscriptShape;
+    /** Why this request's messages were kept out of MemTree (cc-request.notSessionConversation). */
+    notConversation?: NotConversationKind;
     /** The request's max_tokens (output reservation counted against the window). */
     maxTokens?: number;
     /**

@@ -69,7 +69,7 @@ import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js"
 import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText, subscribeUrlFromDetail } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
@@ -1431,6 +1431,12 @@ async function handleMessages(req, res, opts, upstream, state) {
     const { lane: requestRouteLane, key: requestRouteKey } = routeIdentity(req, isAwaySummary);
     const isSubagentRequest = requestRouteLane === "agent";
     const isMainRequest = requestRouteLane === "main";
+    // A side request or a thread continuation carries a fragment, not the conversation:
+    // it is forwarded as sent, with no compress, route, recovery or MemTree upload.
+    // The away summary keeps its own lane and handling.
+    const notConversation = isAwaySummary ? undefined : notSessionConversation(body, clientInfo);
+    if (notConversation)
+        rec.notConversation = notConversation;
     const requestSizeKey = laneSizeKey(req, requestRouteKey, body.model);
     const hold = indexHolds.get(rec);
     if (hold) {
@@ -1497,7 +1503,9 @@ async function handleMessages(req, res, opts, upstream, state) {
     // API identity and validated history alone govern route eligibility.
     const rideableCandidate = getMemoryRoute(state, requestRouteKey);
     const existingRide = rideableCandidate && memoryRoutedToolBody(body, messages, rideableCandidate, state.mainRouteEpoch, requestSessionId(req));
-    const isFollowupUserTurn = isUserTurn && hasEarlierNonToolUserMessage(messages);
+    // A fragment is never a follow-up: it must not reserve a route decision (it would never
+    // release it, and an in-flight main compression could not install its route).
+    const isFollowupUserTurn = !notConversation && isUserTurn && hasEarlierNonToolUserMessage(messages);
     const routeEpoch = state.mainRouteEpoch;
     let routeDecisionGeneration = state.mainRouteDecisionGeneration;
     let routeDecisionSettled = false;
@@ -1543,7 +1551,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
         recoverLate: async (_ride, rideTokens, target) => {
             // A compression already made may be redone only to a smaller target.
-            if ((rec.compress && target === undefined) ||
+            if (notConversation || (rec.compress && target === undefined) ||
                 compactionMode(opts, state, requestSessionKey).mode === "off" ||
                 !hasEarlierNonToolUserMessage(messages) ||
                 (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
@@ -1566,9 +1574,14 @@ async function handleMessages(req, res, opts, upstream, state) {
     // The main lane's latest conversation: what its final index sends, plus the
     // reply the session ends with (scheduleFinalIndex, on Stop).
     const mainSessionId = isMainRequest ? requestSessionId(req) : undefined;
-    if (mainSessionId !== undefined) {
-        if (isResumableSessionId(mainSessionId))
-            state.resumableMainSession = mainSessionId;
+    if (mainSessionId !== undefined && isResumableSessionId(mainSessionId)) {
+        state.resumableMainSession = mainSessionId;
+    }
+    // A continuation is the session at work (a side request, e.g. a status summary, is not).
+    if (mainSessionId !== undefined && notConversation === "thread-continue") {
+        opts.memtree.noteMainActivity(mainSessionId);
+    }
+    if (mainSessionId !== undefined && !notConversation) {
         opts.memtree.noteMainConversation(mainSessionId, {
             messages: msgsForMemtree,
             modelContextLimit,
@@ -1588,7 +1601,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Observation only: which requests carry Claude Code's turn origin.
     if (clientInfo)
         rec.client = clientInfo;
-    if (!isFollowupUserTurn) {
+    if (!isFollowupUserTurn || notConversation) {
         // Tool turn or FIRST user turn: keep the index fed off the response path
         // and forward as-is (on the lane's memory route or the session's stable
         // prefix when one applies) — except a tool turn whose estimated size
@@ -1604,7 +1617,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         let routedTool = false;
         let routedCandidate;
         let routeMiss;
-        if (isToolResultTurn || isContinuationTurn || isUserTurn) {
+        if (!notConversation && (isToolResultTurn || isContinuationTurn || isUserTurn)) {
             // Reuse only this API session/lane's independently validated prefix.
             const activeRoute = rideableCandidate;
             if (activeRoute) {
@@ -1665,7 +1678,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             rec.continuation = true;
         // Cheap shape check: without an earlier real user message there is
         // nothing MemTree could compress, so no attempt is worth making.
-        const canCompress = hasEarlierNonToolUserMessage(messages);
+        const canCompress = !notConversation && hasEarlierNonToolUserMessage(messages);
         let toolRide = routedTool
             ? {
                 raw: routedBody,
@@ -1674,7 +1687,10 @@ async function handleMessages(req, res, opts, upstream, state) {
             }
             : undefined;
         let toolNeedsOriginal = false;
-        if (opts.toolRouteRecovery === false) {
+        if (notConversation) {
+            // A fragment: forwarded as sent (no route, no stable prefix, no compaction).
+        }
+        else if (opts.toolRouteRecovery === false) {
             // Kill switch: no size check and no compress call on any tool turn.
             // A route still rides; a miss forwards whole and records "disabled".
             if ((routeMiss === "missing" || routeMiss === "rejected") && canCompress) {
@@ -1851,8 +1867,10 @@ async function handleMessages(req, res, opts, upstream, state) {
             requestSendPolicies.get(req)?.allowed.add(toolRide.raw);
         const sendBody = toolRide?.raw ?? (toolNeedsOriginal ? rawBody : forwardBody);
         recordTurn(rec, toolRide ? toolRide.turnType : isUserTurn ? "first-user" : "tool", sendBody);
-        indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
-            sessionId: toolSessionId, clientMeta });
+        if (!notConversation) {
+            indexTurn({ opts, state, req, rec, hash, msgsForMemtree, modelContextLimit,
+                sessionId: toolSessionId, clientMeta });
+        }
         capture(opts, toolRide ? "anthropic-request-memory-tool" : "anthropic-request", sendBody);
         // The size Anthropic reports is the next budget check's anchor: a ride
         // reports to its prefix (or route), a whole request to the session's (or

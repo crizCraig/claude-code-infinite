@@ -1632,14 +1632,24 @@ export class MemtreeClient {
    */
   noteMainConversation(sessionId: string | undefined, conversation: MainConversation): void {
     if (sessionId === undefined) return;
-    this.cancelFinalIndex(sessionId);
-    this.finalPreparing.get(sessionId)?.abort();
+    this.noteMainActivity(sessionId);
     this.mainConversations.delete(sessionId);
     this.mainConversations.set(sessionId, conversation);
     if (this.mainConversations.size > DEDUPE_CACHE_MAX) {
       const first = this.mainConversations.keys().next().value;
       if (first !== undefined) this.mainConversations.delete(first);
     }
+  }
+
+  /**
+   * A main-lane request whose messages are not the conversation (a message-threads
+   * continuation) still shows the session did not end at the last Stop: its pending final
+   * index is cancelled, and the kept conversation stays.
+   */
+  noteMainActivity(sessionId: string | undefined): void {
+    if (sessionId === undefined) return;
+    this.cancelFinalIndex(sessionId);
+    this.finalPreparing.get(sessionId)?.abort();
   }
 
   /**

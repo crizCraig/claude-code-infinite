@@ -115,6 +115,36 @@ function oneLine(text) {
 export function isClaudeCodeSideRequest(info) {
     return info.billingHeader && info.turnOrigin === undefined && info.tools === 0;
 }
+/** Most messages a Claude Code one-off side request was seen to send (title, status summary). */
+const SIDE_REQUEST_MAX_MESSAGES = 2;
+export function notSessionConversation(body, info) {
+    if (isThreadContinuation(body))
+        return "thread-continue";
+    // One-off requests send one or two messages. A release from before cc_turn_origin sends
+    // its main thread without one too: there, only a recognised side request is one.
+    const messages = Array.isArray(body?.messages) ? body.messages.length : 0;
+    if (info && isClaudeCodeSideRequest(info) && messages <= SIDE_REQUEST_MAX_MESSAGES &&
+        (knownSideRequestKind(info) !== undefined || sendsTurnOrigin(info.ccVersion))) {
+        return "side-request";
+    }
+    return undefined;
+}
+/** Claude Code releases from 2.1.281 on mark main-thread requests with cc_turn_origin. */
+const TURN_ORIGIN_SINCE = [2, 1, 281];
+function sendsTurnOrigin(ccVersion) {
+    const parts = (ccVersion ?? "").split(".").slice(0, 3).map(Number);
+    if (parts.length < 3 || parts.some((n) => !Number.isInteger(n)))
+        return false;
+    for (let i = 0; i < 3; i++) {
+        if (parts[i] !== TURN_ORIGIN_SINCE[i])
+            return parts[i] > TURN_ORIGIN_SINCE[i];
+    }
+    return true;
+}
+export function isThreadContinuation(body) {
+    const thread = body?.thread;
+    return thread !== null && typeof thread === "object" && thread.type === "continue";
+}
 export function knownSideRequestKind(info) {
     if (info.systemHead?.includes("You are naming a coding session"))
         return "session-title";

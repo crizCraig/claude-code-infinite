@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { describeClaudeCodeRequest } from "../dist/cc-request.js";
+import { describeClaudeCodeRequest, notSessionConversation } from "../dist/cc-request.js";
 
 const MAIN = "x-anthropic-billing-header: cc_version=2.1.281.835; cc_entrypoint=cli; cch=e9458; cc_prev_req=req_1; cc_prompt_id=17789129; cc_turn_origin=human;";
 const MONITOR = "x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;";
@@ -127,4 +127,29 @@ test("MemTree client metadata keeps short printable values only", async () => {
       agent_id: "a1", parent_agent_id: "p1", requested_model: "claude-opus-5-5" },
   );
   assert.deepEqual(memtreeClientMeta({ lane: "main", model: 42, agentId: "é", parentAgentId: "x".repeat(129) }), { lane: "main" });
+});
+
+test("side requests and thread continuations are not the session's conversation", () => {
+  const body = (system, extra = {}) => ({ system: [{ type: "text", text: system }],
+    messages: [{ role: "user", content: "x" }], ...extra });
+  const info = (b) => describeClaudeCodeRequest(b);
+  const main = body(MAIN, { tools: [{ name: "Bash" }] });
+  assert.equal(notSessionConversation(main, info(main)), undefined);
+  const side = body(MONITOR);
+  assert.equal(notSessionConversation(side, info(side)), "side-request");
+  const cont = body(MAIN, { thread: { type: "continue", previous_message_id: "msg_1" } });
+  assert.equal(notSessionConversation(cont, info(cont)), "thread-continue");
+  const create = body(MAIN, { tools: [{ name: "Bash" }], thread: { type: "create" } });
+  assert.equal(notSessionConversation(create, info(create)), undefined);
+  assert.equal(notSessionConversation(main, undefined), undefined);
+  // An old release's main thread (no turn origin) run without tools sends its history.
+  const history = { ...side, messages: [{ role: "user", content: "a" },
+    { role: "assistant", content: "b" }, { role: "user", content: "c" }] };
+  assert.equal(notSessionConversation(history, info(history)), undefined);
+  // ...and its first turn too: before cc_turn_origin, only a recognised side request is one.
+  const OLD = "x-anthropic-billing-header: cc_version=2.1.250.abc; cc_entrypoint=cli; cch=1;";
+  const oldMain = body(OLD);
+  assert.equal(notSessionConversation(oldMain, info(oldMain)), undefined);
+  const oldTitle = body(OLD + " You are naming a coding session");
+  assert.equal(notSessionConversation(oldTitle, info(oldTitle)), "side-request");
 });
