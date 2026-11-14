@@ -9,8 +9,9 @@
  * every later read cheaper, with no change to what the model sees in the steady state
  * (plans: memtree-marketing notes/subscription_savings_2026-11-14.md, lever c).
  *
- * This module only measures: the time since each lane's previous request (LaneCacheClock)
- * and the TTL the request's own markers ask for (cacheTtlMs). proxy.ts decides.
+ * This module only measures: the time since each lane last sent a request upstream
+ * (LaneCacheClock; an in-memory clock, so a fresh ccc process has no gap to judge) and the
+ * TTL the request's own markers ask for (cacheTtlMs). proxy.ts decides.
  */
 
 /** Anthropic's default prompt-cache TTL, and the one a `ttl: "1h"` marker asks for. */
@@ -30,21 +31,46 @@ export interface ColdCacheSample {
   cold: boolean;
 }
 
-/** When each lane (route key) last sent a request. */
+/**
+ * When each lane (route key) last sent a request to Anthropic, which is when its cache entry
+ * was last refreshed, and which of those sends a cold compression has already answered.
+ */
 export class LaneCacheClock {
   private readonly last = new Map<string, number>();
+  private readonly claimed = new Map<string, number>();
 
   constructor(private readonly now: () => number = () => Date.now()) {}
 
-  /** Note a request on `lane` now; the time since its previous one, or undefined if none. */
-  touch(lane: string): number | undefined {
-    const now = this.now();
-    const previous = this.last.get(lane);
-    this.last.delete(lane);
-    this.last.set(lane, now);
-    if (this.last.size > MAX_LANES) this.last.delete(this.last.keys().next().value!);
-    return previous === undefined ? undefined : Math.max(0, now - previous);
+  /**
+   * The time since `lane` last sent a request, and that send's time (the gap's identity), or
+   * undefined if it has sent none. Arrival time, not the proxy's own waits, is what counts.
+   */
+  gap(lane: string): { gapMs: number; basis: number } | undefined {
+    const basis = this.last.get(lane);
+    return basis === undefined ? undefined : { gapMs: Math.max(0, this.now() - basis), basis };
   }
+
+  /** A request of `lane` is going out to Anthropic now: its cache is warm from here. */
+  sent(lane: string): void {
+    bounded(this.last, lane, this.now());
+  }
+
+  /**
+   * Whether a cold compression may answer the gap that began at `basis`: true once per gap,
+   * so a compression that fails, or a request refused before it is sent, does not force
+   * again on every retry. A send starts a new gap.
+   */
+  claim(lane: string, basis: number): boolean {
+    if (this.claimed.get(lane) === basis) return false;
+    bounded(this.claimed, lane, basis);
+    return true;
+  }
+}
+
+function bounded(map: Map<string, number>, key: string, value: number): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > MAX_LANES) map.delete(map.keys().next().value!);
 }
 
 /**

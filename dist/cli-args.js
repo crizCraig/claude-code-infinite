@@ -118,8 +118,8 @@ export function compactTargetFromEnv(raw, parseTokens, minTokens) {
  * `CCC_AGENT_BUDGET_TOKENS` ("200k") and `CCC_AGENT_TARGET_TOKENS` ("100k", default half the
  * budget): subagent lanes compress at their own, smaller budget to their own target, while
  * the main lane keeps the model budget. Off (undefined) unless the budget is set; the budget
- * must be at least twice `minTokens`, and a target outside [minTokens, budget) falls back to
- * half the budget. `warnings` explains anything ignored.
+ * must be at least twice `minTokens`, and a target outside [minTokens, budget) is ignored
+ * (half the budget). `warnings` explains anything ignored.
  */
 export function agentLaneBudgetFromEnv(budgetRaw, targetRaw, parseTokens, minTokens) {
     if (!budgetRaw || !budgetRaw.trim())
@@ -131,14 +131,13 @@ export function agentLaneBudgetFromEnv(budgetRaw, targetRaw, parseTokens, minTok
                     `${(2 * minTokens) / 1000}k)`,
             ] };
     }
-    const half = Math.floor(budget / 2);
     if (!targetRaw || !targetRaw.trim())
-        return { value: { budget, target: half }, warnings: [] };
+        return { value: { budget }, warnings: [] };
     const target = parseTokens(targetRaw);
     if (target === undefined || target < minTokens || target >= budget) {
-        return { value: { budget, target: half }, warnings: [
+        return { value: { budget }, warnings: [
                 `ccc: ignoring CCC_AGENT_TARGET_TOKENS=${targetRaw} (use a token count from ` +
-                    `${minTokens / 1000}k to under the agent budget); using ${half / 1000}k`,
+                    `${minTokens / 1000}k to under the agent budget); using half the agent budget`,
             ] };
     }
     return { value: { budget, target }, warnings: [] };

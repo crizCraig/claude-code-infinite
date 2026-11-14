@@ -131,12 +131,13 @@ export interface ProxyOptions {
     budgetTokensOverride?: number;
     /**
      * `CCC_AGENT_BUDGET_TOKENS` / `CCC_AGENT_TARGET_TOKENS` (benchmarks; off by default):
-     * subagent lanes compress at this budget to this target, whatever the main lane's
-     * budget. `/memtree-compact off` still turns compaction off for them.
+     * subagent lanes compress at this budget to this target (unset: half the budget, as the
+     * window caps it), whatever the main lane's budget or CCC_COMPACT_TARGET.
+     * `/memtree-compact off` still turns compaction off for them.
      */
     agentLaneBudget?: {
         budget: number;
-        target: number;
+        target?: number;
     };
     /**
      * `CCC_COMPRESS_ON_COLD_CACHE=1` (off by default): a lane whose prompt cache expired

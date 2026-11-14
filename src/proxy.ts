@@ -307,10 +307,11 @@ export interface ProxyOptions {
   budgetTokensOverride?: number;
   /**
    * `CCC_AGENT_BUDGET_TOKENS` / `CCC_AGENT_TARGET_TOKENS` (benchmarks; off by default):
-   * subagent lanes compress at this budget to this target, whatever the main lane's
-   * budget. `/memtree-compact off` still turns compaction off for them.
+   * subagent lanes compress at this budget to this target (unset: half the budget, as the
+   * window caps it), whatever the main lane's budget or CCC_COMPACT_TARGET.
+   * `/memtree-compact off` still turns compaction off for them.
    */
-  agentLaneBudget?: { budget: number; target: number };
+  agentLaneBudget?: { budget: number; target?: number };
   /**
    * `CCC_COMPRESS_ON_COLD_CACHE=1` (off by default): a lane whose prompt cache expired
    * since its previous request (cold-cache.ts) and whose context is above its target
@@ -2426,7 +2427,8 @@ async function handleMessages(
   }
   rec.routeLane = requestRouteLane;
   noteLaneActivity(state, rec, requestSessionId(req));
-  noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined);
+  noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined,
+    requestSessionKey);
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
   const clientMeta = memtreeClientMeta({
@@ -4543,7 +4545,9 @@ function compactionMode(
       : opts.defaultCompactTarget;
   if (configured === null) return { mode: "off" };
   if (lane === "agent" && opts.agentLaneBudget !== undefined) {
-    return { mode: "explicit", tokens: opts.agentLaneBudget.target };
+    const target = opts.agentLaneBudget.target;
+    // Unset: half of the lane's effective budget (the window may cap it), as auto does.
+    return target === undefined ? { mode: "auto" } : { mode: "explicit", tokens: target };
   }
   if (configured === undefined) return { mode: "auto" };
   return { mode: "explicit", tokens: configured };
@@ -4575,8 +4579,10 @@ function laneCompaction(
   lane: RouteLane | undefined
 ): { target?: number; threshold?: number } {
   const mode = compactionMode(opts, state, sessionId, lane);
-  if (mode.mode === "off" || !state.serverReportsBudget) return {};
+  if (mode.mode === "off") return {};
   const budget = resolveBudget(opts, state, model, modelContextLimit, lane);
+  // The server's own budget knows nothing of a subagent lane's (CCC_AGENT_BUDGET_TOKENS).
+  if (!state.serverReportsBudget && budget.source !== "agent") return {};
   return {
     target: compactionTarget(mode, budget.tokens),
     threshold: Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens),
@@ -4977,7 +4983,12 @@ async function planEdgeCompaction(args: {
       if (adopted) return { kind: "ride", ...adopted };
       return forced("budget", fallback);
     }
-    if (coldCacheCompress(rec, size, targetTokens)) return forced("cold-cache", fallback);
+    if (coldCacheCompress(state, rec, size, targetTokens)) {
+      const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+        waitMs: opts.memtree.longCompressBudgetMs });
+      if (adopted) return { kind: "ride", ...adopted };
+      return forced("cold-cache", fallback);
+    }
     return { kind: "ride", prefix, routed };
   }
 
@@ -4995,7 +5006,12 @@ async function planEdgeCompaction(args: {
     if (adopted) return { kind: "ride", ...adopted };
     return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
   }
-  if (coldCacheCompress(rec, size, targetTokens)) return forced("cold-cache");
+  if (coldCacheCompress(state, rec, size, targetTokens)) {
+    const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+      waitMs: opts.memtree.longCompressBudgetMs });
+    if (adopted) return { kind: "ride", ...adopted };
+    return forced("cold-cache");
+  }
   if (state.serverReportsBudget) {
     // The server measures the request and compresses only past the budget.
     const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
@@ -5136,7 +5152,7 @@ async function planToolCompaction(args: {
     return ride ? { kind: "ride", ride } : { kind: "pass" };
   }
   const underBudget = size.tokens < budget.tokens && !overWindow;
-  const cold = underBudget && coldCacheCompress(rec, size, targetTokens);
+  const cold = underBudget && coldCacheCompress(state, rec, size, targetTokens);
   if (underBudget && !cold) {
     return ride ? { kind: "ride", ride } : { kind: "pass" };
   }
@@ -7845,27 +7861,50 @@ function noteLaneActivity(
 }
 
 /**
- * `CCC_COMPRESS_ON_COLD_CACHE=1`: note this conversation request on its lane's clock and
- * record whether the lane's prompt cache expired since its previous one (rec.coldCache).
+ * `CCC_COMPRESS_ON_COLD_CACHE=1`: record whether this conversation request's lane has sent
+ * nothing upstream for longer than its cache TTL (rec.coldCache), and stamp the lane's clock
+ * when this request goes out (forwardAccepted). An away recap carries the main thread's
+ * history, so sending it warms the main lane's cache too.
  */
 function noteLaneCache(
   opts: ProxyOptions, state: ProxyState, rec: MessagesRecord, routeKey: string,
-  body: Record<string, any>, notConversation: boolean,
+  body: Record<string, any>, notConversation: boolean, sessionId: string | undefined,
 ): void {
   if (opts.compressOnColdCache !== true || notConversation) return;
-  const sample = coldCacheSample(state.laneCacheClock.touch(routeKey), body);
+  const clock = state.laneCacheClock;
+  const gap = clock.gap(routeKey);
+  const sample = coldCacheSample(gap?.gapMs, body);
   if (sample) rec.coldCache = sample;
+  if (sample?.cold && gap) coldGaps.set(rec, { lane: routeKey, basis: gap.basis });
+  const warms = rec.routeLane === "away" ? [routeKey, JSON.stringify([sessionId ?? "", "main"])]
+    : [routeKey];
+  laneSendStamps.set(rec, () => { for (const lane of warms) clock.sent(lane); });
 }
+
+/** Per request: stamps its lane's cache clock as it goes upstream (noteLaneCache). */
+const laneSendStamps = new WeakMap<MessagesRecord, () => void>();
+/** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
+const coldGaps = new WeakMap<MessagesRecord, { lane: string; basis: number }>();
+/** Requests that claimed their cold gap (a re-plan of the same request keeps it). */
+const coldClaims = new WeakSet<MessagesRecord>();
 
 /**
  * Whether this turn compresses because its lane's cache went cold (noteLaneCache) while it
  * sits above the target by a calibrated size: the next request rewrites the whole context
  * anyway, so it may as well rewrite the target's worth. A bare target, like a
- * `/memtree-compact`: it forces once per cold gap, never on an uncalibrated byte guess.
+ * `/memtree-compact`, never on an uncalibrated byte guess, and at most once per cold gap:
+ * a failed or refused attempt's retries plan as usual until the lane sends again.
  */
-function coldCacheCompress(rec: MessagesRecord, size: PlannedSize, targetTokens: number): boolean {
-  return rec.coldCache?.cold === true && size.source === "reported" &&
-    coldCacheWorthCompressing(size.tokens, targetTokens);
+function coldCacheCompress(
+  state: ProxyState, rec: MessagesRecord, size: PlannedSize, targetTokens: number
+): boolean {
+  if (rec.coldCache?.cold !== true || size.source !== "reported" ||
+      !coldCacheWorthCompressing(size.tokens, targetTokens)) return false;
+  if (coldClaims.has(rec)) return true;
+  const gap = coldGaps.get(rec);
+  if (!gap || !state.laneCacheClock.claim(gap.lane, gap.basis)) return false;
+  coldClaims.add(rec);
+  return true;
 }
 
 /** Whether a notice other than the heavy-request one (the lowest priority) waits. */
@@ -7978,7 +8017,9 @@ function reachedBudget(compaction: CompactionRecord | undefined): boolean {
  * (degradedNotices), since a plan can undercount.
  */
 function compressionNeeded(compaction: CompactionRecord | undefined): boolean {
-  if (compaction === undefined || compaction.reason !== undefined) return true;
+  if (compaction === undefined) return true;
+  // A cold-cache compression is optional: under the budget, whole is the normal outcome.
+  if (compaction.reason !== undefined && compaction.reason !== "cold-cache") return true;
   if (compaction.estimatedTokens === undefined) return true;
   return compaction.estimatedTokens >= compaction.budgetTokens;
 }
@@ -8167,6 +8208,7 @@ function forwardAccepted(
       return;
     }
 
+    if (rec) laneSendStamps.get(rec)?.();
     upstreamReq = upstream.module.request(
       {
         host: upstream.host,

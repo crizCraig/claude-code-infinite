@@ -55,17 +55,20 @@ export declare function compactTargetFromEnv(raw: string | undefined, parseToken
     value: number | null | undefined;
     warning?: string;
 };
-/** A subagent lane's own budget and target (CCC_AGENT_BUDGET_TOKENS / CCC_AGENT_TARGET_TOKENS). */
+/**
+ * A subagent lane's own budget and target (CCC_AGENT_BUDGET_TOKENS / CCC_AGENT_TARGET_TOKENS).
+ * No target: half the lane's effective budget (proxy.ts; the context window may cap it).
+ */
 export interface AgentLaneBudget {
     budget: number;
-    target: number;
+    target?: number;
 }
 /**
  * `CCC_AGENT_BUDGET_TOKENS` ("200k") and `CCC_AGENT_TARGET_TOKENS` ("100k", default half the
  * budget): subagent lanes compress at their own, smaller budget to their own target, while
  * the main lane keeps the model budget. Off (undefined) unless the budget is set; the budget
- * must be at least twice `minTokens`, and a target outside [minTokens, budget) falls back to
- * half the budget. `warnings` explains anything ignored.
+ * must be at least twice `minTokens`, and a target outside [minTokens, budget) is ignored
+ * (half the budget). `warnings` explains anything ignored.
  */
 export declare function agentLaneBudgetFromEnv(budgetRaw: string | undefined, targetRaw: string | undefined, parseTokens: (text: string) => number | undefined, minTokens: number): {
     value: AgentLaneBudget | undefined;
