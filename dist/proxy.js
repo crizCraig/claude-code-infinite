@@ -78,6 +78,7 @@ import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
+import { requestThreadType, threadUnsupportedBody, ThreadRefusals, } from "./thread-backstop.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -356,6 +357,7 @@ export function startProxy(opts) {
     const shutdownAbort = new AbortController();
     const backgroundAbort = new AbortController();
     const state = {
+        threadRefusals: new ThreadRefusals(),
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         keyInvalid: () => opts.memtree.keyInvalid,
@@ -1329,6 +1331,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         // Not a shape we understand — forward verbatim rather than break the session.
         return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
     }
+    if (opts.messageThreads !== "passthrough" && refuseThreadRequest(req, res, opts, state, body, rec)) {
+        return logged(Promise.resolve());
+    }
     // Defensive legacy strip pass first: old marker-wrapped notices (including
     // one copied into an away-summary or top-level system prompt) must never
     // reach Anthropic or MemTree. Hook-delivered notices never enter this body.
@@ -1484,7 +1489,8 @@ async function handleMessages(req, res, opts, upstream, state) {
         (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
     if (!rides) {
         const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
-        if (measured.source === "exact") {
+        // A fragment's count is not the conversation's: it never replaces its size sample.
+        if (measured.source === "exact" && !notConversation) {
             sizeSlot.set(sizeSampleOf(forwardCandidate.body, measured.tokens, rec.model ?? body.model));
         }
     }
@@ -1879,7 +1885,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             toolForwarding.settle(delivered);
             if (toolRide)
                 noteRideSize(toolRide.sizeHolder, rec, sendBody);
-            else {
+            // A fragment's bytes are not what its reported input counts (a continue's tail
+            // against the whole thread): it never sizes the conversation's next request.
+            else if (!notConversation) {
                 noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec, sendBody);
             }
         }));
@@ -5313,6 +5321,29 @@ function recordTurn(rec, turnType, forwardBody) {
 }
 /** The forwarded body's inline image bytes (recordTurn), for the heavy-request notice. */
 const forwardedImageBytes = new WeakMap();
+/**
+ * A request carrying `thread` while threads are off: answer ccc's own 400 (Claude Code then
+ * resends stateless for the session) and forward nothing; log the first per session.
+ */
+function refuseThreadRequest(req, res, opts, state, body, rec) {
+    const thread = requestThreadType(body);
+    if (thread === undefined)
+        return false;
+    rec.turnType = "thread-refused";
+    rec.forwardedBytes = 0;
+    if (typeof body.model === "string")
+        rec.model = body.model;
+    const sessionId = requestSessionId(req);
+    if (state.threadRefusals.first(sessionId)) {
+        opts.reqlog?.log({ kind: "thread-refused", sessionTag: sessionTag(sessionId), thread,
+            model: rec.model, lane: agentAttributionId(req) ? "agent" : "main" });
+    }
+    if (!res.headersSent) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(threadUnsupportedBody());
+    }
+    return true;
+}
 /** What this request uploaded to Anthropic, for the session's heavy-request notice. */
 function noteForwardedSize(state, rec, sessionId) {
     const bytes = rec.forwardedBytes ?? 0;

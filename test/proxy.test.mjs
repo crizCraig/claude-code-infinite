@@ -601,7 +601,9 @@ test("side requests and thread continuations neither replace the final index's c
     noted.push(conversation.messages.length);
     note(sessionId, conversation);
   };
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin });
+  // passthrough: with threads off (the default) ccc refuses a continue (thread-backstop).
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin,
+    messageThreads: "passthrough" });
   const post = async (body) => {
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",

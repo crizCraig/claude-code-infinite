@@ -67,6 +67,7 @@ import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { UrlOpener } from "./open-url.js";
+import { ThreadRefusals, type MessageThreadsMode } from "./thread-backstop.js";
 import { type MessagesRecord, type RequestLogSink } from "./reqlog.js";
 export interface ProxyOptions {
     memtree: MemtreeClient;
@@ -122,6 +123,12 @@ export interface ProxyOptions {
      * cannot type the command; `/memtree-compact [N]` still turns it back on.
      */
     defaultCompactTarget?: number | null;
+    /**
+     * Requests carrying Claude Code's message `thread` (thread-backstop.ts): "off" (default)
+     * answers them with ccc's own 400 `thread_unsupported_request`, so Claude Code resends
+     * stateless for the session; "passthrough" forwards them as sent (tests).
+     */
+    messageThreads?: MessageThreadsMode;
     /**
      * Test-only whole-request budget (tokens) for every session:
      * `CCC_BUDGET_TOKENS`. Replaces the server-reported model budget (and the
@@ -338,6 +345,8 @@ interface MemtreePage {
 }
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
+    /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
+    threadRefusals: ThreadRefusals;
     /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
     paymentNotice: PaymentNoticeThrottle;
     /** Invalid-key (401/403) notice throttle, on the payment notice's interval. */
