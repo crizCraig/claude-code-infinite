@@ -48,8 +48,9 @@ export declare const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
  * and the final index misses the last tool loop. HTTPS-proxy mode gets threads from
  * Anthropic's rollout flag today; base-URL mode would too if the flag reached it (it
  * does with the opt-in set). Claude Code reads this env var (a tri-state in its env
- * schema) before that flag; "0" makes every request stateless. Undocumented: if a later
- * release drops it, threads come back and proxy.ts still forwards continuations untouched.
+ * schema, once per process) before that flag; "0" turns message threads off. A settings
+ * `env` value would win over it. Undocumented: if a later release drops it, threads come
+ * back and proxy.ts still forwards continuations untouched (logged as notConversation).
  */
 export declare const MESSAGE_THREADS_OFF: Readonly<Record<string, string>>;
 /**
