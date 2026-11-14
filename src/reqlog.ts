@@ -250,6 +250,14 @@ export interface MessagesRecord {
    */
   routeLane?: "main" | "away" | "agent";
   /**
+   * `CCC_COMPRESS_ON_COLD_CACHE=1` only: the time since this lane's previous request and the
+   * TTL of the request's shortest cache_control marker (5 min unless "1h"); `cold` when the
+   * gap passed it, so the lane's prompt cache had expired (cold-cache.ts). Sampled on arrival:
+   * a forced cold compression is `compaction.reason: "cold-cache"`, not `cold` alone (another
+   * request of the lane may have warmed it, or the size was under the target).
+   */
+  coldCache?: { gapMs: number; ttlMs: number; cold: boolean };
+  /**
    * Tool turns that missed their lane's route: "missing" (empty lane),
    * "rejected" (a route was present in this lane but unusable for this
    * request), or "replay" (the body was an exact replay of the request that
@@ -484,7 +492,12 @@ export type RecompressReason =
   /** `/memtree-compact [N]` asked for a compaction now. */
   | "manual"
   /** The session's target or context window changed since the prefix was built. */
-  | "target-change";
+  | "target-change"
+  /**
+   * `CCC_COMPRESS_ON_COLD_CACHE=1`: the lane's prompt cache expired while it was above its
+   * target, so it compressed to the target before the whole context is written again.
+   */
+  | "cold-cache";
 
 export interface CompactionRecord {
   /** "off" after `/memtree-compact off`; "explicit" for an N or CCC_COMPACT_TARGET. */
@@ -494,9 +507,10 @@ export interface CompactionRecord {
   /**
    * Where the budget came from: CCC_BUDGET_TOKENS ("override"), the
    * server's `model_budget_tokens` ("server"), or fallbackBudgetTokens
-   * (proxy.ts: a share of the context window) until the server reports one.
+   * (proxy.ts: a share of the context window) until the server reports one;
+   * on a subagent lane, CCC_AGENT_BUDGET_TOKENS ("agent") when set.
    */
-  budgetSource: "override" | "server" | "window-ratio";
+  budgetSource: "override" | "server" | "window-ratio" | "agent";
   /** What a compaction on this turn aims at (budget/2, or the explicit N). */
   targetTokens?: number;
   /** Sent as compression_threshold_tokens (servers that report a budget). */

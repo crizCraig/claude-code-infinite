@@ -43,6 +43,7 @@ import { type HttpsProxyModeOptions } from "./https-proxy-mode.js";
 import { PromptAccounting } from "./prompt-accounting.js";
 import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
 import { LaneActivity } from "./lane-activity.js";
+import { LaneCacheClock } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
 import type { StatusLinkFiles } from "./status-link.js";
 import { type NetworkFailure } from "./network-failure.js";
@@ -135,6 +136,22 @@ export interface ProxyOptions {
      * context-window fallback) so a cheap session crosses it in a few turns.
      */
     budgetTokensOverride?: number;
+    /**
+     * `CCC_AGENT_BUDGET_TOKENS` / `CCC_AGENT_TARGET_TOKENS` (benchmarks; off by default):
+     * subagent lanes compress at this budget to this target (unset: half the budget, as the
+     * window caps it), whatever the main lane's budget or CCC_COMPACT_TARGET.
+     * `/memtree-compact off` still turns compaction off for them.
+     */
+    agentLaneBudget?: {
+        budget: number;
+        target?: number;
+    };
+    /**
+     * `CCC_COMPRESS_ON_COLD_CACHE=1` (off by default): a lane whose prompt cache expired
+     * since its previous request (cold-cache.ts) and whose context is above its target
+     * compresses to the target before the context is written to the cache again.
+     */
+    compressOnColdCache?: boolean;
     /** Test-only overrides for the first-tree probe (5s) and total wait (60s). */
     awaitedIndexProbeTimeoutMs?: number;
     awaitedIndexWaitTimeoutMs?: number;
@@ -418,6 +435,8 @@ interface ProxyState {
     activeSubagents: Set<string>;
     /** Heavy request bodies and recent agent lanes per session (lane-activity.ts). */
     laneActivity: LaneActivity;
+    /** When each lane last sent a request (cold-cache.ts), for CCC_COMPRESS_ON_COLD_CACHE. */
+    laneCacheClock: LaneCacheClock;
     /** The queued heavy-request notice: the lowest priority, any other may replace it. */
     heavyNotice?: object;
     /**
