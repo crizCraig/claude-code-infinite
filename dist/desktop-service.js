@@ -152,7 +152,7 @@ export async function startDesktopService(opts) {
         if (cwd && entry.cwd === undefined) {
             const target = entry;
             target.cwd = cwd;
-            target.refused = projectRefusal(cwd);
+            target.refused = projectRefusal(cwd, opts.state.claudeConfigDir);
             if (target.refused)
                 log(`session ${id.slice(0, 8)} refused: ${target.refused}`);
             target.projectReady = readProjectMeta(cwd).then((meta) => {
@@ -425,11 +425,19 @@ function interceptUpstream(origin) {
  * NO_PROXY, CA or env file that breaks the routing (Codex r1 P1). Setup checks only what
  * it can see; each project is checked here, on its session's first model call.
  */
-export function projectRefusal(cwd) {
-    const decision = httpsProxyModeDecision({
-        env: { [HTTPS_PROXY_MODE_ENV]: "1" }, platform: process.platform, claudeArgs: [], cwd,
-    });
-    return decision.mode === "base-url" && decision.requested ? decision.reason : undefined;
+export function projectRefusal(cwd, claudeConfigDir) {
+    // The service can't see which config dir a session uses: check the default one and the
+    // one setup ran with (Codex r2 P1), and refuse if either says so.
+    for (const dir of [undefined, claudeConfigDir]) {
+        const env = { [HTTPS_PROXY_MODE_ENV]: "1",
+            ...(dir ? { CLAUDE_CONFIG_DIR: dir } : {}) };
+        const decision = httpsProxyModeDecision({
+            env, platform: process.platform, claudeArgs: [], cwd,
+        });
+        if (decision.mode === "base-url" && decision.requested)
+            return decision.reason;
+    }
+    return undefined;
 }
 /** The session's model calls get an error it shows, instead of running unprotected. */
 function refuseSession(res, reason) {

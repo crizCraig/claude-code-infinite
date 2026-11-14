@@ -37,5 +37,5 @@ export declare function toolsOffered(body: string): boolean | undefined;
  * NO_PROXY, CA or env file that breaks the routing (Codex r1 P1). Setup checks only what
  * it can see; each project is checked here, on its session's first model call.
  */
-export declare function projectRefusal(cwd: string): string | undefined;
+export declare function projectRefusal(cwd: string, claudeConfigDir?: string): string | undefined;
 //# sourceMappingURL=desktop-service.d.ts.map

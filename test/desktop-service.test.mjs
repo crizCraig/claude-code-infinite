@@ -399,3 +399,20 @@ test("Bash gets the user's own CA file and env file back (review r1 P3)", async 
     { env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: paths.caPem, CLAUDE_ENV_FILE: paths.bashEnv } }).toString();
   assert.equal(out.trim(), `ca=/corp/ca.pem f=${userFile} u=1`);
 });
+
+test("the per-session check also reads setup's CLAUDE_CONFIG_DIR (Codex r2 P1)",
+  { skip: process.platform === "win32" }, async (t) => {
+    const { projectRefusal } = await import("../dist/desktop-service.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-desktop-cfg-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const cfg = path.join(root, "cfg");
+    fs.mkdirSync(cfg);
+    fs.writeFileSync(path.join(cfg, "settings.json"), '{"sandbox":{"enabled":true}}');
+    const proj = path.join(root, "proj");
+    fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    assert.match(projectRefusal(proj, cfg), /sandbox is on in .*cfg\/settings\.json/);
+    const paths = desktopPaths(root, "local");
+    const state = await setupDesktopFiles(paths, "local", { claudeConfigDir: cfg });
+    assert.equal(state.claudeConfigDir, cfg);
+    assert.equal(readState(paths).claudeConfigDir, cfg);
+  });

@@ -81,6 +81,8 @@ export async function runDesktopCommand(args, deps) {
         const state = await setupDesktopFiles(paths, deps.mode, {
             rotateToken: args.includes("--rotate-token"), rotateCa: args.includes("--rotate-ca"),
             userExtraCaPem: userExtraCaPem(process.env),
+            ...(process.env.CLAUDE_CONFIG_DIR?.trim()
+                ? { claudeConfigDir: process.env.CLAUDE_CONFIG_DIR.trim() } : {}),
             userEnv: {
                 ...(process.env.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS } : {}),
                 ...(process.env.CLAUDE_ENV_FILE ? { CLAUDE_ENV_FILE: process.env.CLAUDE_ENV_FILE } : {}),

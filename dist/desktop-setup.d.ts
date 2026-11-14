@@ -23,6 +23,8 @@ export interface DesktopState {
     notAfter: string;
     /** Setup registered the memtree MCP server, so compress calls may say the tools exist. */
     mcpRegistered?: boolean;
+    /** CLAUDE_CONFIG_DIR when setup ran, if any: its settings are checked for each session too. */
+    claudeConfigDir?: string;
 }
 export declare function desktopPaths(configDir: string, mode: DesktopMode): DesktopPaths;
 export declare function desktopLaunchdLabel(mode: DesktopMode): string;
@@ -55,6 +57,7 @@ export declare function setupDesktopFiles(paths: DesktopPaths, mode: DesktopMode
     rotateCa?: boolean;
     userExtraCaPem?: string;
     userEnv?: DesktopUserEnv;
+    claudeConfigDir?: string;
 }): Promise<DesktopState & {
     caRotated: boolean;
 }>;

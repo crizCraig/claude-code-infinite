@@ -137,15 +137,17 @@ export async function setupDesktopFiles(paths, mode, opts = {}) {
         createdAt: caRotated || !previous ? new Date(now).toISOString() : previous.createdAt,
         notAfter: caRotated || !previous ? new Date(now + 365 * 24 * 3600_000).toISOString() : previous.notAfter,
         ...(previous?.mcpRegistered ? { mcpRegistered: true } : {}),
+        ...(opts.claudeConfigDir ? { claudeConfigDir: opts.claudeConfigDir } : {}),
     };
     write(paths.state, `${JSON.stringify(state, null, 2)}\n`, 0o600);
     write(paths.bashEnv, desktopBashEnvScript(paths, state, opts.userEnv), 0o600);
     return { ...state, caRotated };
 }
 export function writeDesktopState(paths, state) {
-    const { mode, port, token, createdAt, notAfter, mcpRegistered } = state;
+    const { mode, port, token, createdAt, notAfter, mcpRegistered, claudeConfigDir } = state;
     const tmp = `${paths.state}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify({ mode, port, token, createdAt, notAfter, mcpRegistered }, null, 2)}\n`, { mode: 0o600 });
+    const kept = { mode, port, token, createdAt, notAfter, mcpRegistered, claudeConfigDir };
+    fs.writeFileSync(tmp, `${JSON.stringify(kept, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(tmp, paths.state);
 }
 /**
@@ -170,6 +172,8 @@ function portFree(port) {
 /** The launchd agent: `node <cli.js> [staging|local] desktop serve`, kept alive. */
 export function launchdPlist(mode, paths, cliPath) {
     const args = [process.execPath, cliPath, ...(mode === "production" ? [] : [mode]), "desktop", "serve"];
+    // Transcripts (usage, the final reply) are read where setup's Claude Code keeps them.
+    const configDir = readDesktopState(paths)?.claudeConfigDir;
     const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -183,7 +187,7 @@ ${args.map((a) => `    <string>${esc(a)}</string>`).join("\n")}
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>${esc(`${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`)}</string>${fs.existsSync(paths.upstreamCa)
-        ? `\n    <key>NODE_EXTRA_CA_CERTS</key><string>${esc(paths.upstreamCa)}</string>` : ""}
+        ? `\n    <key>NODE_EXTRA_CA_CERTS</key><string>${esc(paths.upstreamCa)}</string>` : ""}${configDir ? `\n    <key>CLAUDE_CONFIG_DIR</key><string>${esc(configDir)}</string>` : ""}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>ExitTimeOut</key><integer>45</integer>
