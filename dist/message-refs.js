@@ -38,6 +38,9 @@ const HEX_RE = /^[0-9a-f]{64}$/;
 /** The server's limits per request: ref entries, and cache marks on refs (past them, inline). */
 const MAX_REFS = 50_000;
 const MAX_MARKS = 64;
+/** What the named messages may expand to (their JSON, images as bytes: an overestimate of
+ *  what the server reads, which keeps images as refs), under its 32 MiB rebuild cap. */
+const MAX_NAMED_CHARS = 30 * 1024 * 1024;
 /** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
 const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
@@ -97,13 +100,14 @@ export class MessageRefs {
     noteRefusal(sessionId, messages, refs, status, bodyText) {
         if (refs.length === 0)
             return false;
+        // Over a size cap (stored text or the images the refs bring back): this call only.
+        if (status === 400 && /expand past/i.test(bodyText))
+            return true;
         if (status === 400 && /message refs/i.test(bodyText)) {
             this.disabled = true;
             this.acked.clear();
             return true;
         }
-        if (status === 400 && /image references expand/i.test(bodyText))
-            return true;
         const missing = status === MISSING_MESSAGES_STATUS ? missingMessageHashes(bodyText) : undefined;
         if (missing === undefined)
             return false;
@@ -188,18 +192,21 @@ export function buildDelta(messages, acked) {
         return { messages, refs: [] };
     let headerSeen = false;
     let marks = 0;
+    let chars = 0;
     const refs = [];
     const out = messages.map((message, index) => {
         const eligible = (index > opening || isSkipped(message)) && refs.length < MAX_REFS;
         const ref = eligible ? refFor(message, !headerSeen) : undefined;
         headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
-        if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS)
+        if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS ||
+            chars + ref.chars > MAX_NAMED_CHARS)
             return message;
         const named = refJson(ref);
         // A short message is smaller than its ref: sent as it is.
         if (JSON.stringify(named).length >= ref.chars)
             return message;
         marks += ref.marks.length;
+        chars += ref.chars;
         refs.push(ref.digest);
         return named;
     });

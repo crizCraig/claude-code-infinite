@@ -65,6 +65,23 @@ test("an acked message's images are not decoded again on later acks", () => {
     "already acked: kept without a second look");
 });
 
+test("a delta stays within the server's caps: 64 cache marks, 30 MiB named", () => {
+  const marked = [conversation()[0], { role: "user", content: "start" }];
+  for (let i = 0; i < 100; i++) {
+    marked.push({ role: "assistant", content: [{ type: "text", text: `${i} ${"x".repeat(300)}`,
+      cache_control: { type: "ephemeral" } }] });
+  }
+  const all = new Set(marked.map((m, i) => refFor(m, i === 0).digest));
+  const delta = buildDelta(marked, all);
+  const marks = delta.messages.filter((m) => REF_KEY in m)
+    .reduce((n, m) => n + (m.cache_marks?.length ?? 0), 0);
+  assert.ok(marks <= 64 && delta.refs.length >= 63, `${marks} marks, ${delta.refs.length} refs`);
+  const big = [{ role: "user", content: "start" }];
+  for (let i = 0; i < 40; i++) big.push({ role: "assistant", content: `${i}`.repeat(1024 * 1024) });
+  const bigDelta = buildDelta(big, new Set(big.map((m) => refFor(m).digest)));
+  assert.ok(bigDelta.refs.length > 0 && bigDelta.refs.length < 31, `${bigDelta.refs.length} refs`);
+});
+
 test("only the request's first billing header is split", () => {
   const sys = conversation()[0];
   assert.ok(refFor(sys, true).header);
@@ -119,6 +136,9 @@ test("answers decide what is named: acks, no field, 409s, a 400", () => {
   assert.equal(refs.noteRefusal("s", messages, sent, 500, "boom"), false);
   assert.ok(refs.noteRefusal("s", messages, sent, 400,
     '{"detail":"Image references expand past the request size limit."}'), "resend only");
+  assert.ok(refs.noteRefusal("s", messages, sent, 400,
+    '{"detail":"Message refs expand past the request size limit."}'), "resend only");
+  assert.ok(refs.active && refs.delta("s", messages).refs.length > 0, "size caps disable nothing");
   assert.ok(refs.delta("s", messages).refs.length > 0);
   const next = refs.delta("s", messages).refs;
   assert.ok(refs.noteRefusal("s", messages, next, 409, body(next)), "every ref missing (kill switch)");
@@ -139,6 +159,7 @@ test("answers decide what is named: acks, no field, 409s, a 400", () => {
     '{"detail":"Malformed message refs: x"}'));
   refs.noteAnswer("u", messages, answer);
   assert.equal(refs.delta("u", messages).refs.length, 0, "a 400 ends refs for the process");
+  assert.equal(refs.active, false, "and calls stop declaring message-refs");
   assert.ok(refs.noteRefusal("u", messages, ["b".repeat(64)], 409, body(["b".repeat(64)])),
     "a concurrent 409 after the 400 is still resent");
   const off = new MessageRefs(false);

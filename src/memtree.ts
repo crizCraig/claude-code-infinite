@@ -2012,6 +2012,9 @@ export class MemtreeClient {
     if (unconfirmed) planned = unconfirmed;
     if (planned.payload === undefined) throw this.oversized(planned.limit, opts);
     const payload = planned.payload;
+    // Fixed with the body: a transport retry of a delta body still declares refs.
+    const features = delta.refs.length || this.messageRefs.active
+      ? `${CLIENT_FEATURES},${MESSAGE_REFS_FEATURE}` : CLIENT_FEATURES;
     // The answer named references it could not serve: sent again as its own call.
     let resent = false;
     let refusalText: string | undefined;
@@ -2045,7 +2048,8 @@ export class MemtreeClient {
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
     try {
-      const response = await this.postRetryingDrop(payload, opts, controller.signal)
+      const response = await this.postRetryingDrop(payload, { ...opts, features },
+        controller.signal)
         .catch((err: unknown) => {
           // A background index call is no request's own evidence (review r1): it may clear
           // the state by an answer, never set it.
@@ -2227,7 +2231,8 @@ export class MemtreeClient {
    */
   private async postRetryingDrop(
     payload: string,
-    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
+    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string>;
+      features?: string },
     signal: AbortSignal
   ): Promise<Response> {
     const upload = { done: false };
@@ -2253,7 +2258,8 @@ export class MemtreeClient {
    */
   private postContextMemory(
     payload: string,
-    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
+    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string>;
+      features?: string },
     signal: AbortSignal,
     upload?: { done: boolean }
   ): Promise<Response> {
@@ -2268,8 +2274,7 @@ export class MemtreeClient {
         ...(streamed ? { "content-length": String(bytes.length) } : {}),
         "x-client": CLIENT_NAME,
         "x-client-version": CLIENT_VERSION,
-        "x-client-features": this.messageRefs.active
-          ? `${CLIENT_FEATURES},${MESSAGE_REFS_FEATURE}` : CLIENT_FEATURES,
+        "x-client-features": opts.features ?? CLIENT_FEATURES,
         ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
         ...(opts.clientMeta && Object.keys(opts.clientMeta).length
           ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
