@@ -44,11 +44,28 @@ import type { HttpsProxyChild } from "./https-proxy-session.js";
 export const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
 
 /**
+ * Message threads off. On the first-party API, Claude Code 2.1.325 sends
+ * `thread: {type: "continue", previous_message_id}` on tool-loop turns: only the messages
+ * after the continued reply, Anthropic holding the rest. ccc then can't compress mid-loop
+ * and the final index misses the last tool loop. HTTPS-proxy mode gets threads from
+ * Anthropic's rollout flag today; base-URL mode would too if the flag reached it (it
+ * does with the opt-in set). Claude Code reads this env var (a tri-state in its env
+ * schema, once per process) before that flag; "0" turns message threads off. A settings
+ * `env` value would win over it. Undocumented: if a later release drops it, threads come
+ * back and proxy.ts still forwards continuations untouched (logged as notConversation).
+ */
+export const MESSAGE_THREADS_OFF: Readonly<Record<string, string>> =
+  Object.freeze({ CLAUDE_CODE_TETHER_LIVE: "0" });
+
+/**
  * `httpsProxy` (HTTPS-proxy mode, https-proxy-session.ts): Claude Code reaches ccc
  * through HTTPS_PROXY instead, with no custom base URL (so Remote Control stays
  * available and no first-party override is needed); the MemTree MCP server and agents
  * find the loopback in CCC_MEMTREE_PROXY, and Bash commands get today's variables back
  * from CLAUDE_ENV_FILE.
+ *
+ * Both modes turn message threads off (MESSAGE_THREADS_OFF), whatever the parent exported,
+ * so every request carries the whole conversation.
  */
 export function claudeChildEnv(
   parentEnv: NodeJS.ProcessEnv,
@@ -63,6 +80,7 @@ export function claudeChildEnv(
       _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
     };
   childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = "1000000000";
+  Object.assign(childEnv, MESSAGE_THREADS_OFF);
 
   // Wrapper-only control; do not leak it into Claude Code itself.
   delete childEnv.CCC_AUTO_COMPACT;

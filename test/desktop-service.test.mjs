@@ -148,11 +148,12 @@ test("setup's Bash env file is valid with an apostrophe in the path (Codex r1 P2
   const paths = desktopPaths(dir, "local");
   await setupDesktopFiles(paths, "local");
   execFileSync("bash", ["-n", paths.bashEnv]);
-  const out = execFileSync("bash", ["-c", `. "$1"; echo "ca=\${NODE_EXTRA_CA_CERTS-unset} dac=\${DISABLE_AUTO_COMPACT-unset} bl=\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-unset}"`, "x", paths.bashEnv],
+  const out = execFileSync("bash", ["-c", `. "$1"; echo "ca=\${NODE_EXTRA_CA_CERTS-unset} dac=\${DISABLE_AUTO_COMPACT-unset} bl=\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-unset} th=\${CLAUDE_CODE_TETHER_LIVE-unset}"`, "x", paths.bashEnv],
     { env: { PATH: process.env.PATH, NODE_EXTRA_CA_CERTS: paths.caPem, DISABLE_AUTO_COMPACT: "1",
-      CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000" } }).toString();
-  // Bash children get Claude Code's own compaction back (Claude r2 P2).
-  assert.equal(out.trim(), "ca=unset dac=unset bl=unset");
+      CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000", CLAUDE_CODE_TETHER_LIVE: "0" } }).toString();
+  // Bash children (not routed through ccc) get Claude Code's own compaction and threads back
+  // (Claude r2 P2).
+  assert.equal(out.trim(), "ca=unset dac=unset bl=unset th=unset");
   const kept = execFileSync("bash", ["-c", `. "$1"; echo "bl=\${CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE-unset} rc=$?"`, "x", paths.bashEnv],
     { env: { PATH: process.env.PATH, CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "5000" } }).toString();
   assert.equal(kept.trim(), "bl=5000 rc=0");
@@ -286,10 +287,11 @@ test("the pasted CA bundle keeps the user's own extra CAs first, and no key", MA
   await setupDesktopFiles(paths, "local");
   assert.ok(!fs.readFileSync(paths.caPem, "utf8").includes("Q09SUA=="));
   const lines = desktopEnvLines(paths, readState(paths));
-  assert.equal(lines.length, 6);
+  assert.equal(lines.length, 7);
+  assert.ok(lines.includes("CLAUDE_CODE_TETHER_LIVE=0"), "Desktop sessions get message threads off");
   assert.match(lines[0], /^HTTPS_PROXY=http:\/\/ccc:[0-9a-f]{48}@127\.0\.0\.1:\d+$/);
   assert.equal(lines[1], `NODE_EXTRA_CA_CERTS=${paths.caPem}`);
-  assert.equal(lines[5], `CLAUDE_ENV_FILE=${paths.bashEnv}`);
+  assert.equal(lines[6], `CLAUDE_ENV_FILE=${paths.bashEnv}`);
   assert.ok(!fs.readFileSync(paths.bashEnv, "utf8").includes(readState(paths).token), "no token");
 });
 

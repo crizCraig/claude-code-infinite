@@ -11,7 +11,7 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createSessionCa } from "./mitm-ca.js";
-import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
+import { MESSAGE_THREADS_OFF, UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { MEMTREE_MCP_SCRIPT } from "./memtree-mcp-config.js";
 import { MEMTREE_MCP_SERVER_NAME } from "./memtree-mcp.js";
 import { proxyUrlFor } from "./https-proxy-mode.js";
@@ -50,6 +50,7 @@ const PASTED_LIMITS = {
     DISABLE_AUTO_COMPACT: "1",
     CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: UNREACHABLE_BLOCKING_LIMIT,
     CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000",
+    ...MESSAGE_THREADS_OFF,
 };
 /**
  * Bash-tool commands get the session's env minus ccc's proxy and CA (else curl, Python
