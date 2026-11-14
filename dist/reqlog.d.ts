@@ -230,7 +230,9 @@ export interface MessagesRecord {
     /**
      * `CCC_COMPRESS_ON_COLD_CACHE=1` only: the time since this lane's previous request and the
      * TTL of the request's shortest cache_control marker (5 min unless "1h"); `cold` when the
-     * gap passed it, so the lane's prompt cache had expired (cold-cache.ts).
+     * gap passed it, so the lane's prompt cache had expired (cold-cache.ts). Sampled on arrival:
+     * a forced cold compression is `compaction.reason: "cold-cache"`, not `cold` alone (another
+     * request of the lane may have warmed it, or the size was under the target).
      */
     coldCache?: {
         gapMs: number;

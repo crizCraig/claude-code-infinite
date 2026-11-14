@@ -2866,7 +2866,7 @@ async function handleMessages(
       requestSendPolicies.get(req)?.allowed.add(fork.body);
       releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
       recordTurn(rec, "fork-memory", fork.body);
-      noteAwayWarmsMain(state, rec, requestSessionId(req));
+      noteAwayWarmsMain(state, rec, requestSessionId(req), fork.body);
       capture(opts, "anthropic-request-memory-fork", fork.body);
       return logged(
         forwardRaw(req, res, fork.body, opts, upstream, state.shutdownSignal, rec)
@@ -7879,16 +7879,24 @@ function noteLaneCache(
   laneSendStamps.set(rec, () => clock.sent(routeKey));
 }
 
-/** An away recap sent on the main thread's prefix also refreshes the main lane's cache. */
-function noteAwayWarmsMain(state: ProxyState, rec: MessagesRecord, sessionId: string | undefined) {
+/**
+ * An away recap sent on the main thread's prefix (`forkBody`, as delivery sent it, not a
+ * replacement late recovery chose) also refreshes the main lane's cache.
+ */
+function noteAwayWarmsMain(
+  state: ProxyState, rec: MessagesRecord, sessionId: string | undefined, forkBody: Buffer
+): void {
   const stamp = laneSendStamps.get(rec);
   if (!stamp) return;
   const main = JSON.stringify([sessionId ?? "", "main"]);
-  laneSendStamps.set(rec, () => { stamp(); state.laneCacheClock.sent(main); });
+  laneSendStamps.set(rec, (sent) => {
+    stamp(sent);
+    if (sent === forkBody) state.laneCacheClock.sent(main);
+  });
 }
 
-/** Per request: stamps its lane's cache clock as it goes upstream (noteLaneCache). */
-const laneSendStamps = new WeakMap<MessagesRecord, () => void>();
+/** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
+const laneSendStamps = new WeakMap<MessagesRecord, (sent: Buffer) => void>();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
 const coldGaps = new WeakMap<MessagesRecord, { lane: string; basis: number }>();
 /** Requests that claimed their cold gap (a re-plan of the same request keeps it). */
@@ -8214,7 +8222,7 @@ function forwardAccepted(
       return;
     }
 
-    if (rec) laneSendStamps.get(rec)?.();
+    if (rec) laneSendStamps.get(rec)?.(bodyBuffer);
     upstreamReq = upstream.module.request(
       {
         host: upstream.host,

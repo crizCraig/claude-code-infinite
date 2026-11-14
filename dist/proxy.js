@@ -1899,7 +1899,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             requestSendPolicies.get(req)?.allowed.add(fork.body);
             releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
             recordTurn(rec, "fork-memory", fork.body);
-            noteAwayWarmsMain(state, rec, requestSessionId(req));
+            noteAwayWarmsMain(state, rec, requestSessionId(req), fork.body);
             capture(opts, "anthropic-request-memory-fork", fork.body);
             return logged(forwardRaw(req, res, fork.body, opts, upstream, state.shutdownSignal, rec));
         }
@@ -5962,15 +5962,22 @@ function noteLaneCache(opts, state, rec, routeKey, body, notConversation) {
         coldGaps.set(rec, { lane: routeKey, basis: gap.basis });
     laneSendStamps.set(rec, () => clock.sent(routeKey));
 }
-/** An away recap sent on the main thread's prefix also refreshes the main lane's cache. */
-function noteAwayWarmsMain(state, rec, sessionId) {
+/**
+ * An away recap sent on the main thread's prefix (`forkBody`, as delivery sent it, not a
+ * replacement late recovery chose) also refreshes the main lane's cache.
+ */
+function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
     const stamp = laneSendStamps.get(rec);
     if (!stamp)
         return;
     const main = JSON.stringify([sessionId ?? "", "main"]);
-    laneSendStamps.set(rec, () => { stamp(); state.laneCacheClock.sent(main); });
+    laneSendStamps.set(rec, (sent) => {
+        stamp(sent);
+        if (sent === forkBody)
+            state.laneCacheClock.sent(main);
+    });
 }
-/** Per request: stamps its lane's cache clock as it goes upstream (noteLaneCache). */
+/** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
 const coldGaps = new WeakMap();
@@ -6272,7 +6279,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             return;
         }
         if (rec)
-            laneSendStamps.get(rec)?.();
+            laneSendStamps.get(rec)?.(bodyBuffer);
         upstreamReq = upstream.module.request({
             host: upstream.host,
             port: upstream.port,
