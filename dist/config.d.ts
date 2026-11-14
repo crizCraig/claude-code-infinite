@@ -8,6 +8,11 @@ export interface Config {
     autoUpdate?: boolean;
     /** false turns off client diagnostics (diagnostics.ts). */
     diagnostics?: boolean;
+    /**
+     * true runs sessions in HTTPS-proxy mode (Remote Control; https-proxy-eligibility.ts)
+     * where it can work. CCC_HTTPS_PROXY_MODE=1/0 overrides it.
+     */
+    httpsProxyMode?: boolean;
 }
 export declare function getConfigDir(): string;
 export declare function loadConfig(): Config;

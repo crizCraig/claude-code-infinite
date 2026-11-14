@@ -61,6 +61,8 @@ import { probeAnswersForSession, probeClaudeAuthStatus, skippedProbe, } from "./
 import { mayWaitForEnter, presentSignInNotice, sessionProbe, signInNotice, signInNoticeApplies, SignInTracker, } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
 import { urlOpenerFor } from "./open-url.js";
+import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
+import { startHttpsProxySession, } from "./https-proxy-session.js";
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
 const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
@@ -609,7 +611,13 @@ async function main() {
     const memtreeLinkPlacement = memtreeLinkPlacementFromEnv(process.env.CCC_MEMTREE_LINK);
     const memtreeLinkStore = new MemtreeLinkStore();
     const transcriptUsage = new ClaudeTranscriptUsage();
+    // Opt-in HTTPS-proxy mode (Remote Control): skipped, with one line, where it can't work.
+    const httpsProxy = httpsProxySessionFor(claudeArgs, config, isDebugMode);
+    // Set just before Claude Code starts: undefined if it runs in base-URL mode after all,
+    // whose model calls never pass the interception (so no missing-call warning then).
+    let proxyModeChild;
     const proxy = await startProxy({
+        ...(httpsProxy ? { httpsProxyMode: httpsProxy.proxyOptions } : {}),
         memtree,
         debug: isDebugMode,
         reqlog: observedLog,
@@ -660,7 +668,9 @@ async function main() {
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
         // install) on a later SessionStart of this session, once.
         sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine, statuslineSessionLine),
-        promptSubmitNotice: interactiveUi ? () => rateLimits.promptLine() : undefined,
+        promptSubmitNotice: interactiveUi
+            ? () => joinPromptLines(rateLimits.promptLine(), proxyModeChild ? httpsProxy?.promptLine() : undefined)
+            : undefined,
         // `/memtree-view` opens its link only where a browser would appear in
         // front of the user: interactive (also not `-pc`-style print), not SSH
         // or CI (open-url.ts).
@@ -767,8 +777,9 @@ async function main() {
     // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
     // native login and sends its own OAuth bearer to the local base URL.
     const claudeStartedAt = Date.now();
+    proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
     const child = spawn(claude.command, childArgs, {
-        env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`), claude),
+        env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild), claude),
         stdio: "inherit",
     });
     // Its memtree MCP server asks the proxy which session this process is on.
@@ -1033,5 +1044,53 @@ function pausedUpdateLine(autoUpdate) {
     if (autoUpdate?.bannerInstalled)
         return updateInstalledNoticeText(autoUpdate.bannerInstalled, color);
     return autoUpdate?.bannerUpdate ? updateNoticeText(autoUpdate.bannerUpdate, color) : null;
+}
+/**
+ * The session's HTTPS-proxy mode (https-proxy-session.ts), when asked for
+ * (CCC_HTTPS_PROXY_MODE or the `httpsProxyMode` config key) and nothing rules it out
+ * (https-proxy-eligibility.ts); otherwise undefined: today's base-URL mode, with one line
+ * saying why when it was asked for. Its temp files go when ccc exits.
+ */
+function httpsProxySessionFor(claudeArgs, config, debug) {
+    const decision = httpsProxyModeDecision({
+        env: process.env, configured: config.httpsProxyMode, platform: process.platform,
+        claudeArgs, cwd: process.cwd(),
+    });
+    if (decision.mode === "base-url") {
+        if (decision.requested)
+            console.log(`${skippedNoticeText(decision.reason)}\n`);
+        return undefined;
+    }
+    try {
+        const session = startHttpsProxySession(process.env, process.env.CCC_PROXY_TRACE);
+        process.on("exit", session.cleanup);
+        console.log("\x1b[2mHTTPS-proxy mode: /remote-control is available in this session\x1b[0m\n");
+        return session;
+    }
+    catch (err) {
+        console.log(`${skippedNoticeText(`its setup failed (${String(err)})`)}\n`);
+        if (debug)
+            console.error(`[DEBUG] HTTPS-proxy mode setup failed: ${String(err)}`);
+        return undefined;
+    }
+}
+/** Claude Code's env pieces for proxy mode; undefined (base-URL mode) if they can't be written. */
+function httpsProxyChild(session, port, debug) {
+    if (!session)
+        return undefined;
+    try {
+        return session.childFor(port);
+    }
+    catch (err) {
+        // The loopback still serves base-URL requests: this session just has no /rc.
+        console.log(`${skippedNoticeText(`its Bash env file couldn't be written`)}\n`);
+        if (debug)
+            console.error(`[DEBUG] HTTPS-proxy mode: ${String(err)}`);
+        return undefined;
+    }
+}
+function joinPromptLines(...lines) {
+    const present = lines.filter((line) => typeof line === "string" && line !== "");
+    return present.length ? present.join("\n") : undefined;
 }
 //# sourceMappingURL=cli-main.js.map

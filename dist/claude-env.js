@@ -40,13 +40,22 @@
  */
 /** Claude Code's local refusal limit under ccc: effectively never reached. */
 export const UNREACHABLE_BLOCKING_LIMIT = "1000000000";
-export function claudeChildEnv(parentEnv, anthropicBaseUrl) {
-    const childEnv = {
-        ...parentEnv,
-        ANTHROPIC_BASE_URL: anthropicBaseUrl,
-        _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
-        CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000",
-    };
+/**
+ * `httpsProxy` (HTTPS-proxy mode, https-proxy-session.ts): Claude Code reaches ccc
+ * through HTTPS_PROXY instead, with no custom base URL (so Remote Control stays
+ * available and no first-party override is needed); the MemTree MCP server and agents
+ * find the loopback in CCC_MEMTREE_PROXY, and Bash commands get today's variables back
+ * from CLAUDE_ENV_FILE.
+ */
+export function claudeChildEnv(parentEnv, anthropicBaseUrl, httpsProxy) {
+    const childEnv = httpsProxy
+        ? httpsProxyChildEnv(parentEnv, anthropicBaseUrl, httpsProxy)
+        : {
+            ...parentEnv,
+            ANTHROPIC_BASE_URL: anthropicBaseUrl,
+            _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
+        };
+    childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = "1000000000";
     // Wrapper-only control; do not leak it into Claude Code itself.
     delete childEnv.CCC_AUTO_COMPACT;
     if (parentEnv.CCC_AUTO_COMPACT === "1") {
@@ -60,6 +69,22 @@ export function claudeChildEnv(parentEnv, anthropicBaseUrl) {
             childEnv.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE = UNREACHABLE_BLOCKING_LIMIT;
         }
     }
+    return childEnv;
+}
+function httpsProxyChildEnv(parentEnv, loopbackUrl, httpsProxy) {
+    const childEnv = {
+        ...parentEnv,
+        ...httpsProxy.noProxy,
+        HTTPS_PROXY: httpsProxy.proxyUrl,
+        NODE_EXTRA_CA_CERTS: httpsProxy.caBundlePath,
+        CLAUDE_ENV_FILE: httpsProxy.bashEnvPath,
+        CCC_MEMTREE_PROXY: loopbackUrl,
+    };
+    // An outer base URL (e.g. a nested ccc) must not override the proxy route.
+    delete childEnv.ANTHROPIC_BASE_URL;
+    delete childEnv._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL;
+    // Claude Code would read the lowercase one too; Bash gets the user's value back.
+    delete childEnv.https_proxy;
     return childEnv;
 }
 function envFlagEnabled(value) {
