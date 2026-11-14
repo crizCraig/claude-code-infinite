@@ -363,8 +363,8 @@ How it works and what it changes:
 - **When it stays off.** `ccc` uses the default mode for the session, and says so in one line,
   on Windows; when you already use a proxy (`HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` in your
   environment); when a Claude Code settings file (user, project, local, managed, or
-  `--settings`) sets a proxy, `NO_PROXY` or `NODE_EXTRA_CA_CERTS` in its `env`; and when Claude
-  Code's Bash sandbox is enabled. These are checked at startup. If you turn one on mid-session
+  `--settings`) sets a proxy, `NO_PROXY`, `NODE_EXTRA_CA_CERTS` or `CLAUDE_ENV_FILE` in its `env`;
+  and when Claude Code's Bash sandbox is enabled. These are checked at startup. If you turn one on mid-session
   and your prompts stop reaching `ccc`, it warns you once. Restart `ccc` then.
 - `CCC_PROXY_TRACE=<file>` writes a debug trace: connection targets, and the method, path,
   status and User-Agent of each decrypted request. It holds no other header values and no bodies.

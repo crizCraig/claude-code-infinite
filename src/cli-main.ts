@@ -792,6 +792,9 @@ async function main() {
   const transcriptUsage = new ClaudeTranscriptUsage();
   // Opt-in HTTPS-proxy mode (Remote Control): skipped, with one line, where it can't work.
   const httpsProxy = httpsProxySessionFor(claudeArgs, config, isDebugMode);
+  // Set just before Claude Code starts: undefined if it runs in base-URL mode after all,
+  // whose model calls never pass the interception (so no missing-call warning then).
+  let proxyModeChild: HttpsProxyChild | undefined;
   const proxy = await startProxy({
     ...(httpsProxy ? { httpsProxyMode: httpsProxy.proxyOptions } : {}),
     memtree,
@@ -847,7 +850,8 @@ async function main() {
     // install) on a later SessionStart of this session, once.
     sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine, statuslineSessionLine),
     promptSubmitNotice: interactiveUi
-      ? () => joinPromptLines(rateLimits.promptLine(), httpsProxy?.promptLine())
+      ? () => joinPromptLines(rateLimits.promptLine(),
+        proxyModeChild ? httpsProxy?.promptLine() : undefined)
       : undefined,
     // `/memtree-view` opens its link only where a browser would appear in
     // front of the user: interactive (also not `-pc`-style print), not SSH
@@ -966,10 +970,10 @@ async function main() {
   // Never set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY — Claude Code keeps its
   // native login and sends its own OAuth bearer to the local base URL.
   const claudeStartedAt = Date.now();
+  proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
   const child = spawn(claude.command, childArgs, {
     env: withClaudeOnPath(
-      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`,
-        httpsProxyChild(httpsProxy, proxy.port, isDebugMode)),
+      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
       claude
     ),
     stdio: "inherit",

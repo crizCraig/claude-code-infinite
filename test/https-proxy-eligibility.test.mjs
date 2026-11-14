@@ -62,6 +62,16 @@ test("settings env with a proxy, NO_PROXY or a CA, in any scope, keeps the base-
       assert.match(d.reason, new RegExp(`${key} is set in ${file.replace(/[.]/g, "\\.")}`));
     }
   }
+  const bom = "\uFEFF";
+  assert.match(decide({ files: { [scopes[0]]: `${bom}{"sandbox":{"enabled":true}}` } }).reason,
+    /sandbox is on/, "a BOM doesn't hide the sandbox (Codex r1 P1)");
+  assert.match(decide({ files: { [scopes[2]]: `${bom}{"env":{"HTTPS_PROXY":"x"}}` } }).reason,
+    /HTTPS_PROXY/);
+  assert.match(decide({ args: ["--settings", "b.json"],
+    files: { [path.join(CWD, "b.json")]: `${bom}{"sandbox":{"enabled":true}}` } }).reason,
+  /--settings/);
+  assert.match(decide({ files: { [scopes[0]]: '{"env":{"CLAUDE_ENV_FILE":"/u/env.sh"}}' } }).reason,
+    /CLAUDE_ENV_FILE is set/, "it would replace the Bash env file (Codex r1 P2)");
   const unrelated = decide({ files: { [scopes[0]]: JSON.stringify({ env: { FOO: "1" } }) } });
   assert.equal(unrelated.mode, "https-proxy");
   assert.equal(decide({ files: { [scopes[0]]: "{not json" } }).mode, "https-proxy");

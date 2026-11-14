@@ -27,8 +27,14 @@ export const HTTPS_PROXY_MODE_ENV = "CCC_HTTPS_PROXY_MODE";
 const PROXY_VARS = [
     "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
 ];
-/** Settings `env` keys that would override what proxy mode gives Claude Code. */
-const SETTINGS_ENV_BLOCKERS = [...PROXY_VARS, "NO_PROXY", "no_proxy", "NODE_EXTRA_CA_CERTS"];
+/**
+ * Settings `env` keys that would override what proxy mode gives Claude Code. A settings
+ * CLAUDE_ENV_FILE would replace the Bash env file, so Bash commands would keep the token
+ * proxy and the session CA.
+ */
+const SETTINGS_ENV_BLOCKERS = [
+    ...PROXY_VARS, "NO_PROXY", "no_proxy", "NODE_EXTRA_CA_CERTS", "CLAUDE_ENV_FILE",
+];
 export function httpsProxyModeDecision(input) {
     if (!httpsProxyModeRequested(input.env, input.configured)) {
         return { mode: "base-url", requested: false };
@@ -178,11 +184,12 @@ function readTextFile(file) {
         return null;
     }
 }
+/** JSON as Claude Code reads settings: a leading byte-order mark is allowed. */
 function parseJson(text) {
     if (text === null)
         return undefined;
     try {
-        return JSON.parse(text);
+        return JSON.parse(text.replace(/^\uFEFF/, ""));
     }
     catch {
         return undefined;

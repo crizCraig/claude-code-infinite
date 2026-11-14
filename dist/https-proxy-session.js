@@ -126,8 +126,8 @@ export function shellQuote(value) {
 }
 /**
  * Settings that change mid-session (a proxy in a settings `env`, the sandbox turned on)
- * can send Claude Code's model calls past ccc with no error. Two prompts with no model
- * call through ccc between them get one warning.
+ * can send Claude Code's model calls past ccc with no error. Two consecutive prompts with
+ * no model call through ccc get one warning, at the next prompt.
  */
 export class ModelCallWatch {
     promptsWithoutCall = 0;
@@ -139,7 +139,8 @@ export class ModelCallWatch {
         if (this.warned)
             return undefined;
         this.promptsWithoutCall++;
-        if (this.promptsWithoutCall < 2)
+        // Two whole prompts with no call (a prompt a user's hook blocks makes none): at the third.
+        if (this.promptsWithoutCall < 3)
             return undefined;
         this.warned = true;
         return MODEL_CALLS_MISSING;

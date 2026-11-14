@@ -122,11 +122,12 @@ test("cleanup removes the session's files", () => {
   assert.equal(existsSync(path.dirname(child.caBundlePath)), false);
 });
 
-test("two prompts with no model call through ccc get one warning", () => {
+test("two consecutive prompts with no model call through ccc get one warning", () => {
   const watch = new ModelCallWatch();
   assert.equal(watch.promptLine(), undefined);
   watch.modelCall();
   assert.equal(watch.promptLine(), undefined, "a model call since the last prompt");
+  assert.equal(watch.promptLine(), undefined, "one prompt without a call (a blocked prompt)");
   assert.equal(watch.promptLine(), MODEL_CALLS_MISSING);
   assert.equal(watch.promptLine(), undefined, "once per session");
   assert.match(MODEL_CALLS_MISSING, /CCC_HTTPS_PROXY_MODE=0/);

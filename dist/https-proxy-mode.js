@@ -59,7 +59,8 @@ function onConnect(req, socket, head, ctx) {
     ctx.trace({ ev: "connect", target: req.url, ua: userAgent(req), mitm });
     // Before any answer: a reset must not be an unhandled error, and drain must see it.
     socket.on("error", () => { });
-    ctx.tunnels.track(socket, mitm ? "intercepted" : "blind");
+    if (!ctx.tunnels.track(socket, mitm ? "intercepted" : "blind"))
+        return;
     if (!target)
         return refuse(socket, "HTTP/1.1 400 Bad Request\r\n\r\n");
     if (!authorized(req, ctx.opts.proxyToken)) {
@@ -84,7 +85,8 @@ function interceptServer(onRequest, upstream, tunnels, trace) {
     server.on("upgrade", (req, socket, head) => {
         trace({ ev: "upgrade", path: pathOf(req) });
         socket.on("error", () => { });
-        tunnels.track(socket, "intercepted");
+        if (!tunnels.track(socket, "intercepted"))
+            return;
         tunnels.requestStarted(socket); // a live WebSocket is never idle: only the deadline cuts it
         upgradeToUpstream(req, socket, head, upstream);
     });
@@ -200,10 +202,16 @@ class TunnelSet {
     sets = { blind: new Set(), intercepted: new Set() };
     inFlight = new Map();
     draining = false;
+    /** false (and the socket destroyed) once drain started: no new tunnels or upgrades. */
     track(socket, kind) {
+        if (this.draining) {
+            socket.destroy();
+            return false;
+        }
         const set = this.sets[kind];
         set.add(socket);
         socket.once("close", () => set.delete(socket));
+        return true;
     }
     trackDecrypted(socket) {
         this.inFlight.set(socket, 0);

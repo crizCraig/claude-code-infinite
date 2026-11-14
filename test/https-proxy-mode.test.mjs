@@ -281,3 +281,25 @@ test("CONNECT authorities parse with IPv6 brackets, ports bounded", () => {
   }
   assert.equal(proxyUrlFor(4321, "abc"), "http://ccc:abc@127.0.0.1:4321");
 });
+
+test("a CONNECT after drain started gets no tunnel (review r1 P3)", async () => {
+  const echo = net.createServer((s) => s.pipe(s));
+  await new Promise((r) => echo.listen(0, "127.0.0.1", r));
+  const h = await harness();
+  try {
+    // One kept-alive loopback socket: a request first, then a CONNECT once drain began.
+    const sock = net.connect(h.proxy.port, "127.0.0.1");
+    await new Promise((r) => sock.once("connect", r));
+    sock.on("error", () => {});
+    const draining = h.proxy.drain(5_000);
+    sock.write(`CONNECT 127.0.0.1:${echo.address().port} HTTP/1.1\r\nHost: x\r\n` +
+      `Proxy-Authorization: Basic ${Buffer.from(`ccc:${TOKEN}`).toString("base64")}\r\n\r\n`);
+    const started = Date.now();
+    await draining;
+    assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started} ms`);
+    sock.destroy();
+  } finally {
+    h.upstream.close();
+    echo.close();
+  }
+});

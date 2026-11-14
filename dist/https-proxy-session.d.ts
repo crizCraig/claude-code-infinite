@@ -41,8 +41,8 @@ export declare function bashEnvScript(input: BashEnvInput): string;
 export declare function shellQuote(value: string): string;
 /**
  * Settings that change mid-session (a proxy in a settings `env`, the sandbox turned on)
- * can send Claude Code's model calls past ccc with no error. Two prompts with no model
- * call through ccc between them get one warning.
+ * can send Claude Code's model calls past ccc with no error. Two consecutive prompts with
+ * no model call through ccc get one warning, at the next prompt.
  */
 export declare class ModelCallWatch {
     private promptsWithoutCall;
