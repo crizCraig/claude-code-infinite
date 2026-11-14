@@ -207,8 +207,11 @@ export function formatSearchResults(body, args) {
     }
     const hits = body.hits ?? [];
     const hybrid = body.mode === "hybrid";
-    if (!hits.length)
-        return noHits(query, hybrid ? "hybrid" : "text", args, body.coverage, body.charged);
+    const notes = hybrid ? legNotes(body.legs) : [];
+    if (!hits.length) {
+        const empty = noHits(query, hybrid ? "hybrid" : "text", args, body.coverage, body.charged, notes.length > 0);
+        return notes.length ? `${empty} ${notes.join(" ")}` : empty;
+    }
     const kind = hybrid ? "hybrid" : "text";
     const out = [
         `${hits.length} ${kind} match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}` +
@@ -216,7 +219,7 @@ export function formatSearchResults(body, args) {
             ":",
     ];
     if (hybrid)
-        out.push(HYBRID_NOTE);
+        out.push(HYBRID_NOTE, ...notes);
     const missing = new MissingTimeNote();
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     if (body.relaxed === "any_word") {
@@ -265,6 +268,25 @@ function formatHit(hit, n, missing) {
     }
     return lines;
 }
+/** What each ranking of a hybrid page reported: a failure, a partial or relaxed ranking. */
+export function legNotes(legs) {
+    if (!legs || typeof legs !== "object")
+        return [];
+    const out = [];
+    for (const [name, leg] of Object.entries(legs)) {
+        if (!leg || typeof leg !== "object")
+            continue;
+        if (leg.error)
+            out.push(`(The ${name} search ${leg.error === "timed out" ? "timed out" : `failed: ${leg.error}`}, so it ranked nothing here.)`);
+        if (leg.partial)
+            out.push(`(The ${name} search ranked only the newest trees: it ran out of time.)`);
+        if (leg.relaxed === "any_word")
+            out.push(`(The ${name} search found no passage with every word, so it ranked those with some.)`);
+        if (leg.matches_capped)
+            out.push(`(The ${name} search ranked only the newest matching passages.)`);
+    }
+    return out;
+}
 /** `text #2 · vector #1`: where each ranking of a hybrid search placed the hit. */
 function legsLine(legs) {
     if (!legs || typeof legs !== "object")
@@ -296,14 +318,16 @@ export function formatPath(path, ref) {
         .map((p) => `${oneLine(p.summary, PATH_SUMMARY_CHARS)}${ref ? ` (${ref}#${p.id})` : ` (node ${p.id})`}`)
         .join(" › ");
 }
-function noHits(query, mode, args, coverage, charged) {
+function noHits(query, mode, args, coverage, charged, legFailed = false) {
     if (args.cursor)
         return "No more matches.";
     const searched = charged ? `${mode} search, ${CHARGED_NOTE}` : `${mode} search`;
     const other = mode === "vector"
         ? 'For an exact word, id or path, try mode "text".'
         : mode === "hybrid"
-            ? "Neither the words nor their meaning matched: try other words or a wider scope."
+            ? legFailed
+                ? 'Not every search ran (below): try again, or mode "text" or "vector".'
+                : "Neither the words nor their meaning matched: try other words or a wider scope."
             : 'Text mode needs the exact words; for meaning, try mode "vector".';
     if (typeof args.tree === "string" && args.tree) {
         return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${searched}). ${other}`;

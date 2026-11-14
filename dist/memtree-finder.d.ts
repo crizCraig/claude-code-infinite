@@ -114,6 +114,16 @@ export interface FinderSearchResponse {
     relaxed?: string;
     /** On an empty first page across sessions (servers from 2026-11): what was searched. */
     coverage?: FinderSearchCoverage;
+    /** A hybrid page: what each ranking reported (`text`, `vector` or `vector:<model>`). */
+    legs?: Record<string, FinderSearchLeg>;
+}
+/** One ranking of a hybrid search (polychat memtree_hybrid.legs_field). */
+export interface FinderSearchLeg {
+    hits?: number;
+    error?: string;
+    relaxed?: string;
+    matches_capped?: boolean;
+    partial?: unknown;
 }
 /** One embedding model's ranking. */
 export interface FinderSearchGroup {
@@ -177,6 +187,8 @@ export declare const CHARGED_NOTE = "charged: one search";
 export declare function formatSearchResults(body: FinderSearchResponse, args: Record<string, unknown>): string;
 /** Said under a hybrid page's heading. */
 export declare const HYBRID_NOTE = "(Text and vector matches fused by rank: each hit says where each search ranked it; one page, no cursor.)";
+/** What each ranking of a hybrid page reported: a failure, a partial or relaxed ranking. */
+export declare function legNotes(legs: FinderSearchResponse["legs"]): string[];
 /** Ancestors root first, ` › `-joined, each with its address when the tree is known. */
 export declare function formatPath(path: {
     id: number;

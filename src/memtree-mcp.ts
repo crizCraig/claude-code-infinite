@@ -45,6 +45,8 @@ import {
   searchMode,
   defaultSearchMode,
   hybridSearchOn,
+  HYBRID_SEARCH_ENV,
+  type FinderSearchMode,
   formatSessions,
   RECENT_SEARCH_WINDOWS_DAYS,
   recentSearchArgs,
@@ -368,6 +370,26 @@ const HYBRID_MODE_DESCRIPTION =
   "hybrid (default here: text and vector together, fused by rank; one page, no cursor), text (exact words) or " +
   "vector (meaning); first page charged, except text in one tree.";
 
+/** The search tool's mode sentence, and what it says once hybrid is the default. */
+const TEXT_DEFAULT_SENTENCE =
+  "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
+  "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
+  "first page is charged even when cached; cursor continuation and a text search of one tree are free.";
+const HYBRID_DEFAULT_SENTENCE =
+  "mode \"hybrid\" (default) runs text and vector together and fuses them by rank into one page (no cursor), " +
+  "one tree included; mode \"text\" matches exact words, ids, paths and errors (in one tree: node summaries and " +
+  "transcript lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 in any " +
+  "mode: its first page is charged even when cached; cursor continuation and a text search of one tree are free.";
+/** The MCP instructions' mode sentence, and what it says once hybrid is the default. */
+const TEXT_DEFAULT_INSTRUCTION =
+  "Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
+  "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
+  "re-embedded, as is a text search of one tree.";
+const HYBRID_DEFAULT_INSTRUCTION =
+  "Hybrid mode (default) runs text and vector together, fused by rank into one page; text mode matches exact " +
+  "words, ids and paths; vector mode matches meaning. A search costs $0.0005 in any mode, one tree included " +
+  "unless the mode is text: its first page is charged even when cached; cursor continuation is free.";
+
 /** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
 export function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS {
   if (!hybridSearchOn(env)) return MEMTREE_TOOLS;
@@ -375,8 +397,20 @@ export function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS {
     if (tool.name !== "search") return tool;
     const properties = tool.inputSchema.properties as Record<string, unknown>;
     const mode = { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION };
-    return { ...tool, inputSchema: { ...tool.inputSchema, properties: { ...properties, mode } } };
+    const description = replaceOnce(tool.description, TEXT_DEFAULT_SENTENCE, HYBRID_DEFAULT_SENTENCE);
+    return { ...tool, description, inputSchema: { ...tool.inputSchema, properties: { ...properties, mode } } };
   }) as typeof MEMTREE_TOOLS;
+}
+
+/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS, saying hybrid is the default once opted in. */
+export function memtreeInstructions(env: NodeJS.ProcessEnv): string {
+  if (!hybridSearchOn(env)) return MEMTREE_MCP_INSTRUCTIONS;
+  return replaceOnce(MEMTREE_MCP_INSTRUCTIONS, TEXT_DEFAULT_INSTRUCTION, HYBRID_DEFAULT_INSTRUCTION);
+}
+
+function replaceOnce(text: string, from: string, to: string): string {
+  if (!text.includes(from)) throw new Error(`memtree MCP: hybrid wording is out of date ("${from.slice(0, 40)}…")`);
+  return text.replace(from, to);
 }
 
 export interface MemtreeMcpDeps {
@@ -1025,7 +1059,7 @@ export async function handleMcpMessage(
         protocolVersion: typeof requested === "string" ? requested : LATEST_PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: MEMTREE_MCP_SERVER_NAME, version: CLIENT_VERSION },
-        ...(inert ? {} : { instructions: MEMTREE_MCP_INSTRUCTIONS }),
+        ...(inert ? {} : { instructions: memtreeInstructions(process.env) }),
       });
     }
     case "ping":
@@ -1145,18 +1179,51 @@ async function searchTool(
   if (typeof args.query !== "string" || !args.query.trim()) {
     throw new ToolInputError("search: query must be a non-empty string");
   }
-  const mode = searchMode(args.mode, defaultSearchMode(process.env));
+  const mode = toolSearchMode(args, process.env);
   const current = args.tree === CURRENT_TREE;
   const named = current ? undefined : checkTreeId(args.tree);
-  if (mode === "text" && (current || named)) {
-    const limit = args.limit === undefined ? undefined : Number(args.limit);
-    if (tree.search) return tree.search(args.query, limit, named);
-    return formatSearch(await tree.get(named), args.query, limit, named);
-  }
+  if (mode === "text" && (current || named)) return localTreeSearch(args, tree, named);
   if (!finder) throw new ToolInputError("search across sessions is not available here");
   if (current && !tree.currentId) throw new ToolInputError("this session's tree is not available here");
   const scope = current ? await tree.currentId!(true) : named;
-  return finder.searchSessions({ ...args, mode }, scope);
+  try {
+    return await finder.searchSessions({ ...args, mode }, scope);
+  } catch (err) {
+    // The default hybrid mode on a server that has it off: answer this search in text mode.
+    if (mode !== "hybrid" || isSet(args.mode) || !HYBRID_OFF_RE.test(String(err))) throw err;
+    const text = current || named
+      ? await localTreeSearch(args, tree, named)
+      : await finder.searchSessions({ ...args, mode: "text" }, scope);
+    return `${HYBRID_OFF_NOTE}\n\n${text}`;
+  }
+}
+
+/** The server's refusal of mode=hybrid while its MEMTREE_HYBRID_SEARCH is off. */
+const HYBRID_OFF_RE = /mode must be one of text, vector\b/;
+export const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
+
+/**
+ * The search's mode: the agent's, else hybrid once this process opted in (HYBRID_SEARCH_ENV),
+ * else text. A cursor without a mode keeps text (hybrid has no cursor), and hybrid is refused
+ * unless opted in.
+ */
+export function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode {
+  const on = hybridSearchOn(env);
+  const mode = searchMode(args.mode, on && !isSet(args.cursor) ? defaultSearchMode(env) : "text");
+  if (mode === "hybrid" && !on) {
+    throw new ToolInputError(`search: mode "hybrid" is off here (set ${HYBRID_SEARCH_ENV}=1 to use it)`);
+  }
+  return mode;
+}
+
+function localTreeSearch(args: Record<string, unknown>, tree: TreeSource, named?: string): Promise<string> {
+  const limit = args.limit === undefined ? undefined : Number(args.limit);
+  if (tree.search) return tree.search(args.query as string, limit, named);
+  return tree.get(named).then((index) => formatSearch(index, args.query as string, limit, named));
+}
+
+function isSet(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
 }
 
 /** `{tree, id}` from a node address, or from tree (optional) and the numeric field. */
