@@ -75,7 +75,7 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
   });
   async function post(bytes, { agent = 'a', oneMillion = false, text = 'x',
     session = 's', messages: suppliedMessages, model = 'claude-x', maxTokens = 64,
-    thread } = {}) {
+    thread, system } = {}) {
     const messages = suppliedMessages ?? [{ role: 'user', content: 'task' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: text.repeat(bytes) }] }];
@@ -83,7 +83,8 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
       method: 'POST', headers: { 'content-type': 'application/json',
         'x-claude-code-session-id': session, ...(agent ? { 'x-claude-code-agent-id': agent } : {}),
         ...(oneMillion ? { 'anthropic-beta': 'context-1m-2025-08-07' } : {}) },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages, ...(thread ? { thread } : {}) }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages, ...(thread ? { thread } : {}),
+        ...(system ? { system } : {}) }),
     });
     await response.text();
     return response.status;
@@ -112,6 +113,40 @@ for (const lane of ['main', 'agent']) {
       assert.equal(h.forwards.length, 3);
     } finally { h.close(); }
   });
+}
+
+// Claude Code's side request (a status summary): one message, no turn origin.
+const SIDE_SYSTEM = [{ type: 'text',
+  text: 'x-anthropic-billing-header: cc_version=2.1.325.29f; cc_entrypoint=cli; cch=1;' }];
+
+for (const lane of ['main', 'agent']) {
+  for (const fragment of ['side request', 'thread continue']) {
+    test(`${lane} lane, counting on: an exactly counted ${fragment} stores no size sample`, async () => {
+      // Codex r1 (PR #78): the plan-time exact count stored a fragment's sample in the
+      // conversation's slot; a denser fragment then over-sized the next whole request.
+      const tokensPerByte = body => JSON.stringify(body.messages).includes('y'.repeat(100))
+        ? 0.5 : 0.25;
+      const tokens = (body, bytes) => Math.floor(bytes * tokensPerByte(body));
+      const h = await harness({ budget: 100_000, messageThreads: 'passthrough',
+        count: body => ({ input_tokens: tokens(body, JSON.stringify(body).length) }),
+        usage: (body, bytes) => tokens(body, bytes) });
+      const agent = lane === 'main' ? null : 'a';
+      try {
+        assert.equal(await h.post(10_000, { agent }), 200);
+        const sideBody = fragment === 'side request'
+          ? { system: SIDE_SYSTEM, messages: [{ role: 'user', content: 'y'.repeat(350_000) }] }
+          : { thread: { type: 'continue', previous_message_id: 'msg_1' }, text: 'y' };
+        const bytes = fragment === 'side request' ? 0 : 350_000;
+        assert.equal(await h.post(bytes, { agent, ...sideBody }), 200);
+        const fragmentRecord = h.records.filter(r => r.kind === 'messages')[1];
+        assert.ok(fragmentRecord.notConversation, 'the fragment was classified as one');
+        // ~300 kB at the conversation's 0.25: ~75k, under the 100k budget.
+        assert.equal(await h.post(300_000, { agent }), 200);
+        assert.equal(h.compressions.length, 0, 'sized by the conversation, not the fragment');
+        assert.equal(h.forwards.length, 3);
+      } finally { h.close(); }
+    });
+  }
 }
 
 for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {

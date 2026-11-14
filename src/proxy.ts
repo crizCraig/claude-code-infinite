@@ -2419,7 +2419,8 @@ async function handleMessages(
     (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
   if (!rides) {
     const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
-    if (measured.source === "exact") {
+    // A fragment's count is not the conversation's: it never replaces its size sample.
+    if (measured.source === "exact" && !notConversation) {
       sizeSlot.set(sizeSampleOf(forwardCandidate.body, measured.tokens, rec.model ?? body.model));
     }
   }
@@ -7124,7 +7125,6 @@ function recordTurn(
 /** The forwarded body's inline image bytes (recordTurn), for the heavy-request notice. */
 const forwardedImageBytes = new WeakMap<MessagesRecord, number>();
 
-/** What this request uploaded to Anthropic, for the session's heavy-request notice. */
 /**
  * A request carrying `thread` while threads are off: answer ccc's own 400 (Claude Code then
  * resends stateless for the session) and forward nothing; log the first per session.
@@ -7150,6 +7150,7 @@ function refuseThreadRequest(
   return true;
 }
 
+/** What this request uploaded to Anthropic, for the session's heavy-request notice. */
 function noteForwardedSize(
   state: ProxyState, rec: MessagesRecord, sessionId: string | undefined,
 ): void {
