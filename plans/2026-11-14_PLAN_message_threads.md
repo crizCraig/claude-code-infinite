@@ -1,6 +1,6 @@
 # Message threads: ccc and MemTree with Anthropic's server-held conversations
 
-Status: plan (2026-11-14), revised after review round 1 (Opus and Codex). Nothing here has
+Status: plan (2026-11-14), revised after review rounds 1-2 (Opus and Codex). Nothing here has
 shipped. The stop-gap that turns threads off is being built separately (worktree
 `proxy-threads-off`; coordination in `~/src/agent-bus/threads/ccc-message-threads/notes.md`).
 This plan starts from that stop-gap.
@@ -11,9 +11,11 @@ ahead of it."
 ## Recommendation
 
 1. **Ship the stop-gap now, in every mode, with a backstop that ccc controls.** Set
-   `CLAUDE_CODE_TETHER_LIVE=0` in base-URL mode too, not only in HTTPS-proxy and desktop mode.
-   With the variable set to 1, a probe showed base-URL mode sends threads, so today only
-   Anthropic's rollout flag keeps them away. Back the variable up with a proxy-side switch:
+   `CLAUDE_CODE_TETHER_LIVE=0` in base-URL mode too, as a defence, not only in HTTPS-proxy
+   and desktop mode. With the variable unset, base-URL mode is kept off by a client gate that
+   also checks the base URL. With it set to 1, a probe showed base-URL mode sends threads, so
+   only that gate, which Anthropic can change in any release, keeps base-URL mode safe.
+   Back the variable up with a proxy-side switch:
    ccc answers any request that carries `thread` with a 400 `thread_unsupported_request`, and
    Claude Code then goes stateless for the rest of the session (probed below). Also fix the
    live size-sample bug (2.0): it already hurts whenever a continue slips through.
@@ -115,8 +117,11 @@ marked *(probed)*.
   - not ZDR (`tengu_twinkly_sunrise`)
 
   Then `CLAUDE_CODE_TETHER_LIVE`, a tri-state environment variable, decides when it is set:
-  `0` forces threads off, `1` turns them on. Unset, it falls back to an internal check this
-  plan could not resolve, plus the GrowthBook flag `tengu_curious_tower`.
+  `0` forces threads off, `1` turns them on. Unset, two more checks apply:
+  - `Gt() || gc()`. Per Codex r2's reading of the binary, `Gt()` is diskless mode, and
+    `gc()` is true when `ANTHROPIC_BASE_URL` is unset or points at `api.anthropic.com`. So
+    an ordinary localhost base URL (ccc base-URL mode) fails here.
+  - The GrowthBook flag `tengu_curious_tower`.
 
   Also excluded: models in `tengu_curious_tower_stateless_models`,
   `CLAUDE_CODE_SIMULATE_PROXY_USAGE`, and teleport/relay states. The main lane and each
@@ -163,8 +168,9 @@ marked *(probed)*.
     *(probed)*.
   - An unrecognised 400 on a request that carried the header is resent once without the
     header.
-  - Ordinary retries (5xx, network) resend the request already planned, the same continue
-    included. Only a thread error forces a create.
+  - *(inferred from the strings, not probed; H5 checks it with a mock 529 on a continue)*
+    Ordinary retries (5xx, network) resend the request already planned, the same continue
+    included. Only a thread error forces a create. The ledger transactions are safe either way.
   - The server can report "thinking dropped for prefix mismatch" (`input_transformations`,
     behind `tengu_wondrous_acorn`). That can make Claude Code re-create the thread, or hold it
     stateless.
@@ -185,7 +191,9 @@ that was probed, or probe its own shape first.
 
 What the probe settles:
 
-- Base-URL mode is not protected by its mode, only by the rollout flag.
+- With the override set to 1, base-URL mode sends threads. Unset, it is kept off by the
+  base-URL check (`gc()`), which is a client-side rule that a release can change, not a
+  property of the API. The harness covers the unset case too (H6).
 - A proxy can ask Claude Code for the full conversation whenever it wants, at the cost of one
   local round trip.
 - A proxy can turn threads off for a session without the environment variable.
@@ -238,7 +246,7 @@ threads (memory is under U6). It holds three views, and each consumer uses one:
 | View | Contents | Used by |
 |---|---|---|
 | `conversation` | the create's messages as Claude Code sent them, then committed replies and tails | MemTree: `noteMainConversation`, `indexInBackground`, the final index, after `normalizeMessagesForMemtree` (which drops reasoning blocks) |
-| `upstream` | the create's messages as ccc *forwarded* them (compressed or ridden), then the same replies and tails | sizing: estimates, `count_tokens` without `thread`, `maybePrepareCompression` input |
+| `upstream` | the forwarded create's body minus `thread` (its `system`, `tools` and messages as ccc *forwarded* them, compressed or ridden), then the same replies and tails | sizing only: estimates, and `count_tokens` without `thread`. Never sent to MemTree (it may be a compressed fragment) |
 | `anchor` | `generation`, `tipId`, `tipUsage` (the tip reply's reported prompt tokens plus output), the last create's system/tools/fixed-field hash | continue matching and budget checks |
 
 **Transactions.** Claude Code resends the same continue after a dropped stream, a 5xx or
@@ -265,23 +273,64 @@ ccc's own 503 index-wait answer, so nothing is appended when a request merely ar
   - no tool call was cut off by `max_tokens`
   - there is no `fallback_message` in `usage.iterations`
 
-  A completion from an older `generation` is dropped. A reply that was seen but not
-  committed leaves `tipId` empty. Claude Code then normally sends a create on its own, and if
-  it doesn't, the next continue gets a fake 404.
+  A completion from an older `generation` is dropped. The API never acknowledges storage,
+  so "committed" means only that the reply may be continued from. **What happened and what
+  can be continued are tracked separately:**
+  - A reply that completed but can't be continued from is still *retained*: a fallback-model
+    reply, a refusal, or a cut-off tool call. Its tail and reply are kept in an
+    `observed` suffix of the `conversation` view, marked uncommitted, and `tipId` is left
+    empty. MemTree indexing and the final index read `conversation` *including* `observed`,
+    so a session that ends on such a turn (Stop with no later create) still indexes its last
+    tail and reply.
+  - An interrupted stream keeps its tail and whatever text arrived, also in `observed`, as
+    Claude Code's own transcript does.
+  - The next create replaces `observed` with Claude Code's own version.
+  - Today's transcript fallback (`withFinalReply`) appends nothing when the history already
+    ends with an assistant, so the ledger itself must hold these turns.
+  - Claude Code normally sends a create after such a reply. If it doesn't, the next continue
+    gets a fake 404.
 - **Mismatch** (an unknown anchor, ccc restarted, a reply ccc couldn't parse, a dirty
   ledger, a lane ccc never saw): answer the fake 404, and the create that follows rebuilds the
-  ledger.
+  ledger. **Repair bound:** count unsuccessful repairs across generations and anchors, that is
+  a create whose next reply still leaves the ledger unusable. After 2 in a row, the lane gets
+  `thread_unsupported_request` and goes back to stateless, today's full-request path. Budget
+  episodes (2b) have their own bound.
 
-**Shadow first.** In step 2 nothing reads the ledger. Each create is compared, after
-`normalizeMessagesForMemtree`, with the ledger's `conversation` view of the same running
-session. A create is Claude Code's own full replay. Shadow mode can also force a replay every
-N continues to sample more often. Mismatches are counted by cause. Step 3 is gated on a
-measured mismatch rate, and a lane that mismatches stops feeding MemTree from the ledger until
-the next create repairs it.
+**Shadow first.** In step 2 nothing reads the ledger. Each create (Claude Code's own full
+replay) is compared with the ledger's `conversation` view of the same running session. Shadow
+mode can also force a replay every N continues to sample more often.
 
-No new uploads: with delta uploads on (`CCC_MEMTREE_DELTA=1`, tracker step 4), each index call
-already sends refs for acked messages, plus the new messages inline. Because creates
-converge on Claude Code's form, a reply whose stream form differs is re-uploaded once at most.
+`normalizeMessagesForMemtree` drops only reasoning blocks, so the comparison has its own
+normalization. It separates harmless wire formatting from missing or changed content:
+
+- Removed: every `cache_control` key. Claude Code moves breakpoints on each replay, while the
+  ledger keeps the markers each tail carried.
+- Removed: the billing-header system block, and `thinking`/`redacted_thinking` blocks (MemTree
+  drops these anyway).
+- Rejoined: adjacent text blocks of one assistant reply are joined.
+- Re-serialized: tool `input` is parsed and serialized canonically, to absorb
+  `wireToolInputs.textAsWritten`.
+- Alignment: by role sequence and `tool_use` ids, so per-request reminder text that Claude
+  Code adds or moves is reported as "reminder" and is not a mismatch.
+
+Anything left over (a missing or extra message, changed text or a changed tool result, a
+different tool id) is a mismatch, counted by cause. Deterministic fixtures cover moving cache
+markers, joined text runs, rewritten tool inputs and reminders. A lane that mismatches stops
+feeding MemTree from the ledger until the next create repairs it. Step 3 needs zero
+content mismatches across the shadow week, not "an acceptable rate".
+
+Uploads: with delta uploads on (`CCC_MEMTREE_DELTA=1`, tracker step 4), ordinary index calls
+send refs for messages the server acked, plus everything else inline. Those savings are
+steady-state and apply to acknowledged content only:
+
+- The **final index sends no refs** (memtree.ts disables message refs there), so it is a full
+  upload, as it is today.
+- Unacked or unservable messages, such as those with redacted secrets or unserved images,
+  are re-sent inline each time, per the delta contract.
+- A reply whose stream form differs from Claude Code's form is re-sent when the next create
+  replaces it.
+
+The harness measures the full payload (H2).
 
 ### (b) Compression with threads
 
@@ -290,9 +339,20 @@ converge on Claude Code's form, a reply whose stream form differs is re-uploaded
     `input_tokens + cache_read_input_tokens + cache_creation_input_tokens + output_tokens`),
     and add an estimate of the tail. This is a new per-thread sample, not the lane's
     whole-request samples.
-  - **Under the budget:** forward the continue unchanged. Also feed the `upstream` view to
-    `maybePrepareCompression`, so the background compression that starts at about 850k still
-    happens.
+  - **Under the budget:** forward the continue unchanged. Keep background compression (from
+    about 850k) working on continues.
+    - **Input:** `maybePrepareCompression` compresses the ORIGINAL conversation, as
+      `recoverLate` does. So it gets the ledger's `conversation` view, normalized as today,
+      with its hash, never the `upstream` view.
+    - **Trigger:** the `upstream` size (`anchor.tipUsage` plus the tail).
+    - **Setup:** `maybePrepareCompression` returns early without `rec.compaction`, so the
+      continue path builds that itself.
+    - **Scope:** main lane only, as today.
+    - **Test:** a loop of continues passes `prepareStartTokens` and prepares in the background.
+      At the budget, the fake-404 replay create rides the prepared result. Repeat this across a
+      **second** compression cycle: after the first compressed create, `upstream` starts with
+      the flattened memory message, but preparation still compresses `conversation`, and its
+      prefix identities match Claude Code's next full create.
   - **At the budget, and only when compression can actually run:** answer the fake 404. Claude
     Code sends the full create, and the tool-turn or edge compaction we have today compresses
     it, or rides the prepared result. Compression can run when no attempt is in flight for the
@@ -381,9 +441,13 @@ converge on Claude Code's form, a reply whose stream form differs is re-uploaded
   fragment. This is the PR #75 bug moved to the server, and any client or partner that
   forwards Claude Code bodies can trigger it.
   - The server stops storing and indexing a body with `thread.type == "continue"`.
-  - Every ccc release degrades to passthrough on any 4xx from `/v1/context_memory`
-    (memtree.ts), so for ccc a 400 that says to send the full conversation (or message refs)
-    is safe.
+  - S1 guards only clients that forward raw Claude Code bodies. It is not a fix for old ccc
+    releases: ccc never sends a `thread` field to MemTree (it uploads
+    `messagesWithSystem(messages, system)`), so the server can't spot a pre-#75 release's
+    fragment uploads.
+  - Current ccc degrades to passthrough on any failure from `/v1/context_memory` (`compress()`
+    returns null, memtree.ts). For ccc, a 400 that says to send the full conversation (or
+    message refs) is therefore safe.
   - For partners, whose fallback we don't know, answer with the messages unchanged plus a
     `thread_fragment` warning instead of a 400, unless a partner confirms it degrades on 4xx.
   - A `thread: {type: "create"}` field is harmless, so ignore it.
@@ -397,8 +461,8 @@ converge on Claude Code's form, a reply whose stream form differs is re-uploaded
 
 ### (d) What breaks for partners and other clients
 
-- **ccc base-URL mode:** the same gaps as proxy mode, once the rollout reaches it (the probe
-  shows nothing else stops it). The ledger covers every mode, because the classifier doesn't
+- **ccc base-URL mode:** kept off today by Claude Code's base-URL check (`gc()`). If a
+  release relaxes that check, it gets the same gaps as proxy mode. The ledger covers every mode, because the classifier doesn't
   depend on the mode.
 - **Clients that forward Claude Code request bodies to `/v1/context_memory`:** orphan trees
   and bad compressions, until S1 ships.
@@ -421,7 +485,7 @@ converge on Claude Code's form, a reply whose stream form differs is re-uploaded
 
 | # | Unknown or risk | How we settle it |
 |---|---|---|
-| U1 | Which users the gate turns on: the unresolved internal check plus `tengu_curious_tower`. Seen on subscription OAuth in HTTPS-proxy mode. `TETHER_LIVE=1` still needs first-party, experimental betas and a non-ZDR org. | Real-API acceptance (H6) across auth types and models. Plan for "everyone, any day". |
+| U1 | Which users the gate turns on: `Gt()`/`gc()` (diskless mode, or no custom base URL; per Codex r2, not probed with the override unset) plus `tengu_curious_tower`. Seen on subscription OAuth in HTTPS-proxy mode. `TETHER_LIVE=1` still needs first-party, experimental betas and a non-ZDR org. | Real-API acceptance (H6) across auth types and models. Plan for "everyone, any day". |
 | U2 | Continues carry a 1-block `system`, but the docs say no `system`. The thread's stored system can differ from Claude Code's (rule 4). | H1 and H3 against the real API, after a compressed create and after a ride create. |
 | U3 | The server TTL Claude Code expects for closed turns may be longer than 5 min. | H1 with a persistent process: idle 6 min, then see whether Claude Code continues and whether it gets a 404. |
 | U4 | Claude Code's thinking-drop logic re-creating, or holding stateless, after a compressed create. | H3 on Opus 5.5 with thinking on. |
@@ -461,9 +525,13 @@ output differs between runs.
 - **H1 (real API, Haiku):** a 15-step Bash loop, a 6-minute idle in the same process, then a
   human turn. Check: creates and continues as expected, no upstream `thread_*` 400s, what the
   1-block `system` is, and the TTL behaviour (U2, U3).
-- **H2 (mock):** the ledger's `conversation` view equals the normalized body of a forced
-  replay in the same session. The final index is the full conversation, and the tree covers
-  the last loop.
+- **H2 (mock):** the ledger's `conversation` view equals a forced replay in the same session,
+  under the comparison normalization (2a). The final index is the full conversation, and the
+  tree covers the last loop. Record the payload bytes of each index call and of the final
+  index. Also cover:
+  - a fallback reply, then Stop with no later create
+  - an interrupted stream, then Stop or exit
+  - repeated parse failures (the repair bound)
 - **H3 (real API, Opus 5.5 with thinking on):** a budget crossing during a continue gives a
   fake 404, then a compressed create, then continues on its id. Also test a ride create
   followed by continues. Check for no fingerprint mismatch, no 400, and how Claude Code reacts
@@ -480,6 +548,13 @@ output differs between runs.
   - a ccc restart mid-loop (desktop service), which should recover in one fake 404
 - **H6 (real API acceptance):** the off backstop and the probe's three runs, on subscription
   OAuth and on an API key, with the models we route.
+  - Base-URL mode with `CLAUDE_CODE_TETHER_LIVE` unset: expect no `thread` (the `gc()`
+    check). Check it on every Claude Code release.
+  - Also send `thread_unsupported_request` on a *continue* (the probe only tried a create).
+    The next body must hold every message, `tools` and the full `system`. Both the
+    window-guard and loop-bound exits depend on this.
+  - Also send a mock 529 on a continue (in H5), and record whether the retry is the same
+    continue.
 
 ## Sources
 
