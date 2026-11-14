@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.0.37](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.36...v1.0.37) (2026-11-14)
+
+
+### Features
+
+* delta uploads (message refs) behind CCC_MEMTREE_DELTA=1, default off ([f8972e2](https://github.com/crizCraig/claude-code-infinite/commit/f8972e2bae50edeb244ff926ff895715bac4b67b))
+* opt-in ccc desktop mode (Claude desktop app, macOS) ([b231968](https://github.com/crizCraig/claude-code-infinite/commit/b231968b9b0d5214dabb71d8a15456dfc37c03a7))
+* opt-in ccc desktop mode: MemTree for the Claude desktop app's Code tab (macOS) ([0d625d5](https://github.com/crizCraig/claude-code-infinite/commit/0d625d593b7f3d6c1fa39b7164b1439e05599e9a))
+* opt-in HTTPS-proxy mode for Remote Control in ccc sessions ([4b781e5](https://github.com/crizCraig/claude-code-infinite/commit/4b781e5027f77e76529753853e000738839829cc))
+* opt-in HTTPS-proxy mode so Remote Control works in ccc sessions (macOS, Linux) ([7956da0](https://github.com/crizCraig/claude-code-infinite/commit/7956da066453f957d6229f0fa1fb55f5fe886cf9))
+
+
+### Bug Fixes
+
+* a fragment is never a follow-up, so it reserves no route decision (Codex r2 P2, review r2) ([88c7973](https://github.com/crizCraig/claude-code-infinite/commit/88c7973129969df82b96b92ac21d075644b0db9b))
+* a message shorter than its ref is sent as it is (a delta never outgrows the full body); disabled conversations bounded (Codex r3) ([4bca948](https://github.com/crizCraig/claude-code-infinite/commit/4bca94886e3357023438b6d59c5c7592f19e3296))
+* a thread continuation still cancels the pending final index; fragments skip compress, route and recovery; old releases' no-tool main turns stay the conversation (review r1, Codex r1 P2s) ([85d35bf](https://github.com/crizCraig/claude-code-infinite/commit/85d35bfa57b26994a1a12d12c1614d678fa3417f))
+* acked messages' images are not decoded again, LRU for refused hashes, cache-mark positions skip keys JSON drops, message-refs declared only while active, image-409 resend logged (review r3) ([2275d60](https://github.com/crizCraig/claude-code-infinite/commit/2275d60ea36cd705a656d0f4df433121a7192924))
+* an image-ref 409 on a delta body resends the turn's ordinary body; all-missing check uses a set (Codex r2) ([19cf051](https://github.com/crizCraig/claude-code-infinite/commit/19cf051ebef8366f1a0b3cf4c47a174d823360ba))
+* deltas stay under the server's 32 MiB rebuild cap, size-cap 400s resend without disabling refs, the feature header is fixed with the body across transport retries (review r4, Codex r4) ([8ec0086](https://github.com/crizCraig/claude-code-infinite/commit/8ec0086a59c475b193203413259816299d3f7d32))
+* desktop MCP follows the session after /clear, certificate expiry flagged, Bash keeps the user's CA and env file, rotate-ca without launchd says to restart (review r1) ([f827d8a](https://github.com/crizCraig/claude-code-infinite/commit/f827d8af230be941493e7962fa20b6b7b3e4fbb8))
+* desktop upstream held to loopback, sessions whose project enables the sandbox refused (Codex r1 P1s); NO_PROXY covering Anthropic refused at setup, the user's CAs for the service's own TLS (Codex r1 P2s) ([14cae11](https://github.com/crizCraig/claude-code-infinite/commit/14cae116e200670d8f14061e210ef675d5c650a4))
+* each Desktop session's settings check also reads setup's CLAUDE_CONFIG_DIR, which the agent gets too (Codex r2 P1) ([08307da](https://github.com/crizCraig/claude-code-infinite/commit/08307da31a46f2ed512e26e1829214f35a1d9450))
+* message refs per conversation (session + opening), 409-named hashes never acked again, no acks from a trimmed body or an exit index's early answer, server-side image cap resends in full, one deadline across resends, ambiguous openings stay inline (review r1, Codex r1) ([aea130b](https://github.com/crizCraig/claude-code-infinite/commit/aea130bd6943d9f062a75ff1d5d7de39403e234c))
+* refused message refs always resend (even after the lane went off), only partial 409s ban hashes, refs and cache marks within the server's limits, no refs on the final index (review r2) ([44eb3b8](https://github.com/crizCraig/claude-code-infinite/commit/44eb3b87a67e00bcd228c3dd47511cdbac1027ec))
+* settings with a BOM or CLAUDE_ENV_FILE keep base-URL mode (Codex r1 P1, P2); no warning in base-URL fallback, none for one blocked prompt, no tunnels once draining (review r1 P3) ([f63b228](https://github.com/crizCraig/claude-code-infinite/commit/f63b2284edcbfcc9c6a231ab7890db7932eaf869))
+* side requests and message-thread continuations no longer become the session's MemTree conversation ([b506bac](https://github.com/crizCraig/claude-code-infinite/commit/b506bacb1f67d126806fc2c684467f6ec57c6314))
+* side requests and message-thread continuations no longer become the session's MemTree conversation ([fdd9dbf](https://github.com/crizCraig/claude-code-infinite/commit/fdd9dbf2d3136d36f96b2ac15a2f51b3f7e16d1a))
+
 ## [1.0.36](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.35...v1.0.36) (2026-11-13)
 
 
