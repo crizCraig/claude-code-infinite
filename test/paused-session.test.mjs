@@ -22,9 +22,11 @@ test("inside another ccc session, the outer session's settings are dropped too",
   const outer = {
     ANTHROPIC_BASE_URL: "http://127.0.0.1:51234", _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
     CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: "1000000000", DISABLE_AUTO_COMPACT: "1",
-    CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000", HOME: "/h",
+    CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "1000000000", CLAUDE_CODE_TETHER_LIVE: "0", HOME: "/h",
   };
   assert.deepEqual(plainClaudeEnv(outer), { HOME: "/h" });
+  const ownThreads = { ...outer, CLAUDE_CODE_TETHER_LIVE: "1" };
+  assert.equal(plainClaudeEnv(ownThreads).CLAUDE_CODE_TETHER_LIVE, "1", "a user's own value stays");
   const own = { ANTHROPIC_BASE_URL: "https://gw.example", DISABLE_AUTO_COMPACT: "1" };
   assert.deepEqual(plainClaudeEnv(own), own, "a user's own gateway and settings stay");
   const ownLimit = { ...outer, CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE: "150000" };

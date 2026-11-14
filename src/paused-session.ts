@@ -22,7 +22,7 @@ import {
   onHangup,
   settleWithin,
 } from "./cli-lifecycle.js";
-import { UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
+import { MESSAGE_THREADS_OFF, UNREACHABLE_BLOCKING_LIMIT } from "./claude-env.js";
 import { type ClaudeLocation, claudeMissingText, withClaudeOnPath } from "./claude-locate.js";
 import { type Diagnostics, recordError } from "./diagnostics.js";
 import {
@@ -83,6 +83,9 @@ export function plainClaudeEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
     if (env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE === UNREACHABLE_BLOCKING_LIMIT) {
       delete env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE;
     }
+    for (const [name, value] of Object.entries(MESSAGE_THREADS_OFF)) {
+      if (env[name] === value) delete env[name];
+    }
   }
   return env;
 }
@@ -103,7 +106,10 @@ export function resumesSession(args: readonly string[]): boolean {
   return false;
 }
 
-/** What claudeChildEnv sets for the Claude Code it starts, besides the blocking limit. */
+/**
+ * What claudeChildEnv sets for the Claude Code it starts, besides the blocking limit and
+ * message threads off (dropped only while they hold ccc's values).
+ */
 const OUTER_CCC_SETTINGS = [
   "ANTHROPIC_BASE_URL", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
   "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "DISABLE_AUTO_COMPACT",

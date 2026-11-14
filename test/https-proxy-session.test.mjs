@@ -32,7 +32,8 @@ function session(parentEnv, port = 41234) {
 
 test("Claude Code gets the token proxy and the bundle, and no base URL", () => {
   const parent = { PATH: "/bin", ANTHROPIC_BASE_URL: "http://127.0.0.1:1",
-    _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1", https_proxy: "", CCC_AUTO_COMPACT: "0" };
+    _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1", https_proxy: "", CCC_AUTO_COMPACT: "0",
+    CLAUDE_CODE_TETHER_LIVE: "1" };
   const { s, child, env } = session(parent);
   try {
     assert.match(env.HTTPS_PROXY, /^http:\/\/ccc:[0-9a-f]{48}@127\.0\.0\.1:41234$/);
@@ -45,6 +46,8 @@ test("Claude Code gets the token proxy and the bundle, and no base URL", () => {
     }
     assert.equal(env.DISABLE_AUTO_COMPACT, "1");
     assert.equal(env.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD, "1000000000");
+    // Message threads off, even over a parent's opt-in: every request is the whole conversation.
+    assert.equal(env.CLAUDE_CODE_TETHER_LIVE, "0");
     assert.equal(parent.ANTHROPIC_BASE_URL, "http://127.0.0.1:1", "the parent env is untouched");
     const bundle = readFileSync(child.caBundlePath, "utf8");
     assert.match(bundle, /BEGIN CERTIFICATE/);

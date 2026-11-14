@@ -285,6 +285,12 @@ refusal before `ccc` ever saw the request. `ccc` sets
 `CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE` (unless you exported your own) so such a
 request reaches the proxy, which compresses it mid-turn.
 
+On Anthropic's own API, Claude Code can send tool-loop turns as "message threads":
+only the newest messages, with Anthropic keeping the rest of the conversation. MemTree
+needs the whole conversation to compress and index it, so `ccc` sets
+`CLAUDE_CODE_TETHER_LIVE=0` for the Claude Code it starts, and every request carries
+the full conversation as before.
+
 A session whose last response reached the verified local refusal threshold
 (for example one sent whole while MemTree was unavailable) would otherwise be
 refused locally with "Context limit reached" on every prompt after a resume.

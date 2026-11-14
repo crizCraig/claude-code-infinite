@@ -122,3 +122,13 @@ test("ccc lifts Claude Code's local refusal near the window so MemTree can compr
   const native = claudeChildEnv({ CCC_AUTO_COMPACT: "1" }, "http://x");
   assert.equal(native.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE, undefined);
 });
+
+test("message threads are off in base-URL mode too, even over a parent's opt-in", () => {
+  // With the opt-in, Claude Code 2.1.325 threads through a base URL as well: tool turns
+  // would carry only the newest messages, and ccc could not compress or index them.
+  for (const parent of [{}, { CLAUDE_CODE_TETHER_LIVE: "1" }]) {
+    const child = claudeChildEnv(parent, "http://127.0.0.1:1234");
+    assert.equal(child.CLAUDE_CODE_TETHER_LIVE, "0", JSON.stringify(parent));
+    assert.equal(parent.CLAUDE_CODE_TETHER_LIVE ?? "unset", parent.CLAUDE_CODE_TETHER_LIVE ? "1" : "unset");
+  }
+});
