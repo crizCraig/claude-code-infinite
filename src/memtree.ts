@@ -33,6 +33,7 @@ import {
   IMAGE_REFS_FEATURE, ImageRefs, MISSING_IMAGES_STATUS, missingImageShas, refusesImageRefs,
 } from "./image-refs.js";
 import { planMemtreeBody, type BodyLimitNote, type PlannedBody } from "./memtree-body.js";
+import { MESSAGE_REFS_FEATURE, MessageRefs } from "./message-refs.js";
 import {
   stripCcSystemReminders,
   type Message,
@@ -121,6 +122,8 @@ export interface MemtreeOptions {
    * place of the 402 detail's long `/payment?…` link in every paused notice.
    */
   paymentLinks?: PaymentLinkCache;
+  /** Delta uploads (message-refs.ts); default: CCC_MEMTREE_DELTA=1. */
+  messageRefs?: boolean;
 }
 
 /**
@@ -1070,6 +1073,8 @@ export class MemtreeClient {
   private drainCutting = false;
   /** Images MemTree stores, sent as references instead of their bytes. */
   private readonly imageRefs = new ImageRefs();
+  /** Messages MemTree stores, named by hash instead of sent (CCC_MEMTREE_DELTA=1). */
+  private readonly messageRefs: MessageRefs;
   /** Session → its main lane's latest conversation, for the final index. */
   private readonly mainConversations = new Map<string, MainConversation>();
   /** Session → its final index waiting for the session to stay idle. */
@@ -1258,6 +1263,7 @@ export class MemtreeClient {
     this.reqlog = opts.reqlog;
     this.memtreeTools = opts.memtreeTools || undefined;
     this.paymentLinks = opts.paymentLinks;
+    this.messageRefs = new MessageRefs(opts.messageRefs ?? process.env.CCC_MEMTREE_DELTA === "1");
   }
 
   static hashMessages(messages: Message[]): string {
@@ -1915,6 +1921,10 @@ export class MemtreeClient {
       imageRefs?: boolean;
       /** This call is the one resend that keeps unconfirmed references (after a 409). */
       unconfirmedRetry?: boolean;
+      /** False: name no message by ref (the resend after a refused one). */
+      messageRefs?: boolean;
+      /** The status that refused this call's refs (logged on its full resend). */
+      refusedMessageRefs?: number;
       signal?: AbortSignal;
       model?: string;
       tools?: unknown[];
@@ -1982,10 +1992,15 @@ export class MemtreeClient {
       // (within its image allowance) instead of naming them in placeholders.
       body.flatten_images = true;
     }
-    // Stored images as references, and never a body over the HTTP/1 limit (memtree-body.ts).
+    // Stored messages named by hash (message-refs.ts), stored images as references, and
+    // never a body over the HTTP/1 limit (memtree-body.ts).
+    // Not on the final index: its body is prepared cooperatively (final-index.ts).
+    const delta = opts.messageRefs === false || opts.finalIndex ? { messages, refs: [] }
+      : this.messageRefs.delta(opts.sessionId, messages);
+    const sentMessages = delta.messages;
     const plan = (refs: boolean): PlannedBody => planMemtreeBody({
-      body, messages, indexOnly: opts.indexOnly === true,
-      serialized: refs && opts.serializedMessages !== undefined
+      body, messages: sentMessages, indexOnly: opts.indexOnly === true,
+      serialized: refs && opts.serializedMessages !== undefined && !delta.refs.length
         ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
       imageRefs: refs ? this.imageRefs : undefined,
     });
@@ -1993,16 +2008,22 @@ export class MemtreeClient {
     // A compress over the limit is not sent at all: before that, try it with images
     // the server has not listed as references too (a resumed session's first call).
     const unconfirmed = planned.payload === undefined && !opts.indexOnly &&
-      opts.imageRefs !== false ? this.planUnconfirmed(body, messages) : undefined;
+      opts.imageRefs !== false ? this.planUnconfirmed(body, sentMessages) : undefined;
     if (unconfirmed) planned = unconfirmed;
     if (planned.payload === undefined) throw this.oversized(planned.limit, opts);
     const payload = planned.payload;
+    // Fixed with the body: a transport retry of a delta body still declares refs.
+    const features = delta.refs.length || this.messageRefs.active
+      ? `${CLIENT_FEATURES},${MESSAGE_REFS_FEATURE}` : CLIENT_FEATURES;
     // The answer named references it could not serve: sent again as its own call.
     let resent = false;
     let refusalText: string | undefined;
     opts.signal?.throwIfAborted();
 
     const started = Date.now();
+    // Resends draw on what is left of this call's budget: one absolute deadline, so a
+    // resend of a resend never counts the same time twice.
+    const callDeadline = started + opts.timeoutMs;
     let status: number | undefined;
     let ok = false;
     let keyRefused = false;
@@ -2027,7 +2048,8 @@ export class MemtreeClient {
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
     try {
-      const response = await this.postRetryingDrop(payload, opts, controller.signal)
+      const response = await this.postRetryingDrop(payload, { ...opts, features },
+        controller.signal)
         .catch((err: unknown) => {
           // A background index call is no request's own evidence (review r1): it may clear
           // the state by an answer, never set it.
@@ -2036,22 +2058,39 @@ export class MemtreeClient {
         });
       status = response.status;
       this.lastUnreachable = undefined;
-      if (planned.refs.length && !response.ok) {
+      if (delta.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
+        if (this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs, response.status,
+          refusalText)) {
+          // Sent again in full as its own call, within what is left of this call's budget.
+          resent = true;
+          this.log(`context_memory ${response.status} on message refs: sending in full`);
+          return await this.callContextMemory(messages, modelContextLimit, {
+            ...opts, messageRefs: false, refusedMessageRefs: response.status,
+            get timeoutMs() { return callDeadline - Date.now(); },
+          });
+        }
+      }
+      if (planned.refs.length && !response.ok) {
+        refusalText = refusalText ?? await readUnlessAborted(response, controller.signal);
         if (this.refusedRefs(response.status, refusalText, planned.refs)) {
           // A new call with bytes: its own size and request-log record, within what is
           // left of this call's budget (a caller's deadline is never extended). Read when
           // its timer starts, after its body is built, and never clamped: a size-scaled
           // budget adds its allowance to what is left, however negative.
           resent = true;
-          const budget = opts.timeoutMs;
           // Unconfirmed references the server named as missing: only those go as bytes
           // (all bytes would be over the limit again), once.
           const keepRefs = unconfirmed !== undefined && !opts.unconfirmedRetry &&
             namesMissingImages(response.status, refusalText);
+          // A delta body: sent again as this turn's ordinary body (no message refs, the
+          // images it lacks now forgotten), so the usual size fallbacks plan it.
+          const plain = delta.refs.length > 0;
           return await this.callContextMemory(messages, modelContextLimit, {
-            ...opts, ...(keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
-            get timeoutMs() { return budget - (Date.now() - started); },
+            ...opts,
+            ...(plain ? { messageRefs: false, refusedMessageRefs: response.status }
+              : keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
+            get timeoutMs() { return callDeadline - Date.now(); },
           });
         }
       }
@@ -2082,6 +2121,11 @@ export class MemtreeClient {
         throw new Error("context_memory answer does not show it resolves image references");
       }
       this.imageRefs.noteAnswer(json);
+      // A trimmed body stored other messages than these: nothing is acked from it.
+      if (planned.limit?.action !== "trimmed") {
+        this.messageRefs.noteAnswer(opts.sessionId, messages, json,
+          { finalIndex: opts.finalIndex === true, sentRefs: delta.refs.length });
+      }
       // An index-only ack is `{ messages: [], usage: {...zeros}, index_only:
       // true }` by contract: the server skips compression and returns no
       // messages. Only a compress call needs a non-empty conversation back.
@@ -2155,6 +2199,8 @@ export class MemtreeClient {
         requestBytes: Buffer.byteLength(payload),
         ...(planned.limit ? { bodyLimit: planned.limit } : {}),
         ...(unconfirmed ? { unconfirmedImageRefs: unconfirmed.refs.length } : {}),
+        ...(delta.refs.length ? { messageRefs: delta.refs.length } : {}),
+        ...(opts.refusedMessageRefs ? { messageRefsRefused: opts.refusedMessageRefs } : {}),
         // Aborted by an exit drain that ran out: a known cut, not a server failure.
         ...(!ok && this.drainCutting && controller.signal.aborted
           ? { exitCut: true, finalIndex: opts.finalIndex === true }
@@ -2185,7 +2231,8 @@ export class MemtreeClient {
    */
   private async postRetryingDrop(
     payload: string,
-    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
+    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string>;
+      features?: string },
     signal: AbortSignal
   ): Promise<Response> {
     const upload = { done: false };
@@ -2211,7 +2258,8 @@ export class MemtreeClient {
    */
   private postContextMemory(
     payload: string,
-    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string> },
+    opts: { indexOnly?: boolean; sessionId?: string; clientMeta?: Record<string, string>;
+      features?: string },
     signal: AbortSignal,
     upload?: { done: boolean }
   ): Promise<Response> {
@@ -2226,7 +2274,7 @@ export class MemtreeClient {
         ...(streamed ? { "content-length": String(bytes.length) } : {}),
         "x-client": CLIENT_NAME,
         "x-client-version": CLIENT_VERSION,
-        "x-client-features": CLIENT_FEATURES,
+        "x-client-features": opts.features ?? CLIENT_FEATURES,
         ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
         ...(opts.clientMeta && Object.keys(opts.clientMeta).length
           ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
