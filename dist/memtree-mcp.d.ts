@@ -1,3 +1,4 @@
+import { type FinderSearchMode } from "./memtree-finder.js";
 import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
 /**
@@ -346,6 +347,10 @@ export declare const MEMTREE_TOOLS: ({
         required?: undefined;
     };
 })[];
+/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+export declare function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS;
+/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS, saying hybrid is the default once opted in. */
+export declare function memtreeInstructions(env: NodeJS.ProcessEnv): string;
 export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
     proxyUrl?: string;
@@ -519,6 +524,13 @@ notice?: {
 }, 
 /** Not in a ccc-routed session: no tools, no instructions. */
 inert?: boolean): Promise<object | undefined>;
+export declare const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
+/**
+ * The search's mode: the agent's, else hybrid once this process opted in (HYBRID_SEARCH_ENV),
+ * else text. A cursor without a mode keeps text (hybrid has no cursor), and hybrid is refused
+ * unless opted in.
+ */
+export declare function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

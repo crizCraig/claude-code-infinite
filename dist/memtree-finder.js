@@ -19,7 +19,13 @@ export const SESSIONS_DEFAULT_LIMIT = 20;
 export const SESSIONS_MAX_LIMIT = 100;
 export const FINDER_SEARCH_DEFAULT_LIMIT = 10;
 export const FINDER_SEARCH_MAX_LIMIT = 50;
-export const FINDER_SEARCH_MODES = ["vector", "text"];
+export const FINDER_SEARCH_MODES = ["vector", "text", "hybrid"];
+/**
+ * Opt-in (off by default): `1` makes `hybrid` (text and vector run together and fused by rank,
+ * polychat memtree_hybrid.py) the search tool's default mode and lists it in the tool's schema.
+ * The server serves it only while its MEMTREE_HYBRID_SEARCH setting is on.
+ */
+export const HYBRID_SEARCH_ENV = "CCC_MEMTREE_HYBRID_SEARCH";
 const SNIPPET_CHARS = 400;
 /** One `snippets` line of a cross-session hit (the server cuts them at ~240 characters). */
 const SNIPPET_LINE_CHARS = 300;
@@ -100,13 +106,21 @@ export function recentSearchNote(since, days, pages = false) {
 function isSet(value) {
     return value !== undefined && value !== null && value !== "";
 }
-export function searchMode(value) {
+export function searchMode(value, fallback = "text") {
     if (value === undefined || value === null || value === "")
-        return "text";
+        return fallback;
     const mode = String(value).trim().toLowerCase();
-    if (mode === "vector" || mode === "text")
+    if (FINDER_SEARCH_MODES.includes(mode))
         return mode;
-    throw new ToolInputError(`search: mode must be "vector" or "text", got ${JSON.stringify(value)}`);
+    throw new ToolInputError(`search: mode must be "vector", "text" or "hybrid", got ${JSON.stringify(value)}`);
+}
+/** Whether this process opted in to hybrid search (HYBRID_SEARCH_ENV). */
+export function hybridSearchOn(env) {
+    return ["1", "on", "true", "yes"].includes(String(env[HYBRID_SEARCH_ENV] ?? "").trim().toLowerCase());
+}
+/** The search tool's mode when the agent names none: hybrid once opted in, else text. */
+export function defaultSearchMode(env) {
+    return hybridSearchOn(env) ? "hybrid" : "text";
 }
 function addText(params, name, value) {
     if (value === undefined || value === null)
@@ -192,13 +206,21 @@ export function formatSearchResults(body, args) {
         return out.join("\n");
     }
     const hits = body.hits ?? [];
-    if (!hits.length)
-        return noHits(query, "text", args, body.coverage, body.charged);
+    const hybrid = body.mode === "hybrid";
+    const notes = hybrid ? legNotes(body.legs) : [];
+    if (!hits.length) {
+        const failed = Object.values(body.legs ?? {}).some((leg) => !!leg?.error);
+        const empty = noHits(query, hybrid ? "hybrid" : "text", args, body.coverage, body.charged, failed);
+        return notes.length ? `${empty} ${notes.join(" ")}` : empty;
+    }
+    const kind = hybrid ? "hybrid" : "text";
     const out = [
-        `${hits.length} text match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}` +
+        `${hits.length} ${kind} match${hits.length === 1 ? "" : "es"} for ${JSON.stringify(query)}` +
             (body.charged ? ` (${CHARGED_NOTE})` : "") +
             ":",
     ];
+    if (hybrid)
+        out.push(HYBRID_NOTE, ...notes);
     const missing = new MissingTimeNote();
     hits.forEach((hit, i) => out.push(...formatHit(hit, i + 1, missing)));
     if (body.relaxed === "any_word") {
@@ -210,6 +232,8 @@ export function formatSearchResults(body, args) {
     out.push("", nextPage("search", body.next_cursor), OPEN_NOTE);
     return out.join("\n");
 }
+/** Said under a hybrid page's heading. */
+export const HYBRID_NOTE = "(Text and vector matches fused by rank: each hit says where each search ranked it; one page, no cursor.)";
 const OPEN_NOTE = "Snippets are excerpts (L<n>: the line in the hit's block). read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
     "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 function formatHit(hit, n, missing) {
@@ -234,6 +258,9 @@ function formatHit(hit, n, missing) {
     if (hit.summary)
         lines.push(`    summary: ${oneLine(hit.summary, SUMMARY_CHARS)}`);
     lines.push(...hitSnippets(hit));
+    const legs = legsLine(hit.legs);
+    if (legs)
+        lines.push(`    found by: ${legs}`);
     if (hit.address) {
         lines.push(`    address: ${hit.address}`);
     }
@@ -241,6 +268,34 @@ function formatHit(hit, n, missing) {
         lines.push(`    open: read_lines {"tree": "${ref}", "block": ${range.block}, "start": ${range.start}, "end": ${range.end}}`);
     }
     return lines;
+}
+/** What each ranking of a hybrid page reported: a failure, a partial or relaxed ranking. */
+export function legNotes(legs) {
+    if (!legs || typeof legs !== "object")
+        return [];
+    const out = [];
+    for (const [name, leg] of Object.entries(legs)) {
+        if (!leg || typeof leg !== "object")
+            continue;
+        if (leg.error)
+            out.push(`(The ${name} search ${leg.error === "timed out" ? "timed out" : `failed: ${leg.error}`}, so it ranked nothing here.)`);
+        if (leg.partial)
+            out.push(`(The ${name} search ranked only the newest trees: it ran out of time.)`);
+        if (leg.relaxed === "any_word")
+            out.push(`(The ${name} search found no passage with every word, so it ranked those with some.)`);
+        if (leg.matches_capped)
+            out.push(`(The ${name} search ranked only the newest matching passages.)`);
+    }
+    return out;
+}
+/** `text #2 · vector #1`: where each ranking of a hybrid search placed the hit. */
+function legsLine(legs) {
+    if (!legs || typeof legs !== "object")
+        return undefined;
+    const parts = Object.entries(legs)
+        .filter(([, leg]) => typeof leg?.rank === "number")
+        .map(([name, leg]) => `${name} #${leg.rank}`);
+    return parts.length ? parts.join(" · ") : undefined;
 }
 /** `L<n>: text` per server snippet line, else the joined `snippet` (older servers). */
 function hitSnippets(hit) {
@@ -264,13 +319,17 @@ export function formatPath(path, ref) {
         .map((p) => `${oneLine(p.summary, PATH_SUMMARY_CHARS)}${ref ? ` (${ref}#${p.id})` : ` (node ${p.id})`}`)
         .join(" › ");
 }
-function noHits(query, mode, args, coverage, charged) {
+function noHits(query, mode, args, coverage, charged, legFailed = false) {
     if (args.cursor)
         return "No more matches.";
     const searched = charged ? `${mode} search, ${CHARGED_NOTE}` : `${mode} search`;
     const other = mode === "vector"
         ? 'For an exact word, id or path, try mode "text".'
-        : 'Text mode needs the exact words; for meaning, try mode "vector".';
+        : mode === "hybrid"
+            ? legFailed
+                ? 'Not every search ran (see the notes after this): try again, or mode "text" or "vector".'
+                : "Neither the words nor their meaning matched: try other words or a wider scope."
+            : 'Text mode needs the exact words; for meaning, try mode "vector".';
     if (typeof args.tree === "string" && args.tree) {
         return `Nothing in tree ${args.tree} matches ${JSON.stringify(query)} (${searched}). ${other}`;
     }

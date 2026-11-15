@@ -36,7 +36,7 @@
  */
 
 import fs from "node:fs";
-import { MEMTREE_MCP_INSTRUCTIONS } from "./memtree-mcp.js";
+import { MEMTREE_MCP_INSTRUCTIONS, memtreeInstructions } from "./memtree-mcp.js";
 
 export { RESUME_GUIDANCE_HOOK_SUFFIX } from "./hooks.js";
 
@@ -55,6 +55,19 @@ export const RESUME_GUIDANCE = `${RESUME_GUIDANCE_PREFIX}\n\n${MEMTREE_MCP_INSTR
 export const ANNOUNCED_INSTRUCTIONS_NEEDLE = JSON.stringify(
   `## memtree\n${MEMTREE_MCP_INSTRUCTIONS}`
 ).slice(1, -1);
+/**
+ * The guidance and the announcement needle for the instructions this process's MCP server
+ * announces now: RESUME_GUIDANCE and ANNOUNCED_INSTRUCTIONS_NEEDLE, or their hybrid-default
+ * wording under CCC_MEMTREE_HYBRID_SEARCH=1 (memtreeInstructions).
+ */
+export function resumeGuidance(env: NodeJS.ProcessEnv = process.env): string {
+  return `${RESUME_GUIDANCE_PREFIX}\n\n${memtreeInstructions(env)}`;
+}
+
+export function announcedInstructionsNeedle(env: NodeJS.ProcessEnv = process.env): string {
+  return JSON.stringify(`## memtree\n${memtreeInstructions(env)}`).slice(1, -1);
+}
+
 /** An announcement line's marker is at most this far before its block. */
 const LINE_CONTEXT_BYTES = 64 * 1024;
 const ANNOUNCEMENT_MARKER = Buffer.from('"type":"mcp_instructions_delta"', "utf-8");
@@ -120,20 +133,20 @@ export class ResumeGuidance {
     // Compressed: any earlier announcement, native or ours, may be out of view.
     if (state.compressed() === true) return resumeGuidanceAgain(this.now());
     const path = input.transcript_path;
-    if (path && (await fileContains(path, ANNOUNCED_INSTRUCTIONS_NEEDLE, this.scanMs))) {
+    if (path && (await fileContains(path, announcedInstructionsNeedle(), this.scanMs))) {
       return undefined;
     }
     // MemTree may have paused or failed while the transcript was read.
     if (!this.enabled || !state.working()) return undefined;
     // No page known (a young session, a fork's new id, a lost link store): it
     // may be compressed, and Claude Code would drop an identical earlier copy.
-    return state.compressed() === false ? RESUME_GUIDANCE : resumeGuidanceAgain(this.now());
+    return state.compressed() === false ? resumeGuidance() : resumeGuidanceAgain(this.now());
   }
 }
 
 /** The guidance for a compressed session: new to Claude Code at each resume. */
 export function resumeGuidanceAgain(at: Date): string {
-  return `${RESUME_GUIDANCE}\n\n(Given again at the resume of ${at.toISOString()}: ` +
+  return `${resumeGuidance()}\n\n(Given again at the resume of ${at.toISOString()}: ` +
     "MemTree may have compressed this conversation, so an earlier copy may be out of view.)";
 }
 
