@@ -11427,6 +11427,7 @@ test("the status line keeps the session's stable link when a later lookup fails"
   try {
     await lookup.settle("session-1");
     await armMainTurn(proxy, "turn two", "prompt-1");
+    assert.equal(readStatusLink("session-1", dir), stable, "known before the refresh fails");
     // The compress answer's page invalidates the lookup; its refresh fails.
     await postSessionMessages(proxy.port, followupTurn("turn two"));
     await lookup.settle("session-1");
@@ -11437,6 +11438,34 @@ test("the status line keeps the session's stable link when a later lookup fails"
     proxy.close();
     upstream.close();
     memtreeSrv.close();
+  }
+});
+
+test("a resumed session keeps the stable link its status-line file already holds", async () => {
+  // Codex r8 P2: after a restart the caches are empty; a failed lookup must not put the
+  // stored pinned page back over the stable link.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const stable = "https://staging.example/m/sessions/session-1";
+  new StatusLinkFiles(dir).write("session-1", stable);
+  const store = new MemtreeLinkStore(pathMod.join(dir, "links.json"));
+  store.put("session-1", { url: PAGE_URL_1, index: "index-a", compressed: true });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup(() => 503);
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store,
+    newestTrees: lookup, statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), stable);
+  } finally {
+    proxy.close();
+    upstream.close();
   }
 });
 

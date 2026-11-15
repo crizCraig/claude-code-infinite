@@ -47,6 +47,7 @@ import { refusalCause, refusalMessage } from "./refusal-reason.js";
 import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
+import { readStatusLink } from "./status-link.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
@@ -1430,8 +1431,11 @@ async function handleMessages(req, res, opts, upstream, state) {
     }
     else if (state.statusLinks && state.statusLinkRefresh) {
         // Keeps the status line's link fresh through long tool runs: answers from the cache,
-        // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS).
-        state.newestTrees?.peek(requestSessionId(req));
+        // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
+        // whose stable link is known needs no refresh: that link never changes.
+        const sessionId = requestSessionId(req);
+        if (!sessionId || !state.stableSessionLinks.has(sessionId))
+            state.newestTrees?.peek(sessionId);
     }
     const isLocalBashCommand = isLocalBashCommandTurn(messages);
     // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
@@ -2919,14 +2923,32 @@ function publishStatusLink(state, sessionId) {
 function stableSessionLink(state, sessionId) {
     const fresh = state.newestTrees?.sessionUrl(sessionId) ??
         state.newestTrees?.peek(sessionId)?.sessionUrl;
-    if (fresh === undefined)
-        return state.stableSessionLinks.get(sessionId);
+    if (fresh === undefined) {
+        return state.stableSessionLinks.get(sessionId) ?? persistedSessionLink(state, sessionId);
+    }
     state.stableSessionLinks.delete(sessionId);
     state.stableSessionLinks.set(sessionId, fresh);
     while (state.stableSessionLinks.size > MEMTREE_LINKS_MAX_SESSIONS) {
         state.stableSessionLinks.delete(state.stableSessionLinks.keys().next().value);
     }
     return fresh;
+}
+/**
+ * After a restart: the stable link the session's status-line file already holds (the
+ * server's `/m/sessions/<this session>` link), so a failed lookup doesn't replace it with a
+ * stored pinned page (Codex r8).
+ */
+function persistedSessionLink(state, sessionId) {
+    const url = state.statusLinks ? readStatusLink(sessionId, state.statusLinks.dir) : undefined;
+    if (url === undefined)
+        return undefined;
+    try {
+        return new URL(url).pathname.endsWith(`/m/sessions/${encodeURIComponent(sessionId)}`)
+            ? url : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 /** Bound optional page state independently of how many sessions use the proxy. */
 function rememberPage(pages, sessionId, page) {

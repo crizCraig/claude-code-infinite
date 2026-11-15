@@ -45,7 +45,7 @@ import { RefusalStreaks, RouteFallbackFailures } from "./route-fallback.js";
 import { LaneActivity } from "./lane-activity.js";
 import { LaneCacheClock } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
-import type { StatusLinkFiles } from "./status-link.js";
+import { type StatusLinkFiles } from "./status-link.js";
 import { type NetworkFailure } from "./network-failure.js";
 import { CountTokensCooldowns, type SizeSample } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, type RequestCandidate } from "./request-sizing.js";
