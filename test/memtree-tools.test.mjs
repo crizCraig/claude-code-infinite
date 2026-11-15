@@ -1360,7 +1360,7 @@ test("hybrid search is the default; CCC_MEMTREE_HYBRID_SEARCH=0 opts out to text
     assert.match(textTool.description, /mode "text" \(default\)/);
     assert.doesNotMatch(textTool.description, /hybrid/);
     assert.match(memtreeInstructions(process.env), /Text mode \(default\)/);
-    assert.doesNotMatch(memtreeInstructions(process.env), /Hybrid mode/);
+    assert.doesNotMatch(memtreeInstructions(process.env), /hybrid/i);
     await call("search", { query: "x", tree: "current" });
     assert.deepEqual(seen, [["tree-search"]], "opted out: a one-tree text search stays local and free");
     seen.length = 0;
@@ -1416,6 +1416,11 @@ test("the default hybrid mode falls back to text, silently, when the server has 
     const explicit = await call({ query: "x", mode: "hybrid" });
     assert.equal(explicit.content[0].text, `${HYBRID_OFF_NOTE}\n\nserver text hits`, "an asked-for hybrid says it fell back");
     assert.deepEqual(seen, [["hybrid", undefined], ["text", undefined]], "an explicit hybrid still asks the server");
+    seen.length = 0;
+    serverHybrid = true;
+    await call({ query: "x", mode: "hybrid", cursor: "c1" });
+    assert.deepEqual(seen, [["text", undefined]], "the fallback page's cursor continues in text, even once hybrid is on");
+    serverHybrid = false;
     seen.length = 0;
     serverHybrid = true;
     resetHybridServerOff(HYBRID_OFF_RECHECK_MS + 1);

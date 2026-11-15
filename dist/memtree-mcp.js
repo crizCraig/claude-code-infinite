@@ -171,7 +171,7 @@ export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infini
     "So once you see that memory message: when your answer depends on something said earlier (what the user asked " +
     "for, ruled out or told you, decisions and why, facts, ids, paths, commands, what was tried and failed), search " +
     "MemTree before guessing or re-deriving it. No hit is not proof it was never said: try other wordings, synonyms " +
-    "and broader terms (hybrid and vector match meaning) first. Check exact values (numbers, names, dates) by reading " +
+    "and broader terms (vector matches meaning) first. Check exact values (numbers, names, dates) by reading " +
     "the lines (read_lines), not a summary.\n\n" +
     "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
     "ccc sessions on any machine (not Codex or plain claude sessions), and list shows those sessions by time and " +
@@ -221,7 +221,7 @@ export const MEMTREE_TOOLS = [
         inputSchema: {
             type: "object",
             properties: {
-                query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions), a question (vector) or either (hybrid)." },
+                query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions) or a question (vector)." },
                 tree: { type: "string", description: `Optional. ${TREE_DESC} Omit to search all sessions.` },
                 mode: { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION },
                 project: { type: "string", description: "Without tree: only sessions in this working directory or git repository (owner/repo, or just repo)." },
@@ -1065,12 +1065,15 @@ export function resetHybridServerOff(agoMs) {
 }
 /**
  * The search's mode: the agent's, else hybrid unless this process opted out (HYBRID_SEARCH_ENV),
- * else text. A cursor without a mode keeps text (hybrid has no cursor), and hybrid is refused
- * once opted out.
+ * else text. A cursor keeps text (hybrid has no cursor), and hybrid is refused once opted out.
  */
 export function toolSearchMode(args, env) {
     const on = hybridSearchOn(env);
     const mode = searchMode(args.mode, on && !isSet(args.cursor) ? defaultSearchMode(env) : "text");
+    // A hybrid page has no cursor, so hybrid with one continues the text page a refused hybrid fell
+    // back to (its "same arguments" carry mode hybrid): keep it text, even once the server serves hybrid.
+    if (mode === "hybrid" && isSet(args.cursor))
+        return "text";
     if (mode === "hybrid" && !on) {
         throw new ToolInputError(`search: mode "hybrid" is off here (${HYBRID_SEARCH_ENV} opts out; unset it to use hybrid)`);
     }
