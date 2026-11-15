@@ -475,7 +475,7 @@ function noHits(
       ? 'For an exact word, id or path, try mode "text".'
       : mode === "hybrid"
         ? legFailed
-          ? 'Not every search ran (below): try again, or mode "text" or "vector".'
+          ? 'Not every search ran (see the notes after this): try again, or mode "text" or "vector".'
           : "Neither the words nor their meaning matched: try other words or a wider scope."
         : 'Text mode needs the exact words; for meaning, try mode "vector".';
   if (typeof args.tree === "string" && args.tree) {

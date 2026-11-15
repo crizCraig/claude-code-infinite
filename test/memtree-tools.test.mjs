@@ -1403,7 +1403,7 @@ test("a hybrid page says which of its searches failed or ranked only part", () =
   assert.match(text, /\(The vector search ranked only the newest trees/);
   const empty = formatSearchResults({ query: "q", mode: "hybrid", hits: [],
     legs: { text: { hits: 0 }, vector: { hits: 0, error: "Could not embed" } } }, { query: "q" });
-  assert.match(empty, /Not every search ran \(below\)/);
+  assert.match(empty, /Not every search ran \(see the notes after this\)/);
   assert.match(empty, /The vector search failed: Could not embed/);
   assert.doesNotMatch(empty, /Neither the words nor their meaning/);
   const relaxed = formatSearchResults({ query: "q", mode: "hybrid", hits: [hit],
