@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.0.38](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.37...v1.0.38) (2026-11-15)
+
+
+### Features
+
+* CCC_SUBAGENT_PARENT_TREE first-step wording, now what =1 means: the subagent's first call searches the parent's memory ([91c5c3c](https://github.com/crizCraig/claude-code-infinite/commit/91c5c3ca6d20d50f955eca4603c144a64dec7645))
+* CCC_SUBAGENT_PARENT_TREE first-step wording, the default for =1 ([926e413](https://github.com/crizCraig/claude-code-infinite/commit/926e4134801063d0a606c312290bbdd363baa47d))
+* CCC_SUBAGENT_PARENT_TREE: a subagent's note names its parent session as the MemTree tree, with how to read it (off by default) ([b1fc622](https://github.com/crizCraig/claude-code-infinite/commit/b1fc62259304031d2d9335c516eb8f6f0a2b3ea3))
+* CCC_SUBAGENT_PARENT_TREE: subagents get their parent's MemTree as a tree to read (off by default) ([5b84921](https://github.com/crizCraig/claude-code-infinite/commit/5b8492160c58474c4c938ff99fb126dc358c11dd))
+* hybrid MemTree search is the default; guidance says to try other wordings before concluding something was never said ([fe3870e](https://github.com/crizCraig/claude-code-infinite/commit/fe3870e6d702d04ec385d673c162fbd4644af728))
+* hybrid MemTree search is the default; guidance: try other wordings before concluding something was never said ([4c955fb](https://github.com/crizCraig/claude-code-infinite/commit/4c955fb3a4d4df9041d04297cf8adf2b8257ca88))
+* opt-in hybrid MemTree search (CCC_MEMTREE_HYBRID_SEARCH=1) ([7cfe529](https://github.com/crizCraig/claude-code-infinite/commit/7cfe529ae517e8533ceea6dca3365f4b9166d245))
+* opt-in hybrid MemTree search (CCC_MEMTREE_HYBRID_SEARCH=1): lists mode hybrid and makes it the search default; hybrid pages say where each ranking placed a hit ([24d3084](https://github.com/crizCraig/claude-code-infinite/commit/24d30844a8b4fed749666bc1e592df2d0152e7cb))
+* opt-in subagent lane budget and compress on a cold cache ([c2fa282](https://github.com/crizCraig/claude-code-infinite/commit/c2fa282cf53fdbd05383eb002989a4ba80f44a45))
+* opt-in subagent lane budget and compress on a cold cache (benchmark switches, default off) ([2c36fa5](https://github.com/crizCraig/claude-code-infinite/commit/2c36fa5fad3bdefa65ecf531ecf532020e62d29c))
+
+
+### Bug Fixes
+
+* a compress call also retires a carried index waiting behind an upload; an aborted one retires nothing (review r4) ([66db5fb](https://github.com/crizCraig/claude-code-infinite/commit/66db5fba278d4e28e1c33f78718ec03e405e5906))
+* a compress call retires the held-back history it carries when it is sent, not when it succeeds (Codex r3 P1) ([ba540ce](https://github.com/crizCraig/claude-code-infinite/commit/ba540ce37fe8f083588ae9c5ecdff1bddbc058de))
+* a compress call retires the held-back history it carries; the stable link sticks once known (review r1) ([30cf272](https://github.com/crizCraig/claude-code-infinite/commit/30cf272822e56802e91d5d0f8262a5b86a4ac257))
+* a fragment's exact count no longer replaces the conversation's size sample (review r1) ([da448d2](https://github.com/crizCraig/claude-code-infinite/commit/da448d2cef480c457c42cac8ad2ee403e60828e2))
+* a held history given back when its compress call never reaches the server; a final index retires it too (Codex r4) ([55384ce](https://github.com/crizCraig/claude-code-infinite/commit/55384ce06a6569ca763aab84393f9f2d2a262204))
+* a held-back history never goes while a newer compress call is in flight; one that repeats the last upload is dropped (review r2) ([8ff6c7f](https://github.com/crizCraig/claude-code-infinite/commit/8ff6c7f6e39f8ec376acd12fad28113f8e8cad11))
+* a known stable link is rewritten if its file was pruned; only this session's /m/sessions link is taken (review r9) ([7c46f01](https://github.com/crizCraig/claude-code-infinite/commit/7c46f01b6666655e8d3394e88801f50f15e47c67))
+* a persisted stable link gives way once this server answers; a remembered link needs no lookup (review r10) ([701d436](https://github.com/crizCraig/claude-code-infinite/commit/701d4362442e47d83fde78f4da1c4ed6f3585480))
+* a resumed session keeps its persisted prefix across Claude Code 2.1.325's media placeholders and restored media ([0ea4a92](https://github.com/crizCraig/claude-code-infinite/commit/0ea4a92479d9f16db1daaf2201ba0cc27c112041))
+* a resumed session keeps the stable link its status-line file holds; no refresh once it is known (review r8) ([79f78ce](https://github.com/crizCraig/claude-code-infinite/commit/79f78ce8ca84aefb83a31eebef3127a016725c68))
+* an answer with no tree also updates the status line; another server's persisted link is removed when nothing replaces it (Codex r11) ([1a77601](https://github.com/crizCraig/claude-code-infinite/commit/1a77601a258d4d0128a3d7848afe780d1a705810))
+* an away recap warms main only when its fork body is what went out; coldCache documented as the arrival sample (Codex r2 P3, review r3 P3) ([1c1aa68](https://github.com/crizCraig/claude-code-infinite/commit/1c1aa68dc229efe7fb6c15982f3924de88b82b26))
+* away recap warms main only on its prefix ride; a cold claim needs the lane idle since arrival; threshold-honoring test mock, agent followup threshold test (review r2 P3s, Codex r1 P3) ([84f9683](https://github.com/crizCraig/claude-code-infinite/commit/84f9683ef16d43b6a980498cececbc4eee18eb0a))
+* cold-cache clock stamped at the upstream send, once per gap; away recap warms main; no degraded notice, prepared adoption and agent followup threshold (review r1) ([fc36a0c](https://github.com/crizCraig/claude-code-infinite/commit/fc36a0c057bf4213ee4ddde12ce2616cb6cf7895))
+* empty hybrid page points at the notes after it (review r3 P3) ([0292d79](https://github.com/crizCraig/claude-code-infinite/commit/0292d79578e2c2e994bcd3474ab64637629bf450))
+* first-step uses the parent's findings only where they cover the task (facts only for an independent check) and says memory shows files and logs as they were (review r1) ([1e15caa](https://github.com/crizCraig/claude-code-infinite/commit/1e15caafd2e10ffe22732505106a2f5d4a0efc13))
+* hybrid search opt-in review fixes: refuse an explicit hybrid unless opted in, describe hybrid as the default in the tool and instructions, fall back to text when the server has it off, keep text for a bare cursor, show each search's failures and partial rankings (review r1, Codex r1) ([fb9e70d](https://github.com/crizCraig/claude-code-infinite/commit/fb9e70d91f135278388a3473e05d72957aefc964))
+* hybrid with a cursor continues the text page a refused hybrid fell back to; opt-out wording names no hybrid (review r1: Codex P2, Opus P3s) ([d99c4db](https://github.com/crizCraig/claude-code-infinite/commit/d99c4dbec3953e6dabda3e9e620831da73f85e0e))
+* no size sample from a thread continue; ccc's own 400 backstop for message threads ([5a9bc11](https://github.com/crizCraig/claude-code-infinite/commit/5a9bc11a18f4aa62add9347055842991329bce7d))
+* no size sample from a thread continue; ccc's own 400 backstop for message threads ([3ad5bf2](https://github.com/crizCraig/claude-code-infinite/commit/3ad5bf2bd0cd3b85cae000b9d702e81eb9a7c9e5))
+* one high-water mark replaces restoring held histories (review r5) ([d71b3ad](https://github.com/crizCraig/claude-code-infinite/commit/d71b3adc6ac593c8f750d0258ea00a36d6712cae))
+* put-back media matches only slot by slot, never added or moved media; only Claude Code's exact placeholder texts (Codex r1 P1/P2/P2, review r1) ([9badad8](https://github.com/crizCraig/claude-code-infinite/commit/9badad8045afb7a409112b257b55ca81a0534d50))
+* resume guidance carries the hybrid wording when hybrid is on; an empty hybrid page says a search failed only when one did; hybrid default notes the un-indexed tail is text-only (review r2, Codex r2) ([33511cb](https://github.com/crizCraig/claude-code-infinite/commit/33511cb997c7923cdf089c2519aa15842daf02ee))
+* resumed sessions keep their persisted prefix across Claude Code 2.1.325 media placeholders and put-back media ([5296c0c](https://github.com/crizCraig/claude-code-infinite/commit/5296c0c76fb8111441256883738f1e69c3ded987))
+* slot entries come from the blocks the slot hash is built from; one digest per media block for both identities; no put-back on the last covered message (review r2 P3, Codex r2 P2/P2/P3) ([920a6ce](https://github.com/crizCraig/claude-code-infinite/commit/920a6ce1dbb87affff0a1834ec3097bb5e3ee482))
+* status line links the session's stable MemTree page; held-back indexes reach the page within 3 min ([26748a7](https://github.com/crizCraig/claude-code-infinite/commit/26748a714c5c6be515611501c78d2d360dd83557))
+* the carried mark follows the newest sent history on any branch (Opus r6 P2) ([89b99ef](https://github.com/crizCraig/claude-code-infinite/commit/89b99efde9102c2dc89ec52cb25b898668c41a2e))
+* the exact-media guard is on the last covered message that is not ambient system (Codex r3 P2) ([f9fd49a](https://github.com/crizCraig/claude-code-infinite/commit/f9fd49aca769568d1532269acbe8a2b6c642a27c))
+* the parent-tree note names only tools the session has, says hybrid only when search defaults to it, and never steers a subagent away from current files (review r1) ([d634f1e](https://github.com/crizCraig/claude-code-infinite/commit/d634f1eb82d6cd8322f491a2bf879ebb50dad3cf))
+* the stable session link is kept before the session's first tree (Codex r2 P2) ([78fc8b5](https://github.com/crizCraig/claude-code-infinite/commit/78fc8b5cd87d2e3b3379a23f2e6ef6927970d6ed))
+* the status line links the session's stable MemTree page; held-back indexes go within 3 minutes ([efc674b](https://github.com/crizCraig/claude-code-infinite/commit/efc674b19253cccffbc7588eb7c3d9b301cf5e5c))
+
+
+### Reverts
+
+* take the index hold limit out of this change (needs a design decision) ([e980a02](https://github.com/crizCraig/claude-code-infinite/commit/e980a0241a2575fdb21100ba7b963dbd7d9b6ada))
+
 ## [1.0.37](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.36...v1.0.37) (2026-11-14)
 
 
