@@ -1432,9 +1432,12 @@ async function handleMessages(req, res, opts, upstream, state) {
     else if (state.statusLinks && state.statusLinkRefresh) {
         // Keeps the status line's link fresh through long tool runs: answers from the cache,
         // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
-        // whose stable link is known needs no refresh: that link never changes.
+        // whose stable link is known needs no lookup (that link never changes), only its file
+        // written again if another ccc process pruned it (a local read; Codex r9).
         const sessionId = requestSessionId(req);
-        if (!sessionId || !state.stableSessionLinks.has(sessionId))
+        if (sessionId && state.stableSessionLinks.has(sessionId))
+            publishStatusLink(state, sessionId);
+        else
             state.newestTrees?.peek(sessionId);
     }
     const isLocalBashCommand = isLocalBashCommandTurn(messages);

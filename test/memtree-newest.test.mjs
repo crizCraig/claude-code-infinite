@@ -47,6 +47,10 @@ test("newestTreeFrom carries the session's stable link when the server names one
   const bad = { ...item("session-1", NEW_ID), links: { url: "javascript:alert(1)" } };
   assert.deepEqual(newestTreeFrom({ sessions: [bad] }, "session-1"),
     { url: NEW_URL, key: `${NEW_ID}-v1-own` }, "an unusable link is left out");
+  for (const other of ["https://staging.example/m/abc", "https://staging.example/m/sessions/session-2"]) {
+    const item2 = { ...item("session-1", NEW_ID), links: { url: other } };
+    assert.equal(newestTreeFrom({ sessions: [item2] }, "session-1").sessionUrl, undefined, other);
+  }
 });
 
 test("a session's stable link is kept even before it has a tree, and announced", async () => {

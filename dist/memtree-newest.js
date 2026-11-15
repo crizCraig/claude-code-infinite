@@ -286,8 +286,12 @@ export function newestTreeFrom(body, sessionId) {
 }
 /** A sessions item's stable link (`links.url`, polychat's /m/sessions/<id>), validated. */
 export function sessionUrlFrom(item) {
-    const link = item?.links?.url;
-    return typeof link === "string" ? validatedTreeUrl(link) : undefined;
+    const { links, session_id: sessionId } = (item ?? {});
+    const url = typeof links?.url === "string" ? validatedTreeUrl(links.url) : undefined;
+    // Only this session's own stable link (review r9): never another page.
+    const own = typeof sessionId === "string" &&
+        url?.split(/[?#]/)[0].endsWith(`/m/sessions/${encodeURIComponent(sessionId)}`);
+    return own ? url : undefined;
 }
 /** Preserve the server-selected reference; shortening it can select another tree. */
 export function validatedTreeUrl(serverUrl) {
