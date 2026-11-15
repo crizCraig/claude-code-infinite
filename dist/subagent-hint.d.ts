@@ -21,7 +21,10 @@ import type { KeyCheck } from "./key-status.js";
  * `search` tool, off once ccc could not register the server after all.
  */
 export declare class SubagentMemoryHint {
+    readonly style: ParentTreeStyle;
     private disabled;
+    /** The SubagentStart wording (PARENT_TREE_ENV); the shipped hint unless switched. */
+    constructor(style?: ParentTreeStyle);
     disable(): void;
     get enabled(): boolean;
 }
@@ -35,9 +38,28 @@ export declare function subagentHintFor(s: {
     tools: readonly string[];
     keyCheck: KeyCheck;
     memtreeOff: boolean;
+    env?: NodeJS.ProcessEnv;
 }): SubagentMemoryHint | undefined;
-/** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
-export declare function subagentMemoryHintText(sessionId: string, treeRef: string): string | undefined;
+/**
+ * `CCC_SUBAGENT_PARENT_TREE`: how a subagent is told about its parent's MemTree (off by
+ * default). Unset, `0` or `off`: the shipped one-line hint. `1` or `on`: the default note
+ * below (PARENT_TREE_DEFAULT_STYLE). A style name picks that wording (the plan-savings
+ * benchmark compares them on one build); `none` says nothing at SubagentStart (a
+ * benchmark baseline). Anything else reads as off.
+ */
+export declare const PARENT_TREE_ENV = "CCC_SUBAGENT_PARENT_TREE";
+/** The parent-tree note's wordings (parentTreeNote), plus the shipped hint and none. */
+export declare const PARENT_TREE_STYLES: readonly ["shipped", "none", "pointer", "search-first", "example", "outline"];
+export type ParentTreeStyle = (typeof PARENT_TREE_STYLES)[number];
+/** What `CCC_SUBAGENT_PARENT_TREE=1` means. */
+export declare const PARENT_TREE_DEFAULT_STYLE: ParentTreeStyle;
+/** The style PARENT_TREE_ENV selects. */
+export declare function parentTreeStyleFromEnv(env: NodeJS.ProcessEnv): ParentTreeStyle;
+/**
+ * The hint for a subagent of `sessionId` in `style`, or undefined when either id looks
+ * wrong or the style says nothing.
+ */
+export declare function subagentMemoryHintText(sessionId: string, treeRef: string, style?: ParentTreeStyle): string | undefined;
 /**
  * Said to the parent after each Agent/Task call: a subagent's result (returned now, or
  * as a notification when it was launched in the background, which `-p` runs mostly

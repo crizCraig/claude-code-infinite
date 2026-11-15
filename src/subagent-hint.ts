@@ -29,6 +29,9 @@ const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
 export class SubagentMemoryHint {
   private disabled = false;
 
+  /** The SubagentStart wording (PARENT_TREE_ENV); the shipped hint unless switched. */
+  constructor(readonly style: ParentTreeStyle = "shipped") {}
+
   disable(): void {
     this.disabled = true;
   }
@@ -48,17 +51,51 @@ export function subagentHintFor(s: {
   tools: readonly string[];
   keyCheck: KeyCheck;
   memtreeOff: boolean;
+  env?: NodeJS.ProcessEnv;
 }): SubagentMemoryHint | undefined {
   if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff) return undefined;
-  return new SubagentMemoryHint();
+  return new SubagentMemoryHint(parentTreeStyleFromEnv(s.env ?? {}));
 }
 
-/** The hint for a subagent of `sessionId`, or undefined when either id looks wrong. */
+/**
+ * `CCC_SUBAGENT_PARENT_TREE`: how a subagent is told about its parent's MemTree (off by
+ * default). Unset, `0` or `off`: the shipped one-line hint. `1` or `on`: the default note
+ * below (PARENT_TREE_DEFAULT_STYLE). A style name picks that wording (the plan-savings
+ * benchmark compares them on one build); `none` says nothing at SubagentStart (a
+ * benchmark baseline). Anything else reads as off.
+ */
+export const PARENT_TREE_ENV = "CCC_SUBAGENT_PARENT_TREE";
+
+/** The parent-tree note's wordings (parentTreeNote), plus the shipped hint and none. */
+export const PARENT_TREE_STYLES = [
+  "shipped", "none", "pointer", "search-first", "example", "outline",
+] as const;
+export type ParentTreeStyle = (typeof PARENT_TREE_STYLES)[number];
+
+/** What `CCC_SUBAGENT_PARENT_TREE=1` means. */
+export const PARENT_TREE_DEFAULT_STYLE: ParentTreeStyle = "search-first";
+
+/** The style PARENT_TREE_ENV selects. */
+export function parentTreeStyleFromEnv(env: NodeJS.ProcessEnv): ParentTreeStyle {
+  const value = String(env[PARENT_TREE_ENV] ?? "").trim().toLowerCase();
+  if (["1", "on", "true", "yes"].includes(value)) return PARENT_TREE_DEFAULT_STYLE;
+  return (PARENT_TREE_STYLES as readonly string[]).includes(value)
+    ? (value as ParentTreeStyle) : "shipped";
+}
+
+/**
+ * The hint for a subagent of `sessionId` in `style`, or undefined when either id looks
+ * wrong or the style says nothing.
+ */
 export function subagentMemoryHintText(
   sessionId: string,
-  treeRef: string
+  treeRef: string,
+  style: ParentTreeStyle = "shipped"
 ): string | undefined {
-  if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef)) return undefined;
+  if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef) || style === "none") {
+    return undefined;
+  }
+  if (style !== "shipped") return parentTreeNote(sessionId, treeRef, style);
   return (
     `ccc: You are a subagent of session ${sessionId}, whose memory is MemTree tree ` +
     `${treeRef}; your own work is indexed too. Before re-deriving earlier decisions, ` +
@@ -66,6 +103,38 @@ export function subagentMemoryHintText(
     `with tree ${treeRef} (or without tree to search all sessions).`
   );
 }
+
+/**
+ * The parent-tree note (PARENT_TREE_ENV): the parent's memory by its session id, which
+ * every memtree tool resolves to that session's newest tree at call time (memtree-mcp.ts
+ * sessionAsTree), so the note stays true as the parent's tree grows, and its bytes never
+ * change for the subagent's turns (SubagentStart context, added once). The tree it had at
+ * the start is named too. Same account only: the ref came from this key's own sessions,
+ * and the tools read with the same key. Then how to use it, per style.
+ */
+function parentTreeNote(sessionId: string, treeRef: string, style: ParentTreeStyle): string {
+  const tree = `"tree": "${sessionId}"`;
+  const pointer =
+    `ccc: You are a subagent of session ${sessionId}. What it read, ran, found and decided ` +
+    `before delegating to you is in its MemTree (tree ${treeRef} at your start): pass ` +
+    `${tree} to the mcp__memtree__ tools for its newest tree. search finds things (hybrid ` +
+    "by default); read_lines on a hit gives the exact lines (summaries drop values); " +
+    `read_lines {${tree}, "tail": true} reads its newest messages, which no tree covers yet.`;
+  return pointer + (PARENT_TREE_ADVICE[style] ?? "").replaceAll("@TREE@", tree);
+}
+
+/** What each style adds to the pointer (`@TREE@`: the tree argument). */
+const PARENT_TREE_ADVICE: Partial<Record<ParentTreeStyle, string>> = {
+  "search-first":
+    " Search there before reading files or logs the parent may already have read; read " +
+    "one yourself only for what its memory lacks, or to edit it.",
+  example:
+    " For example: search {@TREE@, \"query\": \"<an id, file or error from your task>\"}, " +
+    "then read_lines {\"node\": \"<the hit's address>\"} for its exact lines.",
+  outline:
+    " Start with read_node {@TREE@, \"id\": 0}: the parent's outline; its children lead " +
+    "to what it covered.",
+};
 
 /**
  * Said to the parent after each Agent/Task call: a subagent's result (returned now, or

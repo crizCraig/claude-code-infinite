@@ -24,6 +24,9 @@ import { MEMTREE_LOADED_NOTE, MEMTREE_TOOLS } from "../dist/memtree-mcp.js";
 import { NewestTreeLookup } from "../dist/memtree-newest.js";
 import {
   isSubagentCall,
+  PARENT_TREE_DEFAULT_STYLE,
+  PARENT_TREE_STYLES,
+  parentTreeStyleFromEnv,
   postToolUseOutput,
   SUBAGENT_RESULT_HINT,
   SubagentMemoryHint,
@@ -52,6 +55,46 @@ test("the subagent hint names the parent session and its tree, in one short para
   assert.deepEqual(subagentStartOutput("x"), {
     hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: "x" },
   });
+});
+
+test("CCC_SUBAGENT_PARENT_TREE picks the note's style; off (the shipped hint) by default", () => {
+  const style = (value) => parentTreeStyleFromEnv(
+    value === undefined ? {} : { CCC_SUBAGENT_PARENT_TREE: value });
+  for (const off of [undefined, "", "0", "off", "nonsense"]) assert.equal(style(off), "shipped");
+  for (const on of ["1", "on", "ON", " true "]) assert.equal(style(on), PARENT_TREE_DEFAULT_STYLE);
+  for (const name of PARENT_TREE_STYLES) assert.equal(style(name), name);
+  assert.notEqual(PARENT_TREE_DEFAULT_STYLE, "shipped");
+  assert.notEqual(PARENT_TREE_DEFAULT_STYLE, "none");
+  const tools = ["search"];
+  assert.equal(subagentHintFor({ tools, keyCheck: null, memtreeOff: false }).style, "shipped");
+  assert.equal(subagentHintFor({ tools, keyCheck: null, memtreeOff: false,
+    env: { CCC_SUBAGENT_PARENT_TREE: "outline" } }).style, "outline");
+});
+
+test("the parent-tree notes name the session as the tree, the start tree, and how to read it", () => {
+  assert.equal(subagentMemoryHintText(SESSION, REF, "shipped"), HINT);
+  assert.equal(subagentMemoryHintText(SESSION, REF, "none"), undefined);
+  const notes = ["pointer", "search-first", "example", "outline"].map((style) =>
+    [style, subagentMemoryHintText(SESSION, REF, style)]);
+  for (const [style, note] of notes) {
+    assert.ok(note.startsWith(`ccc: You are a subagent of session ${SESSION}.`), style);
+    assert.ok(note.includes(`"tree": "${SESSION}"`), `${style}: the stable session id`);
+    assert.ok(note.includes(`tree ${REF} at your start`), style);
+    assert.match(note, /search finds things \(hybrid by default\)/, style);
+    assert.match(note, /read_lines on a hit gives the exact lines/, style);
+    assert.ok(note.includes(`read_lines {"tree": "${SESSION}", "tail": true}`), style);
+    assert.ok(!note.includes("@TREE@"), style);
+    assert.ok(note.length < 800, `${style}: short, once per subagent (${note.length})`);
+    assert.equal(subagentMemoryHintText(SESSION, REF, style), note, `${style}: same bytes`);
+    assert.equal(subagentMemoryHintText("bad id\n", REF, style), undefined);
+    assert.equal(subagentMemoryHintText(SESSION, "ref with spaces", style), undefined);
+  }
+  const [pointer, searchFirst, example, outline] = notes.map(([, note]) => note);
+  assert.ok(searchFirst.startsWith(pointer) && example.startsWith(pointer) &&
+    outline.startsWith(pointer), "each style is the pointer plus its advice");
+  assert.match(searchFirst, /before reading files or logs/);
+  assert.ok(example.includes(`search {"tree": "${SESSION}", "query": `));
+  assert.ok(outline.includes(`read_node {"tree": "${SESSION}", "id": 0}`));
 });
 
 test("search's description (live on every request) says the tools are loaded: no ToolSearch", () => {
@@ -230,6 +273,29 @@ test("proxy: SubagentStart while MemTree works gives the subagent the hint", asy
     assert.deepEqual(await subagentStart(h, { agent_id: "agent-2", agent_type: "Explore" }),
       subagentStartOutput(HINT), "every subagent, background and nested ones too");
   } finally { h.close(); }
+});
+
+test("proxy: CCC_SUBAGENT_PARENT_TREE's note replaces the hint; none says nothing", async () => {
+  const on = await harness({ hint: new SubagentMemoryHint("search-first") });
+  try {
+    await turn(on);
+    assert.deepEqual(await subagentStart(on),
+      subagentStartOutput(subagentMemoryHintText(SESSION, REF, "search-first")));
+  } finally { on.close(); }
+  const none = await harness({ hint: new SubagentMemoryHint("none") });
+  try {
+    await turn(none);
+    const asked = none.asked;
+    assert.equal(await subagentStart(none), null, "no SubagentStart note");
+    assert.equal(none.asked, asked, "and no tree lookup for it");
+    assert.deepEqual(await subagentResult(none), postToolUseOutput(SUBAGENT_RESULT_HINT),
+      "the parent's after-a-subagent line stays");
+  } finally { none.close(); }
+  const treeless = await harness({ hint: new SubagentMemoryHint("pointer"), tree: false });
+  try {
+    await turn(treeless);
+    assert.equal(await subagentStart(treeless), null, "no tree of this key's: nothing named");
+  } finally { treeless.close(); }
 });
 
 test("proxy: no hint while MemTree is paused, without a parent tree, or without the tools", async () => {

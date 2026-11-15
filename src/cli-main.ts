@@ -797,7 +797,7 @@ async function main() {
   // work is (subagent-hint.ts), when the session has the `search` tool they name and
   // MemTree is not known off at startup.
   const subagentHint = subagentHintFor({
-    tools: memtreeMcpPlan.tools, keyCheck: checked.check, memtreeOff,
+    tools: memtreeMcpPlan.tools, keyCheck: checked.check, memtreeOff, env: process.env,
   });
   // A resumed session is given the current MemTree guidance (resume-guidance.ts):
   // Claude Code keeps the server instructions it first announced.
