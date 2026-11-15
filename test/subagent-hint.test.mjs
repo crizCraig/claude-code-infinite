@@ -78,7 +78,7 @@ test("CCC_SUBAGENT_PARENT_TREE picks the note's style; off (the shipped hint) by
 
 test("a note names only tools the session has: else the shipped hint, or the pointer", () => {
   const all = ["search", "read_lines", "read_node"];
-  for (const style of ["pointer", "search-first", "example", "outline"]) {
+  for (const style of ["pointer", "search-first", "example", "outline", "first-step"]) {
     assert.equal(styleForTools(style, all), style);
     assert.equal(styleForTools(style, ["search", "read_node"]), "shipped", `${style}: no read_lines`);
   }
@@ -93,7 +93,7 @@ test("a note names only tools the session has: else the shipped hint, or the poi
 test("the parent-tree notes name the session as the tree, the start tree, and how to read it", () => {
   assert.equal(subagentMemoryHintText(SESSION, REF, "shipped"), HINT);
   assert.equal(subagentMemoryHintText(SESSION, REF, "none"), undefined);
-  const notes = ["pointer", "search-first", "example", "outline"].map((style) =>
+  const notes = ["pointer", "search-first", "example", "outline", "first-step"].map((style) =>
     [style, subagentMemoryHintText(SESSION, REF, style)]);
   for (const [style, note] of notes) {
     assert.ok(note.startsWith(`ccc: You are a subagent of session ${SESSION}.`), style);
@@ -106,7 +106,7 @@ test("the parent-tree notes name the session as the tree, the start tree, and ho
     assert.match(text, /search finds things; read_lines/, style);
     assert.ok(note.includes(`read_lines {"tree": "${SESSION}", "tail": true}`), style);
     assert.ok(!note.includes("@TREE@"), style);
-    assert.ok(note.length < 900, `${style}: short, once per subagent (${note.length})`);
+    assert.ok(note.length < 1000, `${style}: short, once per subagent (${note.length})`);
     assert.equal(subagentMemoryHintText(SESSION, REF, style), note, `${style}: same bytes`);
     assert.equal(subagentMemoryHintText("bad id\n", REF, style), undefined);
     assert.equal(subagentMemoryHintText(SESSION, "ref with spaces", style), undefined);
@@ -119,6 +119,10 @@ test("the parent-tree notes name the session as the tree, the start tree, and ho
     "memory shows files as they were: never steer a subagent away from current code");
   assert.ok(example.includes(`search {"tree": "${SESSION}", "query": `));
   assert.ok(outline.includes(`read_node {"tree": "${SESSION}", "id": 0}`));
+  const firstStep = notes[4][1];
+  assert.ok(firstStep.startsWith(pointer));
+  assert.ok(firstStep.includes(`make your first tool call search {"tree": "${SESSION}", "query": `));
+  assert.match(firstStep, /read files for their current contents/);
 });
 
 test("search's description (live on every request) says the tools are loaded: no ToolSearch", () => {

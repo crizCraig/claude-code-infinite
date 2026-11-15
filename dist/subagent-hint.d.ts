@@ -58,7 +58,7 @@ export declare function styleForTools(style: ParentTreeStyle, tools: readonly st
  */
 export declare const PARENT_TREE_ENV = "CCC_SUBAGENT_PARENT_TREE";
 /** The parent-tree note's wordings (parentTreeNote), plus the shipped hint and none. */
-export declare const PARENT_TREE_STYLES: readonly ["shipped", "none", "pointer", "search-first", "example", "outline"];
+export declare const PARENT_TREE_STYLES: readonly ["shipped", "none", "pointer", "search-first", "example", "outline", "first-step"];
 export type ParentTreeStyle = (typeof PARENT_TREE_STYLES)[number];
 /** What `CCC_SUBAGENT_PARENT_TREE=1` means. */
 export declare const PARENT_TREE_DEFAULT_STYLE: ParentTreeStyle;
