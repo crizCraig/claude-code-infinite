@@ -251,11 +251,12 @@ function optionalHashes(hashes, length) {
     return hashes === undefined ||
         (Array.isArray(hashes) && hashes.length === length && hashes.every(nonEmptyString));
 }
-/** Absent, or one entry per covered message: "" or comma-joined sha-256 hex digests. */
-function optionalDigestLists(lists, length) {
+/** Absent, or one entry per covered message: "" or `<hash>|<entries>` (mediaSlots). */
+function optionalSlotLists(lists, length) {
     return lists === undefined || (Array.isArray(lists) && lists.length === length &&
-        lists.every((v) => typeof v === "string" && /^(?:[0-9a-f]{64}(?:,[0-9a-f]{64})*)?$/.test(v)));
+        lists.every((v) => typeof v === "string" && SLOTS_RE.test(v)));
 }
+const SLOTS_RE = /^(?:[0-9a-f]{64}\|(?:[0-9a-f]{64})?(?:,(?:[0-9a-f]{64})?)*)?$/;
 /** The prefix's invariants: the identity of a covered history, and well-formed bytes. */
 function isPrefix(p) {
     return isObject(p) && nonEmptyString(p.originalSystemHash) &&
@@ -264,7 +265,7 @@ function isPrefix(p) {
         optionalHashes(p.originalMediaFreeHashes, p.originalPrefixHashes.length) &&
         optionalHashes(p.originalPortableHashes, p.originalPrefixHashes.length) &&
         optionalHashes(p.originalPortableMediaFreeHashes, p.originalPrefixHashes.length) &&
-        optionalDigestLists(p.originalMediaDigests, p.originalPrefixHashes.length) &&
+        optionalSlotLists(p.originalMediaSlots, p.originalPrefixHashes.length) &&
         Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
         p.compressedMessages.every(isMessage) &&
         typeof p.hasCompressedSystem === "boolean" &&

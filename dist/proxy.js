@@ -3110,7 +3110,7 @@ function persistStablePrefix(state, sessionId, prefix) {
             originalMediaFreeHashes: prefix.originalMediaFreeHashes,
             originalPortableHashes: prefix.originalPortableHashes,
             originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
-            originalMediaDigests: prefix.originalMediaDigests,
+            originalMediaSlots: prefix.originalMediaSlots,
             compressedMessages: prefix.compressedMessages,
             compressedSystem: prefix.compressedSystem,
             hasCompressedSystem: prefix.hasCompressedSystem,
@@ -3208,7 +3208,7 @@ function prefixMismatch(body, messages, prefix, sessionId, kind = "route") {
 function firstPrefixMiss(messages, prefix, kind) {
     const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
     for (let i = 0; i < length; i++) {
-        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i], prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaDigests?.[i])) {
+        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i], prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaSlots?.[i])) {
             return i;
         }
     }
@@ -4197,7 +4197,7 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     if (messages.length < prefixLength)
         return null;
     for (let i = 0; i < prefixLength; i++) {
-        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i], route.originalPortableMediaFreeHashes?.[i], route.originalMediaDigests?.[i])) {
+        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i], route.originalPortableMediaFreeHashes?.[i], route.originalMediaSlots?.[i])) {
             return null;
         }
     }

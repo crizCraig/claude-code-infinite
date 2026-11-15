@@ -791,8 +791,8 @@ interface MemoryRoute {
   originalPortableHashes?: string[];
   /** The same without media; absent on old stores. */
   originalPortableMediaFreeHashes?: string[];
-  /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
-  originalMediaDigests?: string[];
+  /** Each message's media slots (route-identity mediaSlots); absent on old stores. */
+  originalMediaSlots?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -827,8 +827,8 @@ interface StablePrefix {
   originalPortableHashes?: string[];
   /** The same without media; absent on old stores. */
   originalPortableMediaFreeHashes?: string[];
-  /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
-  originalMediaDigests?: string[];
+  /** Each message's media slots (route-identity mediaSlots); absent on old stores. */
+  originalMediaSlots?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -4318,7 +4318,7 @@ function persistStablePrefix(state: ProxyState, sessionId: string, prefix: Stabl
       originalMediaFreeHashes: prefix.originalMediaFreeHashes,
       originalPortableHashes: prefix.originalPortableHashes,
       originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
-      originalMediaDigests: prefix.originalMediaDigests,
+      originalMediaSlots: prefix.originalMediaSlots,
       compressedMessages: prefix.compressedMessages,
       compressedSystem: prefix.compressedSystem,
       hasCompressedSystem: prefix.hasCompressedSystem,
@@ -4413,7 +4413,7 @@ type PrefixLike = Pick<
   | "originalMediaFreeHashes"
   | "originalPortableHashes"
   | "originalPortableMediaFreeHashes"
-  | "originalMediaDigests"
+  | "originalMediaSlots"
   | "compressedMessages"
   | "compressedSystem"
   | "hasCompressedSystem"
@@ -4448,7 +4448,7 @@ function firstPrefixMiss(
   for (let i = 0; i < length; i++) {
     if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i],
       prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i],
-      prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaDigests?.[i])) {
+      prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaSlots?.[i])) {
       return i;
     }
   }
@@ -5791,7 +5791,7 @@ function memoryRoutedToolBody(
   for (let i = 0; i < prefixLength; i++) {
     if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i],
       route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i],
-      route.originalPortableMediaFreeHashes?.[i], route.originalMediaDigests?.[i])) {
+      route.originalPortableMediaFreeHashes?.[i], route.originalMediaSlots?.[i])) {
       return null;
     }
   }

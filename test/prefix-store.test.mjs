@@ -278,24 +278,28 @@ test("a resume under Claude Code 2.1.325, whose eviction placeholders are longer
 test("a resume after Claude Code restored media it had evicted adopts the prefix", async () => {
   // Staging 2026-11-15 (session 89127e82): a flag raised Claude Code 2.1.325's media byte
   // cap (24 MiB -> 56 MiB), so on resume it sent back 91 images it had evicted: placeholders
-  // became images again, dropped pasted screenshots reappeared, a partly evicted message got
-  // its image back. The request grew from 33 MB to 55 MB and no stored history matched it.
-  const pasted = (media) => ({ role: "user", content: [{ type: "text", text: "see [Image #4]" },
-    ...media, { type: "text", text: "[Image: source: /tmp/4.png]" }] });
+  // became images again and a partly evicted message got its image back. The request grew
+  // from 33 MB to 55 MB and no stored history matched it.
   const two = (first) => ({ role: "user", content: [
     { type: "tool_result", tool_use_id: "r3", content: [first] },
     { type: "tool_result", tool_use_id: "r4", content: [image("four")] }] });
-  const old = [user("q1"), shot("r1"), read("r1", [NEW_PLACEHOLDERS[0]]), pasted([]),
-    assistant("seen"), shot("r3"), two(NEW_PLACEHOLDERS[0]), assistant("a1"), user("q2")];
+  const old = [user("q1"), shot("r1"), read("r1", [NEW_PLACEHOLDERS[0]]), assistant("seen"),
+    shot("r3"), two(NEW_PLACEHOLDERS[0]), assistant("a1"), user("q2")];
   const restore = (messages) => messages.map((m, i) =>
-    i === 2 ? read("r1", [image("one")]) : i === 3 ? pasted([image("pasted", "image/jpeg")])
-      : i === 6 ? two(image("three")) : m);
+    i === 2 ? read("r1", [image("one")]) : i === 5 ? two(image("three")) : m);
   const { record, compressCalls } = await resumeAfterCompact(old, restore);
   assert.equal(record.storedPrefix, "adopted");
   assert.equal(compressCalls, 0, "no blocking compress");
   assert.equal(record.turnType, "followup-prefix");
 
-  // An image the stored history carried, replaced by another, is new content.
+  // Media where the stored message had none (a dropped top-level screenshot left no trace,
+  // or new media) and an image replaced by another are new content.
+  const pasted = (media) => ({ role: "user", content: [{ type: "text", text: "see [Image #4]" },
+    ...media] });
+  const bare = [user("q1"), pasted([]), assistant("a1"), user("q2")];
+  const added = await resumeAfterCompact(bare, (messages) =>
+    messages.map((m, i) => i === 1 ? pasted([image("pasted")]) : m));
+  assert.equal(added.record.storedPrefix, "discarded");
   const kept = [user("q1"), shot("r1"), read("r1", [image("one")]), assistant("a1"), user("q2")];
   const replaced = await resumeAfterCompact(kept, (messages) =>
     messages.map((m, i) => i === 2 ? read("r1", [image("other")]) : m));
