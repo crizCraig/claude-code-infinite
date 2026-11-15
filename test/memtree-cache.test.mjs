@@ -676,6 +676,35 @@ test("a held-back history goes after at most the hold limit, so the newest messa
   }
 });
 
+test("a compress call that carries a held-back history retires it (no older upload after it)", async () => {
+  // Codex r1 P1: the timer later uploaded the older held history, which then became the
+  // server's newest stored request and dropped the compress call's newer messages.
+  const fixture = await memtreeFixture({ result: (body) => body.index_only
+    ? { messages: [], index_only: true } : RESULT });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexHoldMaxMs: 100 });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const index = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    index();
+    await waitFor(() => fixture.calls.length === 1);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
+    index(); // held back
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "newer" });
+    const newer = conv.slice();
+    await client.compress(MemtreeClient.hashMessages(newer), newer, 100, undefined,
+      { sessionId: "s" });
+    assert.equal(fixture.calls.length, 2);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(fixture.calls.length, 2, "the held history the compress call carried is not sent");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
   assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);

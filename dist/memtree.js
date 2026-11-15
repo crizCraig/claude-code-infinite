@@ -79,7 +79,10 @@ export const INDEX_MIN_NEW_CHARS = 30_000;
  * conversation's last upload. The MemTree page shows its owner the newest stored request,
  * so without a bound a session's quiet turns stayed off the page for as long as the
  * session ran short (2026-11-14: 10+ minutes on a 27 MB session). Costs at most one extra
- * upload per conversation per limit, and only while its turns stay under the minimum.
+ * upload per conversation per limit, and only while its turns stay under the minimum: worst
+ * case the whole history every 3 minutes (a 27 MB session: ~540 MB an hour, against the
+ * ~1.5 GB an hour of every-turn uploads the minimum replaced). A compress call that carries
+ * the held history retires it (retireHeldBy).
  * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
  */
 export const INDEX_HOLD_MAX_MS = 3 * 60_000;
@@ -1281,6 +1284,20 @@ export class MemtreeClient {
         timer.unref();
         this.indexHoldTimers.set(lane, timer);
     }
+    /**
+     * A compress call stored `messages` (the server stores every request): a held-back
+     * history it carries whole is dropped, or its later upload would be the older request
+     * the page reads as the newest (Codex r1 P1).
+     */
+    retireHeldBy(sessionId, messages) {
+        const lane = indexLaneKey(sessionId, messages);
+        const held = this.indexLanesHeld.get(lane);
+        if (!held || !extendsHistory(messages, held.messages) || losesMedia(held.messages, messages)) {
+            return;
+        }
+        this.indexLanesHeld.delete(lane);
+        this.clearHoldTimer(lane);
+    }
     clearHoldTimer(lane) {
         const timer = this.indexHoldTimers.get(lane);
         if (timer === undefined)
@@ -1804,6 +1821,9 @@ export class MemtreeClient {
             ok = true;
             if (!opts.indexOnly)
                 this.compressSuccessAt = Date.now();
+            if (!opts.indexOnly && planned.limit?.action !== "trimmed") {
+                this.retireHeldBy(opts.sessionId, messages);
+            }
             diagnostics = {
                 ...(memtreeUrl ? { memtreeUrl } : {}),
                 ...(memtreeIndex ? { memtreeIndex } : {}),

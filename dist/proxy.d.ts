@@ -500,6 +500,8 @@ interface ProxyState {
     newestTrees?: NewestTreeLookup;
     /** The session's link for Claude Code's status line (status-link.ts). */
     statusLinks?: StatusLinkFiles;
+    /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
+    stableSessionLinks: Map<string, string>;
     statusLinkRefresh: boolean;
     memtreeLinkPlacement: MemtreeLinkPlacement;
     /**

@@ -681,6 +681,8 @@ interface ProxyState {
   newestTrees?: NewestTreeLookup;
   /** The session's link for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
+  /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
+  stableSessionLinks: Map<string, string>;
   statusLinkRefresh: boolean;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
@@ -1233,6 +1235,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       ? opts.memtree.storageIdentity : undefined,
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
+    stableSessionLinks: new Map(),
     statusLinkRefresh: opts.statusLinkRefresh === true,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
@@ -4073,8 +4076,23 @@ function rememberMemtreePage(state: ProxyState, sessionId: string, page: Memtree
  */
 function publishStatusLink(state: ProxyState, sessionId: string): void {
   if (!state.statusLinks) return;
-  const stable = state.newestTrees?.peek(sessionId)?.sessionUrl;
+  const stable = stableSessionLink(state, sessionId);
   state.statusLinks.write(sessionId, stable ?? currentSessionLink(state, sessionId));
+}
+
+/**
+ * The session's stable link, remembered once a lookup named it: it never changes, so a
+ * later failed or evicted lookup does not put the pinned tree back (Codex r1).
+ */
+function stableSessionLink(state: ProxyState, sessionId: string): string | undefined {
+  const fresh = state.newestTrees?.peek(sessionId)?.sessionUrl;
+  if (fresh === undefined) return state.stableSessionLinks.get(sessionId);
+  state.stableSessionLinks.delete(sessionId);
+  state.stableSessionLinks.set(sessionId, fresh);
+  while (state.stableSessionLinks.size > MEMTREE_LINKS_MAX_SESSIONS) {
+    state.stableSessionLinks.delete(state.stableSessionLinks.keys().next().value!);
+  }
+  return fresh;
 }
 
 /** Bound optional page state independently of how many sessions use the proxy. */

@@ -11409,6 +11409,37 @@ test("the status line links the session's stable page once the server names one"
   }
 });
 
+test("the status line keeps the session's stable link when a later lookup fails", async () => {
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const stable = "https://staging.example/m/sessions/session-1";
+  let calls = 0;
+  const { lookup } = await newestLookup((q) => (calls++ === 0
+    ? { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] } : 503));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    // The compress answer's page invalidates the lookup; its refresh fails.
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), stable,
+      "once known, the stable link stays: it never goes stale");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
 /** An upstream that streams `recapText` for the recap and answers others plainly. */
 async function recapUpstream(recapText) {
   return listen((req, res) => {
