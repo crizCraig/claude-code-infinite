@@ -3811,12 +3811,14 @@ async function subagentHintContext(
   sessionId: string
 ): Promise<string | undefined> {
   if (!state.subagentHint?.enabled || !memtreeWorking(state)) return undefined;
+  if (state.subagentHint.style === "none") return undefined;
   try {
     // A cached tree will do (peek refreshes it in the background); wait only for none.
     const tree = state.newestTrees?.peek(sessionId) ?? await state.newestTrees?.settle(sessionId);
     // MemTree may have paused or failed while the lookup was on its way.
     if (!tree || !state.subagentHint.enabled || !memtreeWorking(state)) return undefined;
-    return subagentMemoryHintText(sessionId, tree.key);
+    return subagentMemoryHintText(
+      sessionId, tree.key, state.subagentHint.style, state.subagentHint.hybrid);
   } catch {
     return undefined;
   }
