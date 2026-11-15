@@ -50,6 +50,12 @@ export interface NewestTree {
   url: string;
   /** What makes the link news: the pinned tree ref. */
   key: string;
+  /**
+   * The session's stable link (`/m/sessions/<id>`), when the server names one: it sends
+   * the owner to the session's newest page, so a link shown for long (the status line)
+   * never goes stale. Older servers name none.
+   */
+  sessionUrl?: string;
 }
 
 /** GET a polychat path with the user's key (MemtreeClient.fetchMemTree). */
@@ -276,7 +282,9 @@ export function newestTreeFrom(body: unknown, sessionId: string): NewestTree | u
   const url = validatedTreeUrl(tree.links.url);
   if (!url) return undefined;
   const key = typeof tree.ref === "string" && tree.ref ? tree.ref : tree.request_id;
-  return { url, key };
+  const sessionLink = (item as { links?: { url?: unknown } }).links?.url;
+  const sessionUrl = typeof sessionLink === "string" ? validatedTreeUrl(sessionLink) : undefined;
+  return sessionUrl ? { url, key, sessionUrl } : { url, key };
 }
 
 /** Preserve the server-selected reference; shortening it can select another tree. */

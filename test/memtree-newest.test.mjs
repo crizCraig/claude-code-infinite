@@ -39,6 +39,16 @@ function scripted(answer, clock = { t: 0 }) {
   return { lookup, asked, clock };
 }
 
+test("newestTreeFrom carries the session's stable link when the server names one", () => {
+  const stable = "https://staging.example/m/sessions/session-1";
+  const linked = { ...item("session-1", NEW_ID), links: { url: stable } };
+  assert.deepEqual(newestTreeFrom({ sessions: [linked] }, "session-1"),
+    { url: NEW_URL, key: `${NEW_ID}-v1-own`, sessionUrl: stable });
+  const bad = { ...item("session-1", NEW_ID), links: { url: "javascript:alert(1)" } };
+  assert.deepEqual(newestTreeFrom({ sessions: [bad] }, "session-1"),
+    { url: NEW_URL, key: `${NEW_ID}-v1-own` }, "an unusable link is left out");
+});
+
 test("newestTreeFrom takes only the exact session's tree, with the server's pinned link", () => {
   const body = { sessions: [item("session-2", OLD_ID), item("session-1", NEW_ID)] };
   assert.deepEqual(newestTreeFrom(body, "session-1"), { url: NEW_URL, key: `${NEW_ID}-v1-own` });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { INDEX_MIN_NEW_CHARS, MemtreeClient, isDroppedConnection, messagesTextChars, withFinalReply }
+import { INDEX_HOLD_MAX_MS, INDEX_MIN_NEW_CHARS, MemtreeClient, holdMaxFromEnv, isDroppedConnection, messagesTextChars, withFinalReply }
   from "../dist/memtree.js";
 import { startProxy } from "../dist/proxy.js";
 
@@ -645,6 +645,44 @@ test("an index upload waits until its history has gained the server's index mini
   } finally {
     await fixture.close();
   }
+});
+
+test("a held-back history goes after at most the hold limit, so the newest messages reach the page", async () => {
+  // 2026-11-14: a 27 MB session's small turns stayed held back for 10+ minutes, so its
+  // MemTree page (which shows the newest stored request) missed them.
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexHoldMaxMs: 150 });
+    const conv = [{ role: "user", content: "task" }];
+    const turn = (text) => {
+      conv.push({ role: "assistant", content: "ok" }, { role: "user", content: text });
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    turn("x".repeat(50_000));
+    await waitFor(() => fixture.calls.length === 1);
+    turn("small one");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    turn("small two"); // replaces the held one; the limit runs from the first hold
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(fixture.calls.length, 1, "inside the limit: still held back");
+    await waitFor(() => fixture.calls.length === 2, 1_000);
+    assert.equal(fixture.calls[1].messages.length, conv.length, "the newest held history");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(fixture.calls.length, 2, "nothing held, nothing more sent");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
+  assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
+  assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);
+  assert.equal(holdMaxFromEnv("0"), 0, "0: no bound");
+  assert.equal(holdMaxFromEnv("60000"), 60_000);
+  assert.equal(holdMaxFromEnv("-5"), INDEX_HOLD_MAX_MS);
+  assert.equal(holdMaxFromEnv("soon"), INDEX_HOLD_MAX_MS);
 });
 
 test("an image is never held back by the text minimum (Claude Code may evict it later)", async () => {

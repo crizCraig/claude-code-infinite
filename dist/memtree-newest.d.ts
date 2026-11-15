@@ -43,6 +43,12 @@ export interface NewestTree {
     url: string;
     /** What makes the link news: the pinned tree ref. */
     key: string;
+    /**
+     * The session's stable link (`/m/sessions/<id>`), when the server names one: it sends
+     * the owner to the session's newest page, so a link shown for long (the status line)
+     * never goes stale. Older servers name none.
+     */
+    sessionUrl?: string;
 }
 /** GET a polychat path with the user's key (MemtreeClient.fetchMemTree). */
 export type NewestTreeFetch = (pathAndQuery: string, signal: AbortSignal) => Promise<{

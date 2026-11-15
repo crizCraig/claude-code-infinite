@@ -252,7 +252,9 @@ export function newestTreeFrom(body, sessionId) {
     if (!url)
         return undefined;
     const key = typeof tree.ref === "string" && tree.ref ? tree.ref : tree.request_id;
-    return { url, key };
+    const sessionLink = item.links?.url;
+    const sessionUrl = typeof sessionLink === "string" ? validatedTreeUrl(sessionLink) : undefined;
+    return sessionUrl ? { url, key, sessionUrl } : { url, key };
 }
 /** Preserve the server-selected reference; shortening it can select another tree. */
 export function validatedTreeUrl(serverUrl) {

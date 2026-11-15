@@ -51,6 +51,15 @@ export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 2.5;
  */
 export declare const INDEX_MIN_NEW_CHARS = 30000;
 /**
+ * Most a history waits held back by INDEX_MIN_NEW_CHARS, from the first hold since its
+ * conversation's last upload. The MemTree page shows its owner the newest stored request,
+ * so without a bound a session's quiet turns stayed off the page for as long as the
+ * session ran short (2026-11-14: 10+ minutes on a 27 MB session). Costs at most one extra
+ * upload per conversation per limit, and only while its turns stay under the minimum.
+ * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
+ */
+export declare const INDEX_HOLD_MAX_MS: number;
+/**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
  * pauses spend the server's once-per-30-minutes final index mid-session.
@@ -66,6 +75,8 @@ export interface MemtreeOptions {
     longCompressTimeoutMs?: number;
     /** New text an index upload waits for (INDEX_MIN_NEW_CHARS); tests set 0. */
     indexMinNewChars?: number;
+    /** Most a held-back index waits (INDEX_HOLD_MAX_MS); 0: no bound. Tests set it small. */
+    indexHoldMaxMs?: number;
     /** Added to a compress budget per KiB uploaded (COMPRESS_TIMEOUT_MS_PER_KIB); tests set 0. */
     compressTimeoutMsPerKiB?: number;
     debug?: boolean;
@@ -382,6 +393,9 @@ export declare class MemtreeClient {
      * call that does not carry it whole (a rewind, evicted media) replaces it.
      */
     private readonly indexLanesHeld;
+    /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
+    private readonly indexHoldTimers;
+    private readonly indexHoldMaxMs;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
@@ -594,6 +608,12 @@ export declare class MemtreeClient {
     private releaseHeldIndex;
     private holdIndex;
     /**
+     * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
+     * since its last upload, so newer held histories replacing it do not push it back.
+     */
+    private startHoldTimer;
+    private clearHoldTimer;
+    /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
      * last sent (or has waiting to send): the server's index minimum would only ack it.
      */
@@ -731,4 +751,6 @@ export declare function messagesTextChars(messages: Message[]): number;
  * replacing `older` by `newer` would leave it never uploaded.
  */
 export declare function losesMedia(older: Message[], newer: Message[]): boolean;
+/** `CCC_INDEX_HOLD_MAX_MS` as milliseconds (0 or more), else INDEX_HOLD_MAX_MS. */
+export declare function holdMaxFromEnv(value: string | undefined): number;
 //# sourceMappingURL=memtree.d.ts.map

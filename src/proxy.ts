@@ -4066,10 +4066,15 @@ function rememberMemtreePage(state: ProxyState, sessionId: string, page: Memtree
   publishStatusLink(state, sessionId);
 }
 
-/** Write the session's current link (as the trailers would show it) for the status line. */
+/**
+ * Write the session's link for the status line: its stable session page once the server
+ * names one (always the newest page, so it never goes stale), else the current link as the
+ * trailers would show it.
+ */
 function publishStatusLink(state: ProxyState, sessionId: string): void {
   if (!state.statusLinks) return;
-  state.statusLinks.write(sessionId, currentSessionLink(state, sessionId));
+  const stable = state.newestTrees?.peek(sessionId)?.sessionUrl;
+  state.statusLinks.write(sessionId, stable ?? currentSessionLink(state, sessionId));
 }
 
 /** Bound optional page state independently of how many sessions use the proxy. */

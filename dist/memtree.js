@@ -74,6 +74,15 @@ const INDEX_TIMEOUT_MS = 120_000;
  * acknowledges the upload.
  */
 export const INDEX_MIN_NEW_CHARS = 30_000;
+/**
+ * Most a history waits held back by INDEX_MIN_NEW_CHARS, from the first hold since its
+ * conversation's last upload. The MemTree page shows its owner the newest stored request,
+ * so without a bound a session's quiet turns stayed off the page for as long as the
+ * session ran short (2026-11-14: 10+ minutes on a 27 MB session). Costs at most one extra
+ * upload per conversation per limit, and only while its turns stay under the minimum.
+ * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
+ */
+export const INDEX_HOLD_MAX_MS = 3 * 60_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -811,6 +820,9 @@ export class MemtreeClient {
      * call that does not carry it whole (a rewind, evicted media) replaces it.
      */
     indexLanesHeld = new Map();
+    /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
+    indexHoldTimers = new Map();
+    indexHoldMaxMs;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     indexLanesPending = new Map();
     /** Once draining begins, no later request may create another log producer. */
@@ -979,6 +991,7 @@ export class MemtreeClient {
             opts.longCompressTimeoutMs ??
                 Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_LONG_COMPRESS_TIMEOUT_MS);
         this.indexMinNewChars = opts.indexMinNewChars ?? INDEX_MIN_NEW_CHARS;
+        this.indexHoldMaxMs = opts.indexHoldMaxMs ?? holdMaxFromEnv(process.env.CCC_INDEX_HOLD_MAX_MS);
         this.compressTimeoutMsPerKiB = opts.compressTimeoutMsPerKiB ?? COMPRESS_TIMEOUT_MS_PER_KIB;
         this.debug = opts.debug ?? false;
         this.reqlog = opts.reqlog;
@@ -1215,6 +1228,7 @@ export class MemtreeClient {
      * turn is not held back by an upload the server never got.
      */
     sendLaneIndex(lane, job) {
+        this.clearHoldTimer(lane);
         const sent = { messages: job.messages, chars: messagesTextChars(job.messages) };
         this.indexLanesPending.set(lane, sent);
         return this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).then((ok) => {
@@ -1241,12 +1255,38 @@ export class MemtreeClient {
     }
     holdIndex(lane, job) {
         this.indexLanesHeld.set(lane, job);
+        this.startHoldTimer(lane);
         if (this.indexLanesHeld.size > DEDUPE_CACHE_MAX) {
             // Over capacity the oldest held history is sent, not dropped (origin/main sent it).
             const [first, evicted] = this.indexLanesHeld.entries().next().value;
             this.indexLanesHeld.delete(first);
             this.enqueueIndex(first, evicted);
         }
+    }
+    /**
+     * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
+     * since its last upload, so newer held histories replacing it do not push it back.
+     */
+    startHoldTimer(lane) {
+        if (this.indexHoldMaxMs <= 0 || this.indexHoldTimers.has(lane))
+            return;
+        const timer = setTimeout(() => {
+            this.indexHoldTimers.delete(lane);
+            const held = this.indexLanesHeld.get(lane);
+            if (!held || this.backgroundClosing)
+                return;
+            this.indexLanesHeld.delete(lane);
+            this.enqueueIndex(lane, held);
+        }, this.indexHoldMaxMs);
+        timer.unref();
+        this.indexHoldTimers.set(lane, timer);
+    }
+    clearHoldTimer(lane) {
+        const timer = this.indexHoldTimers.get(lane);
+        if (timer === undefined)
+            return;
+        clearTimeout(timer);
+        this.indexHoldTimers.delete(lane);
     }
     /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
@@ -1304,6 +1344,8 @@ export class MemtreeClient {
             }
         }
         this.indexLanesHeld.clear();
+        for (const lane of [...this.indexHoldTimers.keys()])
+            this.clearHoldTimer(lane);
         for (const [lane, job] of this.indexLanesNext) {
             if (!carries(this.finalIndexLanes.get(lane), job.messages)) {
                 void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
@@ -2121,5 +2163,10 @@ function scaledTimeout(baseMs, bytes, perKiB) {
 function indexLaneKey(sessionId, messages) {
     const first = messages.find((message) => message.role !== "system");
     return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
+}
+/** `CCC_INDEX_HOLD_MAX_MS` as milliseconds (0 or more), else INDEX_HOLD_MAX_MS. */
+export function holdMaxFromEnv(value) {
+    const n = value === undefined || value.trim() === "" ? NaN : Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : INDEX_HOLD_MAX_MS;
 }
 //# sourceMappingURL=memtree.js.map
