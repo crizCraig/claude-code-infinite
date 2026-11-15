@@ -399,6 +399,8 @@ export declare class MemtreeClient {
     /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
     private readonly indexHoldTimers;
     private readonly indexHoldMaxMs;
+    /** Per conversation, compress calls in flight: a held history never goes before one. */
+    private readonly compressLanesInFlight;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
@@ -615,6 +617,13 @@ export declare class MemtreeClient {
      * since its last upload, so newer held histories replacing it do not push it back.
      */
     private startHoldTimer;
+    /**
+     * `job` only repeats the history its conversation last sent (a retried request): its
+     * upload would store nothing new, so the hold limit drops it (review r2 P3).
+     */
+    private addsNothing;
+    /** Count a compress call of `lane` in flight (+1) or done (-1). */
+    private noteCompressInFlight;
     /**
      * A compress call stored `messages` (the server stores every request): a held-back
      * history it carries whole is dropped, or its later upload would be the older request

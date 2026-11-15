@@ -86,6 +86,8 @@ export const INDEX_MIN_NEW_CHARS = 30_000;
  * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
  */
 export const INDEX_HOLD_MAX_MS = 3 * 60_000;
+/** A hold limit reached while a compress call of that conversation is in flight looks again. */
+const HOLD_RECHECK_MS = 5_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -826,6 +828,8 @@ export class MemtreeClient {
     /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
     indexHoldTimers = new Map();
     indexHoldMaxMs;
+    /** Per conversation, compress calls in flight: a held history never goes before one. */
+    compressLanesInFlight = new Map();
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     indexLanesPending = new Map();
     /** Once draining begins, no later request may create another log producer. */
@@ -1270,7 +1274,7 @@ export class MemtreeClient {
      * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
      * since its last upload, so newer held histories replacing it do not push it back.
      */
-    startHoldTimer(lane) {
+    startHoldTimer(lane, delayMs = this.indexHoldMaxMs) {
         if (this.indexHoldMaxMs <= 0 || this.indexHoldTimers.has(lane))
             return;
         const timer = setTimeout(() => {
@@ -1278,11 +1282,35 @@ export class MemtreeClient {
             const held = this.indexLanesHeld.get(lane);
             if (!held || this.backgroundClosing)
                 return;
+            // A compress call in flight is newer: sent now, the held one would be stored after
+            // it and read as the newest request (Codex r2 P1). Its success retires the held one.
+            if ((this.compressLanesInFlight.get(lane) ?? 0) > 0) {
+                this.startHoldTimer(lane, Math.min(HOLD_RECHECK_MS, this.indexHoldMaxMs));
+                return;
+            }
             this.indexLanesHeld.delete(lane);
-            this.enqueueIndex(lane, held);
-        }, this.indexHoldMaxMs);
+            if (!this.addsNothing(lane, held))
+                this.enqueueIndex(lane, held);
+        }, delayMs);
         timer.unref();
         this.indexHoldTimers.set(lane, timer);
+    }
+    /**
+     * `job` only repeats the history its conversation last sent (a retried request): its
+     * upload would store nothing new, so the hold limit drops it (review r2 P3).
+     */
+    addsNothing(lane, job) {
+        const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
+        return sent !== undefined && job.messages.length === sent.messages.length &&
+            extendsHistory(job.messages, sent.messages) && !losesMedia(sent.messages, job.messages);
+    }
+    /** Count a compress call of `lane` in flight (+1) or done (-1). */
+    noteCompressInFlight(lane, delta) {
+        const n = (this.compressLanesInFlight.get(lane) ?? 0) + delta;
+        if (n > 0)
+            this.compressLanesInFlight.set(lane, n);
+        else
+            this.compressLanesInFlight.delete(lane);
     }
     /**
      * A compress call stored `messages` (the server stores every request): a held-back
@@ -1735,6 +1763,9 @@ export class MemtreeClient {
         opts.signal?.addEventListener("abort", abort, { once: true });
         if (opts.signal?.aborted)
             abort();
+        const compressLane = opts.indexOnly ? undefined : indexLaneKey(opts.sessionId, messages);
+        if (compressLane !== undefined)
+            this.noteCompressInFlight(compressLane, 1);
         try {
             const response = await this.postRetryingDrop(payload, { ...opts, features }, controller.signal)
                 .catch((err) => {
@@ -1850,6 +1881,8 @@ export class MemtreeClient {
             };
         }
         finally {
+            if (compressLane !== undefined)
+                this.noteCompressInFlight(compressLane, -1);
             clearTimeout(timeout);
             opts.signal?.removeEventListener("abort", abort);
             // A call the caller aborted says nothing about the server.

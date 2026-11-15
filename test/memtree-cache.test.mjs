@@ -705,6 +705,72 @@ test("a compress call that carries a held-back history retires it (no older uplo
   }
 });
 
+test("a held-back history waits for a compress call in flight, which then retires it", async () => {
+  // Codex r2 P1: the limit was reached while a newer compress call was in flight, and the
+  // older held history went first. Order: index(1) -> compress(5) -> index(3) must not happen.
+  let releaseCompress;
+  const compressGate = new Promise((resolve) => { releaseCompress = resolve; });
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      calls.push(body.index_only ? `index:${body.messages.length}` : `compress:${body.messages.length}`);
+      if (!body.index_only) await compressGate;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true } : RESULT));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k", indexHoldMaxMs: 80 });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const index = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    index();
+    await waitFor(() => calls.length === 1);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
+    index(); // held back
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "newer" });
+    const newer = conv.slice();
+    const compressed = client.compress(MemtreeClient.hashMessages(newer), newer, 100, undefined,
+      { sessionId: "s" });
+    await new Promise((resolve) => setTimeout(resolve, 200)); // past the limit, compress pending
+    assert.deepEqual(calls, ["index:1", "compress:5"], "the held history did not overtake it");
+    releaseCompress();
+    await compressed;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(calls, ["index:1", "compress:5"], "and once it succeeded, it is retired");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    releaseCompress();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("the hold limit drops a held history that only repeats the last upload", async () => {
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexHoldMaxMs: 60 });
+    const send = (system) => {
+      const messages = [{ role: "system", content: system }, { role: "user", content: "x".repeat(50_000) }];
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    send("one");
+    await waitFor(() => fixture.calls.length === 1);
+    send("two"); // another hash, the same conversation: held, adds nothing
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(fixture.calls.length, 1, "nothing new: not uploaded again");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
   assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);
