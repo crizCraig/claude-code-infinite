@@ -11499,6 +11499,32 @@ test("a known stable link is written again when another process pruned the file"
   }
 });
 
+test("a persisted stable link gives way once this server answers without one", async () => {
+  // Codex r10 P2: resumed against a server that names no stable link, the old server's
+  // link must not stay.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  new StatusLinkFiles(dir).write("session-1", "https://old.example/m/sessions/session-1");
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    for (let i = 0; i < 50 && readStatusLink("session-1", dir) !== NEWEST_URL; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(readStatusLink("session-1", dir), NEWEST_URL);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 /** An upstream that streams `recapText` for the recap and answers others plainly. */
 async function recapUpstream(recapText) {
   return listen((req, res) => {

@@ -80,6 +80,8 @@ export declare class NewestTreeLookup {
     onSessionLink(listener: (sessionId: string, url: string) => void): void;
     /** The session's stable link, once any lookup named it (even before its first tree). */
     sessionUrl(sessionId: string | undefined): string | undefined;
+    /** Whether the server has answered for this session (a tree or its absence). */
+    answered(sessionId: string): boolean;
     /** The cached answer, refreshing in the background when stale. Never waits. */
     peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */

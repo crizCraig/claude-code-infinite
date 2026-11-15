@@ -4090,10 +4090,12 @@ function publishStatusLink(state: ProxyState, sessionId: string): void {
  * later failed or evicted lookup does not put the pinned tree back (Codex r1).
  */
 function stableSessionLink(state: ProxyState, sessionId: string): string | undefined {
-  const fresh = state.newestTrees?.sessionUrl(sessionId) ??
-    state.newestTrees?.peek(sessionId)?.sessionUrl;
+  const known = state.newestTrees?.sessionUrl(sessionId) ?? state.stableSessionLinks.get(sessionId);
+  const fresh = known ?? state.newestTrees?.peek(sessionId)?.sessionUrl;
   if (fresh === undefined) {
-    return state.stableSessionLinks.get(sessionId) ?? persistedSessionLink(state, sessionId);
+    // A file from before a restart counts only until this server answers (Codex r10).
+    return state.newestTrees?.answered(sessionId) ? undefined
+      : persistedSessionLink(state, sessionId);
   }
   state.stableSessionLinks.delete(sessionId);
   state.stableSessionLinks.set(sessionId, fresh);
@@ -4106,7 +4108,7 @@ function stableSessionLink(state: ProxyState, sessionId: string): string | undef
 /**
  * After a restart: the stable link the session's status-line file already holds (the
  * server's `/m/sessions/<this session>` link), so a failed lookup doesn't replace it with a
- * stored pinned page (Codex r8).
+ * stored pinned page (Codex r8), until this server answers for the session.
  */
 function persistedSessionLink(state: ProxyState, sessionId: string): string | undefined {
   const url = state.statusLinks ? readStatusLink(sessionId, state.statusLinks.dir) : undefined;

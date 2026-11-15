@@ -116,6 +116,11 @@ export class NewestTreeLookup {
     return sessionId === undefined ? undefined : this.sessionUrls.get(sessionId);
   }
 
+  /** Whether the server has answered for this session (a tree or its absence). */
+  answered(sessionId: string): boolean {
+    return this.entries.get(sessionId)?.answered === true;
+  }
+
   /** The cached answer, refreshing in the background when stale. Never waits. */
   peek(sessionId: string | undefined): NewestTree | undefined {
     if (!sessionId || !SESSION_ID.test(sessionId)) return undefined;
