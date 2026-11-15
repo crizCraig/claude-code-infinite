@@ -28,6 +28,9 @@ import {
   resumeGuidanceFor,
 } from "../dist/resume-guidance.js";
 
+// Hybrid search is opt-in: these tests expect the default wording whatever the shell exports.
+delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
+
 const SESSION = "6472823f-ca4f-4027-9b89-64a81c367dc3";
 const OLD_INSTRUCTIONS =
   "Search and read this session's MemTree: the summarized earlier part of the conversation, " +
@@ -386,4 +389,15 @@ test("the session plugin runs the guidance as its own SessionStart hook, on resu
     without.close();
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("with hybrid search on, resume guidance carries the hybrid wording and its own needle", async () => {
+  const { resumeGuidance, announcedInstructionsNeedle } = await import("../dist/resume-guidance.js");
+  assert.equal(resumeGuidance({}), RESUME_GUIDANCE, "off: unchanged");
+  assert.equal(announcedInstructionsNeedle({}), ANNOUNCED_INSTRUCTIONS_NEEDLE);
+  const on = { CCC_MEMTREE_HYBRID_SEARCH: "1" };
+  assert.match(resumeGuidance(on), /Hybrid mode \(default\)/);
+  assert.doesNotMatch(resumeGuidance(on), /Text mode \(default\)/);
+  assert.notEqual(announcedInstructionsNeedle(on), ANNOUNCED_INSTRUCTIONS_NEEDLE);
+  assert.ok(announcedInstructionsNeedle(on).includes("Hybrid mode (default)"));
 });

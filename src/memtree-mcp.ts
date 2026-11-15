@@ -377,7 +377,8 @@ const TEXT_DEFAULT_SENTENCE =
   "first page is charged even when cached; cursor continuation and a text search of one tree are free.";
 const HYBRID_DEFAULT_SENTENCE =
   "mode \"hybrid\" (default) runs text and vector together and fuses them by rank into one page (no cursor), " +
-  "one tree included; mode \"text\" matches exact words, ids, paths and errors (in one tree: node summaries and " +
+  "one tree included (only a text search of one tree also matches its newest un-indexed messages); mode " +
+  "\"text\" matches exact words, ids, paths and errors (in one tree: node summaries and " +
   "transcript lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 in any " +
   "mode: its first page is charged even when cached; cursor continuation and a text search of one tree are free.";
 /** The MCP instructions' mode sentence, and what it says once hybrid is the default. */

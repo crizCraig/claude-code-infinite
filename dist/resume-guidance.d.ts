@@ -45,6 +45,13 @@ export declare const RESUME_GUIDANCE = "ccc: current MemTree guidance (replaces 
  * line), not in a tool result or a paste that quotes it.
  */
 export declare const ANNOUNCED_INSTRUCTIONS_NEEDLE: string;
+/**
+ * The guidance and the announcement needle for the instructions this process's MCP server
+ * announces now: RESUME_GUIDANCE and ANNOUNCED_INSTRUCTIONS_NEEDLE, or their hybrid-default
+ * wording under CCC_MEMTREE_HYBRID_SEARCH=1 (memtreeInstructions).
+ */
+export declare function resumeGuidance(env?: NodeJS.ProcessEnv): string;
+export declare function announcedInstructionsNeedle(env?: NodeJS.ProcessEnv): string;
 /** A scan that has not found the announcement by then gives the guidance. */
 export declare const ANNOUNCED_SCAN_MS = 1000;
 export interface ResumeGuidanceStartup {

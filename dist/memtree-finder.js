@@ -209,7 +209,8 @@ export function formatSearchResults(body, args) {
     const hybrid = body.mode === "hybrid";
     const notes = hybrid ? legNotes(body.legs) : [];
     if (!hits.length) {
-        const empty = noHits(query, hybrid ? "hybrid" : "text", args, body.coverage, body.charged, notes.length > 0);
+        const failed = Object.values(body.legs ?? {}).some((leg) => !!leg?.error);
+        const empty = noHits(query, hybrid ? "hybrid" : "text", args, body.coverage, body.charged, failed);
         return notes.length ? `${empty} ${notes.join(" ")}` : empty;
     }
     const kind = hybrid ? "hybrid" : "text";
