@@ -84,12 +84,13 @@ export const PARENT_TREE_ENV = "CCC_SUBAGENT_PARENT_TREE";
 
 /** The parent-tree note's wordings (parentTreeNote), plus the shipped hint and none. */
 export const PARENT_TREE_STYLES = [
-  "shipped", "none", "pointer", "search-first", "example", "outline",
+  "shipped", "none", "pointer", "search-first", "example", "outline", "first-step",
 ] as const;
 export type ParentTreeStyle = (typeof PARENT_TREE_STYLES)[number];
 
 /** What `CCC_SUBAGENT_PARENT_TREE=1` means. */
-export const PARENT_TREE_DEFAULT_STYLE: ParentTreeStyle = "search-first";
+// first-step: in the plan-savings pilot (2026-11-15) the only wording subagents acted on.
+export const PARENT_TREE_DEFAULT_STYLE: ParentTreeStyle = "first-step";
 
 /** The style PARENT_TREE_ENV selects. */
 export function parentTreeStyleFromEnv(env: NodeJS.ProcessEnv): ParentTreeStyle {
@@ -158,6 +159,15 @@ const PARENT_TREE_ADVICE: Partial<Record<ParentTreeStyle, string>> = {
   outline:
     " Start with read_node {@TREE@, \"id\": 0}: the parent's outline; its children lead " +
     "to what it covered.",
+  // An instruction, not advice: in the plan-savings pilot (2026-11-15) subagents given the
+  // advisory styles never searched; their brief named the logs and they re-read them.
+  "first-step":
+    " Your task may continue the parent's work, so make your first tool call search " +
+    "{@TREE@, \"query\": \"<your task's key terms>\"} and, where it covers your task, use " +
+    "what the parent found instead of re-deriving it (if your brief asks for an independent " +
+    "check, take only facts such as ids and commands, not its conclusions). Memory shows " +
+    "files and logs as they were then: read one yourself when you need its current contents " +
+    "(it may have changed since) or to edit it.",
 };
 
 /**
