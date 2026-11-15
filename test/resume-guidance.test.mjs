@@ -28,7 +28,7 @@ import {
   resumeGuidanceFor,
 } from "../dist/resume-guidance.js";
 
-// Hybrid search is opt-in: these tests expect the default wording whatever the shell exports.
+// Hybrid search is the default: these tests expect the default wording whatever the shell exports.
 delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
 
 const SESSION = "6472823f-ca4f-4027-9b89-64a81c367dc3";
@@ -391,13 +391,14 @@ test("the session plugin runs the guidance as its own SessionStart hook, on resu
   }
 });
 
-test("with hybrid search on, resume guidance carries the hybrid wording and its own needle", async () => {
+test("resume guidance carries the hybrid-default wording; opted out, the text wording and its own needle", async () => {
   const { resumeGuidance, announcedInstructionsNeedle } = await import("../dist/resume-guidance.js");
-  assert.equal(resumeGuidance({}), RESUME_GUIDANCE, "off: unchanged");
+  assert.equal(resumeGuidance({}), RESUME_GUIDANCE, "default: unchanged");
   assert.equal(announcedInstructionsNeedle({}), ANNOUNCED_INSTRUCTIONS_NEEDLE);
-  const on = { CCC_MEMTREE_HYBRID_SEARCH: "1" };
-  assert.match(resumeGuidance(on), /Hybrid mode \(default\)/);
-  assert.doesNotMatch(resumeGuidance(on), /Text mode \(default\)/);
-  assert.notEqual(announcedInstructionsNeedle(on), ANNOUNCED_INSTRUCTIONS_NEEDLE);
-  assert.ok(announcedInstructionsNeedle(on).includes("Hybrid mode (default)"));
+  assert.match(RESUME_GUIDANCE, /Hybrid mode \(default\)/);
+  const off = { CCC_MEMTREE_HYBRID_SEARCH: "0" };
+  assert.match(resumeGuidance(off), /Text mode \(default\)/);
+  assert.doesNotMatch(resumeGuidance(off), /Hybrid mode \(default\)/);
+  assert.notEqual(announcedInstructionsNeedle(off), ANNOUNCED_INSTRUCTIONS_NEEDLE);
+  assert.ok(announcedInstructionsNeedle(off).includes("Text mode (default)"));
 });

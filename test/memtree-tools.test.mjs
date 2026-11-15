@@ -24,6 +24,8 @@ import {
   memtreeInstructions,
   memtreeTools,
   HYBRID_OFF_NOTE,
+  HYBRID_OFF_RECHECK_MS,
+  resetHybridServerOff,
   SessionFinder,
 } from "../dist/memtree-mcp.js";
 import { formatSessions, formatSearchResults, searchQuery, sessionsQuery } from "../dist/memtree-finder.js";
@@ -39,8 +41,8 @@ import {
 
 import { setDisplayTimeZone } from "../dist/memtree-times.js";
 
-// Hybrid search is opt-in (CCC_MEMTREE_HYBRID_SEARCH): these tests expect the default unless
-// they set it themselves, whatever the developer's shell exports.
+// Hybrid search is the default (CCC_MEMTREE_HYBRID_SEARCH=0 opts out): these tests expect the
+// default unless they set it themselves, whatever the developer's shell exports.
 delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
 
 // Times are shown in the local zone: pin it so the expected text is fixed.
@@ -737,15 +739,18 @@ test("search routes by tree and mode; read_node and read_lines take node address
     (await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, tree, finder))
       .result.content[0].text;
 
-  assert.equal(await call("search", { query: "x", tree: "current" }), "tree hits");
-  assert.equal(await call("search", { query: "x", tree: "abc-v1-own" }), "tree hits");
-  assert.equal(await call("search", { query: "x" }), "server hits");
+  resetHybridServerOff();
+  assert.equal(await call("search", { query: "x", mode: "text", tree: "current" }), "tree hits");
+  assert.equal(await call("search", { query: "x", mode: "text", tree: "abc-v1-own" }), "tree hits");
+  assert.equal(await call("search", { query: "x", mode: "text" }), "server hits");
+  assert.equal(await call("search", { query: "x", tree: "abc-v1-own" }), "server hits", "hybrid, the default");
   assert.equal(await call("search", { query: "x", mode: "vector", tree: "current" }), "server hits");
   assert.equal(await call("search", { query: "x", mode: "vector", tree: "abc-v1-own" }), "server hits");
   assert.deepEqual(seen, [
     ["tree-search", "x", undefined],
     ["tree-search", "x", "abc-v1-own"],
     ["server-search", "text", undefined],
+    ["server-search", "hybrid", "abc-v1-own"],
     ["server-search", "vector", "cur-id"],
     ["server-search", "vector", "abc-v1-own"],
   ]);
@@ -995,8 +1000,9 @@ test("MCP instructions and search lead with when to use them, before any compres
   // Constant overhead: instructions + search description, measured 2026-10-18, plus the
   // context-advice paragraph (no /compact, /clear or fresh session) added 2026-10-28, plus
   // the cross-session scope (ccc sessions on any machine) and hand-off line, 2026-11-05, plus
-  // the handover / user_messages line, 2026-11-08, plus the search price, 2026-11-09.
-  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 4_850,
+  // the handover / user_messages line, 2026-11-08, plus the search price, 2026-11-09, plus hybrid
+  // as the default and "no hit is not proof: try other wordings" (LongMemEval), 2026-11-14.
+  assert.ok(MEMTREE_MCP_INSTRUCTIONS.length + search.description.length < 5_150,
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
 
@@ -1006,22 +1012,26 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
   assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /_sessions/);
   const search = MEMTREE_TOOLS.find((t) => t.name === "search");
   for (const description of [MEMTREE_MCP_INSTRUCTIONS, search.description]) {
-    assert.match(description, /text.*default/i);
+    assert.match(description, /hybrid.*default.*best recall/i);
+    assert.match(description, /other wordings, synonyms.*broader terms/);
     assert.match(description, /address/i);
     assert.match(description, /address.*unavailable|unavailable.*address/i);
     assert.match(description, /range/i);
     assert.match(description, /first page.*charged/i);
     assert.match(description, /cached/i);
     assert.match(description, /cursor continuation.*free/i);
-    // Text search across sessions is charged like vector (polychat, 2026-11-09); one tree is free.
-    assert.match(description, /\$0\.0005 either way/);
+    // Every server search is charged (polychat, 2026-11-09; hybrid 2026-11-14); text in one tree is free.
+    assert.match(description, /\$0\.0005 in any mode/);
     assert.match(description, /free.*text search of one tree/i);
     assert.doesNotMatch(description, /default, free/i);
     assert.match(description, /live.*snapshot/i);
   }
   assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
-  assert.doesNotMatch(search.inputSchema.properties.mode.description, /\bfree\b/i);
-  assert.equal(search.inputSchema.properties.mode.enum.join(","), "text,vector");
+  assert.match(search.inputSchema.properties.mode.description, /text \(exact words; free and faster in one tree\)/);
+  assert.equal(search.inputSchema.properties.mode.enum.join(","), "hybrid,text,vector");
+  // Not only for code: chats, role-play and agents ask what the user said, too (LongMemEval, 2026-11-14).
+  assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /re-deriving it from the code|The code shows what exists/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /Check exact values .* by reading the lines \(read_lines\), not a summary/);
   for (const name of ["search", "read_node", "read_lines"]) {
     const tree = MEMTREE_TOOLS.find((t) => t.name === name).inputSchema.properties.tree;
     assert.ok(tree, name);
@@ -1313,7 +1323,7 @@ test("search and list say which sessions they cover; instructions ask hand-offs 
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /hand-off or kickoff prompt .* names this session's id and MemTree link/);
 });
 
-test("hybrid search is opt-in: CCC_MEMTREE_HYBRID_SEARCH=1 lists it and makes it the default", async () => {
+test("hybrid search is the default; CCC_MEMTREE_HYBRID_SEARCH=0 opts out to text", async () => {
   const seen = [];
   const tree = { get: async () => index(), search: async () => (seen.push(["tree-search"]), "tree hits"), currentId: async () => "cur-id" };
   const finder = { listSessions: async () => "", searchSessions: async (args, t) => (seen.push([args.mode, t]), "server hits") };
@@ -1322,31 +1332,42 @@ test("hybrid search is opt-in: CCC_MEMTREE_HYBRID_SEARCH=1 lists it and makes it
   const listedModes = async () => (await handleMcpMessage({ jsonrpc: "2.0", id: 2, method: "tools/list" }, tree, finder))
     .result.tools.find((t) => t.name === "search").inputSchema.properties.mode.enum;
   const saved = process.env.CCC_MEMTREE_HYBRID_SEARCH;
+  resetHybridServerOff();
   try {
     delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
-    assert.deepEqual(await listedModes(), ["text", "vector"], "off by default: the schema is unchanged");
-    assert.equal(memtreeTools(process.env), MEMTREE_TOOLS);
-    await call("search", { query: "x", tree: "current" });
-    assert.deepEqual(seen, [["tree-search"]], "off: a one-tree text search stays local and free");
-    seen.length = 0;
-    const refused = await call("search", { query: "x", mode: "hybrid" });
-    assert.equal(refused.result.isError, true, "off: an explicit hybrid is refused, not sent");
-    assert.match(refused.result.content[0].text, /CCC_MEMTREE_HYBRID_SEARCH=1/);
-    assert.equal(memtreeInstructions(process.env), MEMTREE_MCP_INSTRUCTIONS);
-    assert.deepEqual(seen, [], "the refused hybrid reached neither the tree nor the server");
-    process.env.CCC_MEMTREE_HYBRID_SEARCH = "1";
     assert.deepEqual(await listedModes(), ["hybrid", "text", "vector"]);
-    const search = memtreeTools(process.env).find((t) => t.name === "search");
-    assert.match(search.description, /mode "hybrid" \(default\)/);
+    assert.equal(memtreeTools(process.env), MEMTREE_TOOLS);
+    const search = MEMTREE_TOOLS.find((t) => t.name === "search");
+    assert.match(search.description, /mode "hybrid" \(default, best recall\)/);
+    assert.match(search.description, /in one tree: summaries and transcript lines; free and faster/);
     assert.doesNotMatch(search.description, /mode "text" \(default\)/);
-    assert.match(memtreeInstructions(process.env), /Hybrid mode \(default\)/);
-    assert.doesNotMatch(memtreeInstructions(process.env), /Text mode \(default\)/);
+    assert.equal(memtreeInstructions(process.env), MEMTREE_MCP_INSTRUCTIONS);
+    assert.match(MEMTREE_MCP_INSTRUCTIONS, /Hybrid mode \(default\) .* the best recall/);
+    assert.match(MEMTREE_MCP_INSTRUCTIONS, /"mode": "text" with a tree: free and faster/);
+    assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /Text mode \(default\)/);
     await call("search", { query: "x", tree: "current" });
     await call("search", { query: "x" });
     await call("search", { query: "x", mode: "text", tree: "current" });
     await call("search", { query: "x", cursor: "c1" });
     assert.deepEqual(seen, [["hybrid", "cur-id"], ["hybrid", undefined], ["tree-search"], ["text", undefined]],
       "a cursor without a mode is a text or vector page's: hybrid has none");
+    seen.length = 0;
+    for (const off of ["0", "off", "false", "no"]) {
+      process.env.CCC_MEMTREE_HYBRID_SEARCH = off;
+      assert.deepEqual(await listedModes(), ["text", "vector"], `${off}: the text-default schema`);
+    }
+    const textTool = memtreeTools(process.env).find((t) => t.name === "search");
+    assert.match(textTool.description, /mode "text" \(default\)/);
+    assert.doesNotMatch(textTool.description, /hybrid/);
+    assert.match(memtreeInstructions(process.env), /Text mode \(default\)/);
+    assert.doesNotMatch(memtreeInstructions(process.env), /hybrid/i);
+    await call("search", { query: "x", tree: "current" });
+    assert.deepEqual(seen, [["tree-search"]], "opted out: a one-tree text search stays local and free");
+    seen.length = 0;
+    const refused = await call("search", { query: "x", mode: "hybrid" });
+    assert.equal(refused.result.isError, true, "opted out: an explicit hybrid is refused, not sent");
+    assert.match(refused.result.content[0].text, /CCC_MEMTREE_HYBRID_SEARCH opts out/);
+    assert.deepEqual(seen, [], "the refused hybrid reached neither the tree nor the server");
   } finally {
     if (saved === undefined) delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
     else process.env.CCC_MEMTREE_HYBRID_SEARCH = saved;
@@ -1367,30 +1388,54 @@ test("a hybrid page says it is fused and where each ranking placed each hit", ()
   assert.throws(() => searchQuery({ query: "x", mode: "fuzzy" }), /"vector", "text" or "hybrid"/);
 });
 
-test("the default hybrid mode falls back to text when the server has hybrid off", async () => {
+test("the default hybrid mode falls back to text, silently, when the server has hybrid off", async () => {
   const seen = [];
+  let serverHybrid = false;
   const tree = { get: async () => index(), search: async () => (seen.push(["tree-search"]), "tree hits"), currentId: async () => "cur-id" };
   const finder = {
     listSessions: async () => "",
     searchSessions: async (args, t) => {
       seen.push([args.mode, t]);
-      if (args.mode === "hybrid") throw new ToolInputError("search failed: HTTP 400 mode must be one of text, vector, got 'hybrid'");
-      return "server text hits";
+      if (args.mode === "hybrid" && !serverHybrid) {
+        throw new ToolInputError("search failed: HTTP 400 mode must be one of text, vector, got 'hybrid'");
+      }
+      return `server ${args.mode} hits`;
     },
   };
   const call = async (args) => (await handleMcpMessage(
     { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "search", arguments: args } }, tree, finder)).result;
-  const saved = process.env.CCC_MEMTREE_HYBRID_SEARCH;
-  process.env.CCC_MEMTREE_HYBRID_SEARCH = "1";
+  resetHybridServerOff();
   try {
-    assert.equal((await call({ query: "x", tree: "current" })).content[0].text, `${HYBRID_OFF_NOTE}\n\ntree hits`);
-    assert.equal((await call({ query: "x" })).content[0].text, `${HYBRID_OFF_NOTE}\n\nserver text hits`);
+    assert.equal((await call({ query: "x", tree: "current" })).content[0].text, "tree hits", "silent: today's free local search");
+    assert.deepEqual(seen, [["hybrid", "cur-id"], ["tree-search"]]);
+    seen.length = 0;
+    assert.equal((await call({ query: "x" })).content[0].text, "server text hits");
+    assert.equal((await call({ query: "x", tree: "current" })).content[0].text, "tree hits");
+    assert.deepEqual(seen, [["text", undefined], ["tree-search"]], "once refused, the default goes straight to text");
+    seen.length = 0;
     const explicit = await call({ query: "x", mode: "hybrid" });
-    assert.equal(explicit.isError, true, "an explicit hybrid keeps the server's answer");
-    assert.deepEqual(seen, [["hybrid", "cur-id"], ["tree-search"], ["hybrid", undefined], ["text", undefined], ["hybrid", undefined]]);
+    assert.equal(explicit.content[0].text, `${HYBRID_OFF_NOTE}\n\nserver text hits`, "an asked-for hybrid says it fell back");
+    assert.deepEqual(seen, [["hybrid", undefined], ["text", undefined]], "an explicit hybrid still asks the server");
+    seen.length = 0;
+    serverHybrid = true;
+    const next = await call({ query: "x", mode: "hybrid", cursor: "c1" });
+    assert.equal(next.content[0].text, "server text hits", "a text page, no fallback note");
+    assert.deepEqual(seen, [["text", undefined]], "the fallback page's cursor continues in text, even once hybrid is on");
+    seen.length = 0;
+    resetHybridServerOff(HYBRID_OFF_RECHECK_MS + 1);
+    assert.equal((await call({ query: "x" })).content[0].text, "server hybrid hits", "after the recheck window: hybrid again");
+    assert.deepEqual(seen, [["hybrid", undefined]]);
+    seen.length = 0;
+    serverHybrid = false;
+    resetHybridServerOff();
+    finder.searchSessions = async (args) => {
+      seen.push([args.mode]);
+      throw new ToolInputError("search failed: HTTP 500 internal");
+    };
+    assert.equal((await call({ query: "x" })).isError, true, "any other failure is the agent's to see");
+    assert.deepEqual(seen, [["hybrid"]], "and is not retried in text");
   } finally {
-    if (saved === undefined) delete process.env.CCC_MEMTREE_HYBRID_SEARCH;
-    else process.env.CCC_MEMTREE_HYBRID_SEARCH = saved;
+    resetHybridServerOff();
   }
 });
 

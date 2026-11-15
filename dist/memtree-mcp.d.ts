@@ -35,11 +35,6 @@ export declare function installedVersion(): string | undefined;
 export declare const MEMTREE_TOOL_NAMES: readonly ["search", "read_node", "read_lines", "list", "user_messages", "handover"];
 /** `tree` value naming this session's own current tree. */
 export declare const CURRENT_TREE = "current";
-/**
- * The MCP server's instructions, which Claude Code places in the system prompt
- * from the first request: the one place that explains the agent's situation
- * before any memory message exists. Constant, so the prompt cache holds.
- */
 export declare const MEMTREE_MCP_INSTRUCTIONS: string;
 /**
  * Claude Code's per-tool key (2.1.296): the tool is in the prompt from the
@@ -347,9 +342,9 @@ export declare const MEMTREE_TOOLS: ({
         required?: undefined;
     };
 })[];
-/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+/** The tools as listed: MEMTREE_TOOLS (hybrid the default), or text-default ones once opted out. */
 export declare function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS;
-/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS, saying hybrid is the default once opted in. */
+/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS (hybrid the default), or text's once opted out. */
 export declare function memtreeInstructions(env: NodeJS.ProcessEnv): string;
 export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
@@ -525,10 +520,14 @@ notice?: {
 /** Not in a ccc-routed session: no tools, no instructions. */
 inert?: boolean): Promise<object | undefined>;
 export declare const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
+/** After a refusal the default stays text this long, then hybrid is tried again (a setting can flip). */
+export declare const HYBRID_OFF_RECHECK_MS: number;
+/** Tests: forget a server's refusal of hybrid, or pretend it came `agoMs` ago. */
+export declare function resetHybridServerOff(agoMs?: number): void;
 /**
- * The search's mode: the agent's, else hybrid once this process opted in (HYBRID_SEARCH_ENV),
- * else text. A cursor without a mode keeps text (hybrid has no cursor), and hybrid is refused
- * unless opted in.
+ * The search's mode: the agent's, else hybrid unless this process opted out (HYBRID_SEARCH_ENV),
+ * else text. A cursor keeps text even when hybrid is named (hybrid has no cursor); hybrid without
+ * one is refused once opted out.
  */
 export declare function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */

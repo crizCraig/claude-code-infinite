@@ -21,9 +21,11 @@ export const FINDER_SEARCH_DEFAULT_LIMIT = 10;
 export const FINDER_SEARCH_MAX_LIMIT = 50;
 export const FINDER_SEARCH_MODES = ["vector", "text", "hybrid"];
 /**
- * Opt-in (off by default): `1` makes `hybrid` (text and vector run together and fused by rank,
- * polychat memtree_hybrid.py) the search tool's default mode and lists it in the tool's schema.
- * The server serves it only while its MEMTREE_HYBRID_SEARCH setting is on.
+ * On by default (Craig, 2026-11-14): `hybrid` (text and vector run together and fused by rank,
+ * polychat memtree_hybrid.py) is the search tool's default mode and is listed in its schema.
+ * `0` (or off/false/no) opts out: text is the default again and hybrid is not offered. The
+ * server serves hybrid only while its MEMTREE_HYBRID_SEARCH setting is on; a server that
+ * refuses it gets text mode instead (memtree-mcp.ts searchTool).
  */
 export const HYBRID_SEARCH_ENV = "CCC_MEMTREE_HYBRID_SEARCH";
 const SNIPPET_CHARS = 400;
@@ -114,11 +116,11 @@ export function searchMode(value, fallback = "text") {
         return mode;
     throw new ToolInputError(`search: mode must be "vector", "text" or "hybrid", got ${JSON.stringify(value)}`);
 }
-/** Whether this process opted in to hybrid search (HYBRID_SEARCH_ENV). */
+/** Whether this process offers hybrid search: yes unless opted out (HYBRID_SEARCH_ENV). */
 export function hybridSearchOn(env) {
-    return ["1", "on", "true", "yes"].includes(String(env[HYBRID_SEARCH_ENV] ?? "").trim().toLowerCase());
+    return !["0", "off", "false", "no"].includes(String(env[HYBRID_SEARCH_ENV] ?? "").trim().toLowerCase());
 }
-/** The search tool's mode when the agent names none: hybrid once opted in, else text. */
+/** The search tool's mode when the agent names none: hybrid unless opted out, else text. */
 export function defaultSearchMode(env) {
     return hybridSearchOn(env) ? "hybrid" : "text";
 }

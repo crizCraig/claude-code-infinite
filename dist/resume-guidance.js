@@ -50,8 +50,8 @@ export const RESUME_GUIDANCE = `${RESUME_GUIDANCE_PREFIX}\n\n${MEMTREE_MCP_INSTR
 export const ANNOUNCED_INSTRUCTIONS_NEEDLE = JSON.stringify(`## memtree\n${MEMTREE_MCP_INSTRUCTIONS}`).slice(1, -1);
 /**
  * The guidance and the announcement needle for the instructions this process's MCP server
- * announces now: RESUME_GUIDANCE and ANNOUNCED_INSTRUCTIONS_NEEDLE, or their hybrid-default
- * wording under CCC_MEMTREE_HYBRID_SEARCH=1 (memtreeInstructions).
+ * announces now: RESUME_GUIDANCE and ANNOUNCED_INSTRUCTIONS_NEEDLE (hybrid the default), or
+ * their text-default wording under CCC_MEMTREE_HYBRID_SEARCH=0 (memtreeInstructions).
  */
 export function resumeGuidance(env = process.env) {
     return `${RESUME_GUIDANCE_PREFIX}\n\n${memtreeInstructions(env)}`;
