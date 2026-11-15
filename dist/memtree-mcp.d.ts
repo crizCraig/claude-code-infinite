@@ -526,7 +526,8 @@ export declare const HYBRID_OFF_RECHECK_MS: number;
 export declare function resetHybridServerOff(agoMs?: number): void;
 /**
  * The search's mode: the agent's, else hybrid unless this process opted out (HYBRID_SEARCH_ENV),
- * else text. A cursor keeps text (hybrid has no cursor), and hybrid is refused once opted out.
+ * else text. A cursor keeps text even when hybrid is named (hybrid has no cursor); hybrid without
+ * one is refused once opted out.
  */
 export declare function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */

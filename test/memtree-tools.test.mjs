@@ -1418,11 +1418,10 @@ test("the default hybrid mode falls back to text, silently, when the server has 
     assert.deepEqual(seen, [["hybrid", undefined], ["text", undefined]], "an explicit hybrid still asks the server");
     seen.length = 0;
     serverHybrid = true;
-    await call({ query: "x", mode: "hybrid", cursor: "c1" });
+    const next = await call({ query: "x", mode: "hybrid", cursor: "c1" });
+    assert.equal(next.content[0].text, "server text hits", "a text page, no fallback note");
     assert.deepEqual(seen, [["text", undefined]], "the fallback page's cursor continues in text, even once hybrid is on");
-    serverHybrid = false;
     seen.length = 0;
-    serverHybrid = true;
     resetHybridServerOff(HYBRID_OFF_RECHECK_MS + 1);
     assert.equal((await call({ query: "x" })).content[0].text, "server hybrid hits", "after the recheck window: hybrid again");
     assert.deepEqual(seen, [["hybrid", undefined]]);
