@@ -396,6 +396,8 @@ export declare class MemtreeClient {
      * call that does not carry it whole (a rewind, evicted media) replaces it.
      */
     private readonly indexLanesHeld;
+    /** Per conversation, the newest history a compress or final call sent (retireHeldBy). */
+    private readonly indexLanesCarried;
     /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
     private readonly indexHoldTimers;
     private readonly indexHoldMaxMs;
@@ -616,23 +618,21 @@ export declare class MemtreeClient {
      */
     private startHoldTimer;
     /**
-     * The history its conversation last sent already carries `job` (a retried request, or
-     * one given back after a failed call while a newer upload went): its upload would store
-     * nothing new, or an older request than the newest, so the hold limit drops it.
-     */
-    private addsNothing;
-    /**
-     * A compress call is sending `messages` (the server stores every request it gets, even
-     * one it refuses): a held-back history it carries whole is dropped, or its later upload
-     * would be the older request the page reads as the newest (Codex r1-r3 P1). A trimmed
-     * body stores other messages, so it retires nothing.
+     * A compress call (or the final index) is sending `messages`: the server stores every
+     * request it gets, even one it refuses (an index-pending 413), and a call that fails in
+     * transport may have arrived too, so `messages` is the lane's newest stored history from
+     * now on (indexLanesCarried). A held-back or waiting history it carries is dropped, or
+     * its later upload would be an older request the page reads as the newest (Codex r1-r5).
+     * If the call never arrived, nothing is lost: the next turn's index holds again and
+     * carries it, and the final index carries everything. A final index still waiting goes.
      */
     private retireHeldBy;
+    private noteCarried;
     /**
-     * The call that retired these never reached the server (Codex r4 P1): they go as before,
-     * unless something newer has taken their place since.
+     * `job` adds nothing to what the lane has stored or is storing: the last index upload
+     * (a retried request) or a compress or final call carries it whole, media included.
      */
-    private restoreRetired;
+    private carriedByUpload;
     private clearHoldTimer;
     /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation

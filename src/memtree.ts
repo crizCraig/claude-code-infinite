@@ -1028,13 +1028,6 @@ interface QueuedIndex {
 }
 
 /** The history a conversation's last index call carried, and its text size. */
-/** What a compress (or final) call retired from its conversation's lane (retireHeldBy). */
-interface RetiredIndexes {
-  lane: string;
-  held?: QueuedIndex;
-  waiting?: QueuedIndex;
-}
-
 interface SentIndex {
   messages: Message[];
   chars: number;
@@ -1086,6 +1079,8 @@ export class MemtreeClient {
    * call that does not carry it whole (a rewind, evicted media) replaces it.
    */
   private readonly indexLanesHeld = new Map<string, QueuedIndex>();
+  /** Per conversation, the newest history a compress or final call sent (retireHeldBy). */
+  private readonly indexLanesCarried = new Map<string, Message[]>();
   /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
   private readonly indexHoldTimers = new Map<string, NodeJS.Timeout>();
   private readonly indexHoldMaxMs: number;
@@ -1599,60 +1594,53 @@ export class MemtreeClient {
       const held = this.indexLanesHeld.get(lane);
       if (!held || this.backgroundClosing) return;
       this.indexLanesHeld.delete(lane);
-      if (!this.addsNothing(lane, held)) this.enqueueIndex(lane, held);
+      if (!this.carriedByUpload(lane, held)) this.enqueueIndex(lane, held);
     }, this.indexHoldMaxMs);
     timer.unref();
     this.indexHoldTimers.set(lane, timer);
   }
 
   /**
-   * The history its conversation last sent already carries `job` (a retried request, or
-   * one given back after a failed call while a newer upload went): its upload would store
-   * nothing new, or an older request than the newest, so the hold limit drops it.
+   * A compress call (or the final index) is sending `messages`: the server stores every
+   * request it gets, even one it refuses (an index-pending 413), and a call that fails in
+   * transport may have arrived too, so `messages` is the lane's newest stored history from
+   * now on (indexLanesCarried). A held-back or waiting history it carries is dropped, or
+   * its later upload would be an older request the page reads as the newest (Codex r1-r5).
+   * If the call never arrived, nothing is lost: the next turn's index holds again and
+   * carries it, and the final index carries everything. A final index still waiting goes.
    */
-  private addsNothing(lane: string, job: QueuedIndex): boolean {
-    const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
-    return sent !== undefined && extendsHistory(sent.messages, job.messages) &&
-      !losesMedia(job.messages, sent.messages);
-  }
-
-  /**
-   * A compress call is sending `messages` (the server stores every request it gets, even
-   * one it refuses): a held-back history it carries whole is dropped, or its later upload
-   * would be the older request the page reads as the newest (Codex r1-r3 P1). A trimmed
-   * body stores other messages, so it retires nothing.
-   */
-  private retireHeldBy(sessionId: string | undefined, messages: Message[]): RetiredIndexes {
+  private retireHeldBy(sessionId: string | undefined, messages: Message[]): void {
     const lane = indexLaneKey(sessionId, messages);
-    const carries = (job: QueuedIndex | undefined): job is QueuedIndex => job !== undefined &&
-      extendsHistory(messages, job.messages) && !losesMedia(job.messages, messages);
-    const retired: RetiredIndexes = { lane };
-    const held = this.indexLanesHeld.get(lane);
-    if (carries(held)) {
+    const carried = this.indexLanesCarried.get(lane);
+    if (!carried || extendsHistory(messages, carried)) this.noteCarried(lane, messages);
+    if (this.carriedByUpload(lane, this.indexLanesHeld.get(lane))) {
       this.indexLanesHeld.delete(lane);
       this.clearHoldTimer(lane);
-      retired.held = held;
     }
-    // One waiting behind an upload in flight too (the server indexes a compress request
-    // like an index-only one, so nothing is lost; review r4). A final index still goes.
     const waiting = this.indexLanesNext.get(lane);
-    if (carries(waiting) && !waiting.opts.finalIndex) {
+    if (this.carriedByUpload(lane, waiting) && !waiting!.opts.finalIndex) {
       this.indexLanesNext.delete(lane);
-      retired.waiting = waiting;
     }
-    return retired;
+  }
+
+  private noteCarried(lane: string, messages: Message[]): void {
+    this.indexLanesCarried.delete(lane);
+    this.indexLanesCarried.set(lane, messages);
+    if (this.indexLanesCarried.size > DEDUPE_CACHE_MAX) {
+      this.indexLanesCarried.delete(this.indexLanesCarried.keys().next().value!);
+    }
   }
 
   /**
-   * The call that retired these never reached the server (Codex r4 P1): they go as before,
-   * unless something newer has taken their place since.
+   * `job` adds nothing to what the lane has stored or is storing: the last index upload
+   * (a retried request) or a compress or final call carries it whole, media included.
    */
-  private restoreRetired({ lane, held, waiting }: RetiredIndexes): void {
-    if (this.backgroundClosing) return;
-    if (waiting && !this.indexLanesNext.has(lane)) this.enqueueIndex(lane, waiting);
-    if (held && !this.indexLanesHeld.has(lane) && !this.addsNothing(lane, held)) {
-      this.holdIndex(lane, held);
-    }
+  private carriedByUpload(lane: string, job: QueuedIndex | undefined): boolean {
+    if (job === undefined) return false;
+    const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
+    return [sent?.messages, this.indexLanesCarried.get(lane)].some((upload) =>
+      upload !== undefined && extendsHistory(upload, job.messages) &&
+      !losesMedia(job.messages, upload));
   }
 
   private clearHoldTimer(lane: string): void {
@@ -1829,6 +1817,8 @@ export class MemtreeClient {
         this.finalIndexed.get(sessionId) === prepared.key) return;
     signal.throwIfAborted();
     this.finalIndexed.set(sessionId, prepared.key);
+    // The raw history (images as sent per turn, not as references) names what it carries.
+    this.retireHeldBy(sessionId, conversation.messages);
     const messageTimes = conversation.messageTimesFor?.(prepared.retained);
     await this.callContextMemory(prepared.messages, conversation.modelContextLimit, {
       sessionId, clientMeta: conversation.clientMeta, messageTimes,
@@ -2159,12 +2149,10 @@ export class MemtreeClient {
     timeout.unref();
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
-    // Sent, this compress call (or a final index) is stored as the conversation's newest
-    // request whatever it answers (polychat stores a refused 413 too): an older held history
-    // it carries must not follow it (Codex r2-r4). One that never reaches the server gives
-    // it back (restoreRetired).
-    const retired = (!opts.indexOnly || opts.finalIndex) && planned.limit?.action !== "trimmed" &&
-      !controller.signal.aborted ? this.retireHeldBy(opts.sessionId, messages) : undefined;
+    // Sent, this compress call is the conversation's newest stored request (retireHeldBy).
+    if (!opts.indexOnly && planned.limit?.action !== "trimmed" && !controller.signal.aborted) {
+      this.retireHeldBy(opts.sessionId, messages);
+    }
     try {
       const response = await this.postRetryingDrop(payload, { ...opts, features },
         controller.signal)
@@ -2172,7 +2160,6 @@ export class MemtreeClient {
           // A background index call is no request's own evidence (review r1): it may clear
           // the state by an answer, never set it.
           if (!opts.indexOnly) this.noteUnreachable(err);
-          if (retired) this.restoreRetired(retired);
           throw err;
         });
       status = response.status;
@@ -2645,5 +2632,10 @@ function indexLaneKey(sessionId: string | undefined, messages: Message[]): strin
 /** `CCC_INDEX_HOLD_MAX_MS` as milliseconds (0 or more), else INDEX_HOLD_MAX_MS. */
 export function holdMaxFromEnv(value: string | undefined): number {
   const n = value === undefined || value.trim() === "" ? NaN : Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : INDEX_HOLD_MAX_MS;
+  if (!Number.isFinite(n) || n < 0) return INDEX_HOLD_MAX_MS;
+  // setTimeout fires at once past its maximum: anything longer means no bound.
+  return n > MAX_TIMER_MS ? 0 : n;
 }
+
+/** The longest delay setTimeout honours (2^31 - 1 ms). */
+const MAX_TIMER_MS = 2_147_483_647;

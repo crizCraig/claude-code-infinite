@@ -860,26 +860,25 @@ test("a held history the timer queued behind a slow upload is retired by a compr
   }
 });
 
-test("a compress call that never reaches the server gives the held history back", async () => {
-  // Codex r4 P1: retired at send, a held history was lost when the compress call failed
-  // in transport; it must still reach the server (here: at the limit).
+test("after a compress call fails in transport, the held history waits for the next turn, not older", async () => {
+  // Opus r5: a call that fails in transport may have arrived, so the held history it
+  // carried is not given back (it would land after it); the next turn's history carries it.
   const calls = [];
-  let refuseCompress = true;
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if (!body.index_only && refuseCompress) { req.socket.destroy(); return; }
       calls.push(body.index_only ? `index:${body.messages.length}` : `compress:${body.messages.length}`);
+      if (!body.index_only) { req.socket.destroy(); return; }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true } : RESULT));
+      res.end(JSON.stringify({ messages: [], index_only: true }));
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
-      apiKey: "k", indexHoldMaxMs: 150 });
+      apiKey: "k", indexHoldMaxMs: 100 });
     const conv = [{ role: "user", content: "x".repeat(50_000) }];
     const index = () => {
       const messages = conv.slice();
@@ -889,16 +888,17 @@ test("a compress call that never reaches the server gives the held history back"
     await waitFor(() => calls.length === 1);
     conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
     index(); // held back
-    const held = conv.length;
     conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "newer" });
     const newer = conv.slice();
     await client.compress(MemtreeClient.hashMessages(newer), newer, 100, undefined,
       { sessionId: "s" }).catch(() => null);
-    await waitFor(() => calls.length === 2, 1_500);
-    assert.deepEqual(calls, ["index:1", `index:${held}`], "the held history still goes");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.ok(!calls.slice(1).includes("index:3"), `no older history after it: ${calls}`);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "next turn" });
+    index(); // held, then sent at the limit: it carries everything
+    await waitFor(() => calls.at(-1) === `index:${conv.length}`, 1_500);
     assert.equal(await client.drainBackground(2_000), true);
   } finally {
-    refuseCompress = false;
     await new Promise((resolve) => server.close(resolve));
   }
 });
@@ -919,10 +919,9 @@ test("a final index that carries a held history retires it", async () => {
     await waitFor(() => fixture.calls.length === 1);
     conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
     index(); // held back
-    conv.push({ role: "assistant", content: "the end" });
     // The idle final index goes straight out (scheduleFinalIndex), not through the lane.
-    const final = conv.slice();
-    await client.submitIndexOnly(final, 100, { sessionId: "s", finalIndex: true });
+    client.noteMainConversation("s", { messages: conv.slice(), modelContextLimit: 100 });
+    client.scheduleFinalIndex("s", () => ({ role: "assistant", content: "the end" }), 1);
     await waitFor(() => fixture.calls.length === 2);
     await new Promise((resolve) => setTimeout(resolve, 250));
     assert.equal(fixture.calls.length, 2, "no older history after the final index");
@@ -940,6 +939,7 @@ test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => 
   assert.equal(holdMaxFromEnv("60000"), 60_000);
   assert.equal(holdMaxFromEnv("-5"), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv("soon"), INDEX_HOLD_MAX_MS);
+  assert.equal(holdMaxFromEnv(String(2 ** 31)), 0, "past setTimeout's maximum: no bound");
 });
 
 test("an image is never held back by the text minimum (Claude Code may evict it later)", async () => {
