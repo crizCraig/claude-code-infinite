@@ -611,6 +611,8 @@ interface MemoryRoute {
     originalPortableHashes?: string[];
     /** The same without media; absent on old stores. */
     originalPortableMediaFreeHashes?: string[];
+    /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
+    originalMediaDigests?: string[];
     compressedMessages: Message[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;
@@ -643,6 +645,8 @@ interface StablePrefix {
     originalPortableHashes?: string[];
     /** The same without media; absent on old stores. */
     originalPortableMediaFreeHashes?: string[];
+    /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
+    originalMediaDigests?: string[];
     compressedMessages: Message[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;

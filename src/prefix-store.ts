@@ -37,6 +37,8 @@ export interface PersistedPrefix {
   originalPortableHashes?: string[];
   /** The same without media (Claude Code's eviction beside a re-render); absent before them. */
   originalPortableMediaFreeHashes?: string[];
+  /** Each message's media digests, "" for none (route-identity mediaDigests); absent before them. */
+  originalMediaDigests?: string[];
   compressedMessages: any[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -292,6 +294,12 @@ function optionalHashes(hashes: unknown, length: number): boolean {
     (Array.isArray(hashes) && hashes.length === length && hashes.every(nonEmptyString));
 }
 
+/** Absent, or one entry per covered message: "" or comma-joined sha-256 hex digests. */
+function optionalDigestLists(lists: unknown, length: number): boolean {
+  return lists === undefined || (Array.isArray(lists) && lists.length === length &&
+    lists.every((v) => typeof v === "string" && /^(?:[0-9a-f]{64}(?:,[0-9a-f]{64})*)?$/.test(v)));
+}
+
 /** The prefix's invariants: the identity of a covered history, and well-formed bytes. */
 function isPrefix(p: PersistedPrefix): boolean {
   return isObject(p) && nonEmptyString(p.originalSystemHash) &&
@@ -300,6 +308,7 @@ function isPrefix(p: PersistedPrefix): boolean {
     optionalHashes(p.originalMediaFreeHashes, p.originalPrefixHashes.length) &&
     optionalHashes(p.originalPortableHashes, p.originalPrefixHashes.length) &&
     optionalHashes(p.originalPortableMediaFreeHashes, p.originalPrefixHashes.length) &&
+    optionalDigestLists(p.originalMediaDigests, p.originalPrefixHashes.length) &&
     Array.isArray(p.compressedMessages) && p.compressedMessages.length > 0 &&
     p.compressedMessages.every(isMessage) &&
     typeof p.hasCompressedSystem === "boolean" &&

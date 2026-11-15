@@ -8,6 +8,9 @@ const hashCaches = new Map<string, WeakMap<Message, string>>();
 /** Each message's tool input JSON strings (jsonStringFields), computed once. */
 const jsonFieldCache = new WeakMap<Message, Map<string, string>>();
 
+/** Each message's mediaDigests, computed once. */
+const mediaDigestCache = new WeakMap<Message, string>();
+
 /**
  * What an identity keeps of a message (messageHash). `portable` canonicalizes how Claude
  * Code renders unchanged history (portableContent).
@@ -38,6 +41,7 @@ export function prefixIdentity(
 ): {
   originalPrefixHashes: string[]; originalMediaFreeHashes: string[];
   originalPortableHashes: string[]; originalPortableMediaFreeHashes: string[];
+  originalMediaDigests: string[];
 } {
   const exact = kind === "stable" ? stablePrefixMessageHash : routeMessageHash;
   return {
@@ -45,28 +49,35 @@ export function prefixIdentity(
     originalMediaFreeHashes: messages.map((m) => mediaFreeHash(m, kind)),
     originalPortableHashes: messages.map((m) => portableIdentity(m, kind, "keep")),
     originalPortableMediaFreeHashes: messages.map((m) => portableIdentity(m, kind, "drop")),
+    originalMediaDigests: messages.map(mediaDigests),
   };
 }
 
 /**
  * Whether `message` still stands where a prefix's message stood: unchanged, or the same
- * apart from media Claude Code evicted. Past its media caps (count, and bytes in 2.1.310)
- * Claude Code evicts the oldest images and documents from its history: a tool result's
- * becomes a placeholder, a top-level one is dropped, an emptied message becomes the
- * placeholder. That counts only when the message has no media left, so an attachment
- * replaced by another never matches; a removed one is indistinguishable from eviction.
+ * apart from media Claude Code evicted or put back. Past its media caps (count, and bytes
+ * in 2.1.310) Claude Code evicts the oldest images and documents from its history: a tool
+ * result's becomes a placeholder, a top-level one is dropped, an emptied message becomes
+ * the placeholder. A raised cap puts them back (2.1.325 on 2026-11-15: a flag took its byte
+ * cap from 24 to 56 MiB and a resume sent 91 evicted images again). With no media left it
+ * counts as eviction; with media left, only when `mediaDigests` (the stored message's
+ * media, mediaDigests) shows the media dropped or added, never one replaced by another.
  * A newer Claude Code can also render the same history differently on resume (see
  * portableHash), with media kept or (no media left) evicted the same way.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
 export function prefixMessageMatches(
   message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined,
-  portable?: string, portableMediaFree?: string
+  portable?: string, portableMediaFree?: string, storedMedia?: string
 ): boolean {
   const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
   if (hash === exact) return true;
   if (portable !== undefined && portableMatches(message, kind, "keep", portable)) return true;
-  if (carriesMedia(message.content)) return false;
+  if (carriesMedia(message.content)) {
+    return storedMedia !== undefined && mediaFree !== undefined &&
+      mediaFreeHash(message, kind) === mediaFree &&
+      mediaOnlyDroppedOrAdded(mediaDigests(message), storedMedia);
+  }
   return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
     (portableMediaFree !== undefined &&
       portableMatches(message, kind, "drop", portableMediaFree));
@@ -83,7 +94,8 @@ export function extendsHistory(newer: Message[], older: Message[]): boolean {
   const a = newer.filter((message) => message.role !== "system");
   const b = older.filter((message) => message.role !== "system");
   return a.length >= b.length && b.every((message, i) =>
-    prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message)));
+    prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message),
+      undefined, undefined, mediaDigests(message)));
 }
 
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
@@ -93,6 +105,50 @@ export function mediaFreeMessageHash(message: Message): string {
 
 function mediaFreeHash(message: Message, kind: PrefixIdentity): string {
   return messageHash(message, kind === "stable" && stableShape(message), MEDIA_FREE);
+}
+
+/**
+ * The digests of a message's images and documents, in order (top level and inside tool
+ * results), joined by ","; "" when it carries none. Stored beside a prefix's hashes so a
+ * later match can tell media put back from media replaced (prefixMessageMatches).
+ */
+export function mediaDigests(message: Message): string {
+  const cached = mediaDigestCache.get(message);
+  if (cached !== undefined) return cached;
+  const digests: string[] = [];
+  collectMediaDigests(message.content, digests);
+  const joined = digests.join(",");
+  mediaDigestCache.set(message, joined);
+  return joined;
+}
+
+/**
+ * Whether one message's media are the other's with some left out, in order: Claude Code
+ * evicted some (`current` within `stored`) or put some back (`stored` within `current`).
+ */
+function mediaOnlyDroppedOrAdded(current: string, stored: string): boolean {
+  const a = current ? current.split(",") : [];
+  const b = stored ? stored.split(",") : [];
+  return isSubsequence(a, b) || isSubsequence(b, a);
+}
+
+function isSubsequence(part: string[], whole: string[]): boolean {
+  let i = 0;
+  for (const item of whole) if (i < part.length && part[i] === item) i++;
+  return i === part.length;
+}
+
+function collectMediaDigests(content: unknown, out: string[]): void {
+  if (!Array.isArray(content)) return;
+  for (const part of content) {
+    if (part?.type === "image" || part?.type === "document") {
+      const hash = createHash("sha256");
+      updateCanonical(hash, stripBlockCache(part));
+      out.push(hash.digest("hex"));
+    } else if (part?.type === "tool_result") {
+      collectMediaDigests(part.content, out);
+    }
+  }
 }
 
 /**
@@ -328,6 +384,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 const MEDIA_PLACEHOLDERS = new Set([
   "[media removed: request limit]", "(media removed \u2014 rejected by API)",
 ]);
+/**
+ * Claude Code 2.1.325's longer eviction placeholders: "[media removed: request limit.",
+ * a sentence on whether the model saw it, then "Re-reading pushes out others ... them
+ * all.]" (three variants). A resume under it changed every evicted message's text and
+ * discarded the persisted prefix (staging 2026-11-15, session 89127e82).
+ */
+const MEDIA_PLACEHOLDER_RE =
+  /^\[media removed: request limit\. [^\]]*Re-reading pushes out others[^\]]*\]$/;
+
+function isMediaPlaceholderText(text: unknown): boolean {
+  return typeof text === "string" &&
+    (MEDIA_PLACEHOLDERS.has(text) || MEDIA_PLACEHOLDER_RE.test(text));
+}
 
 /** Content without media blocks and without Claude Code's placeholders for them. */
 function withoutMedia(content: unknown): unknown {
@@ -348,7 +417,7 @@ function carriesMedia(content: unknown): boolean {
 function isMediaOrPlaceholder(part: any): boolean {
   if (!part || typeof part !== "object") return false;
   if (part.type === "image" || part.type === "document") return true;
-  return part.type === "text" && MEDIA_PLACEHOLDERS.has(part.text);
+  return part.type === "text" && isMediaPlaceholderText(part.text);
 }
 
 /** Cache metadata on blocks is incidental; identically named tool input keys aren't. */

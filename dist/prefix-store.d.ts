@@ -8,6 +8,8 @@ export interface PersistedPrefix {
     originalPortableHashes?: string[];
     /** The same without media (Claude Code's eviction beside a re-render); absent before them. */
     originalPortableMediaFreeHashes?: string[];
+    /** Each message's media digests, "" for none (route-identity mediaDigests); absent before them. */
+    originalMediaDigests?: string[];
     compressedMessages: any[];
     compressedSystem: unknown;
     hasCompressedSystem: boolean;

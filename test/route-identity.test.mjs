@@ -319,3 +319,50 @@ test("one input parsed since beside one still the same JSON string matches (Code
     assert.ok(!matches(message([{ old_str: "a", new_str: "c" }], '{"a":1}')), `${kind}: other edits`);
   }
 });
+
+test("Claude Code 2.1.325's longer placeholders count as eviction; text that only looks like one does not", () => {
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const tail = " Re-reading pushes out others and re-sends everything, so don't re-read them all.]";
+  const seen = { type: "text", text: "[media removed: request limit. You have already seen this." + tail };
+  const old = { type: "text", text: "[media removed: request limit]" };
+  const tool = (parts) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: parts }] });
+  for (const kind of ["route", "stable"]) {
+    for (const before of [tool([image("a")]), tool([old])]) {
+      const id = prefixIdentity([before], kind);
+      assert.ok(prefixMessageMatches(tool([seen]), kind, id.originalPrefixHashes[0],
+        id.originalMediaFreeHashes[0]), `${kind}: ${JSON.stringify(before)}`);
+      assert.ok(!prefixMessageMatches(tool([{ type: "text", text: "[media removed: request limit. typed]" }]),
+        kind, id.originalPrefixHashes[0], id.originalMediaFreeHashes[0]), "not Claude Code's text");
+    }
+  }
+});
+
+test("media Claude Code put back still matches; a replaced or reordered image does not", () => {
+  // 2026-11-15: a raised byte cap made Claude Code 2.1.325 send evicted images again.
+  const image = (data) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const removed = { type: "text", text: "[media removed: request limit]" };
+  const tool = (parts) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: parts }] });
+  const pasted = (media) => ({ role: "user", content: [{ type: "text", text: "look" }, ...media] });
+  for (const kind of ["route", "stable"]) {
+    const matches = (stored, current, digests = true) => {
+      const id = prefixIdentity([stored], kind);
+      return prefixMessageMatches(current, kind, id.originalPrefixHashes[0],
+        id.originalMediaFreeHashes[0], id.originalPortableHashes[0],
+        id.originalPortableMediaFreeHashes[0], digests ? id.originalMediaDigests[0] : undefined);
+    };
+    assert.ok(matches(tool([removed]), tool([image("a")])), "a placeholder became its image");
+    assert.ok(matches(pasted([]), pasted([image("a")])), "a dropped screenshot reappeared");
+    assert.ok(matches(tool([removed, image("b")]), tool([image("a"), image("b")])), "partly restored");
+    assert.ok(matches(tool([image("a"), image("b")]), tool([removed, image("b")])), "partly evicted");
+    assert.ok(!matches(tool([removed]), tool([image("a")]), false), "stored before digests: exact only");
+    assert.ok(!matches(tool([image("a")]), tool([image("b")])), "a replaced image");
+    assert.ok(!matches(tool([image("a"), image("b")]), tool([image("b"), image("a")])), "reordered");
+    assert.ok(!matches(pasted([image("a")]), pasted([image("b"), image("c")])), "replaced, then added");
+    assert.ok(!matches(tool([removed]), { role: "user", content: [{ type: "tool_result",
+      tool_use_id: "t", content: [image("a"), { type: "text", text: "new" }] }] }), "new text");
+  }
+  const older = [{ role: "user", content: "task" }, tool([removed]), { role: "assistant", content: "seen" }];
+  const restored = [{ role: "user", content: "task" }, tool([image("a")]),
+    { role: "assistant", content: "seen" }, { role: "user", content: "next" }];
+  assert.ok(extendsHistory(restored, older), "restoration keeps the older history covered");
+});

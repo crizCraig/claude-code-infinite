@@ -791,6 +791,8 @@ interface MemoryRoute {
   originalPortableHashes?: string[];
   /** The same without media; absent on old stores. */
   originalPortableMediaFreeHashes?: string[];
+  /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
+  originalMediaDigests?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -825,6 +827,8 @@ interface StablePrefix {
   originalPortableHashes?: string[];
   /** The same without media; absent on old stores. */
   originalPortableMediaFreeHashes?: string[];
+  /** Each message's media digests (route-identity mediaDigests); absent on old stores. */
+  originalMediaDigests?: string[];
   compressedMessages: Message[];
   compressedSystem: unknown;
   hasCompressedSystem: boolean;
@@ -4314,6 +4318,7 @@ function persistStablePrefix(state: ProxyState, sessionId: string, prefix: Stabl
       originalMediaFreeHashes: prefix.originalMediaFreeHashes,
       originalPortableHashes: prefix.originalPortableHashes,
       originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
+      originalMediaDigests: prefix.originalMediaDigests,
       compressedMessages: prefix.compressedMessages,
       compressedSystem: prefix.compressedSystem,
       hasCompressedSystem: prefix.hasCompressedSystem,
@@ -4408,6 +4413,7 @@ type PrefixLike = Pick<
   | "originalMediaFreeHashes"
   | "originalPortableHashes"
   | "originalPortableMediaFreeHashes"
+  | "originalMediaDigests"
   | "compressedMessages"
   | "compressedSystem"
   | "hasCompressedSystem"
@@ -4442,7 +4448,7 @@ function firstPrefixMiss(
   for (let i = 0; i < length; i++) {
     if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i],
       prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i],
-      prefix.originalPortableMediaFreeHashes?.[i])) {
+      prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaDigests?.[i])) {
       return i;
     }
   }
@@ -5785,7 +5791,7 @@ function memoryRoutedToolBody(
   for (let i = 0; i < prefixLength; i++) {
     if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i],
       route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i],
-      route.originalPortableMediaFreeHashes?.[i])) {
+      route.originalPortableMediaFreeHashes?.[i], route.originalMediaDigests?.[i])) {
       return null;
     }
   }

@@ -11,19 +11,22 @@ export declare function prefixIdentity(messages: Message[], kind: PrefixIdentity
     originalMediaFreeHashes: string[];
     originalPortableHashes: string[];
     originalPortableMediaFreeHashes: string[];
+    originalMediaDigests: string[];
 };
 /**
  * Whether `message` still stands where a prefix's message stood: unchanged, or the same
- * apart from media Claude Code evicted. Past its media caps (count, and bytes in 2.1.310)
- * Claude Code evicts the oldest images and documents from its history: a tool result's
- * becomes a placeholder, a top-level one is dropped, an emptied message becomes the
- * placeholder. That counts only when the message has no media left, so an attachment
- * replaced by another never matches; a removed one is indistinguishable from eviction.
+ * apart from media Claude Code evicted or put back. Past its media caps (count, and bytes
+ * in 2.1.310) Claude Code evicts the oldest images and documents from its history: a tool
+ * result's becomes a placeholder, a top-level one is dropped, an emptied message becomes
+ * the placeholder. A raised cap puts them back (2.1.325 on 2026-11-15: a flag took its byte
+ * cap from 24 to 56 MiB and a resume sent 91 evicted images again). With no media left it
+ * counts as eviction; with media left, only when `mediaDigests` (the stored message's
+ * media, mediaDigests) shows the media dropped or added, never one replaced by another.
  * A newer Claude Code can also render the same history differently on resume (see
  * portableHash), with media kept or (no media left) evicted the same way.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
-export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined, portable?: string, portableMediaFree?: string): boolean;
+export declare function prefixMessageMatches(message: Message, kind: PrefixIdentity, exact: string, mediaFree: string | undefined, portable?: string, portableMediaFree?: string, storedMedia?: string): boolean;
 /**
  * Whether `newer` carries everything `older` does: every message of `older` after the
  * system prompt (whose billing line changes per call), in place and unchanged apart from
@@ -34,4 +37,10 @@ export declare function prefixMessageMatches(message: Message, kind: PrefixIdent
 export declare function extendsHistory(newer: Message[], older: Message[]): boolean;
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
 export declare function mediaFreeMessageHash(message: Message): string;
+/**
+ * The digests of a message's images and documents, in order (top level and inside tool
+ * results), joined by ","; "" when it carries none. Stored beside a prefix's hashes so a
+ * later match can tell media put back from media replaced (prefixMessageMatches).
+ */
+export declare function mediaDigests(message: Message): string;
 //# sourceMappingURL=route-identity.d.ts.map
