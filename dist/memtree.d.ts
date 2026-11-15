@@ -51,18 +51,6 @@ export declare const COMPRESS_TIMEOUT_MS_PER_KIB = 2.5;
  */
 export declare const INDEX_MIN_NEW_CHARS = 30000;
 /**
- * Most a history waits held back by INDEX_MIN_NEW_CHARS, from the first hold since its
- * conversation's last upload. The MemTree page shows its owner the newest stored request,
- * so without a bound a session's quiet turns stayed off the page for as long as the
- * session ran short (2026-11-14: 10+ minutes on a 27 MB session). Costs at most one extra
- * upload per conversation per limit, and only while its turns stay under the minimum: worst
- * case the whole history every 3 minutes (a 27 MB session: ~540 MB an hour, against the
- * ~1.5 GB an hour of every-turn uploads the minimum replaced). A compress call that carries
- * the held history retires it when it is sent (retireHeldBy).
- * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
- */
-export declare const INDEX_HOLD_MAX_MS: number;
-/**
  * A main-lane Stop followed by this long without a new request is taken as the
  * session's end, and its final index goes out (exit sends it at once). Shorter
  * pauses spend the server's once-per-30-minutes final index mid-session.
@@ -78,8 +66,6 @@ export interface MemtreeOptions {
     longCompressTimeoutMs?: number;
     /** New text an index upload waits for (INDEX_MIN_NEW_CHARS); tests set 0. */
     indexMinNewChars?: number;
-    /** Most a held-back index waits (INDEX_HOLD_MAX_MS); 0: no bound. Tests set it small. */
-    indexHoldMaxMs?: number;
     /** Added to a compress budget per KiB uploaded (COMPRESS_TIMEOUT_MS_PER_KIB); tests set 0. */
     compressTimeoutMsPerKiB?: number;
     debug?: boolean;
@@ -396,11 +382,6 @@ export declare class MemtreeClient {
      * call that does not carry it whole (a rewind, evicted media) replaces it.
      */
     private readonly indexLanesHeld;
-    /** Per conversation, the newest history a compress or final call sent (retireHeldBy). */
-    private readonly indexLanesCarried;
-    /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
-    private readonly indexHoldTimers;
-    private readonly indexHoldMaxMs;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
@@ -613,28 +594,6 @@ export declare class MemtreeClient {
     private releaseHeldIndex;
     private holdIndex;
     /**
-     * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
-     * since its last upload, so newer held histories replacing it do not push it back.
-     */
-    private startHoldTimer;
-    /**
-     * A compress call (or the final index) is sending `messages`: the server stores every
-     * request it gets, even one it refuses (an index-pending 413), and a call that fails in
-     * transport may have arrived too, so `messages` is the lane's newest stored history from
-     * now on (indexLanesCarried), on whatever branch. A held-back or waiting history it carries is dropped, or
-     * its later upload would be an older request the page reads as the newest (Codex r1-r5).
-     * If the call never arrived, nothing is lost: the next turn's index holds again and
-     * carries it, and the final index carries everything. A final index still waiting goes.
-     */
-    private retireHeldBy;
-    private noteCarried;
-    /**
-     * `job` adds nothing to what the lane has stored or is storing: the last index upload
-     * (a retried request) or a compress or final call carries it whole, media included.
-     */
-    private carriedByUpload;
-    private clearHoldTimer;
-    /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
      * last sent (or has waiting to send): the server's index minimum would only ack it.
      */
@@ -772,6 +731,4 @@ export declare function messagesTextChars(messages: Message[]): number;
  * replacing `older` by `newer` would leave it never uploaded.
  */
 export declare function losesMedia(older: Message[], newer: Message[]): boolean;
-/** `CCC_INDEX_HOLD_MAX_MS` as milliseconds (0 or more), else INDEX_HOLD_MAX_MS. */
-export declare function holdMaxFromEnv(value: string | undefined): number;
 //# sourceMappingURL=memtree.d.ts.map

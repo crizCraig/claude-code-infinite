@@ -74,18 +74,6 @@ const INDEX_TIMEOUT_MS = 120_000;
  * acknowledges the upload.
  */
 export const INDEX_MIN_NEW_CHARS = 30_000;
-/**
- * Most a history waits held back by INDEX_MIN_NEW_CHARS, from the first hold since its
- * conversation's last upload. The MemTree page shows its owner the newest stored request,
- * so without a bound a session's quiet turns stayed off the page for as long as the
- * session ran short (2026-11-14: 10+ minutes on a 27 MB session). Costs at most one extra
- * upload per conversation per limit, and only while its turns stay under the minimum: worst
- * case the whole history every 3 minutes (a 27 MB session: ~540 MB an hour, against the
- * ~1.5 GB an hour of every-turn uploads the minimum replaced). A compress call that carries
- * the held history retires it when it is sent (retireHeldBy).
- * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
- */
-export const INDEX_HOLD_MAX_MS = 3 * 60_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -823,11 +811,6 @@ export class MemtreeClient {
      * call that does not carry it whole (a rewind, evicted media) replaces it.
      */
     indexLanesHeld = new Map();
-    /** Per conversation, the newest history a compress or final call sent (retireHeldBy). */
-    indexLanesCarried = new Map();
-    /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
-    indexHoldTimers = new Map();
-    indexHoldMaxMs;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     indexLanesPending = new Map();
     /** Once draining begins, no later request may create another log producer. */
@@ -996,7 +979,6 @@ export class MemtreeClient {
             opts.longCompressTimeoutMs ??
                 Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_LONG_COMPRESS_TIMEOUT_MS);
         this.indexMinNewChars = opts.indexMinNewChars ?? INDEX_MIN_NEW_CHARS;
-        this.indexHoldMaxMs = opts.indexHoldMaxMs ?? holdMaxFromEnv(process.env.CCC_INDEX_HOLD_MAX_MS);
         this.compressTimeoutMsPerKiB = opts.compressTimeoutMsPerKiB ?? COMPRESS_TIMEOUT_MS_PER_KIB;
         this.debug = opts.debug ?? false;
         this.reqlog = opts.reqlog;
@@ -1233,7 +1215,6 @@ export class MemtreeClient {
      * turn is not held back by an upload the server never got.
      */
     sendLaneIndex(lane, job) {
-        this.clearHoldTimer(lane);
         const sent = { messages: job.messages, chars: messagesTextChars(job.messages) };
         this.indexLanesPending.set(lane, sent);
         return this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts).then((ok) => {
@@ -1260,79 +1241,12 @@ export class MemtreeClient {
     }
     holdIndex(lane, job) {
         this.indexLanesHeld.set(lane, job);
-        this.startHoldTimer(lane);
         if (this.indexLanesHeld.size > DEDUPE_CACHE_MAX) {
             // Over capacity the oldest held history is sent, not dropped (origin/main sent it).
             const [first, evicted] = this.indexLanesHeld.entries().next().value;
             this.indexLanesHeld.delete(first);
             this.enqueueIndex(first, evicted);
         }
-    }
-    /**
-     * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
-     * since its last upload, so newer held histories replacing it do not push it back.
-     */
-    startHoldTimer(lane) {
-        if (this.indexHoldMaxMs <= 0 || this.indexHoldTimers.has(lane))
-            return;
-        const timer = setTimeout(() => {
-            this.indexHoldTimers.delete(lane);
-            const held = this.indexLanesHeld.get(lane);
-            if (!held || this.backgroundClosing)
-                return;
-            this.indexLanesHeld.delete(lane);
-            if (!this.carriedByUpload(lane, held))
-                this.enqueueIndex(lane, held);
-        }, this.indexHoldMaxMs);
-        timer.unref();
-        this.indexHoldTimers.set(lane, timer);
-    }
-    /**
-     * A compress call (or the final index) is sending `messages`: the server stores every
-     * request it gets, even one it refuses (an index-pending 413), and a call that fails in
-     * transport may have arrived too, so `messages` is the lane's newest stored history from
-     * now on (indexLanesCarried), on whatever branch. A held-back or waiting history it carries is dropped, or
-     * its later upload would be an older request the page reads as the newest (Codex r1-r5).
-     * If the call never arrived, nothing is lost: the next turn's index holds again and
-     * carries it, and the final index carries everything. A final index still waiting goes.
-     */
-    retireHeldBy(sessionId, messages) {
-        const lane = indexLaneKey(sessionId, messages);
-        // The newest request sent is the newest stored, on whatever branch (a rewind too).
-        this.noteCarried(lane, messages);
-        if (this.carriedByUpload(lane, this.indexLanesHeld.get(lane))) {
-            this.indexLanesHeld.delete(lane);
-            this.clearHoldTimer(lane);
-        }
-        const waiting = this.indexLanesNext.get(lane);
-        if (this.carriedByUpload(lane, waiting) && !waiting.opts.finalIndex) {
-            this.indexLanesNext.delete(lane);
-        }
-    }
-    noteCarried(lane, messages) {
-        this.indexLanesCarried.delete(lane);
-        this.indexLanesCarried.set(lane, messages);
-        if (this.indexLanesCarried.size > DEDUPE_CACHE_MAX) {
-            this.indexLanesCarried.delete(this.indexLanesCarried.keys().next().value);
-        }
-    }
-    /**
-     * `job` adds nothing to what the lane has stored or is storing: the last index upload
-     * (a retried request) or a compress or final call carries it whole, media included.
-     */
-    carriedByUpload(lane, job) {
-        if (job === undefined)
-            return false;
-        const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
-        return [sent?.messages, this.indexLanesCarried.get(lane)].some((upload) => upload !== undefined && extendsHistory(upload, job.messages) &&
-            !losesMedia(job.messages, upload));
-    }
-    clearHoldTimer(lane) {
-        const timer = this.indexHoldTimers.get(lane);
-        if (timer === undefined)
-            return;
-        clearTimeout(timer);
-        this.indexHoldTimers.delete(lane);
     }
     /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation
@@ -1390,8 +1304,6 @@ export class MemtreeClient {
             }
         }
         this.indexLanesHeld.clear();
-        for (const lane of [...this.indexHoldTimers.keys()])
-            this.clearHoldTimer(lane);
         for (const [lane, job] of this.indexLanesNext) {
             if (!carries(this.finalIndexLanes.get(lane), job.messages)) {
                 void this.submitIndexOnly(job.messages, job.modelContextLimit, job.opts);
@@ -1500,8 +1412,6 @@ export class MemtreeClient {
             return;
         signal.throwIfAborted();
         this.finalIndexed.set(sessionId, prepared.key);
-        // The raw history (images as sent per turn, not as references) names what it carries.
-        this.retireHeldBy(sessionId, conversation.messages);
         const messageTimes = conversation.messageTimesFor?.(prepared.retained);
         await this.callContextMemory(prepared.messages, conversation.modelContextLimit, {
             sessionId, clientMeta: conversation.clientMeta, messageTimes,
@@ -1766,10 +1676,6 @@ export class MemtreeClient {
         opts.signal?.addEventListener("abort", abort, { once: true });
         if (opts.signal?.aborted)
             abort();
-        // Sent, this compress call is the conversation's newest stored request (retireHeldBy).
-        if (!opts.indexOnly && planned.limit?.action !== "trimmed" && !controller.signal.aborted) {
-            this.retireHeldBy(opts.sessionId, messages);
-        }
         try {
             const response = await this.postRetryingDrop(payload, { ...opts, features }, controller.signal)
                 .catch((err) => {
@@ -2216,14 +2122,4 @@ function indexLaneKey(sessionId, messages) {
     const first = messages.find((message) => message.role !== "system");
     return JSON.stringify([sessionId ?? null, first ? mediaFreeMessageHash(first) : ""]);
 }
-/** `CCC_INDEX_HOLD_MAX_MS` as milliseconds (0 or more), else INDEX_HOLD_MAX_MS. */
-export function holdMaxFromEnv(value) {
-    const n = value === undefined || value.trim() === "" ? NaN : Number(value);
-    if (!Number.isFinite(n) || n < 0)
-        return INDEX_HOLD_MAX_MS;
-    // setTimeout fires at once past its maximum: anything longer means no bound.
-    return n > MAX_TIMER_MS ? 0 : n;
-}
-/** The longest delay setTimeout honours (2^31 - 1 ms). */
-const MAX_TIMER_MS = 2_147_483_647;
 //# sourceMappingURL=memtree.js.map
