@@ -163,9 +163,11 @@ const PARENT_TREE_ADVICE: Partial<Record<ParentTreeStyle, string>> = {
   // advisory styles never searched; their brief named the logs and they re-read them.
   "first-step":
     " Your task may continue the parent's work, so make your first tool call search " +
-    "{@TREE@, \"query\": \"<your task's key terms>\"} and use what the parent already " +
-    "found instead of re-reading logs or re-deriving it; read files for their current " +
-    "contents or to edit them.",
+    "{@TREE@, \"query\": \"<your task's key terms>\"} and, where it covers your task, use " +
+    "what the parent found instead of re-deriving it (if your brief asks for an independent " +
+    "check, take only facts such as ids and commands, not its conclusions). Memory shows " +
+    "files and logs as they were then: read one yourself when you need its current contents " +
+    "(it may have changed since) or to edit it.",
 };
 
 /**
