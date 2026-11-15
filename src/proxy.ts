@@ -4442,11 +4442,20 @@ function prefixMismatch(
 
 /**
  * The stored media slots that let covered message `i` match with media evicted or put back
- * (prefixMessageMatches), except on the last covered message: the only one a user can still
- * send again differently (rewind and resend), so there media must match exactly (Codex r2).
+ * (prefixMessageMatches), except on the last covered message that is not an ambient system
+ * one (`last`, lastSentCovered): the only one a user can still send again differently
+ * (rewind and resend), so there media must match exactly (Codex r2, r3).
  */
-function putBackSlots(slots: string[] | undefined, i: number, covered: number): string | undefined {
-  return i < covered - 1 ? slots?.[i] : undefined;
+function putBackSlots(slots: string[] | undefined, i: number, last: number): string | undefined {
+  return i < last ? slots?.[i] : undefined;
+}
+
+/** The index of the last of the first `covered` messages whose role is not system. */
+function lastSentCovered(messages: Message[], covered: number): number {
+  for (let i = Math.min(covered, messages.length) - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "system") return i;
+  }
+  return -1;
 }
 
 /** The first message the prefix covers that no longer matches it, if any. */
@@ -4454,11 +4463,12 @@ function firstPrefixMiss(
   messages: Message[], prefix: PrefixLike, kind: PrefixIdentity
 ): number | undefined {
   const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
+  const last = lastSentCovered(messages, prefix.originalPrefixHashes.length);
   for (let i = 0; i < length; i++) {
     if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i],
       prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i],
       prefix.originalPortableMediaFreeHashes?.[i],
-      putBackSlots(prefix.originalMediaSlots, i, prefix.originalPrefixHashes.length))) {
+      putBackSlots(prefix.originalMediaSlots, i, last))) {
       return i;
     }
   }
@@ -5798,11 +5808,12 @@ function memoryRoutedToolBody(
   }
   const prefixLength = route.originalPrefixHashes.length;
   if (messages.length < prefixLength) return null;
+  const last = lastSentCovered(messages, prefixLength);
   for (let i = 0; i < prefixLength; i++) {
     if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i],
       route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i],
       route.originalPortableMediaFreeHashes?.[i],
-      putBackSlots(route.originalMediaSlots, i, prefixLength))) {
+      putBackSlots(route.originalMediaSlots, i, last))) {
       return null;
     }
   }

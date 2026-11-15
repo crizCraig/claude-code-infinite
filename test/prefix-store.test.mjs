@@ -306,6 +306,30 @@ test("a resume after Claude Code restored media it had evicted adopts the prefix
   assert.equal(replaced.record.storedPrefix, "discarded");
 });
 
+test("media put back on the last covered message, ambient system after it, is new content (Codex r3)",
+  async () => {
+    // The last covered message a user sends is the one they can rewind and resend with other
+    // media; a trailing role=system message must not hide that it is the last one.
+    const last = (media) => ({ role: "user", content: [{ type: "text", text: BIG("q3") }, media] });
+    const ambient = { role: "system", content: "ambient" };
+    const dir = tempDir();
+    const before = await proxyProcess(new StablePrefixStore(dir));
+    const conv = [user("q1"), assistant("a1"), user("q2"), assistant("a2"),
+      last(NEW_PLACEHOLDERS[1]), ambient];
+    try {
+      assert.equal(await before.post(conv.slice(0, 3)), 200);
+      assert.equal(await before.post(conv), 200);
+      assert.equal(before.lastRecord().turnType, "followup-compressed");
+    } finally { before.close(); }
+    assert.equal((await waitForFile(dir)).length, 1);
+    const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort: before.memoryPort });
+    try {
+      const resent = [...conv.slice(0, 4), last(image("other")), ambient, assistant("a3"), user("q4")];
+      assert.equal(await after.post(resent), 200);
+      assert.equal(after.lastRecord().storedPrefix, "discarded");
+    } finally { after.close(); }
+  });
+
 test("a corrupt persisted prefix is discarded and the turn behaves as today", async () => {
   const dir = tempDir();
   const before = await proxyProcess(new StablePrefixStore(dir));
