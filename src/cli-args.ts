@@ -137,6 +137,47 @@ export function compactTargetFromEnv(
   return { value: target };
 }
 
+/**
+ * A subagent lane's own budget and target (CCC_AGENT_BUDGET_TOKENS / CCC_AGENT_TARGET_TOKENS).
+ * No target: half the lane's effective budget (proxy.ts; the context window may cap it).
+ */
+export interface AgentLaneBudget {
+  budget: number;
+  target?: number;
+}
+
+/**
+ * `CCC_AGENT_BUDGET_TOKENS` ("200k") and `CCC_AGENT_TARGET_TOKENS` ("100k", default half the
+ * budget): subagent lanes compress at their own, smaller budget to their own target, while
+ * the main lane keeps the model budget. Off (undefined) unless the budget is set; the budget
+ * must be at least twice `minTokens`, and a target outside [minTokens, budget) is ignored
+ * (half the budget). `warnings` explains anything ignored.
+ */
+export function agentLaneBudgetFromEnv(
+  budgetRaw: string | undefined,
+  targetRaw: string | undefined,
+  parseTokens: (text: string) => number | undefined,
+  minTokens: number
+): { value: AgentLaneBudget | undefined; warnings: string[] } {
+  if (!budgetRaw || !budgetRaw.trim()) return { value: undefined, warnings: [] };
+  const budget = parseTokens(budgetRaw);
+  if (budget === undefined || budget < 2 * minTokens) {
+    return { value: undefined, warnings: [
+      `ccc: ignoring CCC_AGENT_BUDGET_TOKENS=${budgetRaw} (use a token count of at least ` +
+        `${(2 * minTokens) / 1000}k)`,
+    ] };
+  }
+  if (!targetRaw || !targetRaw.trim()) return { value: { budget }, warnings: [] };
+  const target = parseTokens(targetRaw);
+  if (target === undefined || target < minTokens || target >= budget) {
+    return { value: { budget }, warnings: [
+      `ccc: ignoring CCC_AGENT_TARGET_TOKENS=${targetRaw} (use a token count from ` +
+        `${minTokens / 1000}k to under the agent budget); using half the agent budget`,
+    ] };
+  }
+  return { value: { budget, target }, warnings: [] };
+}
+
 /** Hosts `CCC_ANTHROPIC_UPSTREAM` may name: this machine only. */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
 

@@ -45,6 +45,7 @@ import { PromptAccounting } from "./prompt-accounting.js";
 import { INDEX_WAIT_RETRY_AFTER_SECONDS, RefusalStreaks, RouteFallbackFailures, pausedRefusal, unreachableRefusal } from "./route-fallback.js";
 import { refusalCause, refusalMessage } from "./refusal-reason.js";
 import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
+import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
@@ -78,6 +79,7 @@ import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
+import { requestThreadType, threadUnsupportedBody, ThreadRefusals, } from "./thread-backstop.js";
 import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
@@ -356,6 +358,7 @@ export function startProxy(opts) {
     const shutdownAbort = new AbortController();
     const backgroundAbort = new AbortController();
     const state = {
+        threadRefusals: new ThreadRefusals(),
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         keyInvalid: () => opts.memtree.keyInvalid,
@@ -386,6 +389,7 @@ export function startProxy(opts) {
         refusalStreaks: new RefusalStreaks(),
         activeSubagents: new Set(),
         laneActivity: new LaneActivity(),
+        laneCacheClock: new LaneCacheClock(),
         deferredAgentIndexes: new Map(),
         adoptingPrepared: new Map(),
         memoryRoutes: new Map(),
@@ -1329,6 +1333,9 @@ async function handleMessages(req, res, opts, upstream, state) {
         // Not a shape we understand — forward verbatim rather than break the session.
         return logged(forwardRaw(req, res, rawBody, opts, upstream, state.shutdownSignal, rec));
     }
+    if (opts.messageThreads !== "passthrough" && refuseThreadRequest(req, res, opts, state, body, rec)) {
+        return logged(Promise.resolve());
+    }
     // Defensive legacy strip pass first: old marker-wrapped notices (including
     // one copied into an away-summary or top-level system prompt) must never
     // reach Anthropic or MemTree. Hook-delivered notices never enter this body.
@@ -1472,7 +1479,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     candidateSizeOwners.set(originalCandidate, sizeSlot);
     candidateSizeOwners.set(forwardCandidate, sizeSlot);
     const sizingLimits = () => ({
-        budget: resolveBudget(opts, state, body.model, modelContextLimit).tokens,
+        budget: resolveBudget(opts, state, body.model, modelContextLimit, requestRouteLane).tokens,
         context: modelContextLimit,
         output: bodyOutputReservation(body),
         recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
@@ -1484,12 +1491,14 @@ async function handleMessages(req, res, opts, upstream, state) {
         (isMainRequest && requestSessionKey !== undefined && state.stablePrefixes.has(requestSessionKey));
     if (!rides) {
         const measured = await requestSizing.measure(forwardCandidate, sizingLimits(), "plan");
-        if (measured.source === "exact") {
+        // A fragment's count is not the conversation's: it never replaces its size sample.
+        if (measured.source === "exact" && !notConversation) {
             sizeSlot.set(sizeSampleOf(forwardCandidate.body, measured.tokens, rec.model ?? body.model));
         }
     }
     rec.routeLane = requestRouteLane;
     noteLaneActivity(state, rec, requestSessionId(req));
+    noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined);
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
     const clientMeta = memtreeClientMeta({
@@ -1552,7 +1561,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         recoverLate: async (_ride, rideTokens, target) => {
             // A compression already made may be redone only to a smaller target.
             if (notConversation || (rec.compress && target === undefined) ||
-                compactionMode(opts, state, requestSessionKey).mode === "off" ||
+                compactionMode(opts, state, requestSessionKey, requestRouteLane).mode === "off" ||
                 !hasEarlierNonToolUserMessage(messages) ||
                 (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
                 return undefined;
@@ -1879,7 +1888,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             toolForwarding.settle(delivered);
             if (toolRide)
                 noteRideSize(toolRide.sizeHolder, rec, sendBody);
-            else {
+            // A fragment's bytes are not what its reported input counts (a continue's tail
+            // against the whole thread): it never sizes the conversation's next request.
+            else if (!notConversation) {
                 noteWholeRequestSize(state, isMainRequest, toolSessionId, requestSizeKey, body.model, rec, sendBody);
             }
         }));
@@ -1896,6 +1907,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             requestSendPolicies.get(req)?.allowed.add(fork.body);
             releaseRouteDecision(state, requestRouteKey, routeDecisionGeneration);
             recordTurn(rec, "fork-memory", fork.body);
+            noteAwayWarmsMain(state, rec, requestSessionId(req), fork.body);
             capture(opts, "anthropic-request-memory-fork", fork.body);
             return logged(forwardRaw(req, res, fork.body, opts, upstream, state.shutdownSignal, rec));
         }
@@ -3121,7 +3133,7 @@ function adoptStoredPrefix(opts, state, rec, sessionId, body, messages, modelCon
     const { stablePrefixStore: store, storageOwner: owner } = state;
     if (!store || !owner || state.stablePrefixes.has(sessionId))
         return;
-    if (compactionMode(opts, state, sessionId).mode === "off")
+    if (compactionMode(opts, state, sessionId, "main").mode === "off")
         return;
     let entry = state.storedPrefixLookups.get(sessionId);
     if (entry === undefined) {
@@ -3240,15 +3252,19 @@ function serverBudgetKey(model, modelContextLimit) {
 }
 /**
  * The session's whole-request budget, the size at which a request is
- * compressed: CCC_BUDGET_TOKENS when set (tests), else the model budget the
+ * compressed: on a subagent lane CCC_AGENT_BUDGET_TOKENS when set, else
+ * CCC_BUDGET_TOKENS when set (tests), else the model budget the
  * server last reported for this model and window, else fallbackBudgetTokens
  * (servers that predate `model_budget_tokens`, and the first request before
  * any response). Never above the window less the reply's room
  * (compressionTrigger): a request is compressed when its projected size plus
  * that reserve would exceed the window, or the budget.
  */
-function resolveBudget(opts, state, model, modelContextLimit) {
+function resolveBudget(opts, state, model, modelContextLimit, lane) {
     const trigger = (tokens) => compressionTrigger(tokens, modelContextLimit);
+    if (lane === "agent" && opts.agentLaneBudget !== undefined) {
+        return { tokens: trigger(opts.agentLaneBudget.budget), source: "agent" };
+    }
     if (opts.budgetTokensOverride !== undefined) {
         return { tokens: trigger(opts.budgetTokensOverride), source: "override" };
     }
@@ -3268,13 +3284,21 @@ function noteServerBudget(state, model, modelContextLimit, result) {
     state.serverReportsBudget = true;
     boundedSet(state.serverBudgets, serverBudgetKey(model, modelContextLimit), tokens);
 }
-/** `/memtree-compact` for this session, else CCC_COMPACT_TARGET, else automatic. */
-function compactionMode(opts, state, sessionId) {
+/**
+ * `/memtree-compact` for this session, else CCC_COMPACT_TARGET, else automatic; on a
+ * subagent lane with CCC_AGENT_BUDGET_TOKENS, its agent target unless compaction is off.
+ */
+function compactionMode(opts, state, sessionId, lane) {
     const configured = sessionId !== undefined && state.compactTargets.has(sessionId)
         ? state.compactTargets.get(sessionId)
         : opts.defaultCompactTarget;
     if (configured === null)
         return { mode: "off" };
+    if (lane === "agent" && opts.agentLaneBudget !== undefined) {
+        const target = opts.agentLaneBudget.target;
+        // Unset: half of the lane's effective budget (the window may cap it), as auto does.
+        return target === undefined ? { mode: "auto" } : { mode: "explicit", tokens: target };
+    }
     if (configured === undefined)
         return { mode: "auto" };
     return { mode: "explicit", tokens: configured };
@@ -3294,11 +3318,14 @@ function compactionTarget(mode, budgetTokens) {
  * own model budget. Never a bare target, which would force a compression on
  * every call.
  */
-function laneCompaction(opts, state, sessionId, model, modelContextLimit) {
-    const mode = compactionMode(opts, state, sessionId);
-    if (mode.mode === "off" || !state.serverReportsBudget)
+function laneCompaction(opts, state, sessionId, model, modelContextLimit, lane) {
+    const mode = compactionMode(opts, state, sessionId, lane);
+    if (mode.mode === "off")
         return {};
-    const budget = resolveBudget(opts, state, model, modelContextLimit);
+    const budget = resolveBudget(opts, state, model, modelContextLimit, lane);
+    // The server's own budget knows nothing of a subagent lane's (CCC_AGENT_BUDGET_TOKENS).
+    if (!state.serverReportsBudget && budget.source !== "agent")
+        return {};
     return {
         target: compactionTarget(mode, budget.tokens),
         threshold: Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens),
@@ -3331,8 +3358,9 @@ function budgetCompaction(state, record, target, body, modelContextLimit) {
     if (calibratedSizeExceedsLimits(record, body, modelContextLimit))
         return { target };
     // Older servers may ignore a threshold, so do not send a forcing target
-    // until support is known. They can still compact against their own budget.
-    if (!state.serverReportsBudget)
+    // until support is known. They can still compact against their own budget,
+    // which knows nothing of a subagent lane's own one (CCC_AGENT_BUDGET_TOKENS).
+    if (!state.serverReportsBudget && record.budgetSource !== "agent")
         return {};
     const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, record.budgetTokens);
     record.thresholdTokens = threshold;
@@ -3489,8 +3517,8 @@ function boundedSet(map, key, value, limit = STABLE_PREFIX_MAX_SESSIONS) {
  */
 async function planEdgeCompaction(args) {
     const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } = args;
-    const mode = compactionMode(opts, state, sessionId);
-    const budget = resolveBudget(opts, state, body.model, modelContextLimit);
+    const mode = compactionMode(opts, state, sessionId, rec.routeLane);
+    const budget = resolveBudget(opts, state, body.model, modelContextLimit, rec.routeLane);
     const compaction = {
         mode: mode.mode,
         budgetTokens: budget.tokens,
@@ -3570,6 +3598,13 @@ async function planEdgeCompaction(args) {
                 return { kind: "ride", ...adopted };
             return forced("budget", fallback);
         }
+        if (coldCacheCompress(state, rec, size, targetTokens)) {
+            const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+                waitMs: opts.memtree.longCompressBudgetMs });
+            if (adopted)
+                return { kind: "ride", ...adopted };
+            return forced("cold-cache", fallback);
+        }
         return { kind: "ride", prefix, routed };
     }
     if (state.compactNow.has(sessionId))
@@ -3587,6 +3622,13 @@ async function planEdgeCompaction(args) {
         if (adopted)
             return { kind: "ride", ...adopted };
         return forced(compaction.prefixMiss ? "prefix-mismatch" : "budget");
+    }
+    if (coldCacheCompress(state, rec, size, targetTokens)) {
+        const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
+            waitMs: opts.memtree.longCompressBudgetMs });
+        if (adopted)
+            return { kind: "ride", ...adopted };
+        return forced("cold-cache");
     }
     if (state.serverReportsBudget) {
         // The server measures the request and compresses only past the budget.
@@ -3619,8 +3661,8 @@ async function planEdgeCompaction(args) {
  */
 async function planToolCompaction(args) {
     const { opts, state, body, messages, sessionId, modelContextLimit, forwardBody, rec } = args;
-    const mode = compactionMode(opts, state, sessionId);
-    const budget = resolveBudget(opts, state, body.model, modelContextLimit);
+    const mode = compactionMode(opts, state, sessionId, rec.routeLane);
+    const budget = resolveBudget(opts, state, body.model, modelContextLimit, rec.routeLane);
     const compaction = {
         mode: mode.mode,
         budgetTokens: budget.tokens,
@@ -3669,7 +3711,9 @@ async function planToolCompaction(args) {
             return { kind: "pass", original: true };
         return ride ? { kind: "ride", ride } : { kind: "pass" };
     }
-    if (size.tokens < budget.tokens && !overWindow) {
+    const underBudget = size.tokens < budget.tokens && !overWindow;
+    const cold = underBudget && coldCacheCompress(state, rec, size, targetTokens);
+    if (underBudget && !cold) {
         return ride ? { kind: "ride", ride } : { kind: "pass" };
     }
     const adopted = stableLane
@@ -3691,16 +3735,18 @@ async function planToolCompaction(args) {
         return plan;
     }
     // Settings current after any wait for a preparation (a /memtree-compact N meanwhile).
-    const modeNow = compactionMode(opts, state, sessionId);
+    const modeNow = compactionMode(opts, state, sessionId, rec.routeLane);
     if (modeNow.mode === "off")
         return { kind: "off" };
     const targetNow = compactionTarget(modeNow, budget.tokens);
     compaction.mode = modeNow.mode;
     compaction.targetTokens = targetNow;
-    compaction.reason = "budget";
+    compaction.reason = cold ? "cold-cache" : "budget";
     return {
         kind: "compress",
-        ...budgetCompaction(state, compaction, targetNow, body, modelContextLimit),
+        // Cold: under the budget, so a threshold would let the server pass it through.
+        ...(cold ? { target: targetNow }
+            : budgetCompaction(state, compaction, targetNow, body, modelContextLimit)),
         targetTokens: targetNow,
         explicitTarget: modeNow.mode === "explicit",
         estimateTokens: size.tokens,
@@ -3796,7 +3842,8 @@ async function adoptEntry(args, entry, base) {
     // Another request installed a prefix, or `/memtree-compact` asked for its
     // own target, while this one waited or counted: that wins.
     const kind = fit.kind === "used" && (state.stablePrefixes.get(sessionId) !== base ||
-        state.compactNow.has(sessionId) || compactionMode(args.opts, state, sessionId).mode !== "auto")
+        state.compactNow.has(sessionId) ||
+        compactionMode(args.opts, state, sessionId, "main").mode !== "auto")
         ? "stale" : fit.kind;
     args.compaction.prepared = kind;
     if (kind !== "used" || fit.kind !== "used") {
@@ -3826,7 +3873,7 @@ function notePreparedTruncationBase(args, entry, base, candidate) {
     const { state, sessionId } = args;
     preparedTruncationBases.set(args.sizing, { candidate, install: () => {
             if (state.stablePrefixes.get(sessionId) !== base || state.compactNow.has(sessionId) ||
-                compactionMode(args.opts, state, sessionId).mode !== "auto")
+                compactionMode(args.opts, state, sessionId, "main").mode !== "auto")
                 return;
             args.compaction.prepared = "truncated";
             installPreparedPrefix(state, sessionId, entry);
@@ -4676,7 +4723,7 @@ function closedSignal(res) {
 async function runBlockingCompressionOnce(args) {
     const { opts, state, body, msgsForMemtree, hash, modelContextLimit, rec } = args;
     const compaction = args.compaction ??
-        laneCompaction(opts, state, args.sessionId, body.model, modelContextLimit);
+        laneCompaction(opts, state, args.sessionId, body.model, modelContextLimit, rec.routeLane);
     const messageUsage = args.sessionId !== undefined && opts.transcriptUsage
         ? opts.transcriptUsage.usageFor(args.sessionId, msgsForMemtree, args.agentId)
         : undefined;
@@ -5313,6 +5360,29 @@ function recordTurn(rec, turnType, forwardBody) {
 }
 /** The forwarded body's inline image bytes (recordTurn), for the heavy-request notice. */
 const forwardedImageBytes = new WeakMap();
+/**
+ * A request carrying `thread` while threads are off: answer ccc's own 400 (Claude Code then
+ * resends stateless for the session) and forward nothing; log the first per session.
+ */
+function refuseThreadRequest(req, res, opts, state, body, rec) {
+    const thread = requestThreadType(body);
+    if (thread === undefined)
+        return false;
+    rec.turnType = "thread-refused";
+    rec.forwardedBytes = 0;
+    if (typeof body.model === "string")
+        rec.model = body.model;
+    const sessionId = requestSessionId(req);
+    if (state.threadRefusals.first(sessionId)) {
+        opts.reqlog?.log({ kind: "thread-refused", sessionTag: sessionTag(sessionId), thread,
+            model: rec.model, lane: agentAttributionId(req) ? "agent" : "main" });
+    }
+    if (!res.headersSent) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(threadUnsupportedBody());
+    }
+    return true;
+}
 /** What this request uploaded to Anthropic, for the session's heavy-request notice. */
 function noteForwardedSize(state, rec, sessionId) {
     const bytes = rec.forwardedBytes ?? 0;
@@ -5391,8 +5461,9 @@ async function recoverLateCount(args) {
     let generation;
     try {
         const { body, msgsForMemtree: messages } = args;
-        const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit).tokens;
-        const target = args.target ?? lateRecoveryTarget(compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req)), budget), budget, args.rideTokens);
+        const lane = args.rec.routeLane;
+        const budget = resolveBudget(args.opts, args.state, body.model, args.modelContextLimit, lane).tokens;
+        const target = args.target ?? lateRecoveryTarget(compactionTarget(compactionMode(args.opts, args.state, requestSessionId(args.req), lane), budget), budget, args.rideTokens);
         const sessionId = requestSessionId(args.req);
         const linkSeq = args.route.lane === "main" ? nextMemtreeCallSeq(args.state) : undefined;
         const replaces = sessionId !== undefined
@@ -5904,6 +5975,64 @@ function noteLaneActivity(state, rec, sessionId) {
         return;
     state.heavyNotice = state.notices.queueSuffix(heavyRequestNoticeText(heavy), () => state.laneActivity.markWarned(sessionId), prompt.promptId);
 }
+/**
+ * `CCC_COMPRESS_ON_COLD_CACHE=1`: record whether this conversation request's lane has sent
+ * nothing upstream for longer than its cache TTL (rec.coldCache), and stamp the lane's clock
+ * when this request goes out (forwardAccepted). An away recap riding the main thread's
+ * prefix warms the main lane's cache too (noteAwayWarmsMain).
+ */
+function noteLaneCache(opts, state, rec, routeKey, body, notConversation) {
+    if (opts.compressOnColdCache !== true || notConversation)
+        return;
+    const clock = state.laneCacheClock;
+    const gap = clock.gap(routeKey);
+    const sample = coldCacheSample(gap?.gapMs, body);
+    if (sample)
+        rec.coldCache = sample;
+    if (sample?.cold && gap)
+        coldGaps.set(rec, { lane: routeKey, basis: gap.basis });
+    laneSendStamps.set(rec, () => clock.sent(routeKey));
+}
+/**
+ * An away recap sent on the main thread's prefix (`forkBody`, as delivery sent it, not a
+ * replacement late recovery chose) also refreshes the main lane's cache.
+ */
+function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
+    const stamp = laneSendStamps.get(rec);
+    if (!stamp)
+        return;
+    const main = JSON.stringify([sessionId ?? "", "main"]);
+    laneSendStamps.set(rec, (sent) => {
+        stamp(sent);
+        if (sent === forkBody)
+            state.laneCacheClock.sent(main);
+    });
+}
+/** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
+const laneSendStamps = new WeakMap();
+/** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
+const coldGaps = new WeakMap();
+/** Requests that claimed their cold gap (a re-plan of the same request keeps it). */
+const coldClaims = new WeakSet();
+/**
+ * Whether this turn compresses because its lane's cache went cold (noteLaneCache) while it
+ * sits above the target by a calibrated size: the next request rewrites the whole context
+ * anyway, so it may as well rewrite the target's worth. A bare target, like a
+ * `/memtree-compact`, never on an uncalibrated byte guess, and at most once per cold gap:
+ * a failed or refused attempt's retries plan as usual until the lane sends again.
+ */
+function coldCacheCompress(state, rec, size, targetTokens) {
+    if (rec.coldCache?.cold !== true || size.source !== "reported" ||
+        !coldCacheWorthCompressing(size.tokens, targetTokens))
+        return false;
+    if (coldClaims.has(rec))
+        return true;
+    const gap = coldGaps.get(rec);
+    if (!gap || !state.laneCacheClock.claim(gap.lane, gap.basis))
+        return false;
+    coldClaims.add(rec);
+    return true;
+}
 /** Whether a notice other than the heavy-request one (the lowest priority) waits. */
 function otherNoticePending(state, promptId) {
     return state.notices.hasPending(promptId) && !state.notices.pendingIs(state.heavyNotice);
@@ -6004,7 +6133,10 @@ function reachedBudget(compaction) {
  * (degradedNotices), since a plan can undercount.
  */
 function compressionNeeded(compaction) {
-    if (compaction === undefined || compaction.reason !== undefined)
+    if (compaction === undefined)
+        return true;
+    // A cold-cache compression is optional: under the budget, whole is the normal outcome.
+    if (compaction.reason !== undefined && compaction.reason !== "cold-cache")
         return true;
     if (compaction.estimatedTokens === undefined)
         return true;
@@ -6177,6 +6309,8 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             cancelForShutdown();
             return;
         }
+        if (rec)
+            laneSendStamps.get(rec)?.(bodyBuffer);
         upstreamReq = upstream.module.request({
             host: upstream.host,
             port: upstream.port,

@@ -24,6 +24,7 @@ import { getConfigDir } from "./config.js";
 import type { ClaudeCodeRequestInfo, NotConversationKind, TranscriptShape } from "./cc-request.js";
 import type { ClaudeAuthType, UpstreamErrorCode } from "./claude-auth.js";
 import type { RateLimitInfo } from "./rate-limit.js";
+import type { ThreadRefusedRecord } from "./thread-backstop.js";
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024; // rotate above ~20MB at startup
 const APPROX_CHARS_PER_TOKEN = 4;
@@ -84,6 +85,11 @@ export type TurnType =
    * whole history did not fit, so Claude Code retries it (route-fallback.ts).
    */
   | "followup-refused"
+  /**
+   * A request carrying Claude Code's message `thread` while threads are off: ccc answered
+   * its own 400 thread_unsupported_request and forwarded nothing (thread-backstop.ts).
+   */
+  | "thread-refused"
   /**
    * A fork of the main conversation (the away recap) rode the main thread's
    * last compressed prefix: same bytes the main thread sent, so Anthropic's
@@ -243,6 +249,14 @@ export interface MessagesRecord {
    * when evaluating recovery behaviour after the fact.
    */
   routeLane?: "main" | "away" | "agent";
+  /**
+   * `CCC_COMPRESS_ON_COLD_CACHE=1` only: the time since this lane's previous request and the
+   * TTL of the request's shortest cache_control marker (5 min unless "1h"); `cold` when the
+   * gap passed it, so the lane's prompt cache had expired (cold-cache.ts). Sampled on arrival:
+   * a forced cold compression is `compaction.reason: "cold-cache"`, not `cold` alone (another
+   * request of the lane may have warmed it, or the size was under the target).
+   */
+  coldCache?: { gapMs: number; ttlMs: number; cold: boolean };
   /**
    * Tool turns that missed their lane's route: "missing" (empty lane),
    * "rejected" (a route was present in this lane but unusable for this
@@ -478,7 +492,12 @@ export type RecompressReason =
   /** `/memtree-compact [N]` asked for a compaction now. */
   | "manual"
   /** The session's target or context window changed since the prefix was built. */
-  | "target-change";
+  | "target-change"
+  /**
+   * `CCC_COMPRESS_ON_COLD_CACHE=1`: the lane's prompt cache expired while it was above its
+   * target, so it compressed to the target before the whole context is written again.
+   */
+  | "cold-cache";
 
 export interface CompactionRecord {
   /** "off" after `/memtree-compact off`; "explicit" for an N or CCC_COMPACT_TARGET. */
@@ -488,9 +507,10 @@ export interface CompactionRecord {
   /**
    * Where the budget came from: CCC_BUDGET_TOKENS ("override"), the
    * server's `model_budget_tokens` ("server"), or fallbackBudgetTokens
-   * (proxy.ts: a share of the context window) until the server reports one.
+   * (proxy.ts: a share of the context window) until the server reports one;
+   * on a subagent lane, CCC_AGENT_BUDGET_TOKENS ("agent") when set.
    */
-  budgetSource: "override" | "server" | "window-ratio";
+  budgetSource: "override" | "server" | "window-ratio" | "agent";
   /** What a compaction on this turn aims at (budget/2, or the explicit N). */
   targetTokens?: number;
   /** Sent as compression_threshold_tokens (servers that report a budget). */
@@ -595,7 +615,7 @@ export interface NoticeRecord {
   via: "MessageDisplay" | "Stop";
 }
 
-export type RequestRecord = MessagesRecord | MemtreeRecord | NoticeRecord;
+export type RequestRecord = MessagesRecord | MemtreeRecord | NoticeRecord | ThreadRefusedRecord;
 
 /** Structural logging seam retained for embedders and focused tests. */
 export interface RequestLogSink {
