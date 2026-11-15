@@ -1604,15 +1604,15 @@ export class MemtreeClient {
    * A compress call (or the final index) is sending `messages`: the server stores every
    * request it gets, even one it refuses (an index-pending 413), and a call that fails in
    * transport may have arrived too, so `messages` is the lane's newest stored history from
-   * now on (indexLanesCarried). A held-back or waiting history it carries is dropped, or
+   * now on (indexLanesCarried), on whatever branch. A held-back or waiting history it carries is dropped, or
    * its later upload would be an older request the page reads as the newest (Codex r1-r5).
    * If the call never arrived, nothing is lost: the next turn's index holds again and
    * carries it, and the final index carries everything. A final index still waiting goes.
    */
   private retireHeldBy(sessionId: string | undefined, messages: Message[]): void {
     const lane = indexLaneKey(sessionId, messages);
-    const carried = this.indexLanesCarried.get(lane);
-    if (!carried || extendsHistory(messages, carried)) this.noteCarried(lane, messages);
+    // The newest request sent is the newest stored, on whatever branch (a rewind too).
+    this.noteCarried(lane, messages);
     if (this.carriedByUpload(lane, this.indexLanesHeld.get(lane))) {
       this.indexLanesHeld.delete(lane);
       this.clearHoldTimer(lane);

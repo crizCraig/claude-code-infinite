@@ -932,6 +932,34 @@ test("a final index that carries a held history retires it", async () => {
   }
 });
 
+test("after a rewind, a compress call on the new branch still retires the held history it carries", async () => {
+  // Opus r6 P2: the mark stayed on the abandoned, longer branch.
+  const fixture = await memtreeFixture({ result: (body) => body.index_only
+    ? { messages: [], index_only: true } : RESULT });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexHoldMaxMs: 100 });
+    const root = [{ role: "user", content: "x".repeat(50_000) }];
+    const send = (messages) =>
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    const compress = (messages) => client.compress(MemtreeClient.hashMessages(messages), messages,
+      100, undefined, { sessionId: "s" });
+    send(root);
+    await waitFor(() => fixture.calls.length === 1);
+    const old = [...root, { role: "assistant", content: "a" }, { role: "user", content: "old" },
+      { role: "assistant", content: "b" }, { role: "user", content: "branch" }];
+    await compress(old); // the mark: the old branch
+    const held = [...root, { role: "assistant", content: "c" }, { role: "user", content: "new" }];
+    send(held); // the rewound branch: held back
+    await compress([...held, { role: "assistant", content: "d" }, { role: "user", content: "e" }]);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(fixture.calls.filter((c) => c.index_only).length, 1,
+      "the held history the newer compress call carried is not sent after it");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
   assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);
