@@ -616,8 +616,9 @@ export declare class MemtreeClient {
      */
     private startHoldTimer;
     /**
-     * `job` only repeats the history its conversation last sent (a retried request): its
-     * upload would store nothing new, so the hold limit drops it (review r2 P3).
+     * The history its conversation last sent already carries `job` (a retried request, or
+     * one given back after a failed call while a newer upload went): its upload would store
+     * nothing new, or an older request than the newest, so the hold limit drops it.
      */
     private addsNothing;
     /**
@@ -627,6 +628,11 @@ export declare class MemtreeClient {
      * body stores other messages, so it retires nothing.
      */
     private retireHeldBy;
+    /**
+     * The call that retired these never reached the server (Codex r4 P1): they go as before,
+     * unless something newer has taken their place since.
+     */
+    private restoreRetired;
     private clearHoldTimer;
     /**
      * Whether `job` adds under INDEX_MIN_NEW_CHARS of text to the history its conversation

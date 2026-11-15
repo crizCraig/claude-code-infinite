@@ -1286,13 +1286,14 @@ export class MemtreeClient {
         this.indexHoldTimers.set(lane, timer);
     }
     /**
-     * `job` only repeats the history its conversation last sent (a retried request): its
-     * upload would store nothing new, so the hold limit drops it (review r2 P3).
+     * The history its conversation last sent already carries `job` (a retried request, or
+     * one given back after a failed call while a newer upload went): its upload would store
+     * nothing new, or an older request than the newest, so the hold limit drops it.
      */
     addsNothing(lane, job) {
         const sent = this.indexLanesPending.get(lane) ?? this.indexLanesSent.get(lane);
-        return sent !== undefined && job.messages.length === sent.messages.length &&
-            extendsHistory(job.messages, sent.messages) && !losesMedia(sent.messages, job.messages);
+        return sent !== undefined && extendsHistory(sent.messages, job.messages) &&
+            !losesMedia(job.messages, sent.messages);
     }
     /**
      * A compress call is sending `messages` (the server stores every request it gets, even
@@ -1304,15 +1305,34 @@ export class MemtreeClient {
         const lane = indexLaneKey(sessionId, messages);
         const carries = (job) => job !== undefined &&
             extendsHistory(messages, job.messages) && !losesMedia(job.messages, messages);
-        if (carries(this.indexLanesHeld.get(lane))) {
+        const retired = { lane };
+        const held = this.indexLanesHeld.get(lane);
+        if (carries(held)) {
             this.indexLanesHeld.delete(lane);
             this.clearHoldTimer(lane);
+            retired.held = held;
         }
         // One waiting behind an upload in flight too (the server indexes a compress request
         // like an index-only one, so nothing is lost; review r4). A final index still goes.
         const waiting = this.indexLanesNext.get(lane);
-        if (carries(waiting) && !waiting.opts.finalIndex)
+        if (carries(waiting) && !waiting.opts.finalIndex) {
             this.indexLanesNext.delete(lane);
+            retired.waiting = waiting;
+        }
+        return retired;
+    }
+    /**
+     * The call that retired these never reached the server (Codex r4 P1): they go as before,
+     * unless something newer has taken their place since.
+     */
+    restoreRetired({ lane, held, waiting }) {
+        if (this.backgroundClosing)
+            return;
+        if (waiting && !this.indexLanesNext.has(lane))
+            this.enqueueIndex(lane, waiting);
+        if (held && !this.indexLanesHeld.has(lane) && !this.addsNothing(lane, held)) {
+            this.holdIndex(lane, held);
+        }
     }
     clearHoldTimer(lane) {
         const timer = this.indexHoldTimers.get(lane);
@@ -1751,12 +1771,12 @@ export class MemtreeClient {
         opts.signal?.addEventListener("abort", abort, { once: true });
         if (opts.signal?.aborted)
             abort();
-        // Sent, this compress call is stored as the conversation's newest request whatever it
-        // answers (polychat stores a refused 413 too): an older held history it carries must
-        // not follow it (Codex r2/r3 P1). If it never arrives, the next turn holds again.
-        if (!opts.indexOnly && planned.limit?.action !== "trimmed" && !controller.signal.aborted) {
-            this.retireHeldBy(opts.sessionId, messages);
-        }
+        // Sent, this compress call (or a final index) is stored as the conversation's newest
+        // request whatever it answers (polychat stores a refused 413 too): an older held history
+        // it carries must not follow it (Codex r2-r4). One that never reaches the server gives
+        // it back (restoreRetired).
+        const retired = (!opts.indexOnly || opts.finalIndex) && planned.limit?.action !== "trimmed" &&
+            !controller.signal.aborted ? this.retireHeldBy(opts.sessionId, messages) : undefined;
         try {
             const response = await this.postRetryingDrop(payload, { ...opts, features }, controller.signal)
                 .catch((err) => {
@@ -1764,6 +1784,8 @@ export class MemtreeClient {
                 // the state by an answer, never set it.
                 if (!opts.indexOnly)
                     this.noteUnreachable(err);
+                if (retired)
+                    this.restoreRetired(retired);
                 throw err;
             });
             status = response.status;

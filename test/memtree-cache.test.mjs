@@ -860,6 +860,79 @@ test("a held history the timer queued behind a slow upload is retired by a compr
   }
 });
 
+test("a compress call that never reaches the server gives the held history back", async () => {
+  // Codex r4 P1: retired at send, a held history was lost when the compress call failed
+  // in transport; it must still reach the server (here: at the limit).
+  const calls = [];
+  let refuseCompress = true;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (!body.index_only && refuseCompress) { req.socket.destroy(); return; }
+      calls.push(body.index_only ? `index:${body.messages.length}` : `compress:${body.messages.length}`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true } : RESULT));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k", indexHoldMaxMs: 150 });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const index = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    index();
+    await waitFor(() => calls.length === 1);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
+    index(); // held back
+    const held = conv.length;
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "newer" });
+    const newer = conv.slice();
+    await client.compress(MemtreeClient.hashMessages(newer), newer, 100, undefined,
+      { sessionId: "s" }).catch(() => null);
+    await waitFor(() => calls.length === 2, 1_500);
+    assert.deepEqual(calls, ["index:1", `index:${held}`], "the held history still goes");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    refuseCompress = false;
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a final index that carries a held history retires it", async () => {
+  // Codex r4 P2: with a hold limit longer than the idle final index, the held, older
+  // history went after the final one.
+  const fixture = await memtreeFixture({ result: () => ({ messages: [], index_only: true }) });
+  try {
+    const client = new MemtreeClient({ baseUrl: fixture.origin, apiKey: "k", indexHoldMaxMs: 120 });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const index = (opts) => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s",
+        undefined, undefined, opts);
+    };
+    index();
+    await waitFor(() => fixture.calls.length === 1);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
+    index(); // held back
+    conv.push({ role: "assistant", content: "the end" });
+    // The idle final index goes straight out (scheduleFinalIndex), not through the lane.
+    const final = conv.slice();
+    await client.submitIndexOnly(final, 100, { sessionId: "s", finalIndex: true });
+    await waitFor(() => fixture.calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(fixture.calls.length, 2, "no older history after the final index");
+    assert.equal(fixture.calls[1].final_index, true);
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
   assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);
