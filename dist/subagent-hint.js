@@ -15,6 +15,7 @@
  * when the server named the parent's newest tree: a parent without one has
  * little to re-derive.
  */
+import { hybridSearchOn } from "./memtree-finder.js";
 import { SESSION_ID } from "./memtree-newest.js";
 /** The server's tree refs (`<uuid>-v1-own`). */
 const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
@@ -24,10 +25,15 @@ const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
  */
 export class SubagentMemoryHint {
     style;
+    hybrid;
     disabled = false;
-    /** The SubagentStart wording (PARENT_TREE_ENV); the shipped hint unless switched. */
-    constructor(style = "shipped") {
+    /**
+     * The SubagentStart wording (PARENT_TREE_ENV; the shipped hint unless switched), and
+     * whether this process's search defaults to hybrid (the note says so only then).
+     */
+    constructor(style = "shipped", hybrid = true) {
         this.style = style;
+        this.hybrid = hybrid;
     }
     disable() {
         this.disabled = true;
@@ -45,7 +51,19 @@ export class SubagentMemoryHint {
 export function subagentHintFor(s) {
     if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff)
         return undefined;
-    return new SubagentMemoryHint(parentTreeStyleFromEnv(s.env ?? {}));
+    const env = s.env ?? {};
+    return new SubagentMemoryHint(styleForTools(parentTreeStyleFromEnv(env), s.tools), hybridSearchOn(env));
+}
+/**
+ * The style the session's tools allow: every note names read_lines (else the shipped
+ * hint, which names only search), and `outline` read_node too (else the pointer).
+ */
+export function styleForTools(style, tools) {
+    if (style === "shipped" || style === "none")
+        return style;
+    if (!tools.includes("read_lines"))
+        return "shipped";
+    return style === "outline" && !tools.includes("read_node") ? "pointer" : style;
 }
 /**
  * `CCC_SUBAGENT_PARENT_TREE`: how a subagent is told about its parent's MemTree (off by
@@ -73,12 +91,12 @@ export function parentTreeStyleFromEnv(env) {
  * The hint for a subagent of `sessionId` in `style`, or undefined when either id looks
  * wrong or the style says nothing.
  */
-export function subagentMemoryHintText(sessionId, treeRef, style = "shipped") {
+export function subagentMemoryHintText(sessionId, treeRef, style = "shipped", hybrid = true) {
     if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef) || style === "none") {
         return undefined;
     }
     if (style !== "shipped")
-        return parentTreeNote(sessionId, treeRef, style);
+        return parentTreeNote(sessionId, treeRef, style, hybrid);
     return (`ccc: You are a subagent of session ${sessionId}, whose memory is MemTree tree ` +
         `${treeRef}; your own work is indexed too. Before re-deriving earlier decisions, ` +
         "findings or commands from the parent's work, search its memory: mcp__memtree__search " +
@@ -92,21 +110,23 @@ export function subagentMemoryHintText(sessionId, treeRef, style = "shipped") {
  * the start is named too. Same account only: the ref came from this key's own sessions,
  * and the tools read with the same key. Then how to use it, per style.
  */
-function parentTreeNote(sessionId, treeRef, style) {
+function parentTreeNote(sessionId, treeRef, style, hybrid) {
     const tree = `"tree": "${sessionId}"`;
     const pointer = `ccc: You are a subagent of session ${sessionId}. What it read, ran, found and decided ` +
         `before delegating to you is in its MemTree (tree ${treeRef} at your start): pass ` +
-        `${tree} to the mcp__memtree__ tools for its newest tree. search finds things (hybrid ` +
-        "by default); read_lines on a hit gives the exact lines (summaries drop values); " +
+        `${tree} to the mcp__memtree__ tools for its newest tree. search finds things` +
+        `${hybrid ? " (hybrid by default)" : ""}; read_lines on a hit (its address, or its ` +
+        "tree ref and range) gives the exact lines (summaries drop values); " +
         `read_lines {${tree}, "tail": true} reads its newest messages, which no tree covers yet.`;
     return pointer + (PARENT_TREE_ADVICE[style] ?? "").replaceAll("@TREE@", tree);
 }
 /** What each style adds to the pointer (`@TREE@`: the tree argument). */
 const PARENT_TREE_ADVICE = {
-    "search-first": " Search there before reading files or logs the parent may already have read; read " +
-        "one yourself only for what its memory lacks, or to edit it.",
+    "search-first": " Search there for what the parent already read, found or ran before re-deriving it or " +
+        "re-reading its logs; memory shows files as they were then, so read a file yourself for " +
+        "its current contents or to edit it.",
     example: " For example: search {@TREE@, \"query\": \"<an id, file or error from your task>\"}, " +
-        "then read_lines {\"node\": \"<the hit's address>\"} for its exact lines.",
+        "then read_lines on the best hit for its exact lines.",
     outline: " Start with read_node {@TREE@, \"id\": 0}: the parent's outline; its children lead " +
         "to what it covered.",
 };

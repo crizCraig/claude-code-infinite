@@ -17,6 +17,7 @@
  */
 
 import type { KeyCheck } from "./key-status.js";
+import { hybridSearchOn } from "./memtree-finder.js";
 import { SESSION_ID } from "./memtree-newest.js";
 
 /** The server's tree refs (`<uuid>-v1-own`). */
@@ -29,8 +30,11 @@ const TREE_REF = /^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/;
 export class SubagentMemoryHint {
   private disabled = false;
 
-  /** The SubagentStart wording (PARENT_TREE_ENV); the shipped hint unless switched. */
-  constructor(readonly style: ParentTreeStyle = "shipped") {}
+  /**
+   * The SubagentStart wording (PARENT_TREE_ENV; the shipped hint unless switched), and
+   * whether this process's search defaults to hybrid (the note says so only then).
+   */
+  constructor(readonly style: ParentTreeStyle = "shipped", readonly hybrid = true) {}
 
   disable(): void {
     this.disabled = true;
@@ -54,7 +58,19 @@ export function subagentHintFor(s: {
   env?: NodeJS.ProcessEnv;
 }): SubagentMemoryHint | undefined {
   if (!s.tools.includes("search") || s.keyCheck === "invalid" || s.memtreeOff) return undefined;
-  return new SubagentMemoryHint(parentTreeStyleFromEnv(s.env ?? {}));
+  const env = s.env ?? {};
+  return new SubagentMemoryHint(
+    styleForTools(parentTreeStyleFromEnv(env), s.tools), hybridSearchOn(env));
+}
+
+/**
+ * The style the session's tools allow: every note names read_lines (else the shipped
+ * hint, which names only search), and `outline` read_node too (else the pointer).
+ */
+export function styleForTools(style: ParentTreeStyle, tools: readonly string[]): ParentTreeStyle {
+  if (style === "shipped" || style === "none") return style;
+  if (!tools.includes("read_lines")) return "shipped";
+  return style === "outline" && !tools.includes("read_node") ? "pointer" : style;
 }
 
 /**
@@ -90,12 +106,13 @@ export function parentTreeStyleFromEnv(env: NodeJS.ProcessEnv): ParentTreeStyle 
 export function subagentMemoryHintText(
   sessionId: string,
   treeRef: string,
-  style: ParentTreeStyle = "shipped"
+  style: ParentTreeStyle = "shipped",
+  hybrid = true
 ): string | undefined {
   if (!SESSION_ID.test(sessionId) || !TREE_REF.test(treeRef) || style === "none") {
     return undefined;
   }
-  if (style !== "shipped") return parentTreeNote(sessionId, treeRef, style);
+  if (style !== "shipped") return parentTreeNote(sessionId, treeRef, style, hybrid);
   return (
     `ccc: You are a subagent of session ${sessionId}, whose memory is MemTree tree ` +
     `${treeRef}; your own work is indexed too. Before re-deriving earlier decisions, ` +
@@ -112,13 +129,19 @@ export function subagentMemoryHintText(
  * the start is named too. Same account only: the ref came from this key's own sessions,
  * and the tools read with the same key. Then how to use it, per style.
  */
-function parentTreeNote(sessionId: string, treeRef: string, style: ParentTreeStyle): string {
+function parentTreeNote(
+  sessionId: string,
+  treeRef: string,
+  style: ParentTreeStyle,
+  hybrid: boolean
+): string {
   const tree = `"tree": "${sessionId}"`;
   const pointer =
     `ccc: You are a subagent of session ${sessionId}. What it read, ran, found and decided ` +
     `before delegating to you is in its MemTree (tree ${treeRef} at your start): pass ` +
-    `${tree} to the mcp__memtree__ tools for its newest tree. search finds things (hybrid ` +
-    "by default); read_lines on a hit gives the exact lines (summaries drop values); " +
+    `${tree} to the mcp__memtree__ tools for its newest tree. search finds things` +
+    `${hybrid ? " (hybrid by default)" : ""}; read_lines on a hit (its address, or its ` +
+    "tree ref and range) gives the exact lines (summaries drop values); " +
     `read_lines {${tree}, "tail": true} reads its newest messages, which no tree covers yet.`;
   return pointer + (PARENT_TREE_ADVICE[style] ?? "").replaceAll("@TREE@", tree);
 }
@@ -126,11 +149,12 @@ function parentTreeNote(sessionId: string, treeRef: string, style: ParentTreeSty
 /** What each style adds to the pointer (`@TREE@`: the tree argument). */
 const PARENT_TREE_ADVICE: Partial<Record<ParentTreeStyle, string>> = {
   "search-first":
-    " Search there before reading files or logs the parent may already have read; read " +
-    "one yourself only for what its memory lacks, or to edit it.",
+    " Search there for what the parent already read, found or ran before re-deriving it or " +
+    "re-reading its logs; memory shows files as they were then, so read a file yourself for " +
+    "its current contents or to edit it.",
   example:
     " For example: search {@TREE@, \"query\": \"<an id, file or error from your task>\"}, " +
-    "then read_lines {\"node\": \"<the hit's address>\"} for its exact lines.",
+    "then read_lines on the best hit for its exact lines.",
   outline:
     " Start with read_node {@TREE@, \"id\": 0}: the parent's outline; its children lead " +
     "to what it covered.",

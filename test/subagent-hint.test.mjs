@@ -28,6 +28,7 @@ import {
   PARENT_TREE_STYLES,
   parentTreeStyleFromEnv,
   postToolUseOutput,
+  styleForTools,
   SUBAGENT_RESULT_HINT,
   SubagentMemoryHint,
   subagentHintFor,
@@ -65,10 +66,28 @@ test("CCC_SUBAGENT_PARENT_TREE picks the note's style; off (the shipped hint) by
   for (const name of PARENT_TREE_STYLES) assert.equal(style(name), name);
   assert.notEqual(PARENT_TREE_DEFAULT_STYLE, "shipped");
   assert.notEqual(PARENT_TREE_DEFAULT_STYLE, "none");
-  const tools = ["search"];
+  const tools = ["search", "read_lines", "read_node"];
   assert.equal(subagentHintFor({ tools, keyCheck: null, memtreeOff: false }).style, "shipped");
+  const hint = subagentHintFor({ tools, keyCheck: null, memtreeOff: false,
+    env: { CCC_SUBAGENT_PARENT_TREE: "outline" } });
+  assert.equal(hint.style, "outline");
+  assert.equal(hint.hybrid, true);
   assert.equal(subagentHintFor({ tools, keyCheck: null, memtreeOff: false,
-    env: { CCC_SUBAGENT_PARENT_TREE: "outline" } }).style, "outline");
+    env: { CCC_SUBAGENT_PARENT_TREE: "1", CCC_MEMTREE_HYBRID_SEARCH: "0" } }).hybrid, false);
+});
+
+test("a note names only tools the session has: else the shipped hint, or the pointer", () => {
+  const all = ["search", "read_lines", "read_node"];
+  for (const style of ["pointer", "search-first", "example", "outline"]) {
+    assert.equal(styleForTools(style, all), style);
+    assert.equal(styleForTools(style, ["search", "read_node"]), "shipped", `${style}: no read_lines`);
+  }
+  assert.equal(styleForTools("outline", ["search", "read_lines"]), "pointer", "no read_node");
+  assert.equal(styleForTools("shipped", ["search"]), "shipped");
+  assert.equal(styleForTools("none", ["search"]), "none");
+  assert.equal(subagentHintFor({ tools: ["search", "read_node"], keyCheck: null,
+    memtreeOff: false, env: { CCC_SUBAGENT_PARENT_TREE: "1" } }).style, "shipped",
+    "--disallowedTools=mcp__memtree__read_lines");
 });
 
 test("the parent-tree notes name the session as the tree, the start tree, and how to read it", () => {
@@ -80,11 +99,14 @@ test("the parent-tree notes name the session as the tree, the start tree, and ho
     assert.ok(note.startsWith(`ccc: You are a subagent of session ${SESSION}.`), style);
     assert.ok(note.includes(`"tree": "${SESSION}"`), `${style}: the stable session id`);
     assert.ok(note.includes(`tree ${REF} at your start`), style);
-    assert.match(note, /search finds things \(hybrid by default\)/, style);
-    assert.match(note, /read_lines on a hit gives the exact lines/, style);
+    assert.match(note, /search finds things \(hybrid by default\);/, style);
+    assert.match(note, /read_lines on a hit \(its address, or its tree ref and range\) gives/, style);
+    const text = subagentMemoryHintText(SESSION, REF, style, false);
+    assert.ok(!text.includes("hybrid"), `${style}: no hybrid claim when search defaults to text`);
+    assert.match(text, /search finds things; read_lines/, style);
     assert.ok(note.includes(`read_lines {"tree": "${SESSION}", "tail": true}`), style);
     assert.ok(!note.includes("@TREE@"), style);
-    assert.ok(note.length < 800, `${style}: short, once per subagent (${note.length})`);
+    assert.ok(note.length < 900, `${style}: short, once per subagent (${note.length})`);
     assert.equal(subagentMemoryHintText(SESSION, REF, style), note, `${style}: same bytes`);
     assert.equal(subagentMemoryHintText("bad id\n", REF, style), undefined);
     assert.equal(subagentMemoryHintText(SESSION, "ref with spaces", style), undefined);
@@ -92,7 +114,9 @@ test("the parent-tree notes name the session as the tree, the start tree, and ho
   const [pointer, searchFirst, example, outline] = notes.map(([, note]) => note);
   assert.ok(searchFirst.startsWith(pointer) && example.startsWith(pointer) &&
     outline.startsWith(pointer), "each style is the pointer plus its advice");
-  assert.match(searchFirst, /before reading files or logs/);
+  assert.match(searchFirst, /before re-deriving it or re-reading its logs/);
+  assert.match(searchFirst, /read a file yourself for its current contents/,
+    "memory shows files as they were: never steer a subagent away from current code");
   assert.ok(example.includes(`search {"tree": "${SESSION}", "query": `));
   assert.ok(outline.includes(`read_node {"tree": "${SESSION}", "id": 0}`));
 });
@@ -282,6 +306,13 @@ test("proxy: CCC_SUBAGENT_PARENT_TREE's note replaces the hint; none says nothin
     assert.deepEqual(await subagentStart(on),
       subagentStartOutput(subagentMemoryHintText(SESSION, REF, "search-first")));
   } finally { on.close(); }
+  const text = await harness({ hint: new SubagentMemoryHint("pointer", false) });
+  try {
+    await turn(text);
+    assert.deepEqual(await subagentStart(text),
+      subagentStartOutput(subagentMemoryHintText(SESSION, REF, "pointer", false)),
+      "search opted out of hybrid: the note says nothing about hybrid");
+  } finally { text.close(); }
   const none = await harness({ hint: new SubagentMemoryHint("none") });
   try {
     await turn(none);

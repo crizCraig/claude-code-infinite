@@ -22,9 +22,13 @@ import type { KeyCheck } from "./key-status.js";
  */
 export declare class SubagentMemoryHint {
     readonly style: ParentTreeStyle;
+    readonly hybrid: boolean;
     private disabled;
-    /** The SubagentStart wording (PARENT_TREE_ENV); the shipped hint unless switched. */
-    constructor(style?: ParentTreeStyle);
+    /**
+     * The SubagentStart wording (PARENT_TREE_ENV; the shipped hint unless switched), and
+     * whether this process's search defaults to hybrid (the note says so only then).
+     */
+    constructor(style?: ParentTreeStyle, hybrid?: boolean);
     disable(): void;
     get enabled(): boolean;
 }
@@ -40,6 +44,11 @@ export declare function subagentHintFor(s: {
     memtreeOff: boolean;
     env?: NodeJS.ProcessEnv;
 }): SubagentMemoryHint | undefined;
+/**
+ * The style the session's tools allow: every note names read_lines (else the shipped
+ * hint, which names only search), and `outline` read_node too (else the pointer).
+ */
+export declare function styleForTools(style: ParentTreeStyle, tools: readonly string[]): ParentTreeStyle;
 /**
  * `CCC_SUBAGENT_PARENT_TREE`: how a subagent is told about its parent's MemTree (off by
  * default). Unset, `0` or `off`: the shipped one-line hint. `1` or `on`: the default note
@@ -59,7 +68,7 @@ export declare function parentTreeStyleFromEnv(env: NodeJS.ProcessEnv): ParentTr
  * The hint for a subagent of `sessionId` in `style`, or undefined when either id looks
  * wrong or the style says nothing.
  */
-export declare function subagentMemoryHintText(sessionId: string, treeRef: string, style?: ParentTreeStyle): string | undefined;
+export declare function subagentMemoryHintText(sessionId: string, treeRef: string, style?: ParentTreeStyle, hybrid?: boolean): string | undefined;
 /**
  * Said to the parent after each Agent/Task call: a subagent's result (returned now, or
  * as a notification when it was launched in the background, which `-p` runs mostly

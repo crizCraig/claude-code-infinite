@@ -2682,7 +2682,7 @@ async function subagentHintContext(state, sessionId) {
         // MemTree may have paused or failed while the lookup was on its way.
         if (!tree || !state.subagentHint.enabled || !memtreeWorking(state))
             return undefined;
-        return subagentMemoryHintText(sessionId, tree.key, state.subagentHint.style);
+        return subagentMemoryHintText(sessionId, tree.key, state.subagentHint.style, state.subagentHint.hybrid);
     }
     catch {
         return undefined;
