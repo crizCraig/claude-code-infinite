@@ -5,8 +5,13 @@ import { stripSystemReminderText } from "./turns.js";
 const hashCaches = new Map();
 /** Each message's tool input JSON strings (jsonStringFields), computed once. */
 const jsonFieldCache = new WeakMap();
+/** Each message's mediaSlots, per identity kind, computed once. */
+const mediaSlotCaches = { route: new WeakMap(), stable: new WeakMap() };
+/** Each media block's digest, computed once (Codex r2). */
+const mediaDigestCache = new WeakMap();
 const EXACT = { media: "keep" };
 const MEDIA_FREE = { media: "drop" };
+const MEDIA_SLOTS = { media: "slot" };
 /** Hash each incoming message once, then reuse it across route candidates/checks. */
 export function routeMessageHash(message) {
     return messageHash(message, false, EXACT);
@@ -23,27 +28,35 @@ export function prefixIdentity(messages, kind) {
         originalMediaFreeHashes: messages.map((m) => mediaFreeHash(m, kind)),
         originalPortableHashes: messages.map((m) => portableIdentity(m, kind, "keep")),
         originalPortableMediaFreeHashes: messages.map((m) => portableIdentity(m, kind, "drop")),
+        originalMediaSlots: messages.map((m) => mediaSlots(m, kind)),
     };
 }
 /**
  * Whether `message` still stands where a prefix's message stood: unchanged, or the same
- * apart from media Claude Code evicted. Past its media caps (count, and bytes in 2.1.310)
- * Claude Code evicts the oldest images and documents from its history: a tool result's
- * becomes a placeholder, a top-level one is dropped, an emptied message becomes the
- * placeholder. That counts only when the message has no media left, so an attachment
- * replaced by another never matches; a removed one is indistinguishable from eviction.
+ * apart from media Claude Code evicted or put back. Past its media caps (count, and bytes
+ * in 2.1.310) Claude Code evicts the oldest images and documents from its history: a tool
+ * result's becomes a placeholder, a top-level one is dropped, an emptied message becomes
+ * the placeholder. A raised cap puts them back (2.1.325 on 2026-11-15: a flag took its byte
+ * cap from 24 to 56 MiB and a resume sent 91 evicted images again). With no media left it
+ * counts as eviction. With media left, only slot by slot against `storedSlots` (the stored
+ * message's mediaSlots): the same content around the same media slots, each slot now a
+ * placeholder (evicted), the stored media, or media where the stored message had a
+ * placeholder (put back). A top-level image Claude Code dropped left no slot, so putting
+ * it back does not match (the prefix is rebuilt); nor does media in a message whose
+ * stored form had no slot there, or one image replaced by another.
  * A newer Claude Code can also render the same history differently on resume (see
  * portableHash), with media kept or (no media left) evicted the same way.
  * Prefixes stored before media-free or portable hashes existed match exactly only.
  */
-export function prefixMessageMatches(message, kind, exact, mediaFree, portable, portableMediaFree) {
+export function prefixMessageMatches(message, kind, exact, mediaFree, portable, portableMediaFree, storedSlots) {
     const hash = kind === "stable" ? stablePrefixMessageHash(message) : routeMessageHash(message);
     if (hash === exact)
         return true;
     if (portable !== undefined && portableMatches(message, kind, "keep", portable))
         return true;
-    if (carriesMedia(message.content))
-        return false;
+    if (carriesMedia(message.content)) {
+        return storedSlots !== undefined && slotsEvictedOrPutBack(mediaSlots(message, kind), storedSlots);
+    }
     return (mediaFree !== undefined && mediaFreeHash(message, kind) === mediaFree) ||
         (portableMediaFree !== undefined &&
             portableMatches(message, kind, "drop", portableMediaFree));
@@ -58,7 +71,8 @@ export function prefixMessageMatches(message, kind, exact, mediaFree, portable, 
 export function extendsHistory(newer, older) {
     const a = newer.filter((message) => message.role !== "system");
     const b = older.filter((message) => message.role !== "system");
-    return a.length >= b.length && b.every((message, i) => prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message)));
+    return a.length >= b.length && b.every((message, i) => routeMessageHash(a[i]) === routeMessageHash(message) ||
+        prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message), undefined, undefined, carriesMedia(a[i].content) ? mediaSlots(message, "route") : undefined));
 }
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
 export function mediaFreeMessageHash(message) {
@@ -66,6 +80,77 @@ export function mediaFreeMessageHash(message) {
 }
 function mediaFreeHash(message, kind) {
     return messageHash(message, kind === "stable" && stableShape(message), MEDIA_FREE);
+}
+/**
+ * Where a message's images, documents and Claude Code's placeholders for them sit, and what
+ * each one is: "" when it has none, else `<slot hash>|<entries>`. The slot hash is the
+ * message's identity with each of them replaced by the same slot marker (so it pins all
+ * other content, which tool result each slot is in and its place among the blocks); the
+ * entries, one per slot in order and comma-joined, are a media block's sha-256 or "" for a
+ * placeholder.
+ */
+export function mediaSlots(message, kind) {
+    const cache = mediaSlotCaches[kind];
+    const cached = cache.get(message);
+    if (cached !== undefined)
+        return cached;
+    const stable = kind === "stable" && stableShape(message);
+    const entries = [];
+    // From the blocks the slot hash is built from, so entry i is the hash's slot i (review r2).
+    collectSlots(normalizeReminders(hashedBlocks(message, stable)), entries);
+    const slots = entries.length === 0 ? ""
+        : `${messageHash(message, stable, MEDIA_SLOTS)}|${entries.join(",")}`;
+    cache.set(message, slots);
+    return slots;
+}
+/**
+ * Whether `current` is `stored` with media evicted or put back, slot by slot: the same slot
+ * hash, and each changed slot either now a placeholder (all of them) or now media where the
+ * stored message had a placeholder (all of them).
+ */
+function slotsEvictedOrPutBack(current, stored) {
+    if (!current || !stored)
+        return false;
+    const [currentHash, currentEntries] = splitSlots(current);
+    const [storedHash, storedEntries] = splitSlots(stored);
+    if (currentHash !== storedHash || currentEntries.length !== storedEntries.length)
+        return false;
+    // One way only: a cap moves one way at a time, and an eviction beside a put-back would
+    // let an image move between slots (Codex r1).
+    const changed = currentEntries.filter((entry, i) => entry !== storedEntries[i]);
+    const evicted = changed.every((entry) => entry === "");
+    return evicted || currentEntries.every((entry, i) => entry === storedEntries[i] ||
+        (storedEntries[i] === "" && entry !== ""));
+}
+/** A media block's sha-256, once per block object (shared by both identity kinds). */
+function mediaDigest(part) {
+    const cached = mediaDigestCache.get(part);
+    if (cached !== undefined)
+        return cached;
+    const hash = createHash("sha256");
+    updateCanonical(hash, stripBlockCache(part));
+    const digest = hash.digest("hex");
+    mediaDigestCache.set(part, digest);
+    return digest;
+}
+function splitSlots(slots) {
+    const bar = slots.indexOf("|");
+    return [slots.slice(0, bar), slots.slice(bar + 1).split(",")];
+}
+function collectSlots(content, out) {
+    if (!Array.isArray(content))
+        return;
+    for (const part of content) {
+        if (part?.type === "image" || part?.type === "document") {
+            out.push(mediaDigest(part));
+        }
+        else if (isMediaOrPlaceholder(part)) {
+            out.push("");
+        }
+        else if (part?.type === "tool_result") {
+            collectSlots(part.content, out);
+        }
+    }
 }
 /**
  * An identity that also ignores how Claude Code renders unchanged history, which differs
@@ -146,13 +231,9 @@ function messageHash(message, stable, mode) {
     const cached = cache.get(message);
     if (cached !== undefined)
         return cached;
-    let content = message.content;
-    if (stable && Array.isArray(content)) {
-        content = content.filter((part) => part?.type !== "thinking" && part?.type !== "redacted_thinking");
-    }
-    const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
-    const reminded = normalizeReminders(blocks);
-    const kept = mode.media === "drop" ? withoutMedia(reminded) : reminded;
+    const reminded = normalizeReminders(hashedBlocks(message, stable));
+    const kept = mode.media === "drop" ? withoutMedia(reminded)
+        : mode.media === "slot" ? withMediaSlots(reminded) : reminded;
     const normalized = {
         ...message,
         content: stripBlockCache(mode.portable ? withoutToolLoadedNotes(portableContent(kept)) : kept),
@@ -162,6 +243,14 @@ function messageHash(message, stable, mode) {
     const digest = hash.digest("hex");
     cache.set(message, digest);
     return digest;
+}
+/** The content blocks an identity hashes: a string as one text block, stable shapes without thinking. */
+function hashedBlocks(message, stable) {
+    let content = message.content;
+    if (stable && Array.isArray(content)) {
+        content = content.filter((part) => part?.type !== "thinking" && part?.type !== "redacted_thinking");
+    }
+    return typeof content === "string" ? [{ type: "text", text: content }] : content;
 }
 /** Same transform for stored and incoming messages, including nested tool results. */
 function normalizeReminders(content) {
@@ -303,6 +392,24 @@ function isPlainObject(value) {
 const MEDIA_PLACEHOLDERS = new Set([
     "[media removed: request limit]", "(media removed \u2014 rejected by API)",
 ]);
+/**
+ * Claude Code 2.1.325's longer eviction placeholders, exactly as its bundle writes them
+ * (whether the model saw the media decides which). A resume under it changed every evicted
+ * message's text and discarded the persisted prefix (staging 2026-11-15, session 89127e82).
+ */
+const PLACEHOLDER_HEAD = "[media removed: request limit.";
+const PLACEHOLDER_TAIL = "Re-reading pushes out others and re-sends everything, so don't re-read them all.]";
+for (const middle of [
+    "You have already seen this, and what you concluded from it still stands. It made room " +
+        "for newer images and documents.",
+    "You have not seen this: it did not fit in the request. If you need it, get it again " +
+        "once, by itself. If it is dropped again, go on without it and say so.",
+    "If you have seen this, what you concluded from it still stands.",
+])
+    MEDIA_PLACEHOLDERS.add(`${PLACEHOLDER_HEAD} ${middle} ${PLACEHOLDER_TAIL}`);
+function isMediaPlaceholderText(text) {
+    return typeof text === "string" && MEDIA_PLACEHOLDERS.has(text);
+}
 /** Content without media blocks and without Claude Code's placeholders for them. */
 function withoutMedia(content) {
     if (!Array.isArray(content))
@@ -311,6 +418,15 @@ function withoutMedia(content) {
         ? { ...part, content: withoutMedia(part.content) }
         : part);
 }
+/** Content with each media block and each placeholder replaced by the same slot marker. */
+function withMediaSlots(content) {
+    if (!Array.isArray(content))
+        return content;
+    return content.map((part) => isMediaOrPlaceholder(part) ? MEDIA_SLOT
+        : part && typeof part === "object" && part.type === "tool_result"
+            ? { ...part, content: withMediaSlots(part.content) } : part);
+}
+const MEDIA_SLOT = { type: "media-slot" };
 /** Whether any image or document is left, at the top level or in a tool result. */
 function carriesMedia(content) {
     if (!Array.isArray(content))
@@ -323,7 +439,7 @@ function isMediaOrPlaceholder(part) {
         return false;
     if (part.type === "image" || part.type === "document")
         return true;
-    return part.type === "text" && MEDIA_PLACEHOLDERS.has(part.text);
+    return part.type === "text" && isMediaPlaceholderText(part.text);
 }
 /** Cache metadata on blocks is incidental; identically named tool input keys aren't. */
 function stripBlockCache(content) {

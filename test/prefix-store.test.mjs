@@ -217,6 +217,119 @@ test("a resume under a Claude Code that renders old messages differently adopts 
     } finally { after.close(); }
   });
 
+/**
+ * Compact `old` on one process, then resume with `resumed` on a fresh one against the
+ * same backend and store: the resumed turn's record and compress count.
+ */
+async function resumeAfterCompact(old, render) {
+  const dir = tempDir();
+  const before = await proxyProcess(new StablePrefixStore(dir));
+  const conv = [...old];
+  try {
+    assert.equal(await before.post(conv), 200);
+    conv.push(assistant("a2"), user(BIG("q3")));
+    assert.equal(await before.post(conv), 200);
+    assert.equal(before.lastRecord().turnType, "followup-compressed");
+  } finally { before.close(); }
+  assert.equal((await waitForFile(dir)).length, 1);
+  const rendered = render(old);
+  const resumed = [...rendered, ...conv.slice(rendered.length), assistant("a3"), user("q4")];
+  const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort: before.memoryPort });
+  try {
+    assert.equal(await after.post(resumed), 200);
+    return { record: after.lastRecord(), compressCalls: after.compressCalls };
+  } finally { after.close(); }
+}
+
+const image = (data, type = "image/png") =>
+  ({ type: "image", source: { type: "base64", media_type: type, data } });
+const OLD_PLACEHOLDER = { type: "text", text: "[media removed: request limit]" };
+// Claude Code 2.1.325's three eviction placeholders (its bundle, 2026-11-15).
+const NEW_PLACEHOLDERS = [
+  "You have already seen this, and what you concluded from it still stands. It made room " +
+    "for newer images and documents.",
+  "You have not seen this: it did not fit in the request. If you need it, get it again " +
+    "once, by itself. If it is dropped again, go on without it and say so.",
+  "If you have seen this, what you concluded from it still stands.",
+].map((middle) => ({ type: "text", text: "[media removed: request limit. " + middle +
+  " Re-reading pushes out others and re-sends everything, so don't re-read them all.]" }));
+const read = (id, content) => ({ role: "user", content: [
+  { type: "tool_result", tool_use_id: id, content }] });
+const shot = (id) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "Read",
+  input: { file_path: `/tmp/${id}.png` } }] });
+
+test("a resume under Claude Code 2.1.325, whose eviction placeholders are longer, adopts the prefix",
+  async () => {
+    // Staging 2026-11-15 (session 89127e82): evicted under 2.1.319 with the short
+    // placeholder, resumed under 2.1.325, which writes a longer one. The persisted prefix
+    // was discarded at the first evicted message (storedPrefixMissAt 1180), every turn
+    // compressed 2.8M tokens from scratch and was refused.
+    for (const placeholder of NEW_PLACEHOLDERS) {
+      const old = [user("q1"), shot("r1"), read("r1", [OLD_PLACEHOLDER]), shot("r2"),
+        read("r2", [image("kept")]), assistant("a1"), user("q2")];
+      const { record, compressCalls } = await resumeAfterCompact(old, (messages) =>
+        messages.map((m, i) => i === 2 ? read("r1", [placeholder]) : m));
+      assert.equal(record.storedPrefix, "adopted", placeholder.text);
+      assert.equal(compressCalls, 0, "no blocking compress");
+      assert.equal(record.turnType, "followup-prefix");
+    }
+  });
+
+test("a resume after Claude Code restored media it had evicted adopts the prefix", async () => {
+  // Staging 2026-11-15 (session 89127e82): a flag raised Claude Code 2.1.325's media byte
+  // cap (24 MiB -> 56 MiB), so on resume it sent back 91 images it had evicted: placeholders
+  // became images again and a partly evicted message got its image back. The request grew
+  // from 33 MB to 55 MB and no stored history matched it.
+  const two = (first) => ({ role: "user", content: [
+    { type: "tool_result", tool_use_id: "r3", content: [first] },
+    { type: "tool_result", tool_use_id: "r4", content: [image("four")] }] });
+  const old = [user("q1"), shot("r1"), read("r1", [NEW_PLACEHOLDERS[0]]), assistant("seen"),
+    shot("r3"), two(NEW_PLACEHOLDERS[0]), assistant("a1"), user("q2")];
+  const restore = (messages) => messages.map((m, i) =>
+    i === 2 ? read("r1", [image("one")]) : i === 5 ? two(image("three")) : m);
+  const { record, compressCalls } = await resumeAfterCompact(old, restore);
+  assert.equal(record.storedPrefix, "adopted");
+  assert.equal(compressCalls, 0, "no blocking compress");
+  assert.equal(record.turnType, "followup-prefix");
+
+  // Media where the stored message had none (a dropped top-level screenshot left no trace,
+  // or new media) and an image replaced by another are new content.
+  const pasted = (media) => ({ role: "user", content: [{ type: "text", text: "see [Image #4]" },
+    ...media] });
+  const bare = [user("q1"), pasted([]), assistant("a1"), user("q2")];
+  const added = await resumeAfterCompact(bare, (messages) =>
+    messages.map((m, i) => i === 1 ? pasted([image("pasted")]) : m));
+  assert.equal(added.record.storedPrefix, "discarded");
+  const kept = [user("q1"), shot("r1"), read("r1", [image("one")]), assistant("a1"), user("q2")];
+  const replaced = await resumeAfterCompact(kept, (messages) =>
+    messages.map((m, i) => i === 2 ? read("r1", [image("other")]) : m));
+  assert.equal(replaced.record.storedPrefix, "discarded");
+});
+
+test("media put back on the last covered message, ambient system after it, is new content (Codex r3)",
+  async () => {
+    // The last covered message a user sends is the one they can rewind and resend with other
+    // media; a trailing role=system message must not hide that it is the last one.
+    const last = (media) => ({ role: "user", content: [{ type: "text", text: BIG("q3") }, media] });
+    const ambient = { role: "system", content: "ambient" };
+    const dir = tempDir();
+    const before = await proxyProcess(new StablePrefixStore(dir));
+    const conv = [user("q1"), assistant("a1"), user("q2"), assistant("a2"),
+      last(NEW_PLACEHOLDERS[1]), ambient];
+    try {
+      assert.equal(await before.post(conv.slice(0, 3)), 200);
+      assert.equal(await before.post(conv), 200);
+      assert.equal(before.lastRecord().turnType, "followup-compressed");
+    } finally { before.close(); }
+    assert.equal((await waitForFile(dir)).length, 1);
+    const after = await proxyProcess(new StablePrefixStore(dir), { memoryPort: before.memoryPort });
+    try {
+      const resent = [...conv.slice(0, 4), last(image("other")), ambient, assistant("a3"), user("q4")];
+      assert.equal(await after.post(resent), 200);
+      assert.equal(after.lastRecord().storedPrefix, "discarded");
+    } finally { after.close(); }
+  });
+
 test("a corrupt persisted prefix is discarded and the turn behaves as today", async () => {
   const dir = tempDir();
   const before = await proxyProcess(new StablePrefixStore(dir));
