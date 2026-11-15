@@ -177,14 +177,42 @@ const PREFIX_RETRY_INTERVAL_MS = 45_000;
  * from the first request: the one place that explains the agent's situation
  * before any memory message exists. Constant, so the prompt cache holds.
  */
+/**
+ * The search mode wording: hybrid is the default (Craig, 2026-11-14); the text-default
+ * wording is what a process opted out of hybrid (HYBRID_SEARCH_ENV=0) lists instead.
+ */
+const HYBRID_DEFAULT_INSTRUCTION =
+  "Hybrid mode (default) fuses text and vector by rank: the best recall. Text mode matches exact words, ids and " +
+  "paths; vector mode matches meaning. A search costs $0.0005 in any mode: its first page is charged even when " +
+  "cached; cursor continuation is free, as is a text search of one tree (\"mode\": \"text\" with a tree: free " +
+  "and faster).";
+const TEXT_DEFAULT_INSTRUCTION =
+  "Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
+  "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
+  "re-embedded, as is a text search of one tree.";
+const HYBRID_DEFAULT_SENTENCE =
+  "mode \"hybrid\" (default, best recall) fuses text and vector by rank into one page (no cursor); mode \"text\" " +
+  "matches exact words, ids, paths and errors (in one tree: summaries and transcript lines; free and faster); " +
+  "mode \"vector\" matches meaning. A search costs $0.0005 in any mode: its first page is charged even when " +
+  "cached; cursor continuation and a text search of one tree are free.";
+const TEXT_DEFAULT_SENTENCE =
+  "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
+  "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
+  "first page is charged even when cached; cursor continuation and a text search of one tree are free.";
+const HYBRID_MODE_DESCRIPTION =
+  "hybrid (default: text and vector fused by rank, best recall; one page, no cursor), text (exact words; free " +
+  "and faster in one tree) or vector (meaning); first page charged, except text in one tree.";
+const TEXT_MODE_DESCRIPTION =
+  "text (default, exact words) or vector (meaning); first page charged, except text in one tree.";
+
 export const MEMTREE_MCP_INSTRUCTIONS =
   "This session runs in Claude Code Infinite, which lets a conversation continue past the model's context window. " +
   "MemTree indexes the whole conversation as it goes: a tree of summaries from a one-line overview at the root down to " +
   "leaves, each pointing at the exact transcript lines it summarizes. Indexing runs in the background and trails the " +
   "newest messages slightly.\n\n" +
   "Until the conversation reaches its size budget you see every message verbatim. The tools reach beyond this " +
-  "conversation: when the user refers to earlier work from another session (\"like last time\", \"the " +
-  "fix from yesterday\"), search without tree, or list recent sessions, before asking or re-deriving it.\n\n" +
+  "conversation: when the user refers to something from another session (\"like last time\", \"what I " +
+  "said yesterday\"), search without tree, or list recent sessions, before asking or re-deriving it.\n\n" +
   "Once the conversation reaches the budget, the earlier conversation is replaced by a single memory " +
   "message: that tree, expanded where it looked relevant to the latest request and collapsed elsewhere. The user's own " +
   "messages shown there, and everything after the memory message, stay word for word; the rest of the earlier " +
@@ -194,15 +222,15 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "session to free context: they discard what MemTree keeps (/ccc:memtree-compact compresses now if the " +
   "user asks). The exception is a ccc notice that MemTree is paused or off: it is not compressing then, " +
   "and that advice is the fallback.\n\n" +
-  "So once you see that memory message: when your work depends on something from earlier in the session (what the " +
-  "user asked for or ruled out, decisions and why they were made, findings, ids and paths, commands, what was tried " +
-  "and failed), search MemTree before re-deriving it from the code or guessing. The code shows what exists; the " +
-  "memory shows what was decided and why. Read the exact lines (read_lines) when precision matters.\n\n" +
+  "So once you see that memory message: when your answer depends on something said earlier (what the user asked " +
+  "for, ruled out or told you, decisions and why, facts, ids, paths, commands, what was tried and failed), search " +
+  "MemTree before guessing or re-deriving it. No hit is not proof it was never said: try other wordings, synonyms " +
+  "and broader terms (hybrid and vector match meaning) first. Check exact values (numbers, names, dates) by reading " +
+  "the lines (read_lines), not a summary.\n\n" +
   "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
   "ccc sessions on any machine (not Codex or plain claude sessions), and list shows those sessions by time and " +
-  "project. Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
-  "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
-  "re-embedded, as is a text search of one tree. Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
+  `project. ${HYBRID_DEFAULT_INSTRUCTION} ` +
+  "Hits may include an address (<tree>#<node>) and its path from the root. If the address is unavailable, read_lines with the hit’s tree.ref and range reads its exact lines. With an address: " +
   "read_node {\"node\": address} opens it with its children, and the path's addresses lead to its parent and " +
   "siblings; read_lines {\"node\": address} reads a leaf's exact lines. Cursors page over live results, not a " +
   "frozen snapshot. A tree trails its conversation: the newest messages (often how a session ended) are in no tree " +
@@ -239,12 +267,11 @@ export const MEMTREE_TOOLS = [
     name: "search",
     description:
       "Find what this conversation doesn't show: exact details from earlier in this session that the memory only " +
-      "summarizes, or earlier work from the user's other sessions. Search one tree (tree, \"current\" for this session) " +
+      "summarizes, or what came up in the user's other sessions. Search one tree (tree, \"current\" for this session) " +
       "or, without tree, all of the user's ccc sessions on any machine (not Codex or plain claude sessions). " +
-      "Use it before re-deriving or guessing something from earlier work. " +
-      "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
-      "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
-      "first page is charged even when cached; cursor continuation and a text search of one tree are free. Cursors page over live results, not a frozen snapshot. " +
+      "Use it before guessing or re-deriving anything from earlier; if nothing matches, try other wordings, synonyms " +
+      "or broader terms before concluding it was never said. " +
+      `${HYBRID_DEFAULT_SENTENCE} Cursors page over live results, not a frozen snapshot. ` +
       "Hits include a snippet and range; their node address (<tree>#<node>) and path may be unavailable. Without an address, use read_lines with the hit’s tree.ref and range. " +
       "A text search of one tree also lists matching newest messages no tree covers yet (read them with read_lines tail). " +
       "Results show when the messages were written, each matched line its own message's time where recorded. " +
@@ -254,9 +281,9 @@ export const MEMTREE_TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions) or a question (vector)." },
+        query: { type: "string", description: "Distinctive words (text; \"quoted phrase\", or, -word across sessions), a question (vector) or either (hybrid)." },
         tree: { type: "string", description: `Optional. ${TREE_DESC} Omit to search all sessions.` },
-        mode: { type: "string", enum: ["text", "vector"], description: "text (default, exact words) or vector (meaning); first page charged, except text in one tree." },
+        mode: { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION },
         project: { type: "string", description: "Without tree: only sessions in this working directory or git repository (owner/repo, or just repo)." },
         since: { type: "string", description: "Without tree: only requests at or after this ISO 8601 time or date." },
         until: { type: "string", description: "Without tree: only requests before this ISO 8601 time or date." },
@@ -365,52 +392,26 @@ export const MEMTREE_TOOLS = [
   },
 ].map((tool) => ({ ...tool, _meta: MEMTREE_TOOL_META }));
 
-/** HYBRID_SEARCH_ENV's search tool: `hybrid` listed and the default mode. */
-const HYBRID_MODE_DESCRIPTION =
-  "hybrid (default here: text and vector together, fused by rank; one page, no cursor), text (exact words) or " +
-  "vector (meaning); first page charged, except text in one tree.";
-
-/** The search tool's mode sentence, and what it says once hybrid is the default. */
-const TEXT_DEFAULT_SENTENCE =
-  "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
-  "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
-  "first page is charged even when cached; cursor continuation and a text search of one tree are free.";
-const HYBRID_DEFAULT_SENTENCE =
-  "mode \"hybrid\" (default) runs text and vector together and fuses them by rank into one page (no cursor), " +
-  "one tree included (only a text search of one tree also matches its newest un-indexed messages); mode " +
-  "\"text\" matches exact words, ids, paths and errors (in one tree: node summaries and " +
-  "transcript lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 in any " +
-  "mode: its first page is charged even when cached; cursor continuation and a text search of one tree are free.";
-/** The MCP instructions' mode sentence, and what it says once hybrid is the default. */
-const TEXT_DEFAULT_INSTRUCTION =
-  "Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
-  "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
-  "re-embedded, as is a text search of one tree.";
-const HYBRID_DEFAULT_INSTRUCTION =
-  "Hybrid mode (default) runs text and vector together, fused by rank into one page; text mode matches exact " +
-  "words, ids and paths; vector mode matches meaning. A search costs $0.0005 in any mode, one tree included " +
-  "unless the mode is text: its first page is charged even when cached; cursor continuation is free.";
-
-/** The tools as listed: MEMTREE_TOOLS, with hybrid search once this process opted in. */
+/** The tools as listed: MEMTREE_TOOLS (hybrid the default), or text-default ones once opted out. */
 export function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS {
-  if (!hybridSearchOn(env)) return MEMTREE_TOOLS;
+  if (hybridSearchOn(env)) return MEMTREE_TOOLS;
   return MEMTREE_TOOLS.map((tool) => {
     if (tool.name !== "search") return tool;
     const properties = tool.inputSchema.properties as Record<string, unknown>;
-    const mode = { type: "string", enum: ["hybrid", "text", "vector"], description: HYBRID_MODE_DESCRIPTION };
-    const description = replaceOnce(tool.description, TEXT_DEFAULT_SENTENCE, HYBRID_DEFAULT_SENTENCE);
+    const mode = { type: "string", enum: ["text", "vector"], description: TEXT_MODE_DESCRIPTION };
+    const description = replaceOnce(tool.description, HYBRID_DEFAULT_SENTENCE, TEXT_DEFAULT_SENTENCE);
     return { ...tool, description, inputSchema: { ...tool.inputSchema, properties: { ...properties, mode } } };
   }) as typeof MEMTREE_TOOLS;
 }
 
-/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS, saying hybrid is the default once opted in. */
+/** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS (hybrid the default), or text's once opted out. */
 export function memtreeInstructions(env: NodeJS.ProcessEnv): string {
-  if (!hybridSearchOn(env)) return MEMTREE_MCP_INSTRUCTIONS;
-  return replaceOnce(MEMTREE_MCP_INSTRUCTIONS, TEXT_DEFAULT_INSTRUCTION, HYBRID_DEFAULT_INSTRUCTION);
+  if (hybridSearchOn(env)) return MEMTREE_MCP_INSTRUCTIONS;
+  return replaceOnce(MEMTREE_MCP_INSTRUCTIONS, HYBRID_DEFAULT_INSTRUCTION, TEXT_DEFAULT_INSTRUCTION);
 }
 
 function replaceOnce(text: string, from: string, to: string): string {
-  if (!text.includes(from)) throw new Error(`memtree MCP: hybrid wording is out of date ("${from.slice(0, 40)}…")`);
+  if (!text.includes(from)) throw new Error(`memtree MCP: search wording is out of date ("${from.slice(0, 40)}…")`);
   return text.replace(from, to);
 }
 
@@ -1170,7 +1171,9 @@ async function dispatchTool(
 /**
  * `search`: a text search of one tree uses the per-tree term search (summaries
  * and lines); every other combination is the server's search, across sessions
- * or scoped to the tree.
+ * or scoped to the tree. Hybrid is the default; a server that refuses it (an older
+ * polychat, or its MEMTREE_HYBRID_SEARCH off) gets this search in text mode, and the
+ * default stays text for HYBRID_OFF_RECHECK_MS before asking the server again.
  */
 async function searchTool(
   args: Record<string, unknown>,
@@ -1180,39 +1183,64 @@ async function searchTool(
   if (typeof args.query !== "string" || !args.query.trim()) {
     throw new ToolInputError("search: query must be a non-empty string");
   }
-  const mode = toolSearchMode(args, process.env);
+  const explicit = isSet(args.mode);
+  const chosen = toolSearchMode(args, process.env);
+  // No server to ask (no finder) or one that just refused hybrid: the default is text.
+  const mode = chosen === "hybrid" && !explicit && (!finder || hybridServerOff()) ? "text" : chosen;
+  try {
+    return await modeSearch(args, mode, tree, finder);
+  } catch (err) {
+    if (mode !== "hybrid" || !HYBRID_OFF_RE.test(String(err))) throw err;
+    hybridOffAt = Date.now();
+    const text = await modeSearch(args, "text", tree, finder);
+    // Silent for the default (it is today's text search); said when the agent asked for hybrid.
+    return explicit ? `${HYBRID_OFF_NOTE}\n\n${text}` : text;
+  }
+}
+
+/** One search in `mode`: local for text in one tree, else the server's. */
+async function modeSearch(
+  args: Record<string, unknown>,
+  mode: FinderSearchMode,
+  tree: TreeSource,
+  finder?: SessionFinderSource
+): Promise<string> {
   const current = args.tree === CURRENT_TREE;
   const named = current ? undefined : checkTreeId(args.tree);
   if (mode === "text" && (current || named)) return localTreeSearch(args, tree, named);
   if (!finder) throw new ToolInputError("search across sessions is not available here");
   if (current && !tree.currentId) throw new ToolInputError("this session's tree is not available here");
   const scope = current ? await tree.currentId!(true) : named;
-  try {
-    return await finder.searchSessions({ ...args, mode }, scope);
-  } catch (err) {
-    // The default hybrid mode on a server that has it off: answer this search in text mode.
-    if (mode !== "hybrid" || isSet(args.mode) || !HYBRID_OFF_RE.test(String(err))) throw err;
-    const text = current || named
-      ? await localTreeSearch(args, tree, named)
-      : await finder.searchSessions({ ...args, mode: "text" }, scope);
-    return `${HYBRID_OFF_NOTE}\n\n${text}`;
-  }
+  return finder.searchSessions({ ...args, mode }, scope);
 }
 
-/** The server's refusal of mode=hybrid while its MEMTREE_HYBRID_SEARCH is off. */
+/** The server's refusal of mode=hybrid while its MEMTREE_HYBRID_SEARCH is off (or it predates it). */
 const HYBRID_OFF_RE = /mode must be one of text, vector\b/;
 export const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
+/** After a refusal the default stays text this long, then hybrid is tried again (a setting can flip). */
+export const HYBRID_OFF_RECHECK_MS = 10 * 60_000;
+/** When the server last refused hybrid (0: never, in this process). */
+let hybridOffAt = 0;
+
+function hybridServerOff(): boolean {
+  return hybridOffAt > 0 && Date.now() - hybridOffAt < HYBRID_OFF_RECHECK_MS;
+}
+
+/** Tests: forget a server's refusal of hybrid, or pretend it came `agoMs` ago. */
+export function resetHybridServerOff(agoMs?: number): void {
+  hybridOffAt = agoMs === undefined ? 0 : Date.now() - agoMs;
+}
 
 /**
- * The search's mode: the agent's, else hybrid once this process opted in (HYBRID_SEARCH_ENV),
+ * The search's mode: the agent's, else hybrid unless this process opted out (HYBRID_SEARCH_ENV),
  * else text. A cursor without a mode keeps text (hybrid has no cursor), and hybrid is refused
- * unless opted in.
+ * once opted out.
  */
 export function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode {
   const on = hybridSearchOn(env);
   const mode = searchMode(args.mode, on && !isSet(args.cursor) ? defaultSearchMode(env) : "text");
   if (mode === "hybrid" && !on) {
-    throw new ToolInputError(`search: mode "hybrid" is off here (set ${HYBRID_SEARCH_ENV}=1 to use it)`);
+    throw new ToolInputError(`search: mode "hybrid" is off here (${HYBRID_SEARCH_ENV} opts out; unset it to use hybrid)`);
   }
   return mode;
 }

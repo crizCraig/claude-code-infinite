@@ -5,9 +5,11 @@ export declare const FINDER_SEARCH_MAX_LIMIT = 50;
 export declare const FINDER_SEARCH_MODES: readonly ["vector", "text", "hybrid"];
 export type FinderSearchMode = (typeof FINDER_SEARCH_MODES)[number];
 /**
- * Opt-in (off by default): `1` makes `hybrid` (text and vector run together and fused by rank,
- * polychat memtree_hybrid.py) the search tool's default mode and lists it in the tool's schema.
- * The server serves it only while its MEMTREE_HYBRID_SEARCH setting is on.
+ * On by default (Craig, 2026-11-14): `hybrid` (text and vector run together and fused by rank,
+ * polychat memtree_hybrid.py) is the search tool's default mode and is listed in its schema.
+ * `0` (or off/false/no) opts out: text is the default again and hybrid is not offered. The
+ * server serves hybrid only while its MEMTREE_HYBRID_SEARCH setting is on; a server that
+ * refuses it gets text mode instead (memtree-mcp.ts searchTool).
  */
 export declare const HYBRID_SEARCH_ENV = "CCC_MEMTREE_HYBRID_SEARCH";
 export interface FinderProject {
@@ -175,9 +177,9 @@ export declare function recentSearchFailedNote(triedDays: readonly number[], las
 /** Said first in a narrowed retry's answer, so the model knows what was left out. */
 export declare function recentSearchNote(since: string, days: number, pages?: boolean): string;
 export declare function searchMode(value: unknown, fallback?: FinderSearchMode): FinderSearchMode;
-/** Whether this process opted in to hybrid search (HYBRID_SEARCH_ENV). */
+/** Whether this process offers hybrid search: yes unless opted out (HYBRID_SEARCH_ENV). */
 export declare function hybridSearchOn(env: NodeJS.ProcessEnv): boolean;
-/** The search tool's mode when the agent names none: hybrid once opted in, else text. */
+/** The search tool's mode when the agent names none: hybrid unless opted out, else text. */
 export declare function defaultSearchMode(env: NodeJS.ProcessEnv): FinderSearchMode;
 export declare function formatSessions(body: FinderSessionsResponse, args: Record<string, unknown>, 
 /** The calling Claude Code session: its entry is marked "(this session)". */
