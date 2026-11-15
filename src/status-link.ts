@@ -66,6 +66,17 @@ export class StatusLinkFiles {
     }
   }
 
+  /** Remove the session's link (a stale one with nothing to replace it). Never throws. */
+  remove(sessionId: string): void {
+    if (!SESSION_ID.test(sessionId)) return;
+    this.written.delete(sessionId);
+    try {
+      fs.unlinkSync(path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`));
+    } catch {
+      // Already gone.
+    }
+  }
+
   private remember(sessionId: string, url: string): void {
     this.written.delete(sessionId);
     this.written.set(sessionId, url);

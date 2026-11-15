@@ -229,9 +229,12 @@ kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
 
 ### MemTree link in the status line
 
-`ccc` keeps each session's newest MemTree link in
-`~/.claude-code-infinite/statusline/<session id>.url`, updated in the background as trees
-finish. Claude Code's status line can show it as a clickable `🌿 tree` (the plain URL in
+`ccc` keeps each session's MemTree link in
+`~/.claude-code-infinite/statusline/<session id>.url`. On servers that offer it, that is the
+session's stable link (`/m/sessions/<session id>`, yours only: it opens the session's newest
+tree with its newest messages, so it never goes stale; to share a tree with someone, use the
+page's Share control, not this link); otherwise the newest tree's link,
+updated in the background as trees finish. Claude Code's status line can show it as a clickable `🌿 tree` (the plain URL in
 terminals without OSC 8 links; `CCC_STATUSLINE_LINK=url` or `osc8` forces either). The status
 line only reads that file, so it never waits on the server. While the status line uses it,
 `ccc` refreshes the link about once a minute; with a status-line script `ccc` can't see in

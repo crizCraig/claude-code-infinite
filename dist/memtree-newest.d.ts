@@ -43,6 +43,12 @@ export interface NewestTree {
     url: string;
     /** What makes the link news: the pinned tree ref. */
     key: string;
+    /**
+     * The session's stable link (`/m/sessions/<id>`), when the server names one: it sends
+     * the owner to the session's newest page, so a link shown for long (the status line)
+     * never goes stale. Older servers name none.
+     */
+    sessionUrl?: string;
 }
 /** GET a polychat path with the user's key (MemtreeClient.fetchMemTree). */
 export type NewestTreeFetch = (pathAndQuery: string, signal: AbortSignal) => Promise<{
@@ -64,9 +70,22 @@ export declare class NewestTreeLookup {
     private activeFetches;
     private unsupportedUntil;
     private readonly listeners;
+    /** Session → its stable link (`links.url`), tree or not; it never changes. Bounded. */
+    private readonly sessionUrls;
+    private readonly sessionLinkListeners;
+    private readonly noTreeListeners;
     constructor(fetchPath: NewestTreeFetch, now?: () => number, ttlMs?: number, fetchTimeoutMs?: number);
     /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
     onTree(listener: (sessionId: string, tree: NewestTree) => void): void;
+    /** Call `listener` when a lookup first names a session's stable link (the status line). */
+    onSessionLink(listener: (sessionId: string, url: string) => void): void;
+    /** The session's stable link, once any lookup named it (even before its first tree). */
+    sessionUrl(sessionId: string | undefined): string | undefined;
+    /** Call `listener` when the server answers that a session has no tree yet. */
+    onNoTree(listener: (sessionId: string) => void): void;
+    private notifyAnswered;
+    /** Whether the server has answered for this session (a tree or its absence). */
+    answered(sessionId: string): boolean;
     /** The cached answer, refreshing in the background when stale. Never waits. */
     peek(sessionId: string | undefined): NewestTree | undefined;
     /** A fresh answer if one arrives within `waitMs`, else the cached one. */
@@ -88,6 +107,7 @@ export declare class NewestTreeLookup {
     private fetch;
     /** All pages share one deadline; failures retain the last known answer. */
     private ask;
+    private rememberSessionUrl;
     private remember;
 }
 /**
@@ -96,6 +116,8 @@ export declare class NewestTreeLookup {
  * item whose `session_id` is this session counts: never another session's tree.
  */
 export declare function newestTreeFrom(body: unknown, sessionId: string): NewestTree | undefined;
+/** A sessions item's stable link (`links.url`, polychat's /m/sessions/<id>), validated. */
+export declare function sessionUrlFrom(item: unknown): string | undefined;
 /** Preserve the server-selected reference; shortening it can select another tree. */
 export declare function validatedTreeUrl(serverUrl: string): string | undefined;
 //# sourceMappingURL=memtree-newest.d.ts.map

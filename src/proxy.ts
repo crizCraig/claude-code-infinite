@@ -51,7 +51,7 @@ import { refusalCause, refusalMessage, type RefusalCause } from "./refusal-reaso
 import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
-import type { StatusLinkFiles } from "./status-link.js";
+import { readStatusLink, type StatusLinkFiles } from "./status-link.js";
 import {
   freshFailure, networkFailureOf, unreachableMessage, type NetworkFailure,
 } from "./network-failure.js";
@@ -681,6 +681,8 @@ interface ProxyState {
   newestTrees?: NewestTreeLookup;
   /** The session's link for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
+  /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
+  stableSessionLinks: Map<string, string>;
   statusLinkRefresh: boolean;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
@@ -1237,6 +1239,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       ? opts.memtree.storageIdentity : undefined,
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
+    stableSessionLinks: new Map(),
     statusLinkRefresh: opts.statusLinkRefresh === true,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
@@ -1255,6 +1258,8 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   installMemtreeLink(state, state.memtreeLinkPlacement);
   // A newer tree from the background lookup reaches the status line without a turn ending.
   opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
+  opts.newestTrees?.onSessionLink((sessionId) => publishStatusLink(state, sessionId));
+  opts.newestTrees?.onNoTree((sessionId) => publishStatusLink(state, sessionId));
   state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
   // One handler for the loopback server and, in HTTPS-proxy mode, for the decrypted
   // api.anthropic.com streams (`intercepted`): both are tracked, drained and cancelled alike.
@@ -2372,8 +2377,12 @@ async function handleMessages(
     });
   } else if (state.statusLinks && state.statusLinkRefresh) {
     // Keeps the status line's link fresh through long tool runs: answers from the cache,
-    // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS).
-    state.newestTrees?.peek(requestSessionId(req));
+    // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
+    // whose stable link is known needs no lookup (that link never changes), only its file
+    // written again if another ccc process pruned it (a local read; Codex r9).
+    const sessionId = requestSessionId(req);
+    if (sessionId && state.stableSessionLinks.has(sessionId)) publishStatusLink(state, sessionId);
+    else state.newestTrees?.peek(sessionId);
   }
   const isLocalBashCommand = isLocalBashCommandTurn(messages);
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
@@ -4070,10 +4079,55 @@ function rememberMemtreePage(state: ProxyState, sessionId: string, page: Memtree
   publishStatusLink(state, sessionId);
 }
 
-/** Write the session's current link (as the trailers would show it) for the status line. */
+/**
+ * Write the session's link for the status line: its stable session page once the server
+ * names one (always the newest page, so it never goes stale), else the current link as the
+ * trailers would show it.
+ */
 function publishStatusLink(state: ProxyState, sessionId: string): void {
   if (!state.statusLinks) return;
-  state.statusLinks.write(sessionId, currentSessionLink(state, sessionId));
+  const link = stableSessionLink(state, sessionId) ?? currentSessionLink(state, sessionId);
+  if (link !== undefined) state.statusLinks.write(sessionId, link);
+  // Another server's stable link from before a restart, with nothing here to replace it.
+  else if (state.newestTrees?.answered(sessionId) && persistedSessionLink(state, sessionId)) {
+    state.statusLinks.remove(sessionId);
+  }
+}
+
+/**
+ * The session's stable link, remembered once a lookup named it: it never changes, so a
+ * later failed or evicted lookup does not put the pinned tree back (Codex r1).
+ */
+function stableSessionLink(state: ProxyState, sessionId: string): string | undefined {
+  const known = state.newestTrees?.sessionUrl(sessionId) ?? state.stableSessionLinks.get(sessionId);
+  const fresh = known ?? state.newestTrees?.peek(sessionId)?.sessionUrl;
+  if (fresh === undefined) {
+    // A file from before a restart counts only until this server answers (Codex r10).
+    return state.newestTrees?.answered(sessionId) ? undefined
+      : persistedSessionLink(state, sessionId);
+  }
+  state.stableSessionLinks.delete(sessionId);
+  state.stableSessionLinks.set(sessionId, fresh);
+  while (state.stableSessionLinks.size > MEMTREE_LINKS_MAX_SESSIONS) {
+    state.stableSessionLinks.delete(state.stableSessionLinks.keys().next().value!);
+  }
+  return fresh;
+}
+
+/**
+ * After a restart: the stable link the session's status-line file already holds (the
+ * server's `/m/sessions/<this session>` link), so a failed lookup doesn't replace it with a
+ * stored pinned page (Codex r8), until this server answers for the session.
+ */
+function persistedSessionLink(state: ProxyState, sessionId: string): string | undefined {
+  const url = state.statusLinks ? readStatusLink(sessionId, state.statusLinks.dir) : undefined;
+  if (url === undefined) return undefined;
+  try {
+    return new URL(url).pathname.endsWith(`/m/sessions/${encodeURIComponent(sessionId)}`)
+      ? url : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Bound optional page state independently of how many sessions use the proxy. */

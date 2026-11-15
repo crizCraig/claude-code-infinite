@@ -50,6 +50,12 @@ export interface NewestTree {
   url: string;
   /** What makes the link news: the pinned tree ref. */
   key: string;
+  /**
+   * The session's stable link (`/m/sessions/<id>`), when the server names one: it sends
+   * the owner to the session's newest page, so a link shown for long (the status line)
+   * never goes stale. Older servers name none.
+   */
+  sessionUrl?: string;
 }
 
 /** GET a polychat path with the user's key (MemtreeClient.fetchMemTree). */
@@ -84,6 +90,10 @@ export class NewestTreeLookup {
   private activeFetches = 0;
   private unsupportedUntil = 0;
   private readonly listeners: ((sessionId: string, tree: NewestTree) => void)[] = [];
+  /** Session → its stable link (`links.url`), tree or not; it never changes. Bounded. */
+  private readonly sessionUrls = new Map<string, string>();
+  private readonly sessionLinkListeners: ((sessionId: string, url: string) => void)[] = [];
+  private readonly noTreeListeners: ((sessionId: string) => void)[] = [];
 
   constructor(
     private readonly fetchPath: NewestTreeFetch,
@@ -95,6 +105,36 @@ export class NewestTreeLookup {
   /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
   onTree(listener: (sessionId: string, tree: NewestTree) => void): void {
     this.listeners.push(listener);
+  }
+
+  /** Call `listener` when a lookup first names a session's stable link (the status line). */
+  onSessionLink(listener: (sessionId: string, url: string) => void): void {
+    this.sessionLinkListeners.push(listener);
+  }
+
+  /** The session's stable link, once any lookup named it (even before its first tree). */
+  sessionUrl(sessionId: string | undefined): string | undefined {
+    return sessionId === undefined ? undefined : this.sessionUrls.get(sessionId);
+  }
+
+  /** Call `listener` when the server answers that a session has no tree yet. */
+  onNoTree(listener: (sessionId: string) => void): void {
+    this.noTreeListeners.push(listener);
+  }
+
+  private notifyAnswered(sessionId: string): void {
+    for (const listener of this.noTreeListeners) {
+      try {
+        listener(sessionId);
+      } catch {
+        // A listener's failure never fails the lookup.
+      }
+    }
+  }
+
+  /** Whether the server has answered for this session (a tree or its absence). */
+  answered(sessionId: string): boolean {
+    return this.entries.get(sessionId)?.answered === true;
   }
 
   /** The cached answer, refreshing in the background when stale. Never waits. */
@@ -221,6 +261,7 @@ export class NewestTreeLookup {
           (s: { session_id?: unknown } | null) => s?.session_id === sessionId
         ) as { latest_tree?: unknown } | undefined;
         if (exact) {
+          this.rememberSessionUrl(sessionId, sessionUrlFrom(exact));
           if (exact.latest_tree === null || exact.latest_tree === undefined) return answer();
           const tree = newestTreeFrom(body, sessionId);
           // An unusable tree is not "none": keep what was known, like a failure.
@@ -238,13 +279,32 @@ export class NewestTreeLookup {
     return entry();
   }
 
+  private rememberSessionUrl(sessionId: string, url: string | undefined): void {
+    if (url === undefined || this.sessionUrls.get(sessionId) === url) return;
+    this.sessionUrls.delete(sessionId);
+    this.sessionUrls.set(sessionId, url);
+    while (this.sessionUrls.size > MAX_SESSIONS) {
+      this.sessionUrls.delete(this.sessionUrls.keys().next().value!);
+    }
+    for (const listener of this.sessionLinkListeners) {
+      try {
+        listener(sessionId, url);
+      } catch {
+        // A listener's failure never fails the lookup.
+      }
+    }
+  }
+
   private remember(sessionId: string, entry: Entry): void {
     this.entries.delete(sessionId);
     this.entries.set(sessionId, entry);
     while (this.entries.size > MAX_SESSIONS) {
       this.entries.delete(this.entries.keys().next().value!);
     }
-    if (!entry.tree) return;
+    if (!entry.tree) {
+      if (entry.answered) this.notifyAnswered(sessionId);
+      return;
+    }
     for (const listener of this.listeners) {
       try {
         listener(sessionId, entry.tree);
@@ -276,7 +336,19 @@ export function newestTreeFrom(body: unknown, sessionId: string): NewestTree | u
   const url = validatedTreeUrl(tree.links.url);
   if (!url) return undefined;
   const key = typeof tree.ref === "string" && tree.ref ? tree.ref : tree.request_id;
-  return { url, key };
+  const sessionUrl = sessionUrlFrom(item);
+  return sessionUrl ? { url, key, sessionUrl } : { url, key };
+}
+
+/** A sessions item's stable link (`links.url`, polychat's /m/sessions/<id>), validated. */
+export function sessionUrlFrom(item: unknown): string | undefined {
+  const { links, session_id: sessionId } =
+    (item ?? {}) as { links?: { url?: unknown }; session_id?: unknown };
+  const url = typeof links?.url === "string" ? validatedTreeUrl(links.url) : undefined;
+  // Only this session's own stable link (review r9): never another page.
+  const own = typeof sessionId === "string" &&
+    url?.split(/[?#]/)[0].endsWith(`/m/sessions/${encodeURIComponent(sessionId)}`);
+  return own ? url : undefined;
 }
 
 /** Preserve the server-selected reference; shortening it can select another tree. */

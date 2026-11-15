@@ -39,6 +39,34 @@ function scripted(answer, clock = { t: 0 }) {
   return { lookup, asked, clock };
 }
 
+test("newestTreeFrom carries the session's stable link when the server names one", () => {
+  const stable = "https://staging.example/m/sessions/session-1";
+  const linked = { ...item("session-1", NEW_ID), links: { url: stable } };
+  assert.deepEqual(newestTreeFrom({ sessions: [linked] }, "session-1"),
+    { url: NEW_URL, key: `${NEW_ID}-v1-own`, sessionUrl: stable });
+  const bad = { ...item("session-1", NEW_ID), links: { url: "javascript:alert(1)" } };
+  assert.deepEqual(newestTreeFrom({ sessions: [bad] }, "session-1"),
+    { url: NEW_URL, key: `${NEW_ID}-v1-own` }, "an unusable link is left out");
+  for (const other of ["https://staging.example/m/abc", "https://staging.example/m/sessions/session-2"]) {
+    const item2 = { ...item("session-1", NEW_ID), links: { url: other } };
+    assert.equal(newestTreeFrom({ sessions: [item2] }, "session-1").sessionUrl, undefined, other);
+  }
+});
+
+test("a session's stable link is kept even before it has a tree, and announced", async () => {
+  const stable = "https://staging.example/m/sessions/session-1";
+  const { lookup } = scripted(() => ({ sessions: [{ ...item("session-1", null), links: { url: stable } }] }));
+  const seen = [];
+  lookup.onSessionLink((sessionId, url) => seen.push([sessionId, url]));
+  assert.equal(await lookup.settle("session-1"), undefined, "no tree yet");
+  assert.equal(lookup.sessionUrl("session-1"), stable);
+  assert.deepEqual(seen, [["session-1", stable]]);
+  assert.equal(lookup.sessionUrl("session-2"), undefined);
+  const { lookup: other } = scripted(() => ({ sessions: [{ ...item("session-2", null), links: { url: stable } }] }));
+  await other.settle("session-1");
+  assert.equal(other.sessionUrl("session-1"), undefined, "never another session's link");
+});
+
 test("newestTreeFrom takes only the exact session's tree, with the server's pinned link", () => {
   const body = { sessions: [item("session-2", OLD_ID), item("session-1", NEW_ID)] };
   assert.deepEqual(newestTreeFrom(body, "session-1"), { url: NEW_URL, key: `${NEW_ID}-v1-own` });

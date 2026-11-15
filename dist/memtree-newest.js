@@ -55,6 +55,10 @@ export class NewestTreeLookup {
     activeFetches = 0;
     unsupportedUntil = 0;
     listeners = [];
+    /** Session → its stable link (`links.url`), tree or not; it never changes. Bounded. */
+    sessionUrls = new Map();
+    sessionLinkListeners = [];
+    noTreeListeners = [];
     constructor(fetchPath, now = Date.now, ttlMs = NEWEST_TREE_TTL_MS, fetchTimeoutMs = NEWEST_TREE_FETCH_TIMEOUT_MS) {
         this.fetchPath = fetchPath;
         this.now = now;
@@ -64,6 +68,32 @@ export class NewestTreeLookup {
     /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
     onTree(listener) {
         this.listeners.push(listener);
+    }
+    /** Call `listener` when a lookup first names a session's stable link (the status line). */
+    onSessionLink(listener) {
+        this.sessionLinkListeners.push(listener);
+    }
+    /** The session's stable link, once any lookup named it (even before its first tree). */
+    sessionUrl(sessionId) {
+        return sessionId === undefined ? undefined : this.sessionUrls.get(sessionId);
+    }
+    /** Call `listener` when the server answers that a session has no tree yet. */
+    onNoTree(listener) {
+        this.noTreeListeners.push(listener);
+    }
+    notifyAnswered(sessionId) {
+        for (const listener of this.noTreeListeners) {
+            try {
+                listener(sessionId);
+            }
+            catch {
+                // A listener's failure never fails the lookup.
+            }
+        }
+    }
+    /** Whether the server has answered for this session (a tree or its absence). */
+    answered(sessionId) {
+        return this.entries.get(sessionId)?.answered === true;
     }
     /** The cached answer, refreshing in the background when stale. Never waits. */
     peek(sessionId) {
@@ -196,6 +226,7 @@ export class NewestTreeLookup {
                     return entry();
                 const exact = body.sessions.find((s) => s?.session_id === sessionId);
                 if (exact) {
+                    this.rememberSessionUrl(sessionId, sessionUrlFrom(exact));
                     if (exact.latest_tree === null || exact.latest_tree === undefined)
                         return answer();
                     const tree = newestTreeFrom(body, sessionId);
@@ -216,14 +247,34 @@ export class NewestTreeLookup {
         }
         return entry();
     }
+    rememberSessionUrl(sessionId, url) {
+        if (url === undefined || this.sessionUrls.get(sessionId) === url)
+            return;
+        this.sessionUrls.delete(sessionId);
+        this.sessionUrls.set(sessionId, url);
+        while (this.sessionUrls.size > MAX_SESSIONS) {
+            this.sessionUrls.delete(this.sessionUrls.keys().next().value);
+        }
+        for (const listener of this.sessionLinkListeners) {
+            try {
+                listener(sessionId, url);
+            }
+            catch {
+                // A listener's failure never fails the lookup.
+            }
+        }
+    }
     remember(sessionId, entry) {
         this.entries.delete(sessionId);
         this.entries.set(sessionId, entry);
         while (this.entries.size > MAX_SESSIONS) {
             this.entries.delete(this.entries.keys().next().value);
         }
-        if (!entry.tree)
+        if (!entry.tree) {
+            if (entry.answered)
+                this.notifyAnswered(sessionId);
             return;
+        }
         for (const listener of this.listeners) {
             try {
                 listener(sessionId, entry.tree);
@@ -252,7 +303,17 @@ export function newestTreeFrom(body, sessionId) {
     if (!url)
         return undefined;
     const key = typeof tree.ref === "string" && tree.ref ? tree.ref : tree.request_id;
-    return { url, key };
+    const sessionUrl = sessionUrlFrom(item);
+    return sessionUrl ? { url, key, sessionUrl } : { url, key };
+}
+/** A sessions item's stable link (`links.url`, polychat's /m/sessions/<id>), validated. */
+export function sessionUrlFrom(item) {
+    const { links, session_id: sessionId } = (item ?? {});
+    const url = typeof links?.url === "string" ? validatedTreeUrl(links.url) : undefined;
+    // Only this session's own stable link (review r9): never another page.
+    const own = typeof sessionId === "string" &&
+        url?.split(/[?#]/)[0].endsWith(`/m/sessions/${encodeURIComponent(sessionId)}`);
+    return own ? url : undefined;
 }
 /** Preserve the server-selected reference; shortening it can select another tree. */
 export function validatedTreeUrl(serverUrl) {

@@ -11,6 +11,8 @@ export declare class StatusLinkFiles {
     constructor(dir?: string, maxFiles?: number);
     /** Record `url` as the session's link; writes only when it changed. Never throws. */
     write(sessionId: string | undefined, url: string | undefined): void;
+    /** Remove the session's link (a stale one with nothing to replace it). Never throws. */
+    remove(sessionId: string): void;
     private remember;
     /** Keep the newest maxFiles links (by modification time). */
     private prune;

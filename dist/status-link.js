@@ -70,6 +70,18 @@ export class StatusLinkFiles {
             // A missed status-line link is never an error.
         }
     }
+    /** Remove the session's link (a stale one with nothing to replace it). Never throws. */
+    remove(sessionId) {
+        if (!SESSION_ID.test(sessionId))
+            return;
+        this.written.delete(sessionId);
+        try {
+            fs.unlinkSync(path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`));
+        }
+        catch {
+            // Already gone.
+        }
+    }
     remember(sessionId, url) {
         this.written.delete(sessionId);
         this.written.set(sessionId, url);

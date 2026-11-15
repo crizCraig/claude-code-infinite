@@ -11380,6 +11380,174 @@ test("the status line's link file follows the session's page, then its newest tr
   }
 });
 
+test("the status line links the session's stable page once the server names one", async () => {
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const stable = "https://staging.example/m/sessions/session-1";
+  const { lookup } = await newestLookup((q) => ({
+    sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    for (let i = 0; i < 50 && readStatusLink("session-1", dir) !== stable; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(readStatusLink("session-1", dir), stable,
+      "the server's stable session link, not the pinned tree that goes stale");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("the status line keeps the session's stable link when a later lookup fails", async () => {
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const stable = "https://staging.example/m/sessions/session-1";
+  let calls = 0;
+  const { lookup } = await newestLookup((q) => (calls++ === 0
+    ? { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] } : 503));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    assert.equal(readStatusLink("session-1", dir), stable, "known before the refresh fails");
+    // The compress answer's page invalidates the lookup; its refresh fails.
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    await lookup.settle("session-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), stable,
+      "once known, the stable link stays: it never goes stale");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a resumed session keeps the stable link its status-line file already holds", async () => {
+  // Codex r8 P2: after a restart the caches are empty; a failed lookup must not put the
+  // stored pinned page back over the stable link.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const { MemtreeLinkStore } = await import("../dist/memtree-links.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const stable = "https://staging.example/m/sessions/session-1";
+  new StatusLinkFiles(dir).write("session-1", stable);
+  const store = new MemtreeLinkStore(pathMod.join(dir, "links.json"));
+  store.put("session-1", { url: PAGE_URL_1, index: "index-a", compressed: true });
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup(() => 503);
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, memtreeLinkStore: store,
+    newestTrees: lookup, statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await postHook(proxy, { hook_event_name: "SessionStart", source: "resume" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), stable);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test("a known stable link is written again when another process pruned the file", async () => {
+  // Codex r9 P2: with the refresh skipped once the link is known, a pruned file stayed gone.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  const upstream = await mockUpstream();
+  const memtreeSrv = await mockMemtree(200, compressedOnce, pageHeaders(PAGE_URL_1, "index-a"));
+  const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
+  const stable = "https://staging.example/m/sessions/session-1";
+  const { lookup } = await newestLookup((q) => (
+    { sessions: [{ ...sessionsItem(q, NEWEST_REQUEST_ID), links: { url: stable } }] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir), statusLinkRefresh: true });
+  try {
+    await lookup.settle("session-1");
+    await armMainTurn(proxy, "turn two", "prompt-1");
+    await postSessionMessages(proxy.port, followupTurn("turn two"));
+    assert.equal(readStatusLink("session-1", dir), stable);
+    fs.rmSync(pathMod.join(dir, "session-1.url"));
+    await postSessionMessages(proxy.port, followupTurn("turn three"));
+    assert.equal(readStatusLink("session-1", dir), stable, "written again");
+  } finally {
+    proxy.close();
+    upstream.close();
+    memtreeSrv.close();
+  }
+});
+
+test("a persisted stable link gives way once this server answers without one", async () => {
+  // Codex r10 P2: resumed against a server that names no stable link, the old server's
+  // link must not stay.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  new StatusLinkFiles(dir).write("session-1", "https://old.example/m/sessions/session-1");
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    for (let i = 0; i < 50 && readStatusLink("session-1", dir) !== NEWEST_URL; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(readStatusLink("session-1", dir), NEWEST_URL);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test("a persisted stable link gives way when this server answers with no tree and no link", async () => {
+  // Codex r11 P2: an answer without a tree fired no listener, so the old link stayed.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  new StatusLinkFiles(dir).write("session-1", "https://old.example/m/sessions/session-1");
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [{ ...sessionsItem(q, "x"), latest_tree: null }] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), undefined, "no link beats another server's");
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 /** An upstream that streams `recapText` for the recap and answers others plainly. */
 async function recapUpstream(recapText) {
   return listen((req, res) => {
