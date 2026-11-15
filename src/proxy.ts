@@ -1254,6 +1254,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   installMemtreeLink(state, state.memtreeLinkPlacement);
   // A newer tree from the background lookup reaches the status line without a turn ending.
   opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
+  opts.newestTrees?.onSessionLink((sessionId) => publishStatusLink(state, sessionId));
   state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
   // One handler for the loopback server and, in HTTPS-proxy mode, for the decrypted
   // api.anthropic.com streams (`intercepted`): both are tracked, drained and cancelled alike.
@@ -4085,7 +4086,8 @@ function publishStatusLink(state: ProxyState, sessionId: string): void {
  * later failed or evicted lookup does not put the pinned tree back (Codex r1).
  */
 function stableSessionLink(state: ProxyState, sessionId: string): string | undefined {
-  const fresh = state.newestTrees?.peek(sessionId)?.sessionUrl;
+  const fresh = state.newestTrees?.sessionUrl(sessionId) ??
+    state.newestTrees?.peek(sessionId)?.sessionUrl;
   if (fresh === undefined) return state.stableSessionLinks.get(sessionId);
   state.stableSessionLinks.delete(sessionId);
   state.stableSessionLinks.set(sessionId, fresh);
