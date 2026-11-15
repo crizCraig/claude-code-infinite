@@ -58,7 +58,7 @@ export declare const INDEX_MIN_NEW_CHARS = 30000;
  * upload per conversation per limit, and only while its turns stay under the minimum: worst
  * case the whole history every 3 minutes (a 27 MB session: ~540 MB an hour, against the
  * ~1.5 GB an hour of every-turn uploads the minimum replaced). A compress call that carries
- * the held history retires it (retireHeldBy).
+ * the held history retires it when it is sent (retireHeldBy).
  * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
  */
 export declare const INDEX_HOLD_MAX_MS: number;
@@ -399,8 +399,6 @@ export declare class MemtreeClient {
     /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
     private readonly indexHoldTimers;
     private readonly indexHoldMaxMs;
-    /** Per conversation, compress calls in flight: a held history never goes before one. */
-    private readonly compressLanesInFlight;
     /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
     private readonly indexLanesPending;
     /** Once draining begins, no later request may create another log producer. */
@@ -622,12 +620,11 @@ export declare class MemtreeClient {
      * upload would store nothing new, so the hold limit drops it (review r2 P3).
      */
     private addsNothing;
-    /** Count a compress call of `lane` in flight (+1) or done (-1). */
-    private noteCompressInFlight;
     /**
-     * A compress call stored `messages` (the server stores every request): a held-back
-     * history it carries whole is dropped, or its later upload would be the older request
-     * the page reads as the newest (Codex r1 P1).
+     * A compress call is sending `messages` (the server stores every request it gets, even
+     * one it refuses): a held-back history it carries whole is dropped, or its later upload
+     * would be the older request the page reads as the newest (Codex r1-r3 P1). A trimmed
+     * body stores other messages, so it retires nothing.
      */
     private retireHeldBy;
     private clearHoldTimer;

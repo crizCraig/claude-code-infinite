@@ -95,12 +95,10 @@ export const INDEX_MIN_NEW_CHARS = 30_000;
  * upload per conversation per limit, and only while its turns stay under the minimum: worst
  * case the whole history every 3 minutes (a 27 MB session: ~540 MB an hour, against the
  * ~1.5 GB an hour of every-turn uploads the minimum replaced). A compress call that carries
- * the held history retires it (retireHeldBy).
+ * the held history retires it when it is sent (retireHeldBy).
  * `CCC_INDEX_HOLD_MAX_MS` overrides it; 0 holds without a bound (the old behaviour).
  */
 export const INDEX_HOLD_MAX_MS = 3 * 60_000;
-/** A hold limit reached while a compress call of that conversation is in flight looks again. */
-const HOLD_RECHECK_MS = 5_000;
 const DEDUPE_CACHE_MAX = 64;
 /**
  * A main-lane Stop followed by this long without a new request is taken as the
@@ -1084,8 +1082,6 @@ export class MemtreeClient {
   /** Per conversation holding a history back, the timer that sends it (INDEX_HOLD_MAX_MS). */
   private readonly indexHoldTimers = new Map<string, NodeJS.Timeout>();
   private readonly indexHoldMaxMs: number;
-  /** Per conversation, compress calls in flight: a held history never goes before one. */
-  private readonly compressLanesInFlight = new Map<string, number>();
   /** Per conversation, the upload in flight: the baseline until it succeeds or fails. */
   private readonly indexLanesPending = new Map<string, SentIndex>();
   /** Once draining begins, no later request may create another log producer. */
@@ -1589,21 +1585,15 @@ export class MemtreeClient {
    * Bound how long `lane` holds a history back (INDEX_HOLD_MAX_MS): from its first hold
    * since its last upload, so newer held histories replacing it do not push it back.
    */
-  private startHoldTimer(lane: string, delayMs = this.indexHoldMaxMs): void {
+  private startHoldTimer(lane: string): void {
     if (this.indexHoldMaxMs <= 0 || this.indexHoldTimers.has(lane)) return;
     const timer = setTimeout(() => {
       this.indexHoldTimers.delete(lane);
       const held = this.indexLanesHeld.get(lane);
       if (!held || this.backgroundClosing) return;
-      // A compress call in flight is newer: sent now, the held one would be stored after
-      // it and read as the newest request (Codex r2 P1). Its success retires the held one.
-      if ((this.compressLanesInFlight.get(lane) ?? 0) > 0) {
-        this.startHoldTimer(lane, Math.min(HOLD_RECHECK_MS, this.indexHoldMaxMs));
-        return;
-      }
       this.indexLanesHeld.delete(lane);
       if (!this.addsNothing(lane, held)) this.enqueueIndex(lane, held);
-    }, delayMs);
+    }, this.indexHoldMaxMs);
     timer.unref();
     this.indexHoldTimers.set(lane, timer);
   }
@@ -1618,17 +1608,13 @@ export class MemtreeClient {
       extendsHistory(job.messages, sent.messages) && !losesMedia(sent.messages, job.messages);
   }
 
-  /** Count a compress call of `lane` in flight (+1) or done (-1). */
-  private noteCompressInFlight(lane: string, delta: 1 | -1): void {
-    const n = (this.compressLanesInFlight.get(lane) ?? 0) + delta;
-    if (n > 0) this.compressLanesInFlight.set(lane, n);
-    else this.compressLanesInFlight.delete(lane);
-  }
+
 
   /**
-   * A compress call stored `messages` (the server stores every request): a held-back
-   * history it carries whole is dropped, or its later upload would be the older request
-   * the page reads as the newest (Codex r1 P1).
+   * A compress call is sending `messages` (the server stores every request it gets, even
+   * one it refuses): a held-back history it carries whole is dropped, or its later upload
+   * would be the older request the page reads as the newest (Codex r1-r3 P1). A trimmed
+   * body stores other messages, so it retires nothing.
    */
   private retireHeldBy(sessionId: string | undefined, messages: Message[]): void {
     const lane = indexLaneKey(sessionId, messages);
@@ -2144,8 +2130,12 @@ export class MemtreeClient {
     timeout.unref();
     opts.signal?.addEventListener("abort", abort, { once: true });
     if (opts.signal?.aborted) abort();
-    const compressLane = opts.indexOnly ? undefined : indexLaneKey(opts.sessionId, messages);
-    if (compressLane !== undefined) this.noteCompressInFlight(compressLane, 1);
+    // Sent, this compress call is stored as the conversation's newest request whatever it
+    // answers (polychat stores a refused 413 too): an older held history it carries must
+    // not follow it (Codex r2/r3 P1). If it never arrives, the next turn holds again.
+    if (!opts.indexOnly && planned.limit?.action !== "trimmed") {
+      this.retireHeldBy(opts.sessionId, messages);
+    }
     try {
       const response = await this.postRetryingDrop(payload, { ...opts, features },
         controller.signal)
@@ -2244,9 +2234,6 @@ export class MemtreeClient {
       this.unpaidDetail = null; // a success proves the key is paid (again)
       ok = true;
       if (!opts.indexOnly) this.compressSuccessAt = Date.now();
-      if (!opts.indexOnly && planned.limit?.action !== "trimmed") {
-        this.retireHeldBy(opts.sessionId, messages);
-      }
       diagnostics = {
         ...(memtreeUrl ? { memtreeUrl } : {}),
         ...(memtreeIndex ? { memtreeIndex } : {}),
@@ -2277,7 +2264,6 @@ export class MemtreeClient {
         ...(memtreeIndex ? { memtreeIndex } : {}),
       };
     } finally {
-      if (compressLane !== undefined) this.noteCompressInFlight(compressLane, -1);
       clearTimeout(timeout);
       opts.signal?.removeEventListener("abort", abort);
       // A call the caller aborted says nothing about the server.
