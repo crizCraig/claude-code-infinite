@@ -73,6 +73,7 @@ export declare class NewestTreeLookup {
     /** Session → its stable link (`links.url`), tree or not; it never changes. Bounded. */
     private readonly sessionUrls;
     private readonly sessionLinkListeners;
+    private readonly noTreeListeners;
     constructor(fetchPath: NewestTreeFetch, now?: () => number, ttlMs?: number, fetchTimeoutMs?: number);
     /** Call `listener` whenever a lookup answers with a session's tree (the status line). */
     onTree(listener: (sessionId: string, tree: NewestTree) => void): void;
@@ -80,6 +81,9 @@ export declare class NewestTreeLookup {
     onSessionLink(listener: (sessionId: string, url: string) => void): void;
     /** The session's stable link, once any lookup named it (even before its first tree). */
     sessionUrl(sessionId: string | undefined): string | undefined;
+    /** Call `listener` when the server answers that a session has no tree yet. */
+    onNoTree(listener: (sessionId: string) => void): void;
+    private notifyAnswered;
     /** Whether the server has answered for this session (a tree or its absence). */
     answered(sessionId: string): boolean;
     /** The cached answer, refreshing in the background when stale. Never waits. */

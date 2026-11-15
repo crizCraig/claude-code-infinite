@@ -434,6 +434,7 @@ export function startProxy(opts) {
     // A newer tree from the background lookup reaches the status line without a turn ending.
     opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
     opts.newestTrees?.onSessionLink((sessionId) => publishStatusLink(state, sessionId));
+    opts.newestTrees?.onNoTree((sessionId) => publishStatusLink(state, sessionId));
     state.notices.setFirstTreeIntro(opts.firstTreeIntro ?? null);
     // One handler for the loopback server and, in HTTPS-proxy mode, for the decrypted
     // api.anthropic.com streams (`intercepted`): both are tracked, drained and cancelled alike.
@@ -2916,8 +2917,13 @@ function rememberMemtreePage(state, sessionId, page) {
 function publishStatusLink(state, sessionId) {
     if (!state.statusLinks)
         return;
-    const stable = stableSessionLink(state, sessionId);
-    state.statusLinks.write(sessionId, stable ?? currentSessionLink(state, sessionId));
+    const link = stableSessionLink(state, sessionId) ?? currentSessionLink(state, sessionId);
+    if (link !== undefined)
+        state.statusLinks.write(sessionId, link);
+    // Another server's stable link from before a restart, with nothing here to replace it.
+    else if (state.newestTrees?.answered(sessionId) && persistedSessionLink(state, sessionId)) {
+        state.statusLinks.remove(sessionId);
+    }
 }
 /**
  * The session's stable link, remembered once a lookup named it: it never changes, so a

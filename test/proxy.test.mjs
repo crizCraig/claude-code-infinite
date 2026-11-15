@@ -11525,6 +11525,29 @@ test("a persisted stable link gives way once this server answers without one", a
   }
 });
 
+test("a persisted stable link gives way when this server answers with no tree and no link", async () => {
+  // Codex r11 P2: an answer without a tree fired no listener, so the old link stayed.
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const pathMod = await import("node:path");
+  const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ccc-statusline-"));
+  new StatusLinkFiles(dir).write("session-1", "https://old.example/m/sessions/session-1");
+  const upstream = await mockUpstream();
+  const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" });
+  const { lookup } = await newestLookup((q) => ({ sessions: [{ ...sessionsItem(q, "x"), latest_tree: null }] }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, newestTrees: lookup,
+    statusLinks: new StatusLinkFiles(dir) });
+  try {
+    await lookup.settle("session-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(readStatusLink("session-1", dir), undefined, "no link beats another server's");
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 /** An upstream that streams `recapText` for the recap and answers others plainly. */
 async function recapUpstream(recapText) {
   return listen((req, res) => {

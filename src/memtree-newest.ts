@@ -93,6 +93,7 @@ export class NewestTreeLookup {
   /** Session → its stable link (`links.url`), tree or not; it never changes. Bounded. */
   private readonly sessionUrls = new Map<string, string>();
   private readonly sessionLinkListeners: ((sessionId: string, url: string) => void)[] = [];
+  private readonly noTreeListeners: ((sessionId: string) => void)[] = [];
 
   constructor(
     private readonly fetchPath: NewestTreeFetch,
@@ -114,6 +115,21 @@ export class NewestTreeLookup {
   /** The session's stable link, once any lookup named it (even before its first tree). */
   sessionUrl(sessionId: string | undefined): string | undefined {
     return sessionId === undefined ? undefined : this.sessionUrls.get(sessionId);
+  }
+
+  /** Call `listener` when the server answers that a session has no tree yet. */
+  onNoTree(listener: (sessionId: string) => void): void {
+    this.noTreeListeners.push(listener);
+  }
+
+  private notifyAnswered(sessionId: string): void {
+    for (const listener of this.noTreeListeners) {
+      try {
+        listener(sessionId);
+      } catch {
+        // A listener's failure never fails the lookup.
+      }
+    }
   }
 
   /** Whether the server has answered for this session (a tree or its absence). */
@@ -285,7 +301,10 @@ export class NewestTreeLookup {
     while (this.entries.size > MAX_SESSIONS) {
       this.entries.delete(this.entries.keys().next().value!);
     }
-    if (!entry.tree) return;
+    if (!entry.tree) {
+      if (entry.answered) this.notifyAnswered(sessionId);
+      return;
+    }
     for (const listener of this.listeners) {
       try {
         listener(sessionId, entry.tree);
