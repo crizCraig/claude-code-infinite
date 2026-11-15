@@ -366,6 +366,11 @@ test("media Claude Code put back still matches slot by slot; added, replaced or 
     const around = (parts) => ({ role: "user", content: parts });
     assert.ok(!matches(around([{ type: "text", text: "x" }, removed]),
       around([image("a"), { type: "text", text: "x" }])), "moved across text (review r1)");
+    const noted = { type: "text", text: "[media removed: request limit]\n<system-reminder>x</system-reminder>" };
+    assert.ok(!matches(two([noted], [image("a")]), two([image("a")], [noted])),
+      "a placeholder with a reminder still counts as its slot (review r2)");
+    assert.ok(matches(two([noted], [image("b")]), two([image("a")], [image("b")])),
+      "and its put-back matches");
     assert.ok(!matches(tool([removed]), { role: "user", content: [tr("t",
       [image("a"), { type: "text", text: "new" }])] }), "new text");
   }

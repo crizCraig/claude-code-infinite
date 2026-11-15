@@ -7,6 +7,8 @@ const hashCaches = new Map();
 const jsonFieldCache = new WeakMap();
 /** Each message's mediaSlots, per identity kind, computed once. */
 const mediaSlotCaches = { route: new WeakMap(), stable: new WeakMap() };
+/** Each media block's digest, computed once (Codex r2). */
+const mediaDigestCache = new WeakMap();
 const EXACT = { media: "keep" };
 const MEDIA_FREE = { media: "drop" };
 const MEDIA_SLOTS = { media: "slot" };
@@ -70,7 +72,7 @@ export function extendsHistory(newer, older) {
     const a = newer.filter((message) => message.role !== "system");
     const b = older.filter((message) => message.role !== "system");
     return a.length >= b.length && b.every((message, i) => routeMessageHash(a[i]) === routeMessageHash(message) ||
-        prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message), undefined, undefined, mediaSlots(message, "route")));
+        prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message), undefined, undefined, carriesMedia(a[i].content) ? mediaSlots(message, "route") : undefined));
 }
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
 export function mediaFreeMessageHash(message) {
@@ -92,10 +94,12 @@ export function mediaSlots(message, kind) {
     const cached = cache.get(message);
     if (cached !== undefined)
         return cached;
+    const stable = kind === "stable" && stableShape(message);
     const entries = [];
-    collectSlots(message.content, entries);
+    // From the blocks the slot hash is built from, so entry i is the hash's slot i (review r2).
+    collectSlots(normalizeReminders(hashedBlocks(message, stable)), entries);
     const slots = entries.length === 0 ? ""
-        : `${messageHash(message, kind === "stable" && stableShape(message), MEDIA_SLOTS)}|${entries.join(",")}`;
+        : `${messageHash(message, stable, MEDIA_SLOTS)}|${entries.join(",")}`;
     cache.set(message, slots);
     return slots;
 }
@@ -118,6 +122,17 @@ function slotsEvictedOrPutBack(current, stored) {
     return evicted || currentEntries.every((entry, i) => entry === storedEntries[i] ||
         (storedEntries[i] === "" && entry !== ""));
 }
+/** A media block's sha-256, once per block object (shared by both identity kinds). */
+function mediaDigest(part) {
+    const cached = mediaDigestCache.get(part);
+    if (cached !== undefined)
+        return cached;
+    const hash = createHash("sha256");
+    updateCanonical(hash, stripBlockCache(part));
+    const digest = hash.digest("hex");
+    mediaDigestCache.set(part, digest);
+    return digest;
+}
 function splitSlots(slots) {
     const bar = slots.indexOf("|");
     return [slots.slice(0, bar), slots.slice(bar + 1).split(",")];
@@ -127,9 +142,7 @@ function collectSlots(content, out) {
         return;
     for (const part of content) {
         if (part?.type === "image" || part?.type === "document") {
-            const hash = createHash("sha256");
-            updateCanonical(hash, stripBlockCache(part));
-            out.push(hash.digest("hex"));
+            out.push(mediaDigest(part));
         }
         else if (isMediaOrPlaceholder(part)) {
             out.push("");
@@ -218,12 +231,7 @@ function messageHash(message, stable, mode) {
     const cached = cache.get(message);
     if (cached !== undefined)
         return cached;
-    let content = message.content;
-    if (stable && Array.isArray(content)) {
-        content = content.filter((part) => part?.type !== "thinking" && part?.type !== "redacted_thinking");
-    }
-    const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
-    const reminded = normalizeReminders(blocks);
+    const reminded = normalizeReminders(hashedBlocks(message, stable));
     const kept = mode.media === "drop" ? withoutMedia(reminded)
         : mode.media === "slot" ? withMediaSlots(reminded) : reminded;
     const normalized = {
@@ -235,6 +243,14 @@ function messageHash(message, stable, mode) {
     const digest = hash.digest("hex");
     cache.set(message, digest);
     return digest;
+}
+/** The content blocks an identity hashes: a string as one text block, stable shapes without thinking. */
+function hashedBlocks(message, stable) {
+    let content = message.content;
+    if (stable && Array.isArray(content)) {
+        content = content.filter((part) => part?.type !== "thinking" && part?.type !== "redacted_thinking");
+    }
+    return typeof content === "string" ? [{ type: "text", text: content }] : content;
 }
 /** Same transform for stored and incoming messages, including nested tool results. */
 function normalizeReminders(content) {

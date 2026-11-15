@@ -4440,6 +4440,15 @@ function prefixMismatch(
   return firstPrefixMiss(messages, prefix, kind) === undefined ? null : "prefix";
 }
 
+/**
+ * The stored media slots that let covered message `i` match with media evicted or put back
+ * (prefixMessageMatches), except on the last covered message: the only one a user can still
+ * send again differently (rewind and resend), so there media must match exactly (Codex r2).
+ */
+function putBackSlots(slots: string[] | undefined, i: number, covered: number): string | undefined {
+  return i < covered - 1 ? slots?.[i] : undefined;
+}
+
 /** The first message the prefix covers that no longer matches it, if any. */
 function firstPrefixMiss(
   messages: Message[], prefix: PrefixLike, kind: PrefixIdentity
@@ -4448,7 +4457,8 @@ function firstPrefixMiss(
   for (let i = 0; i < length; i++) {
     if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i],
       prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i],
-      prefix.originalPortableMediaFreeHashes?.[i], prefix.originalMediaSlots?.[i])) {
+      prefix.originalPortableMediaFreeHashes?.[i],
+      putBackSlots(prefix.originalMediaSlots, i, prefix.originalPrefixHashes.length))) {
       return i;
     }
   }
@@ -5791,7 +5801,8 @@ function memoryRoutedToolBody(
   for (let i = 0; i < prefixLength; i++) {
     if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i],
       route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i],
-      route.originalPortableMediaFreeHashes?.[i], route.originalMediaSlots?.[i])) {
+      route.originalPortableMediaFreeHashes?.[i],
+      putBackSlots(route.originalMediaSlots, i, prefixLength))) {
       return null;
     }
   }

@@ -11,6 +11,9 @@ const jsonFieldCache = new WeakMap<Message, Map<string, string>>();
 /** Each message's mediaSlots, per identity kind, computed once. */
 const mediaSlotCaches = { route: new WeakMap<Message, string>(), stable: new WeakMap<Message, string>() };
 
+/** Each media block's digest, computed once (Codex r2). */
+const mediaDigestCache = new WeakMap<object, string>();
+
 /**
  * What an identity keeps of a message (messageHash). `portable` canonicalizes how Claude
  * Code renders unchanged history (portableContent).
@@ -100,7 +103,7 @@ export function extendsHistory(newer: Message[], older: Message[]): boolean {
   return a.length >= b.length && b.every((message, i) =>
     routeMessageHash(a[i]) === routeMessageHash(message) ||
     prefixMessageMatches(a[i], "route", routeMessageHash(message), mediaFreeMessageHash(message),
-      undefined, undefined, mediaSlots(message, "route")));
+      undefined, undefined, carriesMedia(a[i].content) ? mediaSlots(message, "route") : undefined));
 }
 
 /** A message's route identity without its media (Claude Code's eviction keeps it). */
@@ -124,10 +127,12 @@ export function mediaSlots(message: Message, kind: PrefixIdentity): string {
   const cache = mediaSlotCaches[kind];
   const cached = cache.get(message);
   if (cached !== undefined) return cached;
+  const stable = kind === "stable" && stableShape(message);
   const entries: string[] = [];
-  collectSlots(message.content, entries);
+  // From the blocks the slot hash is built from, so entry i is the hash's slot i (review r2).
+  collectSlots(normalizeReminders(hashedBlocks(message, stable)), entries);
   const slots = entries.length === 0 ? ""
-    : `${messageHash(message, kind === "stable" && stableShape(message), MEDIA_SLOTS)}|${entries.join(",")}`;
+    : `${messageHash(message, stable, MEDIA_SLOTS)}|${entries.join(",")}`;
   cache.set(message, slots);
   return slots;
 }
@@ -150,6 +155,17 @@ function slotsEvictedOrPutBack(current: string, stored: string): boolean {
     (storedEntries[i] === "" && entry !== ""));
 }
 
+/** A media block's sha-256, once per block object (shared by both identity kinds). */
+function mediaDigest(part: object): string {
+  const cached = mediaDigestCache.get(part);
+  if (cached !== undefined) return cached;
+  const hash = createHash("sha256");
+  updateCanonical(hash, stripBlockCache(part));
+  const digest = hash.digest("hex");
+  mediaDigestCache.set(part, digest);
+  return digest;
+}
+
 function splitSlots(slots: string): [string, string[]] {
   const bar = slots.indexOf("|");
   return [slots.slice(0, bar), slots.slice(bar + 1).split(",")];
@@ -159,9 +175,7 @@ function collectSlots(content: unknown, out: string[]): void {
   if (!Array.isArray(content)) return;
   for (const part of content) {
     if (part?.type === "image" || part?.type === "document") {
-      const hash = createHash("sha256");
-      updateCanonical(hash, stripBlockCache(part));
-      out.push(hash.digest("hex"));
+      out.push(mediaDigest(part));
     } else if (isMediaOrPlaceholder(part)) {
       out.push("");
     } else if (part?.type === "tool_result") {
@@ -248,14 +262,7 @@ function messageHash(message: Message, stable: boolean, mode: HashMode): string 
   const cache = hashCache(stable, mode);
   const cached = cache.get(message);
   if (cached !== undefined) return cached;
-  let content = message.content;
-  if (stable && Array.isArray(content)) {
-    content = content.filter(
-      (part: any) => part?.type !== "thinking" && part?.type !== "redacted_thinking"
-    );
-  }
-  const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
-  const reminded = normalizeReminders(blocks);
+  const reminded = normalizeReminders(hashedBlocks(message, stable));
   const kept = mode.media === "drop" ? withoutMedia(reminded)
     : mode.media === "slot" ? withMediaSlots(reminded) : reminded;
   const normalized = {
@@ -267,6 +274,17 @@ function messageHash(message: Message, stable: boolean, mode: HashMode): string 
   const digest = hash.digest("hex");
   cache.set(message, digest);
   return digest;
+}
+
+/** The content blocks an identity hashes: a string as one text block, stable shapes without thinking. */
+function hashedBlocks(message: Message, stable: boolean): unknown {
+  let content = message.content;
+  if (stable && Array.isArray(content)) {
+    content = content.filter(
+      (part: any) => part?.type !== "thinking" && part?.type !== "redacted_thinking"
+    );
+  }
+  return typeof content === "string" ? [{ type: "text", text: content }] : content;
 }
 
 /** Same transform for stored and incoming messages, including nested tool results. */
