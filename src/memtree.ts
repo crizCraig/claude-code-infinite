@@ -1608,8 +1608,6 @@ export class MemtreeClient {
       extendsHistory(job.messages, sent.messages) && !losesMedia(sent.messages, job.messages);
   }
 
-
-
   /**
    * A compress call is sending `messages` (the server stores every request it gets, even
    * one it refuses): a held-back history it carries whole is dropped, or its later upload
@@ -1618,12 +1616,16 @@ export class MemtreeClient {
    */
   private retireHeldBy(sessionId: string | undefined, messages: Message[]): void {
     const lane = indexLaneKey(sessionId, messages);
-    const held = this.indexLanesHeld.get(lane);
-    if (!held || !extendsHistory(messages, held.messages) || losesMedia(held.messages, messages)) {
-      return;
+    const carries = (job: QueuedIndex | undefined): job is QueuedIndex => job !== undefined &&
+      extendsHistory(messages, job.messages) && !losesMedia(job.messages, messages);
+    if (carries(this.indexLanesHeld.get(lane))) {
+      this.indexLanesHeld.delete(lane);
+      this.clearHoldTimer(lane);
     }
-    this.indexLanesHeld.delete(lane);
-    this.clearHoldTimer(lane);
+    // One waiting behind an upload in flight too (the server indexes a compress request
+    // like an index-only one, so nothing is lost; review r4). A final index still goes.
+    const waiting = this.indexLanesNext.get(lane);
+    if (carries(waiting) && !waiting.opts.finalIndex) this.indexLanesNext.delete(lane);
   }
 
   private clearHoldTimer(lane: string): void {
@@ -2133,7 +2135,7 @@ export class MemtreeClient {
     // Sent, this compress call is stored as the conversation's newest request whatever it
     // answers (polychat stores a refused 413 too): an older held history it carries must
     // not follow it (Codex r2/r3 P1). If it never arrives, the next turn holds again.
-    if (!opts.indexOnly && planned.limit?.action !== "trimmed") {
+    if (!opts.indexOnly && planned.limit?.action !== "trimmed" && !controller.signal.aborted) {
       this.retireHeldBy(opts.sessionId, messages);
     }
     try {

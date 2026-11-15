@@ -815,6 +815,51 @@ test("a compress call the server stores but refuses (413) still retires the held
   }
 });
 
+test("a held history the timer queued behind a slow upload is retired by a compress call that carries it", async () => {
+  // Opus r4 P2: the timer fired while an upload was in flight, the held history waited
+  // behind it, and went after a newer compress call.
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      calls.push(body.index_only ? `index:${body.messages.length}` : `compress:${body.messages.length}`);
+      if (body.index_only && calls.length === 1) await firstGate;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body.index_only ? { messages: [], index_only: true } : RESULT));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new MemtreeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      apiKey: "k", indexHoldMaxMs: 50 });
+    const conv = [{ role: "user", content: "x".repeat(50_000) }];
+    const index = () => {
+      const messages = conv.slice();
+      client.indexInBackground(MemtreeClient.hashMessages(messages), messages, 100, "s");
+    };
+    index(); // in flight until released
+    await waitFor(() => calls.length === 1);
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "small" });
+    index(); // held; the timer queues it behind the upload in flight
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    conv.push({ role: "assistant", content: "ok" }, { role: "user", content: "newer" });
+    const newer = conv.slice();
+    await client.compress(MemtreeClient.hashMessages(newer), newer, 100, undefined,
+      { sessionId: "s" });
+    releaseFirst();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(calls, ["index:1", "compress:5"], "no older history after the compress call");
+    assert.equal(await client.drainBackground(2_000), true);
+  } finally {
+    releaseFirst();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("CCC_INDEX_HOLD_MAX_MS sets the hold limit; junk keeps the default", () => {
   assert.equal(holdMaxFromEnv(undefined), INDEX_HOLD_MAX_MS);
   assert.equal(holdMaxFromEnv(""), INDEX_HOLD_MAX_MS);
