@@ -3110,6 +3110,7 @@ function persistStablePrefix(state, sessionId, prefix) {
             originalMediaFreeHashes: prefix.originalMediaFreeHashes,
             originalPortableHashes: prefix.originalPortableHashes,
             originalPortableMediaFreeHashes: prefix.originalPortableMediaFreeHashes,
+            originalMediaSlots: prefix.originalMediaSlots,
             compressedMessages: prefix.compressedMessages,
             compressedSystem: prefix.compressedSystem,
             hasCompressedSystem: prefix.hasCompressedSystem,
@@ -3203,11 +3204,29 @@ function prefixMismatch(body, messages, prefix, sessionId, kind = "route") {
         return "prefix";
     return firstPrefixMiss(messages, prefix, kind) === undefined ? null : "prefix";
 }
+/**
+ * The stored media slots that let covered message `i` match with media evicted or put back
+ * (prefixMessageMatches), except on the last covered message that is not an ambient system
+ * one (`last`, lastSentCovered): the only one a user can still send again differently
+ * (rewind and resend), so there media must match exactly (Codex r2, r3).
+ */
+function putBackSlots(slots, i, last) {
+    return i < last ? slots?.[i] : undefined;
+}
+/** The index of the last of the first `covered` messages whose role is not system. */
+function lastSentCovered(messages, covered) {
+    for (let i = Math.min(covered, messages.length) - 1; i >= 0; i--) {
+        if (messages[i]?.role !== "system")
+            return i;
+    }
+    return -1;
+}
 /** The first message the prefix covers that no longer matches it, if any. */
 function firstPrefixMiss(messages, prefix, kind) {
     const length = Math.min(messages.length, prefix.originalPrefixHashes.length);
+    const last = lastSentCovered(messages, prefix.originalPrefixHashes.length);
     for (let i = 0; i < length; i++) {
-        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i], prefix.originalPortableMediaFreeHashes?.[i])) {
+        if (!prefixMessageMatches(messages[i], kind, prefix.originalPrefixHashes[i], prefix.originalMediaFreeHashes?.[i], prefix.originalPortableHashes?.[i], prefix.originalPortableMediaFreeHashes?.[i], putBackSlots(prefix.originalMediaSlots, i, last))) {
             return i;
         }
     }
@@ -4195,8 +4214,9 @@ function memoryRoutedToolBody(body, messages, route, routeEpoch, sessionId) {
     const prefixLength = route.originalPrefixHashes.length;
     if (messages.length < prefixLength)
         return null;
+    const last = lastSentCovered(messages, prefixLength);
     for (let i = 0; i < prefixLength; i++) {
-        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i], route.originalPortableMediaFreeHashes?.[i])) {
+        if (!prefixMessageMatches(messages[i], "route", route.originalPrefixHashes[i], route.originalMediaFreeHashes?.[i], route.originalPortableHashes?.[i], route.originalPortableMediaFreeHashes?.[i], putBackSlots(route.originalMediaSlots, i, last))) {
             return null;
         }
     }
