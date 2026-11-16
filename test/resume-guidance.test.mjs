@@ -395,10 +395,10 @@ test("resume guidance carries the hybrid-default wording; opted out, the text wo
   const { resumeGuidance, announcedInstructionsNeedle } = await import("../dist/resume-guidance.js");
   assert.equal(resumeGuidance({}), RESUME_GUIDANCE, "default: unchanged");
   assert.equal(announcedInstructionsNeedle({}), ANNOUNCED_INSTRUCTIONS_NEEDLE);
-  assert.match(RESUME_GUIDANCE, /Hybrid mode \(default\)/);
+  assert.match(RESUME_GUIDANCE, /leave mode at hybrid \(the default\)/);
   const off = { CCC_MEMTREE_HYBRID_SEARCH: "0" };
   assert.match(resumeGuidance(off), /Text mode \(default\)/);
-  assert.doesNotMatch(resumeGuidance(off), /Hybrid mode \(default\)/);
+  assert.doesNotMatch(resumeGuidance(off), /hybrid \(the default\)/);
   assert.notEqual(announcedInstructionsNeedle(off), ANNOUNCED_INSTRUCTIONS_NEEDLE);
   assert.ok(announcedInstructionsNeedle(off).includes("Text mode (default)"));
 });

@@ -132,25 +132,26 @@ const PREFIX_RETRY_INTERVAL_MS = 45_000;
  * before any memory message exists. Constant, so the prompt cache holds.
  */
 /**
- * The search mode wording: hybrid is the default (Craig, 2026-11-14); the text-default
- * wording is what a process opted out of hybrid (HYBRID_SEARCH_ENV=0) lists instead.
+ * The search mode wording: hybrid is the default (Craig, 2026-11-14) and the mode for finding
+ * things; text is for known exact words (2026-11-15: "free and faster" steered readers to text).
+ * The text-default wording is what a process opted out of hybrid (HYBRID_SEARCH_ENV=0) lists.
  */
-const HYBRID_DEFAULT_INSTRUCTION = "Hybrid mode (default) fuses text and vector by rank: the best recall. Text mode matches exact words, ids and " +
-    "paths; vector mode matches meaning. A search costs $0.0005 in any mode: its first page is charged even when " +
-    "cached; cursor continuation is free, as is a text search of one tree (\"mode\": \"text\" with a tree: free " +
-    "and faster).";
+const HYBRID_DEFAULT_INSTRUCTION = "To find something, leave mode at hybrid (the default): it fuses text and vector by rank, the best recall. " +
+    "Use mode \"text\" only when you know the exact words, ids, paths or errors; vector matches meaning. A " +
+    "search costs $0.0005 in any mode: its first page is charged even when cached; cursor continuation is free, " +
+    "as is a text search of one tree.";
 const TEXT_DEFAULT_INSTRUCTION = "Text mode (default) matches exact words, ids and paths; vector mode matches meaning. A search costs " +
     "$0.0005 either way: its first page is charged even when cached; cursor continuation is free, even if " +
     "re-embedded, as is a text search of one tree.";
-const HYBRID_DEFAULT_SENTENCE = "mode \"hybrid\" (default, best recall) fuses text and vector by rank into one page (no cursor); mode \"text\" " +
-    "matches exact words, ids, paths and errors (in one tree: summaries and transcript lines; free and faster); " +
-    "mode \"vector\" matches meaning. A search costs $0.0005 in any mode: its first page is charged even when " +
-    "cached; cursor continuation and a text search of one tree are free.";
+const HYBRID_DEFAULT_SENTENCE = "mode \"hybrid\" (default, best recall: use it to find things) fuses text and vector by rank into one page (no " +
+    "cursor); mode \"text\" matches exact words, ids, paths and errors you already know (in one tree: summaries " +
+    "and transcript lines); mode \"vector\" matches meaning. A search costs $0.0005 in any mode: its first page is " +
+    "charged even when cached; cursor continuation and a text search of one tree are free.";
 const TEXT_DEFAULT_SENTENCE = "mode \"text\" (default) matches words, ids, paths and errors (in one tree: node summaries and transcript " +
     "lines); mode \"vector\" matches meaning, ranked per embedding model. A search costs $0.0005 either way: its " +
     "first page is charged even when cached; cursor continuation and a text search of one tree are free.";
-const HYBRID_MODE_DESCRIPTION = "hybrid (default: text and vector fused by rank, best recall; one page, no cursor), text (exact words; free " +
-    "and faster in one tree) or vector (meaning); first page charged, except text in one tree.";
+const HYBRID_MODE_DESCRIPTION = "hybrid (default, best recall: use it to find things; one page, no cursor), text (when you know the exact " +
+    "words, ids or paths) or vector (meaning); first page charged, except text in one tree.";
 const TEXT_MODE_DESCRIPTION = "text (default, exact words) or vector (meaning); first page charged, except text in one tree.";
 export const MEMTREE_MCP_INSTRUCTIONS = "This session runs in Claude Code Infinite, which lets a conversation continue past the model's context window. " +
     "MemTree indexes the whole conversation as it goes: a tree of summaries from a one-line overview at the root down to " +
