@@ -94,7 +94,7 @@ your indexed sessions, so you can just ask:
 
 | Tool | What it does |
 | --- | --- |
-| `search` | Searches this session's tree or all of your sessions. Hybrid mode (default) runs text and vector together, fused by rank: the best recall. Text mode matches exact words, ids, paths and errors; vector mode matches meaning. A search costs $0.0005 in any mode, first page only (continuations and a text search of one tree are free, so `mode: "text"` with a tree is the free, faster option). Filter by project, `since` and `until`. |
+| `search` | Searches this session's tree or all of your sessions. Hybrid mode (default) runs text and vector together, fused by rank: the best recall, and the mode for finding things. Text mode matches exact words, ids, paths and errors, for when you know them; vector mode matches meaning. A search costs $0.0005 in any mode, first page only (continuations and a text search of one tree are free). Filter by project, `since` and `until`. |
 | `list` | Lists your sessions, most recently active first, with title, first message, project (directory, repo, branch), models and times. Filter by time, project or words. |
 | `read_node` | Opens a node: its summary, its path from the root, and its children. |
 | `read_lines` | Reads the exact original transcript lines under a leaf. |
