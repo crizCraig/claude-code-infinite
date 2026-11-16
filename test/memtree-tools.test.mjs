@@ -1027,7 +1027,13 @@ test("MCP instructions mention the cross-session tools and stay constant", () =>
     assert.match(description, /live.*snapshot/i);
   }
   assert.match(search.inputSchema.properties.mode.description, /first page.*charged/i);
-  assert.match(search.inputSchema.properties.mode.description, /text \(exact words; free and faster in one tree\)/);
+  // Hybrid is for finding things; text only when the exact words are known. "Free and faster"
+  // steered readers to text for 323 of 464 searches (LongMemEval, 2026-11-15).
+  assert.match(search.inputSchema.properties.mode.description, /hybrid \(default, best recall: use it to find things/);
+  assert.match(search.inputSchema.properties.mode.description, /text \(when you know the exact words, ids or paths\)/);
+  for (const text of [MEMTREE_MCP_INSTRUCTIONS, search.description, search.inputSchema.properties.mode.description]) {
+    assert.doesNotMatch(text, /faster/i);
+  }
   assert.equal(search.inputSchema.properties.mode.enum.join(","), "hybrid,text,vector");
   // Not only for code: chats, role-play and agents ask what the user said, too (LongMemEval, 2026-11-14).
   assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /re-deriving it from the code|The code shows what exists/);
@@ -1338,12 +1344,12 @@ test("hybrid search is the default; CCC_MEMTREE_HYBRID_SEARCH=0 opts out to text
     assert.deepEqual(await listedModes(), ["hybrid", "text", "vector"]);
     assert.equal(memtreeTools(process.env), MEMTREE_TOOLS);
     const search = MEMTREE_TOOLS.find((t) => t.name === "search");
-    assert.match(search.description, /mode "hybrid" \(default, best recall\)/);
-    assert.match(search.description, /in one tree: summaries and transcript lines; free and faster/);
+    assert.match(search.description, /mode "hybrid" \(default, best recall: use it to find things\)/);
+    assert.match(search.description, /exact words, ids, paths and errors you already know \(in one tree: summaries and transcript lines\)/);
     assert.doesNotMatch(search.description, /mode "text" \(default\)/);
     assert.equal(memtreeInstructions(process.env), MEMTREE_MCP_INSTRUCTIONS);
-    assert.match(MEMTREE_MCP_INSTRUCTIONS, /Hybrid mode \(default\) .* the best recall/);
-    assert.match(MEMTREE_MCP_INSTRUCTIONS, /"mode": "text" with a tree: free and faster/);
+    assert.match(MEMTREE_MCP_INSTRUCTIONS, /To find something, leave mode at hybrid \(the default\).* the best recall/);
+    assert.match(MEMTREE_MCP_INSTRUCTIONS, /Use mode "text" only when you know the exact words, ids, paths or errors/);
     assert.doesNotMatch(MEMTREE_MCP_INSTRUCTIONS, /Text mode \(default\)/);
     await call("search", { query: "x", tree: "current" });
     await call("search", { query: "x" });
