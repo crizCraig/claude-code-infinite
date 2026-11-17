@@ -12,6 +12,7 @@
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
 import spawn from "cross-spawn";
+import { SavingsTracker } from "./savings-tracker.js";
 import { exec } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
@@ -683,7 +684,13 @@ async function main() {
         toolOutputs: new ToolOutputStore(),
         // The link shown to the user follows the session's newest tree on the server.
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
-        // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
+        // Local API-equivalent totals; authoritative MemTree bills refresh in the background.
+        savings: new SavingsTracker({ usageUrl: memtree.usageDashboardUrl, diagnostics,
+            fetchCosts: async (sessionId) => {
+                const result = await memtree.fetchMemTree(`/v1/ccc/savings/${encodeURIComponent(sessionId)}`, "application/json", AbortSignal.timeout(3000));
+                return result.status === 200 ? JSON.parse(result.body.toString("utf-8")) : undefined;
+            } }),
+        // The link Claude Code's status line shows, refreshed as trees finish.
         statusLinks: new StatusLinkFiles(),
         // Per-request refreshes (a sessions lookup a minute) only for status lines that show it.
         statusLinkRefresh: process.env.CCC_STATUSLINE_REFRESH === "1" || statusLineWantsLink(),

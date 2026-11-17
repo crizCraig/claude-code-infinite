@@ -66,6 +66,7 @@ import type { ProjectMeta } from "./project-meta.js";
 import type { ProjectTreesHint } from "./project-trees.js";
 import { type SubagentMemoryHint } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
+import type { SavingsTracker } from "./savings-tracker.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { UrlOpener } from "./open-url.js";
 import { ThreadRefusals, type MessageThreadsMode } from "./thread-backstop.js";
@@ -284,6 +285,8 @@ export interface ProxyOptions {
      * and refusals, as allowlisted enums and numbers. Never content.
      */
     diagnostics?: DiagnosticsRecorder;
+    /** Display-only accounting; never changes routing or billing. */
+    savings?: SavingsTracker;
     /** Test-only: forward to this origin instead of api.anthropic.com. */
     upstreamOrigin?: string;
     /**

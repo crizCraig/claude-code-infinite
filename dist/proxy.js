@@ -1308,6 +1308,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
     // An index wait may hold this request (runBlockingCompression) until Claude Code leaves.
     indexHolds.set(rec, { started: received, closed: closedSignal(res) });
+    let settleSavings;
     const logged = async (forward) => {
         try {
             await forward;
@@ -1316,6 +1317,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (rec.totalMs === undefined)
                 rec.totalMs = Date.now() - received;
             noteForwardedSize(state, rec, requestSessionId(req));
+            settleSavings?.();
             opts.reqlog?.log(rec);
         }
     };
@@ -1412,6 +1414,22 @@ async function handleMessages(req, res, opts, upstream, state) {
         }
     }
     if (sideRequest && clientInfo) {
+        const sideSession = requestSessionId(req);
+        if (opts.savings && sideSession) {
+            const savings = opts.savings;
+            savings.begin(sideSession);
+            settleSavings = () => {
+                if (!(rec.forwardedBytes > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
+                    savings.cancel(sideSession);
+                    return;
+                }
+                savings.settle(sideSession, { request: JSON.parse(rawBody.toString("utf-8")),
+                    usage: rec.savingsUsageComplete ? rec.usage : undefined,
+                    model: body.model, requestModified: false,
+                    contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false),
+                    laneKey: "side:" + body.model, nowMs: received });
+            };
+        }
         if (typeof body.model === "string")
             rec.model = body.model;
         rec.stream = body.stream === true;
@@ -1494,6 +1512,27 @@ async function handleMessages(req, res, opts, upstream, state) {
         output: bodyOutputReservation(body),
         recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
     });
+    if (opts.savings && requestSessionKey) {
+        const savings = opts.savings;
+        const originalRequest = JSON.parse(rawBody.toString("utf-8"));
+        let modified = true;
+        savingsSendObservers.set(rec, sent => { modified = !sent.equals(rawBody); });
+        savings.begin(requestSessionKey, isMainRequest ? originalCandidate.estimate.tokens : undefined, isMainRequest ? sizingLimits().budget : undefined);
+        settleSavings = () => {
+            savingsSendObservers.delete(rec);
+            if (!(rec.forwardedBytes > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
+                savings.cancel(requestSessionKey);
+                return;
+            }
+            const exact = countSession.peek(originalCandidate.body)?.tokens;
+            savings.settle(requestSessionKey, { request: originalRequest, usage: rec.savingsUsageComplete ? rec.usage : undefined,
+                model: originalRequest.model, contextWindow: modelContextLimit,
+                outputReserve: sizingLimits().output, requestModified: modified, originalInputTokens: exact,
+                laneKey: notConversation ? "fragment:" + requestRouteKey : requestRouteKey, nowMs: received,
+                ...(isMainRequest ? { progress_tokens: exact ?? originalCandidate.estimate.tokens,
+                    budget_tokens: sizingLimits().budget } : {}) });
+        };
+    }
     if (isMainRequest && requestSessionKey !== undefined) {
         adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
     }
@@ -6087,6 +6126,7 @@ function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
     });
 }
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
+const savingsSendObservers = new WeakMap();
 const laneSendStamps = new WeakMap();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
 const coldGaps = new WeakMap();
@@ -6387,8 +6427,10 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             cancelForShutdown();
             return;
         }
-        if (rec)
+        if (rec) {
             laneSendStamps.get(rec)?.(bodyBuffer);
+            savingsSendObservers.get(rec)?.(bodyBuffer);
+        }
         upstreamReq = upstream.module.request({
             host: upstream.host,
             port: upstream.port,

@@ -230,6 +230,21 @@ kitty, VS Code, JetBrains, Windows Terminal); elsewhere you get the plain URL.
 
 ### MemTree link in the status line
 
+The installed `ccc statusline` also shows this session's estimated net savings:
+`🌿 MemTree · $4.20 saved · 38% less usage · savings`, followed by the tree link.
+The savings link opens your signed-in `/usage#savings` page. On narrow terminals the
+percentage is dropped first. Before positive savings, it shows progress toward the
+compression budget, such as `🌿 MemTree [■■■■□□□□□□] 41% to savings`.
+
+These are API-price equivalents, after compression costs and recorded MemTree bills,
+not measured subscription credits. Totals persist across resumes. The status command
+reads local files only; the proxy refreshes billing metadata in the background and
+shows progress while costs are unknown. Diagnostics opt-outs stop server reporting;
+local accounting can still fetch your own recorded costs. See [the accounting model](docs/savings.md)
+for prices, cache durations, the conservative plain-Claude compaction model, and limitations.
+The manual URL-only shell snippet below continues to show just the tree.
+
+
 `ccc` keeps each session's MemTree link in
 `~/.claude-code-infinite/statusline/<session id>.url`. On servers that offer it, that is the
 session's stable link (`/m/sessions/<session id>`, yours only: it opens the session's newest

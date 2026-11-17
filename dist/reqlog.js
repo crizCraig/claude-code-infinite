@@ -95,26 +95,75 @@ export class RequestLogger {
         return true;
     }
 }
-/**
- * Merge token usage out of a parsed SSE event into a record. Anthropic sends
- * input/cache counts on message_start and the final output count (plus
- * occasionally refreshed input counts) on message_delta.
- */
+const savingsUsageProtocols = new WeakMap();
 export function mergeUsageFromSseEvent(data, rec) {
     const type = data?.type;
-    if (type === "message_start")
-        mergeUsage(data?.message?.usage, rec);
-    else if (type === "message_delta")
-        mergeUsage(data?.usage, rec);
+    let protocol = savingsUsageProtocols.get(rec);
+    if (!protocol) {
+        protocol = { started: false, finalOutput: false, invalid: false };
+        savingsUsageProtocols.set(rec, protocol);
+    }
+    if (type === "message_start") {
+        if (rec.savingsUsageComplete !== undefined)
+            rec.savingsUsageComplete = false;
+        const usage = data?.message?.usage;
+        protocol.invalid ||= protocol.started || !validSavingsUsage(usage, true);
+        protocol.started = true;
+        mergeUsage(usage, rec);
+    }
+    else if (type === "message_delta") {
+        if (rec.savingsUsageComplete !== undefined)
+            rec.savingsUsageComplete = false;
+        const usage = data?.usage;
+        protocol.invalid ||= !protocol.started || !validSavingsUsage(usage, false);
+        protocol.finalOutput = validTokenCount(usage?.output_tokens);
+        mergeUsage(usage, rec);
+    }
+    else if (type === "error") {
+        protocol.invalid = true;
+        rec.savingsUsageComplete = false;
+    }
+    else if (type === "message_stop") {
+        rec.savingsUsageComplete = protocol.started && protocol.finalOutput && !protocol.invalid;
+    }
 }
 /** Merge usage from a non-streaming /v1/messages JSON response body. */
 export function mergeUsageFromJsonBody(body, rec) {
+    rec.savingsUsageComplete = false;
     try {
-        mergeUsage(JSON.parse(body.toString("utf-8"))?.usage, rec);
+        const response = JSON.parse(body.toString("utf-8"));
+        mergeUsage(response?.usage, rec);
+        rec.savingsUsageComplete = response?.type === "message" && Array.isArray(response.content) &&
+            validSavingsUsage(response.usage, true);
     }
     catch {
         // Not the shape we expected — usage just stays absent.
     }
+}
+const validTokenCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+/** Validate the raw fields before reqlog's permissive merge can drop bad values.
+ * In particular an invalid final output must not leave the valid initial zero
+ * looking like the complete billable output count. */
+function validSavingsUsage(value, full) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return false;
+    const usage = value;
+    if (full && (!validTokenCount(usage.input_tokens) || !validTokenCount(usage.output_tokens)))
+        return false;
+    for (const field of USAGE_FIELDS) {
+        if (Object.hasOwn(usage, field) && !validTokenCount(usage[field]))
+            return false;
+    }
+    if (Object.hasOwn(usage, "cache_creation")) {
+        const creation = usage.cache_creation;
+        if (!creation || typeof creation !== "object" || Array.isArray(creation))
+            return false;
+        for (const field of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
+            if (Object.hasOwn(creation, field) && !validTokenCount(creation[field]))
+                return false;
+        }
+    }
+    return true;
 }
 const USAGE_FIELDS = [
     "input_tokens",
@@ -131,6 +180,15 @@ function mergeUsage(usage, rec) {
             continue;
         rec.usage = rec.usage ?? {};
         rec.usage[field] = value;
+    }
+    const creation = usage.cache_creation;
+    if (creation && typeof creation === "object") {
+        const target = ((rec.usage ??= {}).cache_creation ??= {});
+        for (const key of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
+            const value = creation[key];
+            if (typeof value === "number")
+                target[key] = value;
+        }
     }
     const serverTools = serverToolUse(usage.server_tool_use);
     if (serverTools)

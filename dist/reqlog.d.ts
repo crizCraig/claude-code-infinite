@@ -92,6 +92,10 @@ export interface UsageRecord {
     input_tokens?: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+    cache_creation?: {
+        ephemeral_5m_input_tokens?: number;
+        ephemeral_1h_input_tokens?: number;
+    };
     output_tokens?: number;
     /** Server tool calls (e.g. web_search_requests); their results count as input. */
     server_tool_use?: Record<string, number>;
@@ -112,6 +116,8 @@ export interface CountTokensRecord {
 }
 export interface MessagesRecord {
     kind: "messages";
+    /** Complete usage protocol observed; an interrupted stream cannot claim savings. */
+    savingsUsageComplete?: boolean;
     turnType: TurnType;
     /** Body bytes as received from Claude Code. */
     requestBytes: number;
@@ -621,11 +627,6 @@ export declare class RequestLogger implements RequestLogSink {
      */
     flush(timeoutMs?: number): Promise<boolean>;
 }
-/**
- * Merge token usage out of a parsed SSE event into a record. Anthropic sends
- * input/cache counts on message_start and the final output count (plus
- * occasionally refreshed input counts) on message_delta.
- */
 export declare function mergeUsageFromSseEvent(data: any, rec: MessagesRecord): void;
 /** Merge usage from a non-streaming /v1/messages JSON response body. */
 export declare function mergeUsageFromJsonBody(body: Buffer, rec: MessagesRecord): void;

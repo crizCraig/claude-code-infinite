@@ -11930,3 +11930,32 @@ test("MemTree tool reads carry the tool and session on to the server; malformed 
     memtreeSrv.close();
   }
 });
+
+test('savings includes same-session monitor and title passthrough usage', async () => {
+  const upstream = await mockUpstream();
+  const settled = [];
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({baseUrl:upstream.origin,apiKey:'test'}),
+    upstreamOrigin:upstream.origin,
+    savings: {begin(){},cancel(){},settle(id,input){settled.push({id,input})}},
+  });
+  try {
+    for (const [system,content] of [
+      ['You are a security monitor for autonomous AI coding agents.', '<transcript>\n{"user":"hello"}\n</transcript>'],
+      ['You are naming a coding session', 'Give this session a title'],
+    ]) {
+      const response=await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method:'POST',headers:{'content-type':'application/json','x-claude-code-session-id':'savings-session'},
+        body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:64,
+          system:[{type:'text',text:'x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;'},
+            {type:'text',text:system}],messages:[{role:'user',content}]})});
+      assert.equal(response.status,200); await response.text();
+    }
+    await waitFor(()=>settled.length===2);
+    assert.equal(settled[0].input.requestModified,false);
+    assert.equal(settled[1].input.requestModified,false);
+    assert.equal(settled[0].input.usage.input_tokens,1);
+    assert.equal(settled[1].input.usage.output_tokens,1);
+    assert.notEqual(settled[0].input.laneKey,settled[1].input.laneKey);
+  } finally { proxy.close();upstream.close(); }
+});

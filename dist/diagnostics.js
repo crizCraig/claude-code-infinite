@@ -17,6 +17,7 @@
  * DO_NOT_TRACK=1, or Claude Code's DISABLE_TELEMETRY /
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
+import { savingsReport } from "./savings-report.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
@@ -57,6 +58,8 @@ export class Diagnostics {
     dropped = 0;
     installId;
     queue = [];
+    savings = new Map();
+    sendingSavings = new Set();
     inFlight = new Set();
     repeats = new Map();
     context = {};
@@ -108,6 +111,20 @@ export class Diagnostics {
             // Never break the caller.
         }
     }
+    /** Cumulative, retryable metadata; bounded and never sent without a user key. */
+    reportSavings(value) {
+        if (!this.enabled)
+            return;
+        const report = savingsReport(value);
+        if (!report)
+            return;
+        const old = this.savings.get(report.session_id);
+        if (old && old.sequence > report.sequence)
+            return;
+        this.savings.set(report.session_id, report);
+        if (this.savings.size > MAX_QUEUE)
+            this.savings.delete(this.savings.keys().next().value);
+    }
     /** Like record, but at most MAX_REPEATS times per `key` in this process. */
     recordLimited(key, name, fields = {}) {
         const seen = this.repeats.get(key) ?? 0;
@@ -127,6 +144,11 @@ export class Diagnostics {
     flushNow() {
         if (!this.enabled)
             return;
+        if (this.apiKey)
+            for (const report of this.savings.values()) {
+                if (!this.sendingSavings.has(report.session_id))
+                    this.track(this.sendSavings(report));
+            }
         while (this.queue.length > 0) {
             this.track(this.send(this.queue.splice(0, BATCH_SIZE)));
         }
@@ -137,17 +159,18 @@ export class Diagnostics {
             clearInterval(this.timer);
         this.timer = undefined;
         this.flushNow();
-        if (this.inFlight.size === 0)
-            return;
-        let timer;
-        await Promise.race([
-            Promise.allSettled([...this.inFlight]),
-            new Promise((resolve) => {
-                timer = setTimeout(resolve, timeoutMs);
-            }),
-        ]);
-        if (timer)
-            clearTimeout(timer);
+        const deadline = Date.now() + timeoutMs;
+        while (this.inFlight.size && Date.now() < deadline) {
+            let timer;
+            await Promise.race([
+                Promise.allSettled([...this.inFlight]),
+                new Promise((resolve) => {
+                    timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+                }),
+            ]);
+            if (timer)
+                clearTimeout(timer);
+        }
     }
     /** The exact JSON body a batch of these events is sent as (tests read it). */
     batchBody(events) {
@@ -167,6 +190,26 @@ export class Diagnostics {
         }
         catch {
             // Dropped: diagnostics never retry or surface errors.
+        }
+    }
+    async sendSavings(report) {
+        this.sendingSavings.add(report.session_id);
+        try {
+            const response = await (this.opts.fetchImpl ?? fetch)(`${this.opts.baseUrl.replace(/\/$/, "")}${DIAGNOSTICS_PATH}`, {
+                method: "POST", headers: this.headers(), signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+                body: JSON.stringify({ schema: DIAGNOSTICS_SCHEMA, install_id: this.installId,
+                    context: this.context, events: [], savings: report }),
+            });
+            if (response.ok && this.savings.get(report.session_id) === report) {
+                this.savings.delete(report.session_id);
+            }
+        }
+        catch { /* Retry newest cumulative snapshot on the next flush. */ }
+        finally {
+            this.sendingSavings.delete(report.session_id);
+            const newer = this.savings.get(report.session_id);
+            if (newer && newer !== report && this.apiKey)
+                this.track(this.sendSavings(newer));
         }
     }
     headers() {

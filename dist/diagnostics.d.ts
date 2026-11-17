@@ -38,6 +38,7 @@ export declare const MAX_REPEATS = 5;
 /** What the proxy and the launcher need: record an event, never fail. */
 export interface DiagnosticsRecorder {
     record(name: string, fields?: Record<string, unknown>): void;
+    reportSavings?(value: unknown): void;
 }
 export interface DiagnosticsOptions {
     baseUrl: string;
@@ -67,6 +68,8 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     dropped: number;
     private readonly installId;
     private readonly queue;
+    private readonly savings;
+    private readonly sendingSavings;
     private readonly inFlight;
     private readonly repeats;
     private context;
@@ -77,6 +80,8 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     /** Add context fields (allowlisted; later values win). */
     setContext(fields: Record<string, unknown>): void;
     record(name: string, fields?: Record<string, unknown>): void;
+    /** Cumulative, retryable metadata; bounded and never sent without a user key. */
+    reportSavings(value: unknown): void;
     /** Like record, but at most MAX_REPEATS times per `key` in this process. */
     recordLimited(key: string, name: string, fields?: Record<string, unknown>): void;
     /** Flush every FLUSH_INTERVAL_MS without keeping the process alive. */
@@ -88,6 +93,7 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     /** The exact JSON body a batch of these events is sent as (tests read it). */
     batchBody(events: DiagnosticsEvent[]): string;
     private send;
+    private sendSavings;
     private headers;
     private track;
     private now;

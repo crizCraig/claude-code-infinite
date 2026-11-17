@@ -18,6 +18,7 @@
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
 
+import { savingsReport, type SavingsReport } from "./savings-report.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
@@ -62,6 +63,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** What the proxy and the launcher need: record an event, never fail. */
 export interface DiagnosticsRecorder {
   record(name: string, fields?: Record<string, unknown>): void;
+  reportSavings?(value: unknown): void;
 }
 
 export interface DiagnosticsOptions {
@@ -93,6 +95,8 @@ export class Diagnostics implements DiagnosticsRecorder {
   dropped = 0;
   private readonly installId: string | null;
   private readonly queue: DiagnosticsEvent[] = [];
+  private readonly savings = new Map<string, SavingsReport>();
+  private readonly sendingSavings = new Set<string>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly repeats = new Map<string, number>();
   private context: DiagnosticsFields = {};
@@ -141,6 +145,17 @@ export class Diagnostics implements DiagnosticsRecorder {
     }
   }
 
+  /** Cumulative, retryable metadata; bounded and never sent without a user key. */
+  reportSavings(value: unknown): void {
+    if (!this.enabled) return;
+    const report = savingsReport(value);
+    if (!report) return;
+    const old = this.savings.get(report.session_id);
+    if (old && old.sequence > report.sequence) return;
+    this.savings.set(report.session_id, report);
+    if (this.savings.size > MAX_QUEUE) this.savings.delete(this.savings.keys().next().value!);
+  }
+
   /** Like record, but at most MAX_REPEATS times per `key` in this process. */
   recordLimited(key: string, name: string, fields: Record<string, unknown> = {}): void {
     const seen = this.repeats.get(key) ?? 0;
@@ -159,6 +174,9 @@ export class Diagnostics implements DiagnosticsRecorder {
   /** Send what is queued now; fire-and-forget. */
   flushNow(): void {
     if (!this.enabled) return;
+    if (this.apiKey) for (const report of this.savings.values()) {
+      if (!this.sendingSavings.has(report.session_id)) this.track(this.sendSavings(report));
+    }
     while (this.queue.length > 0) {
       this.track(this.send(this.queue.splice(0, BATCH_SIZE)));
     }
@@ -169,15 +187,17 @@ export class Diagnostics implements DiagnosticsRecorder {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.flushNow();
-    if (this.inFlight.size === 0) return;
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      Promise.allSettled([...this.inFlight]),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, timeoutMs);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
+    const deadline = Date.now() + timeoutMs;
+    while (this.inFlight.size && Date.now() < deadline) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** The exact JSON body a batch of these events is sent as (tests read it). */
@@ -198,6 +218,26 @@ export class Diagnostics implements DiagnosticsRecorder {
       });
     } catch {
       // Dropped: diagnostics never retry or surface errors.
+    }
+  }
+
+  private async sendSavings(report: SavingsReport): Promise<void> {
+    this.sendingSavings.add(report.session_id);
+    try {
+      const response = await (this.opts.fetchImpl ?? fetch)(
+        `${this.opts.baseUrl.replace(/\/$/, "")}${DIAGNOSTICS_PATH}`, {
+          method: "POST", headers: this.headers(), signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+          body: JSON.stringify({schema: DIAGNOSTICS_SCHEMA, install_id: this.installId,
+            context: this.context, events: [], savings: report}),
+        });
+      if (response.ok && this.savings.get(report.session_id) === report) {
+        this.savings.delete(report.session_id);
+      }
+    } catch { /* Retry newest cumulative snapshot on the next flush. */ }
+    finally {
+      this.sendingSavings.delete(report.session_id);
+      const newer = this.savings.get(report.session_id);
+      if (newer && newer !== report && this.apiKey) this.track(this.sendSavings(newer));
     }
   }
 

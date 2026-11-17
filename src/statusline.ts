@@ -21,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { getConfigDir } from "./config.js";
 import { terminalSupportsHyperlinks } from "./hooks.js";
+import { readSavingsView, renderSavingsSegment, visibleWidth } from "./savings-status.js";
 import { readStatusLink } from "./status-link.js";
 
 /** What `install` puts in settings.json. */
@@ -80,7 +81,12 @@ export async function renderStatusline(
   if (env[WRAPPED_ENV]) return "";
   const wrapped = savedStatusLine(savedFile(paths));
   const base = wrapped ? await runWrapped(wrapped.command, input) : "";
-  const segment = linkSegment(sessionIdOf(input), env, paths.links);
+  const id = sessionIdOf(input);
+  const tree = linkSegment(id, env, paths.links);
+  const columns = Number(env.COLUMNS) || process.stdout.columns || Infinity;
+  const remaining = columns - visibleWidth(base) - visibleWidth(tree) - (base ? 3 : 0) - (tree ? 3 : 0);
+  const savings = renderSavingsSegment(readSavingsView(id, paths.links), env, remaining);
+  const segment = [savings, tree].filter(Boolean).join(" · ");
   if (!segment) return base;
   return base ? `${base}${STATUSLINE_SEPARATOR}${segment}` : segment;
 }

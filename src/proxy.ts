@@ -185,6 +185,7 @@ import {
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
+import type { SavingsTracker } from "./savings-tracker.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
@@ -459,6 +460,8 @@ export interface ProxyOptions {
    * and refusals, as allowlisted enums and numbers. Never content.
    */
   diagnostics?: DiagnosticsRecorder;
+  /** Display-only accounting; never changes routing or billing. */
+  savings?: SavingsTracker;
   /** Test-only: forward to this origin instead of api.anthropic.com. */
   upstreamOrigin?: string;
   /**
@@ -2255,12 +2258,14 @@ async function handleMessages(
   noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
   // An index wait may hold this request (runBlockingCompression) until Claude Code leaves.
   indexHolds.set(rec, { started: received, closed: closedSignal(res) });
+  let settleSavings: (() => void) | undefined;
   const logged = async (forward: Promise<unknown>): Promise<void> => {
     try {
       await forward;
     } finally {
       if (rec.totalMs === undefined) rec.totalMs = Date.now() - received;
       noteForwardedSize(state, rec, requestSessionId(req));
+      settleSavings?.();
       opts.reqlog?.log(rec);
     }
   };
@@ -2356,6 +2361,23 @@ async function handleMessages(
     }
   }
   if (sideRequest && clientInfo) {
+    const sideSession = requestSessionId(req);
+    if (opts.savings && sideSession) {
+      const savings = opts.savings;
+      savings.begin(sideSession);
+      settleSavings = () => {
+        if (!(rec.forwardedBytes! > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
+          savings.cancel(sideSession);
+          return;
+        }
+        savings.settle(sideSession, {request: JSON.parse(rawBody.toString("utf-8")),
+          usage: rec.savingsUsageComplete ? rec.usage : undefined,
+          model: body.model, requestModified: false,
+          contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
+            opts.nativeOneMillionContext !== false),
+          laneKey: "side:" + body.model, nowMs: received});
+      };
+    }
     if (typeof body.model === "string") rec.model = body.model;
     rec.stream = body.stream === true;
     rec.client = clientInfo;
@@ -2442,6 +2464,28 @@ async function handleMessages(
     output: bodyOutputReservation(body),
     recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
   });
+  if (opts.savings && requestSessionKey) {
+    const savings = opts.savings;
+    const originalRequest = JSON.parse(rawBody.toString("utf-8"));
+    let modified = true;
+    savingsSendObservers.set(rec, sent => { modified = !sent.equals(rawBody); });
+    savings.begin(requestSessionKey, isMainRequest ? originalCandidate.estimate.tokens : undefined,
+      isMainRequest ? sizingLimits().budget : undefined);
+    settleSavings = () => {
+      savingsSendObservers.delete(rec);
+      if (!(rec.forwardedBytes! > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
+        savings.cancel(requestSessionKey);
+        return;
+      }
+      const exact = countSession.peek(originalCandidate.body)?.tokens;
+      savings.settle(requestSessionKey, {request:originalRequest,usage:rec.savingsUsageComplete ? rec.usage : undefined,
+        model:originalRequest.model,contextWindow:modelContextLimit,
+        outputReserve:sizingLimits().output,requestModified:modified,originalInputTokens:exact,
+        laneKey:notConversation ? "fragment:" + requestRouteKey : requestRouteKey,nowMs:received,
+        ...(isMainRequest ? {progress_tokens:exact ?? originalCandidate.estimate.tokens,
+          budget_tokens:sizingLimits().budget} : {})});
+    };
+  }
   if (isMainRequest && requestSessionKey !== undefined) {
     adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
   }
@@ -8023,6 +8067,7 @@ function noteAwayWarmsMain(
 }
 
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
+const savingsSendObservers = new WeakMap<MessagesRecord, (sent: Buffer) => void>();
 const laneSendStamps = new WeakMap<MessagesRecord, (sent: Buffer) => void>();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
 const coldGaps = new WeakMap<MessagesRecord, { lane: string; basis: number }>();
@@ -8349,7 +8394,10 @@ function forwardAccepted(
       return;
     }
 
-    if (rec) laneSendStamps.get(rec)?.(bodyBuffer);
+    if (rec) {
+      laneSendStamps.get(rec)?.(bodyBuffer);
+      savingsSendObservers.get(rec)?.(bodyBuffer);
+    }
     upstreamReq = upstream.module.request(
       {
         host: upstream.host,
