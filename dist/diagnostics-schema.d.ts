@@ -3,12 +3,14 @@
  *
  * Every event is rebuilt here from named fields only, each checked against an enum, a tight
  * pattern or an integer range; anything else is dropped before it is queued. The server
- * (polychat/ccc_diagnostics.py) enforces the same list again. There is no free-text field:
- * errors travel as codes, because a Node error message can quote its input (JSON.parse
- * does) and so carry conversation content.
+ * (polychat/ccc_diagnostics.py) enforces the same list again. The sole free-text exception
+ * is the optional first-run answer (account metadata). Errors travel as codes, because
+ * a Node error message can quote its input (JSON.parse does) and so carry conversation content.
  */
 export declare const DIAGNOSTICS_SCHEMA = 1;
 type Validator = (value: unknown) => unknown;
+/** Explicitly volunteered account metadata only; strip controls and cap Unicode characters. */
+export declare function firstRunAnswer(value: unknown): string | undefined;
 /**
  * Error codes and class names are fixed vocabularies; anything else is sent as "other"
  * (errnoName / errorClassName). A shape check would let a project or customer name through.

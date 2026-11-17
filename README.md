@@ -223,6 +223,7 @@ Environment variables, set when launching `ccc`:
 | `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction and idle compaction settings ([details](#claude-code-auto-compaction)). |
 | `CCC_NO_UPDATE_CHECK=1` | Turns off the update check, and with it automatic updates ([details](#upgrading)). |
 | `CCC_DISABLE_AUTOUPDATE=1` | Keeps the update notice but never installs ([details](#automatic-updates)). |
+| `CCC_NO_FIRST_RUN_QUESTION=1` | Skips the optional first-run question about why you use ccc. |
 | `CCC_NO_DIAGNOSTICS=1` | Turns off diagnostics ([details](#diagnostics)). So do `DO_NOT_TRACK=1`, Claude Code's `DISABLE_TELEMETRY=1` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and `"diagnostics": false` in `~/.claude-code-infinite/config.json`. |
 
 Links are clickable in terminals that support OSC 8 hyperlinks (iTerm2, Ghostty, WezTerm,
@@ -430,6 +431,15 @@ environment get MemTree. Sessions in other environments are unchanged.
 
 ### Diagnostics
 
+On your first interactive launch, ccc asks once what brings you to Claude Code Infinite.
+Enter skips; otherwise type a number (1–5) or your own answer and press Enter. Your choice
+is recorded in `~/.claude-code-infinite/first-run-question.json`, including a skip. The
+question never appears in print (`-p`), CI, non-TTY or help/version runs. Set
+`CCC_NO_FIRST_RUN_QUESTION=1` to opt out; disabling diagnostics also disables the question.
+An answer is optional account metadata sent once through diagnostics with your MemTree key,
+never added to a Claude session. Free text is limited to 200 Unicode characters with control
+characters removed. Like other diagnostics, a failed send is dropped rather than retried.
+
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
 
 - versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
@@ -444,8 +454,9 @@ environment get MemTree. Sessions in other environments are unchanged.
 - errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
   compression timeout).
 
-Never sent: your prompts or any conversation content, file paths, project or repository names,
-hostnames, usernames, environment values, keys or tokens, or error message text. Each event is
+Apart from the answer you explicitly type above, never sent: your prompts or any conversation
+content, file paths, project or repository names, hostnames, usernames, environment values,
+keys or tokens, or error message text. Each event is
 checked against a fixed allowlist on your machine before it is queued, and again by the server.
 They are tied to your MemTree key when you have one, otherwise to a random install id in
 `~/.claude-code-infinite/install_id`. Sending is batched in the background and never slows a

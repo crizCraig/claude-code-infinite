@@ -21,6 +21,7 @@ import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
+import { askFirstRunQuestion } from "./first-run-question.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
@@ -712,6 +713,12 @@ async function main() {
   if (isDebugMode && autoUpdate) console.log(`[DEBUG] ${autoUpdate.debugLine}`);
   diagnostics.setContext({ interactive: interactiveUi });
   recordAutoUpdateDecision(diagnostics, autoUpdate);
+  // After key resolution, before either the normal or MemTree-paused Claude launch.
+  await askFirstRunQuestion({
+    configDir: getConfigDir(), args: claudeArgs, env: process.env,
+    stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
+    diagnostics, ask: (question) => askAnswer(question, process.stdout),
+  });
   // A resumed session may be past the window under MemTree; plain Claude Code
   // could not send or compact it, so it keeps ccc's paused handling (402 notices).
   if (memtreeOff && !resumesSession(claudeArgs)) {

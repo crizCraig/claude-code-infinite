@@ -287,7 +287,10 @@ function errorCarrying(secret) {
   return err;
 }
 
-test("no content ever leaves: random events, records, errors and context carry none of it", async () => {
+// The volunteered first-run answer is the sole free-text exception, covered separately.
+const AUTOMATIC_EVENTS = Object.keys(EVENT_FIELDS).filter((name) => name !== "first_run_answer");
+
+test("automatic diagnostics: random events, records, errors and context carry no content", async () => {
   const rand = rng(20261016);
   for (let round = 0; round < 60; round++) {
     const secret = pick(rand, SECRETS);
@@ -295,7 +298,7 @@ test("no content ever leaves: random events, records, errors and context carry n
     const sink = new DiagnosticsRequestSink({ log() {} }, diagnostics);
     diagnostics.setContext(stuffed(rand, secret));
     for (let i = 0; i < 12; i++) {
-      diagnostics.record(pick(rand, [...Object.keys(EVENT_FIELDS), secret]), stuffed(rand, secret));
+      diagnostics.record(pick(rand, [...AUTOMATIC_EVENTS, secret]), stuffed(rand, secret));
       for (const record of realisticRecords(rand, secret)) sink.log(record);
       recordError(diagnostics, pick(rand, ["spawn_failed", secret]), errorCarrying(secret));
     }
@@ -313,13 +316,13 @@ test("no content ever leaves: random events, records, errors and context carry n
   }
 });
 
-test("no content ever leaves: only allowlisted keys and value shapes reach the wire", async () => {
+test("automatic diagnostics: only allowlisted keys and value shapes reach the wire", async () => {
   const rand = rng(7);
   const { diagnostics, sent } = make();
   const sink = new DiagnosticsRequestSink(undefined, diagnostics);
   for (let i = 0; i < 40; i++) {
     const secret = pick(rand, SECRETS);
-    diagnostics.record(pick(rand, Object.keys(EVENT_FIELDS)), stuffed(rand, secret));
+    diagnostics.record(pick(rand, AUTOMATIC_EVENTS), stuffed(rand, secret));
     for (const record of realisticRecords(rand, secret)) sink.log(record);
   }
   await diagnostics.flush(1000);

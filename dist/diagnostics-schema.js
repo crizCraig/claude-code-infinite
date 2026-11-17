@@ -3,13 +3,21 @@
  *
  * Every event is rebuilt here from named fields only, each checked against an enum, a tight
  * pattern or an integer range; anything else is dropped before it is queued. The server
- * (polychat/ccc_diagnostics.py) enforces the same list again. There is no free-text field:
- * errors travel as codes, because a Node error message can quote its input (JSON.parse
- * does) and so carry conversation content.
+ * (polychat/ccc_diagnostics.py) enforces the same list again. The sole free-text exception
+ * is the optional first-run answer (account metadata). Errors travel as codes, because
+ * a Node error message can quote its input (JSON.parse does) and so carry conversation content.
  */
 export const DIAGNOSTICS_SCHEMA = 1;
 /** A validator's "not allowed" answer. */
 const DROP = Symbol("drop");
+/** Explicitly volunteered account metadata only; strip controls and cap Unicode characters. */
+export function firstRunAnswer(value) {
+    if (typeof value !== "string")
+        return undefined;
+    const cleaned = Array.from(value.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "").trim())
+        .slice(0, 200).join("");
+    return cleaned || undefined;
+}
 /** Three parts only: a fourth (Claude Code's build suffix) would let an IPv4 address through. */
 const VERSION_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}(?:-(?:alpha|beta|rc|next|canary)(?:\.\d{1,4})?)?$/;
 /**
@@ -179,6 +187,7 @@ export const EVENT_FIELDS = {
     /** npm's postinstall (install-ping.ts); false when this machine already had an install id. */
     installed: { new_install: bool },
     first_run: {},
+    first_run_answer: { answer: firstRunAnswer },
     sign_in_prompt: {},
     key_saved: {},
     key_status: { result: oneOf(["ok", "invalid", "payment_required", "unknown"]), status: STATUS },
