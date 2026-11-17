@@ -41,7 +41,8 @@ export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn
 export declare const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
 export declare const PAYMENT_REQUIRED_NOTICE = "\u26A0 MemTree is off \u2014 payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export declare const SLOW_FIRST_TOKEN_NOTICE = "\u2728 Something special is happening \u2014 please wait\u2026";
-export declare const STARTUP_NOTICE = "\u221E MemTree \u00B7 Infinite Context Enabled \u221E";
+/** Leads with the product name users installed (Claude Code Infinite), then the feature. */
+export declare const STARTUP_NOTICE = "\u221E Claude Code Infinite \u00B7 MemTree memory on";
 /**
  * Session-start banner delivered inside Claude Code via the SessionStart
  * hook's systemMessage. Styling mirrors the notice queue's conventions:

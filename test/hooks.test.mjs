@@ -420,7 +420,7 @@ test("startup banner rides a SessionStart command hook emitting systemMessage JS
   // Leading newline and an apostrophe: the newline must survive as a JSON
   // escape (sh/zsh `echo` would expand it and corrupt the payload), and the
   // quote exercises shell quoting.
-  const message = "\n·─╼ • MemTree · Infinite Context Enabled ∞ ╾─· it's on";
+  const message = "\n·─╼ ∞ Claude Code Infinite · MemTree memory on ╾─· it's on";
   const plugin = createSessionNoticePlugin(
     "http://127.0.0.1:12345/_ccc/hooks/unpredictable",
     { tempRoot, startupMessage: message }
