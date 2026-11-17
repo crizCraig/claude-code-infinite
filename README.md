@@ -2,7 +2,7 @@
   <img width="470" height="214" alt="cc-inf-wide-transparent" src="https://github.com/user-attachments/assets/1524e5dc-637f-4d25-9a15-f7f7b65c8182" />
 </p>
 
-# Claude Code Infinite
+# Claude Code Infinite - By MemTree
 
 <p align="center">
   <a href="#long-session-benchmark"><img width="640" alt="Long-session benchmark, Claude Opus 5.5, graded blind, on a ~800k-token Claude Code session: MemTree 69% (~420k tokens after MemTree), /compact 49% (~13k tokens after /compact)" src="https://raw.githubusercontent.com/crizCraig/claude-code-infinite/main/docs/images/benchmark-chart.png"></a>
