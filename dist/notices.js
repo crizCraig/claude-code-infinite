@@ -60,7 +60,8 @@ export const DEGRADED_NOTICE = "⚠ MemTree degraded — this turn ran uncompres
 export const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
 export const PAYMENT_REQUIRED_NOTICE = "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
 export const SLOW_FIRST_TOKEN_NOTICE = "✨ Something special is happening — please wait…";
-export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
+/** Leads with the product name users installed (Claude Code Infinite), then the feature. */
+export const STARTUP_NOTICE = "∞ Claude Code Infinite · MemTree memory on";
 /**
  * Session-start banner delivered inside Claude Code via the SessionStart
  * hook's systemMessage. Styling mirrors the notice queue's conventions:
@@ -73,8 +74,8 @@ export const STARTUP_NOTICE = "∞ MemTree · Infinite Context Enabled ∞";
  */
 export function startupNoticeText(color, update = null, installedVersion = null) {
     const banner = color
-        ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mMemTree\x1b[22m · " +
-            "\x1b[32mInfinite Context Enabled\x1b[39m \x1b[36m∞\x1b[39m \x1b[2m╾─·\x1b[22m"
+        ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[36m∞\x1b[39m \x1b[1mClaude Code Infinite\x1b[22m · " +
+            "\x1b[32mMemTree memory on\x1b[39m \x1b[2m╾─·\x1b[22m"
         : `\n\n·─╼ ${STARTUP_NOTICE} ╾─·`;
     if (installedVersion)
         return `${banner}\n${updateInstalledNoticeText(installedVersion, color)}`;
