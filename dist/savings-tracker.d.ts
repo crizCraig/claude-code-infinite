@@ -1,4 +1,3 @@
-/** Proxy settlement adapter: local totals first; authoritative billing refresh in background. */
 import { type SavingsTurnInput, type SavingsPromptCheckpoint } from './savings.js';
 import { SavingsHistory } from './savings-history.js';
 import type { DiagnosticsRecorder } from './diagnostics.js';
@@ -20,7 +19,7 @@ export declare class SavingsTracker {
     private readonly dir;
     constructor(opts?: SavingsTrackerOptions);
     /** Invalidate the previous billing view before this turn can start new MemTree work. */
-    begin(id: string, progress?: number, budget?: number): void;
+    begin(id: string, progress?: number, budget?: number): Promise<void>;
     settle(id: string, input: SavingsTurnInput): Promise<void>;
     cancel(id: string): void;
     private endAttempt;

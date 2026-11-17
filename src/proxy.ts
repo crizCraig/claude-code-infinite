@@ -2366,7 +2366,7 @@ async function handleMessages(
     const sideSession = requestSessionId(req);
     if (opts.savings && isSavingsSessionId(sideSession)) {
       const savings = opts.savings;
-      savings.begin(sideSession);
+      await savings.begin(sideSession);
       settleSavings = () => {
         if (!(rec.forwardedBytes! > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
           savings.cancel(sideSession);
@@ -2476,7 +2476,7 @@ async function handleMessages(
     savingsSelections.set(rec, candidate => {
       modified = candidate.kind !== "original" && !wholeHistoryCandidates.has(candidate);
     });
-    savings.begin(requestSessionKey, tracksProgress ? originalCandidate.estimate.tokens : undefined,
+    await savings.begin(requestSessionKey, tracksProgress ? originalCandidate.estimate.tokens : undefined,
       tracksProgress ? sizingLimits().budget : undefined);
     settleSavings = () => {
       savingsSelections.delete(rec);

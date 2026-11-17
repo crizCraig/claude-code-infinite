@@ -94,7 +94,9 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     /** The exact JSON body a batch of these events is sent as (tests read it). */
     batchBody(events: DiagnosticsEvent[]): string;
     private send;
+    private flushSavings;
     private sendSavings;
+    private deferLegacyReport;
     private headers;
     private track;
     private now;

@@ -1,11 +1,12 @@
 /** Proxy settlement adapter: local totals first; authoritative billing refresh in background. */
+import { randomUUID } from 'node:crypto';
 import { createSavingsState, accountSavingsTurn, loadSavingsState, saveSavingsState,
   isSavingsSessionId, savingsSummary, type SavingsTurnInput, type SavingsState, type SavingsPromptCheckpoint,
   type AuthoritativeSavingsCosts } from './savings.js';
 import { SavingsHistory } from './savings-history.js';
 import { scheduleSavingsPrune, withSavingsLock } from './savings-storage.js';
 import { statusLinkDir } from './status-link.js';
-import { writeSavingsView } from './savings-status.js';
+import { readSavingsView, writeSavingsView } from './savings-status.js';
 import type { DiagnosticsRecorder } from './diagnostics.js';
 
 export interface SavingsTrackerOptions {
@@ -17,7 +18,7 @@ export interface SavingsTrackerOptions {
 export class SavingsTracker {
   readonly history = new SavingsHistory<SavingsPromptCheckpoint>();
   private readonly states = new Map<string, SavingsState>();
-  private readonly epochs = new Map<string, number>();
+  private readonly epochs = new Map<string, string>();
   private readonly active = new Map<string, number>();
   private readonly inFlight = new Set<string>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
@@ -28,18 +29,20 @@ export class SavingsTracker {
   }
 
   /** Invalidate the previous billing view before this turn can start new MemTree work. */
-  begin(id: string, progress?: number, budget?: number): void {
+  async begin(id: string, progress?: number, budget?: number): Promise<void> {
     if (!isSavingsSessionId(id)) return;
     try {
-      const state = this.get(id);
-      const saved = loadSavingsState(this.dir, id);
-      if (saved && saved.sequence > state.sequence) Object.assign(state, saved);
-      if (progress !== undefined) state.progress_tokens = Math.max(0, Math.floor(progress));
-      if (budget !== undefined) state.budget_tokens = Math.max(1, Math.floor(budget));
-      this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1);
-      this.active.set(id, (this.active.get(id) ?? 0) + 1);
-      this.remote.delete(id);
-      this.publish(state);
+      await withSavingsLock(this.dir, id, () => {
+        const state = this.get(id);
+        const saved = loadSavingsState(this.dir, id);
+        if (saved && saved.sequence > state.sequence) Object.assign(state, saved);
+        if (progress !== undefined) state.progress_tokens = Math.max(0, Math.floor(progress));
+        if (budget !== undefined) state.budget_tokens = Math.max(1, Math.floor(budget));
+        this.epochs.set(id, randomUUID());
+        this.active.set(id, (this.active.get(id) ?? 0) + 1);
+        this.remote.delete(id);
+        this.publish(state);
+      });
     } catch { /* Unsupported session identifiers never name files. */ }
   }
 
@@ -52,6 +55,7 @@ export class SavingsTracker {
         const {state} = accountSavingsTurn(previous, input);
         if (!saveSavingsState(this.dir, state)) throw Error('Savings state write failed');
         this.endAttempt(id);
+        this.epochs.set(id, randomUUID());
         // A helper can settle while a main request is still showing provisional progress.
         const view = this.active.get(id) && input.progress_tokens === undefined && local.sequence === previous.sequence
           ? {...state, progress_tokens:local.progress_tokens, budget_tokens:local.budget_tokens} : state;
@@ -71,7 +75,6 @@ export class SavingsTracker {
   }
 
   private endAttempt(id: string): void {
-    this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1);
     this.active.set(id, Math.max(0, (this.active.get(id) ?? 0) - 1));
     this.remote.delete(id);
   }
@@ -93,7 +96,7 @@ export class SavingsTracker {
 
   private publish(state: SavingsState): void {
     const summary = savingsSummary(state, this.active.get(state.session_id) ? undefined : this.remote.get(state.session_id));
-    writeSavingsView(state.session_id, {...summary, less_usage_percent:summary.net_percent,
+    writeSavingsView(state.session_id, {...summary, generation:this.epochs.get(state.session_id), less_usage_percent:summary.net_percent,
       progress_tokens:state.progress_tokens ?? 0, budget_tokens:state.budget_tokens ?? 1,
       url:this.opts.usageUrl ? `${this.opts.usageUrl}#savings` : undefined}, this.dir);
   }
@@ -107,6 +110,8 @@ export class SavingsTracker {
       if (this.epochs.get(id) !== epoch || !this.states.has(id)) return;
       const state = this.states.get(id)!;
       if ((loadSavingsState(this.dir, id)?.sequence ?? 0) !== state.sequence) return;
+      // A sibling begin can replace the view without advancing the settled sequence.
+      if (readSavingsView(id, this.dir)?.generation !== epoch) return;
       const costs = validCosts(value);
       if (costs) this.remote.set(id, costs);
       this.publish(state);

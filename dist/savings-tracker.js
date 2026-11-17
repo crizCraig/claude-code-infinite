@@ -1,9 +1,10 @@
 /** Proxy settlement adapter: local totals first; authoritative billing refresh in background. */
+import { randomUUID } from 'node:crypto';
 import { createSavingsState, accountSavingsTurn, loadSavingsState, saveSavingsState, isSavingsSessionId, savingsSummary } from './savings.js';
 import { SavingsHistory } from './savings-history.js';
 import { scheduleSavingsPrune, withSavingsLock } from './savings-storage.js';
 import { statusLinkDir } from './status-link.js';
-import { writeSavingsView } from './savings-status.js';
+import { readSavingsView, writeSavingsView } from './savings-status.js';
 export class SavingsTracker {
     opts;
     history = new SavingsHistory();
@@ -19,22 +20,24 @@ export class SavingsTracker {
         this.dir = opts.dir ?? statusLinkDir();
     }
     /** Invalidate the previous billing view before this turn can start new MemTree work. */
-    begin(id, progress, budget) {
+    async begin(id, progress, budget) {
         if (!isSavingsSessionId(id))
             return;
         try {
-            const state = this.get(id);
-            const saved = loadSavingsState(this.dir, id);
-            if (saved && saved.sequence > state.sequence)
-                Object.assign(state, saved);
-            if (progress !== undefined)
-                state.progress_tokens = Math.max(0, Math.floor(progress));
-            if (budget !== undefined)
-                state.budget_tokens = Math.max(1, Math.floor(budget));
-            this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1);
-            this.active.set(id, (this.active.get(id) ?? 0) + 1);
-            this.remote.delete(id);
-            this.publish(state);
+            await withSavingsLock(this.dir, id, () => {
+                const state = this.get(id);
+                const saved = loadSavingsState(this.dir, id);
+                if (saved && saved.sequence > state.sequence)
+                    Object.assign(state, saved);
+                if (progress !== undefined)
+                    state.progress_tokens = Math.max(0, Math.floor(progress));
+                if (budget !== undefined)
+                    state.budget_tokens = Math.max(1, Math.floor(budget));
+                this.epochs.set(id, randomUUID());
+                this.active.set(id, (this.active.get(id) ?? 0) + 1);
+                this.remote.delete(id);
+                this.publish(state);
+            });
         }
         catch { /* Unsupported session identifiers never name files. */ }
     }
@@ -49,6 +52,7 @@ export class SavingsTracker {
                 if (!saveSavingsState(this.dir, state))
                     throw Error('Savings state write failed');
                 this.endAttempt(id);
+                this.epochs.set(id, randomUUID());
                 // A helper can settle while a main request is still showing provisional progress.
                 const view = this.active.get(id) && input.progress_tokens === undefined && local.sequence === previous.sequence
                     ? { ...state, progress_tokens: local.progress_tokens, budget_tokens: local.budget_tokens } : state;
@@ -70,7 +74,6 @@ export class SavingsTracker {
         this.refresh(id);
     }
     endAttempt(id) {
-        this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1);
         this.active.set(id, Math.max(0, (this.active.get(id) ?? 0) - 1));
         this.remote.delete(id);
     }
@@ -93,7 +96,7 @@ export class SavingsTracker {
     }
     publish(state) {
         const summary = savingsSummary(state, this.active.get(state.session_id) ? undefined : this.remote.get(state.session_id));
-        writeSavingsView(state.session_id, { ...summary, less_usage_percent: summary.net_percent,
+        writeSavingsView(state.session_id, { ...summary, generation: this.epochs.get(state.session_id), less_usage_percent: summary.net_percent,
             progress_tokens: state.progress_tokens ?? 0, budget_tokens: state.budget_tokens ?? 1,
             url: this.opts.usageUrl ? `${this.opts.usageUrl}#savings` : undefined }, this.dir);
     }
@@ -109,6 +112,9 @@ export class SavingsTracker {
                 return;
             const state = this.states.get(id);
             if ((loadSavingsState(this.dir, id)?.sequence ?? 0) !== state.sequence)
+                return;
+            // A sibling begin can replace the view without advancing the settled sequence.
+            if (readSavingsView(id, this.dir)?.generation !== epoch)
                 return;
             const costs = validCosts(value);
             if (costs)

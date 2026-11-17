@@ -1,4 +1,5 @@
 export interface SavingsView {
+    generation?: string;
     net_usd: number | null;
     less_usage_percent: number | null;
     costs_complete: boolean;

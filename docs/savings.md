@@ -147,7 +147,9 @@ IDs are rejected. Hourly background maintenance retains the newest 512 session f
 and rechecks a file's modification time under the session lock before deletion. Each
 session holds at most 32 lanes and 128 prefix checkpoints per lane. Evicted lane
 history loses its cache/compaction model; cumulative monetary totals survive.
-A resumed session restores totals, completeness, sequence, and lane history.
+Before pruning a full session file, ccc saves its cumulative counters, completeness
+and sequence in a private, compact per-session file under `savings-totals/`. A
+resumed session continues from those totals and rebuilds evicted lane history.
 
 No prompt, message, tool result, credential, or tool argument is persisted by
 this module. Local hashes and model IDs are accounting metadata. Send only the
@@ -164,9 +166,17 @@ storage (or an already-stored newer sequence) for the same UUID. The response co
 {"savings_stored":{"session_id":"12345678-1234-4123-8123-123456789abc","sequence":42}}
 ```
 
-An ordinary diagnostics `202`, a missing body, or an older sequence keeps the report
-pending for the next flush or launch. Each sequence has a distinct filename so an old
+A lower sequence or explicit storage failure keeps the report pending. An older
+server that omits the acknowledgement field gets retries starting at one minute,
+doubling to a maximum of 30 minutes. The retry schedule survives restarts.
+After four hours, another response without the field drops that sequence and writes
+a local entry to `savings.log` in the config directory. A new cumulative sequence
+can be sent immediately. Each sequence has a distinct filename, so an earlier
 acknowledgement cannot delete a newer report.
+
+Trackers serialize provisional progress and settled updates with the session lock.
+Each published turn has a generation ID. A background billing refresh can update
+the status view only while both its settled sequence and generation are current.
 
 Savings reuses the parsed request and the delivery planner's selected candidate. A
 passthrough needs only observed usage. On large modified requests, the existing sizing

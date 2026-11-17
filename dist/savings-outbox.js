@@ -31,24 +31,51 @@ export class SavingsOutbox {
                 if (!report || this.file(report) !== file)
                     continue;
                 const newer = pending.get(report.session_id);
-                if (newer && newer.sequence > report.sequence)
+                if (newer && newer.report.sequence > report.sequence)
                     this.remove(report);
                 else {
                     if (newer)
-                        this.remove(newer);
-                    pending.set(report.session_id, report);
+                        this.remove(newer.report);
+                    pending.set(report.session_id, { report, retry: this.readRetry(file) });
                 }
             }
             catch { /* A sibling process may have acknowledged it. */ }
         }
         return pending;
     }
+    readRetry(file) {
+        try {
+            const stat = fs.lstatSync(file + '.retry');
+            if (!stat.isFile() || stat.size > 256)
+                return;
+            const retry = JSON.parse(fs.readFileSync(file + '.retry', 'utf8'));
+            if (retry && [retry.since, retry.next, retry.attempts].every(Number.isSafeInteger) &&
+                retry.next >= retry.since && retry.attempts > 0)
+                return retry;
+        }
+        catch { /* First attempt, or a sibling already removed the report. */ }
+    }
+    saveRetry(report, retry) {
+        // A late response must never recreate a report a sibling has already removed.
+        const file = this.file(report);
+        if (this.write(file + '.retry', retry) && !fs.existsSync(file))
+            this.clearRetry(report);
+    }
+    clearRetry(report) {
+        try {
+            fs.rmSync(this.file(report) + '.retry', { force: true });
+        }
+        catch { /* Best effort. */ }
+    }
     save(report) {
+        return this.write(this.file(report), report);
+    }
+    write(file, value) {
         const tmp = path.join(this.directory, randomUUID() + '.tmp');
         try {
             fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-            fs.writeFileSync(tmp, JSON.stringify(report), { mode: 0o600, flag: 'wx' });
-            fs.renameSync(tmp, this.file(report));
+            fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+            fs.renameSync(tmp, file);
             return true;
         }
         catch {
@@ -65,7 +92,10 @@ export class SavingsOutbox {
         try {
             fs.rmSync(this.file(report), { force: true });
         }
-        catch { /* Retry after restart. */ }
+        catch {
+            return;
+        }
+        this.clearRetry(report);
     }
     file(report) {
         return path.join(this.directory, report.session_id + '.' + report.sequence + '.json');

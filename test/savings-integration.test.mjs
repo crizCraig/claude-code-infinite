@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import { Diagnostics } from '../dist/diagnostics.js';
 import { mergeUsageFromSseEvent, mergeUsageFromJsonBody } from '../dist/reqlog.js';
 import { renderSavingsSegment, writeSavingsView } from '../dist/savings-status.js';
@@ -88,12 +89,12 @@ test('tracker persists totals, reports no content, and rejects stale cost respon
   const input={request:{model:'claude-sonnet-4-6',messages:[{role:'user',content:'private text'}]},
     usage:{input_tokens:100,output_tokens:10},contextWindow:200000,
     originalInputTokens:100000,requestModified:true};
-  tracker.begin(id,410,1000);
+  await tracker.begin(id,410,1000);
   assert.equal(readSavingsView(id,dir).costs_complete,false);
   await tracker.settle(id,input);
   assert.equal(loadSavingsState(dir,id).turns,1);
   assert.equal(reports.length,1);
-  tracker.begin(id,420,1000);
+  await tracker.begin(id,420,1000);
   resolveCosts({costs_complete:true,memtree_charged_usd:0,compression_api_usd:0});
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(readSavingsView(id,dir).costs_complete,false,'old turn billing cannot validate new turn');
@@ -181,7 +182,7 @@ test('independent processes beginning together allocate distinct cumulative sequ
         reportSavings(value){process.send(value.sequence)}
       }});
       const id=process.argv[2];
-      tracker.begin(id);
+      await tracker.begin(id);
       process.once('message',async()=>{
         for (let i=0;i<${turns};i++) await tracker.settle(id,{request:{model:'claude-sonnet-4-6'},requestModified:false,
           usage:{input_tokens:Number(process.argv[3]),output_tokens:1},contextWindow:200000});
@@ -214,7 +215,7 @@ test('invalid savings IDs never reach either network boundary', async () => {
  const sent=[];
  const tracker=new SavingsTracker({dir:tmp(),fetchCosts:async id=>sent.push(id)});
  for (const id of ['private-text','private identifier','../path']) {
-   tracker.begin(id);tracker.cancel(id);await tracker.settle(id,{});
+   await tracker.begin(id);tracker.cancel(id);await tracker.settle(id,{});
    assert.deepEqual(sent,[]);
    assert.equal(savingsReport({...createSavingsState(sessionId),session_id:id}),undefined);
  }
@@ -222,17 +223,18 @@ test('invalid savings IDs never reach either network boundary', async () => {
 
 test('only a matching stored acknowledgement clears the final savings report', async () => {
  const {createSavingsState}=await import('../dist/savings.js');
- let sent=0, answer;
+ let sent=0, answer, now=0;
  const d=new Diagnostics({baseUrl:'https://example.test',configDir:tmp(),clientName:'ccc',
-   clientVersion:'1.0.0',apiKey:'key',env:{},fetchImpl:async()=>{sent++;
+   clientVersion:'1.0.0',apiKey:'key',env:{},now:()=>now,fetchImpl:async()=>{sent++;
      return Response.json(answer,{status:202});}});
  d.reportSavings({...createSavingsState(sessionId),sequence:2});
  for(const [i,ack] of [{accepted:0},{savings_stored:false},
    {savings_stored:{session_id:sessionId,sequence:1}},
-   {savings_stored:{session_id:sessionId,sequence:2}}].entries()){
-   answer=ack; await d.flush(); assert.equal(sent,i+1);
+   {savings_stored:{session_id:request.install_id,sequence:3}},
+   {savings_stored:{session_id:sessionId,sequence:3}}].entries()){
+   now += 60_000; answer=ack; await d.flush(); assert.equal(sent,i+1);
  }
- await d.flush();assert.equal(sent,4);
+ await d.flush();assert.equal(sent,5);
 });
 
 test('savings and progress stay within every available width', async () => {
@@ -299,15 +301,16 @@ test('settling a helper preserves the main request progress currently being disp
  const input={request:{model:'claude-sonnet-4-6'},requestModified:false,
    usage:{input_tokens:10,output_tokens:1},contextWindow:200000};
  await tracker.settle(sessionId,{...input,progress_tokens:100,budget_tokens:1000});
- tracker.begin(sessionId,700,1000);
- tracker.begin(sessionId);
+ await tracker.begin(sessionId,700,1000);
+ await tracker.begin(sessionId);
  await tracker.settle(sessionId,{...input,laneKey:'fragment:main'});
  assert.equal(readSavingsView(sessionId,dir).progress_tokens,700);
 });
 
 test('an unacknowledged final report retries after restart under the same credential', async () => {
  const {createSavingsState}=await import('../dist/savings.js');
- const sent=[],opts={baseUrl:'https://example.test',configDir:tmp(),clientName:'ccc',
+ let now=0;
+ const sent=[],opts={now:()=>now,baseUrl:'https://example.test',configDir:tmp(),clientName:'ccc',
    clientVersion:'1.0.0',apiKey:'key',env:{},fetchImpl:async(url,init)=>{
      sent.push(JSON.parse(init.body).savings.sequence);return Response.json({accepted:0},{status:202});}};
  const first=new Diagnostics(opts);
@@ -317,6 +320,9 @@ test('an unacknowledged final report retries after restart under the same creden
  const resumed=new Diagnostics({...opts,fetchImpl:async(url,init)=>{
    sent.push(JSON.parse(init.body).savings.sequence);
    return Response.json({savings_stored:{session_id:sessionId,sequence:7}},{status:202});}});
+ await resumed.flush();
+ assert.deepEqual(sent,[7],'restarting respects the pending backoff');
+ now += 60_000;
  await resumed.flush();
  assert.deepEqual(sent,[7,7]);
  await new Diagnostics(opts).flush();assert.deepEqual(sent,[7,7]);
@@ -400,4 +406,156 @@ test('resuming a pre-fix snapshot cannot display its unverified positive delta',
  assert.equal(state.turns,1);
  assert.equal(savingsSummary(state,{costs_complete:true,memtree_charged_usd:0,compression_api_usd:0}).net_usd,null);
  assert.doesNotMatch(renderSavingsSegment(readSavingsView(sessionId,dir),{},120),/saved/);
+});
+
+const contract = JSON.parse(fs.readFileSync(new URL('./fixtures/savings-contract.json', import.meta.url)));
+const { request, response, status } = contract;
+const options = (configDir, fetchImpl) => ({
+  baseUrl:'https://example.test', configDir, clientName:'ccc', clientVersion:'1.0.0',
+  apiKey:'test-key', env:{}, fetchImpl,
+});
+
+async function verifyContract(t, intake) {
+  const dir = tmp();
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  fs.writeFileSync(path.join(dir, 'install_id'), request.install_id);
+  const sent = [], replies = [], failures = [];
+  const opts = options(dir, async (url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push(body);
+    try {
+      const reply = await intake({path:new URL(url).pathname, headers:init.headers, body});
+      replies.push(reply);
+      return Response.json(reply.response, {status:reply.status});
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  });
+  const client = new Diagnostics(opts);
+  client.setContext(request.context);
+  client.reportSavings(request.savings);
+  await client.flush(30000);
+  await new Diagnostics(opts).flush();
+  if (failures.length) throw failures[0];
+  assert.deepEqual(replies, [{response, status}]);
+  assert.deepEqual(sent, [request], 'the durable ack must clear the on-disk report');
+}
+
+test('savings POST and acknowledgement match the shared wire fixture', t =>
+  verifyContract(t, () => ({response, status})));
+
+test('ccc clears the outbox after replay through the Polychat HTTP route', {
+  skip: !process.env.POLYCHAT_CHECKOUT && 'set POLYCHAT_CHECKOUT to run both repositories',
+}, async t => {
+  const {execFileSync} = await import('node:child_process');
+  const root = process.env.POLYCHAT_CHECKOUT;
+  const serverContract = JSON.parse(fs.readFileSync(path.join(root, 'polychat/savings-contract.json')));
+  assert.deepEqual(serverContract, contract);
+  await verifyContract(t, wire => {
+    const script = fileURLToPath(new URL('./fixtures/savings-intake.py', import.meta.url));
+    const output = execFileSync(process.env.POLYCHAT_PYTHON || 'python', [script], {
+      cwd:root, env:{...process.env, PYTHONPATH:root, POLYCHAT_ENV:'dev', SKIP_RUNTIME_TESTS:'1'},
+      input:JSON.stringify(wire), encoding:'utf8', timeout:25000,
+    });
+    return JSON.parse(output.trim().split('\n').at(-1));
+  });
+});
+
+test('an older server backs off across restarts and expires the final report locally', async t => {
+  const dir = tmp();
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  const sent = [];
+  let now = 1_000_000;
+  const opts = {...options(dir, async () => {
+    sent.push(now);
+    return Response.json({accepted:0, dropped:0}, {status:202});
+  }), now:() => now};
+  let client = new Diagnostics(opts);
+  client.reportSavings(request.savings);
+  for (let tick = 0; tick <= 6 * 120; tick++) {
+    if (tick % 20 === 1) client = new Diagnostics(opts);
+    await client.flush();
+    now += 30_000;
+  }
+  assert.ok(sent.length > 2 && sent.length < 30, String(sent.length));
+  const gaps = sent.slice(1).map((time, index) => time - sent[index]);
+  assert.deepEqual(gaps.slice(0, 5), [1, 2, 4, 8, 16].map(minutes => minutes * 60_000));
+  assert.equal(Math.max(...gaps), 30 * 60_000);
+  assert.equal(sent.at(-1) - sent[0], 4 * 3_600_000);
+  assert.match(fs.readFileSync(path.join(dir, 'savings.log'), 'utf8'), /dropp.*42/i);
+  const countAtExpiry = sent.length;
+  now += 24 * 3_600_000;
+  await new Diagnostics(opts).flush();
+  assert.equal(sent.length, countAtExpiry);
+});
+
+test('a pruned session resumes its cumulative counters and next billable turn', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const {createSavingsState, saveSavingsState} = await import('../dist/savings.js');
+  const {scheduleSavingsPrune} = await import('../dist/savings-storage.js');
+  const {randomUUID} = await import('node:crypto');
+  const dir = tmp();
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  const old = {...createSavingsState(sessionId), ...request.savings};
+  assert.ok(saveSavingsState(dir, old));
+  const file = path.join(dir, sessionId+'.savings.json');
+  fs.utimesSync(file, 1, 1);
+  for (let i = 0; i < 512; i++) assert.ok(saveSavingsState(dir, createSavingsState(randomUUID())));
+  scheduleSavingsPrune(dir);
+  for (let i = 0; fs.existsSync(file) && i < 200; i++) await new Promise(r => setTimeout(r, 10));
+  assert.equal(fs.existsSync(file), false, 'exercise normal retention');
+  const reports = [];
+  const tracker = new SavingsTracker({dir, diagnostics:{reportSavings:r => reports.push(r)}});
+  await tracker.settle(sessionId, {request:{model:'claude-sonnet-4-6'}, requestModified:false,
+    usage:{input_tokens:100, output_tokens:10}, contextWindow:200000});
+  const [next] = reports;
+  assert.equal(next.sequence, old.sequence + 1);
+  assert.equal(next.turns, old.turns + 1);
+  assert.equal(next.token_counts.input, old.token_counts.input + 100);
+  assert.ok(next.actual_api_usd > old.actual_api_usd);
+  assert.ok(next.plain_api_usd > old.plain_api_usd);
+});
+
+test('a sibling begin invalidates a billing response for the same settled sequence', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const {readSavingsView} = await import('../dist/savings-status.js');
+  const dir = tmp();
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  let resolve;
+  const first = new SavingsTracker({dir, fetchCosts:() => new Promise(r => {resolve = r})});
+  await first.settle(sessionId, {request:{model:'claude-sonnet-4-6'}, requestModified:true,
+    originalInputTokens:100000, usage:{input_tokens:100, output_tokens:10}, contextWindow:200000,
+    progress_tokens:100, budget_tokens:1000});
+  const second = new SavingsTracker({dir});
+  await second.begin(sessionId, 700, 1000);
+  resolve({costs_complete:true, memtree_charged_usd:0, compression_api_usd:0});
+  await new Promise(r => setImmediate(r));
+  const view = readSavingsView(sessionId, dir);
+  assert.equal(view.progress_tokens, 700);
+  assert.equal(view.net_usd, null);
+});
+
+test('an explicit storage failure or HTTP error keeps an aged report pending', async t => {
+  const dir = tmp();
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  let now = 0;
+  const replies = [
+    Response.json({accepted:0}, {status:202}),
+    Response.json({accepted:0, savings_stored:null}, {status:202}),
+    Response.json({error:'rate limited'}, {status:429}),
+    Response.json(response, {status}),
+  ];
+  const sent = [];
+  const opts = {...options(dir, async (_, init) => {
+    sent.push(JSON.parse(init.body).savings);
+    return replies.shift();
+  }), now:() => now};
+  const client = new Diagnostics(opts);
+  client.reportSavings(request.savings);
+  await client.flush();
+  now += 5 * 3_600_000;
+  for (let i = 0; i < 4; i++) await new Diagnostics(opts).flush();
+  assert.deepEqual(sent, Array(4).fill(request.savings));
+  assert.equal(fs.existsSync(path.join(dir, 'savings.log')), false);
 });

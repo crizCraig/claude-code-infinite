@@ -336,8 +336,16 @@ export function loadSavingsState(directory: string, sessionId: string): SavingsS
   let fd: number | undefined;
   try {
     if (!fs.lstatSync(directory).isDirectory()) return;
-    const file = path.join(directory, `${sessionId}.savings.json`);
-    if (!fs.lstatSync(file).isFile()) return;
+    const name = `${sessionId}.savings.json`;
+    let file = path.join(directory, name);
+    let stat = fs.lstatSync(file, {throwIfNoEntry:false});
+    if (!stat) {
+      const totalsDir = path.join(directory, 'savings-totals');
+      if (!fs.lstatSync(totalsDir).isDirectory()) return;
+      file = path.join(totalsDir, name);
+      stat = fs.lstatSync(file);
+    }
+    if (!stat.isFile()) return;
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     if (fs.fstatSync(fd).size > MAX_FILE_BYTES) return;
     const value: unknown = JSON.parse(fs.readFileSync(fd, 'utf8'));

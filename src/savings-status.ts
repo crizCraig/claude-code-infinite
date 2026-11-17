@@ -7,6 +7,7 @@ import { terminalSupportsHyperlinks } from './hooks.js';
 import { statusLinkDir } from './status-link.js';
 
 export interface SavingsView {
+  generation?: string;
   net_usd: number | null;
   less_usage_percent: number | null;
   costs_complete: boolean;

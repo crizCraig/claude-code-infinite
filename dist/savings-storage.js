@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { isSavingsSessionId } from './savings.js';
+import { isSavingsSessionId, loadSavingsState, saveSavingsState } from './savings.js';
 function tryLocked(directory, id, update) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     if (!fs.lstatSync(directory).isDirectory())
@@ -72,8 +72,15 @@ async function prune(directory) {
         entries.sort((a, b) => b.time - a.time);
         for (const entry of entries.slice(512)) {
             await withSavingsLock(directory, entry.id, () => {
-                if (fs.lstatSync(entry.file, { throwIfNoEntry: false })?.mtimeMs === entry.time)
-                    fs.unlinkSync(entry.file);
+                if (fs.lstatSync(entry.file, { throwIfNoEntry: false })?.mtimeMs !== entry.time)
+                    return;
+                if (suffix === '.savings.json') {
+                    const state = loadSavingsState(directory, entry.id);
+                    // Save cumulative counters before evicting the bulky per-lane cache.
+                    if (!state || !saveSavingsState(path.join(directory, 'savings-totals'), { ...state, lanes: {} }))
+                        return;
+                }
+                fs.unlinkSync(entry.file);
             });
         }
     }
