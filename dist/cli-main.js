@@ -19,7 +19,8 @@ import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
-import { askFirstRunQuestion, QuestionInterrupted, readFirstRunAnswer } from "./first-run-question.js";
+import { askFirstRunQuestion, canAskFirstRunQuestion, keepQuestionInputRaw, QuestionInterrupted, readFirstRunAnswer, } from "./first-run-question.js";
+import { startupPromptInput } from "./question-input.js";
 import { takeNewInstall } from "./new-install.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
@@ -87,8 +88,8 @@ function openUrl(url) {
         ? exec(`${command} "${url}"`, { shell: "cmd.exe" })
         : exec(`${command} "${url}"`);
 }
-async function promptForApiKey(mode, output) {
-    const rl = readline.createInterface({ input: process.stdin, output });
+async function promptForApiKey(mode, output, input = process.stdin) {
+    const rl = readline.createInterface({ input, output });
     const url = mode === "local" ? LOCAL_KEY_PAGE_URL : KEY_PAGE_URL;
     // The label is a clickable link (OSC 8) where the terminal supports it, and
     // the URL is printed too, for other terminals and for opening it elsewhere.
@@ -120,7 +121,7 @@ async function handleInvalidKey(check, ctx) {
         keyPageUrl: keyPageUrl(ctx.baseUrl),
         // console.log is routed to stderr (uncoloured off a terminal) in print/non-TTY runs.
         stderrLine: (text) => console.log(text),
-        ask: askLine,
+        ask: question => askLine(question, ctx.input),
         open: openUrl,
         warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
         say: (text) => console.log(text),
@@ -158,12 +159,12 @@ function paymentOnly(check) {
  * for the webhook to flip the key to paid), continue without MemTree (plain
  * Claude Code for this session), or quit. Resolves true when MemTree is on.
  */
-async function runPaymentGate(status, recheck, links, diagnostics, resumed) {
+async function runPaymentGate(status, recheck, links, diagnostics, resumed, input) {
     const color = terminalSupportsColor();
     for (;;) {
         const link = await links.get();
         console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
-        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
+        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link), input));
         diagnostics.record("payment_gate", { choice });
         if (choice === "quit") {
             await diagnostics.flush();
@@ -239,8 +240,8 @@ function askAnswer(question, output) {
         });
     });
 }
-function askLine(question) {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+function askLine(question, input) {
+    const rl = readline.createInterface({ input, output: process.stdout });
     return new Promise((resolve) => {
         rl.question(question, (answer) => {
             rl.close();
@@ -455,13 +456,20 @@ async function main() {
             : Promise.resolve(skippedProbe());
     if (isDebugMode)
         console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
+    const questionOptions = {
+        newInstall, configDir: getConfigDir(), args: claudeArgs, env: process.env, diagnostics,
+        stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
+    };
+    const promptStream = canAskFirstRunQuestion(questionOptions) ? startupPromptInput() : undefined;
+    const restoreRaw = promptStream && keepQuestionInputRaw(process.stdin);
+    const lineInput = restoreRaw && promptStream ? promptStream : process.stdin;
     if (!polychatApiKey) {
         diagnostics.record("sign_in_prompt");
         // The user may quit at the prompt: send what is known now.
         diagnostics.flushNow();
         // Only a terminal can answer; a print run's stdout stays Claude's.
         polychatApiKey = process.stdin.isTTY === true
-            ? await promptForApiKey(mode, interactiveUi ? process.stdout : process.stderr)
+            ? await promptForApiKey(mode, interactiveUi ? process.stdout : process.stderr, lineInput)
             : undefined;
         if (!polychatApiKey) {
             console.error("A MemTree API key is required: run `ccc` in a terminal once to save one.");
@@ -495,7 +503,8 @@ async function main() {
     // A definite 401/403: the key is mistyped or revoked. Say so before claude
     // starts; interactive runs may paste a new one, others carry on without MemTree.
     const checked = await handleInvalidKey(keyCheck, {
-        mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey, interactive: interactiveUi, diagnostics,
+        mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey, interactive: interactiveUi,
+        diagnostics, input: lineInput,
     });
     polychatApiKey = checked.apiKey;
     const paymentStatus = paymentOnly(checked.check);
@@ -512,7 +521,7 @@ async function main() {
     if (paymentStatus?.paid === false) {
         const key = polychatApiKey;
         if (interactiveUi) {
-            memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs)));
+            memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs), lineInput));
         }
         else {
             console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
@@ -538,17 +547,21 @@ async function main() {
     diagnostics.setContext({ interactive: interactiveUi });
     recordAutoUpdateDecision(diagnostics, autoUpdate);
     // After key resolution, before either the normal or MemTree-paused Claude launch.
-    await askFirstRunQuestion({
-        newInstall, keyCheck: checked.check,
-        configDir: getConfigDir(), args: claudeArgs, env: process.env,
-        stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
-        diagnostics, ask: (question, signal) => readFirstRunAnswer(question, signal, process.stdin, process.stdout),
+    promptStream?.destroy();
+    const questionInput = await askFirstRunQuestion({
+        ...questionOptions, keyCheck: checked.check,
+        ask: (question, signal) => restoreRaw
+            ? readFirstRunAnswer(question, signal, process.stdin, process.stdout, { restoreRaw })
+            : Promise.resolve("skipped"),
     });
+    if (!questionInput)
+        restoreRaw?.();
     // A resumed session may be past the window under MemTree; plain Claude Code
     // could not send or compact it, so it keeps ccc's paused handling (402 notices).
     if (memtreeOff && !resumesSession(claudeArgs)) {
         await runWithoutMemtree({
             claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
+            questionInput,
             banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate)),
         });
     }
@@ -726,7 +739,7 @@ async function main() {
     if (probe)
         signInSessionLine.text = await showSignInNotice(probe, signInNoticeApplies(found), {
             claudeSignIn, creditRefused: creditMemory.refusedAtStart, override: keyOverride,
-            interactive: interactiveUi, diagnostics, tracker: signInTracker,
+            interactive: interactiveUi && !questionInput, diagnostics, tracker: signInTracker,
         });
     reportStrandedResumeRepair(claudeArgs, nativeOneMillionContext, claude.command);
     // The first request after a resume must count the whole session's thinking.
@@ -814,8 +827,9 @@ async function main() {
     proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
     const child = spawn(claude.command, childArgs, {
         env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild), claude),
-        stdio: "inherit",
+        stdio: [questionInput?.fd ?? "inherit", "inherit", "inherit"],
     });
+    child.once("close", () => questionInput?.close());
     // Its memtree MCP server asks the proxy which session this process is on.
     proxy.setHostPid(child.pid);
     let shuttingDown = false;

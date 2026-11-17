@@ -441,13 +441,16 @@ does not ask. Eligibility is checked before this launch writes state or saves it
 
 Before Claude starts, press a number from 1 to 6 to send your choice. **6) Other** is a
 single keypress. Enter or Esc skips as soon as the menu appears. The menu also skips after
-45 seconds. Ctrl+C records a skip and quits ccc with exit code 130.
+45 seconds. Ctrl+C at the displayed menu records a skip and quits ccc with exit code 130.
 
-The menu ignores pastes and discards typed-ahead choices for the first 400 ms after
-display. It records your choice or skip in `~/.claude-code-infinite/first-run-question.json`.
+ccc waits for 400 ms of quiet before showing the menu. If you have already started typing,
+Claude receives your input, including Enter, and ccc permanently skips the question. Typing
+prompt text or pasting at the visible menu also passes it through to Claude. The choice or skip
+is recorded in `~/.claude-code-infinite/first-run-question.json`.
 A choice is optional account metadata sent once through diagnostics with your MemTree key.
-Skips stay local. The question is disabled in print (`-p`), CI, non-TTY and help/version
-runs, and when you continue with a rejected key. Set `CCC_NO_FIRST_RUN_QUESTION=1` to opt
+Skips stay local. Only a bare interactive launch or a standalone continue/resume flag can
+show the question. CI runs and rejected keys skip it. On macOS and Linux, ccc also skips the
+question if Python 3 is unavailable to preserve terminal input. Set `CCC_NO_FIRST_RUN_QUESTION=1` to opt
 out. Disabling diagnostics also disables the question.
 
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:

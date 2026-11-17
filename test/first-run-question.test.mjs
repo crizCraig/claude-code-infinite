@@ -67,6 +67,10 @@ const skips = [
   ...["-p", "--print", "--print=x", "-pc", "-cp", "-prsession"].map((flag) => ({ args: [flag] })),
   { args: ["--append-system-prompt", "--", "-cp"] },
   ...["--help", "--version", "doctor", "mcp"].map((flag) => ({ args: [flag] })),
+  ...[
+    ["--append-system-prompt", "--", "--help"], ["--", "--version"], ["config"],
+    ["auth", "status", "--json"], ["new-future-command"], ["--model", "sonnet", "doctor"],
+  ].map(args => ({ args })),
   { stdinIsTty: false }, { stdoutIsTty: false },
   ...[{ CI: "1" }, { CI: "true" }, { GITHUB_ACTIONS: "true" }, { BUILD_NUMBER: "123" },
     { CCC_NO_FIRST_RUN_QUESTION: "1" }, { CCC_NO_FIRST_RUN_QUESTION: "true" }]
@@ -82,6 +86,14 @@ for (const override of skips) {
     assert.equal(existsSync(file), false);
   });
 }
+
+test("standalone continue and resume flags can show the question", async t => {
+  for (const flag of ["--continue", "-c", "--resume", "-r"]) {
+    const { opts, asked } = fixture(t, { args: [flag] });
+    await askFirstRunQuestion(opts);
+    assert.deepEqual(asked, [FIRST_RUN_QUESTION]);
+  }
+});
 
 test("NO_COLOR and colour runs show the same plain prompt", async (t) => {
   for (const env of [{}, { NO_COLOR: "1" }]) {
@@ -162,12 +174,20 @@ function terminal(t, buffered, display = (flushed) => flushed()) {
   };
   if (buffered) input.write(buffered);
   const controller = new AbortController();
-  let clock = 0;
-  const result = readFirstRunAnswer(FIRST_RUN_QUESTION, controller.signal, input, output, () => clock);
+  const forwarded = [];
+  const relay = {
+    fd: 10, close() {},
+    forward(prefix) {
+      forwarded.push(prefix);
+      input.on("data", chunk => forwarded.push(chunk));
+      input.resume();
+    },
+  };
+  const result = readFirstRunAnswer(FIRST_RUN_QUESTION, controller.signal, input, output, { prepare: async () => relay });
   t.after(() => { controller.abort(); input.destroy(); output.destroy(); });
-  function advance(ms) { clock += ms; t.mock.timers.tick(ms); }
+  function advance(ms) { t.mock.timers.tick(ms); }
   function key(value) { input.write(value); advance(PASTE_QUIET_MS + 1); }
-  return { input, result, controller, advance, key, screen: () => screen };
+  return { input, result, controller, advance, key, relay, forwarded, screen: () => screen };
 }
 
 for (const [i, label] of choices.entries()) {
@@ -183,114 +203,67 @@ for (const [i, label] of choices.entries()) {
   });
 }
 
-test("buffered and early input, including a slow bracketed paste, leaves the menu ready", async (t) => {
-  const tty = terminal(t, "6");
+for (const [name, bytes] of [
+  ["Enter", Buffer.from("\r")], ["digit", Buffer.from("3")],
+  ["Ctrl+C", Buffer.from([3])], ["partial UTF-8", Buffer.from([0xf0, 0x9f])],
+]) {
+  test(`queued ${name} reaches Claude without showing the question`, async (t) => {
+    const tty = terminal(t, bytes);
+    await nextTurn();
+    assert.equal(await tty.result, tty.relay);
+    assert.deepEqual(Buffer.concat(tty.forwarded), bytes);
+    tty.advance(QUESTION_TIMEOUT_MS);
+    assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
+  });
+}
+
+test("typing during the guard bypasses the question and preserves subsequent reads", async t => {
+  const tty = terminal(t);
+  await nextTurn();
+  tty.advance(TYPE_AHEAD_MS - 1);
+  tty.input.write("review ");
+  tty.advance(1000);
+  tty.input.write("file 3\r");
+  assert.equal(await tty.result, tty.relay);
+  assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
+  assert.equal(Buffer.concat(tty.forwarded).toString(), "review file 3\r");
+});
+
+test("a digit typed while menu output is queued belongs to Claude", async t => {
+  let flush;
+  const tty = terminal(t, undefined, callback => { flush = callback; });
   await nextTurn();
   tty.advance(TYPE_AHEAD_MS);
   tty.input.write("6");
-  tty.input.write("\x1b[20");
-  tty.advance(1000);
-  for (const chunk of ["0~", "6", "\r", "1", "\x1b[20", "1~"]) tty.key(chunk);
-  assert.ok(tty.input.isRaw);
-  tty.key("4");
-  tty.controller.abort();
-  assert.equal(await tty.result, "save_usage");
-});
-
-test("the guard starts when the prompt is displayed, even with queued output", async (t) => {
-  let flush;
-  const tty = terminal(t, "6", (callback) => { flush = callback; });
-  await nextTurn();
-  tty.advance(1500);
-  tty.key("6");
   flush();
+  assert.equal(await tty.result, tty.relay);
+  assert.equal(Buffer.concat(tty.forwarded).toString(), "6");
+  assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
+});
+
+test("a pending digit followed by text is handed off with the text", async t => {
+  const tty = terminal(t);
+  await nextTurn();
   tty.advance(TYPE_AHEAD_MS);
-  tty.key("2");
-  assert.ok(tty.input.isRaw);
-  tty.key("6");
-  tty.controller.abort();
-  assert.equal(await tty.result, "other");
-  assert.match(tty.screen(), /6\) Other\n/);
+  tty.input.write("3");
+  tty.input.write(" files\r");
+  assert.equal(await tty.result, tty.relay);
+  assert.equal(Buffer.concat(tty.forwarded).toString(), "3 files\r");
 });
 
-for (const key of ["\r", "\n", "\r\n", "\x1b"]) {
-  test(`an immediate ${JSON.stringify(key)} skips even during the digit guard`, async (t) => {
-    const tty = terminal(t);
-    await nextTurn();
-    tty.input.write("6"); // a typed-ahead digit must not swallow the next skip key
-    tty.input.write(key);
-    await nextTurn(); // let a split terminal escape sequence finish in the same read cycle
-    assert.equal(tty.input.isRaw, false);
-    assert.equal(await tty.result, "skipped");
-  });
-}
-
-test("typed-ahead text and Enter queued together as the question appears skip", async (t) => {
-  const tty = terminal(t, "review 6 files\r");
-  await nextTurn();
-  assert.equal(tty.input.isRaw, false);
-  assert.equal(await tty.result, "skipped");
-});
-
-test("Enter after the end of a typed-ahead bracketed paste skips in the same read", async (t) => {
-  const tty = terminal(t, "\x1b[200~6\r\x1b[201~\r");
-  await nextTurn();
-  assert.equal(tty.input.isRaw, false);
-  assert.equal(await tty.result, "skipped");
-});
-
-test("a typed-ahead line ending in Esc skips", async (t) => {
+test("a deliberate Enter skips the displayed menu", async t => {
   const tty = terminal(t);
   await nextTurn();
-  tty.input.write("review 6 files\x1b");
-  await nextTurn();
-  assert.equal(tty.input.isRaw, false);
+  tty.advance(TYPE_AHEAD_MS);
+  tty.input.write("\r");
   assert.equal(await tty.result, "skipped");
-});
-
-for (const key of ["\r", "\x1b"]) {
-  test(`a deliberate ${JSON.stringify(key)} also skips after the guard`, async (t) => {
-    const tty = terminal(t);
-    await nextTurn();
-    tty.advance(TYPE_AHEAD_MS + 1);
-    tty.input.write(key);
-    await nextTurn();
-    assert.equal(tty.input.isRaw, false);
-    assert.equal(await tty.result, "skipped");
-  });
-}
-
-test("a bracketed paste split at Esc cannot select an answer or skip", async (t) => {
-  const tty = terminal(t);
-  await nextTurn();
-  for (const part of ["\x1b", "[200~", "6\r", "\x1b", "[201~"]) tty.input.write(part);
-  await nextTurn();
-  assert.ok(tty.input.isRaw);
-  tty.advance(TYPE_AHEAD_MS + 1);
-  tty.key("3");
-  tty.controller.abort();
-  assert.equal(await tty.result, "remember");
-});
-
-test("the menu ignores pasted text, control sequences and bursts after the guard", async (t) => {
-  const tty = terminal(t);
-  await nextTurn();
-  tty.advance(TYPE_AHEAD_MS + 1);
-  for (const junk of ["private prompt\r", "6\r", "\x1b[A", "x", "9"]) tty.key(junk);
-  for (const burst of [["6", "x"], ["x", "6"]]) {
-    for (const part of burst) { tty.input.write(part); tty.advance(2); }
-    tty.advance(PASTE_QUIET_MS + 1);
-  }
-  assert.ok(tty.input.isRaw);
-  assert.ok(!tty.screen().includes("private prompt"));
-  tty.key("5");
-  tty.controller.abort();
-  assert.equal(await tty.result, "curious");
+  assert.equal(tty.input.isRaw, false);
 });
 
 test("the menu times out after 45 seconds", async (t) => {
   const tty = terminal(t);
   await nextTurn();
+  tty.advance(TYPE_AHEAD_MS);
   tty.advance(QUESTION_TIMEOUT_MS - 1);
   assert.ok(tty.input.isRaw);
   tty.advance(1);
@@ -327,6 +300,7 @@ test("Ctrl+C records skipped, restores the terminal, and propagates quit instead
   const { opts, sent, file } = fixture(t, { ask: () => tty.result });
   const pending = assert.rejects(askFirstRunQuestion(opts), QuestionInterrupted);
   await nextTurn();
+  tty.advance(TYPE_AHEAD_MS);
   tty.input.write("\x03");
   await pending;
   assert.equal(tty.input.isRaw, false);

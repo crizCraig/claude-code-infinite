@@ -27,8 +27,9 @@ export async function runWithoutMemtree(opts) {
     const startedAt = Date.now();
     const child = spawn(opts.claude.command, args, {
         env: withClaudeOnPath(plainClaudeEnv(process.env), opts.claude),
-        stdio: "inherit",
+        stdio: [opts.questionInput?.fd ?? "inherit", "inherit", "inherit"],
     });
+    child.once("close", () => opts.questionInput?.close());
     const exited = new Promise((resolve) => {
         child.on("error", (err) => resolve(childStartFailed(err, opts.diagnostics)));
         child.on("exit", (code, signal) => {
