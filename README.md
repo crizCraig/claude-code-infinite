@@ -443,7 +443,7 @@ Enter skips; otherwise type a number (1–5, also `1)` or `1.`) or your own answ
 Enter. Your choice is recorded in `~/.claude-code-infinite/first-run-question.json`, including a skip. The
 question never appears in print (`-p`), CI, non-TTY or help/version runs. Buffered input or
 input beginning within 400 ms of the question is discarded as a skip, never sent as an
-answer. Multi-line pastes are discarded. The question skips automatically after 45 seconds;
+answer. After that window, you can paste a single line and press Enter. Multi-line pastes are discarded. The question skips automatically after 45 seconds;
 Ctrl+C records a skip and quits ccc with exit code 130. Set
 `CCC_NO_FIRST_RUN_QUESTION=1` to opt out; disabling diagnostics also disables the question.
 An answer is optional account metadata sent once through diagnostics with your MemTree key,

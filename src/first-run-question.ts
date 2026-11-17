@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { ReadStream } from "node:tty";
 import { PassThrough } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { mayBePrintInvocation } from "./cli-args.js";
 import { isInfoOnlyRun } from "./claude-plan-warning.js";
 import { isCi } from "./install-ping.js";
@@ -14,6 +15,7 @@ export const FIRST_RUN_QUESTION_FILE = "first-run-question.json";
 export const TYPE_AHEAD_MS = 400;
 export const QUESTION_TIMEOUT_MS = 45_000;
 export const PASTE_QUIET_MS = 100;
+const MAX_EDIT_LENGTH = 4096;
 export class QuestionInterrupted extends Error {}
 export const FIRST_RUN_CHOICES = [
   "Long coding sessions", "Agents that run for hours", "Remembering past work",
@@ -100,34 +102,68 @@ export function readFirstRunAnswer(
   return new Promise((resolve, reject) => {
     const wasRaw = input.isRaw;
     const buffered = input.readableLength > 0;
-    const shownAt = now();
     let skip = buffered;
-    let text = "";
+    let previousCR = false;
     let answer: string | null = null;
     let done = false;
     let quiet: NodeJS.Timeout | undefined;
+    const decoder = new StringDecoder("utf8");
+    let partialMarker = "";
     let pasting = false;
+    let pasteText = "";
     // Keep readline's persistent keypress decoder off the shared process.stdin.
     const lines = new PassThrough();
     const rl = createInterface({ input: lines, output, terminal: true });
     // Runs before readline, including for partial input without an Enter.
-    const onData = (chunk: Buffer | string) => {
-      const incoming = chunk.toString();
-      if (incoming.includes("\x03")) { finish(true); return; }
-      text += incoming;
-      if (now() - shownAt <= TYPE_AHEAD_MS) skip = true;
-      // Normalize CRLF, but two lines or text following a newline is a paste.
-      const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      if (/\n[\s\S]+/.test(normalized)) skip = true;
-      if (text.includes("\x1b[200~")) {
-        skip = true;
-        pasting = true;
+    function readText(value: string) {
+      if (!value || skip) return;
+      if (pasting) {
+        if (/[\r\n]/.test(value)) { skip = true; return; }
+        // Paste is literal text, including characters readline would treat as editing keys.
+        const clean = value.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "");
+        pasteText += clean;
+        if (!rl.line) pasteText = pasteText.trimStart();
+        pasteText = pasteText.slice(0, MAX_EDIT_LENGTH);
+        return;
       }
-      if (text.includes("\x1b[201~")) pasting = false;
-      // Bound memory even if a terminal streams input until the 45 s deadline.
-      if (text.length > 4096) { skip = true; text = text.slice(-32); }
-      // Discard rejected input without echoing it or growing readline's line buffer.
-      if (!skip) lines.write(chunk);
+      // A CRLF submission can span two reads. Any further input makes this a multiline burst.
+      if (previousCR && value.startsWith("\n")) value = value.slice(1);
+      previousCR = false;
+      if (!value) return;
+      const newline = value.search(/[\r\n]/);
+      const ending = newline < 0 ? "" : value.slice(newline);
+      if (answer !== null || !["", "\n", "\r", "\r\n"].includes(ending)) { skip = true; return; }
+      previousCR = ending === "\r";
+      let content = newline < 0 ? value : value.slice(0, newline);
+      // Bound readline's edit buffer while still checking the entire input for newlines.
+      if (content.length + rl.line.length > MAX_EDIT_LENGTH) {
+        if (!rl.line) content = content.trimStart();
+        content = content.slice(0, Math.max(0, MAX_EDIT_LENGTH - rl.line.length));
+      }
+      lines.write(content + ending);
+    }
+    const onData = (chunk: Buffer | string) => {
+      let incoming = partialMarker + (typeof chunk === "string" ? chunk : decoder.write(chunk));
+      partialMarker = "";
+      if (incoming.includes("\x03")) { finish(true); return; }
+      if (now() - shownAt <= TYPE_AHEAD_MS) skip = true;
+      while (incoming) {
+        const marker = pasting ? "\x1b[201~" : "\x1b[200~";
+        const index = incoming.indexOf(marker);
+        if (index < 0) {
+          // A terminal may split either marker across reads.
+          const escape = incoming.lastIndexOf("\x1b");
+          if (escape >= 0 && marker.startsWith(incoming.slice(escape))) partialMarker = incoming.slice(escape);
+          readText(incoming.slice(0, incoming.length - partialMarker.length));
+          break;
+        }
+        readText(incoming.slice(0, index));
+        if (answer !== null) skip = true;
+        if (pasting && !skip) lines.write(pasteText.slice(0, Math.max(0, MAX_EDIT_LENGTH - rl.line.length)));
+        pasteText = "";
+        pasting = !pasting;
+        incoming = incoming.slice(index + marker.length);
+      }
       schedule();
     };
     const finish = (interrupt = false) => {
@@ -151,7 +187,7 @@ export function readFirstRunAnswer(
     };
     function schedule() {
       clearTimeout(quiet);
-      if (!pasting && (skip || answer !== null)) {
+      if (!pasting && !partialMarker && (skip || answer !== null)) {
         quiet = setTimeout(() => finish(), PASTE_QUIET_MS);
       }
     }
@@ -170,6 +206,7 @@ export function readFirstRunAnswer(
     // Bracketed paste lets us wait for the end even when a paste spans slow chunks.
     // These are terminal mode controls, independent of NO_COLOR.
     output.write("\x1b[?2004h" + question);
+    const shownAt = now();
     input.setRawMode(true);
     input.on("data", onData);
     input.on("end", onEnd);

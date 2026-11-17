@@ -238,6 +238,50 @@ test("a deliberate answer after 400 ms is accepted and restores stdin", async (t
   assert.equal(tty.input.listenerCount("data"), 0);
 });
 
+test("a single-line paste after the guard waits for Enter and is saved and sent", async (t) => {
+  const tty = terminal(t);
+  const { opts, file, sent } = fixture(t, { ask: () => tty.result });
+  const pending = askFirstRunQuestion(opts);
+  await nextTurn();
+  tty.advance(TYPE_AHEAD_MS + 1);
+  const paste = Buffer.from("\x1b[200~Building 🛠 tools\x1b[201~");
+  for (const byte of paste) {
+    tty.input.write(Buffer.of(byte));
+    tty.advance(PASTE_QUIET_MS + 1);
+  }
+  assert.equal(tty.input.isRaw, true);
+  tty.input.write("\r");
+  tty.advance(PASTE_QUIET_MS);
+  await pending;
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "answered", answer: "Building 🛠 tools" });
+  assert.equal(sent[0].body.events[0].answer, "Building 🛠 tools");
+});
+
+for (const bracketed of [false, true]) {
+  test(`a long single-line ${bracketed ? "bracketed" : "plain"} paste is capped on submission`, async (t) => {
+    const tty = terminal(t);
+    await nextTurn();
+    tty.advance(TYPE_AHEAD_MS + 1);
+    const text = "😀".repeat(5000);
+    tty.input.write(bracketed ? "\x1b[200~" + text + "\x1b[201~\r" : text + "\r");
+    tty.advance(PASTE_QUIET_MS);
+    assert.equal(firstRunAnswer(await tty.result), "😀".repeat(200));
+  });
+}
+
+for (const buffered of [false, true]) {
+  test(`a single-line paste starting ${buffered ? "before" : "within 400 ms of"} the prompt skips`, async (t) => {
+    const tty = terminal(t, buffered ? "\x1b[200~" : undefined);
+    tty.advance(buffered ? TYPE_AHEAD_MS + 1 : TYPE_AHEAD_MS);
+    await nextTurn();
+    if (!buffered) tty.input.write("\x1b[200~");
+    tty.advance(PASTE_QUIET_MS + 1);
+    tty.input.write("private prompt\x1b[201~\r");
+    tty.advance(PASTE_QUIET_MS);
+    assert.equal(await tty.result, null);
+  });
+}
+
 for (const chunks of [["one\ntwo\nthree"], ["one\r\n", "two\r\n", "three"],
   ["\x1b[200~one\n", "two\n", "three\x1b[201~"]]) {
   test(`multi-line paste is entirely drained: ${JSON.stringify(chunks)}`, async (t) => {
