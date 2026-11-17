@@ -439,20 +439,16 @@ including config, saved keys, sessions, logs, or unknown state, excludes the que
 Old install IDs and pending markers alone never qualify; upgrading an existing install
 does not ask. Eligibility is checked before this launch writes state or saves its first key.
 
-Before Claude starts, press a single number from 1 to 5 to send that choice, or press
-6 for **Other (type it)**. Other accepts one typed line and asks “Send this? (y/N)”.
-Only Y sends it. Enter or Esc skips the menu. Each step skips automatically after
+Before Claude starts, press a number from 1 to 6 to send your choice. **6) Other** is a
+single keypress. Enter or Esc skips as soon as the menu appears. The menu also skips after
 45 seconds. Ctrl+C records a skip and quits ccc with exit code 130.
 
-The menu ignores typed-ahead input, the first 400 ms of input, and pastes. A paste or
-multi-character burst in Other discards the answer. The result is recorded in
-`~/.claude-code-infinite/first-run-question.json`, including a skip. The question never
-appears in print (`-p`), CI, non-TTY or help/version runs. Set
-`CCC_NO_FIRST_RUN_QUESTION=1` to opt out. Disabling diagnostics also disables the question.
-An answer is optional account metadata sent once through diagnostics with your MemTree key,
-never added to a Claude session. Free text is limited to 200 Unicode characters with control
-characters removed. The server logs only that an answer arrived, not its text. Like other
-diagnostics, a failed send is dropped rather than retried.
+The menu ignores pastes and discards typed-ahead choices for the first 400 ms after
+display. It records your choice or skip in `~/.claude-code-infinite/first-run-question.json`.
+A choice is optional account metadata sent once through diagnostics with your MemTree key.
+Skips stay local. The question is disabled in print (`-p`), CI, non-TTY and help/version
+runs, and when you continue with a rejected key. Set `CCC_NO_FIRST_RUN_QUESTION=1` to opt
+out. Disabling diagnostics also disables the question.
 
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
 
@@ -468,10 +464,9 @@ diagnostics, a failed send is dropped rather than retried.
 - errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
   compression timeout).
 
-Apart from the answer you explicitly type above, never sent: your prompts or any conversation
-content, file paths, project or repository names, hostnames, usernames, environment values,
-keys or tokens, or error message text. Each event is
-checked against a fixed allowlist on your machine before it is queued, and again by the server.
+Diagnostics never include your prompts, conversation content, file paths, project or repository
+names, hostnames, usernames, environment values, keys or tokens, or error message text. Each
+event is checked against a fixed allowlist on your machine before it is queued, and again by the server.
 They are tied to your MemTree key when you have one, otherwise to a random install id in
 `~/.claude-code-infinite/install_id`. Sending is batched in the background and never slows a
 request; a failed send is dropped.

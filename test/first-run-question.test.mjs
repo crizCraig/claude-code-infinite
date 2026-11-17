@@ -6,9 +6,9 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Diagnostics } from "../dist/diagnostics.js";
-import { firstRunAnswer, sanitizeContext, sanitizeEvent } from "../dist/diagnostics-schema.js";
+import { sanitizeContext, sanitizeEvent } from "../dist/diagnostics-schema.js";
 import {
-  askFirstRunQuestion, FIRST_RUN_CHOICES, FIRST_RUN_QUESTION, FIRST_RUN_QUESTION_FILE,
+  askFirstRunQuestion, FIRST_RUN_QUESTION, FIRST_RUN_QUESTION_FILE,
   PASTE_QUIET_MS, QuestionInterrupted, QUESTION_TIMEOUT_MS, readFirstRunAnswer, TYPE_AHEAD_MS,
 } from "../dist/first-run-question.js";
 import { hasNoInstallState, NEW_INSTALL_FILE, takeNewInstall } from "../dist/new-install.js";
@@ -27,8 +27,8 @@ function fixture(t, overrides = {}) {
     },
   });
   const opts = {
-    configDir, newInstall: true, args: [], env: {}, stdinIsTty: true, stdoutIsTty: true, diagnostics,
-    ask: async (q) => { asked.push(q); return FIRST_RUN_CHOICES[1]; }, ...overrides,
+    configDir, newInstall: true, keyCheck: { paid: true }, args: [], env: {}, stdinIsTty: true, stdoutIsTty: true, diagnostics,
+    ask: async (q) => { asked.push(q); return "long_agents"; }, ...overrides,
   };
   return { opts, asked, sent, file: join(configDir, FIRST_RUN_QUESTION_FILE) };
 }
@@ -40,19 +40,19 @@ test("one answer is persisted and sent once on the authenticated diagnostics pat
   await opts.diagnostics.flush();
   assert.deepEqual(asked, [FIRST_RUN_QUESTION]);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), {
-    status: "answered", answer: "Agents that run for hours",
+    status: "answered", answer: "long_agents",
   });
   if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].url, "https://example.test/v1/ccc/diagnostics");
   assert.equal(sent[0].headers.authorization, "Bearer account-key");
   assert.deepEqual(sent[0].body.events.map(({ t, ...e }) => e), [
-    { name: "first_run_answer", answer: "Agents that run for hours" },
+    { name: "first_run_answer", answer: "long_agents" },
   ]);
   assert.equal(sent[0].body.context.answer, undefined);
 });
 
-for (const answer of ["", "  ", null, "\x00\x1f\x7f\u009f\u202e"]) {
+for (const answer of ["skipped", "private prompt", null]) {
   test(`skip/EOF ${JSON.stringify(answer)} is permanent and sends nothing`, async (t) => {
     const { opts, sent, file } = fixture(t, { ask: async () => answer });
     await askFirstRunQuestion(opts);
@@ -63,7 +63,7 @@ for (const answer of ["", "  ", null, "\x00\x1f\x7f\u009f\u202e"]) {
 }
 
 const skips = [
-  { newInstall: false },
+  { newInstall: false }, { keyCheck: "invalid" },
   ...["-p", "--print", "--print=x", "-pc", "-cp", "-prsession"].map((flag) => ({ args: [flag] })),
   { args: ["--append-system-prompt", "--", "-cp"] },
   ...["--help", "--version", "doctor", "mcp"].map((flag) => ({ args: [flag] })),
@@ -98,7 +98,7 @@ test("concurrent launches claim the question before awaiting input", async (t) =
   const first = askFirstRunQuestion(opts);
   assert.equal(JSON.parse(readFileSync(file, "utf8")).status, "shown");
   await askFirstRunQuestion({ ...opts, ask: () => assert.fail("another process owns prompt") });
-  resolve("building tools");
+  resolve("remember");
   await first;
   assert.equal(sent.length, 1);
 });
@@ -130,24 +130,20 @@ test("a dropped send is never retried by a later launch", async (t) => {
   assert.equal(attempts, 1);
 });
 
-test("free text is control-free, capped at 200 Unicode characters, and only allowed on its event", async (t) => {
-  const raw = " \x00a\t\r\n\x7f\u009f\u202e\ud800" + "😀".repeat(250);
-  const expected = "a" + "😀".repeat(199);
-  assert.equal(firstRunAnswer(raw), expected);
-  for (const invalid of [undefined, null, [], {}, 2, true]) assert.equal(firstRunAnswer(invalid), undefined);
-  const { opts, file, sent } = fixture(t, { ask: async () => raw.replace(/[\r\n]/g, "") });
-  await askFirstRunQuestion(opts);
-  assert.equal(JSON.parse(readFileSync(file, "utf8")).answer, expected);
-  assert.equal(sent[0].body.events[0].answer, expected);
-  assert.deepEqual(sanitizeContext({ answer: raw }), {});
-  assert.deepEqual(sanitizeEvent("session_start", { answer: raw }, 1), { name: "session_start", t: 1 });
-  assert.deepEqual(sanitizeEvent("first_run_answer", { answer: raw, prompt: "secret" }, 1), {
-    name: "first_run_answer", answer: expected, t: 1,
-  });
-});
+const choices = ["long_sessions", "long_agents", "remember", "save_usage", "curious", "other"];
 
-const OTHER = "Type your answer (Enter to send, Esc to skip):";
-const CONFIRM = "Send this? (y/N)";
+test("the answer field accepts only exact first-run enum values and only on its event", () => {
+  for (const answer of [...choices, "skipped"]) {
+    assert.deepEqual(sanitizeEvent("first_run_answer", { answer, text: "private" }, 1), {
+      name: "first_run_answer", t: 1, answer,
+    });
+    assert.deepEqual(sanitizeContext({ answer }), {});
+    assert.deepEqual(sanitizeEvent("session_start", { answer }, 1), { name: "session_start", t: 1 });
+  }
+  for (const answer of ["private prompt", "Long coding sessions", " other", "OTHER", null, {}, 6]) {
+    assert.deepEqual(sanitizeEvent("first_run_answer", { answer }, 1), { name: "first_run_answer", t: 1 });
+  }
+});
 
 function terminal(t, buffered, display = (flushed) => flushed()) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -174,7 +170,7 @@ function terminal(t, buffered, display = (flushed) => flushed()) {
   return { input, result, controller, advance, key, screen: () => screen };
 }
 
-for (const [i, label] of FIRST_RUN_CHOICES.entries()) {
+for (const [i, label] of choices.entries()) {
   test(`a single ${i + 1} picks ${label} without Enter`, async (t) => {
     const tty = terminal(t);
     await nextTurn();
@@ -196,10 +192,9 @@ test("buffered and early input, including a slow bracketed paste, leaves the men
   tty.advance(1000);
   for (const chunk of ["0~", "6", "\r", "1", "\x1b[20", "1~"]) tty.key(chunk);
   assert.ok(tty.input.isRaw);
-  assert.ok(!tty.screen().includes(OTHER));
   tty.key("4");
   tty.controller.abort();
-  assert.equal(await tty.result, FIRST_RUN_CHOICES[3]);
+  assert.equal(await tty.result, "save_usage");
 });
 
 test("the guard starts when the prompt is displayed, even with queued output", async (t) => {
@@ -210,145 +205,105 @@ test("the guard starts when the prompt is displayed, even with queued output", a
   tty.key("6");
   flush();
   tty.advance(TYPE_AHEAD_MS);
-  tty.key("6");
-  assert.ok(!tty.screen().includes(OTHER));
-  tty.key("6");
-  assert.ok(tty.screen().includes(OTHER));
-  tty.key("x"); // before the text prompt has flushed
-  flush();
   tty.key("2");
-  tty.key("\r");
-  assert.ok(tty.screen().includes(CONFIRM));
-  tty.key("y"); // before confirmation has flushed
   assert.ok(tty.input.isRaw);
-  flush();
-  tty.key("Y");
-  assert.equal(await tty.result, "2");
+  tty.key("6");
+  tty.controller.abort();
+  assert.equal(await tty.result, "other");
+  assert.match(tty.screen(), /6\) Other\n/);
 });
 
-test("the menu ignores arbitrary text, control sequences and bursts split across reads", async (t) => {
+for (const key of ["\r", "\n", "\r\n", "\x1b"]) {
+  test(`an immediate ${JSON.stringify(key)} skips even during the digit guard`, async (t) => {
+    const tty = terminal(t);
+    await nextTurn();
+    tty.input.write("6"); // a typed-ahead digit must not swallow the next skip key
+    tty.input.write(key);
+    await nextTurn(); // let a split terminal escape sequence finish in the same read cycle
+    assert.equal(tty.input.isRaw, false);
+    assert.equal(await tty.result, "skipped");
+  });
+}
+
+test("typed-ahead text and Enter queued together as the question appears skip", async (t) => {
+  const tty = terminal(t, "review 6 files\r");
+  await nextTurn();
+  assert.equal(tty.input.isRaw, false);
+  assert.equal(await tty.result, "skipped");
+});
+
+test("Enter after the end of a typed-ahead bracketed paste skips in the same read", async (t) => {
+  const tty = terminal(t, "\x1b[200~6\r\x1b[201~\r");
+  await nextTurn();
+  assert.equal(tty.input.isRaw, false);
+  assert.equal(await tty.result, "skipped");
+});
+
+test("a typed-ahead line ending in Esc skips", async (t) => {
+  const tty = terminal(t);
+  await nextTurn();
+  tty.input.write("review 6 files\x1b");
+  await nextTurn();
+  assert.equal(tty.input.isRaw, false);
+  assert.equal(await tty.result, "skipped");
+});
+
+for (const key of ["\r", "\x1b"]) {
+  test(`a deliberate ${JSON.stringify(key)} also skips after the guard`, async (t) => {
+    const tty = terminal(t);
+    await nextTurn();
+    tty.advance(TYPE_AHEAD_MS + 1);
+    tty.input.write(key);
+    await nextTurn();
+    assert.equal(tty.input.isRaw, false);
+    assert.equal(await tty.result, "skipped");
+  });
+}
+
+test("a bracketed paste split at Esc cannot select an answer or skip", async (t) => {
+  const tty = terminal(t);
+  await nextTurn();
+  for (const part of ["\x1b", "[200~", "6\r", "\x1b", "[201~"]) tty.input.write(part);
+  await nextTurn();
+  assert.ok(tty.input.isRaw);
+  tty.advance(TYPE_AHEAD_MS + 1);
+  tty.key("3");
+  tty.controller.abort();
+  assert.equal(await tty.result, "remember");
+});
+
+test("the menu ignores pasted text, control sequences and bursts after the guard", async (t) => {
   const tty = terminal(t);
   await nextTurn();
   tty.advance(TYPE_AHEAD_MS + 1);
-  assert.match(tty.screen(), /6\) Other \(type it\)/);
   for (const junk of ["private prompt\r", "6\r", "\x1b[A", "x", "9"]) tty.key(junk);
-  for (const burst of [["6", "x"], ["x", "6"], ["6", "\r", "y"]]) {
+  for (const burst of [["6", "x"], ["x", "6"]]) {
     for (const part of burst) { tty.input.write(part); tty.advance(2); }
     tty.advance(PASTE_QUIET_MS + 1);
   }
-  assert.ok(!tty.screen().includes(OTHER));
+  assert.ok(tty.input.isRaw);
   assert.ok(!tty.screen().includes("private prompt"));
   tty.key("5");
   tty.controller.abort();
-  assert.equal(await tty.result, FIRST_RUN_CHOICES[4]);
+  assert.equal(await tty.result, "curious");
 });
 
-async function other(t) {
+test("the menu times out after 45 seconds", async (t) => {
   const tty = terminal(t);
   await nextTurn();
-  tty.advance(TYPE_AHEAD_MS + 1);
-  tty.key("6");
-  assert.ok(tty.screen().includes(OTHER));
-  return tty;
-}
-
-test("Other discards a coalesced character and the start of another UTF-8 character", async (t) => {
-  const tty = await other(t);
-  tty.key(Buffer.from([0x61, 0xf0]));
+  tty.advance(QUESTION_TIMEOUT_MS - 1);
+  assert.ok(tty.input.isRaw);
+  tty.advance(1);
   assert.equal(tty.input.isRaw, false);
-  assert.equal(await tty.result, null);
+  assert.equal(await tty.result, "skipped");
 });
-
-test("a split UTF-8 character is one typed key in Other", async (t) => {
-  const tty = await other(t);
-  for (const byte of Buffer.from("😀")) tty.input.write(Buffer.of(byte));
-  tty.advance(PASTE_QUIET_MS + 1);
-  tty.key("\r");
-  tty.key("Y");
-  assert.equal(await tty.result, "😀");
-});
-
-test("Other sends the displayed single line only after a separate yes", async (t) => {
-  const tty = await other(t);
-  const { opts, file, sent } = fixture(t, { ask: () => tty.result });
-  const pending = askFirstRunQuestion(opts);
-  for (const char of "42x") tty.key(char);
-  tty.key("\x7f");
-  for (const char of "😀".repeat(202)) tty.key(char);
-  tty.key("\r");
-  assert.ok(tty.screen().includes(CONFIRM));
-  assert.ok(!tty.screen().includes("😀".repeat(199)));
-  assert.deepEqual(sent, []);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "shown" });
-  tty.key("y");
-  tty.controller.abort();
-  await pending;
-  const answer = "42" + "😀".repeat(198);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "answered", answer });
-  assert.equal(sent[0].body.events[0].answer, answer);
-});
-
-for (const chunks of [["private prompt"], ["a\nb"], ["\x1b[200~", "6", "\x1b[201~"],
-  ["a", "b"], ["\r", "y"], ["y\r"]]) {
-  test(`Other rejects a paste or burst ${JSON.stringify(chunks)}`, async (t) => {
-    const tty = await other(t);
-    tty.key("1");
-    for (const chunk of chunks) tty.input.write(chunk);
-    tty.advance(PASTE_QUIET_MS + 1);
-    assert.equal(tty.input.isRaw, false);
-    assert.equal(await tty.result, null);
-  });
-}
-
-for (const decision of ["\r", "n", "\x1b", "yes", "y\r", "\x1b[200~y\x1b[201~"]) {
-  test(`Other confirmation defaults to no for ${JSON.stringify(decision)}`, async (t) => {
-    const tty = await other(t);
-    tty.key("2");
-    tty.key("\r");
-    assert.ok(tty.screen().includes(CONFIRM));
-    tty.key(decision);
-    assert.equal(tty.input.isRaw, false);
-    assert.equal(await tty.result, null);
-  });
-}
-
-for (const step of ["menu", "other", "confirm"]) {
-  for (const action of ["timeout", "Ctrl+C", "Escape", ...(step === "menu" ? ["Enter"] : [])]) {
-    test(`${action} at the ${step} step`, async (t) => {
-      const tty = terminal(t);
-      await nextTurn();
-      tty.advance(TYPE_AHEAD_MS + 1);
-      if (step !== "menu") {
-        tty.advance(QUESTION_TIMEOUT_MS - 2000);
-        tty.key("6");
-        assert.ok(tty.screen().includes(OTHER));
-      }
-      if (step === "confirm") {
-        tty.advance(QUESTION_TIMEOUT_MS - 2000);
-        tty.key("a");
-        tty.key("\r");
-        assert.ok(tty.screen().includes(CONFIRM));
-      }
-      if (action === "timeout") {
-        tty.advance(QUESTION_TIMEOUT_MS - 1000);
-        assert.ok(tty.input.isRaw);
-        tty.advance(1000);
-      } else {
-        tty.key({ "Ctrl+C": "\x03", Escape: "\x1b", Enter: "\r" }[action]);
-      }
-      assert.equal(tty.input.isRaw, false);
-      if (action === "Ctrl+C") await assert.rejects(tty.result, QuestionInterrupted);
-      else assert.equal(await tty.result, null);
-    });
-  }
-}
 
 test("non-TTY reader leaves even buffered piped input untouched", async () => {
   const input = new PassThrough();
   input.write("private piped prompt\n");
   const before = input.readableLength;
   assert.equal(await readFirstRunAnswer("question", new AbortController().signal, input,
-    new PassThrough()), null);
+    new PassThrough()), "skipped");
   assert.equal(input.readableLength, before);
   assert.equal(input.listenerCount("data"), 0);
 });
@@ -360,7 +315,7 @@ test("EOF and abort both release the reader without an answer", async (t) => {
       await nextTurn();
       if (action === "end") tty.input.end();
       else tty.controller.abort();
-      assert.equal(await tty.result, null);
+      assert.equal(await tty.result, "skipped");
       assert.equal(tty.input.isRaw, false);
       assert.equal(tty.input.listenerCount("data"), 0);
     });

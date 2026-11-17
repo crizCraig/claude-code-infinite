@@ -717,7 +717,7 @@ async function main() {
   recordAutoUpdateDecision(diagnostics, autoUpdate);
   // After key resolution, before either the normal or MemTree-paused Claude launch.
   await askFirstRunQuestion({
-    newInstall,
+    newInstall, keyCheck: checked.check,
     configDir: getConfigDir(), args: claudeArgs, env: process.env,
     stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
     diagnostics, ask: (question, signal) =>
