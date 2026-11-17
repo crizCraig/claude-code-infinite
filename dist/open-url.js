@@ -50,6 +50,12 @@ export function memtreePageUrl(url, baseUrl) {
     }
     const browser = usageDashboardUrl(baseUrl);
     const origins = new Set([base.origin, ...(browser ? [new URL(browser).origin] : [])]);
+    if (["https://api.polychat.co", "https://app.polychat.co",
+        "https://api.memtree.dev", "https://app.memtree.dev"].includes(base.origin)) {
+        // Old server replies and saved links remain usable throughout the rollout.
+        origins.add("https://app.polychat.co");
+        origins.add("https://app.memtree.dev");
+    }
     return (page.protocol === "https:" || page.protocol === "http:") &&
         origins.has(page.origin) && !page.username && !page.password &&
         !page.search && !page.hash && PAGE_PATH.test(page.pathname);

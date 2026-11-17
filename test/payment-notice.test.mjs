@@ -19,7 +19,7 @@ const DETAIL =
 
 test("subscribe link comes from the 402 detail, tagged source=ccc", () => {
   assert.equal(subscribeUrlFromDetail(DETAIL), `${CHECKOUT}&source=ccc`);
-  assert.equal(subscribeUrlFromDetail("Payment required"), "https://polychat.co/pricing");
+  assert.equal(subscribeUrlFromDetail("Payment required"), "https://app.memtree.dev/pricing");
 });
 
 test("notice text: headline, bare link line, continues line, account, page link", () => {

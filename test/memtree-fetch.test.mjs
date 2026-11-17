@@ -139,5 +139,15 @@ test("a host that is not Polychat's gets no key", async () => {
   });
   assert.equal(code, 2);
   assert.equal(fetched, false);
-  assert.match(err, /not a Polychat host/);
+  assert.match(err, /not a MemTree host/);
+});
+
+
+test("MemTree production hosts accept the production key and reject look-alikes", () => {
+  for (const host of ["app.memtree.dev", "api.memtree.dev"]) {
+    assert.equal(modeForUrl(new URL(`https://${host}/m/tree`)), "production");
+    assert.equal(modeForUrl(new URL(`http://${host}/m/tree`)), null);
+    assert.equal(modeForUrl(new URL(`https://${host}.evil.example/m/tree`)), null);
+  }
+  assert.equal(modeForUrl(new URL("https://account.memtree.dev/m/tree")), null);
 });

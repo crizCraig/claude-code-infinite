@@ -1,10 +1,11 @@
 /**
  * Where to get a MemTree key, per environment, and whether polychat refused
- * one. Its own module (no imports) so the MemTree client can use both without
+ * one. Its own module so the MemTree client can use both without
  * importing the launcher's key check.
  */
 // utm_source=ccc: signups from this link are attributed to ccc (polychat docs/signup_sources.md).
-export const KEY_PAGE_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
+import { KEY_BROWSER_URL } from "./browser-links.js";
+export const KEY_PAGE_URL = KEY_BROWSER_URL;
 export const LOCAL_KEY_PAGE_URL = "http://local.polychat.co:5173/memtree-api";
 /** The account key issued by Open WebUI: sk- followed by a UUID without hyphens. */
 export function isMemtreeKey(value) {

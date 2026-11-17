@@ -103,3 +103,13 @@ test("urlOpenerFor: nothing where a browser can't appear; elsewhere only MemTree
   open("https://app.polychat.co/m/ea18af90658b");
   assert.deepEqual(spawned, ["https://app.polychat.co/m/ea18af90658b"]);
 });
+
+
+test("production opens both browser hosts during the MemTree rollout", () => {
+  for (const base of ["https://api.polychat.co", "https://api.memtree.dev"]) {
+    assert.equal(memtreePageUrl("https://app.memtree.dev/m/ea18af90658b", base), true);
+    assert.equal(memtreePageUrl("https://app.polychat.co/m/ea18af90658b", base), true);
+    assert.equal(memtreePageUrl("https://app.memtree.dev.evil.example/m/ea18af90658b", base), false);
+  }
+  assert.equal(memtreePageUrl("https://app.memtree.dev/m/ea18af90658b", "http://localhost:8080"), false);
+});

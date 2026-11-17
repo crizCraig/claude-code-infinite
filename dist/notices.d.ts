@@ -39,7 +39,7 @@ export declare const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export declare const DEGRADED_NOTICE = "\u26A0 MemTree degraded \u2014 this turn ran uncompressed";
 /** Repeated refusals of one lane while MemTree is slow (RefusalStreaks): Claude Code retries. */
 export declare const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
-export declare const PAYMENT_REQUIRED_NOTICE = "\u26A0 MemTree is off \u2014 payment required (compression + indexing disabled). Visit polychat.co to enable.";
+export declare const PAYMENT_REQUIRED_NOTICE = "\u26A0 MemTree is off \u2014 payment required (compression + indexing disabled). Run ccc to get your payment link.";
 export declare const SLOW_FIRST_TOKEN_NOTICE = "\u2728 Something special is happening \u2014 please wait\u2026";
 /** Leads with the product name users installed (Claude Code Infinite), then the feature. */
 export declare const STARTUP_NOTICE = "\u221E Claude Code Infinite \u00B7 MemTree memory on";

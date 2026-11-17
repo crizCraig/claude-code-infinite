@@ -31,7 +31,7 @@ const MEMTREE_PATH_RE = /^(\/m|\/usage\/memtree)\/([A-Za-z0-9-]+)(\.json)?$/;
  * such as `polychat-staging.evil.example`) gets no key: a pasted URL decides
  * where the request goes, so it must never decide that a stranger gets a key.
  */
-const PRODUCTION_HOSTS = new Set(["api.polychat.co", "app.polychat.co"]);
+const PRODUCTION_HOSTS = new Set(["api.polychat.co", "app.polychat.co", "api.memtree.dev", "app.memtree.dev"]);
 const STAGING_HOSTS = new Set(["polychat-staging-421312241218.us-west2.run.app"]);
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "local.polychat.co"]);
 const ERROR_BODY_PREVIEW_CHARS = 1000;
@@ -72,7 +72,7 @@ export async function runMemtreeFetchCommand(
   }
   const mode = modeForUrl(url);
   if (!mode) {
-    deps.stderr(`ccc fetch: not a Polychat host, so no key is sent: ${url.host}\n`);
+    deps.stderr(`ccc fetch: not a MemTree host, so no key is sent: ${url.host}\n`);
     return 2;
   }
   const key = keyForMode(mode, deps.keys);

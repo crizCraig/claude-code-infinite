@@ -20,7 +20,7 @@
  * choice. The prompt loop itself is in cli-main.ts.
  */
 import { type PaymentLink } from "./payment-link.js";
-export declare const FALLBACK_SUBSCRIBE_URL = "https://polychat.co/pricing";
+export declare const FALLBACK_SUBSCRIBE_URL: string;
 /** Query flag on the checkout link so the server's success page says "go back to your terminal". */
 export declare const CHECKOUT_SOURCE_PARAM = "source=ccc";
 export declare const PAUSED_FREE_CREDIT_HEADLINE = "MemTree is paused: your free credit is used up.";

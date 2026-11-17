@@ -72,7 +72,7 @@ export const DEGRADED_NOTICE =
 /** Repeated refusals of one lane while MemTree is slow (RefusalStreaks): Claude Code retries. */
 export const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
 export const PAYMENT_REQUIRED_NOTICE =
-  "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
+  "⚠ MemTree is off — payment required (compression + indexing disabled). Run ccc to get your payment link.";
 export const SLOW_FIRST_TOKEN_NOTICE =
   "✨ Something special is happening — please wait…";
 /** Leads with the product name users installed (Claude Code Infinite), then the feature. */

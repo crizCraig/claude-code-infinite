@@ -27,7 +27,9 @@ import {
   formatUsd,
 } from "./payment-link.js";
 
-export const FALLBACK_SUBSCRIBE_URL = "https://polychat.co/pricing";
+import { PRICING_BROWSER_URL } from "./browser-links.js";
+
+export const FALLBACK_SUBSCRIBE_URL = PRICING_BROWSER_URL;
 
 /** Query flag on the checkout link so the server's success page says "go back to your terminal". */
 export const CHECKOUT_SOURCE_PARAM = "source=ccc";

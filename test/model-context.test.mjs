@@ -53,13 +53,13 @@ test("paused context: MemTree not Claude, why, the fix, and /compact as fallback
   assert.ok(!longFirst.includes("/payment?"), "a long link on the first line is not quoted either");
   assert.match(text, /not Claude, the user's Claude plan or Anthropic credits/);
   assert.ok(!text.includes(SUBSCRIBE_URL), "the long link carries the email");
-  assert.match(text, /Fix: subscribe at https:\/\/polychat\.co\/pricing, /);
+  assert.match(text, /Fix: subscribe at https:\/\/app\.memtree\.dev\/pricing, /);
   const short = "https://app.polychat.co/p/Ab3xY9Ab3xY9Ab";
   assert.match(pausedModelContext(`${ACCOUNT_LINE}\n\nStarter: ${short}.`, null),
     new RegExp(`Fix: subscribe at ${short}, `));
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"), /Fix: upgrade at /);
   assert.match(text, /fresh session \(\/clear\) or, while the conversation still fits, \/compact/);
-  assert.match(text, /support@polychat\.co/);
+  assert.match(text, /support@memtree\.dev/);
   assert.match(text, /\/compact .* fallback/);
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"),
     /paused: the MemTree plan's usage limit is reached\./);

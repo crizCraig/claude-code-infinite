@@ -117,3 +117,13 @@ test("freshness and prices", () => {
   assert.equal(formatUsd(5), "$5");
   assert.equal(formatUsd(7.5), "$7.50");
 });
+
+
+test("MemTree short links allow only the app host over https", () => {
+  const suffix = "/p/Ab3xY9qwertyuiop";
+  assert.ok(parsePaymentLink({ ...BODY, url: "https://app.memtree.dev" + suffix }));
+  for (const base of ["https://app.memtree.dev.evil.example", "https://api.memtree.dev",
+      "http://app.memtree.dev", "https://account.memtree.dev", "https://evil.memtree.dev"]) {
+    assert.equal(parsePaymentLink({ ...BODY, url: base + suffix }), null);
+  }
+});
