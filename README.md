@@ -439,13 +439,16 @@ including config, saved keys, sessions, logs, or unknown state, excludes the que
 Old install IDs and pending markers alone never qualify; upgrading an existing install
 does not ask. Eligibility is checked before this launch writes state or saves its first key.
 
-Enter skips; otherwise type a number (1–5, also `1)` or `1.`) or your own answer and press
-Enter. Your choice is recorded in `~/.claude-code-infinite/first-run-question.json`, including a skip. The
-question never appears in print (`-p`), CI, non-TTY or help/version runs. Buffered input or
-input beginning within 400 ms of the question is discarded as a skip, never sent as an
-answer. After that window, you can paste a single line and press Enter. Multi-line pastes are discarded. The question skips automatically after 45 seconds;
-Ctrl+C records a skip and quits ccc with exit code 130. Set
-`CCC_NO_FIRST_RUN_QUESTION=1` to opt out; disabling diagnostics also disables the question.
+Before Claude starts, press a single number from 1 to 5 to send that choice, or press
+6 for **Other (type it)**. Other accepts one typed line and asks “Send this? (y/N)”.
+Only Y sends it. Enter or Esc skips the menu. Each step skips automatically after
+45 seconds. Ctrl+C records a skip and quits ccc with exit code 130.
+
+The menu ignores typed-ahead input, the first 400 ms of input, and pastes. A paste or
+multi-character burst in Other discards the answer. The result is recorded in
+`~/.claude-code-infinite/first-run-question.json`, including a skip. The question never
+appears in print (`-p`), CI, non-TTY or help/version runs. Set
+`CCC_NO_FIRST_RUN_QUESTION=1` to opt out. Disabling diagnostics also disables the question.
 An answer is optional account metadata sent once through diagnostics with your MemTree key,
 never added to a Claude session. Free text is limited to 200 Unicode characters with control
 characters removed. The server logs only that an answer arrived, not its text. Like other

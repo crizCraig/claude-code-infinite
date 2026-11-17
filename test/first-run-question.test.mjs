@@ -18,7 +18,6 @@ function fixture(t, overrides = {}) {
   const configDir = mkdtempSync(join(tmpdir(), "ccc-first-question-"));
   t.after(() => rmSync(configDir, { recursive: true, force: true }));
   const asked = [], sent = [];
-  let clock = 0;
   const diagnostics = new Diagnostics({
     configDir, env: {}, baseUrl: "https://example.test", apiKey: "account-key",
     clientName: "cc-infinite", clientVersion: "1.0.38",
@@ -29,8 +28,7 @@ function fixture(t, overrides = {}) {
   });
   const opts = {
     configDir, newInstall: true, args: [], env: {}, stdinIsTty: true, stdoutIsTty: true, diagnostics,
-    now: () => { clock += 1000; return clock; },
-    ask: async (q) => { asked.push(q); return "2"; }, ...overrides,
+    ask: async (q) => { asked.push(q); return FIRST_RUN_CHOICES[1]; }, ...overrides,
   };
   return { opts, asked, sent, file: join(configDir, FIRST_RUN_QUESTION_FILE) };
 }
@@ -53,14 +51,6 @@ test("one answer is persisted and sent once on the authenticated diagnostics pat
   ]);
   assert.equal(sent[0].body.context.answer, undefined);
 });
-
-for (const [i, answer] of FIRST_RUN_CHOICES.entries()) {
-  test(`choice ${i + 1} is stored as its label`, async (t) => {
-    const { opts, file } = fixture(t, { ask: async () => ` ${i + 1} ` });
-    await askFirstRunQuestion(opts);
-    assert.equal(JSON.parse(readFileSync(file, "utf8")).answer, answer);
-  });
-}
 
 for (const answer of ["", "  ", null, "\x00\x1f\x7f\u009f\u202e"]) {
   test(`skip/EOF ${JSON.stringify(answer)} is permanent and sends nothing`, async (t) => {
@@ -156,39 +146,10 @@ test("free text is control-free, capped at 200 Unicode characters, and only allo
   });
 });
 
-for (const input of ["1)", "1.", " 1 "]) {
-  test(`printed choice syntax ${JSON.stringify(input)} maps to its label`, async (t) => {
-    const { opts, file } = fixture(t, { ask: async () => input });
-    await askFirstRunQuestion(opts);
-    assert.equal(JSON.parse(readFileSync(file, "utf8")).answer, FIRST_RUN_CHOICES[0]);
-  });
-}
+const OTHER = "Type your answer (Enter to send, Esc to skip):";
+const CONFIRM = "Send this? (y/N)";
 
-test("an immediately resolved ask is type-ahead, not an answer", async (t) => {
-  const { opts, sent, file } = fixture(t, { now: () => performance.now() });
-  await askFirstRunQuestion(opts);
-  assert.deepEqual(sent, []);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "skipped" });
-});
-
-test("the question aborts its input reader at exactly 45 seconds and never re-asks", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  let signal;
-  const { opts, sent, file } = fixture(t, {
-    ask: (_q, abort) => { signal = abort; return new Promise(() => {}); },
-  });
-  const pending = askFirstRunQuestion(opts);
-  t.mock.timers.tick(QUESTION_TIMEOUT_MS - 1);
-  assert.equal(signal.aborted, false);
-  t.mock.timers.tick(1);
-  await pending;
-  assert.equal(signal.aborted, true);
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "skipped" });
-  await askFirstRunQuestion({ ...opts, ask: () => assert.fail("must not re-ask") });
-  assert.deepEqual(sent, []);
-});
-
-function terminal(t, buffered) {
+function terminal(t, buffered, display = (flushed) => flushed()) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const input = new PassThrough();
   input.isTTY = true;
@@ -197,106 +158,189 @@ function terminal(t, buffered) {
   const output = new PassThrough();
   output.isTTY = true;
   output.columns = 100;
+  let screen = "";
+  output.write = (chunk, flushed) => {
+    screen += chunk;
+    if (flushed) display(flushed);
+    return true;
+  };
   if (buffered) input.write(buffered);
   const controller = new AbortController();
   let clock = 0;
   const result = readFirstRunAnswer(FIRST_RUN_QUESTION, controller.signal, input, output, () => clock);
   t.after(() => { controller.abort(); input.destroy(); output.destroy(); });
-  return { input, result, controller, advance: (ms) => { clock += ms; t.mock.timers.tick(ms); } };
+  function advance(ms) { clock += ms; t.mock.timers.tick(ms); }
+  function key(value) { input.write(value); advance(PASTE_QUIET_MS + 1); }
+  return { input, result, controller, advance, key, screen: () => screen };
 }
 
-for (const ms of [0, 399, 400]) {
-  test(`input starting at ${ms} ms skips even without Enter`, async (t) => {
+for (const [i, label] of FIRST_RUN_CHOICES.entries()) {
+  test(`a single ${i + 1} picks ${label} without Enter`, async (t) => {
     const tty = terminal(t);
     await nextTurn();
-    tty.advance(ms);
-    tty.input.write("session prompt, not an answer");
-    tty.advance(PASTE_QUIET_MS);
-    assert.equal(await tty.result, null);
+    tty.advance(TYPE_AHEAD_MS + 1);
+    tty.key(String(i + 1));
+    tty.controller.abort(); // a pick must already have finished
+    assert.equal(await tty.result, label);
     assert.equal(tty.input.isRaw, false);
     assert.equal(tty.input.listenerCount("data"), 0);
   });
 }
 
-test("already buffered input is discarded even if its delivery is delayed", async (t) => {
-  const tty = terminal(t, "a private prompt\nmore prompt\n");
-  tty.advance(TYPE_AHEAD_MS + 1);
+test("buffered and early input, including a slow bracketed paste, leaves the menu ready", async (t) => {
+  const tty = terminal(t, "6");
   await nextTurn();
-  tty.advance(PASTE_QUIET_MS);
-  assert.equal(await tty.result, null);
-  assert.equal(tty.input.readableLength, 0);
+  tty.advance(TYPE_AHEAD_MS);
+  tty.input.write("6");
+  tty.input.write("\x1b[20");
+  tty.advance(1000);
+  for (const chunk of ["0~", "6", "\r", "1", "\x1b[20", "1~"]) tty.key(chunk);
+  assert.ok(tty.input.isRaw);
+  assert.ok(!tty.screen().includes(OTHER));
+  tty.key("4");
+  tty.controller.abort();
+  assert.equal(await tty.result, FIRST_RUN_CHOICES[3]);
 });
 
-test("a deliberate answer after 400 ms is accepted and restores stdin", async (t) => {
-  const tty = terminal(t);
+test("the guard starts when the prompt is displayed, even with queued output", async (t) => {
+  let flush;
+  const tty = terminal(t, "6", (callback) => { flush = callback; });
   await nextTurn();
-  tty.advance(TYPE_AHEAD_MS + 1);
-  tty.input.write("2\r");
-  tty.advance(PASTE_QUIET_MS);
+  tty.advance(1500);
+  tty.key("6");
+  flush();
+  tty.advance(TYPE_AHEAD_MS);
+  tty.key("6");
+  assert.ok(!tty.screen().includes(OTHER));
+  tty.key("6");
+  assert.ok(tty.screen().includes(OTHER));
+  tty.key("x"); // before the text prompt has flushed
+  flush();
+  tty.key("2");
+  tty.key("\r");
+  assert.ok(tty.screen().includes(CONFIRM));
+  tty.key("y"); // before confirmation has flushed
+  assert.ok(tty.input.isRaw);
+  flush();
+  tty.key("Y");
   assert.equal(await tty.result, "2");
-  assert.equal(tty.input.isRaw, false);
-  assert.equal(tty.input.listenerCount("data"), 0);
 });
 
-test("a single-line paste after the guard waits for Enter and is saved and sent", async (t) => {
+test("the menu ignores arbitrary text, control sequences and bursts split across reads", async (t) => {
   const tty = terminal(t);
-  const { opts, file, sent } = fixture(t, { ask: () => tty.result });
-  const pending = askFirstRunQuestion(opts);
   await nextTurn();
   tty.advance(TYPE_AHEAD_MS + 1);
-  const paste = Buffer.from("\x1b[200~Building 🛠 tools\x1b[201~");
-  for (const byte of paste) {
-    tty.input.write(Buffer.of(byte));
+  assert.match(tty.screen(), /6\) Other \(type it\)/);
+  for (const junk of ["private prompt\r", "6\r", "\x1b[A", "x", "9"]) tty.key(junk);
+  for (const burst of [["6", "x"], ["x", "6"], ["6", "\r", "y"]]) {
+    for (const part of burst) { tty.input.write(part); tty.advance(2); }
     tty.advance(PASTE_QUIET_MS + 1);
   }
-  assert.equal(tty.input.isRaw, true);
-  tty.input.write("\r");
-  tty.advance(PASTE_QUIET_MS);
-  await pending;
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "answered", answer: "Building 🛠 tools" });
-  assert.equal(sent[0].body.events[0].answer, "Building 🛠 tools");
+  assert.ok(!tty.screen().includes(OTHER));
+  assert.ok(!tty.screen().includes("private prompt"));
+  tty.key("5");
+  tty.controller.abort();
+  assert.equal(await tty.result, FIRST_RUN_CHOICES[4]);
 });
 
-for (const bracketed of [false, true]) {
-  test(`a long single-line ${bracketed ? "bracketed" : "plain"} paste is capped on submission`, async (t) => {
-    const tty = terminal(t);
-    await nextTurn();
-    tty.advance(TYPE_AHEAD_MS + 1);
-    const text = "😀".repeat(5000);
-    tty.input.write(bracketed ? "\x1b[200~" + text + "\x1b[201~\r" : text + "\r");
-    tty.advance(PASTE_QUIET_MS);
-    assert.equal(firstRunAnswer(await tty.result), "😀".repeat(200));
-  });
+async function other(t) {
+  const tty = terminal(t);
+  await nextTurn();
+  tty.advance(TYPE_AHEAD_MS + 1);
+  tty.key("6");
+  assert.ok(tty.screen().includes(OTHER));
+  return tty;
 }
 
-for (const buffered of [false, true]) {
-  test(`a single-line paste starting ${buffered ? "before" : "within 400 ms of"} the prompt skips`, async (t) => {
-    const tty = terminal(t, buffered ? "\x1b[200~" : undefined);
-    tty.advance(buffered ? TYPE_AHEAD_MS + 1 : TYPE_AHEAD_MS);
-    await nextTurn();
-    if (!buffered) tty.input.write("\x1b[200~");
+test("Other discards a coalesced character and the start of another UTF-8 character", async (t) => {
+  const tty = await other(t);
+  tty.key(Buffer.from([0x61, 0xf0]));
+  assert.equal(tty.input.isRaw, false);
+  assert.equal(await tty.result, null);
+});
+
+test("a split UTF-8 character is one typed key in Other", async (t) => {
+  const tty = await other(t);
+  for (const byte of Buffer.from("😀")) tty.input.write(Buffer.of(byte));
+  tty.advance(PASTE_QUIET_MS + 1);
+  tty.key("\r");
+  tty.key("Y");
+  assert.equal(await tty.result, "😀");
+});
+
+test("Other sends the displayed single line only after a separate yes", async (t) => {
+  const tty = await other(t);
+  const { opts, file, sent } = fixture(t, { ask: () => tty.result });
+  const pending = askFirstRunQuestion(opts);
+  for (const char of "42x") tty.key(char);
+  tty.key("\x7f");
+  for (const char of "😀".repeat(202)) tty.key(char);
+  tty.key("\r");
+  assert.ok(tty.screen().includes(CONFIRM));
+  assert.ok(!tty.screen().includes("😀".repeat(199)));
+  assert.deepEqual(sent, []);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "shown" });
+  tty.key("y");
+  tty.controller.abort();
+  await pending;
+  const answer = "42" + "😀".repeat(198);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { status: "answered", answer });
+  assert.equal(sent[0].body.events[0].answer, answer);
+});
+
+for (const chunks of [["private prompt"], ["a\nb"], ["\x1b[200~", "6", "\x1b[201~"],
+  ["a", "b"], ["\r", "y"], ["y\r"]]) {
+  test(`Other rejects a paste or burst ${JSON.stringify(chunks)}`, async (t) => {
+    const tty = await other(t);
+    tty.key("1");
+    for (const chunk of chunks) tty.input.write(chunk);
     tty.advance(PASTE_QUIET_MS + 1);
-    tty.input.write("private prompt\x1b[201~\r");
-    tty.advance(PASTE_QUIET_MS);
+    assert.equal(tty.input.isRaw, false);
     assert.equal(await tty.result, null);
   });
 }
 
-for (const chunks of [["one\ntwo\nthree"], ["one\r\n", "two\r\n", "three"],
-  ["\x1b[200~one\n", "two\n", "three\x1b[201~"]]) {
-  test(`multi-line paste is entirely drained: ${JSON.stringify(chunks)}`, async (t) => {
-    const tty = terminal(t);
-    await nextTurn();
-    tty.advance(TYPE_AHEAD_MS + 1);
-    for (const chunk of chunks) {
-      tty.input.write(chunk);
-      tty.advance(PASTE_QUIET_MS - 1);
-    }
-    tty.advance(PASTE_QUIET_MS);
+for (const decision of ["\r", "n", "\x1b", "yes", "y\r", "\x1b[200~y\x1b[201~"]) {
+  test(`Other confirmation defaults to no for ${JSON.stringify(decision)}`, async (t) => {
+    const tty = await other(t);
+    tty.key("2");
+    tty.key("\r");
+    assert.ok(tty.screen().includes(CONFIRM));
+    tty.key(decision);
+    assert.equal(tty.input.isRaw, false);
     assert.equal(await tty.result, null);
-    assert.equal(tty.input.readableLength, 0);
-    assert.equal(tty.input.listenerCount("data"), 0);
   });
+}
+
+for (const step of ["menu", "other", "confirm"]) {
+  for (const action of ["timeout", "Ctrl+C", "Escape", ...(step === "menu" ? ["Enter"] : [])]) {
+    test(`${action} at the ${step} step`, async (t) => {
+      const tty = terminal(t);
+      await nextTurn();
+      tty.advance(TYPE_AHEAD_MS + 1);
+      if (step !== "menu") {
+        tty.advance(QUESTION_TIMEOUT_MS - 2000);
+        tty.key("6");
+        assert.ok(tty.screen().includes(OTHER));
+      }
+      if (step === "confirm") {
+        tty.advance(QUESTION_TIMEOUT_MS - 2000);
+        tty.key("a");
+        tty.key("\r");
+        assert.ok(tty.screen().includes(CONFIRM));
+      }
+      if (action === "timeout") {
+        tty.advance(QUESTION_TIMEOUT_MS - 1000);
+        assert.ok(tty.input.isRaw);
+        tty.advance(1000);
+      } else {
+        tty.key({ "Ctrl+C": "\x03", Escape: "\x1b", Enter: "\r" }[action]);
+      }
+      assert.equal(tty.input.isRaw, false);
+      if (action === "Ctrl+C") await assert.rejects(tty.result, QuestionInterrupted);
+      else assert.equal(await tty.result, null);
+    });
+  }
 }
 
 test("non-TTY reader leaves even buffered piped input untouched", async () => {
@@ -307,19 +351,6 @@ test("non-TTY reader leaves even buffered piped input untouched", async () => {
     new PassThrough()), null);
   assert.equal(input.readableLength, before);
   assert.equal(input.listenerCount("data"), 0);
-});
-
-test("a bracketed paste stays owned until its end, including a large slow paste", async (t) => {
-  const tty = terminal(t);
-  await nextTurn();
-  tty.advance(TYPE_AHEAD_MS + 1);
-  tty.input.write("\x1b[200~" + "private prompt".repeat(1000) + "\n");
-  tty.advance(1000);
-  assert.equal(tty.input.isRaw, true);
-  tty.input.write("more private prompt\n\x1b[201~");
-  tty.advance(PASTE_QUIET_MS);
-  assert.equal(await tty.result, null);
-  assert.equal(tty.input.readableLength, 0);
 });
 
 test("EOF and abort both release the reader without an answer", async (t) => {

@@ -17,11 +17,9 @@ interface QuestionOptions {
     stdoutIsTty: boolean;
     diagnostics: Pick<Diagnostics, "enabled" | "record" | "flushNow">;
     ask: (question: string, signal: AbortSignal) => Promise<string | null>;
-    now?: () => number;
 }
 /** Fail closed: inability to persist the claim means no question, never a startup failure. */
 export declare function askFirstRunQuestion(opts: QuestionOptions): Promise<void>;
-/** Own stdin only for this question. Drain paste bursts before returning it to Claude. */
 export declare function readFirstRunAnswer(question: string, signal: AbortSignal, input: ReadStream, output: NodeJS.WritableStream, now?: () => number): Promise<string | null>;
 export {};
 //# sourceMappingURL=first-run-question.d.ts.map
