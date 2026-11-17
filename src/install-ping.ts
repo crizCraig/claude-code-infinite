@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AUTO_UPDATE_ENV } from "./auto-update.js";
+import { hasNoInstallState, NEW_INSTALL_FILE } from "./new-install.js";
 import {
   DIAGNOSTICS_PATH,
   FIRST_RUN_PENDING_FILE,
@@ -147,11 +148,15 @@ export function isDevInstall(env: NodeJS.ProcessEnv, packageDir: string): boolea
 
 /** The install id (created, with the first-run marker, when missing); random when unwritable. */
 function installIdForPing(configDir: string): { id: string; created?: boolean } {
+  const newInstall = hasNoInstallState(configDir);
   const install = readOrCreateInstallId(configDir);
   if (install === null) return { id: randomUUID() };
   if (install.created) {
     try {
       writeFileSync(join(configDir, FIRST_RUN_PENDING_FILE), "\n", { mode: 0o600 });
+      if (newInstall) {
+        writeFileSync(join(configDir, NEW_INSTALL_FILE), install.id, { flag: "wx", mode: 0o600 });
+      }
     } catch {
       // ccc's first launch then just doesn't record first_run.
     }

@@ -21,7 +21,8 @@ import * as readline from "node:readline";
 import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy.js";
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
-import { askFirstRunQuestion } from "./first-run-question.js";
+import { askFirstRunQuestion, QuestionInterrupted, readFirstRunAnswer } from "./first-run-question.js";
+import { takeNewInstall } from "./new-install.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
@@ -505,6 +506,7 @@ function linkDeps(mode: Mode): LinkDeps {
 }
 
 async function main() {
+  const newInstall = takeNewInstall(getConfigDir());
   const parsedArgs = parseWrapperArgs(process.argv.slice(2));
   const isDebugMode = parsedArgs.debug;
   const filteredArgs = parsedArgs.claudeArgs;
@@ -715,9 +717,11 @@ async function main() {
   recordAutoUpdateDecision(diagnostics, autoUpdate);
   // After key resolution, before either the normal or MemTree-paused Claude launch.
   await askFirstRunQuestion({
+    newInstall,
     configDir: getConfigDir(), args: claudeArgs, env: process.env,
     stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
-    diagnostics, ask: (question) => askAnswer(question, process.stdout),
+    diagnostics, ask: (question, signal) =>
+      readFirstRunAnswer(question, signal, process.stdin, process.stdout),
   });
   // A resumed session may be past the window under MemTree; plain Claude Code
   // could not send or compact it, so it keeps ccc's paused handling (402 notices).
@@ -1147,6 +1151,10 @@ async function main() {
 }
 
 main().catch(async (err) => {
+  if (err instanceof QuestionInterrupted) {
+    await activeDiagnostics?.flush();
+    process.exit(130);
+  }
   console.error(err);
   if (activeDiagnostics) {
     recordError(activeDiagnostics, "startup_failed", err);
