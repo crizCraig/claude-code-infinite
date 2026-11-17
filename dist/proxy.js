@@ -78,6 +78,7 @@ import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
+import { isSavingsSessionId } from "./savings.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
 import { requestThreadType, threadUnsupportedBody, ThreadRefusals, } from "./thread-backstop.js";
@@ -1317,7 +1318,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (rec.totalMs === undefined)
                 rec.totalMs = Date.now() - received;
             noteForwardedSize(state, rec, requestSessionId(req));
-            settleSavings?.();
+            await settleSavings?.();
             opts.reqlog?.log(rec);
         }
     };
@@ -1345,11 +1346,12 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Defensive legacy strip pass first: old marker-wrapped notices (including
     // one copied into an away-summary or top-level system prompt) must never
     // reach Anthropic or MemTree. Hook-delivered notices never enter this body.
+    const originalRequest = body;
     const stripped = stripNoticeBlocks(body.messages);
     const strippedSystem = stripNoticeSystem(body.system);
     let forwardBody = rawBody;
     if (stripped.stripped || strippedSystem.stripped) {
-        body.messages = stripped.messages;
+        body = { ...body, messages: stripped.messages };
         if (strippedSystem.system === undefined)
             delete body.system;
         else
@@ -1415,7 +1417,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     }
     if (sideRequest && clientInfo) {
         const sideSession = requestSessionId(req);
-        if (opts.savings && sideSession) {
+        if (opts.savings && isSavingsSessionId(sideSession)) {
             const savings = opts.savings;
             savings.begin(sideSession);
             settleSavings = () => {
@@ -1423,7 +1425,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                     savings.cancel(sideSession);
                     return;
                 }
-                savings.settle(sideSession, { request: JSON.parse(rawBody.toString("utf-8")),
+                return savings.settle(sideSession, { request: originalRequest,
                     usage: rec.savingsUsageComplete ? rec.usage : undefined,
                     model: body.model, requestModified: false,
                     contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false),
@@ -1490,7 +1492,10 @@ async function handleMessages(req, res, opts, upstream, state) {
     // Before anything reads the size sample: replace an unknown or stale
     // estimate with an exact count where it would decide the outcome.
     const requestSessionKey = requestSessionId(req);
+    const savingsReplay = isSavingsSessionId(requestSessionKey) && !notConversation
+        ? opts.savings?.history?.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
     const countSession = createCountTokensSession({
+        bodyKey: savingsReplay?.bodyKey,
         upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
         signal: state.shutdownSignal,
         onAttempt: (result) => {
@@ -1512,24 +1517,26 @@ async function handleMessages(req, res, opts, upstream, state) {
         output: bodyOutputReservation(body),
         recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
     });
-    if (opts.savings && requestSessionKey) {
+    if (opts.savings && isSavingsSessionId(requestSessionKey)) {
         const savings = opts.savings;
-        const originalRequest = JSON.parse(rawBody.toString("utf-8"));
-        let modified = true;
-        savingsSendObservers.set(rec, sent => { modified = !sent.equals(rawBody); });
-        savings.begin(requestSessionKey, isMainRequest ? originalCandidate.estimate.tokens : undefined, isMainRequest ? sizingLimits().budget : undefined);
+        const tracksProgress = isMainRequest && !notConversation;
+        let modified = false;
+        savingsSelections.set(rec, candidate => {
+            modified = candidate.kind !== "original" && !wholeHistoryCandidates.has(candidate);
+        });
+        savings.begin(requestSessionKey, tracksProgress ? originalCandidate.estimate.tokens : undefined, tracksProgress ? sizingLimits().budget : undefined);
         settleSavings = () => {
-            savingsSendObservers.delete(rec);
+            savingsSelections.delete(rec);
             if (!(rec.forwardedBytes > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
                 savings.cancel(requestSessionKey);
                 return;
             }
-            const exact = countSession.peek(originalCandidate.body)?.tokens;
-            savings.settle(requestSessionKey, { request: originalRequest, usage: rec.savingsUsageComplete ? rec.usage : undefined,
+            const exact = countSession.peekKey(originalCandidate.key)?.tokens;
+            return savings.settle(requestSessionKey, { request: originalRequest, replay: savingsReplay, usage: rec.savingsUsageComplete ? rec.usage : undefined,
                 model: originalRequest.model, contextWindow: modelContextLimit,
                 outputReserve: sizingLimits().output, requestModified: modified, originalInputTokens: exact,
                 laneKey: notConversation ? "fragment:" + requestRouteKey : requestRouteKey, nowMs: received,
-                ...(isMainRequest ? { progress_tokens: exact ?? originalCandidate.estimate.tokens,
+                ...(tracksProgress ? { progress_tokens: exact ?? originalCandidate.estimate.tokens,
                     budget_tokens: sizingLimits().budget } : {}) });
         };
     }
@@ -5715,6 +5722,7 @@ async function selectForwardCandidate(args) {
     if (preparedBase?.derived !== undefined && preparedBase.derived === candidate) {
         preparedBase.install();
     }
+    savingsSelections.get(args.rec)?.(candidate);
     const changed = candidate !== preferred || intended !== args.preferredBody;
     if (changed) {
         policy.allowed.delete(args.preferredBody);
@@ -6125,8 +6133,9 @@ function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
             state.laneCacheClock.sent(main);
     });
 }
+/** Account the candidate delivery selected after sizing and fallbacks. */
+const savingsSelections = new WeakMap();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
-const savingsSendObservers = new WeakMap();
 const laneSendStamps = new WeakMap();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
 const coldGaps = new WeakMap();
@@ -6429,7 +6438,6 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
         }
         if (rec) {
             laneSendStamps.get(rec)?.(bodyBuffer);
-            savingsSendObservers.get(rec)?.(bodyBuffer);
         }
         upstreamReq = upstream.module.request({
             host: upstream.host,

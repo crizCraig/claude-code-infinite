@@ -1,3 +1,4 @@
+import type { SavingsReplay } from './savings-history.js';
 export interface SavingsTokens {
     input: number;
     cache_read: number;
@@ -17,6 +18,11 @@ interface Lane {
     at: number;
     removed: number;
     model: string;
+    warm?: {
+        five: number;
+        hour: number;
+        at: number;
+    };
 }
 export interface SavingsState {
     schema: 1;
@@ -30,11 +36,13 @@ export interface SavingsState {
     token_counts: SavingsTokens;
     plain_token_counts: SavingsTokens;
     estimated_turns: number;
+    has_compressed?: boolean;
     progress_tokens?: number;
     budget_tokens?: number;
     lanes: Record<string, Lane>;
 }
 export interface SavingsTurnInput {
+    replay?: SavingsReplay<SavingsPromptCheckpoint>;
     request: unknown;
     usage: unknown;
     model?: string;
@@ -63,12 +71,28 @@ export interface AuthoritativeSavingsCosts {
     compression_api_usd: number;
     costs_complete: boolean;
 }
+export declare function isSavingsSessionId(value: unknown): value is string;
 /** Cache creation total includes its duration buckets; never count it twice. */
 export declare function normalizeSavingsUsage(value: unknown): SavingsTokens | undefined;
 /** Published base input prices, checked 2026-11-17. Unknown generations are unpriced. */
-export declare function modelInputPriceUsd(model: string, inputTokens: number): number | undefined;
+export declare function modelInputPriceUsd(model: string, inputTokens: number, fast?: boolean): number | undefined;
 export declare function createSavingsState(sessionId: string): SavingsState;
-/** Pure immutable accounting. The caller settles only successfully forwarded responses once. */
+interface SourcePrefix {
+    hash: string;
+    history: string;
+    weight: number;
+    position: number;
+    index: number;
+    ttl: number;
+    toolRun?: string;
+    cacheable: boolean;
+}
+export interface SavingsPromptCheckpoint {
+    model: string;
+    frame: string;
+    prefixes: SourcePrefix[];
+}
+/** Account one successfully forwarded response. The optional local replay cache holds prefix work. */
 export declare function accountSavingsTurn(previous: SavingsState, input: SavingsTurnInput): {
     state: SavingsState;
     turn: SavingsTurn;

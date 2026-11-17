@@ -18,6 +18,7 @@
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
 
+import { SavingsOutbox } from "./savings-outbox.js";
 import { savingsReport, type SavingsReport } from "./savings-report.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -95,7 +96,8 @@ export class Diagnostics implements DiagnosticsRecorder {
   dropped = 0;
   private readonly installId: string | null;
   private readonly queue: DiagnosticsEvent[] = [];
-  private readonly savings = new Map<string, SavingsReport>();
+  private outbox?: SavingsOutbox;
+  private savings = new Map<string, SavingsReport>();
   private readonly sendingSavings = new Set<string>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly repeats = new Map<string, number>();
@@ -112,12 +114,17 @@ export class Diagnostics implements DiagnosticsRecorder {
     this.installId = install?.id ?? null;
     this.firstRun = install?.created === true ||
       (install !== null && takeFirstRunMarker(opts.configDir));
-    this.apiKey = opts.apiKey;
+    this.setApiKey(opts.apiKey);
     if (enabled) this.context = sanitizeContext(environmentContext(env, opts.clientVersion));
   }
 
   setApiKey(apiKey: string | undefined): void {
+    if (this.apiKey === apiKey) return;
+    const unassigned = this.apiKey ? [] : [...this.savings.values()];
     this.apiKey = apiKey;
+    this.outbox = apiKey && this.enabled ? new SavingsOutbox(this.opts.configDir, this.opts.baseUrl, apiKey) : undefined;
+    this.savings = this.outbox?.restore() ?? new Map();
+    for (const report of unassigned) this.reportSavings(report);
   }
 
   /** Add context fields (allowlisted; later values win). */
@@ -153,7 +160,7 @@ export class Diagnostics implements DiagnosticsRecorder {
     const old = this.savings.get(report.session_id);
     if (old && old.sequence > report.sequence) return;
     this.savings.set(report.session_id, report);
-    if (this.savings.size > MAX_QUEUE) this.savings.delete(this.savings.keys().next().value!);
+    if (this.outbox?.save(report) && old && old.sequence < report.sequence) this.outbox.remove(old);
   }
 
   /** Like record, but at most MAX_REPEATS times per `key` in this process. */
@@ -222,6 +229,7 @@ export class Diagnostics implements DiagnosticsRecorder {
   }
 
   private async sendSavings(report: SavingsReport): Promise<void> {
+    const outbox = this.outbox;
     this.sendingSavings.add(report.session_id);
     try {
       const response = await (this.opts.fetchImpl ?? fetch)(
@@ -230,8 +238,11 @@ export class Diagnostics implements DiagnosticsRecorder {
           body: JSON.stringify({schema: DIAGNOSTICS_SCHEMA, install_id: this.installId,
             context: this.context, events: [], savings: report}),
         });
-      if (response.ok && this.savings.get(report.session_id) === report) {
-        this.savings.delete(report.session_id);
+      const ack = response.ok && (await response.json())?.savings_stored;
+      if (ack?.session_id === report.session_id && Number.isSafeInteger(ack.sequence) &&
+          ack.sequence >= report.sequence) {
+        outbox?.remove(report);
+        if (this.savings.get(report.session_id) === report) this.savings.delete(report.session_id);
       }
     } catch { /* Retry newest cumulative snapshot on the next flush. */ }
     finally {

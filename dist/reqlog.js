@@ -181,6 +181,9 @@ function mergeUsage(usage, rec) {
         rec.usage = rec.usage ?? {};
         rec.usage[field] = value;
     }
+    const speed = usage.speed;
+    if (speed === "fast" || speed === "standard")
+        (rec.usage ??= {}).speed = speed;
     const creation = usage.cache_creation;
     if (creation && typeof creation === "object") {
         const target = ((rec.usage ??= {}).cache_creation ??= {});

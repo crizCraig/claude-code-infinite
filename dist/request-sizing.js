@@ -25,7 +25,7 @@ export class RequestSizing {
     }
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body, kind, sample) {
-        const key = createHash("sha256").update(body).digest("hex");
+        const key = this.counts.bodyKey?.(body) ?? createHash("sha256").update(body).digest("hex");
         const existing = this.candidates.get(key);
         if (existing)
             return existing;

@@ -68,7 +68,8 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     dropped: number;
     private readonly installId;
     private readonly queue;
-    private readonly savings;
+    private outbox?;
+    private savings;
     private readonly sendingSavings;
     private readonly inFlight;
     private readonly repeats;

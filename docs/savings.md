@@ -45,6 +45,17 @@ Base input rates were checked on 2026-11-17 against
 | Sonnet 4, 4.5, 4.6 | 3 |
 | Haiku 4.5 | 1 |
 
+Fast-mode rates apply across the full context window. Both sides of the comparison use
+the response's `usage.speed` when present and the request's `speed` otherwise. This
+also prices a fast request served at standard speed on Opus 4.6 correctly.
+[Anthropic fast-mode pricing](https://platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing)
+
+| Fast model | Input USD / million | Output USD / million |
+| --- | ---: | ---: |
+| Fable 5.2, Mythos 5.2 | 16 | 80 |
+| Opus 5.5 | 8 | 40 |
+| Opus 5, Opus 4.8 | 10 | 50 |
+
 Craig explicitly selected multipliers **1, 0.1, 1.25, 2, 5** for ordinary
 input, cache reads, five-minute creation, one-hour creation, and output. This
 comparison policy intentionally retains 0.1 even where current model pricing
@@ -56,8 +67,12 @@ billing adjustments are outside this comparison.
 ## Plain Claude counterfactual
 
 An unmodified request uses actual input usage (all input buckets summed) and
-actual cache/output buckets. It therefore creates no compression savings before
-the simulated plain context needs compaction. Modified requests use an exact
+actual cache/output buckets on both sides, including above the simulated compaction
+ceiling and after a previous compression. Only a delivered compressed context contributes
+an API cost difference. The status line shows progress until the first such turn.
+Snapshots from clients that did not record compression retain their cumulative counts
+and sequence. Their historical monetary comparison is marked incomplete.
+Modified requests use an exact
 original Count Tokens value when supplied; otherwise the module divides prompt
 string characters by four and rounds down. This modest estimate is deliberately
 separate from the high safety token estimator used to decide whether requests
@@ -74,7 +89,8 @@ free plain compaction and retain a summary of at most 1,024 tokens (at most 10%
 of the ceiling), plus a 10% tail. Remember how much of the original transcript
 was removed; subsequent append-only requests grow from that smaller context.
 Another simulated threshold crossing compacts again. Observed edits or transcript replacement reset
-the virtual removal. This deliberately inexpensive summary and free compaction
+the virtual removal. Request framing and changing Claude Code billing attribution
+such as `cch` do not alter that conversation boundary. This deliberately inexpensive summary and free compaction
 favor plain Claude; actual Claude Code's trigger, summary size, generation cost,
 quality, and subsequent outputs can differ. The cumulative `window_crossings` counter counts observed original requests
 whose input exceeds the full native model window; an early simulated compaction
@@ -86,7 +102,8 @@ Cache behavior follows [Anthropic's prompt-caching rules](https://platform.claud
 Only explicit tool/system/content breakpoints, or the last cacheable block under
 top-level automatic caching, create entries. Subsequent reads require a matching
 previously written prefix within the twenty-block lookup range and its own
-five-minute or one-hour TTL. Mixed-duration writes occupy disjoint token ranges;
+five-minute or one-hour TTL. Consecutive parallel tool calls count as one
+lookback position, and consecutive tool results count as another. Mixed-duration writes occupy disjoint token ranges;
 new one-hour coverage costs 2x and new five-minute coverage costs 1.25x. Reads
 refresh an existing entry's duration. No controls means no modeled caching.
 Model minimums are 512 tokens for newer 5-series models except Sonnet 5 (1,024),
@@ -96,7 +113,9 @@ remaining supported models.
 Local cumulative SHA-256 hashes represent prefixes; model/lane changes isolate
 entries. Prefix token positions use relative text weights, an approximation
 even when the whole-prompt count is exact. First-observation actual reads can
-establish warm original-prefix coverage. Synthetic compaction changes cache
+establish warm original-prefix coverage. After a passthrough, the simulation gives
+plain the benefit of observed cache coverage for its possible lifetime. An upstream
+read of unknown age or duration is allowed up to one hour. This can lower the baseline. Synthetic compaction changes cache
 identity and cannot inherit those reads; it must write new eligible entries
 before reusing them. Hashes never leave the local accounting file.
 
@@ -108,7 +127,10 @@ mathematical lower bound or a claim of identical task quality.
 ## Persistence and integration
 
 `accountSavingsTurn(state, input)` returns immutable `{state, turn}`. Call it
-once per successful, billable response and serialize updates within a session.
+once per successful, billable response. The tracker serializes settlements across processes
+with private per-contender lock markers, reloads the latest state, then commits the new
+sequence and totals by atomic rename. A process that encounters contention retries after
+a randomized delay. Dead writers' unique markers can be removed safely.
 Use a distinct `laneKey` for each agent conversation; main is the default.
 Capture the original request before mutation. `requestModified` describes the
 request actually forwarded. `contextWindow` is the active model window, and
@@ -121,7 +143,8 @@ saving fail closed without throwing; creating a state rejects a non-UUID.
 Persistence uses an injected directory, private 0600 files, a 0700 newly created
 directory, exclusive temporary-file creation, and atomic rename. Files larger
 than 600 KB, symlinks, unexpected fields, malformed values, and foreign session
-IDs are rejected. At most 512 session files are retained, newest first. Each
+IDs are rejected. Hourly background maintenance retains the newest 512 session files of each kind
+and rechecks a file's modification time under the session lock before deletion. Each
 session holds at most 32 lanes and 128 prefix checkpoints per lane. Evicted lane
 history loses its cache/compaction model; cumulative monetary totals survive.
 A resumed session restores totals, completeness, sequence, and lane history.
@@ -131,8 +154,26 @@ this module. Local hashes and model IDs are accounting metadata. Send only the
 explicit server savings projection (schema, session_id, sequence, totals,
 completeness, turns, crossings, actual token counts); never send local prefix
 hashes or lane state. The UUID is needed to associate authoritative server costs
-with the same session. Concurrent writers for the same UUID require caller
-serialization; atomic files do not implement a distributed counter merge.
+with the same session. The tracker validates it before bookkeeping, reporting or fetching costs.
+
+Diagnostics stores the latest pending cumulative report per session in a private outbox,
+scoped to the service URL and credential. A successful POST must acknowledge durable
+storage (or an already-stored newer sequence) for the same UUID. The response contract is
+
+```json
+{"savings_stored":{"session_id":"12345678-1234-4123-8123-123456789abc","sequence":42}}
+```
+
+An ordinary diagnostics `202`, a missing body, or an older sequence keeps the report
+pending for the next flush or launch. Each sequence has a distinct filename so an old
+acknowledgement cannot delete a newer report.
+
+Savings reuses the parsed request and the delivery planner's selected candidate. A
+passthrough needs only observed usage. On large modified requests, the existing sizing
+fingerprint also verifies the previous message bytes. Verified appends resume the prefix
+hashes and text weights at the checkpoint and process new blocks. An edit rebuilds the
+affected history. Cold or evicted checkpoints require a full observation. The local
+replay cache holds hashes, weights and cache positions for up to 32 lanes.
 
 ## Worked example
 

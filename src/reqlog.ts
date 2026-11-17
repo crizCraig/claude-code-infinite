@@ -111,6 +111,7 @@ export type TurnType =
 
 /** Real token usage parsed from Anthropic's response, when available. */
 export interface UsageRecord {
+  speed?: "fast" | "standard";
   input_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
@@ -777,6 +778,8 @@ function mergeUsage(usage: unknown, rec: MessagesRecord): void {
     rec.usage = rec.usage ?? {};
     rec.usage[field] = value;
   }
+  const speed = (usage as Record<string, unknown>).speed;
+  if (speed === "fast" || speed === "standard") (rec.usage ??= {}).speed = speed;
   const creation = (usage as Record<string, unknown>).cache_creation;
   if (creation && typeof creation === "object") {
     const target = ((rec.usage ??= {}).cache_creation ??= {});

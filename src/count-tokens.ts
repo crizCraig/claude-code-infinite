@@ -198,6 +198,7 @@ export class CountTokensCooldowns {
 }
 
 export interface CountTokensSessionOptions {
+  bodyKey?: (bytes: Buffer) => string;
   upstream: CountTokensUpstream;
   headers: Record<string, string>;
   requestUrl: string | undefined;
@@ -211,7 +212,9 @@ export interface CountTokensSessionOptions {
 }
 
 export interface CountTokensSession {
+  bodyKey?: (bytes: Buffer) => string;
   count(body: Buffer): Promise<CountTokensResult>;
+  peekKey(key: string): CountTokensResult | undefined;
   peek(body: Buffer): CountTokensResult | undefined;
   /**
    * Count `body` again, once per request, after its count ran out of time or lost its
@@ -239,6 +242,7 @@ export function createCountTokensSession(
   options: CountTokensSessionOptions,
   cooldowns = new CountTokensCooldowns(),
 ): CountTokensSession {
+  const keyOf = options.bodyKey ?? bodyHash;
   const pending = new Map<string, Promise<CountTokensResult>>();
   const completed = new Map<string, CountTokensResult>();
   const account = countAccountKey(options);
@@ -246,9 +250,11 @@ export function createCountTokensSession(
   let allowance = 0;
   let retried = false;
   return {
-    peek: (body) => completed.get(bodyHash(body)),
+    bodyKey: keyOf,
+    peekKey: (key) => completed.get(key),
+    peek: (body) => completed.get(keyOf(body)),
     retry: (body) => {
-      const key = bodyHash(body);
+      const key = keyOf(body);
       const prior = completed.get(key);
       if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
           options.signal?.aborted || cooldowns.active(account)) return undefined;
@@ -261,7 +267,7 @@ export function createCountTokensSession(
       return attempt;
     },
     count: (body) => {
-      const key = bodyHash(body);
+      const key = keyOf(body);
       const existing = pending.get(key);
       if (existing) return existing;
       const tooLarge = exceedsRequestLimit(body.length);

@@ -89,6 +89,7 @@ export type TurnType = "first-user" | "tool"
  | "foreign" | "followup-client-closed" | "unparseable";
 /** Real token usage parsed from Anthropic's response, when available. */
 export interface UsageRecord {
+    speed?: "fast" | "standard";
     input_tokens?: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;

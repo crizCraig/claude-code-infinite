@@ -158,3 +158,72 @@ test('window crossings count original requests beyond the native window, not ear
  const beyond=turn(early.state,{originalInputTokens:105000,contextWindow:100000,outputReserve:10000});
  assert.equal(beyond.state.window_crossings,1);
 });
+
+test('passthroughs use observed buckets on both sides even above the plain ceiling', () => {
+ const args = {request:{...request(),cache_control:{type:'ephemeral'}},requestModified:false,
+   usage:{input_tokens:1,cache_read_input_tokens:160999,output_tokens:1}};
+ for (const previous of [createSavingsState(id), turn(createSavingsState(id)).state]) {
+   const result=turn(previous,args);
+   assert.deepEqual(result.turn.plain_tokens,result.turn.actual_tokens);
+   assert.equal(result.turn.plain_api_usd,result.turn.actual_api_usd);
+ }
+});
+
+test('an attribution change and append keep the plain compaction boundary', () => {
+ const history=request('x'.repeat(20000)).messages;
+ const withHeader=(n,messages)=>({...request(),messages,system:[{type:'text',
+   text:'x-anthropic-billing-header: cc_version=2.1.281; cch='+n+';'}]});
+ const first=turn(createSavingsState(id),{request:withHeader(1,history),originalInputTokens:5000,contextWindow:5000});
+ const next=turn(first.state,{request:withHeader(2,[...history,{role:'assistant',content:'answer'}]),
+   originalInputTokens:5010,contextWindow:5000});
+ assert.equal(first.turn.compacted,true);
+ assert.equal(next.turn.compacted,false);
+ assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
+});
+
+test('parallel tool calls and results each occupy one cache lookback position', () => {
+ const req={...request('x'.repeat(120000)),cache_control:{type:'ephemeral'}};
+ const first=turn(createSavingsState(id),{request:req,originalInputTokens:30000});
+ const calls=Array.from({length:21},(_,i)=>({type:'tool_use',id:String(i),name:'test',input:{}}));
+ const results=calls.map(call=>({type:'tool_result',tool_use_id:call.id,content:'ok'}));
+ const next=turn(first.state,{originalInputTokens:30500,request:{...req,messages:[...req.messages,
+   {role:'assistant',content:calls},{role:'user',content:results}]}});
+ assert.ok(next.turn.plain_tokens.cache_read>=29900);
+});
+
+test('fast rates apply to both sides and unknown fast generations stay incomplete', () => {
+ for (const [model,rate] of [['claude-opus-5-5',8],['claude-opus-5',10],['claude-opus-4-8',10],
+   ['claude-fable-5-2',16],['claude-mythos-5-2',16]]) {
+   const result=turn(createSavingsState(id),{request:{...request(),model,speed:'fast'},
+     usage:{input_tokens:200,output_tokens:10}});
+   assert.equal(result.turn.actual_api_usd,rate*250/1e6);
+   assert.equal(result.turn.plain_api_usd,rate*1050/1e6);
+ }
+ assert.equal(turn(createSavingsState(id),{request:{...request(),speed:'fast'}}).state.costs_complete,false);
+});
+
+test('settling an unchanged request never traverses its transcript', () => {
+ const req={...request(),get messages(){throw Error('walked the unchanged transcript')}};
+ assert.equal(turn(createSavingsState(id),{request:req,requestModified:false}).turn.plain_api_usd,
+   turn(createSavingsState(id),{requestModified:false}).turn.actual_api_usd);
+});
+
+test('the first compressed turn can reuse a prefix warmed by a passthrough', () => {
+ const req={...request('x'.repeat(120000)),cache_control:{type:'ephemeral'}};
+ const first=turn(createSavingsState(id),{request:req,requestModified:false,
+   usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}});
+ const next=turn(first.state,{request:{...req,messages:[...req.messages,{role:'assistant',content:'ok'}]},
+   originalInputTokens:30500,usage:{input_tokens:4000,output_tokens:1},nowMs:2000});
+ assert.equal(next.turn.plain_tokens.cache_read,30000);
+ assert.equal(next.turn.plain_tokens.cache_creation_5m,500);
+});
+
+test('changing the request frame does not replay plain compaction on the same history', () => {
+ const req={...request('x'.repeat(20000)),cache_control:{type:'ephemeral'}};
+ const first=turn(createSavingsState(id),{request:req,originalInputTokens:5000,contextWindow:5000});
+ const next=turn(first.state,{request:{...req,tools:[{name:'additional_tool'}]},
+   originalInputTokens:5010,contextWindow:5000});
+ assert.equal(first.turn.compacted,true);
+ assert.equal(next.turn.compacted,false);
+ assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
+});

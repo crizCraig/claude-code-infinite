@@ -1,4 +1,6 @@
 /** Wire allowlist: content and local cache fingerprints never leave this boundary. */
+import { isSavingsSessionId } from './savings.js';
+
 export interface SavingsReport {
   schema: 1;
   session_id: string;
@@ -13,8 +15,7 @@ export interface SavingsReport {
 export function savingsReport(value: unknown): SavingsReport | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Record<string, unknown>;
-  if (v.schema !== 1 || typeof v.session_id !== 'string' ||
-      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(v.session_id) ||
+  if (v.schema !== 1 || !isSavingsSessionId(v.session_id) ||
       typeof v.costs_complete !== 'boolean') return;
   for (const key of ['sequence','plain_api_usd','actual_api_usd','turns','window_crossings']) {
     if (typeof v[key] !== 'number' || !Number.isFinite(v[key]) || v[key] < 0) return;

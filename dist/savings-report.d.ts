@@ -1,4 +1,3 @@
-/** Wire allowlist: content and local cache fingerprints never leave this boundary. */
 export interface SavingsReport {
     schema: 1;
     session_id: string;

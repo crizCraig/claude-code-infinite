@@ -11933,11 +11933,11 @@ test("MemTree tool reads carry the tool and session on to the server; malformed 
 
 test('savings includes same-session monitor and title passthrough usage', async () => {
   const upstream = await mockUpstream();
-  const settled = [];
+  const settled = [], starts = [];
   const proxy = await startProxy({
     memtree: new MemtreeClient({baseUrl:upstream.origin,apiKey:'test'}),
     upstreamOrigin:upstream.origin,
-    savings: {begin(){},cancel(){},settle(id,input){settled.push({id,input})}},
+    savings: {begin(...args){starts.push(args)},cancel(){},settle(id,input){settled.push({id,input})}},
   });
   try {
     for (const [system,content] of [
@@ -11945,7 +11945,7 @@ test('savings includes same-session monitor and title passthrough usage', async 
       ['You are naming a coding session', 'Give this session a title'],
     ]) {
       const response=await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
-        method:'POST',headers:{'content-type':'application/json','x-claude-code-session-id':'savings-session'},
+        method:'POST',headers:{'content-type':'application/json','x-claude-code-session-id':'12345678-1234-4123-8123-123456789abc'},
         body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:64,
           system:[{type:'text',text:'x-anthropic-billing-header: cc_version=2.1.281.e3c; cc_entrypoint=cli; cch=bb387;'},
             {type:'text',text:system}],messages:[{role:'user',content}]})});
@@ -11956,6 +11956,8 @@ test('savings includes same-session monitor and title passthrough usage', async 
     assert.equal(settled[1].input.requestModified,false);
     assert.equal(settled[0].input.usage.input_tokens,1);
     assert.equal(settled[1].input.usage.output_tokens,1);
+    assert.ok(starts.every(([,progress,budget])=>progress===undefined && budget===undefined));
+    assert.ok(settled.every(({input})=>input.progress_tokens===undefined && input.budget_tokens===undefined));
     assert.notEqual(settled[0].input.laneKey,settled[1].input.laneKey);
   } finally { proxy.close();upstream.close(); }
 });

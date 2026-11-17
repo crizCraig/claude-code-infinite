@@ -14,7 +14,6 @@ export interface SavingsView {
   budget_tokens: number;
   url?: string;
 }
-let writes = 0;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 export function readSavingsView(id: unknown, dir = statusLinkDir()): SavingsView | undefined {
@@ -22,9 +21,10 @@ export function readSavingsView(id: unknown, dir = statusLinkDir()): SavingsView
   try {
     const file = path.join(dir, `${id}.savings-view.json`);
     if (fs.statSync(file).size > 4096) return;
-    const value = JSON.parse(fs.readFileSync(file, 'utf8')) as SavingsView;
-    return value && typeof value.costs_complete === 'boolean' &&
-      Number.isFinite(value.progress_tokens) && Number.isFinite(value.budget_tokens) ? value : undefined;
+    const value = JSON.parse(fs.readFileSync(file, 'utf8')) as SavingsView & {schema?:number};
+    if (!value || typeof value.costs_complete !== 'boolean' ||
+        !Number.isFinite(value.progress_tokens) || !Number.isFinite(value.budget_tokens)) return;
+    return value.schema === 2 ? value : {...value,costs_complete:false,net_usd:null,less_usage_percent:null};
   } catch { return; }
 }
 
@@ -34,22 +34,22 @@ export function writeSavingsView(id: string, view: SavingsView, dir = statusLink
     fs.mkdirSync(dir, {recursive:true,mode:0o700});
     const file = path.join(dir, `${id}.savings-view.json`);
     const tmp = `${file}.${randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(view), {mode:0o600,flag:'wx'});
+    fs.writeFileSync(tmp, JSON.stringify({...view,schema:2}), {mode:0o600,flag:'wx'});
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
-    if (++writes % 20 === 0) {
-      const files = fs.readdirSync(dir).filter(name => /^[A-Za-z0-9_-]+\.savings-view\.json$/.test(name))
-        .map(name => ({file:path.join(dir,name),time:fs.statSync(path.join(dir,name)).mtimeMs}))
-        .sort((a,b) => b.time-a.time);
-      for (const entry of files.slice(512)) fs.unlinkSync(entry.file);
-    }
   } catch { /* Convenience display never breaks the proxy. */ }
 }
 
+const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
+const wide = /[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303f\uff01-\uff60\uffe0-\uffe6]/u;
+
 export function visibleWidth(text: string): number {
-  // Our leaf emoji occupies two cells; combining marks/ZWJ and ANSI take none.
-  return [...stripVTControlCharacters(text)].reduce((n, c) =>
-    n + (/\p{Mark}|\u200d/u.test(c) ? 0 : /\p{Extended_Pictographic}/u.test(c) ? 2 : 1), 0);
+  let width = 0;
+  for (const {segment} of graphemes.segment(stripVTControlCharacters(text))) {
+    if (/^[\p{Mark}\p{Cf}\p{Cc}]+$/u.test(segment)) continue;
+    width += wide.test(segment) ? 2 : 1;
+  }
+  return width;
 }
 
 export function renderSavingsSegment(
@@ -68,12 +68,15 @@ export function renderSavingsSegment(
     const detail = typeof percent === 'number' && Number.isFinite(percent) && percent > 0
       ? ` · ${percent < 1 ? '<1' : Math.min(100, Math.round(percent))}% less usage` : '';
     const full = `${dollars}${detail} · ${link}`;
-    return visibleWidth(full) <= width ? full : `${dollars} · ${link}`;
+    return [full, `${dollars} · ${link}`, dollars, `$${net.toFixed(2)} saved`, `$${net.toFixed(2)}`]
+      .find(segment => visibleWidth(segment) <= width) ?? '';
   }
   if (!(view.budget_tokens > 0) || !Number.isFinite(view.progress_tokens)) return '';
   const pct = Math.max(0, Math.min(100, Math.floor(100 * view.progress_tokens / view.budget_tokens)));
   const filled = Math.floor(pct / 10);
-  return `🌿 MemTree [${'■'.repeat(filled)}${'□'.repeat(10-filled)}] ${pct}% to savings`;
+  const full = `🌿 MemTree [${'■'.repeat(filled)}${'□'.repeat(10-filled)}] ${pct}% to savings`;
+  return [full, `🌿 MemTree ${pct}% to savings`, `${pct}% to savings`, `${pct}%`]
+    .find(segment => visibleWidth(segment) <= width) ?? '';
 }
 
 function safeUrl(value: unknown): string | undefined {

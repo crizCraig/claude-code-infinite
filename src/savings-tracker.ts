@@ -1,7 +1,9 @@
 /** Proxy settlement adapter: local totals first; authoritative billing refresh in background. */
 import { createSavingsState, accountSavingsTurn, loadSavingsState, saveSavingsState,
-  savingsSummary, type SavingsTurnInput, type SavingsState,
+  isSavingsSessionId, savingsSummary, type SavingsTurnInput, type SavingsState, type SavingsPromptCheckpoint,
   type AuthoritativeSavingsCosts } from './savings.js';
+import { SavingsHistory } from './savings-history.js';
+import { scheduleSavingsPrune, withSavingsLock } from './savings-storage.js';
 import { statusLinkDir } from './status-link.js';
 import { writeSavingsView } from './savings-status.js';
 import type { DiagnosticsRecorder } from './diagnostics.js';
@@ -13,6 +15,7 @@ export interface SavingsTrackerOptions {
   fetchCosts?: (sessionId: string) => Promise<unknown>;
 }
 export class SavingsTracker {
+  readonly history = new SavingsHistory<SavingsPromptCheckpoint>();
   private readonly states = new Map<string, SavingsState>();
   private readonly epochs = new Map<string, number>();
   private readonly active = new Map<string, number>();
@@ -26,8 +29,11 @@ export class SavingsTracker {
 
   /** Invalidate the previous billing view before this turn can start new MemTree work. */
   begin(id: string, progress?: number, budget?: number): void {
+    if (!isSavingsSessionId(id)) return;
     try {
       const state = this.get(id);
+      const saved = loadSavingsState(this.dir, id);
+      if (saved && saved.sequence > state.sequence) Object.assign(state, saved);
       if (progress !== undefined) state.progress_tokens = Math.max(0, Math.floor(progress));
       if (budget !== undefined) state.budget_tokens = Math.max(1, Math.floor(budget));
       this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1);
@@ -37,19 +43,29 @@ export class SavingsTracker {
     } catch { /* Unsupported session identifiers never name files. */ }
   }
 
-  settle(id: string, input: SavingsTurnInput): void {
+  async settle(id: string, input: SavingsTurnInput): Promise<void> {
+    if (!isSavingsSessionId(id)) return;
     try {
-      this.endAttempt(id);
-      const {state} = accountSavingsTurn(this.get(id), input);
-      this.states.set(id, state);
-      saveSavingsState(this.dir, state);
-      this.opts.diagnostics?.reportSavings?.(state);
-      this.publish(state);
+      await withSavingsLock(this.dir, id, () => {
+        const local = this.get(id);
+        const previous = loadSavingsState(this.dir, id) ?? local;
+        const {state} = accountSavingsTurn(previous, input);
+        if (!saveSavingsState(this.dir, state)) throw Error('Savings state write failed');
+        this.endAttempt(id);
+        // A helper can settle while a main request is still showing provisional progress.
+        const view = this.active.get(id) && input.progress_tokens === undefined && local.sequence === previous.sequence
+          ? {...state, progress_tokens:local.progress_tokens, budget_tokens:local.budget_tokens} : state;
+        this.states.set(id, view);
+        this.opts.diagnostics?.reportSavings?.(state);
+        this.publish(view);
+      });
+      scheduleSavingsPrune(this.dir);
       this.refresh(id);
-    } catch { /* Savings must never affect model delivery. */ }
+    } catch { this.endAttempt(id); }
   }
 
   cancel(id: string): void {
+    if (!isSavingsSessionId(id)) return;
     this.endAttempt(id);
     this.refresh(id);
   }
@@ -83,16 +99,18 @@ export class SavingsTracker {
   }
 
   private refresh(id: string, attempt = 0): void {
-    if (!this.opts.fetchCosts || this.inFlight.has(id) || this.active.get(id)) return;
+    if (!isSavingsSessionId(id) || !this.opts.fetchCosts || this.inFlight.has(id) || this.active.get(id)) return;
     clearTimeout(this.timers.get(id)); this.timers.delete(id);
     const epoch = this.epochs.get(id);
     this.inFlight.add(id);
-    void this.opts.fetchCosts(id).then(value => {
+    void this.opts.fetchCosts(id).then(value => withSavingsLock(this.dir, id, () => {
       if (this.epochs.get(id) !== epoch || !this.states.has(id)) return;
+      const state = this.states.get(id)!;
+      if ((loadSavingsState(this.dir, id)?.sequence ?? 0) !== state.sequence) return;
       const costs = validCosts(value);
       if (costs) this.remote.set(id, costs);
-      this.publish(this.states.get(id)!);
-    }).catch(() => {}).finally(() => {
+      this.publish(state);
+    })).catch(() => {}).finally(() => {
       this.inFlight.delete(id);
       if (this.epochs.get(id) !== epoch) {
         this.refresh(id);
