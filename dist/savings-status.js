@@ -58,8 +58,8 @@ export function renderSavingsSegment(view, env = process.env, width = Infinity) 
         const link = osc8 ? `\x1b]8;;${url}\x1b\\savings\x1b]8;;\x1b\\` : url;
         const dollars = `🌿 MemTree · $${net.toFixed(2)} saved`;
         const percent = view.less_usage_percent;
-        const detail = typeof percent === 'number' && Number.isFinite(percent) && percent >= 0.5
-            ? ` · ${Math.min(100, Math.round(percent))}% less usage` : '';
+        const detail = typeof percent === 'number' && Number.isFinite(percent) && percent > 0
+            ? ` · ${percent < 1 ? '<1' : Math.min(100, Math.round(percent))}% less usage` : '';
         const full = `${dollars}${detail} · ${link}`;
         return visibleWidth(full) <= width ? full : `${dollars} · ${link}`;
     }

@@ -30,6 +30,8 @@ test('SSE and JSON usage retain 5 minute and 1 hour cache creation separately', 
 test('status shows net dollars and percent; width drops percentage before dollars', () => {
   const wide = renderSavingsSegment(summary, {CCC_STATUSLINE_LINK:'osc8'}, 120);
   assert.match(wide, /🌿 MemTree · \$4\.20 saved · 38% less usage/);
+  assert.match(renderSavingsSegment({...summary,less_usage_percent:0.1},
+    {CCC_STATUSLINE_LINK:'osc8'},120), /<1% less usage/);
   const narrow = renderSavingsSegment(summary, {CCC_STATUSLINE_LINK:'osc8'}, 45);
   assert.match(narrow, /\$4\.20 saved/);
   assert.doesNotMatch(narrow, /38%/);
