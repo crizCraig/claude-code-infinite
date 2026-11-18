@@ -414,12 +414,13 @@ for (const [format, ext] of formats) {
 
 test("Windows skips a stale shim and launches the later executable for startup and resume", { skip: !isWindows }, t => {
   const root = tmpdir();
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
   const bin = path.join(root, "native");
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(root, "claude.cmd"), npmShimText(globalTarget));
   const exe = path.join(bin, "claude.exe");
-  try { fs.linkSync(process.execPath, exe); } catch { fs.copyFileSync(process.execPath, exe); }
+  // Windows keeps the test runner's own executable mapped until the suite exits.
+  fs.copyFileSync(process.execPath, exe);
   const env = { ...process.env, Path: [root, bin].join(";") };
   delete env.PATH;
   for (const args of [["-p", prompts[0]], ["--resume", "session"]]) {
