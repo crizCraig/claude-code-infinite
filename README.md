@@ -686,7 +686,11 @@ then run `ccc` again, from your project folder.
 On Windows, when ccc finds an npm shim, it reads the `claude` entry from the adjacent
 `@anthropic-ai/claude-code` package manifest. It runs a JavaScript entry with the absolute
 path of the Node executable running ccc, or launches a native `.exe` entry directly.
-Startup, sign-in checks, and resume all use the same launcher.
+For standalone `claude.cmd` or `claude.bat` wrappers, including pnpm and Yarn shims
+without that manifest, ccc passes the wrapper's absolute path to `%SystemRoot%\System32\cmd.exe`.
+It sets `NoDefaultCurrentDirectoryInExePath=1` and removes relative paths and the working
+directory from the child's `PATH`, so a wrapper that runs `node` by name looks for it on
+the installed tool paths. Startup, sign-in checks, and resume all use the same launcher.
 
 ### "You've hit your Claude plan's usage limit" / "Anthropic is busy"
 

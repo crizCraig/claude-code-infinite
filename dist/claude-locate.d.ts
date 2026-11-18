@@ -48,6 +48,7 @@ export interface DesktopAppOptions {
     /** True when the path exists (file or folder). */
     exists?: (file: string) => boolean;
 }
+export declare function claudeNpmBin(command: string, readManifest?: (file: string) => string): string | undefined;
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export declare function locateClaude(opts?: LocateClaudeOptions): ClaudeLocation | null;
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */
@@ -78,7 +79,11 @@ export declare function cwdHintText(cwd: string, opts?: {
 /** Resolve a helper without an implicit working-directory or relative PATH lookup. */
 export declare function findPathExecutable(filename: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, cwd: string, isExecutable?: (file: string) => boolean): string | undefined;
 /** cmd must not look up a shim's tools in the project, implicitly or via PATH. */
-export declare function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv;
+export declare function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): {
+    [x: string]: string | undefined;
+    NoDefaultCurrentDirectoryInExePath: string;
+    ComSpec: string;
+};
 /** `%USERPROFILE%\.local\bin` → its value; unknown names stay as written. */
 export declare function expandWindowsVars(value: string, env: NodeJS.ProcessEnv): string;
 /** The Path values in `reg query` output (REG_SZ or REG_EXPAND_SZ). */

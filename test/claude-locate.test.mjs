@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnClaudeSync } from "../dist/claude-process.js";
+import { claudeInvocation, spawnClaudeSync } from "../dist/claude-process.js";
 import {
   CLAUDE_FOUND,
   CLAUDE_SOURCES,
@@ -67,6 +67,38 @@ test("Windows on PATH: spawn the resolved program, never a bare name", () => {
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
 });
 
+function missingManifest() {
+  throw Object.assign(new Error("missing package.json"), { code: "ENOENT" });
+}
+
+test("Windows: standalone wrappers are found on PATH without an npm manifest", () => {
+  const dir = "D:\\Package Managers\\bin";
+  for (const ext of [".cmd", ".bat"]) {
+    const wrapper = W.join(dir, "claude" + ext);
+    const later = "C:\\native\\claude.exe";
+    const env = { ...WIN_ENV, Path: `.;${dir};${W.dirname(later)}` };
+    for (const files of [[wrapper], [wrapper, later]]) {
+      assert.deepEqual(locateWin(files, { env, readManifest: missingManifest }),
+        { command: wrapper, source: "path" });
+    }
+  }
+});
+
+test("Windows: standalone wrappers use System32 cmd and exclude the child cwd from lookup", () => {
+  const cwd = "C:\\project";
+  const env = { SystemRoot: "D:\\Windows", ComSpec: "cmd.exe", Path: ".;C:tools;C:\\project;D:\\bin",
+    NODEFAULTCURRENTDIRECTORYINEXEPATH: "0", CLAUDE_CONFIG_DIR: "D:\\config" };
+  for (const ext of [".cmd", ".bat"]) {
+    const wrapper = W.join("D:\\bin", "claude" + ext);
+    const job = claudeInvocation(wrapper, ["--resume", "a & b"], "win32", missingManifest, { env, cwd });
+    assert.equal(job.command, "D:\\Windows\\System32\\cmd.exe");
+    assert.deepEqual(job.args, ["/d", "/s", "/c", `"${wrapper} ^"--resume^" ^"a^ ^&^ b^""`]);
+    assert.equal(job.options.windowsVerbatimArguments, true);
+    assert.deepEqual(job.options.env, { SystemRoot: env.SystemRoot, ComSpec: job.command,
+      Path: "D:\\bin", NoDefaultCurrentDirectoryInExePath: "1", CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR });
+  }
+});
+
 test("Windows: a broken Claude shim cannot hide a runnable native CLI", () => {
   const wrapper = "C:\\wrappers";
   const native = "D:\\native";
@@ -77,13 +109,10 @@ test("Windows: a broken Claude shim cannot hide a runnable native CLI", () => {
       const exe = W.join(dir, "claude.exe");
       const env = { ...WIN_ENV, Path: wrapper + ";" + native, PATHEXT: ".CMD;.BAT;.EXE" };
       for (const [manifest, files] of [
-        [undefined, []], ["{", []], ['{"bin":{"claude":"cli.js"}}', []],
+        ["{", []], ['{"bin":{"claude":"cli.js"}}', []],
         ['{"bin":"../outside.js"}', [W.resolve(W.dirname(bin), "../outside.js")]],
       ]) {
-        const found = locateWin([shim, exe, ...files], { env, readManifest: () => {
-          if (manifest === undefined) throw new Error("missing package.json");
-          return manifest;
-        } });
+        const found = locateWin([shim, exe, ...files], { env, readManifest: () => manifest });
         assert.equal(found?.command, exe);
       }
     }
@@ -250,10 +279,10 @@ function tmpdir() {
 }
 
 /** Run what locate found the way ccc does, with args that cmd.exe would mangle unescaped. */
-function launch(location, env, outFile) {
+function launch(location, env, outFile, cwd) {
   const args = ["--plugin-dir", "C:\\a dir\\x", "say \"hi\" & echo pwned", "100%"];
   const result = spawnClaudeSync(location.command, args, {
-    env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: outFile }, encoding: "utf8",
+    cwd, env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: outFile }, encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stderr}`);
   return { args, got: JSON.parse(fs.readFileSync(outFile, "utf8")) };
@@ -274,6 +303,27 @@ test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   const location = locateClaude({ env, registryPath: () => [] });
   assert.deepEqual(location, { command: path.join(npmDir, "claude.cmd"), source: "path" });
   const { args, got } = launch(location, env, path.join(dir, "out.json"));
+  assert.deepEqual(got, args);
+});
+
+test("Windows: a standalone wrapper forwards arguments using node from PATH", {
+  skip: !isWindows && "Windows only",
+}, (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, "package manager");
+  const cwd = path.join(dir, "project");
+  fs.mkdirSync(bin);
+  fs.mkdirSync(cwd);
+  fs.writeFileSync(path.join(bin, "claude.bat"), '@node "%~dp0record.cjs" %*\r\n');
+  fs.writeFileSync(path.join(bin, "record.cjs"), "const fs = require('node:fs'); " + RECORD_ARGS);
+  fs.writeFileSync(path.join(cwd, "node.cmd"), "@exit /b 42\r\n");
+  const env = { ...process.env, Path: [cwd, bin, path.dirname(process.execPath)].join(";"),
+    PATHEXT: ".CMD;.BAT;.EXE" };
+  delete env.PATH;
+  const found = locateClaude({ env, registryPath: () => [] });
+  assert.equal(found?.command, path.join(bin, "claude.bat"));
+  const { got, args } = launch(found, env, path.join(dir, "out.json"), cwd);
   assert.deepEqual(got, args);
 });
 
@@ -333,8 +383,7 @@ test("Windows: only the desktop app's claude.exe (on PATH, real files): not laun
   }), false);
 });
 
-test("Windows npm global and local shims launch the declared bin directly", async () => {
-  const { claudeInvocation } = await import("../dist/claude-process.js");
+test("Windows npm global and local shims launch the declared bin directly", () => {
   const args = ["--resume", "a & b", 'say "hello"'];
   const modules = "C:\\Tools With Spaces\\node_modules";
   const pkg = W.join(modules, "@anthropic-ai", "claude-code");

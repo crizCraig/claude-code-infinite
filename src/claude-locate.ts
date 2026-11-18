@@ -17,7 +17,6 @@
  * only when PATH has no `claude`.
  */
 
-import { claudeNpmBin } from "./claude-process.js";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -61,6 +60,35 @@ export interface DesktopAppOptions {
   exists?: (file: string) => boolean;
 }
 
+export function claudeNpmBin(command: string, readManifest = (file: string) => fs.readFileSync(file, "utf8")): string | undefined {
+  if (!/\.(cmd|bat)$/i.test(command)) return undefined;
+  // npm places global shims in the prefix and local ones in node_modules/.bin.
+  // Its JS shim can invoke bare `node`, so resolve the package's bin without
+  // executing batch code or passing Claude's arguments through cmd.exe.
+  const { win32 } = path;
+  const dir = win32.dirname(command);
+  const modules = /[\\/]node_modules[\\/]\.bin$/i.test(dir) ? win32.dirname(dir) : win32.join(dir, "node_modules");
+  const pkg = win32.join(modules, "@anthropic-ai", "claude-code");
+  let manifest: string;
+  try {
+    manifest = readManifest(win32.join(pkg, "package.json"));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined; // Standalone batch wrapper.
+    throw err;
+  }
+  const { bin } = JSON.parse(manifest);
+  const entry = typeof bin === "string" ? bin : bin?.claude;
+  if (typeof entry !== "string" || !/\.(?:[cm]?js|exe)$/i.test(entry)) {
+    throw new Error("Claude Code's npm package has no supported claude executable.");
+  }
+  const file = win32.resolve(pkg, entry);
+  if (win32.parse(entry).root || win32.relative(pkg, file).split(win32.sep)[0] === "..") {
+    throw new Error("Claude Code's npm executable must be inside its package.");
+  }
+  return file;
+}
+
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | null {
   const platform = opts.platform ?? process.platform;
@@ -72,7 +100,7 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
       const bin = platform === "win32" ? claudeNpmBin(file, opts.readManifest) : undefined;
       return !bin || isExecutable(bin);
     } catch {
-      return false; // A standalone wrapper or broken package. Try the next candidate.
+      return false; // Broken npm package. Try the next candidate.
     }
   };
   const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
@@ -324,7 +352,7 @@ export function findPathExecutable(
 }
 
 /** cmd must not look up a shim's tools in the project, implicitly or via PATH. */
-export function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
+export function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string) {
   const key = pathKey(env, "win32");
   const rest = Object.fromEntries(Object.entries(env).filter(([name]) =>
     !["PATH", "COMSPEC", "NODEFAULTCURRENTDIRECTORYINEXEPATH"].includes(name.toUpperCase())));
