@@ -8,7 +8,7 @@ import { join } from "node:path";
 const home = mkdtempSync(join(tmpdir(), "ccc-config-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
-const { savedKeyFor, getPolychatApiKey, getStagingPolychatApiKey, getLocalPolychatApiKey, setPolychatApiKey,
+const { getPolychatApiKey, getStagingPolychatApiKey, getLocalPolychatApiKey, setPolychatApiKey,
   setLocalPolychatApiKey, setStagingPolychatApiKey } = await import("../dist/config.js");
 const dir = join(home, ".claude-code-infinite");
 const file = join(dir, "config.json");
@@ -34,16 +34,6 @@ test("an existing world-readable config is tightened when read", {
   assert.equal(mode(file), 0o600);
 });
 
-test("legacy config values outside the account key format cannot be used as credentials", () => {
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(file, JSON.stringify({
-    polychatApiKey: "review files", stagingPolychatApiKey: "unknown", localPolychatApiKey: "sk-short",
-  }));
-  for (const read of [getPolychatApiKey, getStagingPolychatApiKey, getLocalPolychatApiKey]) {
-    assert.equal(read(), undefined);
-  }
-});
-
 test("all key setters reject malformed input and leave the previous config intact", () => {
   const valid = "sk-" + "1".repeat(32);
   setPolychatApiKey(valid);
@@ -54,12 +44,24 @@ test("all key setters reject malformed input and leave the previous config intac
   }
 });
 
-test("saving a key in another environment does not persist old malformed credentials", () => {
+test("new keys are trimmed in every environment and unrelated saved keys survive", () => {
+  const valid = "sk-" + "a".repeat(32);
+  for (const [set, get] of [[setPolychatApiKey, getPolychatApiKey],
+    [setLocalPolychatApiKey, getLocalPolychatApiKey], [setStagingPolychatApiKey, getStagingPolychatApiKey]]) {
+    set(" \t" + valid + "\n");
+    assert.equal(get(), valid);
+  }
   writeFileSync(file, JSON.stringify({ localPolychatApiKey: "old saved value", updateCheck: false }));
-  setStagingPolychatApiKey("sk-" + "2".repeat(32));
-  const saved = readFileSync(file, "utf8");
-  assert.ok(!saved.includes("old saved value"));
-  assert.equal(JSON.parse(saved).updateCheck, false);
-  assert.equal(getLocalPolychatApiKey(), undefined);
-  assert.equal(savedKeyFor("local"), false, "an unattended launch can still continue");
+  setStagingPolychatApiKey(valid);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).localPolychatApiKey, "old saved value");
+});
+
+test("repeated reads return the original legacy key and warn only once per process", t => {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, JSON.stringify({ polychatApiKey: "legacy-credential" }));
+  const warnings = t.mock.method(console, "warn", () => {});
+  assert.equal(getPolychatApiKey(), "legacy-credential");
+  assert.equal(getPolychatApiKey(), "legacy-credential");
+  assert.equal(warnings.mock.callCount(), 1);
+  assert.doesNotMatch(warnings.mock.calls[0].arguments.join(" "), /legacy-credential/);
 });

@@ -35,7 +35,7 @@ export type KeyGateResult =
 
 export interface KeyGateDeps {
   keyPageUrl: string;
-  ask: (question: string) => Promise<string | null>;
+  ask: (question: string) => Promise<string>;
   open: (url: string) => void;
   /** The headline (the caller styles it). */
   warn: (text: string) => void;
@@ -56,7 +56,6 @@ export async function fetchKeyStatus(
   apiKey: string,
   options: { timeoutMs?: number; diagnostics?: DiagnosticsRecorder } = {}
 ): Promise<KeyCheck> {
-  if (!isMemtreeKey(apiKey)) return "invalid";
   const { diagnostics } = options;
   try {
     const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
@@ -97,8 +96,7 @@ export async function runKeyGate(deps: KeyGateDeps): Promise<KeyGateResult> {
   let headline = `⚠ ${KEY_INVALID_TEXT}. Get a new one at ${deps.keyPageUrl}`;
   for (;;) {
     deps.warn(headline);
-    const answer = await deps.ask(KEY_GATE_PROMPT);
-    const choice = answer === null ? "quit" : parseKeyChoice(answer);
+    const choice = parseKeyChoice(await deps.ask(KEY_GATE_PROMPT));
     if (choice === "quit") return { action: "quit" };
     if (choice === "continue") {
       deps.say("\nStarting claude without MemTree.\n");
@@ -107,9 +105,7 @@ export async function runKeyGate(deps: KeyGateDeps): Promise<KeyGateResult> {
     // The key page once: a retry already has it open.
     if (!opened) deps.open(deps.keyPageUrl);
     opened = true;
-    const pasted = await deps.ask(KEY_PASTE_PROMPT);
-    if (pasted === null) return { action: "quit" };
-    const apiKey = pasted.trim();
+    const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
     if (!isMemtreeKey(apiKey)) {
       headline = KEY_FORMAT_HINT;
       continue;

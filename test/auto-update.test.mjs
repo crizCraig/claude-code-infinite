@@ -859,7 +859,7 @@ test("runner: npm run as `node npm-cli.js` (Windows' way) installs the same", as
   const g = makeGlobal();
   const { calls, state } = await runRunner({ global: g, viaNode: true });
   assert.deepEqual(calls.map((c) => c[0]), ["root", "install"]);
-  assert.ok(calls[1].includes("--ignore-scripts"), "self-update must skip the bare-node postinstall");
+  assert.ok(calls[1].includes("--ignore-scripts"), "self-update must skip npm lifecycle scripts");
   assert.equal(state.last.status, "ok", state.last.error);
 });
 

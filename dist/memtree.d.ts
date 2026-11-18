@@ -60,7 +60,6 @@ export declare const FINAL_INDEX_IDLE_MS: number;
 export declare const FINAL_INDEX_EXIT_SESSIONS = 3;
 export interface MemtreeOptions {
     baseUrl: string;
-    /** Empty when resuming with a withheld legacy key. MemTree stays off locally. */
     apiKey: string;
     compressTimeoutMs?: number;
     /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */

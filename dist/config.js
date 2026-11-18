@@ -28,14 +28,8 @@ export function saveConfig(config) {
     if (!existsSync(CONFIG_DIR)) {
         mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
     }
-    // Keep the upgrade behavior for other environments without copying their
-    // malformed credentials into a newly written config.
-    const saved = { ...config };
-    for (const field of Object.values(keyFields)) {
-        saved[field] = savedKey(config[field]);
-    }
     restrictConfigPermissions(); // before writing, so a loose old file never gets new keys
-    writeFileSync(CONFIG_FILE, JSON.stringify(saved, null, 2), { mode: CONFIG_FILE_MODE });
+    writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: CONFIG_FILE_MODE });
     restrictConfigPermissions();
 }
 /** Tighten a config written before keys were owner-only (the mode above applies on create). */
@@ -54,36 +48,37 @@ const keyFields = {
     staging: "stagingPolychatApiKey",
     local: "localPolychatApiKey",
 };
-function savedKey(value) {
-    if (isMemtreeKey(value))
-        return value;
-    if (value === false || (typeof value === "string" && value.length > 0))
-        return false;
-    return undefined;
+let warnedLegacyKey = false;
+function savedKeyFor(mode) {
+    const key = loadConfig()[keyFields[mode]];
+    if (typeof key !== "string" || !key)
+        return undefined;
+    if (!isMemtreeKey(key) && !warnedLegacyKey) {
+        console.warn("Your saved MemTree key uses a legacy format. Continuing with the saved key.");
+        warnedLegacyKey = true;
+    }
+    return key;
 }
-/** false lets startup continue without using a malformed legacy value as a credential. */
-export function savedKeyFor(mode) {
-    return savedKey(loadConfig()[keyFields[mode]]);
-}
-function setKeyFor(mode, key) {
+function setKeyFor(mode, value) {
+    const key = value.trim();
     if (!isMemtreeKey(key))
         throw new Error(KEY_FORMAT_HINT);
     saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
 }
 export function getPolychatApiKey() {
-    return savedKeyFor("production") || undefined;
+    return savedKeyFor("production");
 }
 export function setPolychatApiKey(key) {
     setKeyFor("production", key);
 }
 export function getStagingPolychatApiKey() {
-    return savedKeyFor("staging") || undefined;
+    return savedKeyFor("staging");
 }
 export function setStagingPolychatApiKey(key) {
     setKeyFor("staging", key);
 }
 export function getLocalPolychatApiKey() {
-    return savedKeyFor("local") || undefined;
+    return savedKeyFor("local");
 }
 export function setLocalPolychatApiKey(key) {
     setKeyFor("local", key);

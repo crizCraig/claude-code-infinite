@@ -60,7 +60,6 @@ test("src process launches use checked executables and explicit shell paths", ()
   for (const file of fs.readdirSync(src, { recursive: true }).filter(f => path.extname(f) === ".ts")) {
     scan(file, fs.readFileSync(new URL(file, src), "utf8"));
   }
-  scan("dist/key-input.js", fs.readFileSync(new URL("../dist/key-input.js", import.meta.url), "utf8"));
   scan("detached updater", RUNNER_SOURCE);
   assert.deepEqual(violations, []);
 });

@@ -5,10 +5,9 @@ import { join } from "node:path";
 import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 
 export interface Config {
-  /** false remembers a legacy credential that was discarded on a subsequent write. */
-  polychatApiKey?: string | false;
-  stagingPolychatApiKey?: string | false;
-  localPolychatApiKey?: string | false;
+  polychatApiKey?: string;
+  stagingPolychatApiKey?: string;
+  localPolychatApiKey?: string;
   /** false turns off the startup check for a newer ccc on npm (update-check.ts). */
   updateCheck?: boolean;
   /** false keeps the update hint but never installs in the background (auto-update.ts). */
@@ -52,14 +51,8 @@ export function saveConfig(config: Config): void {
     mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
   }
 
-  // Keep the upgrade behavior for other environments without copying their
-  // malformed credentials into a newly written config.
-  const saved = { ...config };
-  for (const field of Object.values(keyFields)) {
-    saved[field] = savedKey(config[field]);
-  }
   restrictConfigPermissions(); // before writing, so a loose old file never gets new keys
-  writeFileSync(CONFIG_FILE, JSON.stringify(saved, null, 2), { mode: CONFIG_FILE_MODE });
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: CONFIG_FILE_MODE });
   restrictConfigPermissions();
 }
 
@@ -80,24 +73,26 @@ const keyFields = {
   local: "localPolychatApiKey",
 } as const;
 
-function savedKey(value: unknown): string | false | undefined {
-  if (isMemtreeKey(value)) return value;
-  if (value === false || (typeof value === "string" && value.length > 0)) return false;
-  return undefined;
+let warnedLegacyKey = false;
+
+function savedKeyFor(mode: keyof typeof keyFields): string | undefined {
+  const key = loadConfig()[keyFields[mode]];
+  if (typeof key !== "string" || !key) return undefined;
+  if (!isMemtreeKey(key) && !warnedLegacyKey) {
+    console.warn("Your saved MemTree key uses a legacy format. Continuing with the saved key.");
+    warnedLegacyKey = true;
+  }
+  return key;
 }
 
-/** false lets startup continue without using a malformed legacy value as a credential. */
-export function savedKeyFor(mode: keyof typeof keyFields): string | false | undefined {
-  return savedKey(loadConfig()[keyFields[mode]]);
-}
-
-function setKeyFor(mode: keyof typeof keyFields, key: string): void {
+function setKeyFor(mode: keyof typeof keyFields, value: string): void {
+  const key = value.trim();
   if (!isMemtreeKey(key)) throw new Error(KEY_FORMAT_HINT);
   saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
 }
 
 export function getPolychatApiKey(): string | undefined {
-  return savedKeyFor("production") || undefined;
+  return savedKeyFor("production");
 }
 
 export function setPolychatApiKey(key: string): void {
@@ -105,7 +100,7 @@ export function setPolychatApiKey(key: string): void {
 }
 
 export function getStagingPolychatApiKey(): string | undefined {
-  return savedKeyFor("staging") || undefined;
+  return savedKeyFor("staging");
 }
 
 export function setStagingPolychatApiKey(key: string): void {
@@ -113,7 +108,7 @@ export function setStagingPolychatApiKey(key: string): void {
 }
 
 export function getLocalPolychatApiKey(): string | undefined {
-  return savedKeyFor("local") || undefined;
+  return savedKeyFor("local");
 }
 
 export function setLocalPolychatApiKey(key: string): void {

@@ -26,8 +26,6 @@ const DEFAULT_TIMEOUT_MS = 2000;
  * other status, a network error, a timeout or an unexpected body → null.
  */
 export async function fetchKeyStatus(baseUrl, apiKey, options = {}) {
-    if (!isMemtreeKey(apiKey))
-        return "invalid";
     const { diagnostics } = options;
     try {
         const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
@@ -69,8 +67,7 @@ export async function runKeyGate(deps) {
     let headline = `⚠ ${KEY_INVALID_TEXT}. Get a new one at ${deps.keyPageUrl}`;
     for (;;) {
         deps.warn(headline);
-        const answer = await deps.ask(KEY_GATE_PROMPT);
-        const choice = answer === null ? "quit" : parseKeyChoice(answer);
+        const choice = parseKeyChoice(await deps.ask(KEY_GATE_PROMPT));
         if (choice === "quit")
             return { action: "quit" };
         if (choice === "continue") {
@@ -81,10 +78,7 @@ export async function runKeyGate(deps) {
         if (!opened)
             deps.open(deps.keyPageUrl);
         opened = true;
-        const pasted = await deps.ask(KEY_PASTE_PROMPT);
-        if (pasted === null)
-            return { action: "quit" };
-        const apiKey = pasted.trim();
+        const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
         if (!isMemtreeKey(apiKey)) {
             headline = KEY_FORMAT_HINT;
             continue;

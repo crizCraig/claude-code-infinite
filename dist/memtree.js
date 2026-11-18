@@ -885,7 +885,7 @@ export class MemtreeClient {
      * key. Cleared by any later answer.
      */
     get keyInvalid() {
-        return !this.apiKey || this.lastAnswerKeyInvalid;
+        return this.lastAnswerKeyInvalid;
     }
     /**
      * Whether MemTree's latest answer (or timeout) was a success: true, a
@@ -953,8 +953,6 @@ export class MemtreeClient {
      * through ANTHROPIC_BASE_URL without ever handling the key.
      */
     async fetchMemTree(pathAndQuery, accept = "application/json", signal, extraHeaders = {}) {
-        if (!this.apiKey)
-            return { status: 401, contentType: "text/plain", body: Buffer.alloc(0) };
         const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
             signal,
             headers: {
@@ -1570,8 +1568,6 @@ export class MemtreeClient {
         }
     }
     async callContextMemory(messages, modelContextLimit, opts) {
-        if (!this.apiKey)
-            throw Object.assign(new Error("Missing MemTree key"), { status: 401 });
         const body = {
             messages,
             model_context_limit: modelContextLimit,

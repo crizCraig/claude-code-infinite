@@ -77,7 +77,7 @@ test("startup check: a bare 403 (WAF, proxy) stays unknown", async () => {
     res.end("<html>Attention Required! | Cloudflare</html>");
   });
   try {
-    assert.equal(await fetchKeyStatus(server.url, accountKey), null);
+    assert.equal(await fetchKeyStatus(server.url, "k"), null);
   } finally { server.close(); }
 });
 
@@ -86,7 +86,7 @@ for (const status of [401, 403]) {
     const server = await statusServer(status, { detail: "Invalid API key" });
     const diagnostics = recorder();
     try {
-      assert.equal(await fetchKeyStatus(server.url, accountKey, { diagnostics }), "invalid");
+      assert.equal(await fetchKeyStatus(server.url, "bad", { diagnostics }), "invalid");
       assert.deepEqual(diagnostics.events, [{ name: "key_status", result: "invalid", status }]);
     } finally { server.close(); }
   });
@@ -97,7 +97,7 @@ for (const status of [400, 403, 404, 405, 429, 500, 502, 503]) {
     const server = await statusServer(status, { detail: "nope" });
     const diagnostics = recorder();
     try {
-      assert.equal(await fetchKeyStatus(server.url, accountKey, { diagnostics }), null);
+      assert.equal(await fetchKeyStatus(server.url, "k", { diagnostics }), null);
       assert.equal(diagnostics.events[0].result, "unknown");
     } finally { server.close(); }
   });
@@ -108,7 +108,7 @@ test("startup check: a network error stays unknown", async () => {
   const url = server.url;
   server.close();
   const diagnostics = recorder();
-  assert.equal(await fetchKeyStatus(url, accountKey, { diagnostics }), null);
+  assert.equal(await fetchKeyStatus(url, "k", { diagnostics }), null);
   assert.equal(diagnostics.events[0].name, "error");
 });
 
@@ -117,8 +117,8 @@ test("startup check: paid and unpaid bodies parse as before", async () => {
   const unpaid = await statusServer(200, { paid: false, payment_message: "Pay",
     payment_url: "https://x/payment?u=1" });
   try {
-    assert.deepEqual(await fetchKeyStatus(paid.url, accountKey), { paid: true, message: null, url: null });
-    const status = await fetchKeyStatus(unpaid.url, accountKey);
+    assert.deepEqual(await fetchKeyStatus(paid.url, "k"), { paid: true, message: null, url: null });
+    const status = await fetchKeyStatus(unpaid.url, "k");
     assert.equal(status.paid, false);
     assert.equal(status.url, "https://x/payment?u=1&source=ccc");
   } finally { paid.close(); unpaid.close(); }
@@ -167,16 +167,6 @@ test("gate: q quits without saving anything", async () => {
   assert.match(log.warned[0], /isn't valid \(revoked or mistyped\)/);
   assert.match(log.warned[0], /polychat\.co\/auth\?memtree=true/);
   assert.deepEqual(log.saved, []);
-});
-
-test("gate: cancelling the choice or the paste quits without checking or saving", async () => {
-  for (const answers of [[null], ["", null]]) {
-    const { deps, log } = gateDeps(answers);
-    deps.check = () => assert.fail("cancelled key reached the status check");
-    assert.deepEqual(await runKeyGate(deps), { action: "quit" });
-    assert.deepEqual(log.saved, []);
-    assert.equal(answers.length, 0);
-  }
 });
 
 test("gate: c starts claude without MemTree, as the payment gate does", async () => {
@@ -477,26 +467,10 @@ test("an invalid-key refusal in a subagent's lane keeps the user's key notice du
 
 test("malformed pasted keys never leave the recovery gate", async () => {
   const key = "sk-" + "a".repeat(32);
-  for (const text of ["review files", "review", key.slice(0, 6) + " " + key.slice(6), key + "x", key.slice(1)]) {
+  for (const text of ["review files", "review", key.slice(0, 6) + " " + key.slice(6), key + "0", key.slice(0, -1), key.toUpperCase(), "sk-" + "A".repeat(32)]) {
     const { deps, log } = gateDeps(["", text, "q"]);
     deps.check = () => assert.fail("malformed key reached the status check");
     assert.deepEqual(await runKeyGate(deps), { action: "quit" });
     assert.deepEqual(log.saved, []);
   }
-});
-
-test("the status transport rejects malformed keys before calling fetch", async t => {
-  const send = t.mock.method(globalThis, "fetch", async () => Response.json({ paid: true }));
-  assert.equal(await fetchKeyStatus("https://example.invalid", "review files"), "invalid");
-  assert.equal(send.mock.callCount(), 0);
-});
-
-test("a resumed session without a usable key handles MemTree reads and compression locally", async t => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 401 }));
-  const memtree = new MemtreeClient({ baseUrl: "https://example.invalid", apiKey: "" });
-  assert.equal(memtree.keyInvalid, true);
-  assert.equal((await memtree.fetchMemTree("/usage/memtree/tree.json")).status, 401);
-  assert.equal(await memtree.compress("session", [{ role: "user", content: "hi" }], 200_000), null);
-  assert.equal(memtree.keyInvalid, true);
-  assert.equal(fetch.mock.callCount(), 0);
 });

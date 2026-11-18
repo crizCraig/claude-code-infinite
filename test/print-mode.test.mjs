@@ -157,59 +157,21 @@ test("ccc -p with no saved key and no terminal: fails on stderr, never prompts o
   assert.doesNotMatch(stderr, /Press Enter|paste it here/);
 });
 
-test("ccc -p with a legacy saved key warns once and launches Claude unattended", async () => {
+test("ccc -p checks a legacy saved key and warns once without printing the key", async () => {
   const key = "old-saved-value";
-  const mock = `globalThis.fetch = async () => {
-    console.error("unexpected MemTree request");
-    return new Response("", { status: 401 });
+  const mock = `globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/status") && new Headers(init.headers).get("authorization") === "Bearer ${key}") {
+      console.error("checked legacy credential");
+    }
+    return Response.json({ paid: false });
   };`;
   const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, { key },
     ["--import", "data:text/javascript," + encodeURIComponent(mock)]);
   assert.equal(code, 0, stderr);
   assert.deepEqual(JSON.parse(stdout).args, ["-p", "hi"]);
-  assert.equal(stderr.split("Your MemTree key isn't valid").length - 1, 1);
-  assert.doesNotMatch(stderr, /old-saved-value|Press Enter|paste it here|unexpected MemTree request/);
-});
-
-test("a malformed legacy key keeps resume recovery and never reaches MemTree", async t => {
-  const config = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-resume-legacy-"));
-  t.after(() => fs.rmSync(config, { recursive: true, force: true }));
-  const project = path.join(config, "projects", "project");
-  fs.mkdirSync(project, { recursive: true });
-  const id = "e32c1f3e-f811-468a-8d31-e4967cbf1219";
-  const transcript = path.join(project, id + ".jsonl");
-  const usage = { input_tokens: 999_990, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 100 };
-  fs.writeFileSync(transcript, JSON.stringify({ type: "assistant",
-    message: { id: "last", model: "claude-opus-5-5[1m]", usage } }) + "\n");
-
-  const mock = `
-    import { Server } from "node:net";
-    import cp from "node:child_process";
-    import { syncBuiltinESMExports } from "node:module";
-    Server.prototype.listen = function(port, host, ready) { queueMicrotask(ready); return this; };
-    Server.prototype.address = () => ({ port: 12345 });
-    globalThis.fetch = () => { console.error("unexpected MemTree request"); throw Error(); };
-    const exec = cp.execFileSync;
-    cp.execFileSync = (cmd, ...args) => {
-      if (cmd === "ps") return "1 init";
-      if (cmd === "lsof") throw Object.assign(new Error(), { status: 1, stdout: "" });
-      return exec(cmd, ...args);
-    };
-    syncBuiltinESMExports();
-    for (const name of ["CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "ANTHROPIC_MODEL"])
-      delete process.env[name];
-  `;
-  const { code, stdout, stderr } = await runCcc(["-p", "--resume", id, "hi"],
-    { CLAUDE_CONFIG_DIR: config }, { key: "old-saved-value" },
-    ["--import", "data:text/javascript," + encodeURIComponent(mock)]);
-  assert.equal(code, 0, stderr);
-  assert.deepEqual(JSON.parse(stdout).args.slice(-4), ["-p", "--resume", id, "hi"]);
-  assert.match(stderr, /Your MemTree key isn't valid/);
-  assert.match(stderr, /Request log:/, "resume must use ccc's proxy");
-  assert.doesNotMatch(stderr + stdout, /old-saved-value|unexpected MemTree request/);
-  if (process.platform !== "win32") {
-    assert.equal(JSON.parse(fs.readFileSync(transcript, "utf8")).message.usage.input_tokens, 500_000);
-  }
+  assert.match(stderr, /checked legacy credential/);
+  assert.equal(stderr.match(/legacy format/gi)?.length, 1);
+  assert.doesNotMatch(stderr, /old-saved-value|paste it here/);
 });
 
 const NO_PLAN = /^Claude Code is signed in for API billing \(an Anthropic Console account\), so Claude bills that account per token, not a Claude plan\. Your MemTree credit covers MemTree, not Claude itself\. To use Claude Pro or Max instead, run \/login in Claude Code and choose "Claude account with subscription"\.$/m;

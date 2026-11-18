@@ -99,7 +99,6 @@ export const FINAL_INDEX_EXIT_SESSIONS = 3;
 
 export interface MemtreeOptions {
   baseUrl: string;
-  /** Empty when resuming with a withheld legacy key. MemTree stays off locally. */
   apiKey: string;
   compressTimeoutMs?: number;
   /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
@@ -1147,7 +1146,7 @@ export class MemtreeClient {
    * key. Cleared by any later answer.
    */
   get keyInvalid(): boolean {
-    return !this.apiKey || this.lastAnswerKeyInvalid;
+    return this.lastAnswerKeyInvalid;
   }
 
   /**
@@ -1231,7 +1230,6 @@ export class MemtreeClient {
     signal?: AbortSignal,
     extraHeaders: Record<string, string> = {}
   ): Promise<{ status: number; contentType: string; body: Buffer }> {
-    if (!this.apiKey) return { status: 401, contentType: "text/plain", body: Buffer.alloc(0) };
     const response = await fetch(`${this.baseUrl}${pathAndQuery}`, {
       signal,
       headers: {
@@ -1951,7 +1949,6 @@ export class MemtreeClient {
       clientMeta?: Record<string, string>;
     }
   ): Promise<CompressResult | null> {
-    if (!this.apiKey) throw Object.assign(new Error("Missing MemTree key"), { status: 401 });
     const body: Record<string, unknown> = {
       messages,
       model_context_limit: modelContextLimit,
