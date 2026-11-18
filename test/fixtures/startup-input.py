@@ -6,9 +6,12 @@ import select
 import subprocess
 import sys
 import tempfile
+import termios
 from pathlib import Path
 
 node, scenario = sys.argv[1:]
+rejected = scenario.startswith("rejected-key")
+drain_failed = scenario == "rejected-key-drain-unreadable"
 first = "sk-" + "1" * 32
 stale = "sk-" + "2" * 32
 fresh = "sk-" + "3" * 32
@@ -28,15 +31,20 @@ globalThis.fetch = async (url, init) => {
   if (url.endsWith('/status') && key === 'Bearer ' + process.env.REJECT) {
     process.stderr.write('CHECKING\\n');
     await wait(200);
+    if (process.env.DRAIN_FAULT === 'drain-unreadable') process.env.BREAK_DRAIN = '1';
     return new Response('', {status:401});
+  }
+  if (url.endsWith('/status') && key === 'Bearer ' + process.env.ACCEPT) {
+    process.stderr.write('CHECKING REPLACEMENT\\n');
+    await wait(200);
   }
   return Response.json({paid:false});
 };
 """)
     master, slave = pty.openpty()
     env = {"HOME": directory, "PATH": directory, "CCC_NO_UPDATE_CHECK": "1",
-           "DRAIN_FAULT": scenario if scenario.startswith("drain-") else "",
-           "REJECT": first if scenario == "rejected-key" else "",
+           "DRAIN_FAULT": scenario.removeprefix("rejected-key-") if "drain-" in scenario else "",
+           "REJECT": first if rejected else "", "ACCEPT": fresh if rejected else "",
            **{k: os.environ[k] for k in ("NO_COLOR", "FORCE_COLOR") if k in os.environ}}
     printing = scenario == "print-key"
     args = [node, "--import", str(mock)]
@@ -79,9 +87,10 @@ globalThis.fetch = async (url, init) => {
             os.write(master, b"\x03")
         else:
             enter("  " + first + " " if printing else first)
-        if scenario == "rejected-key":
+        if rejected:
             until(b"CHECKING")
             os.write(master, ("\r" + stale + "\rreview files").encode())
+        if rejected and not drain_failed:
             until(b"[q] quit")
             stays_at_prompt(b"new MemTree key and paste it here")
             # A key-shaped line in the same burst as the menu choice is stale too.
@@ -89,7 +98,9 @@ globalThis.fetch = async (url, init) => {
             until(b"new MemTree key and paste it here")
             stays_at_prompt(b"[q] quit")
             enter(fresh)
-        if not printing and scenario != "cancel-key":
+            until(b"CHECKING REPLACEMENT")
+            enter(stale)  # The successful check hands off to an echoing payment prompt.
+        if not printing and not drain_failed and scenario != "cancel-key":
             until(b"[q] quit")
             enter("q")
         # Keep draining redraws while ccc flushes its diagnostics and exits.
@@ -102,19 +113,24 @@ globalThis.fetch = async (url, init) => {
             except OSError:
                 break
         assert proc.wait(timeout=2) == 0
+        assert termios.tcgetattr(master)[3] & termios.ECHO, "terminal echo was not restored"
         if scenario == "cancel-key":
             assert b"Error:" not in transcript and b"    at " not in transcript
             assert not (root / "sent").exists()
             sys.exit(0)
         if env["DRAIN_FAULT"]:
-            assert b"INJECTED " + scenario.encode() in transcript
-        assert first.encode() not in transcript and fresh.encode() not in transcript, "key echoed in output"
+            assert b"INJECTED " + env["DRAIN_FAULT"].encode() in transcript
+        assert all(key.encode() not in transcript for key in (first, stale, fresh)), "key echoed in output"
+        if drain_failed:
+            assert b"Cancelling the prompt" in transcript and b"[q] quit" not in transcript
+            assert set((root / "sent").read_text().splitlines()) == {"Bearer " + first}
+            sys.exit(0)
         if printing:
             assert proc.stdout.read() == b""
         sent = (root / "sent").read_text().splitlines()
         saved = json.loads((root / ".claude-code-infinite" / "config.json").read_text())
-        assert saved["polychatApiKey"] == (fresh if scenario == "rejected-key" else first)
-        assert set(sent) == {"Bearer " + k for k in ([first, fresh] if scenario == "rejected-key" else [first])}
+        assert saved["polychatApiKey"] == (fresh if rejected else first)
+        assert set(sent) == {"Bearer " + k for k in ([first, fresh] if rejected else [first])}
     finally:
         proc.kill()
         proc.wait()

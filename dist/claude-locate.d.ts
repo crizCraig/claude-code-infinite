@@ -34,6 +34,8 @@ export interface LocateClaudeOptions {
     homedir?: string;
     /** True when `file` exists and can be run. */
     isExecutable?: (file: string) => boolean;
+    /** The adjacent Claude npm package manifest for a Windows shim. */
+    readManifest?: (file: string) => string;
     /** Windows: the user's and the machine's PATH from the registry. */
     registryPath?: () => string[];
     /** Directory entries (winget's package folders); [] when unreadable. */

@@ -16,6 +16,7 @@
  * Only paths are probed; nothing is run except `reg query` on Windows, and
  * only when PATH has no `claude`.
  */
+import { claudeNpmBin } from "./claude-process.js";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -31,13 +32,24 @@ export function locateClaude(opts = {}) {
     const platform = opts.platform ?? process.platform;
     const env = opts.env ?? process.env;
     const isExecutable = opts.isExecutable ?? defaultIsExecutable(platform);
-    const onPath = locateOnPath(pathDirs(env, platform), platform, env, isExecutable);
+    const isRunnableClaude = (file) => {
+        if (!isExecutable(file))
+            return false;
+        try {
+            const bin = platform === "win32" ? claudeNpmBin(file, opts.readManifest) : undefined;
+            return !bin || isExecutable(bin);
+        }
+        catch {
+            return false; // A standalone wrapper or broken package. Try the next candidate.
+        }
+    };
+    const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
     if (onPath)
         return onPath;
     const home = opts.homedir ?? os.homedir();
     for (const candidate of candidates(platform, env, home, opts)) {
         const file = candidate.dirs
-            .map((dir) => findOnPath("claude", [dir], platform, env, isExecutable))
+            .map((dir) => findOnPath("claude", [dir], platform, env, isRunnableClaude))
             .find((f) => f !== null && !isDesktopAppExe(f, platform));
         if (file)
             return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };

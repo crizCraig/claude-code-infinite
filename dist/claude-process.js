@@ -3,10 +3,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { win32 } from "node:path";
 import { executablePath } from "./executable-path.js";
-export function claudeInvocation(command, args, platform = process.platform, readManifest = (file) => readFileSync(file, "utf8")) {
-    executablePath(command, platform);
-    if (platform !== "win32" || !/\.(cmd|bat)$/i.test(command))
-        return { command, args };
+export function claudeNpmBin(command, readManifest = (file) => readFileSync(file, "utf8")) {
+    if (!/\.(cmd|bat)$/i.test(command))
+        return undefined;
     // npm places global shims in the prefix and local ones in node_modules/.bin.
     // Its JS shim can invoke bare `node`, so resolve the package's bin without
     // executing batch code or passing Claude's arguments through cmd.exe.
@@ -18,7 +17,17 @@ export function claudeInvocation(command, args, platform = process.platform, rea
     if (typeof entry !== "string" || !/\.(?:[cm]?js|exe)$/i.test(entry)) {
         throw new Error("Claude Code's npm package has no supported claude executable.");
     }
-    const file = win32.join(pkg, entry);
+    const file = win32.resolve(pkg, entry);
+    if (win32.parse(entry).root || win32.relative(pkg, file).split(win32.sep)[0] === "..") {
+        throw new Error("Claude Code's npm executable must be inside its package.");
+    }
+    return file;
+}
+export function claudeInvocation(command, args, platform = process.platform, readManifest) {
+    executablePath(command, platform);
+    const file = platform === "win32" ? claudeNpmBin(command, readManifest) : undefined;
+    if (!file)
+        return { command, args };
     return /\.exe$/i.test(file) ? { command: file, args } : { command: process.execPath, args: [file, ...args] };
 }
 export function spawnClaude(command, args, options) {

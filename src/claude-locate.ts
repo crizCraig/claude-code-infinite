@@ -17,6 +17,7 @@
  * only when PATH has no `claude`.
  */
 
+import { claudeNpmBin } from "./claude-process.js";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -44,6 +45,8 @@ export interface LocateClaudeOptions {
   homedir?: string;
   /** True when `file` exists and can be run. */
   isExecutable?: (file: string) => boolean;
+  /** The adjacent Claude npm package manifest for a Windows shim. */
+  readManifest?: (file: string) => string;
   /** Windows: the user's and the machine's PATH from the registry. */
   registryPath?: () => string[];
   /** Directory entries (winget's package folders); [] when unreadable. */
@@ -63,12 +66,21 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
   const platform = opts.platform ?? process.platform;
   const env = opts.env ?? process.env;
   const isExecutable = opts.isExecutable ?? defaultIsExecutable(platform);
-  const onPath = locateOnPath(pathDirs(env, platform), platform, env, isExecutable);
+  const isRunnableClaude = (file: string) => {
+    if (!isExecutable(file)) return false;
+    try {
+      const bin = platform === "win32" ? claudeNpmBin(file, opts.readManifest) : undefined;
+      return !bin || isExecutable(bin);
+    } catch {
+      return false; // A standalone wrapper or broken package. Try the next candidate.
+    }
+  };
+  const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
   if (onPath) return onPath;
   const home = opts.homedir ?? os.homedir();
   for (const candidate of candidates(platform, env, home, opts)) {
     const file = candidate.dirs
-      .map((dir) => findOnPath("claude", [dir], platform, env, isExecutable))
+      .map((dir) => findOnPath("claude", [dir], platform, env, isRunnableClaude))
       .find((f): f is string => f !== null && !isDesktopAppExe(f, platform));
     if (file) return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
   }

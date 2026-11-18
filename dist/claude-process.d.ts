@@ -1,4 +1,5 @@
 import { type SpawnOptions, type SpawnSyncOptions } from "node:child_process";
+export declare function claudeNpmBin(command: string, readManifest?: (file: string) => string): string | undefined;
 export declare function claudeInvocation(command: string, args: string[], platform?: NodeJS.Platform, readManifest?: (file: string) => string): {
     command: string;
     args: string[];

@@ -40,27 +40,54 @@ const WIN_ENV = {
   LOCALAPPDATA: "C:\\Users\\ada\\AppData\\Local",
 };
 
+function npmShimFiles(shim) {
+  return [shim, W.join(W.dirname(shim), "node_modules", "@anthropic-ai", "claude-code", "cli.js")];
+}
+
 function locateWin(files, extra = {}) {
   return locateClaude({
     platform: "win32", env: WIN_ENV, homedir: "C:\\Users\\ada",
+    readManifest: () => JSON.stringify({ bin: { claude: "./cli.js" } }),
     isExecutable: fakeFs(files, "win32"), registryPath: () => [], listDir: () => [], ...extra,
   });
 }
 
 test("Windows on PATH: spawn the resolved program, never a bare name", () => {
   const shim = "C:\\Program Files\\nodejs\\claude.cmd";
-  assert.deepEqual(locateWin([shim]), { command: shim, source: "path" });
-  assert.equal(locateWin(["claude.exe", shim], { env: { ...WIN_ENV, Path: ".;" + WIN_ENV.Path } }).command, shim);
+  assert.deepEqual(locateWin(npmShimFiles(shim)), { command: shim, source: "path" });
+  assert.equal(locateWin(["claude.exe", ...npmShimFiles(shim)], { env: { ...WIN_ENV, Path: ".;" + WIN_ENV.Path } }).command, shim);
   // A later desktop exe on PATH changes nothing: the first resolved CLI still wins.
-  const desktopLater = locateClaude({
-    platform: "win32", env: { ...WIN_ENV, Path: `${WIN_ENV.Path};C:\\Users\\ada\\AppData\\Local\\AnthropicClaude` },
-    homedir: "C:\\Users\\ada", registryPath: () => [], listDir: () => [],
-    isExecutable: fakeFs([shim, "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude\\claude.exe"], "win32"),
+  const desktop = "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude";
+  const desktopLater = locateWin([...npmShimFiles(shim), W.join(desktop, "claude.exe")], {
+    env: { ...WIN_ENV, Path: WIN_ENV.Path + ";" + desktop },
   });
   assert.deepEqual(desktopLater, { command: shim, source: "path" });
   assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "C:\\Windows\\system32\\claude.exe", source: "path" });
   // An extensionless `claude` (npm's script for Git Bash) is not something cmd can run.
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
+});
+
+test("Windows: a broken Claude shim cannot hide a runnable native CLI", () => {
+  const wrapper = "C:\\wrappers";
+  const native = "D:\\native";
+  const bin = W.join(wrapper, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+  for (const ext of [".cmd", ".bat"]) {
+    const shim = W.join(wrapper, "claude" + ext);
+    for (const dir of [wrapper, native]) {
+      const exe = W.join(dir, "claude.exe");
+      const env = { ...WIN_ENV, Path: wrapper + ";" + native, PATHEXT: ".CMD;.BAT;.EXE" };
+      for (const [manifest, files] of [
+        [undefined, []], ["{", []], ['{"bin":{"claude":"cli.js"}}', []],
+        ['{"bin":"../outside.js"}', [W.resolve(W.dirname(bin), "../outside.js")]],
+      ]) {
+        const found = locateWin([shim, exe, ...files], { env, readManifest: () => {
+          if (manifest === undefined) throw new Error("missing package.json");
+          return manifest;
+        } });
+        assert.equal(found?.command, exe);
+      }
+    }
+  }
 });
 
 test("Windows project metadata resolves git.exe outside the project", () => {
@@ -82,8 +109,8 @@ test("Windows: the native installer's claude.exe off PATH is found and its folde
 
 test("Windows: npm's global claude.cmd and winget's link are found off PATH", () => {
   const npmShim = "C:\\Users\\ada\\AppData\\Roaming\\npm\\claude.cmd";
-  assert.equal(locateWin([npmShim]).source, "npm");
-  assert.equal(locateWin([npmShim]).command, npmShim);
+  assert.equal(locateWin(npmShimFiles(npmShim)).source, "npm");
+  assert.equal(locateWin(npmShimFiles(npmShim)).command, npmShim);
   const link = "C:\\Users\\ada\\AppData\\Local\\Microsoft\\WinGet\\Links\\claude.exe";
   assert.equal(locateWin([link]).source, "winget");
   const pkgDir = "C:\\Users\\ada\\AppData\\Local\\Microsoft\\WinGet\\Packages";
@@ -109,7 +136,7 @@ test("Windows: the registry is read only when no installer folder has claude", (
   const exe = "C:\\Users\\ada\\.local\\bin\\claude.exe";
   assert.equal(locateWin([exe, "D:\\tools\\claude.exe"], { registryPath }).source, "native");
   assert.equal(reads, 0, "two reg.exe spawns saved");
-  assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude.cmd"], { registryPath }).source, "path");
+  assert.equal(locateWin(npmShimFiles("C:\\Program Files\\nodejs\\claude.cmd"), { registryPath }).source, "path");
   assert.equal(reads, 0);
   assert.equal(locateWin([], { registryPath }), null);
   assert.equal(reads, 1);
@@ -173,14 +200,11 @@ test("Windows: the desktop app's own claude.exe on PATH is not taken for the CLI
   for (const dir of [squirrel, `${squirrel}\\app-1.2.3`, store, alias,
     `${alias}\\Claude_pzs8sxrjxfjjc`]) {
     const env = { ...WIN_ENV, Path: `${dir};${WIN_ENV.Path}` };
-    const locate = (files) => locateClaude({
-      platform: "win32", env, homedir: "C:\\Users\\ada", isExecutable: fakeFs(files, "win32"),
-      registryPath: () => [dir], listDir: () => [],
-    });
+    const locate = (files) => locateWin(files, { env, registryPath: () => [dir] });
     assert.equal(locate([`${dir}\\claude.exe`]), null, dir);
     // The real CLI later on PATH: by its full path, since `claude` would start the desktop app.
     const cli = "C:\\Program Files\\nodejs\\claude.cmd";
-    assert.deepEqual(locate([`${dir}\\claude.exe`, cli]),
+    assert.deepEqual(locate([`${dir}\\claude.exe`, ...npmShimFiles(cli)]),
       { command: cli, source: "path", dir: "C:\\Program Files\\nodejs" });
     const exe = "C:\\Users\\ada\\.local\\bin\\claude.exe";
     assert.equal(locate([`${dir}\\claude.exe`, exe]).source, "native");

@@ -490,3 +490,13 @@ test("the status transport rejects malformed keys before calling fetch", async t
   assert.equal(await fetchKeyStatus("https://example.invalid", "review files"), "invalid");
   assert.equal(send.mock.callCount(), 0);
 });
+
+test("a resumed session without a usable key handles MemTree reads and compression locally", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 401 }));
+  const memtree = new MemtreeClient({ baseUrl: "https://example.invalid", apiKey: "" });
+  assert.equal(memtree.keyInvalid, true);
+  assert.equal((await memtree.fetchMemTree("/usage/memtree/tree.json")).status, 401);
+  assert.equal(await memtree.compress("session", [{ role: "user", content: "hi" }], 200_000), null);
+  assert.equal(memtree.keyInvalid, true);
+  assert.equal(fetch.mock.callCount(), 0);
+});

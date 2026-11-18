@@ -3,62 +3,131 @@
 import { closeSync, constants, openSync, readSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { PassThrough } from "node:stream";
+import { executablePath } from "./executable-path.js";
 import { system32Path } from "./claude-locate.js";
-export async function askFreshKeyLine(question, output = process.stdout) {
+/** Keep echo off from the first prompt through the last status check. */
+export async function withMutedKeyInput(run) {
+    const input = process.stdin;
+    if (!input.isTTY)
+        return run(askFreshKeyLine);
+    const wasRaw = input.isRaw;
+    input.setRawMode(true);
+    try {
+        return await run(askFreshKeyLine);
+    }
+    finally {
+        try {
+            // A successful check can hand the terminal straight to Claude or a
+            // payment prompt. Discard a replacement pasted during that check too.
+            discardBufferedInput();
+            if (process.platform === "win32") {
+                execFileSync(system32Path(process.env, "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoLogo", "-NoProfile", "-Command", "$ErrorActionPreference='Stop'; $Host.UI.RawUI.FlushInputBuffer()"], { stdio: ["inherit", "ignore", "inherit"] });
+            }
+            else if (!discardTerminalInput()) {
+                throw new Error("Could not clear pending terminal input after checking the MemTree key.");
+            }
+        }
+        finally {
+            input.setRawMode(wasRaw);
+        }
+    }
+}
+function discardBufferedInput() {
     const input = process.stdin;
     input.pause();
     while (input.readableLength)
         input.read(); // only bytes already held by Node
+}
+async function askFreshKeyLine(question, output = process.stdout) {
+    const input = process.stdin;
+    discardBufferedInput();
     if (process.platform === "win32")
         return windowsConsoleLine(question, output);
-    const wasRaw = input.isRaw;
-    input.setRawMode(true); // make even a partial line available to the drain
+    // Closing a terminal readline normally re-enables echo. Keep the tty in
+    // the enclosing validation scope and give the editor only its input bytes.
+    const bytes = new PassThrough();
+    const rl = createInterface({ input: bytes, terminal: true });
     try {
-        discardTerminalInput();
-        // Raw mode disables tty echo. Give the line editor no output stream so
-        // pasted text and redraws cannot reach either the screen or a log.
-        const rl = createInterface({ input, terminal: true });
-        try {
-            return await new Promise((resolve) => {
-                rl.once("close", () => resolve(null));
-                rl.once("SIGINT", () => {
-                    output.write("\n");
-                    rl.close();
-                });
-                rl.once("line", answer => {
-                    output.write("\n");
-                    resolve(answer);
-                    rl.close();
-                });
-                output.write(question);
+        return await new Promise((resolve) => {
+            rl.once("close", () => resolve(null));
+            rl.once("SIGINT", () => {
+                output.write("\n");
+                rl.close();
             });
-        }
-        finally {
-            rl.close();
-        }
+            rl.once("line", answer => {
+                output.write("\n");
+                resolve(answer);
+                rl.close();
+            });
+            // Show the prompt at the empty-queue boundary, before closing a device
+            // or waiting for stty to restore VMIN. Only then start the line reader.
+            if (discardTerminalInput(() => output.write(question)))
+                input.pipe(bytes);
+            else {
+                output.write("Could not clear pending terminal input. Cancelling the prompt.\n");
+                rl.close();
+            }
+        });
     }
     finally {
-        input.setRawMode(wasRaw);
+        input.unpipe(bytes);
+        bytes.destroy();
+        rl.close();
+    }
+}
+function drain(fd) {
+    const buffer = Buffer.alloc(4096);
+    try {
+        while (readSync(fd, buffer, 0, buffer.length, null) > 0) { /* discard */ }
+        return true;
+    }
+    catch (err) {
+        const code = err.code;
+        return code === "EAGAIN" || code === "EWOULDBLOCK";
     }
 }
 // Linux reopens the tty through procfs. On macOS /dev/fd/0 duplicates stdin
 // and ignores O_NONBLOCK, so open the actual device with its own file flags.
-function discardTerminalInput() {
+function discardTerminalInput(onEmpty) {
+    let fd;
     try {
         const path = process.platform === "linux" ? "/dev/fd/0"
-            : execFileSync("/usr/bin/tty", { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trimEnd();
-        const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOCTTY);
+            : execFileSync(executablePath("/usr/bin/tty"), { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trimEnd();
+        fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOCTTY);
+    }
+    catch { /* after su, only inherited stdin may be readable */ }
+    if (fd !== undefined) {
         try {
-            const buffer = Buffer.alloc(4096);
-            while (readSync(fd, buffer, 0, buffer.length, null) > 0) { /* discard */ }
+            if (drain(fd)) {
+                onEmpty?.();
+                return true;
+            }
         }
         finally {
-            closeSync(fd);
+            try {
+                closeSync(fd);
+            }
+            catch { /* the read already established whether the queue was empty */ }
         }
     }
+    // In raw mode VMIN=0, VTIME=0 makes even a blocking inherited fd return
+    // when the queue empties. Restore raw mode's VMIN before Node starts reading.
+    const stty = (min) => execFileSync(executablePath("/bin/stty"), ["min", min, "time", "0"], { stdio: ["inherit", "ignore", "ignore"] });
+    try {
+        stty("0");
+        try {
+            if (!drain(process.stdin.fd))
+                return false;
+            onEmpty?.();
+        }
+        finally {
+            stty("1");
+        }
+        return true;
+    }
     catch {
-        // EAGAIN means the queue is empty. If the tty can't be reopened or read
-        // (e.g. after su), the user can still enter a key on inherited stdin.
+        return false;
     }
 }
 // The console reader owns the flush, prompt and read. The answer travels only

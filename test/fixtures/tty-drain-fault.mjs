@@ -15,11 +15,13 @@ function fail(operation, code) {
 fs.openSync = (path, flags, ...args) => {
   if (typeof path !== "string" || !path.startsWith("/dev/") || !(flags & fs.constants.O_NONBLOCK))
     return openSync(path, flags, ...args);
+  if (process.env.BREAK_DRAIN) fail("drain-unreadable", "EACCES");
   fail("drain-open-denied", "EACCES");
   drainFd = openSync(path, flags, ...args);
   return drainFd;
 };
 fs.readSync = (fd, ...args) => {
+  if (fd === 0 && process.env.BREAK_DRAIN) fail("drain-unreadable", "EIO");
   if (fd === drainFd) fail("drain-read-error", "EIO");
   return readSync(fd, ...args);
 };

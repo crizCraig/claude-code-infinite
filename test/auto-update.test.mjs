@@ -682,7 +682,7 @@ test("runner: installs exactly that version into this prefix, records ok, frees 
   const { calls, state, lockLeft, files } = await runRunner({ global: g });
   assert.deepEqual(calls[0], ["root", "--global"]);
   assert.deepEqual(calls[1], [
-    "install", "--global", `--prefix=${g.prefix}`, `${PKG}@1.0.21`, "--no-fund", "--no-audit",
+    "install", "--global", `--prefix=${g.prefix}`, `${PKG}@1.0.21`, "--no-fund", "--no-audit", "--ignore-scripts",
   ]);
   assert.equal(state.last.status, "ok");
   assert.equal(state.last.version, "1.0.21");
@@ -859,6 +859,7 @@ test("runner: npm run as `node npm-cli.js` (Windows' way) installs the same", as
   const g = makeGlobal();
   const { calls, state } = await runRunner({ global: g, viaNode: true });
   assert.deepEqual(calls.map((c) => c[0]), ["root", "install"]);
+  assert.ok(calls[1].includes("--ignore-scripts"), "self-update must skip the bare-node postinstall");
   assert.equal(state.last.status, "ok", state.last.error);
 });
 
