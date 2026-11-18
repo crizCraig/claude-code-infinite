@@ -1933,8 +1933,10 @@ export class MemtreeClient {
       imageRefs?: boolean;
       /** This call is the one resend that keeps unconfirmed references (after a 409). */
       unconfirmedRetry?: boolean;
-      /** The one resend of a call that named unacked messages: the ones its 409 named. */
+      /** A resend of a call that named unacked messages: every hash its 409s named. */
       unconfirmedMessageRefs?: string[];
+      /** How many such resends came before this one (at most UNCONFIRMED_ROUNDS). */
+      unconfirmedRound?: number;
       /** False: name no message by ref (the resend after a refused one). */
       messageRefs?: boolean;
       /** The status that refused this call's refs (logged on its full resend). */
@@ -2087,20 +2089,28 @@ export class MemtreeClient {
       this.lastUnreachable = undefined;
       if (delta.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
-        const lacking = namedUnconfirmed && !opts.unconfirmedMessageRefs &&
-          response.status === MISSING_MESSAGES_STATUS ? missingMessageHashes(refusalText) : undefined;
+        const lacking = namedUnconfirmed && response.status === MISSING_MESSAGES_STATUS
+          ? missingMessageHashes(refusalText) : undefined;
         if (lacking?.length) {
-          // Unacked refs the server lacks: only those go inline, once (not "never": they
-          // were never acked, so the server's hashing is not in question).
-          resent = true;
-          this.log(`context_memory 409 on ${lacking.length} unacked refs: sending those inline`);
-          return await this.callContextMemory(messages, modelContextLimit, {
-            ...opts, unconfirmedMessageRefs: lacking,
-            get timeoutMs() { return callDeadline - Date.now(); },
-          });
+          // Unacked refs the server lacks (its 409s come in stages: rows, then re-hashes):
+          // only those go inline, a few rounds at most, never "never" (they were never
+          // acked, so the server's hashing is not in question). Lacking every one: deltas
+          // are off or the lookup failed, so a while with no such bodies at all.
+          const all = delta.refs.every((ref) => lacking.includes(ref));
+          const round = (opts.unconfirmedRound ?? 0) + 1;
+          if (all) this.messageRefs.pauseUnconfirmed(opts.sessionId, messages);
+          if (!all && round <= UNCONFIRMED_ROUNDS) {
+            resent = true;
+            this.log(`context_memory 409 on ${lacking.length} unacked refs: sending those inline`);
+            return await this.callContextMemory(messages, modelContextLimit, {
+              ...opts, unconfirmedRound: round,
+              unconfirmedMessageRefs: [...(opts.unconfirmedMessageRefs ?? []), ...lacking],
+              get timeoutMs() { return callDeadline - Date.now(); },
+            });
+          }
         }
-        if (this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs, response.status,
-          refusalText)) {
+        if (!lacking?.length && this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs,
+          response.status, refusalText)) {
           // Sent again in full as its own call, within what is left of this call's budget.
           resent = true;
           this.log(`context_memory ${response.status} on message refs: sending in full`);
@@ -2547,6 +2557,9 @@ function contentTextChars(value: unknown): number {
 }
 
 /** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
+/** Resends of a call naming unacked messages, each with what the last 409 named inline. */
+const UNCONFIRMED_ROUNDS = 3;
+
 function scaledTimeout(baseMs: number, bytes: number, perKiB: number): number {
   if (!Number.isFinite(baseMs)) return baseMs;
   // Whole milliseconds: timers truncate a fractional delay, and a call that ran its whole

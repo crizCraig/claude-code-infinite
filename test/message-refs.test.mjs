@@ -334,6 +334,56 @@ test("a fresh process names a too-big conversation's unacked messages; a 409 sen
   }
 });
 
+function bigConversation(n) {
+  const messages = [{ role: "user", content: "start" }];
+  for (let i = 0; i < n; i++) messages.push({ role: i % 2 ? "user" : "assistant",
+    content: `${i} ${`${i % 10}`.repeat(1024 * 1024)}` });
+  return messages;
+}
+
+test("unacked refs: a second-stage 409 is one more round; hashes stay nameable once acked", async () => {
+  const server = await fakeMemtree();
+  server.realMissing = true;
+  try {
+    const messages = bigConversation(36);
+    for (const m of messages) {
+      if (m !== messages[3]) server.store.set(refFor(m).digest, { message: m });
+    }
+    server.unmatchedOnce.add(refFor(messages[5]).digest);
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true });
+    const meta = { sessionId: "sess-staged" };
+    assert.ok(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000,
+      undefined, meta));
+    assert.deepEqual(server.bodies.map((b) => b.status), [409, 409, 200]);
+    assert.deepEqual(server.bodies[2].rebuilt, messages);
+    const next = [...messages, { role: "assistant", content: "done" }];
+    assert.ok(await client.compress(MemtreeClient.hashMessages(next), next, 200_000, undefined,
+      meta));
+    assert.equal(server.bodies[3].status, 200);
+    assert.ok(server.bodies[3].refs >= 29, "the second-stage hash is named again once acked");
+  } finally {
+    await server.close();
+  }
+});
+
+test("unacked refs: a server lacking every one is not sent another 30 MiB body for a while", async () => {
+  const server = await fakeMemtree();
+  server.realMissing = true;
+  try {
+    const messages = bigConversation(36);
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true });
+    const meta = { sessionId: "sess-none" };
+    await assert.rejects(client.callContextMemory(messages, 200_000,
+      { timeoutMs: 30_000, sessionId: meta.sessionId }));
+    assert.deepEqual(server.bodies.map((b) => b.status), [409], "one try, no full resend");
+    await assert.rejects(client.callContextMemory(messages, 200_000,
+      { timeoutMs: 30_000, sessionId: meta.sessionId }));
+    assert.equal(server.bodies.length, 1, "paused: the next too-big body is not sent");
+  } finally {
+    await server.close();
+  }
+});
+
 test("off by default: no feature declared, nothing named", async () => {
   const server = await fakeMemtree();
   try {
@@ -353,7 +403,7 @@ test("off by default: no feature declared, nothing named", async () => {
 /** A MemTree that stores every message it is sent and serves refs back from them. */
 async function fakeMemtree() {
   const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false,
-    storedImages: [], imageMissingNext: false, realMissing: false };
+    storedImages: [], imageMissingNext: false, realMissing: false, unmatchedOnce: new Set() };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -383,6 +433,12 @@ async function fakeMemtree() {
         ? refs.map((r) => r[REF_KEY]).filter((h) => !state.store.has(h)) : [];
       if (lacking.length) {
         return reply(409, { detail: { message: "x", missing_message_hashes: lacking } });
+      }
+      // A later stage: served items whose re-hash fails (an image not stored yet), once.
+      const unmatched = refs.map((r) => r[REF_KEY]).filter((h) => state.unmatchedOnce.has(h));
+      if (unmatched.length) {
+        for (const h of unmatched) state.unmatchedOnce.delete(h);
+        return reply(409, { detail: { message: "x", missing_message_hashes: unmatched } });
       }
       if (refs.length && state.missingNext) {
         state.missingNext = false;

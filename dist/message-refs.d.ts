@@ -7,6 +7,9 @@ export declare const STORED_MESSAGES_FIELD = "memtree_message_refs";
 export declare const MISSING_MESSAGES_FIELD = "missing_message_hashes";
 export declare const MISSING_MESSAGES_STATUS = 409;
 export declare const REF_KEY = "memtree_ref";
+/** How long a conversation names no unacked messages after a 409 named every one it sent
+ *  (deltas off on the server, a failed lookup): a too-big body is then not sent at all. */
+export declare const UNCONFIRMED_PAUSE_MS: number;
 /** Answer field key (in STORED_MESSAGES_FIELD): the stored JSON characters one request's refs
  *  may expand to on this server (polychat's MEMTREE_MAX_NAMED_MIB). */
 export declare const MAX_NAMED_CHARS_KEY = "max_named_chars";
@@ -47,6 +50,8 @@ export declare class MessageRefs {
     /** What one request's refs may expand to: the default until a server says its cap. A
      *  conversation past ~60 MB needs more, or its compress body can never be sent. */
     private namedChars;
+    /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
+    private unconfirmedPaused;
     constructor(enabled: boolean);
     /** Whether calls declare message-refs (on, and not refused by the server for good). */
     get active(): boolean;
@@ -58,6 +63,8 @@ export declare class MessageRefs {
      * of a long conversation, which has no acks. The server's 409 names what it lacks.
      */
     unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>): Delta;
+    /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
+    pauseUnconfirmed(sessionId: string | undefined, messages: Message[], now?: number): void;
     /** What one request's refs may expand to now (for tests and the request log). */
     get maxNamedChars(): number;
     /**

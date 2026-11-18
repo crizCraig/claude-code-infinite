@@ -32,6 +32,9 @@ const BILLING_HEADER_PREFIX = "x-anthropic-billing-header";
 /** Conversations whose acks are remembered, and hashes per conversation (memory bound). */
 const SESSIONS_MAX = 32;
 const ACKED_PER_SESSION_MAX = 200_000;
+/** How long a conversation names no unacked messages after a 409 named every one it sent
+ *  (deltas off on the server, a failed lookup): a too-big body is then not sent at all. */
+export const UNCONFIRMED_PAUSE_MS = 10 * 60_000;
 /** 409s in a row naming every ref before a conversation goes back to full uploads. */
 const ALL_MISSING_MAX = 2;
 const HEX_RE = /^[0-9a-f]{64}$/;
@@ -72,6 +75,8 @@ export class MessageRefs {
     /** What one request's refs may expand to: the default until a server says its cap. A
      *  conversation past ~60 MB needs more, or its compress body can never be sent. */
     namedChars = MAX_NAMED_CHARS;
+    /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
+    unconfirmedPaused = new Map();
     constructor(enabled) {
         this.enabled = enabled;
     }
@@ -94,10 +99,20 @@ export class MessageRefs {
      */
     unconfirmedDelta(sessionId, messages, exclude = new Set()) {
         const lane = this.laneFor(sessionId, messages);
-        if (!lane)
+        if (!lane || (this.unconfirmedPaused.get(lane) ?? 0) > Date.now()) {
             return { messages, refs: [] };
+        }
         const never = this.never.get(lane);
         return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, this.namedChars);
+    }
+    /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
+    pauseUnconfirmed(sessionId, messages, now = Date.now()) {
+        const lane = this.laneFor(sessionId, messages);
+        if (!lane)
+            return;
+        this.unconfirmedPaused.delete(lane);
+        this.unconfirmedPaused.set(lane, now + UNCONFIRMED_PAUSE_MS);
+        boundMap(this.unconfirmedPaused, SESSIONS_MAX);
     }
     /** What one request's refs may expand to now (for tests and the request log). */
     get maxNamedChars() {
