@@ -1323,10 +1323,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (rec.totalMs === undefined)
                 rec.totalMs = Date.now() - received;
             noteForwardedSize(state, rec, requestSessionId(req));
-            const at = upstreamSavingsTime.get(rec);
             if (settleSavings) {
                 try {
-                    settleSavings(at);
+                    settleSavings();
                 }
                 catch { /* Savings is a best-effort delivery observer. */ }
             }
@@ -1431,11 +1430,13 @@ async function handleMessages(req, res, opts, upstream, state) {
     if (sideRequest && clientInfo) {
         if (opts.savings && observed) {
             const savings = opts.savings;
-            settleSavings = at => savings.settle(observed, { request: originalRequest,
+            const lane = "side:" + body.model;
+            savingsDispatch.set(rec, at => observed.dispatched(lane, at));
+            settleSavings = () => savings.settle(observed, { request: originalRequest,
                 usage: rec.savingsUsageComplete ? rec.usage : undefined,
                 model: body.model, requestModified: false,
                 contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false),
-                laneKey: "side:" + body.model, nowMs: at }, rec.upstreamStatus ?? 0);
+                laneKey: lane, nowMs: observed.requestedAt }, rec.upstreamStatus ?? 0);
         }
         if (typeof body.model === "string")
             rec.model = body.model;
@@ -1523,9 +1524,13 @@ async function handleMessages(req, res, opts, upstream, state) {
     }
     if (opts.savings && observed) {
         const savings = opts.savings;
+        const lane = JSON.stringify([requestRouteLane, notConversation ?? null,
+            isSubagentRequest ? agentAttributionId(req) : null]);
+        savingsDispatch.set(rec, at => observed.dispatched(lane, at));
         let modified = false;
         savingsSelections.set(rec, candidate => { modified = candidate.kind !== "original"; });
-        settleSavings = at => {
+        settleSavings = () => {
+            const at = observed.requestedAt;
             // Only a modified turn needs the plain prompt. Verify its replay prefix after delivery.
             const replay = at !== undefined && modified && !notConversation
                 ? savings.history.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
@@ -1533,7 +1538,7 @@ async function handleMessages(req, res, opts, upstream, state) {
                 usage: rec.savingsUsageComplete ? rec.usage : undefined, model: originalRequest.model,
                 contextWindow: modelContextLimit, outputReserve: sizingLimits().output, requestModified: modified,
                 originalInputTokens: countSession.peekKey(originalCandidate.key)?.tokens,
-                laneKey: notConversation ? "fragment:" + requestRouteKey : requestRouteKey, nowMs: at }, rec.upstreamStatus ?? 0);
+                laneKind: requestRouteLane, laneKey: lane, nowMs: at }, rec.upstreamStatus ?? 0);
         };
     }
     if (isMainRequest && requestSessionKey !== undefined) {
@@ -1553,7 +1558,7 @@ async function handleMessages(req, res, opts, upstream, state) {
     noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined);
     // Stored by the server on the usage row (client_meta): which Claude Code,
     // lane, agent and model produced this request.
-    const sessionMeta = memtreeClientMeta({
+    const clientMeta = memtreeClientMeta({
         info: clientInfo,
         lane: requestRouteLane,
         agentId: firstNonEmptyHeader(req, "x-claude-code-agent-id"),
@@ -1561,7 +1566,6 @@ async function handleMessages(req, res, opts, upstream, state) {
         model: body.model,
         project: opts.projectMeta,
     });
-    const clientMeta = observed?.work(sessionMeta) ?? sessionMeta;
     // API identity and validated history alone govern route eligibility.
     const rideableCandidate = getMemoryRoute(state, requestRouteKey);
     const existingRide = rideableCandidate && memoryRoutedToolBody(body, messages, rideableCandidate, state.mainRouteEpoch, requestSessionId(req));
@@ -1647,7 +1651,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         opts.memtree.noteMainConversation(mainSessionId, {
             messages: msgsForMemtree,
             modelContextLimit,
-            clientMeta: sessionMeta, // The Stop/exit index is a separate submission.
+            clientMeta,
             messageTimesFor: transcriptTimesFor(opts, mainSessionId),
             readReply: (signal) => opts.transcriptUsage?.finalReplyAsync
                 ? opts.transcriptUsage.finalReplyAsync(mainSessionId, signal)
@@ -6132,7 +6136,7 @@ function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
     });
 }
 /** Account the candidate delivery selected after sizing and fallbacks. */
-const upstreamSavingsTime = new WeakMap();
+const savingsDispatch = new WeakMap();
 const savingsSelections = new WeakMap();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap();
@@ -6437,8 +6441,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
         }
         if (rec) {
             laneSendStamps.get(rec)?.(bodyBuffer);
-            if (opts.savings)
-                upstreamSavingsTime.set(rec, Date.now());
+            savingsDispatch.get(rec)?.(Date.now());
         }
         upstreamReq = upstream.module.request({
             host: upstream.host,

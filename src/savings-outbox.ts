@@ -20,6 +20,7 @@ type Send = (turns: SavingsRecord[]) => Promise<Response>;
 
 export class SavingsOutbox {
   private readonly directory: string;
+  readonly cacheDirectory: string;
   private readonly writes = new Set<Promise<void>>();
   private drain?: Promise<void>;
   private appendedDuringDrain = false;
@@ -30,6 +31,7 @@ export class SavingsOutbox {
     const scope = createHash('sha256').update(JSON.stringify([baseUrl.replace(/\/$/, ''), key]))
       .digest('hex');
     this.directory = join(configDir, 'savings-turns', scope);
+    this.cacheDirectory = join(configDir, 'savings-cache', scope);
   }
 
   get enabled(): boolean { return !this.suspended; }

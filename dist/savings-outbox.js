@@ -13,6 +13,7 @@ export class SavingsOutbox {
     send;
     now;
     directory;
+    cacheDirectory;
     writes = new Set();
     drain;
     appendedDuringDrain = false;
@@ -23,6 +24,7 @@ export class SavingsOutbox {
         const scope = createHash('sha256').update(JSON.stringify([baseUrl.replace(/\/$/, ''), key]))
             .digest('hex');
         this.directory = join(configDir, 'savings-turns', scope);
+        this.cacheDirectory = join(configDir, 'savings-cache', scope);
     }
     get enabled() { return !this.suspended; }
     suspend() {

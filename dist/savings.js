@@ -1,4 +1,4 @@
-/** Process-local prompt cache model for a single turn's plain-Claude-Code counterfactual. */
+/** Prompt cache model for a single turn's plain-Claude-Code counterfactual. */
 import { createHash } from 'node:crypto';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isSavingsSessionId(value) {
@@ -10,7 +10,22 @@ const MAX_PREFIXES = 128;
 const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const count = (v) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKENS;
 const hash = (s) => createHash('sha256').update(s).digest('hex');
+export const savingsLaneKey = hash;
+// Median observed gap in milliseconds for each conversation lane (see docs/savings.md).
+const medianGapMs = { main: 10_278.5, agent: 6_624.5, away: 1_986_285 };
 const totalInput = (v) => v.input + v.cache_read + v.cache_creation_5m + v.cache_creation_1h;
+/** Reject partial or obsolete checkpoints without discarding their known dispatch time. */
+export function isSavingsLane(value, at) {
+    const digest = (v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
+    if (!record(value) || value.at !== at || !digest(value.full_hash) || !count(value.removed) ||
+        typeof value.model !== 'string' || !/^[a-zA-Z0-9._-]{1,96}$/.test(value.model) ||
+        !Array.isArray(value.prefixes) || value.prefixes.length > MAX_PREFIXES)
+        return false;
+    const warm = value.warm;
+    return (warm === undefined || (record(warm) && warm.at === at && count(warm.five) && count(warm.hour))) &&
+        value.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens) &&
+            (p.ttl === 300_000 || p.ttl === 3_600_000) && Number.isSafeInteger(p.at) && p.at <= at);
+}
 /** Cache creation total includes its duration buckets; never count it twice. */
 export function normalizeSavingsUsage(value) {
     if (!record(value) || !count(value.input_tokens) || !count(value.output_tokens))
@@ -71,9 +86,9 @@ function promptPrefixes(request, model, replay) {
             history: message ? hash(history + content) : history,
             weight: (last?.weight ?? 0) + textWeight(part.value), index: (last?.index ?? -1) + 1,
             position: (last?.position ?? 0) + Number(!part.toolRun || last?.toolRun !== part.toolRun),
-            toolRun: part.toolRun, ttl: part.ttl ?? 0, cacheable: part.cacheable });
+            messageIndex: part.messageIndex ?? -1, toolRun: part.toolRun, ttl: part.ttl ?? 0, cacheable: part.cacheable });
     };
-    const blockPart = (value, role, system = false) => {
+    const blockPart = (value, role, system = false, messageIndex = -1) => {
         if (system || role === 'system') {
             const text = record(value) ? value.text : value;
             if (typeof text === 'string' && text.startsWith('x-anthropic-billing-header:')) {
@@ -83,7 +98,7 @@ function promptPrefixes(request, model, replay) {
         }
         const cacheable = !(record(value) && ['thinking', 'redacted_thinking'].includes(value.type)) &&
             !(typeof value === 'string' && !value.length) && !(record(value) && value.type === 'text' && value.text === '');
-        append({ value: role === undefined ? withoutControls(value) : { role, content: withoutControls(value) },
+        append({ messageIndex, value: role === undefined ? withoutControls(value) : { role, content: withoutControls(value) },
             ttl: cacheable && record(value) ? cacheTtl(value.cache_control) : undefined, cacheable,
             toolRun: role && record(value) && ['tool_use', 'tool_result'].includes(value.type) ? value.type : undefined }, role !== undefined);
     };
@@ -114,7 +129,7 @@ function promptPrefixes(request, model, replay) {
     for (let i = reuse?.count ?? 0; i < messages.length; i++) {
         const message = messages[i];
         for (const block of Array.isArray(message.content) ? message.content : [message.content])
-            blockPart(block, message.role);
+            blockPart(block, message.role, false, i);
         if (replay && i + 1 === checkpoint) {
             // Keep the lookback for each explicit breakpoint and the live tail. The
             // full message payloads and older non-cacheable positions are discarded.
@@ -149,7 +164,7 @@ export function accountSavingsTurn(previous, input) {
     const request = record(input.request) ? input.request : {};
     const model = input.model ?? (typeof request.model === 'string' ? request.model : '');
     const actual = normalizeSavingsUsage(input.usage);
-    const laneKey = hash(input.laneKey ?? 'main');
+    const laneKey = savingsLaneKey(input.laneKey ?? 'main');
     const prior = previous.lanes[laneKey];
     let parts = input.requestModified ? promptPrefixes(request, model, input.replay) : [];
     if (input.requestModified && prior?.removed && prior.model === model && input.replay?.prefix() &&
@@ -184,8 +199,13 @@ export function accountSavingsTurn(previous, input) {
         hash: removed ? hash(`compact:${removed}:${p.hash}`) : p.hash }));
     const eligible = virtualPrefixes.filter(p => p.eligible && p.tokens >= minimumCacheTokens(model));
     const priorEntries = comparable && !compacted ? prior.prefixes : [];
+    const previousAt = input.previousAt ?? prior?.at;
+    const gap = previousAt === undefined ? undefined : Math.max(0, now - previousAt);
+    const effectiveGap = gap ?? medianGapMs[input.laneKind ?? 'main'];
+    const warm = (ttl) => effectiveGap < ttl;
+    const liveEndpoints = eligible.filter(p => warm(p.ttl));
     let cached = 0;
-    for (const endpoint of eligible) {
+    for (const endpoint of liveEndpoints) {
         for (const candidate of virtualPrefixes.filter(p => p.index <= endpoint.index && p.position > endpoint.position - 20)) {
             for (const entry of priorEntries) {
                 if (entry.hash === candidate.hash && now >= entry.at && now - entry.at < entry.ttl)
@@ -193,18 +213,21 @@ export function accountSavingsTurn(previous, input) {
             }
         }
     }
-    // On the first observation only, measured upstream reads can establish a warm
-    // original prefix. Never transfer that shortcut across synthetic compaction.
-    if ((!prior || comparable && prior.warm) && !removed && eligible.length)
-        cached = Math.max(cached, Math.min(actual?.cache_read ?? 0, eligible.at(-1).tokens));
-    // A passthrough reports how much plain context was warm. Without inspecting its
-    // bytes, give plain the benefit of that coverage through its possible lifetime.
-    if (comparable && prior.warm && !removed && eligible.length) {
+    const liveEnd = liveEndpoints.at(-1)?.tokens ?? 0;
+    if (!prior && !removed && liveEnd) {
+        // A resume may predate local observations. The conversation through the last
+        // user request could have been cached. Its reply and the new input are fresh.
+        const messages = Array.isArray(request.messages) ? request.messages : [];
+        const assistant = messages.findLastIndex((m) => m.role === 'assistant');
+        const history = assistant >= 0
+            ? virtualPrefixes.findLast(p => p.messageIndex < assistant)?.tokens ?? 0 : 0;
+        cached = Math.min(liveEnd, Math.max(history, actual?.cache_read ?? 0));
+    }
+    if (comparable && prior.warm && !removed && liveEnd) {
         const age = now - prior.warm.at;
-        if (age >= 0 && age < 3_600_000) {
-            const warm = prior.warm.hour + (age < 300_000 ? prior.warm.five : 0);
-            cached = Math.max(cached, Math.min(warm, eligible.at(-1).tokens));
-        }
+        const coverage = age >= 0 && age < 3_600_000
+            ? prior.warm.hour + (age < 300_000 ? prior.warm.five : 0) : 0;
+        cached = Math.max(cached, Math.min(coverage, liveEnd));
     }
     cached = Math.min(cached, plainInput);
     const hourEnd = Math.max(cached, ...eligible.filter(p => p.ttl === 3_600_000).map(p => p.tokens));

@@ -134,6 +134,8 @@ export class Diagnostics implements DiagnosticsRecorder {
     return this.savingsEnabled ? this.outbox : undefined;
   }
 
+  get savingsCacheDirectory(): string | undefined { return this.outbox?.cacheDirectory; }
+
   /** A turn that finishes after re-keying still belongs to the key it started with. */
   bindSavings(): ((value: unknown) => void) | undefined {
     const outbox = this.outbox;

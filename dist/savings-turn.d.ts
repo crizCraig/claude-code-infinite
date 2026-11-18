@@ -1,21 +1,23 @@
-/** A context_memory POST can start before, during or after its source turn. */
+import { type SavingsLane } from './savings.js';
+interface Dispatch {
+    dir: string;
+    file: string;
+    previousAt?: number;
+    previous?: SavingsLane;
+}
+/** Each writer owns its dispatch file, so a slower response cannot overwrite a newer turn.
+ * Only timestamps, token counts and hashed prompt prefixes are shared across launchers. */
 export declare class SavingsObservation {
     readonly sessionId: string;
-    readonly enabled: () => boolean;
     readonly report: (value: unknown) => void;
+    private readonly cacheDirectory?;
     readonly id: `${string}-${string}-${string}-${string}-${string}`;
-    calls: number;
-    firstSubmissionMs?: number;
     closed: boolean;
-    constructor(sessionId: string, enabled: () => boolean, report: (value: unknown) => void);
-    work(metadata: Record<string, string>): Record<string, string>;
+    requestedAt?: number;
+    dispatch?: Dispatch;
+    constructor(sessionId: string, report: (value: unknown) => void, cacheDirectory?: string | undefined);
+    dispatched(laneKey: string, at: number): void;
+    remember(lane: SavingsLane): void;
 }
-/** Count submitted calls until the server definitively refuses them before billable work.
- * A lost response after upload is ambiguous, so its charge remains expected. */
-export declare function beginSavingsSubmission(metadata?: Record<string, string>): {
-    metadata: {
-        savings_turn_id: `${string}-${string}-${string}-${string}-${string}`;
-    };
-    unbilled(): void;
-} | undefined;
+export {};
 //# sourceMappingURL=savings-turn.d.ts.map

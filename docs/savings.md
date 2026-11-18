@@ -14,16 +14,13 @@ uses the historical five-minute creation bucket; missing input/output is invalid
 Polychat computes each session and reporting period using the same formula.
 
 ```
-PURE = cumulative plain API cost - cumulative actual API cost
-       - authoritative MemTree compression API cost
-NET  = PURE - authoritative MemTree user charges
+GROSS = sum of each turn's plain API cost minus actual API cost
+NET   = GROSS - all recorded MemTree user charges for the period
 Less Usage percent = 100 * NET / cumulative plain API cost
 ```
 
-Polychat prices both sets of buckets, subtracts its recorded compression costs and
-MemTree charges, and returns the session estimate. An unknown bucket or price, or
-incomplete charge coverage, suppresses the monetary claim. Signed values are retained
-for period arithmetic.
+The server dates turns by upstream dispatch and charges by when MemTree did the
+work. Unpriced usage leaves the estimate pending. Signed losses reduce totals.
 
 ## Price policy
 
@@ -102,14 +99,35 @@ Model minimums are 512 tokens for newer 5-series models except Sonnet 5 (1,024),
 2,048 for Opus 4.7, 4,096 for Opus 4.5/4.6 and Haiku 4.5, and 1,024 for the
 remaining supported models.
 
-Local cumulative SHA-256 hashes represent prefixes; model/lane changes isolate
-entries. Prefix token positions use relative text weights, an approximation
-even when the whole-prompt count is exact. First-observation actual reads can
-establish warm original-prefix coverage. After a passthrough, the simulation gives
-plain the benefit of observed cache coverage for its possible lifetime. An upstream
-read of unknown age or duration is allowed up to one hour. This can lower the baseline. Synthetic compaction changes cache
-identity and cannot inherit those reads; it must write new eligible entries
-before reusing them. The launcher keeps these hashes in memory.
+The launcher records upstream dispatch time in a private directory scoped to the
+service, credential, session and conversation lane. Launchers sharing that directory
+use the most recent preceding dispatch, even if its response has not settled.
+A completed checkpoint holds prefix hashes, token counts and virtual compaction
+state. Each writer updates only its own file. Prefix positions use relative text
+weights even when the whole-prompt count is exact.
+
+Warmth uses the gap since the previous dispatch and the TTL on each eligible
+breakpoint of the original request. At exactly the TTL the prefix has expired.
+If the predecessor time is unavailable, the fallback is the median observed gap
+for that lane. The main median is **10,278.5 ms** (278 samples, one-hour TTL).
+The agent median is **6,624.5 ms** (182 samples, five-minute TTL). These are
+fixed calibrations from the two retained local ccc request logs through
+2026-11-17 UTC. Select numeric `coldCache.gapMs` records, group by `routeLane`,
+sort the gaps in milliseconds and take the middle value or average the middle
+pair. These November 15–16 samples measure time from the lane's prior upstream
+send to arrival of its next request.
+
+Away recaps had no recorded `coldCache` samples. Their fallback is **1,986,285
+ms** (33 min 6 s). In the same logs, group successful away messages by launcher
+PID and difference consecutive request start estimates (`ts - totalMs`) in
+time order. The median covers 113 gaps from 15 launchers, November 4–16. A known
+gap always supersedes the calibration. In particular, an unknown away gap is
+cold for a five-minute breakpoint and warm for a one-hour breakpoint.
+
+When a warm predecessor has no prefix checkpoint, estimate the reusable history
+through the input preceding the latest assistant reply, capped at the cacheable
+breakpoint. The new reply and follow-up still require writes. Observed reads can
+also establish reusable coverage. A synthetic compaction starts a new cache.
 
 The virtual compacted token minimum can omit original tool/system overhead,
 which lowers the plain baseline; it is not an exact reconstruction of Claude's
@@ -121,17 +139,10 @@ mathematical lower bound or a claim of identical task quality.
 An attributable upstream response produces a new UUID and one immutable record.
 The UTC timestamp comes from upstream dispatch. The launcher validates the session
 UUID and copies only the model, fast-mode flag, native-window crossing flag and the
-five plain and actual token buckets. ccc also records the number of attributable
-MemTree submissions expected to produce usage rows. It tags those submissions with
-the turn UUID. A definite pre-work validation or authentication rejection removes
-that submission from the expected count. Detached work has its own server timestamp.
-Missing final usage is represented by null. A definitive, nonbillable upstream
-rejection records zero on both sides. If a request ends before Claude dispatch
-with outstanding MemTree submissions, ccc records the `not_dispatched` outcome,
-turn and session IDs, first submission time and expected call count. Polychat
-counts the corresponding MemTree charges and assigns zero API usage to both sides.
-The plain-cache simulation retains bounded, per-lane observations in launcher memory.
-A resumed process starts its cache simulation from the evidence available on that turn.
+five plain and actual token buckets. Missing final usage is represented by null. A definitive, nonbillable
+upstream rejection records zero on both sides. Cancellation before upstream
+dispatch produces no API turn. MemTree billing handles compression, indexing,
+reads and searches independently, including work completing after cancellation.
 
 Each account log is a directory of private one-line JSONL segments. The directory
 is scoped by a digest of the service URL and credential. A writer exclusively creates a private segment, appends one line and syncs it. Readers
@@ -144,8 +155,8 @@ The sender posts up to 50 turns to `/v1/ccc/savings/turns`. Only IDs in a readab
 `acked_turn_ids` response are removed. The filename records the next eligible retry
 time, starting at one minute and doubling to a maximum of 30 minutes. Missing
 acknowledgements survive restarts. An invalid credential suspends the sender.
-Savings reporting honors the existing diagnostics opt-outs. A failing disk or an
-unreachable service cannot hold up the upstream request.
+Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. The launcher reads and writes the local dispatch
+checkpoint on a best-effort basis.
 
 ## Status line
 
@@ -162,9 +173,8 @@ At Sonnet's $3/million base input rate, one plain turn with 10,000 uncached inpu
 90,000 cache reads, 20,000 five-minute writes, 5,000 one-hour writes and 2,000 output
 costs `(10000 + .1*90000 + 1.25*20000 + 2*5000 + 5*2000)*3/1e6 = $0.192`.
 The ccc response reports 2,000 input, 30,000 reads, 4,000 five-minute writes,
-1,000 one-hour writes and the same 2,000 output: `$0.066`. With `$0.010` recorded
-compression API cost and `$0.016` MemTree charges, gross is `$0.116`, net is
-`$0.100`, and estimated plan-usage reduction is `52.1%` (`.100/.192`).
+1,000 one-hour writes and the same 2,000 output: `$0.066`. Gross savings are `$0.126`. With `$0.016` billed by MemTree for work
+in the period, net savings are `$0.110`, or `57.3%` of plain cost (`.110/.192`).
 These are synthetic arithmetic examples, not measurements from customer sessions.
 
 The terminal integration includes attributable main, agent, recap and passthrough

@@ -95,6 +95,7 @@ export class Diagnostics {
     get savingsAccount() {
         return this.savingsEnabled ? this.outbox : undefined;
     }
+    get savingsCacheDirectory() { return this.outbox?.cacheDirectory; }
     /** A turn that finishes after re-keying still belongs to the key it started with. */
     bindSavings() {
         const outbox = this.outbox;

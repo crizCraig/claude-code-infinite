@@ -1,37 +1,59 @@
 import { randomUUID } from 'node:crypto';
-const work = new WeakMap();
-/** A context_memory POST can start before, during or after its source turn. */
+import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { readPrivateFile, writeAtomically } from './prefix-store.js';
+import { isSavingsLane, savingsLaneKey } from './savings.js';
+/** Each writer owns its dispatch file, so a slower response cannot overwrite a newer turn.
+ * Only timestamps, token counts and hashed prompt prefixes are shared across launchers. */
 export class SavingsObservation {
     sessionId;
-    enabled;
     report;
+    cacheDirectory;
     id = randomUUID();
-    calls = 0;
-    firstSubmissionMs;
     closed = false;
-    constructor(sessionId, enabled, report) {
+    requestedAt;
+    dispatch;
+    constructor(sessionId, report, cacheDirectory) {
         this.sessionId = sessionId;
-        this.enabled = enabled;
         this.report = report;
+        this.cacheDirectory = cacheDirectory;
     }
-    work(metadata) {
-        const attributable = { ...metadata };
-        work.set(attributable, this);
-        return attributable;
+    dispatched(laneKey, at) {
+        this.requestedAt = at;
+        if (!this.cacheDirectory)
+            return;
+        try {
+            const dir = join(this.cacheDirectory, this.sessionId, savingsLaneKey(laneKey));
+            mkdirSync(dir, { recursive: true, mode: 0o700 });
+            const file = join(dir, at + '.' + this.id);
+            writeFileSync(file, '', { mode: 0o600, flag: 'wx' });
+            const older = readdirSync(dir)
+                .filter(name => /^\d+\.[0-9a-f-]{36}$/.test(name) && parseInt(name, 10) < at)
+                .sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
+            this.dispatch = { dir, file };
+            if (!older.length)
+                return;
+            this.dispatch.previousAt = parseInt(older[0], 10);
+            const body = readPrivateFile(join(dir, older[0]), 64 * 1024);
+            if (body) {
+                const lane = JSON.parse(body);
+                if (isSavingsLane(lane, this.dispatch.previousAt)) {
+                    this.dispatch.previous = lane;
+                }
+            }
+            for (const name of older.slice(1)) {
+                try {
+                    unlinkSync(join(dir, name));
+                }
+                catch { /* A sibling pruned it. */ }
+            }
+        }
+        catch { /* Missing cache evidence falls back to the observed median. */ }
     }
-}
-/** Count submitted calls until the server definitively refuses them before billable work.
- * A lost response after upload is ambiguous, so its charge remains expected. */
-export function beginSavingsSubmission(metadata) {
-    const turn = metadata && work.get(metadata);
-    if (!turn || turn.closed || !turn.enabled())
-        return;
-    if (turn.calls === 0)
-        turn.firstSubmissionMs = Date.now();
-    turn.calls++;
-    return {
-        metadata: { ...metadata, savings_turn_id: turn.id },
-        unbilled() { turn.calls--; },
-    };
+    remember(lane) {
+        if (this.dispatch && isSavingsLane(lane, lane.at)) {
+            writeAtomically(this.dispatch.dir, this.dispatch.file, JSON.stringify(lane));
+        }
+    }
 }
 //# sourceMappingURL=savings-turn.js.map

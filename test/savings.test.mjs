@@ -160,3 +160,26 @@ test('changing the request frame does not replay plain compaction on the same hi
  assert.equal(next.turn.compacted,false);
  assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
 });
+
+test('an unknown predecessor uses median lane gap on the existing transcript prefix', () => {
+ const messages = [...request('x'.repeat(320000)).messages,
+   {role:'assistant',content:'done'},{role:'user',content:'continue'}];
+ for(const ttl of ['5m','1h']){
+   const result=turn(createSavingsState(),{request:{...request(),messages,cache_control:{type:'ephemeral',ttl}},
+     originalInputTokens:80010,usage:{input_tokens:2000,output_tokens:5}});
+   assert.ok(result.turn.plain_tokens.cache_read >= 79990);
+   assert.ok(result.turn.plain_tokens.cache_read < 80010,'new content still incurs a write');
+ }
+});
+
+test('unknown away gap exceeds five minutes but fits an hour; a known gap takes precedence', () => {
+ const opts = {laneKind:'away', requestModified:true, originalInputTokens:80010,
+   nowMs:4000000, usage:{input_tokens:2000,output_tokens:5}};
+ const price = (ttl, previousAt) => turn(createSavingsState(), {...opts, previousAt, request:{
+   ...request(),messages:[...request('x'.repeat(320000)).messages,{role:'assistant',content:'done'},
+     {role:'user',content:'continue'}],cache_control:{type:'ephemeral',ttl}}}).turn.plain_tokens;
+ assert.equal(price('5m').cache_read,0);
+ assert.ok(price('1h').cache_read>79000);
+ assert.ok(price('5m',3999000).cache_read>79000);
+ assert.equal(price('1h',1000).cache_read,0);
+});

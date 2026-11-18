@@ -138,7 +138,7 @@ export class StablePrefixStore {
     }
 }
 /** Write through an exclusive, unpredictable temporary file and rename it. */
-function writeAtomically(dir, file, text) {
+export function writeAtomically(dir, file, text) {
     const tmp = path.join(dir, `.${randomBytes(12).toString("hex")}.tmp`);
     try {
         const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW, 0o600);
@@ -157,7 +157,7 @@ function writeAtomically(dir, file, text) {
     }
 }
 /** A regular file of ours, opened without following a symlink; mode repaired to 600. */
-function readPrivateFile(file, maxBytes) {
+export function readPrivateFile(file, maxBytes) {
     let fd;
     try {
         // Windows has no O_NOFOLLOW: refuse a symlink by lstat first (best effort).

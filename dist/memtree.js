@@ -22,7 +22,6 @@ import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
 import { extendsHistory, mediaFreeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
-import { beginSavingsSubmission } from "./savings-turn.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { indexWaitFrom413 } from "./index-wait-413.js";
 import { networkFailureOf } from "./network-failure.js";
@@ -1881,9 +1880,8 @@ export class MemtreeClient {
         const streamed = upload !== undefined && bytes.length >= STREAMED_UPLOAD_MIN_BYTES;
         if (upload && !streamed)
             upload.done = true;
-        const submission = beginSavingsSubmission(opts.clientMeta);
-        const clientMeta = submission?.metadata ?? opts.clientMeta;
-        const request = fetch(`${this.baseUrl}/v1/context_memory`, {
+        const { clientMeta } = opts;
+        return fetch(`${this.baseUrl}/v1/context_memory`, {
             method: "POST",
             headers: {
                 authorization: `Bearer ${this.apiKey}`,
@@ -1905,21 +1903,6 @@ export class MemtreeClient {
             ...(streamed ? { duplex: "half" } : {}),
             signal,
         });
-        if (!submission)
-            return request;
-        try {
-            const response = await request;
-            // Auth, input validation or missing references. A 413 can queue indexing.
-            if ([400, 401, 402, 403, 409, 422].includes(response.status))
-                submission.unbilled();
-            return response;
-        }
-        catch (error) {
-            if (isStreamedBodyAuthChallenge(error) || (upload && !upload.done && isDroppedConnection(error))) {
-                submission.unbilled();
-            }
-            throw error;
-        }
     }
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the

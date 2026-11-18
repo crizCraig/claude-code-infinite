@@ -63,5 +63,9 @@ export declare class StablePrefixStore {
      */
     private scan;
 }
+/** Write through an exclusive, unpredictable temporary file and rename it. */
+export declare function writeAtomically(dir: string, file: string, text: string): boolean;
+/** A regular file of ours, opened without following a symlink; mode repaired to 600. */
+export declare function readPrivateFile(file: string, maxBytes: number): string | undefined;
 export {};
 //# sourceMappingURL=prefix-store.d.ts.map

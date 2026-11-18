@@ -21,8 +21,7 @@
           "cache_creation_5m": 3,
           "cache_creation_1h": 4,
           "output": 25
-        },
-        "expected_memtree_calls": 1
+        }
       }
     ]
   },

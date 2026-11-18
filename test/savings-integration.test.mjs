@@ -313,35 +313,6 @@ test('a refused key during compression suspends savings immediately, a gateway 4
   assert.equal(suspended,1);
 });
 
-test('only submitted work carries the same turn id as its upstream observation',async t => {
-  const {SavingsTracker}=await import('../dist/savings-tracker.js');
-  const {MemtreeClient}=await import('../dist/memtree.js');
-  const reports=[], calls=[];
-  const tracker=new SavingsTracker({diagnostics:reporter(r=>reports.push(r))});
-  const observed=tracker.startTurn(sessionId);
-  const original={lane:'main'};
-  const tagged=observed.work(original);
-  const client=new MemtreeClient({baseUrl:'https://example.test',apiKey:'key'});
-  t.mock.method(globalThis,'fetch',async (_url,init)=>{
-    calls.push(JSON.parse(init.headers['x-client-meta']));
-    return Response.json({messages:[{role:'user',content:'hello'}],compressed:true});
-  });
-  const compress=(s,meta)=>{
-    const messages=[{role:'user',content:s}];
-    return client.compress(MemtreeClient.hashMessages(messages),messages,200000,undefined,
-      {sessionId,clientMeta:meta});
-  };
-  await compress('first',tagged);
-  await compress('first',tagged); // Reuses the completed call.
-  await compress('next',tagged);
-  tracker.settle(observed,input,200);
-  await compress('detached',original);
-  await compress('queued until after settlement',tagged);
-  assert.deepEqual(calls.map(c=>c.savings_turn_id),[reports[0].turn_id,reports[0].turn_id,undefined,undefined]);
-  assert.equal(reports[0].expected_memtree_calls,2);
-  assert.equal(reports[0].turn_id,observed.id);
-});
-
 test('failed dispatch cannot claim savings and local refusals carry no fabricated timestamp',async () => {
   const {SavingsTracker}=await import('../dist/savings-tracker.js');
   const reports=[];
@@ -369,7 +340,7 @@ test('credential rotation cannot move an in-flight turn into the replacement acc
   const owner={savingsAccount:accountA,bindSavings(){const out=this.savingsAccount;return r=>out.push(r)}};
   const tracker=new SavingsTracker({diagnostics:owner});
   const observed=tracker.startTurn(sessionId);
-  const meta=observed.work({lane:'main'});
+  const meta={lane:'main'};
   owner.savingsAccount=accountB;
   t.mock.method(globalThis,'fetch',async (_url,init)=>{
     calls.push(JSON.parse(init.headers['x-client-meta']));
@@ -391,29 +362,6 @@ test('status recognizes the same uppercase and lowercase session UUID',async()=>
     session_id:id.toUpperCase(),net_usd:2,net_percent:20,costs_complete:true
   })});
   assert.equal((await tracker.view(sessionId.toUpperCase())).net_usd,2);
-});
-
-test('definite MemTree validation or reference refusals have no billing row to wait for', async t => {
-  const {MemtreeClient} = await import('../dist/memtree.js');
-  const {SavingsTracker} = await import('../dist/savings-tracker.js');
-  const reports = [];
-  const tracker = new SavingsTracker({diagnostics:reporter(r => reports.push(r))});
-  const statuses = [400,401,402,403,409,422,503,200];
-  const client = new MemtreeClient({baseUrl:'https://example.test',apiKey:'key'});
-  t.mock.method(globalThis,'fetch', async () => {
-    const status = statuses.shift();
-    return Response.json(status === 200 ? {compressed:true,messages:[]} : {}, {status});
-  });
-  const turn = tracker.startTurn(sessionId);
-  const clientMeta = turn.work({lane:'main'});
-  for (let i=0; i<8; ++i) {
-    const messages = [{role:'user', content:'a different request ' + i}];
-    await client.compress(MemtreeClient.hashMessages(messages),messages,200000,undefined,
-      {sessionId,clientMeta});
-  }
-  tracker.settle(turn,input,200);
-  assert.equal(statuses.length,0);
-  assert.equal(reports[0].expected_memtree_calls,2, 'one ambiguous failure and one completed call');
 });
 
 test('budget progress works without a reporting credential and across UUID case',async () => {

@@ -9,7 +9,7 @@ import {Diagnostics} from '../dist/diagnostics.js';
 const usage = {input:100, cache_read:20, cache_creation_5m:3, cache_creation_1h:4, output:25};
 const first = {turn_id:'ff0baa4e-c487-465f-87a6-8776d7525bbe',
   session_id:'12345678-1234-4123-8123-123456789abc', requested_at:'2026-11-16T23:59:59.900Z',
-  model:'claude-sonnet-4-6', expected_memtree_calls:1, fast_mode:false, window_crossing:false, actual:usage,
+  model:'claude-sonnet-4-6', fast_mode:false, window_crossing:false, actual:usage,
   plain:{...usage, input:1000}};
 function ack(ids) { return Response.json({acked_turn_ids:ids}); }
 async function harness(t, receive) {
@@ -47,7 +47,7 @@ test('independent writers publish one private JSONL line per turn with no prompt
     turns.sort((a,b) => a.turn_id.localeCompare(b.turn_id)));
 });
 
-test('a tagged 413 refused before Claude dispatch delivers one terminal turn', async t => {
+test('cancelling during a billable compression publishes no upstream turn', async t => {
   const {MemtreeClient} = await import('../dist/memtree.js');
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t);
@@ -56,23 +56,26 @@ test('a tagged 413 refused before Claude dispatch delivers one terminal turn', a
   const turn = tracker.startTurn(first.session_id);
   let workTime = Date.parse(first.requested_at);
   t.mock.method(Date, 'now', () => workTime);
-  t.mock.method(globalThis, 'fetch', async (_url, init) => {
-    assert.equal(JSON.parse(init.headers['x-client-meta']).savings_turn_id, turn.id);
-    return Response.json({}, {status:413});
+  let finish, started;
+  const sent = new Promise(resolve => { started = resolve; });
+  t.mock.method(globalThis, 'fetch', async () => {
+    started();
+    return new Promise(resolve => { finish = () => resolve(Response.json({compressed:true,messages:[]})); });
   });
   const client = new MemtreeClient({baseUrl:'https://example.test', apiKey:'A'});
   const messages = [{role:'user', content:'private'}];
-  await client.compress(MemtreeClient.hashMessages(messages), messages, 200000, undefined,
-    {sessionId:first.session_id, clientMeta:turn.work({lane:'main'})});
+  const metadata = {lane:'main'};
+  const compression = client.compress(MemtreeClient.hashMessages(messages), messages, 200000, undefined,
+    {sessionId:first.session_id, clientMeta:metadata});
+  await sent;
   workTime += 10000; // Settlement after midnight still describes the submitted work.
   const input = {request:{messages}, requestModified:true, contextWindow:200000};
   tracker.settle(turn, input, 0);
   tracker.settle(turn, input, 0);
+  finish();
+  await compression;
   await diagnostics.flush();
-  assert.deepEqual(h.posts.flatMap(p => p.turns), [{
-    turn_id:turn.id, session_id:first.session_id, requested_at:first.requested_at,
-    expected_memtree_calls:1, outcome:'not_dispatched',
-  }]);
+  assert.deepEqual(h.posts, []);
 });
 
 test('only named turns are removed after a committed ack; truncated replies survive restart and age', async t => {
@@ -249,4 +252,121 @@ test('shutdown drains a final turn queued while a previous batch is in flight', 
   release();
   await shutdown;
   assert.deepEqual(h.posts.map(p => p.turns),[[first],[last]]);
+});
+
+test('warm and expired conversation cache cost the same across launcher restarts', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const {execFileSync} = await import('node:child_process');
+  const h = await harness(t);
+  const messages = [{role:'user',content:'x'.repeat(320000)}];
+  for (const ttl of ['5m', '1h']) {
+    for (const gap of [10000, 300000, 3600000]) {
+      const results = [];
+      for (const restart of [false, true]) {
+        const session = randomUUID();
+        const diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
+        const request = {model:first.model, messages, cache_control:{type:'ephemeral', ttl}};
+        const input = {request, usage:{input_tokens:10000,cache_read_input_tokens:10000,output_tokens:1},
+          contextWindow:200000,originalInputTokens:80000,requestModified:true,nowMs:1000};
+        if (restart) {
+          execFileSync(process.execPath, ['--input-type=module','-e',`
+            import {Diagnostics} from './dist/diagnostics.js';
+            import {SavingsTracker} from './dist/savings-tracker.js';
+            import {readFileSync} from 'node:fs';
+            const [configDir, session, input] = JSON.parse(readFileSync(0,'utf8'));
+            const diagnostics = new Diagnostics({configDir, apiKey:'A', baseUrl:'https://example.test',
+              env:{}, clientName:'ccc', clientVersion:'1', fetchImpl:async () => Response.json({acked_turn_ids:[]})});
+            const tracker = new SavingsTracker({diagnostics});
+            tracker.settle(tracker.startTurn(session), input, 200);
+            await diagnostics.flush();
+          `], {cwd:new URL('../',import.meta.url),input:JSON.stringify([h.configDir,session,input])});
+        } else {
+          tracker.settle(tracker.startTurn(session), input, 200);
+          await diagnostics.flush();
+        }
+        tracker.settle(tracker.startTurn(session), {...input, nowMs:1000+gap,
+          originalInputTokens:80010, request:{...request,messages:[...messages,
+            {role:'assistant',content:'done'},{role:'user',content:'continue'}]}}, 200);
+        await diagnostics.flush();
+        results.push(h.posts.at(-1).turns[0].plain);
+      }
+      assert.deepEqual(results[0], results[1], ttl + ' gap ' + gap);
+      assert.equal(results[0].cache_read > 79000, gap < (ttl === '5m' ? 300000 : 3600000));
+    }
+  }
+});
+
+test('late background index refusal leaves the published turn independent of billing', async t => {
+  const {MemtreeClient} = await import('../dist/memtree.js');
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
+  const observation = tracker.startTurn(first.session_id);
+  const messages = [{role:'user',content:'background'}];
+  let refuse, started;
+  const sent = new Promise(resolve => { started = resolve; });
+  t.mock.method(globalThis, 'fetch', async () => {
+    started();
+    return new Promise(resolve => { refuse = () => resolve(Response.json({}, {status:402})); });
+  });
+  const client = new MemtreeClient({baseUrl:'https://example.test',apiKey:'A'});
+  const metadata = {lane:'main'};
+  client.indexInBackground('background',messages,200000,first.session_id,
+    metadata,undefined,{force:true});
+  await sent;
+  tracker.settle(observation,{request:{model:first.model,messages},requestModified:false,
+    usage:{input_tokens:100,output_tokens:1},contextWindow:200000,nowMs:1000},200);
+  await diagnostics.flush();
+  refuse();
+  await client.drainBackground();
+  assert.equal(h.posts[0].turns[0].expected_memtree_calls,undefined);
+});
+
+test('overlapping launchers use dispatch order and isolate credentials', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t);
+  const start = (session, key, at) => {
+    const diagnostics = h.client(key), tracker = new SavingsTracker({diagnostics});
+    const observation = tracker.startTurn(session);
+    observation.dispatched('main', at);
+    return async (ttl, text) => {
+      const request = {model:first.model, cache_control:{type:'ephemeral',ttl}, messages:[
+        {role:'user',content:text.repeat(10000)}, {role:'assistant',content:'hi'},
+        {role:'user',content:'continue'}]};
+      tracker.settle(observation,{request,requestModified:true,nowMs:at,contextWindow:200000,
+        usage:{input_tokens:10,output_tokens:1},originalInputTokens:2500},200);
+      await diagnostics.flush();
+      return h.posts.at(-1).turns[0].plain;
+    };
+  };
+  const id = randomUUID();
+  const older = start(id, 'A', 1000);
+  const later = await start(id, 'A', 301000)('5m','y');
+  assert.equal(later.cache_read,0,'even an unsettled dispatch supplies a known cold gap');
+  await older('5m','x');
+  assert.equal((await start(id, 'A', 302000)('5m','y')).cache_read,2500);
+  assert.equal((await start(id, 'A', 603000)('5m','y')).cache_read,0);
+  assert.ok((await start(id, 'B', 910000)('5m','y')).cache_read>2400,
+    'account B uses its own unknown-gap median');
+});
+
+test('an unreadable predecessor checkpoint cannot lose a measured turn', async t => {
+  const {writeFile} = await import('node:fs/promises');
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client();
+  const tracker = new SavingsTracker({diagnostics});
+  const session = randomUUID();
+  const input = {request:{model:first.model,cache_control:{type:'ephemeral'},
+    messages:[{role:'user',content:'old'.repeat(3000)},{role:'assistant',content:'hi'},
+      {role:'user',content:'new'}]},requestModified:true,contextWindow:200000,
+    usage:{input_tokens:50,output_tokens:1}, originalInputTokens:2250, nowMs:1000};
+  const firstTurn = tracker.startTurn(session);
+  tracker.settle(firstTurn,input,200);
+  await diagnostics.flush();
+  const paths = await readdir(h.configDir,{recursive:true});
+  const file = paths.find(f => f.endsWith(firstTurn.id));
+  await writeFile(join(h.configDir,file), JSON.stringify({at:1000,prefixes:[null],model:first.model}));
+  tracker.settle(tracker.startTurn(session),{...input,nowMs:400000},200);
+  await diagnostics.flush();
+  assert.equal(h.posts.length,2);
+  assert.equal(h.posts[1].turns[0].plain.cache_read,0);
 });

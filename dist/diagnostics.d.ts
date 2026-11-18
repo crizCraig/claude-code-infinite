@@ -78,6 +78,7 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     setApiKey(apiKey: string | undefined): void;
     get savingsEnabled(): boolean;
     get savingsAccount(): object | undefined;
+    get savingsCacheDirectory(): string | undefined;
     /** A turn that finishes after re-keying still belongs to the key it started with. */
     bindSavings(): ((value: unknown) => void) | undefined;
     suspendSavings(): void;

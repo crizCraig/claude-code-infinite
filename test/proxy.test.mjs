@@ -11932,12 +11932,13 @@ test("MemTree tool reads carry the tool and session on to the server; malformed 
 });
 
 test('savings includes same-session monitor and title passthrough usage', async () => {
+  const {SavingsObservation} = await import('../dist/savings-turn.js');
   const upstream = await mockUpstream();
   const settled = [], starts = [];
   const proxy = await startProxy({
     memtree: new MemtreeClient({baseUrl:upstream.origin,apiKey:'test'}),
     upstreamOrigin:upstream.origin,
-    savings: {startTurn(sessionId){return {sessionId,work:meta=>meta}},progress(...args){starts.push(args)},
+    savings: {startTurn(sessionId){return new SavingsObservation(sessionId, () => {})},progress(...args){starts.push(args)},
       settle(observed,input){settled.push({id:observed.sessionId,input})}},
   });
   try {
@@ -11953,6 +11954,7 @@ test('savings includes same-session monitor and title passthrough usage', async 
       assert.equal(response.status,200); await response.text();
     }
     await waitFor(()=>settled.length===2);
+    assert.ok(settled.every(({input}) => Number.isFinite(input.nowMs)));
     assert.equal(settled[0].input.requestModified,false);
     assert.equal(settled[1].input.requestModified,false);
     assert.equal(settled[0].input.usage.input_tokens,1);

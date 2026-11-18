@@ -184,7 +184,7 @@ interface StoredFile {
 }
 
 /** Write through an exclusive, unpredictable temporary file and rename it. */
-function writeAtomically(dir: string, file: string, text: string): boolean {
+export function writeAtomically(dir: string, file: string, text: string): boolean {
   const tmp = path.join(dir, `.${randomBytes(12).toString("hex")}.tmp`);
   try {
     const fd = fs.openSync(tmp,
@@ -203,7 +203,7 @@ function writeAtomically(dir: string, file: string, text: string): boolean {
 }
 
 /** A regular file of ours, opened without following a symlink; mode repaired to 600. */
-function readPrivateFile(file: string, maxBytes: number): string | undefined {
+export function readPrivateFile(file: string, maxBytes: number): string | undefined {
   let fd: number;
   try {
     // Windows has no O_NOFOLLOW: refuse a symlink by lstat first (best effort).

@@ -5,7 +5,7 @@ import type { SavingsView } from './savings-status.js';
 import { type SavingsPromptCheckpoint, type SavingsTurnInput } from './savings.js';
 interface SavingsTrackerOptions {
     usageUrl?: string;
-    diagnostics?: Pick<Diagnostics, 'savingsAccount' | 'bindSavings'>;
+    diagnostics?: Pick<Diagnostics, 'savingsAccount' | 'bindSavings' | 'savingsCacheDirectory'>;
     fetchTotal?: (sessionId: string) => Promise<unknown>;
     now?: () => number;
 }
@@ -18,7 +18,7 @@ export declare class SavingsTracker {
     /** Only a main conversation request updates the launcher's budget indicator. */
     progress(id: unknown, tokens: number, budget: number): void;
     startTurn(id: unknown): SavingsObservation | undefined;
-    /** Settle once, including MemTree work for a request that never reached Claude. */
+    /** Only upstream dispatches contribute an API turn. Billing records MemTree independently. */
     settle(observation: SavingsObservation, input: SavingsTurnInput, status: number): void;
     /** Called only by the status line. One fetch per session per ten seconds, including failures. */
     view(id: unknown): Promise<SavingsView | undefined>;

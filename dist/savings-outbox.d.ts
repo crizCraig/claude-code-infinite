@@ -4,6 +4,7 @@ export declare class SavingsOutbox {
     private readonly send;
     private readonly now;
     private readonly directory;
+    readonly cacheDirectory: string;
     private readonly writes;
     private drain?;
     private appendedDuringDrain;

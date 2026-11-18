@@ -24,16 +24,13 @@ export function savingsReport(value) {
         return;
     const identity = { turn_id: v.turn_id.toLowerCase(), session_id: v.session_id,
         requested_at: new Date(v.requested_at).toISOString() };
-    const expected = v.expected_memtree_calls;
-    if (expected !== undefined && (typeof expected !== 'number' ||
-        !Number.isSafeInteger(expected) || expected < 0))
-        return;
-    if (v.outcome !== undefined) {
-        if (v.outcome === 'not_dispatched' && expected !== undefined && expected > 0) {
-            return { ...identity, expected_memtree_calls: expected, outcome: v.outcome };
-        }
-        return;
+    // Replay old outbox segments unchanged so either generation of server can acknowledge them.
+    if (v.outcome === 'not_dispatched' && Number.isSafeInteger(v.expected_memtree_calls) &&
+        typeof v.expected_memtree_calls === 'number' && v.expected_memtree_calls > 0) {
+        return { ...identity, outcome: v.outcome, expected_memtree_calls: v.expected_memtree_calls };
     }
+    if (v.outcome !== undefined)
+        return;
     if (typeof v.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(v.model) ||
         typeof v.fast_mode !== 'boolean' || typeof v.window_crossing !== 'boolean')
         return;
@@ -41,7 +38,6 @@ export function savingsReport(value) {
     if (actual === undefined || plain === undefined)
         return;
     return { ...identity, model: v.model, fast_mode: v.fast_mode,
-        window_crossing: v.window_crossing, actual, plain,
-        ...(expected === undefined ? {} : { expected_memtree_calls: expected }) };
+        window_crossing: v.window_crossing, actual, plain };
 }
 //# sourceMappingURL=savings-report.js.map

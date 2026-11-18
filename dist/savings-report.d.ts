@@ -10,14 +10,13 @@ interface SavingsIdentity {
     session_id: string;
     requested_at: string;
 }
-type PreflightRecord = SavingsIdentity & {
+type LegacyPreflight = SavingsIdentity & {
     outcome: 'not_dispatched';
     expected_memtree_calls: number;
 };
-export type SavingsRecord = PreflightRecord | (SavingsIdentity & {
+export type SavingsRecord = LegacyPreflight | (SavingsIdentity & {
     model: string;
     fast_mode: boolean;
-    expected_memtree_calls?: number;
     window_crossing: boolean;
     actual: SavingsUsage | null;
     plain: SavingsUsage | null;
