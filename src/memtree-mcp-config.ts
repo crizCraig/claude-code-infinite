@@ -35,7 +35,9 @@ import { HOST_TOKEN_ENV } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
+import type { CccEnvironment } from "./cli-args.js";
 import {
   MEMTREE_MCP_SERVER_NAME,
   MEMTREE_TOOL_NAMES,
@@ -51,6 +53,77 @@ export const MEMTREE_MCP_SCRIPT = fileURLToPath(new URL("./memtree-mcp.js", impo
 
 export function memtreeMcpEnabledByEnv(env: NodeJS.ProcessEnv): boolean {
   return env.CCC_MEMTREE_MCP !== "0";
+}
+
+/** Prefer a stable installation symlink only if it identifies the running binary.
+ * Never obtain the registered command from PATH or the working directory. */
+export function directMcpNodePath(realNode: string): string {
+  if (process.platform === "win32") return realNode;
+  const candidates: string[] = [];
+  const brew = /^(\/.*)\/Cellar\/(node(?:@[\d.]+)?)\/[^/]+\/bin\/node$/.exec(realNode);
+  if (brew) {
+    candidates.push(path.join(brew[1], "bin/node"), path.join(brew[1], "opt", brew[2], "bin/node"));
+  }
+  const nvm = /^(\/.*)\/versions\/node\/[^/]+\/bin\/node$/.exec(realNode);
+  if (nvm) candidates.push(path.join(nvm[1], "current/bin/node"));
+  candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node");
+  for (const candidate of candidates) {
+    try {
+      if (fs.realpathSync(candidate) === realNode) return candidate;
+    } catch {
+      // This installation need not have any of these links.
+    }
+  }
+  return realNode;
+}
+
+/** TOML literal strings preserve Windows backslashes. A quote or control
+ * character requires an escaped basic string instead. */
+function tomlString(value: string): string {
+  if (/['\x00-\x1f\x7f]/.test(value)) return JSON.stringify(value).replaceAll("\x7f", "\\u007f");
+  return `'${value}'`;
+}
+
+export function formatDirectMcpConfig(
+  format: "codex" | "json", command: string, cli: string, mode: "production" | "staging"
+): string {
+  const args = [cli, "memtree-mcp", "--direct"];
+  if (mode === "staging") args.push("--env", mode);
+  if (format === "json") {
+    const server = { command, args, env: { NODE_OPTIONS: "" } };
+    return JSON.stringify({ mcpServers: { [MEMTREE_MCP_SERVER_NAME]: server } }, null, 2);
+  }
+  return [
+    `[mcp_servers.${MEMTREE_MCP_SERVER_NAME}]`,
+    `command = ${tomlString(command)}`,
+    `args = [${args.map(tomlString).join(", ")}]`,
+    'env = { NODE_OPTIONS = "" }',
+  ].join("\n");
+}
+
+export function printDirectMcpConfig(args: string[], defaultEnv: CccEnvironment): number {
+  let values;
+  try {
+    ({ values } = parseArgs({ args, options: { format: { type: "string" }, env: { type: "string" } } }));
+  } catch {
+    // Unexpected arguments may contain secrets. Print only the usage below.
+  }
+  const format = values?.format ?? "codex";
+  const mode = values?.env ?? defaultEnv;
+  if (!values || (format !== "json" && format !== "codex") || (mode !== "production" && mode !== "staging")) {
+    console.error("Usage: ccc memtree-mcp --print-config [--format codex|json] [--env staging|production]");
+    return 1;
+  }
+
+  const realNode = fs.realpathSync(process.execPath);
+  const command = directMcpNodePath(realNode);
+  const cli = fs.realpathSync(new URL("./cli.js", import.meta.url));
+  if (command === realNode) {
+    const note = "# Using the resolved Node binary. Rerun ccc memtree-mcp --print-config if an upgrade moves it.";
+    (format === "json" ? process.stderr : process.stdout).write(note + "\n");
+  }
+  process.stdout.write(formatDirectMcpConfig(format, command, cli, mode) + "\n");
+  return 0;
 }
 
 /** The `--mcp-config` JSON for this ccc's server, bound to its proxy. */

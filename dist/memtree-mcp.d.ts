@@ -1,3 +1,4 @@
+import type { CccEnvironment } from "./cli-args.js";
 import { type FinderSearchMode } from "./memtree-finder.js";
 import { MemtreeIndex } from "./memtree-tools.js";
 export declare const MEMTREE_MCP_SERVER_NAME = "memtree";
@@ -349,6 +350,10 @@ export declare function memtreeInstructions(env: NodeJS.ProcessEnv): string;
 export interface MemtreeMcpDeps {
     /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
     proxyUrl?: string;
+    direct?: {
+        baseUrl: string;
+        apiKey: string;
+    };
     sessionId?: string;
     /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */
     hostToken?: string;
@@ -438,7 +443,6 @@ export declare class CurrentTree implements TreeSource {
     private readonly timesRetryAt;
     /** Set once the server answered 404 to a tree search the page JSON could answer. */
     private serverSearchMissing;
-    private readonly fetchImpl;
     private readonly now;
     constructor(deps: MemtreeMcpDeps);
     get(tree?: string): Promise<MemtreeIndex>;
@@ -493,7 +497,6 @@ export interface SessionFinderSource {
 }
 export declare class SessionFinder implements SessionFinderSource {
     private readonly deps;
-    private readonly fetchImpl;
     constructor(deps: MemtreeMcpDeps);
     listSessions(args: Record<string, unknown>): Promise<string>;
     private readonly sessionTrees;
@@ -518,7 +521,7 @@ notice?: {
     next(): string | undefined;
 }, 
 /** Not in a ccc-routed session: no tools, no instructions. */
-inert?: boolean): Promise<object | undefined>;
+inert?: boolean, direct?: boolean): Promise<object | undefined>;
 export declare const HYBRID_OFF_NOTE = "(Hybrid search is off on this MemTree server, so this searched in text mode.)";
 /** After a refusal the default stays text this long, then hybrid is tried again (a setting can flip). */
 export declare const HYBRID_OFF_RECHECK_MS: number;
@@ -531,5 +534,5 @@ export declare function resetHybridServerOff(agoMs?: number): void;
  */
 export declare function toolSearchMode(args: Record<string, unknown>, env: NodeJS.ProcessEnv): FinderSearchMode;
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
-export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv): void;
+export declare function runMemtreeMcpServer(env?: NodeJS.ProcessEnv, args?: string[], defaultEnv?: CccEnvironment): void;
 //# sourceMappingURL=memtree-mcp.d.ts.map

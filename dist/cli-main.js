@@ -45,10 +45,10 @@ import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
-import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
+import { planMemtreeMcp, printDirectMcpConfig, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, HANGUP_MEMTREE_DRAIN_MS, childExitMeansHangup, ignoreStreamErrors, onHangup, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
-import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalPolychatApiKey, getStagingPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
+import { storedApiKey, memtreeBaseUrlFor, setPolychatApiKey, setLocalPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS, } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
@@ -64,10 +64,6 @@ import { urlOpenerFor } from "./open-url.js";
 import { desktopServiceDownLine, runDesktopCommand } from "./desktop-command.js";
 import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
 import { startHttpsProxySession, } from "./https-proxy-session.js";
-// MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
-const POLYCHAT_BASE_URL = "https://api.polychat.co";
-const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
-const LOCAL_BASE_URL = "http://localhost:8080";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 /** Shutdown's wait for the child's exit and the resume hint's (asynchronous) write. */
@@ -330,10 +326,8 @@ function installedClaudeSupportsMessageDisplay(command) {
 function linkDeps(mode) {
     return {
         fetch: globalThis.fetch,
-        baseUrl: mode === "local" ? LOCAL_BASE_URL : mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
-        apiKey: mode === "local" ? getLocalPolychatApiKey() :
-            mode === "staging" ? getStagingPolychatApiKey() :
-                getPolychatApiKey(),
+        baseUrl: memtreeBaseUrlFor(mode, {}),
+        apiKey: storedApiKey(mode),
         command: mode === "production" ? "ccc" : `ccc ${mode}`,
         stdout: (text) => process.stdout.write(text),
         stderr: (text) => process.stderr.write(text),
@@ -348,14 +342,19 @@ async function main() {
     // when it is not running inside a ccc session.
     // `ccc memtree-mcp`: the `memtree` MCP server over stdio (memtree-mcp.ts),
     // for an --mcp-config a caller writes (e.g. the memory recall probe). It
-    // reads the tree through the ccc proxy in its inherited ANTHROPIC_BASE_URL.
-    // Both also follow `local`/`staging`, whose proxy the base URL already is.
+    // reads through the inherited ccc proxy, or uses the saved key in direct mode.
     const subcommand = subcommandArgs(filteredArgs);
     if (subcommand?.name === "fetch") {
         process.exit(await runMemtreeFetchCommand(subcommand.args));
     }
     if (subcommand?.name === "memtree-mcp") {
-        runMemtreeMcpServer();
+        const mode = environmentOf(filteredArgs);
+        if (subcommand.args[0] === "--print-config") {
+            process.exitCode = printDirectMcpConfig(subcommand.args.slice(1), mode);
+        }
+        else {
+            runMemtreeMcpServer(process.env, subcommand.args, mode);
+        }
         return;
     }
     if (isVersionRequest(filteredArgs)) {
@@ -944,6 +943,8 @@ async function main() {
 }
 main().catch(async (err) => {
     console.error(err);
+    // A piped stderr may still have Node diagnostics queued ahead of the startup error.
+    await writeStdout("", process.stderr);
     if (activeDiagnostics) {
         recordError(activeDiagnostics, "startup_failed", err);
         await activeDiagnostics.flush();
@@ -1123,17 +1124,5 @@ function httpsProxyChild(session, port, debug) {
 function joinPromptLines(...lines) {
     const present = lines.filter((line) => typeof line === "string" && line !== "");
     return present.length ? present.join("\n") : undefined;
-}
-/** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
-function memtreeBaseUrlFor(mode) {
-    return mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
-        mode === "staging" ? STAGING_BASE_URL :
-            POLYCHAT_BASE_URL;
-}
-/** The saved MemTree key for a mode (separate keys per environment). */
-function storedApiKey(mode) {
-    return mode === "local" ? getLocalPolychatApiKey() :
-        mode === "staging" ? getStagingPolychatApiKey() :
-            getPolychatApiKey();
 }
 //# sourceMappingURL=cli-main.js.map

@@ -110,6 +110,49 @@ Hits name their node, so Claude goes from a search hit to the summary around it 
 exact lines. Type `/memtree-view` to open this session's tree in your browser. Details are under
 [Memory tools](#memory-tools).
 
+### Read ccc sessions from Codex or another MCP client
+
+Generate the registration from a trusted directory.
+
+```sh
+ccc memtree-mcp --print-config
+```
+
+Paste the output into your Codex `config.toml`. For a client that uses an `mcpServers` JSON
+object, add `--format json`. Add `--env staging` to generate a staging registration. The
+command finds the running Node executable and this installation’s `dist/cli.js` without
+reading your saved key. Rerun it if upgrading Node or ccc moves either path.
+
+The Node command line must come from trusted configuration. Keep `NODE_OPTIONS` empty in
+the server environment so a client cannot forward preload options that run workspace code
+before ccc starts.
+
+For manual setup, replace both absolute paths in this example with the paths to your trusted
+Node executable and your installed ccc entry point.
+
+```toml
+[mcp_servers.memtree]
+command = '/usr/local/bin/node'
+args = ['/usr/local/lib/node_modules/claude-code-infinite/dist/cli.js', 'memtree-mcp', '--direct']
+env = { NODE_OPTIONS = "" }
+```
+
+On Windows, use the same TOML literal strings with single backslashes, for example
+`'C:\Program Files\nodejs\node.exe'`.
+
+Direct mode uses the production key saved in `~/.claude-code-infinite/config.json`.
+Add `--env staging` to use your saved staging key. Direct reads connect to MemTree over HTTPS
+using Node’s bundled CA certificates and bypass environment proxies. Use `list` or an unscoped `search`
+to find a tree or session id, then pass it to the read tools. Direct mode has no `current` tree.
+
+Direct mode checks Node startup flags before reading the saved key. It accepts
+`--max-old-space-size=N` or `--max_old_space_size=N` (heap limit), `--no-warnings` (suppress warnings),
+`--trace-warnings` and `--trace-deprecation` (warning stacks), and `--disable-sigusr1`
+on Node versions that support it. Direct mode refuses to load the key if the inspector is already
+listening. On macOS and Linux, it also handles SIGUSR1 before loading the key so the signal cannot
+start the inspector afterward. On Windows, another process running as you can still start the
+inspector after this check.
+
 ## Long-session benchmark
 
 In a blind-graded benchmark on a 775k-token Claude Code session, MemTree matched full-context

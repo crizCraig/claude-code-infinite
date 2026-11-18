@@ -24,6 +24,9 @@
  * is fetched through the proxy's key-free `/memtree/<id>.json` relay and cached
  * once complete.
  *
+ * In direct mode there is no current tree. The same reads go to the configured
+ * environment's MemTree API with its saved key.
+ *
  * Other trees (the owner's other sessions, by reference from list or search)
  * are read the same way without the session check: they are
  * named explicitly, and the server authorizes them by the user's key.
@@ -33,6 +36,15 @@
  * and falls back to searching the page JSON locally on a server without that
  * endpoint.
  */
+import https from "node:https";
+import { createRequire } from "node:module";
+import { validateHeaderValue, type IncomingMessage } from "node:http";
+import { text as readText } from "node:stream/consumers";
+import { rootCertificates } from "node:tls";
+import { parseArgs } from "node:util";
+import { memtreeClientMeta } from "./cc-request.js";
+import type { CccEnvironment } from "./cli-args.js";
+import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -74,7 +86,7 @@ import {
   ToolInputError,
   type MemtreePageJson,
 } from "./memtree-tools.js";
-import { CLIENT_VERSION } from "./memtree.js";
+import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
 import {
   formatHandover,
   formatUserMessages,
@@ -163,6 +175,7 @@ export const MEMTREE_TOOL_NAMES = [
 ] as const;
 /** `tree` value naming this session's own current tree. */
 export const CURRENT_TREE = "current";
+const DIRECT_TREE_GUIDANCE = 'Direct mode has no "current" tree. Pass a tree or session id from list or search.';
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 60_000;
 /**
@@ -405,6 +418,30 @@ export function memtreeTools(env: NodeJS.ProcessEnv): typeof MEMTREE_TOOLS {
   }) as typeof MEMTREE_TOOLS;
 }
 
+/** In a standalone harness, reads have an explicit target and search still defaults to all sessions. */
+function directTools() {
+  return memtreeTools(process.env).map(tool => {
+    const properties = { ...tool.inputSchema.properties };
+    if (properties.tree) {
+      properties.tree = { type: "string", description: "A tree reference or session id from list or search." };
+    }
+    if (properties.id) properties.id = { type: "number", description: "Node id (0 is the root) in the specified tree." };
+    let description = tool.description;
+    if (tool.name === "search") {
+      description = "Search across your ccc sessions, or pass tree to search one. " +
+        (hybridSearchOn(process.env) ? HYBRID_DEFAULT_SENTENCE : TEXT_DEFAULT_SENTENCE);
+    } else if (tool.name === "list") {
+      description = "List your ccc sessions, most recently active first, with their session ids and latest trees. Free.";
+    } else if (tool.name === "read_node") {
+      description = "Read a node's summary, ancestors, children and leaf line range. Give its node address or its tree and numeric id.";
+    } else if (tool.name === "read_lines") {
+      description = "Read exact transcript lines by leaf address or by tree, block, start and end. With tree and tail: true, read the newest un-indexed messages.";
+    }
+    const required = tool.name === "handover" || tool.name === "user_messages" ? ["tree"] : tool.inputSchema.required;
+    return { ...tool, description, inputSchema: { ...tool.inputSchema, properties, required } };
+  });
+}
+
 /** The MCP instructions: MEMTREE_MCP_INSTRUCTIONS (hybrid the default), or text's once opted out. */
 export function memtreeInstructions(env: NodeJS.ProcessEnv): string {
   if (hybridSearchOn(env)) return MEMTREE_MCP_INSTRUCTIONS;
@@ -419,6 +456,7 @@ function replaceOnce(text: string, from: string, to: string): string {
 export interface MemtreeMcpDeps {
   /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
   proxyUrl?: string;
+  direct?: { baseUrl: string; apiKey: string };
   sessionId?: string;
   /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */
   hostToken?: string;
@@ -444,44 +482,89 @@ const SESSION_TREES_CACHED = 64;
 /** Other sessions' pages kept in memory at once (each can be several MB). */
 const OTHER_TREES_CACHED = 4;
 
-interface ProxyJson {
+interface JsonAnswer {
   ok: boolean;
   status: number;
   body?: unknown;
   error?: string;
 }
 
-/** GET JSON from the loopback proxy; never throws. */
-async function proxyGetJson(
+function redact(text: string, key?: string): string {
+  return key ? text.replaceAll(key, "[redacted]") : text;
+}
+
+/** Sanitize decoded JSON, including escaped strings and property names, before formatting. */
+function parseJson(text: string, key?: string): unknown {
+  if (!key) return JSON.parse(text);
+  return JSON.parse(text, (_name, value) => {
+    if (typeof value === "string") return redact(value, key);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const names = Object.keys(value);
+      if (names.some(name => name.includes(key))) {
+        return Object.fromEntries(names.map(name => [redact(name, key), value[name]]));
+      }
+    }
+    return value;
+  });
+}
+
+function jsonAnswer(status: number, text: string, key?: string): JsonAnswer {
+  let body: unknown;
+  try {
+    body = parseJson(text, key);
+  } catch {
+    // A non-JSON error can still carry a useful message.
+  }
+  if (status < 200 || status >= 300) {
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    if (typeof detail === "string") return { ok: false, status, error: `HTTP ${status} ${detail}` };
+    const safeText = key && body !== undefined ? JSON.stringify(body) : redact(text, key);
+    return { ok: false, status, error: `HTTP ${status} ${safeText.slice(0, 300)}` };
+  }
+  return body === undefined ? { ok: false, status, error: "response was not JSON" } : { ok: true, status, body };
+}
+
+/** GET JSON through the ccc proxy. */
+async function getJson(
   fetchImpl: typeof fetch,
   url: string,
   headers: Record<string, string> = {},
   timeoutMs: number = FETCH_TIMEOUT_MS
-): Promise<ProxyJson> {
-  let response: Response;
+): Promise<JsonAnswer> {
   try {
-    response = await fetchImpl(url, {
+    const response = await fetchImpl(url, {
       headers: { accept: "application/json", ...headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
+    return jsonAnswer(response.status, await response.text().catch(() => ""));
   } catch (err) {
     return { ok: false, status: 0, error: String(err) };
   }
-  const text = await response.text().catch(() => "");
-  if (!response.ok) {
-    let detail = text.slice(0, 300);
-    try {
-      const parsed = JSON.parse(text);
-      if (typeof parsed?.detail === "string") detail = parsed.detail;
-    } catch {
-      // not JSON: keep the raw text
-    }
-    return { ok: false, status: response.status, error: `HTTP ${response.status} ${detail}` };
-  }
+}
+
+// A private agent has no environment proxy. Explicit bundled roots exclude
+// NODE_EXTRA_CA_CERTS and environment-selected OpenSSL or system CA stores.
+const directAgent = new https.Agent({ ca: [...rootCertificates], rejectUnauthorized: true });
+
+async function getDirectJson(
+  url: string, headers: Record<string, string>, key: string, timeoutMs = FETCH_TIMEOUT_MS
+): Promise<JsonAnswer> {
   try {
-    return { ok: true, status: response.status, body: JSON.parse(text) };
-  } catch {
-    return { ok: false, status: response.status, error: "response was not JSON" };
+    const authorization = `Bearer ${key}`;
+    validateHeaderValue("authorization", authorization); // Fail before opening a socket.
+    // https.request does not follow redirects. The deadline includes reading the body.
+    const response = await new Promise<IncomingMessage>((resolve, reject) => {
+      const request = https.request(url, {
+        agent: directAgent, signal: AbortSignal.timeout(timeoutMs),
+        headers: { accept: "application/json", ...headers },
+      }, resolve).on("error", reject);
+      // Node's connection diagnostics can print the options passed to https.request.
+      request.setHeader("authorization", authorization);
+      request.end();
+    });
+    return jsonAnswer(response.statusCode!, await readText(response), key);
+  } catch (err) {
+    return { ok: false, status: 0, error: redact(String(err), key) };
   }
 }
 
@@ -552,7 +635,7 @@ export async function refreshHostSession(
 ): Promise<void> {
   const base = deps.proxyUrl?.replace(/\/$/, "");
   if (!base || !deps.hostToken) return;
-  const answer = await proxyGetJson(deps.fetch ?? fetch,
+  const answer = await getJson(deps.fetch ?? fetch,
     `${base}/memtree/host-session?host_pid=${hostPid}`,
     { [HOST_TOKEN_HEADER]: deps.hostToken }, HOST_SESSION_TIMEOUT_MS);
   const sessionId = answer.ok ? (answer.body as { session_id?: unknown })?.session_id : undefined;
@@ -587,10 +670,36 @@ function proxyBase(deps: MemtreeMcpDeps): string {
   return base;
 }
 
+/** Both transports return the same JSON. The proxy flattens the server's two route prefixes. */
+async function toolGet(
+  deps: MemtreeMcpDeps, prefix: "/v1" | "/usage", route: string, tool: string, timeoutMs?: number
+): Promise<JsonAnswer> {
+  const headers = toolHeaders(tool, deps);
+  if (deps.direct) {
+    if (prefix === "/v1") {
+      // Never invoke git from the MCP client's working directory.
+      let projectDir: string | undefined;
+      try {
+        projectDir = path.basename(process.cwd());
+      } catch { /* The client may have removed the working directory. */ }
+      const meta = memtreeClientMeta({ project: { project_dir: projectDir } });
+      if (meta.project_dir && !meta.project_dir.includes(deps.direct.apiKey)) {
+        headers["x-client-meta"] = JSON.stringify(meta);
+      }
+    }
+    headers["x-client"] = CLIENT_NAME;
+    headers["x-client-version"] = CLIENT_VERSION;
+    return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${route}`, headers, deps.direct.apiKey, timeoutMs);
+  }
+  return getJson(deps.fetch ?? fetch, `${proxyBase(deps)}/memtree/${route}`, headers, timeoutMs);
+}
+
+class InvalidTreeIdError extends ToolInputError {}
+
 function checkTreeId(tree: unknown): string | undefined {
   if (tree === undefined || tree === null || tree === "") return undefined;
   if (typeof tree !== "string" || !TREE_ID_RE.test(tree.trim())) {
-    throw new ToolInputError("tree must be a tree reference from list or search, or \"current\"");
+    throw new InvalidTreeIdError("tree must be a tree reference from list or search, or \"current\"");
   }
   return tree.trim();
 }
@@ -630,11 +739,9 @@ export class CurrentTree implements TreeSource {
   private readonly timesRetryAt = new WeakMap<MemtreeIndex, number>();
   /** Set once the server answered 404 to a tree search the page JSON could answer. */
   private serverSearchMissing = false;
-  private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
 
   constructor(private readonly deps: MemtreeMcpDeps) {
-    this.fetchImpl = deps.fetch ?? globalThis.fetch;
     this.now = deps.now ?? Date.now;
   }
 
@@ -664,9 +771,8 @@ export class CurrentTree implements TreeSource {
       const id = other ?? (await this.currentId());
       const params = new URLSearchParams({ q: query });
       if (limit !== undefined && Number.isFinite(limit)) params.set("limit", String(limit));
-      const base = proxyBase(this.deps);
-      const answer = await proxyGetJson(
-        this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/search?${params}`, toolHeaders("search", this.deps)
+      const answer = await toolGet(
+        this.deps, "/usage", `${encodeURIComponent(id)}/search?${params}`, "search"
       );
       const parsed = answer.ok ? serverSearchHits(answer.body) : undefined;
       if (parsed) {
@@ -699,9 +805,8 @@ export class CurrentTree implements TreeSource {
     if (end !== undefined) params.set("end", String(end));
     if (full) params.set("full", "true");
     const query = params.toString() ? `?${params}` : "";
-    const base = proxyBase(this.deps);
-    const answer = await proxyGetJson(
-      this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}/messages${query}`, toolHeaders("read_lines", this.deps)
+    const answer = await toolGet(
+      this.deps, "/usage", `${encodeURIComponent(id)}/messages${query}`, "read_lines"
     );
     if (answer.status === 404) {
       return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails).";
@@ -723,9 +828,9 @@ export class CurrentTree implements TreeSource {
     const other = checkTreeId(tree);
     const id = other ?? (await this.currentId());
     const query = params.toString() ? `?${params}` : "";
-    const answer = await proxyGetJson(
-      this.fetchImpl, `${proxyBase(this.deps)}/memtree/${encodeURIComponent(id)}/${route}${query}`,
-      toolHeaders(route, this.deps), route === "handover" ? HANDOVER_TIMEOUT_MS : FETCH_TIMEOUT_MS
+    const answer = await toolGet(
+      this.deps, "/usage", `${encodeURIComponent(id)}/${route}${query}`, route,
+      route === "handover" ? HANDOVER_TIMEOUT_MS : FETCH_TIMEOUT_MS
     );
     if (answer.status === 202) throw new ToolInputError("That MemTree is still being built; try again in a minute.");
     if (answer.status === 0 && route === "handover" && /timeout|abort/i.test(answer.error ?? "")) {
@@ -782,11 +887,12 @@ export class CurrentTree implements TreeSource {
 
   /** The proxy's current page for the calling session; fails closed on any other session. */
   async currentId(validatePage = false): Promise<string> {
+    if (this.deps.direct) throw new ToolInputError(DIRECT_TREE_GUIDANCE);
     const base = proxyBase(this.deps);
     const sessionId = this.requireSessionId();
     const query = `?session=${encodeURIComponent(sessionId)}`;
     // The desktop service needs its token here too (it routes by `?session=`).
-    const pointer = await proxyGetJson(this.fetchImpl, `${base}/memtree/current${query}`,
+    const pointer = await getJson(this.deps.fetch ?? fetch, `${base}/memtree/current${query}`,
       this.deps.token ? { [PROXY_TOKEN_HEADER]: this.deps.token } : {});
     if (pointer.status === 404) {
       throw new ToolInputError(
@@ -855,10 +961,7 @@ export class CurrentTree implements TreeSource {
     // failure so successive tools cannot hammer the page endpoint.
     if (retryAt !== undefined) this.prefixRetryAt.set(id, now + PREFIX_RETRY_INTERVAL_MS);
 
-    const base = proxyBase(this.deps);
-    const page = await proxyGetJson(
-      this.fetchImpl, `${base}/memtree/${encodeURIComponent(id)}.json`, toolHeaders("page", this.deps)
-    );
+    const page = await toolGet(this.deps, "/usage", `${encodeURIComponent(id)}.json`, "page");
     if (!page.ok) throw new ToolInputError(`MemTree unavailable (page ${id}: ${page.error})`);
     const json = page.body as MemtreePageJson;
     if (!Array.isArray(json?.nodes) || json.nodes.length === 0) {
@@ -921,14 +1024,10 @@ export interface SessionFinderSource {
 }
 
 export class SessionFinder implements SessionFinderSource {
-  private readonly fetchImpl: typeof fetch;
-
-  constructor(private readonly deps: MemtreeMcpDeps) {
-    this.fetchImpl = deps.fetch ?? globalThis.fetch;
-  }
+  constructor(private readonly deps: MemtreeMcpDeps) {}
 
   async listSessions(args: Record<string, unknown>): Promise<string> {
-    const body = await this.get(`/memtree/sessions${sessionsQuery(args)}`, "list");
+    const body = await this.get(`sessions${sessionsQuery(args)}`, "list");
     return formatSessions(body as Parameters<typeof formatSessions>[0], args, this.deps.sessionId);
   }
 
@@ -952,7 +1051,7 @@ export class SessionFinder implements SessionFinderSource {
     let cursor: string | undefined;
     for (let page = 0; page < SESSION_TREE_MAX_PAGES; page++) {
       const query = sessionsQuery({ q: sessionId, limit: SESSIONS_MAX_LIMIT, cursor });
-      const answer = await this.fetch(`/memtree/sessions${query}`, "list");
+      const answer = await this.fetch(`sessions${query}`, "list");
       if (!answer.ok) return undefined;
       const body = answer.body as { sessions?: unknown; next_cursor?: unknown } | null;
       if (!Array.isArray(body?.sessions)) return undefined;
@@ -971,7 +1070,7 @@ export class SessionFinder implements SessionFinderSource {
   }
 
   async searchSessions(args: Record<string, unknown>, tree?: string): Promise<string> {
-    const first = await this.fetch(`/memtree/search${searchQuery(args, tree)}`, "search");
+    const first = await this.fetch(`search${searchQuery(args, tree)}`, "search");
     let answer = first;
     let narrowed: { args: Record<string, unknown>; days: number } | undefined;
     const tried: number[] = [];
@@ -980,7 +1079,7 @@ export class SessionFinder implements SessionFinderSource {
       if (!recent) break;
       narrowed = { args: recent, days };
       tried.push(days);
-      answer = await this.fetch(`/memtree/search${searchQuery(recent, tree)}`, "search");
+      answer = await this.fetch(`search${searchQuery(recent, tree)}`, "search");
     }
     // No window answered: the first refusal says how to narrow the search, plus what ccc
     // tried and, when the last try failed otherwise, how.
@@ -1006,13 +1105,11 @@ export class SessionFinder implements SessionFinderSource {
     return this.bodyOf(await this.fetch(pathAndQuery, tool), tool);
   }
 
-  private fetch(pathAndQuery: string, tool: string): Promise<ProxyJson> {
-    return proxyGetJson(
-      this.fetchImpl, `${proxyBase(this.deps)}${pathAndQuery}`, toolHeaders(tool, this.deps)
-    );
+  private fetch(pathAndQuery: string, tool: string): Promise<JsonAnswer> {
+    return toolGet(this.deps, "/v1", pathAndQuery, tool);
   }
 
-  private bodyOf(answer: ProxyJson, tool: string): unknown {
+  private bodyOf(answer: JsonAnswer, tool: string): unknown {
     if (answer.ok) return answer.body;
     if (answer.status === 404) {
       throw new ToolInputError(`${tool}: this MemTree server does not support finding sessions yet (${answer.error}).`);
@@ -1042,7 +1139,8 @@ export async function handleMcpMessage(
   /** A note to append once, to whichever tool answer comes first (StaleToolsNotice). */
   notice?: { next(): string | undefined },
   /** Not in a ccc-routed session: no tools, no instructions. */
-  inert = false
+  inert = false,
+  direct = false
 ): Promise<object | undefined> {
   if (!isRpcRequest(input)) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
@@ -1062,13 +1160,15 @@ export async function handleMcpMessage(
         protocolVersion: typeof requested === "string" ? requested : LATEST_PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: MEMTREE_MCP_SERVER_NAME, version: CLIENT_VERSION },
-        ...(inert ? {} : { instructions: memtreeInstructions(process.env) }),
+        ...(inert ? {} : { instructions: direct
+          ? `Search and read your saved ccc sessions. Omit tree to search across sessions. ${DIRECT_TREE_GUIDANCE}`
+          : memtreeInstructions(process.env) }),
       });
     }
     case "ping":
       return isRequest ? reply({}) : undefined;
     case "tools/list":
-      return reply({ tools: inert ? [] : memtreeTools(process.env) });
+      return reply({ tools: inert ? [] : direct ? directTools() : memtreeTools(process.env) });
     case "tools/call": {
       const name = message.params?.name;
       const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
@@ -1081,7 +1181,8 @@ export async function handleMcpMessage(
         return reply({ content: [{ type: "text", text: withNotice(text) }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
-        const message = err instanceof Error ? err.message : String(err);
+        const message = direct && err instanceof InvalidTreeIdError ? DIRECT_TREE_GUIDANCE
+          : err instanceof Error ? err.message : String(err);
         const text = versionNote ? `${message}\n${versionNote}` : message;
         return reply({ content: [{ type: "text", text: withNotice(text) }], isError: true });
       }
@@ -1206,7 +1307,7 @@ async function modeSearch(
   tree: TreeSource,
   finder?: SessionFinderSource
 ): Promise<string> {
-  const current = args.tree === CURRENT_TREE;
+  const current = typeof args.tree === "string" && args.tree.trim() === CURRENT_TREE;
   const named = current ? undefined : checkTreeId(args.tree);
   if (mode === "text" && (current || named)) return localTreeSearch(args, tree, named);
   if (!finder) throw new ToolInputError("search across sessions is not available here");
@@ -1269,7 +1370,8 @@ function nodeTarget(args: Record<string, unknown>, field: string): { tree?: stri
 }
 
 function treeArgument(tree: unknown): string | undefined {
-  return tree === CURRENT_TREE ? undefined : checkTreeId(tree);
+  const ref = checkTreeId(tree);
+  return ref === CURRENT_TREE ? undefined : ref;
 }
 
 /** `user_messages` / `handover`: the server's answer for the tree, formatted. */
@@ -1315,26 +1417,126 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
   return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
 
+// These switches only suppress warnings, include their call stacks, or turn off
+// the inspector signal. The one valued flag only sets a numeric V8 heap limit.
+const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation"];
+if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1")) DIRECT_NODE_SWITCHES.push("--disable-sigusr1");
+const DIRECT_USAGE = "Usage: ccc memtree-mcp --direct [--env staging|production]";
+
+function nodeOptionsArgs(options: string): string[] {
+  // Node splits on spaces outside double quotes. A backslash escapes the next
+  // character only inside quotes. Leave all other characters literal.
+  const args: string[] = [];
+  let quoted = false;
+  let arg = "";
+  for (let i = 0; i < options.length; i++) {
+    const c = options[i];
+    if (c === '"') quoted = !quoted;
+    else if (quoted && c === "\\") arg += options[++i] ?? "";
+    else if (!quoted && c === " ") {
+      if (arg) args.push(arg);
+      arg = "";
+    } else arg += c;
+  }
+  // Node normally rejects unterminated quotes before it reaches the entry point.
+  if (quoted) throw new Error("Invalid quoting in NODE_OPTIONS.");
+  if (arg) args.push(arg);
+  return args;
+}
+
+function checkDirectNodeFlags(args: string[], source: "NODE_OPTIONS" | "Node command line"): void {
+  for (const arg of args) {
+    if (DIRECT_NODE_SWITCHES.includes(arg) || /^--(?:max-old-space-size|max_old_space_size)=[0-9]+$/.test(arg)) continue;
+    const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
+    const fix = source === "NODE_OPTIONS"
+      ? "Remove the flag from NODE_OPTIONS or clear NODE_OPTIONS in this MCP server's environment."
+      : "Remove the flag from the Node command line.";
+    throw new Error(`Unsupported Node flag ${name} in ${source}. ${fix} MemTree direct mode accepts only --max-old-space-size=N (or --max_old_space_size=N), ${DIRECT_NODE_SWITCHES.join(", ")}.`);
+  }
+}
+
+function directEnvironment(args: string[], defaultEnv: CccEnvironment): "staging" | "production" | undefined {
+  try {
+    const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
+    const mode = values.env ?? defaultEnv;
+    if (mode === "production" || mode === "staging") return mode;
+  } catch {
+    // parseArgs includes the unexpected argument in its error. It may be a key.
+  }
+  return undefined;
+}
+
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
-export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void {
-  const desktop = env.CCC_MEMTREE_MCP_DESKTOP === "1";
+export function runMemtreeMcpServer(
+  env: NodeJS.ProcessEnv = process.env, args: string[] = [], defaultEnv: CccEnvironment = "production"
+): void {
+  const endOptions = args.indexOf("--");
+  const direct = (endOptions < 0 ? args : args.slice(0, endOptions)).includes("--direct");
+  const desktop = !direct && env.CCC_MEMTREE_MCP_DESKTOP === "1";
   const target = desktop ? desktopMcpTarget(env) : undefined;
   const inert = desktop && !target;
-  const deps: MemtreeMcpDeps = {
-    proxyUrl: desktop ? target?.proxyUrl : env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
-    sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
-    hostToken: env[HOST_TOKEN_ENV] || undefined,
-    ...(target?.token ? { token: target.token } : {}),
-  };
+  let deps: MemtreeMcpDeps;
+  if (direct) {
+    if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+      throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
+    }
+    // Diagnostics can log raw traffic or capture the saved key from memory.
+    if (env.NODE_DEBUG !== undefined) {
+      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
+    }
+    try {
+      checkDirectNodeFlags(process.execArgv, "Node command line");
+      checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""), "NODE_OPTIONS");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : "Invalid Node startup flags.");
+      process.exitCode = 1;
+      return;
+    }
+    const mode = directEnvironment(args, defaultEnv);
+    if (!mode) {
+      console.error(DIRECT_USAGE);
+      process.exitCode = 1;
+      return;
+    }
+    // Node 20 lacks --disable-sigusr1. Claim the signal before loading the key.
+    if (process.platform !== "win32") process.on("SIGUSR1", () => {});
+    // The inspector might already be listening. Some Node builds omit it entirely.
+    if (process.features.inspector) {
+      const inspector: typeof import("node:inspector") = createRequire(import.meta.url)("node:inspector");
+      if (inspector.url()) {
+        console.error("The Node inspector is already listening. Restart the MemTree MCP server with debugging disabled.");
+        process.exitCode = 1;
+        return;
+      }
+    }
+    const savedKey = storedApiKey(mode);
+    const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
+    if (!apiKey) {
+      throw new Error(`No MemTree key saved for ${mode}. Run ccc${mode === "staging" ? " staging" : ""} to save one.`);
+    }
+    deps = { direct: { baseUrl: memtreeBaseUrlFor(mode), apiKey } };
+  } else {
+    deps = {
+      proxyUrl: desktop ? target?.proxyUrl : env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
+      sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+      hostToken: env[HOST_TOKEN_ENV] || undefined,
+      ...(target?.token ? { token: target.token } : {}),
+    };
+  }
   const tree = new CurrentTree(deps);
   const finder = new SessionFinder(deps);
-  const versionNote = versionMismatchNote(env[PROXY_VERSION_ENV]);
+  const versionNote = direct ? undefined : versionMismatchNote(env[PROXY_VERSION_ENV]);
   const notice = new StaleToolsNotice();
   if (versionNote) process.stderr.write(`memtree MCP: ${versionNote}\n`);
   let buffer = "";
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
-  const send = (message: object) => process.stdout.write(`${JSON.stringify(message)}\n`);
+  // An upstream error or transcript may echo the saved credential.
+  const key = deps.direct?.apiKey;
+  const redactKey = (_name: string, value: unknown) =>
+    key && typeof value === "string" ? redact(value, key) : value;
+  const send = (message: object) =>
+    process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`);
   process.stdin.setEncoding("utf-8");
   process.stdin.on("data", (chunk: string) => {
     buffer += chunk;
@@ -1345,18 +1547,18 @@ export function runMemtreeMcpServer(env: NodeJS.ProcessEnv = process.env): void 
       if (!line) continue;
       let message: unknown;
       try {
-        message = JSON.parse(line);
+        message = parseJson(line, key);
       } catch {
         send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
         continue;
       }
       queue = queue.then(async () => {
         // Calls run one at a time, so each reads the session its process is on now.
-        if (isToolCall(message) && !inert) {
+        if (isToolCall(message) && !direct && !inert) {
           await refreshHostSession(deps);
           if (desktop) refreshSessionFromClaudePidFile(deps, env);
         }
-        const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert)
+        const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct)
           .catch((err) => ({
           jsonrpc: "2.0",
           id: isRpcRequest(message) ? message.id ?? null : null,
@@ -1384,4 +1586,4 @@ function isMainModule(): boolean {
   }
 }
 
-if (isMainModule()) runMemtreeMcpServer();
+if (isMainModule()) runMemtreeMcpServer(process.env, process.argv.slice(2));
