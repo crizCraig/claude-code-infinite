@@ -1,6 +1,7 @@
 // Read a package manager's launcher as data. Only the resolved JS file or native
 // executable crosses the spawn boundary, even for Yarn Classic's shim-to-shim links.
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import { win32 as path } from "node:path";
 export class ClaudeLocationError extends Error {
 }
@@ -29,7 +30,7 @@ function absolute(file) {
 // Resolve only the generated shim-directory references and fully qualified paths.
 // In particular, win32.resolve must never supply the drive from the current directory.
 function targetPath(shim, token) {
-    const relative = /^(?:%dp0%\\|%~dp0\\|\$basedir(?:_win)?\/)(.+)$/i.exec(token);
+    const relative = /^(?:%dp0%\\|%~dp0\\)(.+)$/i.exec(token);
     if (relative) {
         const tail = relative[1];
         if (path.parse(tail).root)
@@ -43,12 +44,11 @@ function npmBatch(body, native) {
     if (!legacy && !body.startsWith(npmHeader))
         return false;
     body = legacy ? body.slice(oldNpmHeader.length, -oldNpmFooter.length) : body.slice(npmHeader.length);
-    body = body.trimStart();
     if (native)
         return body === "<entry> %*";
     const prog = '"%_prog%" <entry> %*';
-    return body === npmNode + "  " + pathext + "\n)\n\n" + (legacy ? "" : npmJump) + prog ||
-        body === npmNode + ")\n\n" + npmJump + "set PATHEXT=%PATHEXT:;.JS;=;% & " + prog;
+    return body === "\n" + npmNode + "  " + pathext + "\n)\n\n" + (legacy ? "" : npmJump) + prog ||
+        !legacy && body === "\n" + npmNode + ")\n\n" + npmJump + "set PATHEXT=%PATHEXT:;.JS;=;% & " + prog;
 }
 function batchTarget(shim, body) {
     // Every forwarded branch must use the same quoted entry. Match the rest of
@@ -82,21 +82,27 @@ function batchTarget(shim, body) {
         return { file, preferLocalNode: js };
     // pnpm starts with SETLOCAL and optionally sets PATH and NODE_PATH. Classic
     // puts SETLOCAL in the fallback branch. Both generate a direct native form.
+    let nodePath;
     if (pnpm) {
-        body = body.slice("@SETLOCAL\n".length)
-            .replace(/^@SET "PATH=[^"\n]+:%PATH%"\n/, "")
-            .replace(/^@IF NOT DEFINED NODE_PATH \(\n  @SET "NODE_PATH=([^"\n]+)"\n\) ELSE \(\n  @SET "NODE_PATH=\1;%NODE_PATH%"\n\)\n/, "");
+        body = body.slice("@SETLOCAL\n".length).replace(/^@SET "PATH=[^"%\r\n]+:%PATH%"\n/, "");
+        const block = /^@IF NOT DEFINED NODE_PATH \(\n  @SET "NODE_PATH=([^"%\r\n]+)"\n\) ELSE \(\n  @SET "NODE_PATH=([^"\r\n]+)"\n\)\n/.exec(body);
+        if (block) {
+            const [, paths, fallback] = block;
+            const inheritedFirst = fallback === "%NODE_PATH%;" + paths;
+            if (!paths.split(";").every(absolute) || (!inheritedFirst && fallback !== paths + ";%NODE_PATH%"))
+                return undefined;
+            nodePath = { paths, inheritedFirst };
+            body = body.slice(block[0].length);
+        }
     }
     const local = '"%~dp0\\node.exe"';
-    const branch = (nearby, fallback) => "@IF EXIST " + nearby + " (\n  " + nearby + " <entry> %*\n) ELSE (\n" +
-        (pnpm ? "" : "  @SETLOCAL\n") + "  @" + pathext + "\n  " + fallback + " <entry> %*\n)";
-    if (js && body === branch(local, "node"))
-        return { file, preferLocalNode: true };
-    if (!pnpm && path.basename(file) === "claude" && body === branch('"%~dp0\\/bin/sh.exe"', "/bin/sh")) {
-        return { file, preferLocalNode: false }; // Classic global link to its inner sh shim.
-    }
-    if (body === "@<entry> %*" && (native || /\.cmd$/i.test(file)))
+    const nodeBranch = "@IF EXIST " + local + " (\n  " + local + " <entry> %*\n) ELSE (\n" +
+        (pnpm ? "" : "  @SETLOCAL\n") + "  @" + pathext + "\n  node <entry> %*\n)";
+    if (js && body === nodeBranch)
+        return { file, preferLocalNode: true, nodePath };
+    if (body === "@<entry> %*" && (native || (!pnpm && path.basename(file).toLowerCase() === "claude.cmd"))) {
         return { file, preferLocalNode: false };
+    }
     // Berry's makePathWrapper uses absolute paths. pnpm can also pin nodeExecPath.
     if (berry)
         body = body.slice(berryPrefix.length);
@@ -108,81 +114,12 @@ function batchTarget(shim, body) {
         return { file, preferLocalNode: false };
     const node = /^"([^"\n]+)" <entry> %\*$/.exec(body)?.[1];
     if (js && node && absolute(node) && path.basename(node).toLowerCase() === "node.exe") {
-        return { file, preferLocalNode: isAdjacentNode(shim, node) };
+        return { file, preferLocalNode: isAdjacentNode(shim, node), nodePath };
     }
     return undefined;
 }
-// Berry quotes its Windows paths in its extensionless sh companion. makePathWrapper
-// escapes an apostrophe in the JS filename by closing and reopening single quotes.
-function berryScript(shim, body) {
-    const match = /^#!\/bin\/sh\nexec "([^"\n]+)" +(?:'([^\n]+)' +)?"\$@"$/.exec(body);
-    if (!match || !absolute(match[1]))
-        return undefined;
-    if (!match[2]) {
-        return /\.exe$/i.test(match[1]) ? { file: path.normalize(match[1]), preferLocalNode: false } : undefined;
-    }
-    const file = match[2].replaceAll("'\"'\"'", "'");
-    if (!absolute(file) || !/\.[cm]?js$/i.test(file) || path.basename(match[1]).toLowerCase() !== "node.exe")
-        return undefined;
-    return { file: path.normalize(file), preferLocalNode: isAdjacentNode(shim, match[1]) };
-}
 function isAdjacentNode(shim, node) {
     return path.relative(path.dirname(shim), node).toLowerCase() === "node.exe";
-}
-function scriptTarget(shim, body, powershell) {
-    // cmd-shim and @zkochan/cmd-shim vary in their platform detection and pipeline
-    // boilerplate. Require consistent targets across all argv-forwarding branches.
-    if (powershell) {
-        if (!body.startsWith("#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n"))
-            return undefined;
-    }
-    else {
-        const berry = berryScript(shim, body);
-        if (berry)
-            return berry;
-        if (!body.startsWith("#!/bin/sh\n") || !/^(?:basedir=\$\(dirname |link="\$0")/m.test(body))
-            return undefined;
-    }
-    const forward = powershell ? " $args" : ' "$@"';
-    const prefix = powershell ? /^(?:\$input \| )?& / : /^(?:exec +)?(?:NODE_PATH="[^"\n]*" +)?/;
-    let result;
-    for (const raw of body.split("\n")) {
-        const line = raw.trim();
-        if (!line.endsWith(forward) || line.startsWith("#"))
-            continue;
-        const call = line.slice(0, -forward.length).trimEnd().replace(prefix, "");
-        const match = /^(?:(.+?) +)?"([^"\n]+)"$/.exec(call);
-        if (!match)
-            return undefined;
-        const file = targetPath(shim, match[2]);
-        if (!file || (result && path.relative(file, result.file) !== ""))
-            return undefined;
-        const runtime = match[1];
-        let preferLocalNode = result?.preferLocalNode ?? false;
-        if (!runtime) {
-            if (!/\.exe$/i.test(file))
-                return undefined;
-        }
-        else if (!powershell && (runtime === '"/bin/sh"' || runtime === "/bin/sh" || runtime === '"$basedir//bin/sh"')) {
-            if (path.basename(file) !== "claude")
-                return undefined; // Classic's outer global shim.
-        }
-        else {
-            if (!/\.[cm]?js$/i.test(file))
-                return undefined;
-            if (/^"\$basedir\/node(?:\.exe|\$exe)?"$/.test(runtime) || runtime === '"$PROG_EXE"') {
-                preferLocalNode = true;
-            }
-            else if (!/^(?:node(?:\.exe)?|"node\$exe")$/.test(runtime)) {
-                const node = /^"([^"\n]+[\\/]node\.exe)"$/i.exec(runtime)?.[1];
-                if (!node || !absolute(node))
-                    return undefined;
-                preferLocalNode = isAdjacentNode(shim, node);
-            }
-        }
-        result = { file, preferLocalNode };
-    }
-    return result;
 }
 function windowsFileExists(file) {
     try {
@@ -192,31 +129,107 @@ function windowsFileExists(file) {
         return false;
     }
 }
-/** A missing target (including an inner shim) lets discovery try the next PATH candidate. */
-export function resolveWindowsClaude(command, readFile = (f) => fs.readFileSync(f, "utf8"), isFile = windowsFileExists) {
-    let file = command;
-    const seen = new Set();
-    while (!/\.(?:exe|com|[cm]?js)$/i.test(file)) {
-        if (!isFile(file))
-            return undefined;
-        const batch = /\.(?:cmd|bat)$/i.test(file);
-        const body = readFile(file).trim().replace(/\r\n/g, "\n");
-        const target = batch ? batchTarget(file, body) : scriptTarget(file, body, /\.ps1$/i.test(file));
-        if (!target || seen.has(file.toLowerCase()) || seen.size >= 32) {
-            throw new ClaudeLocationError(`Unsupported Claude Code wrapper at ${file}. Install Claude Code with npm or the native installer, ` +
-                "or set CCC_CLAUDE_PATH to the absolute path of claude.exe or the JavaScript entry.");
+// Both batch launchers and package manifests are small text files. Bind the
+// size check and bounded read to the same descriptor, even if PATH is changing.
+function readSmallFile(file) {
+    const fd = fs.openSync(file, "r");
+    try {
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile() || stat.size > 64 * 1024)
+            throw new Error("Expected a small launcher or manifest");
+        const bytes = Buffer.alloc(stat.size + 1);
+        let offset = 0;
+        while (offset < bytes.length) {
+            const n = fs.readSync(fd, bytes, offset, bytes.length - offset, null);
+            if (!n)
+                break;
+            offset += n;
         }
-        seen.add(file.toLowerCase());
-        const localNode = path.join(path.dirname(file), "node.exe");
-        file = target.file;
-        if (!isFile(file))
-            return undefined;
-        if (/\.[cm]?js$/i.test(file)) {
-            return { file, node: target.preferLocalNode && isFile(localNode) ? localNode : process.execPath };
+        if (offset === bytes.length)
+            throw new Error("File grew while reading");
+        return bytes.toString("utf8", 0, offset);
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+}
+function isDeclaredBin(file, readFile, isFile) {
+    // The nearest package owns this entry. Native packages put it under bin/.
+    for (let dir = path.dirname(file); path.dirname(dir) !== dir; dir = path.dirname(dir)) {
+        if (path.basename(dir).toLowerCase() === "node_modules")
+            break;
+        const manifest = path.join(dir, "package.json");
+        if (!isFile(manifest))
+            continue;
+        try {
+            const pkg = JSON.parse(readFile(manifest));
+            const bin = pkg?.bin?.claude;
+            return pkg?.name === "@anthropic-ai/claude-code" && typeof bin === "string" &&
+                !path.parse(bin).root && path.relative(file, path.resolve(dir, bin)) === "";
+        }
+        catch {
+            return false;
         }
     }
-    if (path.basename(file).toLowerCase() === "cmd.exe")
-        throw new ClaudeLocationError("Claude Code must be a native executable or JavaScript entry.");
-    return /\.[cm]?js$/i.test(file) ? { file, node: process.execPath } : { file };
+    return false;
+}
+function unsupported(file) {
+    return new ClaudeLocationError(`Unsupported Claude Code wrapper at ${file}. ` +
+        "Install Claude Code with npm, pnpm, Yarn or the native installer, " +
+        "or set CCC_CLAUDE_PATH to the absolute path of claude.exe or the JavaScript entry.");
+}
+function isNativeInstall(file, env, home) {
+    const key = Object.keys(env).find(k => k.toUpperCase() === "USERPROFILE");
+    const profile = (key && env[key]) || home;
+    return absolute(profile) && path.relative(file, path.join(profile, ".local", "bin", "claude.exe")) === "";
+}
+/** A missing target (including an inner shim) lets discovery try the next PATH candidate. */
+export function resolveWindowsClaude(command, readFile = readSmallFile, isFile = windowsFileExists, env = process.env, home = homedir()) {
+    if (/\.[cm]?js$/i.test(command))
+        return { file: command, node: process.execPath }; // Explicit override.
+    if (/\.exe$/i.test(command) && path.basename(command).toLowerCase() !== "cmd.exe")
+        return { file: command };
+    let shim = command;
+    const seen = new Set();
+    while (/\.(?:cmd|bat)$/i.test(shim) && !seen.has(shim.toLowerCase()) && seen.size < 32) {
+        seen.add(shim.toLowerCase());
+        if (!isFile(shim))
+            return undefined;
+        let body;
+        try {
+            body = readFile(shim);
+        }
+        catch {
+            throw unsupported(command);
+        }
+        const target = batchTarget(shim, body.replace(/\r\n/g, "\n").replace(/\n$/, ""));
+        if (!target)
+            throw unsupported(command);
+        const file = target.file;
+        if (!isFile(file))
+            return undefined;
+        if (/\.cmd$/i.test(file)) {
+            shim = file;
+            continue;
+        }
+        if (isNativeInstall(file, env, home))
+            return { file };
+        if (!isDeclaredBin(file, readFile, isFile))
+            throw unsupported(command);
+        if (path.basename(file).toLowerCase() === "claude.exe")
+            return { file };
+        if (!/\.[cm]?js$/i.test(file))
+            throw unsupported(command);
+        const local = path.join(path.dirname(shim), "node.exe");
+        const node = target.preferLocalNode && isFile(local) ? local : process.execPath;
+        if (!target.nodePath)
+            return { file, node };
+        const key = Object.keys(env).find(k => k.toUpperCase() === "NODE_PATH") ?? "NODE_PATH";
+        const inherited = env[key];
+        const { paths, inheritedFirst } = target.nodePath;
+        const value = !inherited ? paths : inheritedFirst ? inherited + ";" + paths : paths + ";" + inherited;
+        return { file, node, env: { ...env, [key]: value } };
+    }
+    throw unsupported(command);
 }
 //# sourceMappingURL=windows-claude-shim.js.map

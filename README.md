@@ -683,12 +683,13 @@ without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those
 To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
 then run `ccc` again, from your project folder.
 
-On Windows, ccc reads npm, pnpm and Yarn shims and launches their JavaScript or native
-entry directly. It uses the adjacent `node.exe` when the shim selects it, otherwise the
+On Windows, ccc recognizes npm, pnpm and Yarn batch shims. It launches the executable
+declared by the installed Claude Code package or the native installer's `claude.exe` directly.
+For JavaScript it uses the adjacent `node.exe` when the shim selects it, otherwise the
 Node executable running ccc. Startup, sign-in checks and resume pass prompts as literal
-arguments, including line breaks. If a shim's target is missing, ccc keeps searching PATH.
+arguments, including line breaks. A stale or unsupported shim lets ccc try later PATH entries.
 
-For a custom batch wrapper, install Claude Code with npm or the native installer, or set
+For a custom batch wrapper, install Claude Code with npm, pnpm, Yarn or the native installer, or set
 `CCC_CLAUDE_PATH` to the absolute path of `claude.exe` or its JavaScript entry. For example,
 in PowerShell run `$env:CCC_CLAUDE_PATH = 'C:\Tools\Claude Code\cli.mjs'` before starting ccc.
 

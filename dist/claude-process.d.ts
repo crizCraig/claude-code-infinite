@@ -1,5 +1,6 @@
 import { type SpawnOptions, type SpawnSyncOptions } from "node:child_process";
-export declare function claudeInvocation(command: string, args: string[], platform?: NodeJS.Platform, readFile?: (file: string) => string, isFile?: (file: string) => boolean): {
+export declare function claudeInvocation(command: string, args: string[], platform?: NodeJS.Platform, readFile?: (file: string) => string, isFile?: (file: string) => boolean, env?: NodeJS.ProcessEnv): {
+    env?: NodeJS.ProcessEnv | undefined;
     command: string;
     args: string[];
 };

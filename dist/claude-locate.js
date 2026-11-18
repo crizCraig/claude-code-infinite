@@ -40,17 +40,18 @@ export function locateClaude(opts = {}) {
         }
         return { command: override, source: "override" };
     }
+    let refused;
     const isRunnableClaude = (file) => {
         if (!isExecutable(file))
             return false;
         if (platform !== "win32")
             return true;
         try {
-            return !!resolveWindowsClaude(file, opts.readFile, isExecutable);
+            return !!resolveWindowsClaude(file, opts.readFile, isExecutable, env, opts.homedir);
         }
         catch (err) {
-            if (err instanceof ClaudeLocationError && /\.(cmd|bat)$/i.test(file))
-                throw err;
+            if (err instanceof ClaudeLocationError)
+                refused ??= err;
             return false;
         }
     };
@@ -65,6 +66,8 @@ export function locateClaude(opts = {}) {
         if (file)
             return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
     }
+    if (refused)
+        throw refused;
     return null;
 }
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */
@@ -233,7 +236,7 @@ function findOnPath(name, dirs, platform, env, isExecutable) {
     const p = pathFor(platform);
     const exts = platform === "win32"
         ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";")
-            .filter(ext => /^\.(com|exe|bat|cmd|ps1)$/i.test(ext)).concat(".ps1", "")
+            .filter(ext => /^\.(exe|bat|cmd)$/i.test(ext))
         : [""];
     for (const dir of dirs) {
         if (!dir || (platform === "win32" && !isWindowsSearchDir(dir, process.cwd())))

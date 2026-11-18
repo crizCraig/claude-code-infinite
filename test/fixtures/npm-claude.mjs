@@ -14,7 +14,7 @@ export function npmShimText(target) {
 export function installNpmClaude(prefix, source) {
   const pkg = path.join(prefix, "node_modules", "@anthropic-ai", "claude-code");
   fs.mkdirSync(pkg, { recursive: true });
-  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ bin: { claude: "./cli.mjs" } }));
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "@anthropic-ai/claude-code", bin: { claude: "./cli.mjs" } }));
   fs.writeFileSync(path.join(pkg, "cli.mjs"), source);
   fs.writeFileSync(path.join(prefix, "claude.cmd"),
     npmShimText("node_modules\\@anthropic-ai\\claude-code\\cli.mjs"));
