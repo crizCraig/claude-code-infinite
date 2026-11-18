@@ -14,7 +14,7 @@
  */
 
 import spawn from "cross-spawn";
-import { SavingsTracker } from "./savings-tracker.js";
+import { SavingsTracker, sessionSavingsResponse } from "./savings-tracker.js";
 import { isKeyRejected } from "./key-page.js";
 import { exec } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -884,7 +884,7 @@ async function main() {
           suspendSavings();
           return unavailable;
         }
-        return result.status === 200 ? JSON.parse(result.body.toString("utf-8")) : undefined;
+        return sessionSavingsResponse(sessionId,result.status,result.body);
       } }),
     // The link Claude Code's status line shows, refreshed as trees finish.
     statusLinks: new StatusLinkFiles(),
@@ -1019,7 +1019,7 @@ async function main() {
   proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
   const child = spawn(claude.command, childArgs, {
     env: withClaudeOnPath(
-      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
+      claudeChildEnv({...process.env, CCC_SAVINGS_TOKEN:proxy.savingsToken}, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
       claude
     ),
     stdio: "inherit",

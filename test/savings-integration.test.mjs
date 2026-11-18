@@ -77,7 +77,7 @@ test('savings JSON completeness requires a message and valid full usage', () => 
   for(const body of [{usage:{input_tokens:100,output_tokens:20}},
     {type:'message',content:[],usage:{input_tokens:100,output_tokens:'20'}},
     {type:'message',content:[],usage:{input_tokens:100}},
-    {type:'message',content:[],usage:{input_tokens:100,output_tokens:20,cache_creation_input_tokens:null}},
+    {type:'message',content:[],usage:{input_tokens:100,output_tokens:20,cache_creation_input_tokens:'invalid'}},
     {type:'error',content:[],usage:{input_tokens:100,output_tokens:20}}]) {
     const rec={kind:'messages',turnType:'first',requestBytes:0};
     mergeUsageFromJsonBody(Buffer.from(JSON.stringify(body)),rec);
@@ -89,16 +89,16 @@ test('savings JSON completeness requires a message and valid full usage', () => 
 });
 
 test('freshly parsed appends reuse a verified large message, edits rebuild it', async () => {
- const {SavingsTracker}=await import('../dist/savings-tracker.js');
+ const {SavingsHistory}=await import('../dist/savings-history.js');
  const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const tracker=new SavingsTracker();
+ const history=new SavingsHistory();
  const make=(char,tail,header)=>({system:'x-anthropic-billing-header: cch='+header+';',
    model:'claude-sonnet-4-6',messages:[{role:'user',content:char.repeat(90000)},...tail],
    cache_control:{type:'ephemeral'}});
  let state=createSavingsState();
  const one=(req,expectedReuse)=>{
    const bytes=Buffer.from(JSON.stringify(req));
-   const replay=tracker.history.request(sessionId,bytes);
+   const replay=history.request(sessionId,bytes);
    const input={usage:{input_tokens:10,output_tokens:1},requestModified:true,contextWindow:200000,
      request:JSON.parse(bytes),nowMs:1000};
    const expected=accountSavingsTurn(state,input);
@@ -131,15 +131,15 @@ test('response usage speed overrides requested speed for JSON and SSE', async ()
 });
 
 test('a duplicate messages key cannot lend a digest to a different conversation', async () => {
- const {SavingsTracker}=await import('../dist/savings-tracker.js');
+ const {SavingsHistory}=await import('../dist/savings-history.js');
  const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const tracker=new SavingsTracker();
+ const history=new SavingsHistory();
  const first=[{role:'user',content:'x'.repeat(90000)}];
  const changed=[{role:'user',content:'y'.repeat(30000)}];
  let state=createSavingsState();
  for(const raw of [JSON.stringify({messages:first}), '{"messages":'+JSON.stringify(first)+',"mess\\u0061ges":'+JSON.stringify(changed)+'}']){
    const bytes=Buffer.from(raw);
-   const replay=tracker.history.request(sessionId,bytes);
+   const replay=history.request(sessionId,bytes);
    const input={usage:{input_tokens:10,output_tokens:1},requestModified:true,model:'claude-sonnet-4-6',
      contextWindow:200000,request:JSON.parse(raw),nowMs:1000};
    const expected=accountSavingsTurn(state,input);
@@ -158,9 +158,9 @@ test('terminal width accounts for wide text, combining marks and joined emoji', 
 });
 
 test('a verified append also reuses an unchanged system and tools frame', async () => {
- const {SavingsTracker}=await import('../dist/savings-tracker.js');
+ const {SavingsHistory}=await import('../dist/savings-history.js');
  const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const tracker=new SavingsTracker();
+ const history=new SavingsHistory();
  const req={system:'s'.repeat(90000),messages:[{role:'user',content:'hi'}],tools:[{name:'a'}]};
  const input={requestModified:true,model:'claude-sonnet-4-6',contextWindow:200000,
    usage:{input_tokens:10,output_tokens:1},nowMs:1000};
@@ -168,7 +168,7 @@ test('a verified append also reuses an unchanged system and tools frame', async 
  for (const append of [false,true]) {
    if(append) req.messages.push({role:'assistant',content:'ok'});
    const bytes=Buffer.from(JSON.stringify(req)),request=JSON.parse(bytes);
-   const replay=tracker.history.request(sessionId,bytes);
+   const replay=history.request(sessionId,bytes);
    const expected=accountSavingsTurn(state,{...input,request});
    if(append) Object.defineProperty(request,'system',{get(){throw Error('reread verified system');}});
    const result=accountSavingsTurn(state,{...input,request,replay});
@@ -191,7 +191,7 @@ test('each observation reports only that turn, even after resume or under anothe
   const seen=[];
   for (const tokens of [100,200,300]) {
     const tracker=new SavingsTracker({diagnostics:reporter(turn=>seen.push(turn))});
-    tracker.settle(tracker.startTurn(sessionId),{...input,usage:{input_tokens:tokens,output_tokens:10}},200);
+    await tracker.settle(tracker.startTurn(sessionId),{...input,usage:{input_tokens:tokens,output_tokens:10}},200);
   }
   assert.equal(new Set(seen.map(t=>t.turn_id)).size,3);
   assert.deepEqual(seen.map(t=>t.actual.input),[100,200,300]);
@@ -207,7 +207,7 @@ test('missing usage is recorded as unknown on both sides', async () => {
   const { SavingsTracker } = await import('../dist/savings-tracker.js');
   let report;
   const tracker=new SavingsTracker({diagnostics:reporter(turn=>{report=turn})});
-  tracker.settle(tracker.startTurn(sessionId),{...input,usage:undefined},200);
+  await tracker.settle(tracker.startTurn(sessionId),{...input,usage:undefined},200);
   assert.equal(report.actual,null);
   assert.equal(report.plain,null);
 });
@@ -233,7 +233,7 @@ test('main progress survives a helper settlement and delayed server response', a
   tracker.progress(sessionId,100,1000);
   const first=tracker.view(sessionId);
   tracker.progress(sessionId,700,1000);
-  tracker.settle(tracker.startTurn(sessionId),input,200);
+  await tracker.settle(tracker.startTurn(sessionId),input,200);
   resolve({session_id:sessionId,net_usd:0,net_percent:0,costs_complete:true});
   assert.equal((await first).progress_tokens,700);
   assert.equal((await tracker.view(sessionId)).progress_tokens,700);
@@ -264,8 +264,9 @@ test('status asks its own launcher, fits terminal width and keeps tree last',asy
     fs.writeFileSync(path.join(dir,sessionId+'.url'),'https://example.test/tree');
     const paths={settings:path.join(dir,'settings'),saved:path.join(dir,'saved'),links:dir};
     const env={ANTHROPIC_BASE_URL:'http://127.0.0.1:4333',_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL:'1',
-      CCC_STATUSLINE_LINK:'url',COLUMNS:'200'};
-    const fetchView=async url=>{
+      CCC_STATUSLINE_LINK:'url',COLUMNS:'200',CCC_SAVINGS_TOKEN:'this-launcher'};
+    const fetchView=async (url,init)=>{
+      assert.equal(init.headers['x-ccc-savings-token'],'this-launcher');
       assert.equal(String(url),'http://127.0.0.1:4333/memtree/savings?session='+sessionId);
       return Response.json(summary);
     };
@@ -324,8 +325,8 @@ test('failed dispatch cannot claim savings and local refusals carry no fabricate
   enabled=false;
   assert.equal(tracker.startTurn(sessionId),undefined);
   enabled=true;
-  tracker.settle(tracker.startTurn(sessionId),{...input,nowMs:undefined},0);
-  for(const status of [429,0,500]) tracker.settle(tracker.startTurn(sessionId),input,status);
+  await tracker.settle(tracker.startTurn(sessionId),{...input,nowMs:undefined},0);
+  for(const status of [429,0,500]) await tracker.settle(tracker.startTurn(sessionId),input,status);
   assert.equal(reports.length,3);
   assert.ok(Object.values(reports[0].actual).every(n=>n===0));
   assert.deepEqual(reports[0].actual,reports[0].plain);
@@ -349,7 +350,7 @@ test('credential rotation cannot move an in-flight turn into the replacement acc
   const client=new MemtreeClient({baseUrl:'https://example.test',apiKey:'original-key'});
   const messages=[{role:'user',content:'hello'}];
   await client.compress(MemtreeClient.hashMessages(messages),messages,200000,undefined,{sessionId,clientMeta:meta});
-  tracker.settle(observed,input,200);
+  await tracker.settle(observed,input,200);
   assert.equal(calls[0].savings_turn_id,undefined);
   assert.deepEqual(accountA.map(r=>r.turn_id),[observed.id]);
   assert.deepEqual(accountB,[]);
@@ -371,4 +372,50 @@ test('budget progress works without a reporting credential and across UUID case'
   const view = await tracker.view(sessionId.toUpperCase());
   assert.equal(view.progress_tokens,70);
   assert.equal(tracker.startTurn(sessionId),undefined);
+});
+
+test('nullable cache duration breakdown and zero created tokens are measured', () => {
+  const rec = {};
+  mergeUsageFromJsonBody(Buffer.from(JSON.stringify({type:'message',content:[],
+    usage:{input_tokens:21,output_tokens:4,cache_creation_input_tokens:0,cache_creation:null}})), rec);
+  assert.equal(rec.savingsUsageComplete, true);
+  assert.equal(rec.usage.cache_creation_input_tokens, 0);
+});
+
+test('stream usage can be measured across start and final delta', () => {
+  for (const [start,delta,intermediate] of [
+    [{input_tokens:21,output_tokens:0}, {input_tokens:null,output_tokens:4,cache_creation:null}],
+    [null, {input_tokens:21,output_tokens:4}, {type:'message_delta',usage:null}],
+    [{input_tokens:null,output_tokens:0}, {input_tokens:21,output_tokens:4}],
+  ]) {
+    const rec = {};
+    mergeUsageFromSseEvent({type:'message_start',message:{usage:start}}, rec);
+    if (intermediate) mergeUsageFromSseEvent(intermediate,rec);
+    mergeUsageFromSseEvent({type:'message_delta',usage:delta}, rec);
+    mergeUsageFromSseEvent({type:'message_stop'}, rec);
+    assert.equal(rec.savingsUsageComplete, true, JSON.stringify([start,delta]));
+    assert.deepEqual(rec.usage, {input_tokens:21,output_tokens:4});
+  }
+});
+
+test('only an authoritative session-unavailable response withdraws a cached total', async () => {
+  const {SavingsTracker, sessionSavingsResponse} = await import('../dist/savings-tracker.js');
+  const responses = [
+    [200, {session_id:sessionId, net_usd:1,costs_complete:true}],
+    [404, {detail:'Gateway not found'}],
+    [503, {detail:'Session unavailable'}],
+    [404, {detail:'Session unavailable'}],
+  ];
+  let now = 0;
+  const tracker = new SavingsTracker({now:()=>now,fetchTotal:async id=>{
+    const [status, body] = responses.shift();
+    return sessionSavingsResponse(id,status,Buffer.from(JSON.stringify(body)));
+  }});
+  tracker.progress(sessionId,70,100);
+  for (const expected of [1,1,1,null]) {
+    const view = await tracker.view(sessionId);
+    assert.equal(view.net_usd,expected);
+    assert.equal(view.progress_tokens,70);
+    now += 10001;
+  }
 });

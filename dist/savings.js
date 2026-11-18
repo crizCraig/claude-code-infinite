@@ -7,6 +7,9 @@ export function isSavingsSessionId(value) {
 const MAX_TOKENS = 1_000_000_000;
 const MAX_LANES = 32;
 const MAX_PREFIXES = 128;
+// A passthrough has no modeled breakpoint history. Keep content identities even
+// for early blocks in long prompts, bounded to fit the worker's 8 MiB private file.
+const MAX_WARM_PREFIXES = 65_536;
 const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const count = (v) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKENS;
 const hash = (s) => createHash('sha256').update(s).digest('hex');
@@ -22,7 +25,9 @@ export function isSavingsLane(value, at) {
         !Array.isArray(value.prefixes) || value.prefixes.length > MAX_PREFIXES)
         return false;
     const warm = value.warm;
-    return (warm === undefined || (record(warm) && warm.at === at && count(warm.five) && count(warm.hour))) &&
+    return (warm === undefined || (record(warm) && warm.at === at && count(warm.five) && count(warm.hour) &&
+        (warm.prefixes === undefined || (Array.isArray(warm.prefixes) && warm.prefixes.length <= MAX_WARM_PREFIXES &&
+            warm.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens)))))) &&
         value.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens) &&
             (p.ttl === 300_000 || p.ttl === 3_600_000) && Number.isSafeInteger(p.at) && p.at <= at);
 }
@@ -166,7 +171,11 @@ export function accountSavingsTurn(previous, input) {
     const actual = normalizeSavingsUsage(input.usage);
     const laneKey = savingsLaneKey(input.laneKey ?? 'main');
     const prior = previous.lanes[laneKey];
-    let parts = input.requestModified ? promptPrefixes(request, model, input.replay) : [];
+    const warmTokens = actual && actual.cache_read + actual.cache_creation_5m + actual.cache_creation_1h;
+    const partsNeeded = input.requestModified || !!warmTokens || !!prior?.removed;
+    // Replay checkpoints omit older unmarked blocks. A passthrough can share any
+    // content boundary, including one before the next explicit breakpoint.
+    let parts = partsNeeded ? promptPrefixes(request, model, input.requestModified && !prior?.warm ? input.replay : undefined) : [];
     if (input.requestModified && prior?.removed && prior.model === model && input.replay?.prefix() &&
         !parts.some(p => p.history === prior.full_hash)) {
         parts = promptPrefixes(request, model);
@@ -198,7 +207,7 @@ export function accountSavingsTurn(previous, input) {
     const virtualPrefixes = sourcePrefixes.map(p => ({ ...p, tokens: Math.max(0, p.tokens - removed),
         hash: removed ? hash(`compact:${removed}:${p.hash}`) : p.hash }));
     const eligible = virtualPrefixes.filter(p => p.eligible && p.tokens >= minimumCacheTokens(model));
-    const priorEntries = comparable && !compacted ? prior.prefixes : [];
+    const priorEntries = comparable && !compacted && !prior.warm ? prior.prefixes : [];
     const previousAt = input.previousAt ?? prior?.at;
     const gap = previousAt === undefined ? undefined : Math.max(0, now - previousAt);
     const effectiveGap = gap ?? medianGapMs[input.laneKind ?? 'main'];
@@ -214,7 +223,7 @@ export function accountSavingsTurn(previous, input) {
         }
     }
     const liveEnd = liveEndpoints.at(-1)?.tokens ?? 0;
-    if (!prior && !removed && liveEnd) {
+    if (!prior && !input.unverifiedPredecessor && !removed && liveEnd) {
         // A resume may predate local observations. The conversation through the last
         // user request could have been cached. Its reply and the new input are fresh.
         const messages = Array.isArray(request.messages) ? request.messages : [];
@@ -227,7 +236,12 @@ export function accountSavingsTurn(previous, input) {
         const age = now - prior.warm.at;
         const coverage = age >= 0 && age < 3_600_000
             ? prior.warm.hour + (age < 300_000 ? prior.warm.five : 0) : 0;
-        cached = Math.max(cached, Math.min(coverage, liveEnd));
+        const previousTokens = new Map(prior.warm.prefixes?.map(p => [p.hash, p.tokens]));
+        for (const part of virtualPrefixes) {
+            const matched = previousTokens.get(part.hash);
+            if (matched !== undefined)
+                cached = Math.max(cached, Math.min(matched, part.tokens, coverage, liveEnd));
+        }
     }
     cached = Math.min(cached, plainInput);
     const hourEnd = Math.max(cached, ...eligible.filter(p => p.ttl === 3_600_000).map(p => p.tokens));
@@ -260,9 +274,10 @@ export function accountSavingsTurn(previous, input) {
         };
     }
     else if (actual) {
-        const lane = comparable ? prior : { prefixes: [], full_hash: hash(''), removed: 0, model };
-        lanes[laneKey] = { ...lane, at: now, warm: { at: now, five: actual.cache_creation_5m,
-                hour: actual.cache_creation_1h + actual.cache_read } };
+        const prefixes = sourcePrefixes.filter(p => p.cacheable).slice(0, MAX_WARM_PREFIXES)
+            .map(({ hash, tokens }) => ({ hash, tokens }));
+        lanes[laneKey] = { prefixes: [], full_hash: sourcePrefixes.at(-1)?.history || hash(''), removed, model,
+            at: now, warm: { at: now, five: actual.cache_creation_5m, hour: actual.cache_creation_1h + actual.cache_read, prefixes } };
     }
     return { state: { lanes }, turn: {
             original_input_tokens: original, plain_input_tokens: plainInput, input_source: inputSource,

@@ -405,6 +405,7 @@ export function startProxy(opts) {
         routeInstallFault: opts.routeInstallFault,
         memtreePages: new Map(),
         memorySourcePages: new Map(),
+        savingsToken: randomBytes(24).toString("hex"),
         hostToken: randomBytes(24).toString("hex"),
         memtreeCallSeq: 0,
         memtreeLinkStore: opts.memtreeLinkStore,
@@ -544,6 +545,7 @@ export function startProxy(opts) {
                 mainSessionId: () => state.resumableMainSession,
                 setHostPid: (pid) => { state.hostPid = pid; },
                 hostToken: state.hostToken,
+                savingsToken: state.savingsToken,
             });
         });
     });
@@ -587,7 +589,8 @@ async function handleRequest(req, res, opts, upstream, state, hookPath, intercep
             : opts.transcriptUsage?.finalReply?.(sessionId)));
     }
     if (req.method === "GET" && url.pathname === "/memtree/savings") {
-        const view = await opts.savings?.view(url.searchParams.get("session"));
+        const view = sameSecret(req.headers["x-ccc-savings-token"], state.savingsToken)
+            ? await opts.savings?.view(url.searchParams.get("session")) : undefined;
         res.writeHead(view ? 200 : 404, { "content-type": "application/json" });
         res.end(JSON.stringify(view ?? null));
         return;
@@ -1300,7 +1303,7 @@ function messageCarriesPromptText(message, promptText) {
 /** Buffer + inspect /v1/messages; classify the turn, strip notices, forward. */
 async function handleMessages(req, res, opts, upstream, state) {
     const received = Date.now();
-    const rawBody = await readBody(req);
+    const rawBody = await readBody(req, !!opts.savings);
     // One request-log record per /v1/messages, filled in as the request flows
     // through the forward path and written exactly once when the response is
     // done (success or failure) — always on, so a stalled turn leaves a trace.
@@ -1323,13 +1326,13 @@ async function handleMessages(req, res, opts, upstream, state) {
             if (rec.totalMs === undefined)
                 rec.totalMs = Date.now() - received;
             noteForwardedSize(state, rec, requestSessionId(req));
+            opts.reqlog?.log(rec);
             if (settleSavings) {
                 try {
-                    settleSavings();
+                    await settleSavings();
                 }
                 catch { /* Savings is a best-effort delivery observer. */ }
             }
-            opts.reqlog?.log(rec);
         }
     };
     if (opts.claudeCodeOnly && requestSessionId(req) === undefined) {
@@ -1432,7 +1435,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             const savings = opts.savings;
             const lane = "side:" + body.model;
             savingsDispatch.set(rec, at => observed.dispatched(lane, at));
-            settleSavings = () => savings.settle(observed, { request: originalRequest,
+            settleSavings = () => savings.settle(observed, { request: rawBody,
                 usage: rec.savingsUsageComplete ? rec.usage : undefined,
                 model: body.model, requestModified: false,
                 contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false),
@@ -1531,10 +1534,7 @@ async function handleMessages(req, res, opts, upstream, state) {
         savingsSelections.set(rec, candidate => { modified = candidate.kind !== "original"; });
         settleSavings = () => {
             const at = observed.requestedAt;
-            // Only a modified turn needs the plain prompt. Verify its replay prefix after delivery.
-            const replay = at !== undefined && modified && !notConversation
-                ? savings.history.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
-            savings.settle(observed, { request: originalRequest, replay,
+            return savings.settle(observed, { request: rawBody,
                 usage: rec.savingsUsageComplete ? rec.usage : undefined, model: originalRequest.model,
                 contextWindow: modelContextLimit, outputReserve: sizingLimits().output, requestModified: modified,
                 originalInputTokens: countSession.peekKey(originalCandidate.key)?.tokens,
@@ -7022,8 +7022,23 @@ function readBodyWithin(req, limit) {
         req.on("error", () => finish(undefined));
     });
 }
-function readBody(req) {
-    return readAll(req);
+function readBody(req, shared = false) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on("data", (chunk) => chunks.push(chunk));
+        req.on("error", reject);
+        req.on("end", () => {
+            if (!shared)
+                return resolve(Buffer.concat(chunks));
+            // Assemble once. The accounting worker can read these immutable request
+            // bytes without copying or detaching buffers still used by the proxy.
+            const body = Buffer.from(new SharedArrayBuffer(chunks.reduce((n, c) => n + c.length, 0)));
+            let offset = 0;
+            for (const chunk of chunks)
+                offset += chunk.copy(body, offset);
+            resolve(body);
+        });
+    });
 }
 const OBSERVABLE_ENCODINGS = new Set(["gzip", "br", "deflate", "identity"]);
 /**
@@ -7072,14 +7087,6 @@ function decodeForObservation(body, encoding) {
         // Diagnostics only. Unknown/corrupt encodings do not affect proxying.
     }
     return null;
-}
-function readAll(stream) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        stream.on("data", (c) => chunks.push(c));
-        stream.on("end", () => resolve(Buffer.concat(chunks)));
-        stream.on("error", reject);
-    });
 }
 /** Test seam. */
 export const __testCapCacheBreakpoints = capCacheBreakpoints;

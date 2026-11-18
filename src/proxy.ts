@@ -518,6 +518,7 @@ export interface RunningProxy {
   setHostPid: (pid: number | undefined) => void;
   /** The secret this ccc's memtree MCP server sends to `/memtree/host-session`. */
   hostToken: string;
+  savingsToken: string;
 }
 
 interface Upstream {
@@ -607,6 +608,7 @@ interface ProxyState {
   hostPid?: number;
   /** RunningProxy.hostToken. */
   hostToken: string;
+  savingsToken: string;
   /** Hook state affects notices only, never routing. */
   mainNoticePending: boolean;
   mainPromptId?: string;
@@ -1233,6 +1235,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     routeInstallFault: opts.routeInstallFault,
     memtreePages: new Map(),
     memorySourcePages: new Map(),
+    savingsToken: randomBytes(24).toString("hex"),
     hostToken: randomBytes(24).toString("hex"),
     memtreeCallSeq: 0,
     memtreeLinkStore: opts.memtreeLinkStore,
@@ -1377,6 +1380,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
         mainSessionId: () => state.resumableMainSession,
         setHostPid: (pid) => { state.hostPid = pid; },
         hostToken: state.hostToken,
+        savingsToken: state.savingsToken,
       });
     });
   });
@@ -1434,7 +1438,8 @@ async function handleRequest(
   }
 
   if (req.method === "GET" && url.pathname === "/memtree/savings") {
-    const view = await opts.savings?.view(url.searchParams.get("session"));
+    const view = sameSecret(req.headers["x-ccc-savings-token"], state.savingsToken)
+      ? await opts.savings?.view(url.searchParams.get("session")) : undefined;
     res.writeHead(view ? 200 : 404, {"content-type":"application/json"});
     res.end(JSON.stringify(view ?? null));
     return;
@@ -2249,7 +2254,7 @@ async function handleMessages(
   state: ProxyState
 ): Promise<void> {
   const received = Date.now();
-  const rawBody = await readBody(req);
+  const rawBody = await readBody(req, !!opts.savings);
 
   // One request-log record per /v1/messages, filled in as the request flows
   // through the forward path and written exactly once when the response is
@@ -2264,17 +2269,17 @@ async function handleMessages(
   noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
   // An index wait may hold this request (runBlockingCompression) until Claude Code leaves.
   indexHolds.set(rec, { started: received, closed: closedSignal(res) });
-  let settleSavings: (() => void) | undefined;
+  let settleSavings: (() => Promise<void>) | undefined;
   const logged = async (forward: Promise<unknown>): Promise<void> => {
     try {
       await forward;
     } finally {
       if (rec.totalMs === undefined) rec.totalMs = Date.now() - received;
       noteForwardedSize(state, rec, requestSessionId(req));
-      if (settleSavings) {
-        try { settleSavings(); } catch { /* Savings is a best-effort delivery observer. */ }
-      }
       opts.reqlog?.log(rec);
+      if (settleSavings) {
+        try { await settleSavings(); } catch { /* Savings is a best-effort delivery observer. */ }
+      }
     }
   };
 
@@ -2376,7 +2381,7 @@ async function handleMessages(
       const savings = opts.savings;
       const lane = "side:" + body.model;
       savingsDispatch.set(rec, at => observed.dispatched(lane, at));
-      settleSavings = () => savings.settle(observed, {request: originalRequest,
+      settleSavings = () => savings.settle(observed, {request: rawBody,
         usage: rec.savingsUsageComplete ? rec.usage : undefined,
         model: body.model, requestModified: false,
         contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
@@ -2480,10 +2485,7 @@ async function handleMessages(
     savingsSelections.set(rec, candidate => { modified = candidate.kind !== "original"; });
     settleSavings = () => {
       const at = observed.requestedAt;
-      // Only a modified turn needs the plain prompt. Verify its replay prefix after delivery.
-      const replay = at !== undefined && modified && !notConversation
-        ? savings.history.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
-      savings.settle(observed, {request:originalRequest, replay,
+      return savings.settle(observed, {request:rawBody,
         usage:rec.savingsUsageComplete ? rec.usage : undefined, model:originalRequest.model,
         contextWindow:modelContextLimit, outputReserve:sizingLimits().output, requestModified:modified,
         originalInputTokens:countSession.peekKey(originalCandidate.key)?.tokens,
@@ -8993,8 +8995,21 @@ function readBodyWithin(req: http.IncomingMessage, limit: number): Promise<Buffe
   });
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return readAll(req);
+function readBody(req: http.IncomingMessage, shared = false): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("error", reject);
+    req.on("end", () => {
+      if (!shared) return resolve(Buffer.concat(chunks));
+      // Assemble once. The accounting worker can read these immutable request
+      // bytes without copying or detaching buffers still used by the proxy.
+      const body = Buffer.from(new SharedArrayBuffer(chunks.reduce((n,c) => n + c.length, 0)));
+      let offset = 0;
+      for (const chunk of chunks) offset += chunk.copy(body,offset);
+      resolve(body);
+    });
+  });
 }
 
 const OBSERVABLE_ENCODINGS = new Set(["gzip", "br", "deflate", "identity"]);
@@ -9042,15 +9057,6 @@ function decodeForObservation(body: Buffer, encoding: string): Buffer | null {
     // Diagnostics only. Unknown/corrupt encodings do not affect proxying.
   }
   return null;
-}
-
-function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stream.on("data", (c) => chunks.push(c));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
 }
 
 /** Test seam. */

@@ -697,33 +697,36 @@ export class RequestLogger implements RequestLogSink {
  * input/cache counts on message_start and the final output count (plus
  * occasionally refreshed input counts) on message_delta.
  */
-interface SavingsUsageProtocol { started: boolean; finalOutput: boolean; invalid: boolean }
+interface SavingsUsageProtocol { started: boolean; measuredInput: boolean; finalOutput: boolean; invalid: boolean }
 const savingsUsageProtocols = new WeakMap<MessagesRecord, SavingsUsageProtocol>();
 
 export function mergeUsageFromSseEvent(data: any, rec: MessagesRecord): void {
   const type = data?.type;
   let protocol = savingsUsageProtocols.get(rec);
   if (!protocol) {
-    protocol = { started: false, finalOutput: false, invalid: false };
+    protocol = { started: false, measuredInput: false, finalOutput: false, invalid: false };
     savingsUsageProtocols.set(rec, protocol);
   }
   if (type === "message_start") {
     if (rec.savingsUsageComplete !== undefined) rec.savingsUsageComplete = false;
     const usage = data?.message?.usage;
-    protocol.invalid ||= protocol.started || !validSavingsUsage(usage, true);
+    protocol.invalid ||= protocol.started || !data.message || typeof data.message !== "object" ||
+      Array.isArray(data.message) || (usage != null && !validSavingsUsage(usage));
+    protocol.measuredInput = validTokenCount(usage?.input_tokens);
     protocol.started = true;
     mergeUsage(usage, rec);
   } else if (type === "message_delta") {
     if (rec.savingsUsageComplete !== undefined) rec.savingsUsageComplete = false;
     const usage = data?.usage;
-    protocol.invalid ||= !protocol.started || !validSavingsUsage(usage, false);
+    protocol.invalid ||= !protocol.started || (usage != null && !validSavingsUsage(usage));
+    protocol.measuredInput ||= validTokenCount(usage?.input_tokens);
     protocol.finalOutput = validTokenCount(usage?.output_tokens);
     mergeUsage(usage, rec);
   } else if (type === "error") {
     protocol.invalid = true;
     rec.savingsUsageComplete = false;
   } else if (type === "message_stop") {
-    rec.savingsUsageComplete = protocol.started && protocol.finalOutput && !protocol.invalid;
+    rec.savingsUsageComplete = protocol.started && protocol.measuredInput && protocol.finalOutput && !protocol.invalid;
   }
 }
 
@@ -734,7 +737,8 @@ export function mergeUsageFromJsonBody(body: Buffer, rec: MessagesRecord): void 
     const response = JSON.parse(body.toString("utf-8"));
     mergeUsage(response?.usage, rec);
     rec.savingsUsageComplete = response?.type === "message" && Array.isArray(response.content) &&
-      validSavingsUsage(response.usage, true);
+      validSavingsUsage(response.usage) && validTokenCount(response.usage.input_tokens) &&
+      validTokenCount(response.usage.output_tokens);
   } catch {
     // Not the shape we expected — usage just stays absent.
   }
@@ -746,18 +750,18 @@ const validTokenCount = (value: unknown): value is number =>
 /** Validate the raw fields before reqlog's permissive merge can drop bad values.
  * In particular an invalid final output must not leave the valid initial zero
  * looking like the complete billable output count. */
-function validSavingsUsage(value: unknown, full: boolean): boolean {
+function validSavingsUsage(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const usage = value as Record<string, unknown>;
-  if (full && (!validTokenCount(usage.input_tokens) || !validTokenCount(usage.output_tokens))) return false;
   for (const field of USAGE_FIELDS) {
-    if (Object.hasOwn(usage, field) && !validTokenCount(usage[field])) return false;
+    if (usage[field] != null && !validTokenCount(usage[field])) return false;
   }
-  if (Object.hasOwn(usage, "cache_creation")) {
+  if (usage.cache_creation != null) {
     const creation = usage.cache_creation;
     if (!creation || typeof creation !== "object" || Array.isArray(creation)) return false;
     for (const field of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
-      if (Object.hasOwn(creation, field) && !validTokenCount((creation as Record<string, unknown>)[field])) return false;
+      const tokens = (creation as Record<string, unknown>)[field];
+      if (tokens != null && !validTokenCount(tokens)) return false;
     }
   }
   return true;

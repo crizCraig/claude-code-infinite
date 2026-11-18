@@ -13,11 +13,11 @@ import { memtreeMcpConfig } from "../dist/memtree-mcp-config.js";
 
 const HOST_PID = 4242;
 
-async function harness() {
+async function harness(options = {}) {
   const memtree = new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "offline" });
   memtree.compress = async () => null;
   memtree.indexInBackground = () => {};
-  const proxy = await startProxy({ memtree, upstreamOrigin: "http://127.0.0.1:1" });
+  const proxy = await startProxy({ ...options, memtree, upstreamOrigin: "http://127.0.0.1:1" });
   return proxy;
 }
 
@@ -158,4 +158,19 @@ test("a cached page is not reused after the process moves to another session", a
   deps.sessionId = "session-b";
   await assert.rejects(tree.get(), /session/i, "session-a's page is checked again, and refused");
   assert.equal(pageFetches, 2);
+});
+
+test("local savings requires this launcher's status-line credential", async t => {
+  let reads = 0;
+  const proxy = await harness({savings:{view:async () => { reads++; return {net_usd:1}; }}});
+  t.after(() => proxy.close());
+  const url = `http://127.0.0.1:${proxy.port}/memtree/savings?session=12345678-1234-4123-8123-123456789abc`;
+  for (const headers of [{}, {'x-ccc-savings-token':'other-launcher'}]) {
+    assert.equal((await fetch(url, {headers})).status,404);
+  }
+  assert.equal(reads,0);
+  const response = await fetch(url,{headers:{'x-ccc-savings-token':proxy.savingsToken}});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).net_usd,1);
+  assert.equal(reads,1);
 });

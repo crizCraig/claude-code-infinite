@@ -1,12 +1,10 @@
 import { SavingsObservation } from './savings-turn.js';
 import type { Diagnostics } from './diagnostics.js';
-import { SavingsHistory } from './savings-history.js';
+import { randomUUID } from 'node:crypto';
 import type { SavingsView } from './savings-status.js';
-import { accountSavingsTurn, createSavingsState, isSavingsSessionId, savingsLaneKey,
-  type SavingsPromptCheckpoint, type SavingsState, type SavingsTurnInput } from './savings.js';
+import { isSavingsSessionId, type SavingsTurnInput } from './savings.js';
 
 interface Session {
-  baseline: SavingsState;
   progress: number;
   budget: number;
   refreshAt: number;
@@ -20,8 +18,16 @@ interface SavingsTrackerOptions {
   now?: () => number;
 }
 
+/** Only Polychat's explicit session refusal supersedes a cached total. */
+export function sessionSavingsResponse(id: string, status: number, body: Buffer): unknown {
+  if (status !== 200 && status !== 404) return;
+  const value = JSON.parse(body.toString("utf8"));
+  if (status === 200) return value;
+  if (value?.detail === "Session unavailable") return {session_id:id, costs_complete:false};
+}
+
 export class SavingsTracker {
-  readonly history = new SavingsHistory<SavingsPromptCheckpoint>();
+  private readonly scope = randomUUID();
   private readonly sessions = new Map<string, Session>();
 
   private readonly account?: object;
@@ -40,41 +46,12 @@ export class SavingsTracker {
   startTurn(id: unknown): SavingsObservation | undefined {
     if (!isSavingsSessionId(id) || !this.account || this.account !== this.opts.diagnostics?.savingsAccount) return;
     const report = this.opts.diagnostics?.bindSavings();
-    if (report) return new SavingsObservation(id.toLowerCase(), report, this.opts.diagnostics?.savingsCacheDirectory);
+    if (report) return new SavingsObservation(id.toLowerCase(), report, this.scope, this.opts.diagnostics?.savingsCacheDirectory);
   }
 
   /** Only upstream dispatches contribute an API turn. Billing records MemTree independently. */
-  settle(observation: SavingsObservation, input: SavingsTurnInput, status: number): void {
-    if (observation.closed) return;
-    observation.closed = true;
-    try {
-      if (input.nowMs === undefined) return;
-      const lane = input.laneKey ?? 'main';
-      if (observation.requestedAt === undefined) observation.dispatched(lane, input.nowMs);
-      const session = this.session(observation.sessionId);
-      const success = status >= 200 && status < 300;
-      // A conclusive upstream request rejection used zero tokens. Network failures,
-      // timeouts and server errors leave the actual bill unknown.
-      const usage = [400, 401, 403, 404, 413, 422, 429].includes(status)
-        ? {input_tokens:0, output_tokens:0} : undefined;
-      const measured = success ? input : {...input, requestModified:false, usage};
-      const key = savingsLaneKey(lane);
-      const dispatch = observation.dispatch;
-      let baseline = session.baseline;
-      if (dispatch) baseline = {lanes: dispatch.previous ? {[key]:dispatch.previous} : {}};
-      const {state, turn} = accountSavingsTurn(baseline, {...measured, previousAt:dispatch?.previousAt});
-      if (success && turn.actual_tokens) {
-        if (dispatch) observation.remember(state.lanes[key]);
-        else session.baseline = state;
-      }
-      const model = input.model ?? (input.request as {model?: string})?.model;
-      observation.report({
-        turn_id:observation.id, session_id:observation.sessionId,
-        requested_at:new Date(input.nowMs).toISOString(),
-        model, fast_mode:turn.fast_mode, actual:turn.actual_tokens ?? null,
-        plain:turn.actual_tokens ? turn.plain_tokens : null, window_crossing:success && turn.window_crossing,
-      });
-    } catch { /* Accounting never determines request delivery. */ }
+  settle(observation: SavingsObservation, input: Omit<SavingsTurnInput,'replay'>, status: number): Promise<void> {
+    return observation.settle(input,status);
   }
 
   /** Called only by the status line. One fetch per session per ten seconds, including failures. */
@@ -128,7 +105,7 @@ export class SavingsTracker {
     id = id.toLowerCase();
     let session = this.sessions.get(id);
     if (!session) {
-      session = {baseline:createSavingsState(), progress:0, budget:1, refreshAt:0};
+      session = {progress:0, budget:1, refreshAt:0};
       this.sessions.set(id, session);
       if (this.sessions.size > 200) this.sessions.delete(this.sessions.keys().next().value!);
     }

@@ -70,8 +70,8 @@ test('cancelling during a billable compression publishes no upstream turn', asyn
   await sent;
   workTime += 10000; // Settlement after midnight still describes the submitted work.
   const input = {request:{messages}, requestModified:true, contextWindow:200000};
-  tracker.settle(turn, input, 0);
-  tracker.settle(turn, input, 0);
+  await tracker.settle(turn, input, 0);
+  await tracker.settle(turn, input, 0);
   finish();
   await compression;
   await diagnostics.flush();
@@ -277,14 +277,14 @@ test('warm and expired conversation cache cost the same across launcher restarts
             const diagnostics = new Diagnostics({configDir, apiKey:'A', baseUrl:'https://example.test',
               env:{}, clientName:'ccc', clientVersion:'1', fetchImpl:async () => Response.json({acked_turn_ids:[]})});
             const tracker = new SavingsTracker({diagnostics});
-            tracker.settle(tracker.startTurn(session), input, 200);
+            await tracker.settle(tracker.startTurn(session), input, 200);
             await diagnostics.flush();
           `], {cwd:new URL('../',import.meta.url),input:JSON.stringify([h.configDir,session,input])});
         } else {
-          tracker.settle(tracker.startTurn(session), input, 200);
+          await tracker.settle(tracker.startTurn(session), input, 200);
           await diagnostics.flush();
         }
-        tracker.settle(tracker.startTurn(session), {...input, nowMs:1000+gap,
+        await tracker.settle(tracker.startTurn(session), {...input, nowMs:1000+gap,
           originalInputTokens:80010, request:{...request,messages:[...messages,
             {role:'assistant',content:'done'},{role:'user',content:'continue'}]}}, 200);
         await diagnostics.flush();
@@ -313,7 +313,7 @@ test('late background index refusal leaves the published turn independent of bil
   client.indexInBackground('background',messages,200000,first.session_id,
     metadata,undefined,{force:true});
   await sent;
-  tracker.settle(observation,{request:{model:first.model,messages},requestModified:false,
+  await tracker.settle(observation,{request:{model:first.model,messages},requestModified:false,
     usage:{input_tokens:100,output_tokens:1},contextWindow:200000,nowMs:1000},200);
   await diagnostics.flush();
   refuse();
@@ -332,7 +332,7 @@ test('overlapping launchers use dispatch order and isolate credentials', async t
       const request = {model:first.model, cache_control:{type:'ephemeral',ttl}, messages:[
         {role:'user',content:text.repeat(10000)}, {role:'assistant',content:'hi'},
         {role:'user',content:'continue'}]};
-      tracker.settle(observation,{request,requestModified:true,nowMs:at,contextWindow:200000,
+      await tracker.settle(observation,{request,requestModified:true,nowMs:at,contextWindow:200000,
         usage:{input_tokens:10,output_tokens:1},originalInputTokens:2500},200);
       await diagnostics.flush();
       return h.posts.at(-1).turns[0].plain;
@@ -360,13 +360,73 @@ test('an unreadable predecessor checkpoint cannot lose a measured turn', async t
       {role:'user',content:'new'}]},requestModified:true,contextWindow:200000,
     usage:{input_tokens:50,output_tokens:1}, originalInputTokens:2250, nowMs:1000};
   const firstTurn = tracker.startTurn(session);
-  tracker.settle(firstTurn,input,200);
+  await tracker.settle(firstTurn,input,200);
   await diagnostics.flush();
   const paths = await readdir(h.configDir,{recursive:true});
   const file = paths.find(f => f.endsWith(firstTurn.id));
   await writeFile(join(h.configDir,file), JSON.stringify({at:1000,prefixes:[null],model:first.model}));
-  tracker.settle(tracker.startTurn(session),{...input,nowMs:400000},200);
+  await tracker.settle(tracker.startTurn(session),{...input,nowMs:400000},200);
   await diagnostics.flush();
   assert.equal(h.posts.length,2);
   assert.equal(h.posts[1].turns[0].plain.cache_read,0);
+});
+
+test('dispatch and settlement leave checkpoint I/O and prompt hashing off the forwarding thread', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const {existsSync} = await import('node:fs');
+  const h = await harness(t), diagnostics = h.client();
+  let reported = false;
+  const tracker = new SavingsTracker({diagnostics:{
+    savingsCacheDirectory:diagnostics.savingsCacheDirectory,
+    savingsAccount:{}, bindSavings:()=>()=>{ reported = true; }
+  }});
+  const request = {model:first.model,messages:[{role:'user',content:[{type:'image',
+    source:{type:'base64',data:'x'.repeat(30 * 1024 * 1024)}}]}]};
+  const json = JSON.stringify(request);
+  const bytes = Buffer.from(new SharedArrayBuffer(Buffer.byteLength(json)));
+  bytes.write(json);
+  const observation = tracker.startTurn(first.session_id);
+  observation.dispatched('main',1000);
+  // The forwarding stack schedules work and returns before settlement completes.
+  const tick = new Promise(resolve => setImmediate(() => resolve(reported)));
+  const settled = tracker.settle(observation,{request:bytes,requestModified:true,nowMs:1000,
+    usage:{input_tokens:10,output_tokens:1},contextWindow:200000},200);
+  assert.equal(await tick,false);
+  await settled;
+  assert.equal(reported,true);
+  assert.ok(existsSync(diagnostics.savingsCacheDirectory));
+});
+
+test('successive dispatches within one clock millisecond use their immediate predecessor', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client();
+  const tracker = new SavingsTracker({diagnostics});
+  const prompt = text => ({model:first.model,cache_control:{type:'ephemeral'},messages:[
+    {role:'user',content:text.repeat(120000)},{role:'assistant',content:'ok'}]});
+  const input = {request:prompt('a'),requestModified:false,contextWindow:200000,nowMs:1000,
+    usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}};
+  for (const request of [prompt('a'),prompt('b')]) {
+    await tracker.settle(tracker.startTurn(first.session_id),{...input,request},200);
+  }
+  await diagnostics.flush();
+  await tracker.settle(tracker.startTurn(first.session_id),{...input,requestModified:true,
+    originalInputTokens:30000},200);
+  await diagnostics.flush();
+  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
+});
+
+test('a known in-flight predecessor supplies no unverified cache reads', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client();
+  const tracker = new SavingsTracker({diagnostics});
+  const pending = tracker.startTurn(first.session_id);
+  pending.dispatched('main',1000);
+  const input = {request:{model:first.model,cache_control:{type:'ephemeral'},messages:[
+    {role:'user',content:'b'.repeat(120000)}, {role:'assistant',content:'ok'}]},
+    requestModified:true,contextWindow:200000,originalInputTokens:30000,
+    usage:{input_tokens:20,output_tokens:1},nowMs:11000};
+  await tracker.settle(tracker.startTurn(first.session_id),input,200);
+  await diagnostics.flush();
+  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
+  await tracker.settle(pending,{...input,nowMs:1000},200);
 });

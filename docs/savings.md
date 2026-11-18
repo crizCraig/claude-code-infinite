@@ -9,7 +9,8 @@ counterfactual. Polychat prices the ordinary input, cache reads, five-minute wri
 one-hour writes and output independently for each side. The aggregate creation count includes both creation
 durations; it is not an additional bucket. Invalid, negative, fractional, or
 inconsistent usage marks that turn incomplete. A missing cache-duration split
-uses the historical five-minute creation bucket; missing input/output is invalid.
+uses the historical five-minute creation bucket. A stream can supply input on the
+start or final delta. A null field leaves an earlier measured count intact.
 
 Polychat computes each session and reporting period using the same formula.
 
@@ -124,7 +125,11 @@ time order. The median covers 113 gaps from 15 launchers, November 4–16. A kno
 gap always supersedes the calibration. In particular, an unknown away gap is
 cold for a five-minute breakpoint and warm for a one-hour breakpoint.
 
-When a warm predecessor has no prefix checkpoint, estimate the reusable history
+After a passthrough, observed cache coverage is capped at the longest verified
+common content prefix of the two requests. Older passthrough checkpoints without
+content hashes supply no verified reads.
+
+When a predecessor is unknown, estimate the reusable history
 through the input preceding the latest assistant reply, capped at the cacheable
 breakpoint. The new reply and follow-up still require writes. Observed reads can
 also establish reusable coverage. A synthetic compaction starts a new cache.
@@ -155,15 +160,16 @@ The sender posts up to 50 turns to `/v1/ccc/savings/turns`. Only IDs in a readab
 `acked_turn_ids` response are removed. The filename records the next eligible retry
 time, starting at one minute and doubling to a maximum of 30 minutes. Missing
 acknowledgements survive restarts. An invalid credential suspends the sender.
-Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. The launcher reads and writes the local dispatch
-checkpoint on a best-effort basis.
+Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. A launcher worker hashes the shared request bytes
+and handles dispatch checkpoints in the order the proxy queues them.
 
 ## Status line
 
-The hook asks its launcher's loopback proxy for the current session view. The proxy
+The hook uses a launcher-scoped token to ask its loopback proxy for the current session view. The proxy
 fetches the authenticated server session total with a ten-second cache. It combines
 that value with the main conversation's local progress toward its compression budget.
-An offline refresh can reuse the last known value. Missing, incomplete and nonpositive
+An offline refresh can reuse the last known value. An explicit session-unavailable
+response clears it. Missing, incomplete and nonpositive
 results use the progress display. The status line budgets terminal cells and drops the
 percentage first on narrow terminals.
 

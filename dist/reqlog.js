@@ -100,14 +100,16 @@ export function mergeUsageFromSseEvent(data, rec) {
     const type = data?.type;
     let protocol = savingsUsageProtocols.get(rec);
     if (!protocol) {
-        protocol = { started: false, finalOutput: false, invalid: false };
+        protocol = { started: false, measuredInput: false, finalOutput: false, invalid: false };
         savingsUsageProtocols.set(rec, protocol);
     }
     if (type === "message_start") {
         if (rec.savingsUsageComplete !== undefined)
             rec.savingsUsageComplete = false;
         const usage = data?.message?.usage;
-        protocol.invalid ||= protocol.started || !validSavingsUsage(usage, true);
+        protocol.invalid ||= protocol.started || !data.message || typeof data.message !== "object" ||
+            Array.isArray(data.message) || (usage != null && !validSavingsUsage(usage));
+        protocol.measuredInput = validTokenCount(usage?.input_tokens);
         protocol.started = true;
         mergeUsage(usage, rec);
     }
@@ -115,7 +117,8 @@ export function mergeUsageFromSseEvent(data, rec) {
         if (rec.savingsUsageComplete !== undefined)
             rec.savingsUsageComplete = false;
         const usage = data?.usage;
-        protocol.invalid ||= !protocol.started || !validSavingsUsage(usage, false);
+        protocol.invalid ||= !protocol.started || (usage != null && !validSavingsUsage(usage));
+        protocol.measuredInput ||= validTokenCount(usage?.input_tokens);
         protocol.finalOutput = validTokenCount(usage?.output_tokens);
         mergeUsage(usage, rec);
     }
@@ -124,7 +127,7 @@ export function mergeUsageFromSseEvent(data, rec) {
         rec.savingsUsageComplete = false;
     }
     else if (type === "message_stop") {
-        rec.savingsUsageComplete = protocol.started && protocol.finalOutput && !protocol.invalid;
+        rec.savingsUsageComplete = protocol.started && protocol.measuredInput && protocol.finalOutput && !protocol.invalid;
     }
 }
 /** Merge usage from a non-streaming /v1/messages JSON response body. */
@@ -134,7 +137,8 @@ export function mergeUsageFromJsonBody(body, rec) {
         const response = JSON.parse(body.toString("utf-8"));
         mergeUsage(response?.usage, rec);
         rec.savingsUsageComplete = response?.type === "message" && Array.isArray(response.content) &&
-            validSavingsUsage(response.usage, true);
+            validSavingsUsage(response.usage) && validTokenCount(response.usage.input_tokens) &&
+            validTokenCount(response.usage.output_tokens);
     }
     catch {
         // Not the shape we expected — usage just stays absent.
@@ -144,22 +148,21 @@ const validTokenCount = (value) => typeof value === "number" && Number.isSafeInt
 /** Validate the raw fields before reqlog's permissive merge can drop bad values.
  * In particular an invalid final output must not leave the valid initial zero
  * looking like the complete billable output count. */
-function validSavingsUsage(value, full) {
+function validSavingsUsage(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return false;
     const usage = value;
-    if (full && (!validTokenCount(usage.input_tokens) || !validTokenCount(usage.output_tokens)))
-        return false;
     for (const field of USAGE_FIELDS) {
-        if (Object.hasOwn(usage, field) && !validTokenCount(usage[field]))
+        if (usage[field] != null && !validTokenCount(usage[field]))
             return false;
     }
-    if (Object.hasOwn(usage, "cache_creation")) {
+    if (usage.cache_creation != null) {
         const creation = usage.cache_creation;
         if (!creation || typeof creation !== "object" || Array.isArray(creation))
             return false;
         for (const field of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]) {
-            if (Object.hasOwn(creation, field) && !validTokenCount(creation[field]))
+            const tokens = creation[field];
+            if (tokens != null && !validTokenCount(tokens))
                 return false;
         }
     }

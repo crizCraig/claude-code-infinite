@@ -7,17 +7,22 @@ interface Prefix {
     ttl: number;
     at: number;
 }
+interface WarmCoverage {
+    five: number;
+    hour: number;
+    at: number;
+    prefixes?: {
+        hash: string;
+        tokens: number;
+    }[];
+}
 export interface SavingsLane {
     prefixes: Prefix[];
     full_hash: string;
     at: number;
     removed: number;
     model: string;
-    warm?: {
-        five: number;
-        hour: number;
-        at: number;
-    };
+    warm?: WarmCoverage;
 }
 export interface SavingsState {
     lanes: Record<string, SavingsLane>;
@@ -25,6 +30,8 @@ export interface SavingsState {
 type LaneKind = 'main' | 'agent' | 'away';
 export interface SavingsTurnInput {
     laneKind?: LaneKind;
+    /** A recorded dispatch with no completed checkpoint has no verifiable overlap. */
+    unverifiedPredecessor?: boolean;
     replay?: SavingsReplay<SavingsPromptCheckpoint>;
     request: unknown;
     usage: unknown;

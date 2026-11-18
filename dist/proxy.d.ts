@@ -344,6 +344,7 @@ export interface RunningProxy {
     setHostPid: (pid: number | undefined) => void;
     /** The secret this ccc's memtree MCP server sends to `/memtree/host-session`. */
     hostToken: string;
+    savingsToken: string;
 }
 /**
  * A MemTree page the server stamped on a main-conversation compress, with
@@ -423,6 +424,7 @@ interface ProxyState {
     hostPid?: number;
     /** RunningProxy.hostToken. */
     hostToken: string;
+    savingsToken: string;
     /** Hook state affects notices only, never routing. */
     mainNoticePending: boolean;
     mainPromptId?: string;

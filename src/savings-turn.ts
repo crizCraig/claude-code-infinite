@@ -1,57 +1,67 @@
 import {randomUUID} from 'node:crypto';
-import {mkdirSync, readdirSync, unlinkSync, writeFileSync} from 'node:fs';
-import {join} from 'node:path';
-import {readPrivateFile, writeAtomically} from './prefix-store.js';
-import {isSavingsLane, savingsLaneKey, type SavingsLane} from './savings.js';
+import {Worker} from 'node:worker_threads';
+import type {SavingsTurnInput} from './savings.js';
 
-interface Dispatch {
-  dir: string;
-  file: string;
-  previousAt?: number;
-  previous?: SavingsLane;
+type WorkerInput = Omit<SavingsTurnInput,'replay'>;
+export type SavingsJob =
+  | {kind:'dispatch'; id:string; sessionId:string; cacheDirectory:string; laneKey:string; at:number; order:bigint}
+  | {kind:'settle'; id:string; sessionId:string; scope:string; input:WorkerInput; status:number};
+
+// One FIFO mailbox per launcher. Only the worker opens checkpoints or walks prompt
+// bytes. Keep the process alive while a settled turn is on its way to the outbox.
+let worker: Worker | undefined;
+const pending = new Map<string,(report:unknown)=>void>();
+function accountingWorker(): Worker {
+  if (worker) return worker;
+  const current = new Worker(new URL('./savings-worker.js',import.meta.url), {execArgv:[]});
+  worker = current;
+  current.on('message', ({id,report}) => {
+    pending.get(id)?.(report);
+    pending.delete(id);
+    if (!pending.size) current.unref();
+  });
+  current.on('error', () => { /* exit releases pending observations */ });
+  current.on('exit', () => {
+    worker = undefined;
+    for (const finish of pending.values()) finish(undefined);
+    pending.clear();
+  });
+  current.unref();
+  return current;
 }
 
-/** Each writer owns its dispatch file, so a slower response cannot overwrite a newer turn.
- * Only timestamps, token counts and hashed prompt prefixes are shared across launchers. */
 export class SavingsObservation {
   readonly id = randomUUID();
-  closed = false;
   requestedAt?: number;
-  dispatch?: Dispatch;
+  private closed = false;
 
-  constructor(readonly sessionId: string, readonly report: (value: unknown) => void,
-              private readonly cacheDirectory?: string) {}
+  constructor(readonly sessionId: string, private readonly report: (value: unknown) => void,
+              private readonly scope: string, private readonly cacheDirectory?: string) {}
 
   dispatched(laneKey: string, at: number): void {
     this.requestedAt = at;
-    if (!this.cacheDirectory) return;
-    try {
-      const dir = join(this.cacheDirectory, this.sessionId, savingsLaneKey(laneKey));
-      mkdirSync(dir, {recursive:true, mode:0o700});
-      const file = join(dir, at + '.' + this.id);
-      writeFileSync(file, '', {mode:0o600, flag:'wx'});
-      const older = readdirSync(dir)
-        .filter(name => /^\d+\.[0-9a-f-]{36}$/.test(name) && parseInt(name, 10) < at)
-        .sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
-      this.dispatch = {dir, file};
-      if (!older.length) return;
-      this.dispatch.previousAt = parseInt(older[0], 10);
-      const body = readPrivateFile(join(dir, older[0]), 64 * 1024);
-      if (body) {
-        const lane: unknown = JSON.parse(body);
-        if (isSavingsLane(lane, this.dispatch.previousAt)) {
-          this.dispatch.previous = lane;
-        }
-      }
-      for (const name of older.slice(1)) {
-        try { unlinkSync(join(dir, name)); } catch { /* A sibling pruned it. */ }
-      }
-    } catch { /* Missing cache evidence falls back to the observed median. */ }
+    if (this.cacheDirectory) {
+      try {
+        accountingWorker().postMessage({kind:'dispatch', id:this.id, sessionId:this.sessionId,
+          cacheDirectory:this.cacheDirectory, laneKey, at, order:process.hrtime.bigint()} satisfies SavingsJob);
+      } catch { /* Forward even if the worker is unavailable. */ }
+    }
   }
 
-  remember(lane: SavingsLane): void {
-    if (this.dispatch && isSavingsLane(lane, lane.at)) {
-      writeAtomically(this.dispatch.dir, this.dispatch.file, JSON.stringify(lane));
-    }
+  async settle(input: WorkerInput, status: number): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (input.nowMs === undefined) return;
+    try {
+      if (this.requestedAt === undefined) this.dispatched(input.laneKey ?? 'main', input.nowMs);
+      const current = accountingWorker();
+      const result = await new Promise<unknown>((resolve) => {
+        current.postMessage({kind:'settle', id:this.id, sessionId:this.sessionId,
+          scope:this.scope, input, status} satisfies SavingsJob);
+        pending.set(this.id,resolve);
+        current.ref();
+      });
+      if (result) this.report(result);
+    } catch { /* Accounting never determines request delivery. */ }
   }
 }

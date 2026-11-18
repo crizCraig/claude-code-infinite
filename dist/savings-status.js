@@ -4,14 +4,14 @@ import { isSavingsSessionId } from './savings.js';
 /** Query this Claude Code process's ccc launcher (base-URL and HTTPS-proxy modes).
  * The launcher owns the authenticated MemTree client and caches server answers. */
 export async function readSavingsView(id, env, get = fetch) {
-    if (!isSavingsSessionId(id))
+    if (!isSavingsSessionId(id) || !env.CCC_SAVINGS_TOKEN)
         return;
     const origin = (env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL === '1' && env.ANTHROPIC_BASE_URL)
         || env.CCC_MEMTREE_PROXY;
     if (!origin || !/^http:\/\/127\.0\.0\.1:\d+$/.test(origin))
         return;
     try {
-        const response = await get(origin + '/memtree/savings?session=' + id, { signal: AbortSignal.timeout(1500), redirect: 'error' });
+        const response = await get(origin + '/memtree/savings?session=' + id, { headers: { 'x-ccc-savings-token': env.CCC_SAVINGS_TOKEN }, signal: AbortSignal.timeout(1500), redirect: 'error' });
         if (response.ok)
             return await response.json();
     }

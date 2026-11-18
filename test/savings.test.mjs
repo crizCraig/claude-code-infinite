@@ -135,10 +135,10 @@ test('parallel tool calls and results each occupy one cache lookback position', 
  assert.ok(next.turn.plain_tokens.cache_read>=29900);
 });
 
-test('settling an unchanged request never traverses its transcript', () => {
+test('a passthrough with no observed cache coverage needs no transcript hashes', () => {
  const req={...request(),get messages(){throw Error('walked the unchanged transcript')}};
- assert.deepEqual(turn(createSavingsState(),{request:req,requestModified:false}).turn.plain_tokens,
-   turn(createSavingsState(),{requestModified:false}).turn.actual_tokens);
+ assert.deepEqual(turn(createSavingsState(),{request:req,requestModified:false,usage:{input_tokens:10,output_tokens:0}}).turn.plain_tokens,
+   normalizeSavingsUsage({input_tokens:10,output_tokens:0}));
 });
 
 test('the first compressed turn can reuse a prefix warmed by a passthrough', () => {
@@ -182,4 +182,28 @@ test('unknown away gap exceeds five minutes but fits an hour; a known gap takes 
  assert.ok(price('1h').cache_read>79000);
  assert.ok(price('5m',3999000).cache_read>79000);
  assert.equal(price('1h',1000).cache_read,0);
+});
+
+test('warm passthrough coverage stops at the last matching content block', () => {
+  const prompt = (head, tail) => ({...request(), cache_control:{type:'ephemeral'},
+    messages:[{role:'user',content:head.repeat(60000)}, {role:'assistant',content:tail.repeat(60000)}]});
+  const first = turn(createSavingsState(), {request:prompt('a','b'), requestModified:false,
+    usage:{input_tokens:0, cache_creation_input_tokens:30000, output_tokens:1}});
+  const next = request => turn(first.state, {request, originalInputTokens:30000, nowMs:11000}).turn.plain_tokens;
+  const replaced = next(prompt('c','d'));
+  assert.deepEqual([replaced.cache_read,replaced.cache_creation_5m], [0,30000]);
+  const edited = next(prompt('a','d'));
+  assert.ok(Math.abs(edited.cache_read - 15000) < 10, JSON.stringify(edited));
+  assert.equal(edited.cache_read + edited.cache_creation_5m, 30000);
+  assert.equal(next(prompt('a','b')).cache_read, 30000);
+});
+
+test('a long passthrough retains its shared head when the rest of the conversation changes', () => {
+  const head = request('a'.repeat(24000)).messages[0];
+  const prompt = tail => ({...request(), cache_control:{type:'ephemeral'},
+    messages:[head, ...Array.from({length:160}, () => ({role:'user',content:tail.repeat(150)}))]});
+  const first = turn(createSavingsState(), {request:prompt('b'), requestModified:false,
+    usage:{input_tokens:0,cache_creation_input_tokens:12000,output_tokens:0}});
+  const next = turn(first.state, {request:prompt('c'), originalInputTokens:12000,nowMs:11000});
+  assert.ok(next.turn.plain_tokens.cache_read > 5800 && next.turn.plain_tokens.cache_read < 6100);
 });
