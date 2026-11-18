@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,12 +13,13 @@ const session = "12345678-1234-1234-1234-123456789abc";
 
 function run(t, args, messages, env = {}, config = {
   polychatApiKey: "fixture-production-key", stagingPolychatApiKey: "fixture-staging-key",
-}, nodeArgs = []) {
+}, nodeArgs = [], setupHome = () => {}) {
   const home = mkdtempSync(path.join(tmpdir(), "ccc-direct-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const dir = path.join(home, ".claude-code-infinite");
   mkdirSync(dir);
   writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
+  setupHome(home);
   const result = spawnSync(process.execPath, [...nodeArgs, "--import", mock, cli, "memtree-mcp", ...args], {
     cwd: home, // Keep any Node profile files inside the disposable directory.
     // NODE_DEBUG=* can log several MiB of ESM loader diagnostics before startup.
@@ -31,7 +32,7 @@ function run(t, args, messages, env = {}, config = {
   });
   assert.ifError(result.error);
   assert.doesNotMatch(result.stdout + result.stderr, /fixture-(production|staging)-key/);
-  return result;
+  return { ...result, home };
 }
 
 const call = (name, args) => ({ method: "tools/call", params: { name, arguments: args } });
@@ -163,6 +164,67 @@ for (const flag of [
   }
 }
 
+test("direct mode accepts stack-only trace flags", t => {
+  const result = run(t, ["--direct"], [call("list", {})], {
+    NODE_OPTIONS: "--trace-warnings --trace-deprecation --trace-uncaught --trace-exit",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!JSON.parse(result.stdout).result.isError);
+});
+
+const v8Options = spawnSync(process.execPath, ["--v8-options"], { encoding: "utf8" }).stdout;
+const nodeHelp = spawnSync(process.execPath, ["--help"], { encoding: "utf8" }).stdout;
+for (const flag of ["--prof", "-prof-cpp", "--log-code", "--heap-snapshot-on-gc=20", "-heap_snapshot_on_gc=20",
+  "--heap-snapshot-on-oom", "--heap-profiler-show-hidden-objects"]) {
+  const name = flag.replace(/^-{1,2}/, "--").replaceAll("_", "-").split("=")[0];
+  test(`direct mode refuses V8 ${flag} before loading the canary key`, {
+    skip: !v8Options.includes(`  ${name} (`),
+  }, t => {
+    const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1" },
+      { polychatApiKey: "saved-canary-for-refusal" }, [flag]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Node diagnostics can expose the MemTree key/);
+    assert.ok(!readdirSync(result.home).some(file => file.endsWith(".heapsnapshot")));
+  });
+}
+
+for (const selector of ["--experimental-config-file=node.config.json", "--experimental-default-config-file"]) {
+  test(`direct mode refuses ${selector} before loading the canary key`, {
+    skip: !nodeHelp.includes("--experimental-config-file"),
+  }, t => {
+    const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1" },
+      { polychatApiKey: "saved-canary-for-refusal" }, [selector], home => {
+        writeFileSync(path.join(home, "node.config.json"), JSON.stringify({ nodeOptions: { "diagnostic-dir": "." } }));
+      });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Node config.file/i);
+    assert.ok(!readdirSync(result.home).some(file => file.endsWith(".heapsnapshot")));
+  });
+}
+
+// Some Node versions reject these in NODE_OPTIONS themselves, or run the log
+// processor instead of the entry point. Exercise the server's env check directly.
+for (const flag of ["--prof", "--prof-process", '"--experimental_"config_file=node.config.json',
+  "--default-config-file", "--trace-http2", "--trace-event-categories=node.http"]) {
+  test(`direct mode checks NODE_OPTIONS for ${flag}`, t => {
+    const preload = "data:text/javascript," + encodeURIComponent(`process.env.NODE_OPTIONS = ${JSON.stringify(flag)}`);
+    const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1" }, {}, ["--import", preload]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Unset NODE_OPTIONS/);
+  });
+}
+
+for (const repo of ["owner/project", "owner/fixture-production-key"]) {
+  test(`direct list and search send key-free project attribution for ${repo}`, t => {
+    const replies = results(run(t, ["--direct"], [call("list", {}), call("search", { query: "deploy" })],
+      { EXPECT_PROJECT_META: "1", EXPECT_GIT_REPO: repo === "owner/project" ? repo : "" }, undefined, [], home => {
+        execFileSync("git", ["init", "--quiet"], { cwd: home });
+        execFileSync("git", ["remote", "add", "origin", `https://user:fixture-production-key@example.org/${repo}.git`], { cwd: home });
+      }));
+    for (const reply of replies) assert.ok(!reply.isError, reply.content[0].text);
+  });
+}
+
 test("direct requests bypass the global transport and environment proxy", t => {
   const [list] = results(run(t, ["--direct"], [call("list", {})], {
     NODE_USE_ENV_PROXY: "1",
@@ -209,4 +271,16 @@ test("JSON detail is sanitized before SessionFinder throws a tool error", () => 
 test("Node connection diagnostics keep the authorization header private", () => {
   const result = runFinder("await finder.listSessions({});", { NODE_DEBUG: "http,https" });
   assert.ok(!result.stderr.includes("fixture-production-key"));
+});
+
+test("invalid bearer header leaves no open direct request", () => {
+  runFinder(`
+    const https = (await import("node:https")).default;
+    const original = https.request;
+    let request;
+    https.request = (...args) => (request = original(...args));
+    const invalid = new SessionFinder({ direct: { baseUrl: "https://api.polychat.co", apiKey: "invalid\\nkey" } });
+    await assert.rejects(invalid.listSessions({}), /invalid.*header/i);
+    assert.ok(!request || request.destroyed, "invalid header left the request open");
+  `);
 });

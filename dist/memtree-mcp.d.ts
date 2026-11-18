@@ -353,6 +353,7 @@ export interface MemtreeMcpDeps {
     direct?: {
         baseUrl: string;
         apiKey: string;
+        finderMeta?: Promise<string | undefined>;
     };
     sessionId?: string;
     /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */

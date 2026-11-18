@@ -37,10 +37,12 @@
  * endpoint.
  */
 import https from "node:https";
-import type { IncomingMessage } from "node:http";
+import { validateHeaderValue, type IncomingMessage } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
+import { memtreeClientMeta } from "./cc-request.js";
+import { readProjectMeta } from "./project-meta.js";
 import type { CccEnvironment } from "./cli-args.js";
 import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
@@ -454,7 +456,7 @@ function replaceOnce(text: string, from: string, to: string): string {
 export interface MemtreeMcpDeps {
   /** The ccc loopback proxy, e.g. http://127.0.0.1:1234. */
   proxyUrl?: string;
-  direct?: { baseUrl: string; apiKey: string };
+  direct?: { baseUrl: string; apiKey: string; finderMeta?: Promise<string | undefined> };
   sessionId?: string;
   /** HOST_TOKEN_ENV: set by a ccc whose proxy answers `/memtree/host-session`. */
   hostToken?: string;
@@ -548,6 +550,8 @@ async function getDirectJson(
   url: string, headers: Record<string, string>, key: string, timeoutMs = FETCH_TIMEOUT_MS
 ): Promise<JsonAnswer> {
   try {
+    const authorization = `Bearer ${key}`;
+    validateHeaderValue("authorization", authorization); // Fail before opening a socket.
     // https.request does not follow redirects. The deadline includes reading the body.
     const response = await new Promise<IncomingMessage>((resolve, reject) => {
       const request = https.request(url, {
@@ -555,7 +559,7 @@ async function getDirectJson(
         headers: { accept: "application/json", ...headers },
       }, resolve).on("error", reject);
       // Node's connection diagnostics can print the options passed to https.request.
-      request.setHeader("authorization", `Bearer ${key}`);
+      request.setHeader("authorization", authorization);
       request.end();
     });
     return jsonAnswer(response.statusCode!, await readText(response), key);
@@ -666,12 +670,24 @@ function proxyBase(deps: MemtreeMcpDeps): string {
   return base;
 }
 
+async function directFinderMeta(key: string): Promise<string | undefined> {
+  const meta = memtreeClientMeta({ project: await readProjectMeta() });
+  // A directory, branch or remote path can itself contain the saved key.
+  const fields = Object.entries(meta).filter(([, value]) => !value.includes(key));
+  return fields.length ? JSON.stringify(Object.fromEntries(fields)) : undefined;
+}
+
 /** Both transports return the same JSON. The proxy flattens the server's two route prefixes. */
-function toolGet(
+async function toolGet(
   deps: MemtreeMcpDeps, prefix: "/v1" | "/usage", path: string, tool: string, timeoutMs?: number
 ): Promise<JsonAnswer> {
   const headers = toolHeaders(tool, deps);
   if (deps.direct) {
+    if (prefix === "/v1") {
+      deps.direct.finderMeta ??= directFinderMeta(deps.direct.apiKey);
+      const meta = await deps.direct.finderMeta;
+      if (meta) headers["x-client-meta"] = meta;
+    }
     headers["x-client"] = CLIENT_NAME;
     headers["x-client-version"] = CLIENT_VERSION;
     return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${path}`, headers, deps.direct.apiKey, timeoutMs);
@@ -1407,9 +1423,15 @@ function nodeOptionsArgs(options: string): string[] {
 }
 
 function isNodeDiagnosticArg(arg: string): boolean {
-  const flag = arg.split("=", 1)[0].replaceAll("_", "-");
+  // V8 accepts a single leading dash and treats underscores as hyphens.
+  const flag = arg.split("=", 1)[0].replace(/^-(?=[^-])/, "--").replaceAll("_", "-");
+  // Neither execArgv nor NODE_OPTIONS lists settings loaded from a Node config file.
+  if (/^--(?:[a-z0-9-]+-)?config-file(?:-|$)/.test(flag)) return true;
+  // TLS/HTTP and event traces can record traffic. V8 heap, object and compiler
+  // traces can dump in-memory values. Stack-only traces (warnings, exits, etc.) are fine.
+  if (flag === "--trace" || /^--trace-(?:http|tls|event|heap|gc|regexp|deopt|turbo|maglev|generalization|migration|elements-transitions)/.test(flag)) return true;
   return flag.startsWith("--inspect") ||
-    /^--(?:debug|trace|heapsnapshot|heap-prof|cpu-prof|report)(?:-|$)/.test(flag) ||
+    /^--(?:debug|heap-?snapshot|heap-prof(?:iler)?|cpu-prof|prof|log|logfile|report)(?:-|$)/.test(flag) ||
     flag === "--diagnostic-dir" || flag === "--tls-keylog" || flag === "--node-memory-debug";
 }
 
@@ -1432,10 +1454,10 @@ export function runMemtreeMcpServer(
       throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
     }
     if (nodeOptionsArgs(env.NODE_OPTIONS ?? "").some(isNodeDiagnosticArg)) {
-      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove its diagnostic flags.");
+      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove Node config-file selectors and diagnostic flags.");
     }
     if (process.execArgv.some(isNodeDiagnosticArg)) {
-      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove diagnostic flags from the Node command line.");
+      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove Node config-file selectors and diagnostic flags from the Node command line.");
     }
     const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
     const mode = values.env ?? defaultEnv;

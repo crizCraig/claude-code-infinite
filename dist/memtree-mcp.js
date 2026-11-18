@@ -37,9 +37,12 @@
  * endpoint.
  */
 import https from "node:https";
+import { validateHeaderValue } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
+import { memtreeClientMeta } from "./cc-request.js";
+import { readProjectMeta } from "./project-meta.js";
 import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
@@ -450,6 +453,8 @@ async function getJson(fetchImpl, url, headers = {}, timeoutMs = FETCH_TIMEOUT_M
 const directAgent = new https.Agent({ ca: [...rootCertificates], rejectUnauthorized: true });
 async function getDirectJson(url, headers, key, timeoutMs = FETCH_TIMEOUT_MS) {
     try {
+        const authorization = `Bearer ${key}`;
+        validateHeaderValue("authorization", authorization); // Fail before opening a socket.
         // https.request does not follow redirects. The deadline includes reading the body.
         const response = await new Promise((resolve, reject) => {
             const request = https.request(url, {
@@ -457,7 +462,7 @@ async function getDirectJson(url, headers, key, timeoutMs = FETCH_TIMEOUT_MS) {
                 headers: { accept: "application/json", ...headers },
             }, resolve).on("error", reject);
             // Node's connection diagnostics can print the options passed to https.request.
-            request.setHeader("authorization", `Bearer ${key}`);
+            request.setHeader("authorization", authorization);
             request.end();
         });
         return jsonAnswer(response.statusCode, await readText(response), key);
@@ -561,10 +566,22 @@ function proxyBase(deps) {
     }
     return base;
 }
+async function directFinderMeta(key) {
+    const meta = memtreeClientMeta({ project: await readProjectMeta() });
+    // A directory, branch or remote path can itself contain the saved key.
+    const fields = Object.entries(meta).filter(([, value]) => !value.includes(key));
+    return fields.length ? JSON.stringify(Object.fromEntries(fields)) : undefined;
+}
 /** Both transports return the same JSON. The proxy flattens the server's two route prefixes. */
-function toolGet(deps, prefix, path, tool, timeoutMs) {
+async function toolGet(deps, prefix, path, tool, timeoutMs) {
     const headers = toolHeaders(tool, deps);
     if (deps.direct) {
+        if (prefix === "/v1") {
+            deps.direct.finderMeta ??= directFinderMeta(deps.direct.apiKey);
+            const meta = await deps.direct.finderMeta;
+            if (meta)
+                headers["x-client-meta"] = meta;
+        }
         headers["x-client"] = CLIENT_NAME;
         headers["x-client-version"] = CLIENT_VERSION;
         return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${path}`, headers, deps.direct.apiKey, timeoutMs);
@@ -1232,9 +1249,17 @@ function nodeOptionsArgs(options) {
     return args.map(arg => arg.replace(/["\\]/g, ""));
 }
 function isNodeDiagnosticArg(arg) {
-    const flag = arg.split("=", 1)[0].replaceAll("_", "-");
+    // V8 accepts a single leading dash and treats underscores as hyphens.
+    const flag = arg.split("=", 1)[0].replace(/^-(?=[^-])/, "--").replaceAll("_", "-");
+    // Neither execArgv nor NODE_OPTIONS lists settings loaded from a Node config file.
+    if (/^--(?:[a-z0-9-]+-)?config-file(?:-|$)/.test(flag))
+        return true;
+    // TLS/HTTP and event traces can record traffic. V8 heap, object and compiler
+    // traces can dump in-memory values. Stack-only traces (warnings, exits, etc.) are fine.
+    if (flag === "--trace" || /^--trace-(?:http|tls|event|heap|gc|regexp|deopt|turbo|maglev|generalization|migration|elements-transitions)/.test(flag))
+        return true;
     return flag.startsWith("--inspect") ||
-        /^--(?:debug|trace|heapsnapshot|heap-prof|cpu-prof|report)(?:-|$)/.test(flag) ||
+        /^--(?:debug|heap-?snapshot|heap-prof(?:iler)?|cpu-prof|prof|log|logfile|report)(?:-|$)/.test(flag) ||
         flag === "--diagnostic-dir" || flag === "--tls-keylog" || flag === "--node-memory-debug";
 }
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
@@ -1254,10 +1279,10 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
             throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
         }
         if (nodeOptionsArgs(env.NODE_OPTIONS ?? "").some(isNodeDiagnosticArg)) {
-            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove its diagnostic flags.");
+            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove Node config-file selectors and diagnostic flags.");
         }
         if (process.execArgv.some(isNodeDiagnosticArg)) {
-            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove diagnostic flags from the Node command line.");
+            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove Node config-file selectors and diagnostic flags from the Node command line.");
         }
         const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
         const mode = values.env ?? defaultEnv;

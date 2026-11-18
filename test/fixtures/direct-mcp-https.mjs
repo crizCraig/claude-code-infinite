@@ -1,11 +1,26 @@
 // Preloaded into the MCP subprocess. Substitute only the socket, so the real
 // https request and agent choose the destination, TLS options and HTTP headers.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import fs, { readFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
+import { homedir } from "node:os";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import { rootCertificates } from "node:tls";
+
+if (process.env.CHECK_KEY_UNREAD === "1") {
+  const read = fs.readFileSync;
+  fs.readFileSync = function (file, ...args) {
+    if (file === path.join(homedir(), ".claude-code-infinite", "config.json")) {
+      process.stderr.write("Direct mode attempted to read the saved key\n");
+      process.exit(86);
+    }
+    return read.call(this, file, ...args);
+  };
+  syncBuiltinESMExports();
+}
 
 const staging = process.env.EXPECT_STAGING === "1";
 const expectedHost = staging ? "polychat-staging-421312241218.us-west2.run.app" : "api.polychat.co";
@@ -36,6 +51,13 @@ function fixtureResponse(url, method, headers) {
       headers.has("x-ccc-proxy-token")) {
     console.error("Unexpected MemTree request");
     throw new Error("Unexpected MemTree request");
+  }
+  if (process.env.EXPECT_PROJECT_META === "1" && url.pathname.startsWith("/v1/memtree/")) {
+    const expected = { project_dir: path.basename(process.cwd()) };
+    if (process.env.EXPECT_GIT_REPO) expected.git_repo = process.env.EXPECT_GIT_REPO;
+    const meta = headers.get("x-client-meta");
+    assert.ok(meta && !meta.includes(key), "missing or unsafe project metadata");
+    assert.deepEqual(JSON.parse(meta), expected);
   }
   switch (url.pathname) {
     case "/v1/memtree/sessions":
