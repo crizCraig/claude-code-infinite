@@ -36,6 +36,9 @@
  * and falls back to searching the page JSON locally on a server without that
  * endpoint.
  */
+import https from "node:https";
+import { text as readText } from "node:stream/consumers";
+import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
@@ -393,37 +396,74 @@ const SESSION_TREE_TTL_MS = 60_000;
 const SESSION_TREES_CACHED = 64;
 /** Other sessions' pages kept in memory at once (each can be several MB). */
 const OTHER_TREES_CACHED = 4;
-/** GET JSON from MemTree or the loopback proxy; never throws. */
-async function getJson(fetchImpl, url, headers = {}, timeoutMs = FETCH_TIMEOUT_MS) {
-    let response;
+function redact(text, key) {
+    return key ? text.replaceAll(key, "[redacted]") : text;
+}
+/** Sanitize decoded JSON, including escaped strings and property names, before formatting. */
+function parseJson(text, key) {
+    if (!key)
+        return JSON.parse(text);
+    return JSON.parse(text, (_name, value) => {
+        if (typeof value === "string")
+            return redact(value, key);
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+            const names = Object.keys(value);
+            if (names.some(name => name.includes(key))) {
+                return Object.fromEntries(names.map(name => [redact(name, key), value[name]]));
+            }
+        }
+        return value;
+    });
+}
+function jsonAnswer(status, text, key) {
+    let body;
     try {
-        response = await fetchImpl(url, {
+        body = parseJson(text, key);
+    }
+    catch {
+        // A non-JSON error can still carry a useful message.
+    }
+    if (status < 200 || status >= 300) {
+        const detail = body?.detail;
+        if (typeof detail === "string")
+            return { ok: false, status, error: `HTTP ${status} ${detail}` };
+        const safeText = key && body !== undefined ? JSON.stringify(body) : redact(text, key);
+        return { ok: false, status, error: `HTTP ${status} ${safeText.slice(0, 300)}` };
+    }
+    return body === undefined ? { ok: false, status, error: "response was not JSON" } : { ok: true, status, body };
+}
+/** GET JSON through the ccc proxy. */
+async function getJson(fetchImpl, url, headers = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+    try {
+        const response = await fetchImpl(url, {
             headers: { accept: "application/json", ...headers },
-            ...(headers.authorization ? { redirect: "error" } : {}),
             signal: AbortSignal.timeout(timeoutMs),
         });
+        return jsonAnswer(response.status, await response.text().catch(() => ""));
     }
     catch (err) {
         return { ok: false, status: 0, error: String(err) };
     }
-    const text = await response.text().catch(() => "");
-    if (!response.ok) {
-        let detail = text.slice(0, 300);
-        try {
-            const parsed = JSON.parse(text);
-            if (typeof parsed?.detail === "string")
-                detail = parsed.detail;
-        }
-        catch {
-            // not JSON: keep the raw text
-        }
-        return { ok: false, status: response.status, error: `HTTP ${response.status} ${detail}` };
-    }
+}
+// A private agent has no environment proxy. Explicit bundled roots exclude
+// NODE_EXTRA_CA_CERTS and environment-selected OpenSSL or system CA stores.
+const directAgent = new https.Agent({ ca: [...rootCertificates], rejectUnauthorized: true });
+async function getDirectJson(url, headers, key, timeoutMs = FETCH_TIMEOUT_MS) {
     try {
-        return { ok: true, status: response.status, body: JSON.parse(text) };
+        // https.request does not follow redirects. The deadline includes reading the body.
+        const response = await new Promise((resolve, reject) => {
+            const request = https.request(url, {
+                agent: directAgent, signal: AbortSignal.timeout(timeoutMs),
+                headers: { accept: "application/json", ...headers },
+            }, resolve).on("error", reject);
+            // Node's connection diagnostics can print the options passed to https.request.
+            request.setHeader("authorization", `Bearer ${key}`);
+            request.end();
+        });
+        return jsonAnswer(response.statusCode, await readText(response), key);
     }
-    catch {
-        return { ok: false, status: response.status, error: "response was not JSON" };
+    catch (err) {
+        return { ok: false, status: 0, error: redact(String(err), key) };
     }
 }
 /**
@@ -524,17 +564,12 @@ function proxyBase(deps) {
 /** Both transports return the same JSON. The proxy flattens the server's two route prefixes. */
 function toolGet(deps, prefix, path, tool, timeoutMs) {
     const headers = toolHeaders(tool, deps);
-    let base;
     if (deps.direct) {
-        base = deps.direct.baseUrl + prefix;
-        headers.authorization = `Bearer ${deps.direct.apiKey}`;
         headers["x-client"] = CLIENT_NAME;
         headers["x-client-version"] = CLIENT_VERSION;
+        return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${path}`, headers, deps.direct.apiKey, timeoutMs);
     }
-    else {
-        base = proxyBase(deps);
-    }
-    return getJson(deps.fetch ?? fetch, `${base}/memtree/${path}`, headers, timeoutMs);
+    return getJson(deps.fetch ?? fetch, `${proxyBase(deps)}/memtree/${path}`, headers, timeoutMs);
 }
 function checkTreeId(tree) {
     if (tree === undefined || tree === null || tree === "")
@@ -1192,14 +1227,18 @@ async function readLinesTool(args, tree) {
 }
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "production") {
-    const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
-    const direct = values.direct || env.CCC_MEMTREE_DIRECT === "1";
-    const mode = values.env ?? defaultEnv;
+    const endOptions = args.indexOf("--");
+    const direct = (endOptions < 0 ? args : args.slice(0, endOptions)).includes("--direct");
     const desktop = !direct && env.CCC_MEMTREE_MCP_DESKTOP === "1";
     const target = desktop ? desktopMcpTarget(env) : undefined;
     const inert = desktop && !target;
     let deps;
     if (direct) {
+        if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+            throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
+        }
+        const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
+        const mode = values.env ?? defaultEnv;
         if (mode !== "production" && mode !== "staging") {
             throw new Error("Usage: ccc memtree-mcp --direct [--env staging|production]");
         }
@@ -1210,8 +1249,6 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
         deps = { direct: { baseUrl: memtreeBaseUrlFor(mode), apiKey } };
     }
     else {
-        if (values.env !== undefined)
-            throw new Error("The --env option requires MemTree direct mode.");
         deps = {
             proxyUrl: desktop ? target?.proxyUrl : env.CCC_MEMTREE_PROXY || env.ANTHROPIC_BASE_URL,
             sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
@@ -1230,7 +1267,7 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     let queue = Promise.resolve();
     // An upstream error or transcript may echo the saved credential.
     const key = deps.direct?.apiKey;
-    const redactKey = (_name, value) => key && typeof value === "string" ? value.replaceAll(key, "[redacted]") : value;
+    const redactKey = (_name, value) => key && typeof value === "string" ? redact(value, key) : value;
     const send = (message) => process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`);
     process.stdin.setEncoding("utf-8");
     process.stdin.on("data", (chunk) => {
@@ -1243,7 +1280,7 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                 continue;
             let message;
             try {
-                message = JSON.parse(line);
+                message = parseJson(line, key);
             }
             catch {
                 send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });

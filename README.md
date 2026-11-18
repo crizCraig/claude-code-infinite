@@ -122,8 +122,8 @@ args = ["memtree-mcp", "--direct"]
 ```
 
 Direct mode uses the production key saved in `~/.claude-code-infinite/config.json`.
-Add `--env staging` to use your saved staging key, or set `CCC_MEMTREE_DIRECT=1` in the MCP
-server environment to enable direct mode without the flag. Use `list` or an unscoped `search`
+Add `--env staging` to use your saved staging key. Direct reads connect to MemTree over HTTPS
+using Node’s bundled CA certificates and bypass environment proxies. Use `list` or an unscoped `search`
 to find a tree or session id, then pass it to the read tools. Direct mode has no `current` tree.
 
 ## Long-session benchmark

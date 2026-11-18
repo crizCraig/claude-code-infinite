@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
-const mock = new URL("./fixtures/direct-mcp-fetch.mjs", import.meta.url).href;
+const mock = new URL("./fixtures/direct-mcp-https.mjs", import.meta.url).href;
 const tree = "abcd-v1-own";
 const session = "12345678-1234-1234-1234-123456789abc";
 
@@ -23,7 +23,7 @@ function run(t, args, messages, env = {}, config = {
     encoding: "utf8", timeout: 15000,
     env: { ...process.env, HOME: home, USERPROFILE: home,
       CCC_MEMTREE_PROXY: "http://proxy.invalid", ANTHROPIC_BASE_URL: "http://anthropic.invalid",
-      CCC_MEMTREE_DIRECT: "", CCC_MEMTREE_HOST_TOKEN: "stale", CLAUDE_CODE_SESSION_ID: session,
+      CCC_MEMTREE_HOST_TOKEN: "stale", CLAUDE_CODE_SESSION_ID: session,
       CCC_PROXY_VERSION: "", CCC_MEMTREE_MCP_DESKTOP: "", EXPECT_STAGING: "", ...env },
     input: messages.map((msg, id) => JSON.stringify({ jsonrpc: "2.0", id, ...msg }) + "\n").join(""),
   });
@@ -56,9 +56,9 @@ test("direct CLI reads all six tools with the saved production key, including by
   for (const result of tools.slice(-2)) assert.match(result.content[0].text, /fixture message/);
 });
 
-test("environment opt-in selects the saved staging key and keeps it out of errors", t => {
-  const [list, error] = results(run(t, ["--env", "staging"], [call("list", {}), call("list", { q: "denied" })],
-    { CCC_MEMTREE_DIRECT: "1", EXPECT_STAGING: "1", CCC_MEMTREE_MCP_DESKTOP: "1" }));
+test("explicit direct mode selects the saved staging key and keeps it out of errors", t => {
+  const [list, error] = results(run(t, ["--direct", "--env", "staging"], [call("list", {}), call("list", { q: "denied" })],
+    { EXPECT_STAGING: "1", CCC_MEMTREE_MCP_DESKTOP: "1" }));
   assert.ok(!list.isError);
   assert.equal(error.isError, true);
   assert.match(error.content[0].text, /403/);
@@ -87,8 +87,75 @@ test("direct mode reports a missing environment key or invalid --env without mak
 
 test("direct mode is opt-in even when a key is saved", t => {
   const [answer] = results(run(t, [], [call("list", {})], {
-    CCC_MEMTREE_DIRECT: "0", CCC_MEMTREE_PROXY: "", ANTHROPIC_BASE_URL: "",
+    CCC_MEMTREE_DIRECT: "1", CCC_MEMTREE_PROXY: "", ANTHROPIC_BASE_URL: "",
   }));
   assert.equal(answer.isError, true);
   assert.match(answer.content[0].text, /need a running ccc session/);
+});
+
+test("the legacy environment flag leaves an unrouted desktop server inert", t => {
+  const [catalog] = results(run(t, [], [{ method: "tools/list" }], {
+    CCC_MEMTREE_DIRECT: "1", CCC_MEMTREE_MCP_DESKTOP: "1",
+    CCC_MEMTREE_PROXY: "", ANTHROPIC_BASE_URL: "", HTTPS_PROXY: "",
+  }));
+  assert.deepEqual(catalog.tools, []);
+});
+
+test("proxy mode ignores extra flags and positionals", t => {
+  const [reply] = results(run(t, ["extra", "--unknown", "--env", "other"], [{ method: "initialize" }]));
+  assert.doesNotMatch(reply.instructions, /direct mode/i);
+});
+
+test("direct mode refuses disabled TLS verification at startup", t => {
+  const result = run(t, ["--direct"], [], { NODE_TLS_REJECT_UNAUTHORIZED: "0" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /NODE_TLS_REJECT_UNAUTHORIZED/);
+});
+
+test("direct requests bypass the global transport and environment proxy", t => {
+  const [list] = results(run(t, ["--direct"], [call("list", {})], {
+    NODE_USE_ENV_PROXY: "1",
+    HTTPS_PROXY: "http://127.0.0.1:1", HTTP_PROXY: "http://127.0.0.1:1", NO_PROXY: "",
+  }));
+  assert.ok(!list.isError, list.content[0].text);
+});
+
+test("JSON errors without a detail field redact escaped keys before displaying the body", t => {
+  const [reply] = results(run(t, ["--direct"], [call("list", { q: "nested" })]));
+  assert.equal(reply.isError, true);
+  assert.match(reply.content[0].text, /"message":"\[redacted\]"/);
+});
+
+for (const q of ["plain", "title"]) {
+  test(`direct mode redacts the key before truncating a ${q} response`, t => {
+    const [reply] = results(run(t, ["--direct"], [call("list", { q })]));
+    assert.equal(Boolean(reply.isError), q === "plain");
+    assert.doesNotMatch(reply.content[0].text, /fixture-pro/);
+    assert.match(reply.content[0].text, /x\[redacted\]/);
+  });
+}
+
+function runFinder(code, env = {}) {
+  const module = new URL("../dist/memtree-mcp.js", import.meta.url).href;
+  const script = `
+    import assert from "node:assert/strict";
+    import { SessionFinder } from ${JSON.stringify(module)};
+    const finder = new SessionFinder({ direct: { baseUrl: "https://api.polychat.co", apiKey: "fixture-production-key" } });
+    ${code}
+  `;
+  const result = spawnSync(process.execPath, ["--import", mock, "--input-type=module", "-e", script], {
+    encoding: "utf8", timeout: 15000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, ...env },
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  return result;
+}
+
+test("JSON detail is sanitized before SessionFinder throws a tool error", () => {
+  runFinder(String.raw`await assert.rejects(finder.listSessions({ q: "denied" }), /HTTP 403 \[redacted\]/);`);
+});
+
+test("Node connection diagnostics keep the authorization header private", () => {
+  const result = runFinder("await finder.listSessions({});", { NODE_DEBUG: "http,https" });
+  assert.ok(!result.stderr.includes("fixture-production-key"));
 });
