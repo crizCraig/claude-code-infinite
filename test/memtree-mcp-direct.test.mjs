@@ -186,7 +186,7 @@ for (const flag of [
 }
 
 test("direct mode starts with the allowed flags in both sources", t => {
-  const flags = ["--max-old-space-size=256", "--no-warnings", "--trace-warnings", "--trace-deprecation"];
+  const flags = ["--max_old_space_size=256", "--no-warnings", "--trace-warnings", "--trace-deprecation"];
   if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1")) flags.push("--disable-sigusr1");
   const result = run(t, ["--direct"], [call("list", {})], {
     NODE_OPTIONS: flags.map(flag => `"${flag}"`).join(" "),
@@ -198,6 +198,13 @@ test("direct mode handles SIGUSR1 before reading the key and keeps the inspector
   skip: process.platform === "win32",
 }, t => {
   assert.ok(!results(run(t, ["--direct"], [call("list", {})], { CHECK_SIGUSR1: "1" }))[0].isError);
+});
+
+test("direct mode refuses an already listening inspector before reading the key", t => {
+  const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1", TEST_INSPECTOR_LISTENING: "1" });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /inspector is already listening/i);
 });
 
 const v8Options = spawnSync(process.execPath, ["--v8-options"], { encoding: "utf8" }).stdout;
@@ -244,6 +251,8 @@ for (const flag of ["--print-maglev-code", "--redirect-code-traces", "--heap-sna
       assert.equal(result.stdout, "");
       assert.ok(result.stderr.includes(flag.split("=")[0]));
       assert.match(result.stderr, /direct mode accepts only/i);
+      assert.match(result.stderr, source === "execArgv" ? /remove.*Node command line/i : /set NODE_OPTIONS to empty/i);
+      assert.equal(result.stderr.trim().split("\n").length, 1);
       assert.doesNotMatch(result.stderr, /flag-value-canary/);
     });
   }
@@ -303,6 +312,14 @@ function runFinder(code, env = {}) {
   assert.equal(result.status, 0, result.stderr);
   return result;
 }
+
+test("direct list and search omit project attribution when the working directory is gone", () => {
+  runFinder(`
+    process.cwd = () => { throw Object.assign(new Error("uv_cwd"), { code: "ENOENT" }); };
+    await finder.listSessions({});
+    await finder.searchSessions({ query: "deploy" });
+  `, { EXPECT_NO_PROJECT_META: "1" });
+});
 
 test("JSON detail is sanitized before SessionFinder throws a tool error", () => {
   runFinder(String.raw`await assert.rejects(finder.listSessions({ q: "denied" }), /HTTP 403 \[redacted\]/);`);

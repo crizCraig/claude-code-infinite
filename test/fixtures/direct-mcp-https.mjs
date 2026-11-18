@@ -12,6 +12,8 @@ import https from "node:https";
 import net from "node:net";
 import { rootCertificates } from "node:tls";
 
+if (process.env.TEST_INSPECTOR_LISTENING === "1") inspector.url = () => "ws://127.0.0.1:9229/test";
+
 if (process.env.CHECK_NO_SPAWN === "1") {
   for (const method of ["exec", "execFile", "execSync", "execFileSync", "fork", "spawn", "spawnSync"]) {
     childProcess[method] = () => {
@@ -71,6 +73,7 @@ function fixtureResponse(url, method, headers) {
     console.error("Unexpected MemTree request");
     throw new Error("Unexpected MemTree request");
   }
+  if (process.env.EXPECT_NO_PROJECT_META === "1") assert.equal(headers.get("x-client-meta"), null);
   if (process.env.EXPECT_PROJECT_META === "1" && url.pathname.startsWith("/v1/memtree/")) {
     const expected = { project_dir: path.basename(process.cwd()) };
     const meta = headers.get("x-client-meta");

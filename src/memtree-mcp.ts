@@ -37,6 +37,7 @@
  * endpoint.
  */
 import https from "node:https";
+import { createRequire } from "node:module";
 import { validateHeaderValue, type IncomingMessage } from "node:http";
 import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
@@ -677,7 +678,11 @@ async function toolGet(
   if (deps.direct) {
     if (prefix === "/v1") {
       // Never invoke git from the MCP client's working directory.
-      const meta = memtreeClientMeta({ project: { project_dir: path.basename(process.cwd()) } });
+      let projectDir: string | undefined;
+      try {
+        projectDir = path.basename(process.cwd());
+      } catch { /* The client may have removed the working directory. */ }
+      const meta = memtreeClientMeta({ project: { project_dir: projectDir } });
       if (meta.project_dir && !meta.project_dir.includes(deps.direct.apiKey)) {
         headers["x-client-meta"] = JSON.stringify(meta);
       }
@@ -1438,11 +1443,14 @@ function nodeOptionsArgs(options: string): string[] {
   return args;
 }
 
-function checkDirectNodeFlags(args: string[]): void {
+function checkDirectNodeFlags(args: string[], source: "NODE_OPTIONS" | "Node command line"): void {
   for (const arg of args) {
-    if (DIRECT_NODE_SWITCHES.includes(arg) || /^--max-old-space-size=[0-9]+$/.test(arg)) continue;
+    if (DIRECT_NODE_SWITCHES.includes(arg) || /^--(?:max-old-space-size|max_old_space_size)=[0-9]+$/.test(arg)) continue;
     const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
-    throw new Error(`Unsupported Node flag ${name}. MemTree direct mode accepts only --max-old-space-size=N, ${DIRECT_NODE_SWITCHES.join(", ")}.`);
+    const fix = source === "NODE_OPTIONS"
+      ? "Set NODE_OPTIONS to empty in this MCP server's environment."
+      : "Remove the flag from the Node command line.";
+    throw new Error(`Unsupported Node flag ${name} in ${source}. ${fix} MemTree direct mode accepts only --max-old-space-size=N (or --max_old_space_size=N), ${DIRECT_NODE_SWITCHES.join(", ")}.`);
   }
 }
 
@@ -1475,8 +1483,14 @@ export function runMemtreeMcpServer(
     if (env.NODE_DEBUG !== undefined) {
       throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
     }
-    checkDirectNodeFlags(process.execArgv);
-    checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""));
+    try {
+      checkDirectNodeFlags(process.execArgv, "Node command line");
+      checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""), "NODE_OPTIONS");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : "Invalid Node startup flags.");
+      process.exitCode = 1;
+      return;
+    }
     const mode = directEnvironment(args, defaultEnv);
     if (!mode) {
       console.error(DIRECT_USAGE);
@@ -1485,6 +1499,15 @@ export function runMemtreeMcpServer(
     }
     // Node 20 lacks --disable-sigusr1. Claim the signal before loading the key.
     if (process.platform !== "win32") process.on("SIGUSR1", () => {});
+    // The inspector might already be listening. Some Node builds omit it entirely.
+    if (process.features.inspector) {
+      const inspector: typeof import("node:inspector") = createRequire(import.meta.url)("node:inspector");
+      if (inspector.url()) {
+        console.error("The Node inspector is already listening. Restart the MemTree MCP server with debugging disabled.");
+        process.exitCode = 1;
+        return;
+      }
+    }
     const savedKey = storedApiKey(mode);
     const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
     if (!apiKey) {
