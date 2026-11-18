@@ -30,7 +30,7 @@ export type KeyGateResult = {
 };
 export interface KeyGateDeps {
     keyPageUrl: string;
-    ask: (question: string) => Promise<string>;
+    ask: (question: string) => Promise<string | null>;
     open: (url: string) => void;
     /** The headline (the caller styles it). */
     warn: (text: string) => void;

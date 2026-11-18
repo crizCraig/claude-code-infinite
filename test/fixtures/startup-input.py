@@ -35,10 +35,14 @@ globalThis.fetch = async (url, init) => {
 """)
     master, slave = pty.openpty()
     env = {"HOME": directory, "PATH": directory, "CCC_NO_UPDATE_CHECK": "1",
+           "DRAIN_FAULT": scenario if scenario.startswith("drain-") else "",
            "REJECT": first if scenario == "rejected-key" else "",
            **{k: os.environ[k] for k in ("NO_COLOR", "FORCE_COLOR") if k in os.environ}}
     printing = scenario == "print-key"
-    args = [node, "--import", str(mock), "dist/cli.js"] + (["-p", "hi"] if printing else [])
+    args = [node, "--import", str(mock)]
+    if env["DRAIN_FAULT"]:
+        args += ["--import", "./test/fixtures/tty-drain-fault.mjs"]
+    args += ["dist/cli.js"] + (["-p", "hi"] if printing else [])
     proc = subprocess.Popen(args, env=env, stdin=slave,
                             stdout=subprocess.PIPE if printing else slave,
                             stderr=subprocess.PIPE if printing else slave)
@@ -71,7 +75,10 @@ globalThis.fetch = async (url, init) => {
         until(b"in your browser")
         enter("")
         until(b"paste it here")
-        enter(first)
+        if scenario == "cancel-key":
+            os.write(master, b"\x03")
+        else:
+            enter("  " + first + " " if printing else first)
         if scenario == "rejected-key":
             until(b"CHECKING")
             os.write(master, ("\r" + stale + "\rreview files").encode())
@@ -82,7 +89,7 @@ globalThis.fetch = async (url, init) => {
             until(b"new MemTree key and paste it here")
             stays_at_prompt(b"[q] quit")
             enter(fresh)
-        if not printing:
+        if not printing and scenario != "cancel-key":
             until(b"[q] quit")
             enter("q")
         # Keep draining redraws while ccc flushes its diagnostics and exits.
@@ -95,6 +102,12 @@ globalThis.fetch = async (url, init) => {
             except OSError:
                 break
         assert proc.wait(timeout=2) == 0
+        if scenario == "cancel-key":
+            assert b"Error:" not in transcript and b"    at " not in transcript
+            assert not (root / "sent").exists()
+            sys.exit(0)
+        if env["DRAIN_FAULT"]:
+            assert b"INJECTED " + scenario.encode() in transcript
         assert first.encode() not in transcript and fresh.encode() not in transcript, "key echoed in output"
         if printing:
             assert proc.stdout.read() == b""

@@ -146,7 +146,11 @@ function gateDeps(answers, checks = {}) {
     log,
     deps: {
       keyPageUrl: KEY_PAGE_URL,
-      ask: async (question) => { log.asked.push(question); return answers.shift() ?? "q"; },
+      ask: async (question) => {
+        log.asked.push(question);
+        assert.ok(answers.length, "unexpected prompt");
+        return answers.shift();
+      },
       open: (url) => log.opened.push(url),
       warn: (text) => log.warned.push(text),
       say: (text) => log.said.push(text),
@@ -165,6 +169,16 @@ test("gate: q quits without saving anything", async () => {
   assert.deepEqual(log.saved, []);
 });
 
+test("gate: cancelling the choice or the paste quits without checking or saving", async () => {
+  for (const answers of [[null], ["", null]]) {
+    const { deps, log } = gateDeps(answers);
+    deps.check = () => assert.fail("cancelled key reached the status check");
+    assert.deepEqual(await runKeyGate(deps), { action: "quit" });
+    assert.deepEqual(log.saved, []);
+    assert.equal(answers.length, 0);
+  }
+});
+
 test("gate: c starts claude without MemTree, as the payment gate does", async () => {
   const { deps, log } = gateDeps(["c"]);
   assert.deepEqual(await runKeyGate(deps), { action: "continue" });
@@ -174,7 +188,7 @@ test("gate: c starts claude without MemTree, as the payment gate does", async ()
 
 test("gate: a pasted key that works is saved and its status returned", async () => {
   const paid = { paid: true, message: null, url: null };
-  const { deps, log } = gateDeps(["", accountKey], { [accountKey]: paid });
+  const { deps, log } = gateDeps(["", `  ${accountKey}\t`], { [accountKey]: paid });
   assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: accountKey, check: paid });
   assert.deepEqual(log.opened, [KEY_PAGE_URL]);
   assert.deepEqual(log.saved, [accountKey]);
@@ -463,7 +477,7 @@ test("an invalid-key refusal in a subagent's lane keeps the user's key notice du
 
 test("malformed pasted keys never leave the recovery gate", async () => {
   const key = "sk-" + "a".repeat(32);
-  for (const text of ["review files", "review", key + " ", " " + key, key + "x", key.slice(1)]) {
+  for (const text of ["review files", "review", key.slice(0, 6) + " " + key.slice(6), key + "x", key.slice(1)]) {
     const { deps, log } = gateDeps(["", text, "q"]);
     deps.check = () => assert.fail("malformed key reached the status check");
     assert.deepEqual(await runKeyGate(deps), { action: "quit" });

@@ -69,7 +69,8 @@ export async function runKeyGate(deps) {
     let headline = `⚠ ${KEY_INVALID_TEXT}. Get a new one at ${deps.keyPageUrl}`;
     for (;;) {
         deps.warn(headline);
-        const choice = parseKeyChoice(await deps.ask(KEY_GATE_PROMPT));
+        const answer = await deps.ask(KEY_GATE_PROMPT);
+        const choice = answer === null ? "quit" : parseKeyChoice(answer);
         if (choice === "quit")
             return { action: "quit" };
         if (choice === "continue") {
@@ -80,7 +81,10 @@ export async function runKeyGate(deps) {
         if (!opened)
             deps.open(deps.keyPageUrl);
         opened = true;
-        const apiKey = await deps.ask(KEY_PASTE_PROMPT);
+        const pasted = await deps.ask(KEY_PASTE_PROMPT);
+        if (pasted === null)
+            return { action: "quit" };
+        const apiKey = pasted.trim();
         if (!isMemtreeKey(apiKey)) {
             headline = KEY_FORMAT_HINT;
             continue;

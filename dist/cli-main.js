@@ -81,10 +81,14 @@ async function promptForApiKey(mode, output) {
     // The label is a clickable link (OSC 8) where the terminal supports it, and
     // the URL is printed too, for other terminals and for opening it elsewhere.
     console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
-    await askFreshKeyLine("\nPress Enter to open it in your browser...", output);
+    if (await askFreshKeyLine("\nPress Enter to open it in your browser...", output) === null)
+        return null;
     openUrl(url);
     for (;;) {
-        const key = await askFreshKeyLine("Copy your API key and paste it here: ", output);
+        const pasted = await askFreshKeyLine("Copy your API key and paste it here: ", output);
+        if (pasted === null)
+            return null;
+        const key = pasted.trim();
         if (!key || isMemtreeKey(key))
             return key;
         output.write(KEY_FORMAT_HINT + "\n");
@@ -449,9 +453,14 @@ async function main() {
         // The user may quit at the prompt: send what is known now.
         diagnostics.flushNow();
         // Only a terminal can answer; a print run's stdout stays Claude's.
-        polychatApiKey = process.stdin.isTTY === true
+        const entered = process.stdin.isTTY === true
             ? await promptForApiKey(mode, interactiveUi ? process.stdout : process.stderr)
             : undefined;
+        if (entered === null) {
+            await diagnostics.flush();
+            process.exit(0);
+        }
+        polychatApiKey = entered;
         if (!polychatApiKey) {
             console.error("A MemTree API key is required: run `ccc` in a terminal once to save one.");
             await diagnostics.flush();
