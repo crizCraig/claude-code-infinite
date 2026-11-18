@@ -8,7 +8,6 @@ export class ClaudeLocationError extends Error {}
 
 interface ShimTarget {
   file: string;
-  preferLocalNode: boolean;
   nodePath?: { paths: string; inheritedFirst: boolean };
 }
 
@@ -80,7 +79,7 @@ function batchTarget(shim: string, body: string): ShimTarget | undefined {
   // Use one placeholder for the quoted entry, including when it appears in both branches.
   if (body.includes("<entry>")) return undefined;
   body = body.replaceAll('"' + token + '"', "<entry>").replace(/ +(?=<entry>|%\*)/g, " ");
-  if ((js || native) && npmBatch(body, native)) return { file, preferLocalNode: js };
+  if ((js || native) && npmBatch(body, native)) return { file };
 
   // pnpm starts with SETLOCAL and optionally sets PATH and NODE_PATH. Classic
   // puts SETLOCAL in the fallback branch. Both generate a direct native form.
@@ -99,25 +98,21 @@ function batchTarget(shim: string, body: string): ShimTarget | undefined {
   const local = '"%~dp0\\node.exe"';
   const nodeBranch = "@IF EXIST " + local + " (\n  " + local + " <entry> %*\n) ELSE (\n" +
     (pnpm ? "" : "  @SETLOCAL\n") + "  @" + pathext + "\n  node <entry> %*\n)";
-  if (js && body === nodeBranch) return { file, preferLocalNode: true, nodePath };
+  if (js && body === nodeBranch) return { file, nodePath };
   if (body === "@<entry> %*" && (native || (!pnpm && path.basename(file).toLowerCase() === "claude.cmd"))) {
-    return { file, preferLocalNode: false };
+    return { file };
   }
 
   // Berry's makePathWrapper uses absolute paths. pnpm can also pin nodeExecPath.
   if (berry) body = body.slice(berryPrefix.length);
   else if (pnpm && body.startsWith("@")) body = body.slice(1);
   else return undefined;
-  if (native && body === "<entry> %*") return { file, preferLocalNode: false };
+  if (native && body === "<entry> %*") return { file };
   const node = /^"([^"\n]+)" <entry> %\*$/.exec(body)?.[1];
   if (js && node && absolute(node) && path.basename(node).toLowerCase() === "node.exe") {
-    return { file, preferLocalNode: isAdjacentNode(shim, node), nodePath };
+    return { file, nodePath };
   }
   return undefined;
-}
-
-function isAdjacentNode(shim: string, node: string): boolean {
-  return path.relative(path.dirname(shim), node).toLowerCase() === "node.exe";
 }
 
 function windowsFileExists(file: string): boolean {
@@ -206,8 +201,7 @@ export function resolveWindowsClaude(command: string, readFile = readSmallFile, 
     if (path.basename(file).toLowerCase() === "claude.exe") return { file };
     if (!/\.[cm]?js$/i.test(file)) throw unsupported(command);
 
-    const local = path.join(path.dirname(shim), "node.exe");
-    const node = target.preferLocalNode && isFile(local) ? local : process.execPath;
+    const node = process.execPath;
     if (!target.nodePath) return { file, node };
     const key = Object.keys(env).find(k => k.toUpperCase() === "NODE_PATH") ?? "NODE_PATH";
     const inherited = env[key];

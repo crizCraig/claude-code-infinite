@@ -589,6 +589,9 @@ async function main() {
 
   // Before the key prompt: someone without Claude Code learns that first.
   const found = locateClaude();
+  if (interactiveUi && found?.skippedWrapper && !mayBePrintInvocation(claudeArgs)) {
+    console.error(`Skipped unsupported Claude Code wrapper at ${found.skippedWrapper}. Using ${found.command}.`);
+  }
   // Only the desktop app (its Claude Code is not a terminal command) gets its own message.
   const desktopOnly = !found && claudeDesktopInstalled();
   // One read each of Claude Code's config files (~/.claude.json can be large).

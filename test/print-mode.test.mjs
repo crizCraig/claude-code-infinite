@@ -142,6 +142,35 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.doesNotMatch(stderr, /\x1b\[/);
 });
 
+test("Windows reports a skipped wrapper once on interactive stderr and stays quiet about it in print mode", {
+  skip: process.platform !== "win32",
+}, async t => {
+  const { home, bin } = fakeClaudeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const wrappers = path.join(home, "wrappers");
+  fs.mkdirSync(wrappers);
+  const wrapper = path.join(wrappers, "claude.bat");
+  fs.writeFileSync(wrapper, "@exit /b 42");
+  const env = {
+    USERPROFILE: home, Path: [wrappers, bin].join(";"), PATHEXT: ".EXE;.BAT;.CMD",
+    SystemRoot: process.env.SystemRoot, TEMP: home, TMP: home, CCC_NO_DIAGNOSTICS: "1",
+  };
+  const tty = "data:text/javascript,process.stdin.isTTY = process.stdout.isTTY = true";
+  for (const [nodeArgs, args, expectedNotes] of [
+    [["--import", tty], ["--help"], 1],
+    [["--import", tty], ["-p", "hi"], 0],
+    [["--import", tty], ["--print", "hi"], 0],
+    [[], ["--help"], 0],
+  ]) {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath,
+      [...nodeArgs, CLI, "local", ...args], { cwd: home, env, timeout: 15000 });
+    assert.ok(!stdout.includes(wrapper), stdout);
+    const notes = stderr.split(/\r?\n/).filter(line => line.includes(wrapper));
+    assert.equal(notes.length, expectedNotes, stderr);
+    if (expectedNotes) assert.match(notes[0], /skipped.*wrapper/i);
+  }
+});
+
 test("ccc -p with CCC_MEMTREE_MCP=0: Claude's argv is untouched", { timeout: 30_000 }, async () => {
   const { code, stdout, stderr } = await runCcc(["-p", "hi"], { CCC_MEMTREE_MCP: "0" });
   assert.equal(code, 0, stderr);

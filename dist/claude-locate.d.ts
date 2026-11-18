@@ -25,6 +25,8 @@ export interface ClaudeLocation {
     /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
     command: string;
     source: ClaudeSource;
+    /** First refused wrapper when a later Claude on PATH was selected. */
+    skippedWrapper?: string;
     /** Not on PATH: its directory, to put on the child's PATH. */
     dir?: string;
 }

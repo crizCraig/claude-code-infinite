@@ -685,9 +685,10 @@ then run `ccc` again, from your project folder.
 
 On Windows, ccc recognizes npm, pnpm and Yarn batch shims. It launches the executable
 declared by the installed Claude Code package or the native installer's `claude.exe` directly.
-For JavaScript it uses the adjacent `node.exe` when the shim selects it, otherwise the
-Node executable running ccc. Startup, sign-in checks and resume pass prompts as literal
-arguments, including line breaks. A stale or unsupported shim lets ccc try later PATH entries.
+For JavaScript it uses the Node executable running ccc. Startup, sign-in checks and resume
+pass prompts as literal arguments, including line breaks. A stale or unsupported shim lets ccc
+try later PATH entries. Interactive startup names the first refused wrapper on stderr when
+ccc uses a later install on PATH.
 
 For a custom batch wrapper, install Claude Code with npm, pnpm, Yarn or the native installer, or set
 `CCC_CLAUDE_PATH` to the absolute path of `claude.exe` or its JavaScript entry. For example,

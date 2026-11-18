@@ -79,7 +79,7 @@ function batchTarget(shim, body) {
         return undefined;
     body = body.replaceAll('"' + token + '"', "<entry>").replace(/ +(?=<entry>|%\*)/g, " ");
     if ((js || native) && npmBatch(body, native))
-        return { file, preferLocalNode: js };
+        return { file };
     // pnpm starts with SETLOCAL and optionally sets PATH and NODE_PATH. Classic
     // puts SETLOCAL in the fallback branch. Both generate a direct native form.
     let nodePath;
@@ -99,9 +99,9 @@ function batchTarget(shim, body) {
     const nodeBranch = "@IF EXIST " + local + " (\n  " + local + " <entry> %*\n) ELSE (\n" +
         (pnpm ? "" : "  @SETLOCAL\n") + "  @" + pathext + "\n  node <entry> %*\n)";
     if (js && body === nodeBranch)
-        return { file, preferLocalNode: true, nodePath };
+        return { file, nodePath };
     if (body === "@<entry> %*" && (native || (!pnpm && path.basename(file).toLowerCase() === "claude.cmd"))) {
-        return { file, preferLocalNode: false };
+        return { file };
     }
     // Berry's makePathWrapper uses absolute paths. pnpm can also pin nodeExecPath.
     if (berry)
@@ -111,15 +111,12 @@ function batchTarget(shim, body) {
     else
         return undefined;
     if (native && body === "<entry> %*")
-        return { file, preferLocalNode: false };
+        return { file };
     const node = /^"([^"\n]+)" <entry> %\*$/.exec(body)?.[1];
     if (js && node && absolute(node) && path.basename(node).toLowerCase() === "node.exe") {
-        return { file, preferLocalNode: isAdjacentNode(shim, node), nodePath };
+        return { file, nodePath };
     }
     return undefined;
-}
-function isAdjacentNode(shim, node) {
-    return path.relative(path.dirname(shim), node).toLowerCase() === "node.exe";
 }
 function windowsFileExists(file) {
     try {
@@ -220,8 +217,7 @@ export function resolveWindowsClaude(command, readFile = readSmallFile, isFile =
             return { file };
         if (!/\.[cm]?js$/i.test(file))
             throw unsupported(command);
-        const local = path.join(path.dirname(shim), "node.exe");
-        const node = target.preferLocalNode && isFile(local) ? local : process.execPath;
+        const node = process.execPath;
         if (!target.nodePath)
             return { file, node };
         const key = Object.keys(env).find(k => k.toUpperCase() === "NODE_PATH") ?? "NODE_PATH";

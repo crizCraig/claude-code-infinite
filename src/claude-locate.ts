@@ -35,6 +35,8 @@ export interface ClaudeLocation {
   /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
   command: string;
   source: ClaudeSource;
+  /** First refused wrapper when a later Claude on PATH was selected. */
+  skippedWrapper?: string;
   /** Not on PATH: its directory, to put on the child's PATH. */
   dir?: string;
 }
@@ -74,19 +76,19 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
     }
     return { command: override, source: "override" };
   }
-  let refused: ClaudeLocationError | undefined;
+  let refused: { file: string; error: ClaudeLocationError } | undefined;
   const isRunnableClaude = (file: string) => {
     if (!isExecutable(file)) return false;
     if (platform !== "win32") return true;
     try {
       return !!resolveWindowsClaude(file, opts.readFile, isExecutable, env, opts.homedir);
     } catch (err) {
-      if (err instanceof ClaudeLocationError) refused ??= err;
+      if (err instanceof ClaudeLocationError) refused ??= { file, error: err };
       return false;
     }
   };
   const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
-  if (onPath) return onPath;
+  if (onPath) return refused ? { ...onPath, skippedWrapper: refused.file } : onPath;
   const home = opts.homedir ?? os.homedir();
   for (const candidate of candidates(platform, env, home, opts)) {
     const file = candidate.dirs
@@ -94,7 +96,7 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
       .find((f): f is string => f !== null && !isDesktopAppExe(f, platform));
     if (file) return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
   }
-  if (refused) throw refused;
+  if (refused) throw refused.error;
   return null;
 }
 

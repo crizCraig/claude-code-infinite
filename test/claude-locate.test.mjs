@@ -94,7 +94,7 @@ function shimText(format, ext, entry) {
 
 const refusal = /unsupported.*wrapper.*npm.*pnpm.*Yarn.*native installer.*CCC_CLAUDE_PATH.*claude\.exe.*JavaScript/i;
 
-test("Windows recognizes generated shims and uses only the selected target and Node", () => {
+test("Windows launches generated JS shims with the Node running ccc", () => {
   const dir = "D:\\bin";
   const entry = W.join(dir, "pkg", "cli.mjs");
   const node = W.join(dir, "node.exe");
@@ -108,7 +108,7 @@ test("Windows recognizes generated shims and uses only the selected target and N
       assert.equal(found?.command, shim, format + ext);
       const args = ["--resume", "a & b"];
       const job = claudeInvocation(shim, args, "win32", readFile, fakeFs(files, "win32"));
-      assert.equal(job.command, adjacent && format !== "berry" ? node : process.execPath);
+      assert.equal(job.command, process.execPath);
       assert.deepEqual(job.args, [entry, ...args]);
     }
   }
@@ -139,7 +139,8 @@ test("Windows refuses custom batch wrappers, including modified package-manager 
       '@"%dp0%\\custom.exe" %*', '@"$basedir/custom.exe" %*', '@"D:\\bin\\custom.exe" %*',
       stock.replace("%*", "--custom %*"), stock + "@echo finished\r\n"]) {
       const files = [wrapper, W.join(dir, "custom.exe"), W.join(dir, globalTarget), "D:\\native\\claude.exe"];
-      assert.equal(locateWin(files, { env: { Path: dir + ";D:\\native" }, readFile: () => body })?.command, "D:\\native\\claude.exe");
+      assert.deepEqual(locateWin(files, { env: { Path: dir + ";D:\\native" }, readFile: () => body }),
+        { command: "D:\\native\\claude.exe", source: "path", skippedWrapper: wrapper });
       assert.throws(() => locateWin(files, { env: { Path: dir }, readFile: () => body }), refusal);
       assert.throws(() => claudeInvocation(wrapper, [], "win32", () => body, fakeFs(files, "win32")), refusal);
     }
@@ -167,6 +168,8 @@ test("Yarn Classic global bin follows its generated shim in node_modules/.bin", 
     [inner, shimText("classic", ".cmd", entry)], [entry, ""], [json, manifest("./cli.mjs")]]);
   const args = ["--resume", "session"];
   const invoke = () => claudeInvocation(shim, args, "win32", f => files.get(f), f => files.has(f));
+  assert.deepEqual(invoke(), { command: process.execPath, args: [entry, ...args] });
+  files.set(W.join(W.dirname(inner), "node.exe"), "");
   assert.deepEqual(invoke(), { command: process.execPath, args: [entry, ...args] });
   files.set(json, manifest("./other.mjs"));
   assert.throws(invoke, refusal);
@@ -197,7 +200,8 @@ test("Stock batch launchers refuse unrelated targets and require the package's e
       const readFile = f => files.get(f);
       assert.throws(() => claudeInvocation(shim, [], "win32", readFile, f => files.has(f)), refusal);
       const later = "D:\\native\\claude.exe";
-      assert.equal(locateWin([...files.keys(), later], { env: { Path: dir + ";D:\\native" }, readFile })?.command, later);
+      assert.deepEqual(locateWin([...files.keys(), later], { env: { Path: dir + ";D:\\native" }, readFile }),
+        { command: later, source: "path", skippedWrapper: shim });
     }
   }
 });
@@ -508,8 +512,12 @@ test("Windows CLI refuses a custom .bat with install and override instructions b
   const bin = path.join(root, "bin");
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, "claude.bat"), "@echo ran>marker");
-  const env = { ...process.env, Path: bin, CCC_NO_UPDATE_CHECK: "1", CCC_NO_DIAGNOSTICS: "1" };
-  delete env.PATH;
+  // Isolate known install folders and the System32 reg.exe used for registry PATH fallback.
+  const env = {
+    Path: bin, PATHEXT: ".EXE;.BAT;.CMD", USERPROFILE: root, APPDATA: path.join(root, "Roaming"),
+    LOCALAPPDATA: path.join(root, "Local"), SystemRoot: root, TEMP: root, TMP: root,
+    CCC_NO_UPDATE_CHECK: "1", CCC_NO_DIAGNOSTICS: "1",
+  };
   const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
   const result = spawnSync(process.execPath, [cli, "--version"], { cwd: root, env, encoding: "utf8" });
   assert.equal(result.status, 1, result.stderr);

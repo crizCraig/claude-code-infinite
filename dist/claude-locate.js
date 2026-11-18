@@ -51,13 +51,13 @@ export function locateClaude(opts = {}) {
         }
         catch (err) {
             if (err instanceof ClaudeLocationError)
-                refused ??= err;
+                refused ??= { file, error: err };
             return false;
         }
     };
     const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
     if (onPath)
-        return onPath;
+        return refused ? { ...onPath, skippedWrapper: refused.file } : onPath;
     const home = opts.homedir ?? os.homedir();
     for (const candidate of candidates(platform, env, home, opts)) {
         const file = candidate.dirs
@@ -67,7 +67,7 @@ export function locateClaude(opts = {}) {
             return { command: file, source: candidate.source, dir: pathFor(platform).dirname(file) };
     }
     if (refused)
-        throw refused;
+        throw refused.error;
     return null;
 }
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */
