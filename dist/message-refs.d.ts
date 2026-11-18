@@ -7,6 +7,14 @@ export declare const STORED_MESSAGES_FIELD = "memtree_message_refs";
 export declare const MISSING_MESSAGES_FIELD = "missing_message_hashes";
 export declare const MISSING_MESSAGES_STATUS = 409;
 export declare const REF_KEY = "memtree_ref";
+/** Answer field key (in STORED_MESSAGES_FIELD): the stored JSON characters one request's refs
+ *  may expand to on this server (polychat's MEMTREE_MAX_NAMED_MIB). */
+export declare const MAX_NAMED_CHARS_KEY = "max_named_chars";
+/** What the named messages may expand to (their JSON, images as bytes: an overestimate of
+ *  what the server reads, which keeps images as refs): this share of the server's cap. */
+export declare function namedCharsFor(serverChars: number): number;
+/** The default: 30 MiB, under the old 32 MiB rebuild cap. */
+export declare const MAX_NAMED_CHARS: number;
 /** A message's ref as the server hashes it. `marks`: [path, position, value]. */
 export interface Ref {
     digest: string;
@@ -31,11 +39,16 @@ export declare class MessageRefs {
     private allMissing;
     private off;
     private disabled;
+    /** What one request's refs may expand to: the default until a server says its cap. A
+     *  conversation past ~60 MB needs more, or its compress body can never be sent. */
+    private namedChars;
     constructor(enabled: boolean);
     /** Whether calls declare message-refs (on, and not refused by the server for good). */
     get active(): boolean;
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId: string | undefined, messages: Message[]): Delta;
+    /** What one request's refs may expand to now (for tests and the request log). */
+    get maxNamedChars(): number;
     /**
      * Learn what an answer to a call that sent `messages` (in full) lets the next one name.
      * `finalIndex`: the early answer to an exit index, which never carries the field.
@@ -51,6 +64,9 @@ export declare class MessageRefs {
      * images the refs brought back only resends.
      */
     noteRefusal(sessionId: string | undefined, messages: Message[], refs: readonly string[], status: number, bodyText: string): boolean;
+    /** A server's cap from an answer: any whole number at least the old one (a server never
+     *  allows less; anything else is ignored). */
+    private noteCap;
     /** The conversation `messages` belong to, while refs may be named for it. */
     private laneFor;
     /**
@@ -67,7 +83,7 @@ export declare class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export declare function buildDelta(messages: Message[], acked: ReadonlySet<string>): Delta;
+export declare function buildDelta(messages: Message[], acked: ReadonlySet<string>, maxChars?: number): Delta;
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
  * message without its `cache_control` keys and, when `stripHeader` (no earlier message of

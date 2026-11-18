@@ -38,9 +38,21 @@ const HEX_RE = /^[0-9a-f]{64}$/;
 /** The server's limits per request: ref entries, and cache marks on refs (past them, inline). */
 const MAX_REFS = 50_000;
 const MAX_MARKS = 64;
+const MIB = 1024 * 1024;
+/** Answer field key (in STORED_MESSAGES_FIELD): the stored JSON characters one request's refs
+ *  may expand to on this server (polychat's MEMTREE_MAX_NAMED_MIB). */
+export const MAX_NAMED_CHARS_KEY = "max_named_chars";
+/** The server's rebuild cap before it said what it is (and what an old server allows). */
+const DEFAULT_SERVER_NAMED_CHARS = 32 * MIB;
+/** The most this client names, whatever a server says (it holds each named message's JSON). */
+const MAX_CLIENT_NAMED_CHARS = 256 * MIB;
 /** What the named messages may expand to (their JSON, images as bytes: an overestimate of
- *  what the server reads, which keeps images as refs), under its 32 MiB rebuild cap. */
-const MAX_NAMED_CHARS = 30 * 1024 * 1024;
+ *  what the server reads, which keeps images as refs): this share of the server's cap. */
+export function namedCharsFor(serverChars) {
+    return Math.min(Math.floor(serverChars / 16) * 15, MAX_CLIENT_NAMED_CHARS);
+}
+/** The default: 30 MiB, under the old 32 MiB rebuild cap. */
+export const MAX_NAMED_CHARS = namedCharsFor(DEFAULT_SERVER_NAMED_CHARS);
 /** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
 const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
@@ -54,6 +66,9 @@ export class MessageRefs {
     allMissing = new Map();
     off = new Set();
     disabled = false;
+    /** What one request's refs may expand to: the default until a server says its cap. A
+     *  conversation past ~60 MB needs more, or its compress body can never be sent. */
+    namedChars = MAX_NAMED_CHARS;
     constructor(enabled) {
         this.enabled = enabled;
     }
@@ -67,7 +82,11 @@ export class MessageRefs {
         const acked = lane ? this.acked.get(lane) : undefined;
         if (!acked || acked.size === 0)
             return { messages, refs: [] };
-        return buildDelta(messages, acked);
+        return buildDelta(messages, acked, this.namedChars);
+    }
+    /** What one request's refs may expand to now (for tests and the request log). */
+    get maxNamedChars() {
+        return this.namedChars;
     }
     /**
      * Learn what an answer to a call that sent `messages` (in full) lets the next one name.
@@ -87,6 +106,7 @@ export class MessageRefs {
         if (opts.sentRefs)
             this.allMissing.delete(lane);
         const acks = field;
+        this.noteCap(acks?.[MAX_NAMED_CHARS_KEY]);
         if (!acks || acks.stored !== true || acks.messages !== messages.length)
             return;
         this.remember(lane, ackedDigests(messages, acks, this.acked.get(lane)));
@@ -100,9 +120,12 @@ export class MessageRefs {
     noteRefusal(sessionId, messages, refs, status, bodyText) {
         if (refs.length === 0)
             return false;
-        // Over a size cap (stored text or the images the refs bring back): this call only.
-        if (status === 400 && /expand past/i.test(bodyText))
+        // Over a size cap (stored text or the images the refs bring back): this call only, and
+        // the default cap until an answer says the server's again (it may have been lowered).
+        if (status === 400 && /expand past/i.test(bodyText)) {
+            this.namedChars = MAX_NAMED_CHARS;
             return true;
+        }
         if (status === 400 && /message refs/i.test(bodyText)) {
             this.disabled = true;
             this.acked.clear();
@@ -116,6 +139,15 @@ export class MessageRefs {
         if (lane)
             this.noteMissing(lane, refs, missing);
         return true;
+    }
+    /** A server's cap from an answer: any whole number at least the old one (a server never
+     *  allows less; anything else is ignored). */
+    noteCap(value) {
+        if (typeof value !== "number" || !Number.isSafeInteger(value))
+            return;
+        if (value < DEFAULT_SERVER_NAMED_CHARS)
+            return;
+        this.namedChars = namedCharsFor(value);
     }
     /** The conversation `messages` belong to, while refs may be named for it. */
     laneFor(sessionId, messages) {
@@ -186,7 +218,7 @@ export class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export function buildDelta(messages, acked) {
+export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
     const opening = messages.findIndex(isOpening);
     if (opening < 0)
         return { messages, refs: [] };
@@ -199,7 +231,7 @@ export function buildDelta(messages, acked) {
         const ref = eligible ? refFor(message, !headerSeen) : undefined;
         headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
         if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS ||
-            chars + ref.chars > MAX_NAMED_CHARS)
+            chars + ref.chars > maxChars)
             return message;
         const named = refJson(ref);
         // A short message is smaller than its ref: sent as it is.

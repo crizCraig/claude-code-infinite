@@ -5,8 +5,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { MemtreeClient } from "../dist/memtree.js";
 import {
-  MessageRefs, REF_KEY, STORED_MESSAGES_FIELD, ackedDigests, buildDelta, missingMessageHashes,
-  refFor,
+  MAX_NAMED_CHARS, MAX_NAMED_CHARS_KEY, MessageRefs, REF_KEY, STORED_MESSAGES_FIELD, ackedDigests,
+  buildDelta, missingMessageHashes, namedCharsFor, refFor,
 } from "../dist/message-refs.js";
 
 const VECTORS = JSON.parse(readFileSync(new URL("./fixtures/delta_vectors.json", import.meta.url)));
@@ -80,6 +80,34 @@ test("a delta stays within the server's caps: 64 cache marks, 30 MiB named", () 
   for (let i = 0; i < 40; i++) big.push({ role: "assistant", content: `${i}`.repeat(1024 * 1024) });
   const bigDelta = buildDelta(big, new Set(big.map((m) => refFor(m).digest)));
   assert.ok(bigDelta.refs.length > 0 && bigDelta.refs.length < 31, `${bigDelta.refs.length} refs`);
+});
+
+test("a conversation past 30 MiB names more once the server says its cap is higher", () => {
+  const MIB = 1024 * 1024;
+  const big = [{ role: "user", content: "start" }];
+  for (let i = 0; i < 70; i++) big.push({ role: "assistant", content: `${i % 10}`.repeat(MIB) });
+  const refs = new MessageRefs(true);
+  const acks = (extra) => ({ [STORED_MESSAGES_FIELD]: { stored: true, messages: big.length,
+    unservable: [], unserved_images: [], ...extra } });
+  refs.noteAnswer("s", big, acks({}));
+  assert.equal(refs.maxNamedChars, MAX_NAMED_CHARS, "an old server: 30 MiB");
+  const old = refs.delta("s", big).refs.length;
+  assert.ok(old > 0 && old < 31, `${old} refs under the old cap`);
+  refs.noteAnswer("s", big, acks({ [MAX_NAMED_CHARS_KEY]: 128 * MIB }));
+  assert.equal(refs.maxNamedChars, 120 * MIB, "15/16 of the server's cap");
+  assert.equal(refs.delta("s", big).refs.length, 70, "every big message named");
+  for (const bad of [16 * MIB, "128", 1.5e8 + 0.5, null]) {
+    refs.noteAnswer("s", big, acks({ [MAX_NAMED_CHARS_KEY]: bad }));
+    assert.equal(refs.maxNamedChars, 120 * MIB, `ignored: ${bad}`);
+  }
+  assert.equal(namedCharsFor(4096 * MIB), 256 * MIB, "never past the client's own ceiling");
+  const sent = refs.delta("s", big).refs;
+  assert.ok(refs.noteRefusal("s", big, sent, 400,
+    '{"detail":"Message refs expand past the request size limit."}'), "resend");
+  assert.equal(refs.maxNamedChars, MAX_NAMED_CHARS, "back to the default until told again");
+  refs.noteAnswer("s", big, { [STORED_MESSAGES_FIELD]: { stored: false,
+    [MAX_NAMED_CHARS_KEY]: 64 * MIB } });
+  assert.equal(refs.maxNamedChars, 60 * MIB, "a not-stored answer still says the cap");
 });
 
 test("only the request's first billing header is split", () => {
