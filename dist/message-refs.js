@@ -54,6 +54,10 @@ const MAX_CLIENT_NAMED_CHARS = 256 * MIB;
 export function namedCharsFor(serverChars) {
     return Math.min(Math.floor(serverChars / 16) * 15, MAX_CLIENT_NAMED_CHARS);
 }
+/** What unacked naming assumes a server that has not said its cap allows (polychat's
+ *  MEMTREE_MAX_NAMED_MIB ceiling): a lower cap's 400 names it, and the turn is planned
+ *  again within it (a restarted process can then reach a conversation past ~60 MB). */
+const PROBE_SERVER_NAMED_CHARS = 64 * MIB;
 /** The default: 30 MiB, under the old 32 MiB rebuild cap. */
 export const MAX_NAMED_CHARS = namedCharsFor(DEFAULT_SERVER_NAMED_CHARS);
 /** Base64 image characters the named messages may hold: the server resolves served images
@@ -75,6 +79,8 @@ export class MessageRefs {
     /** What one request's refs may expand to: the default until a server says its cap. A
      *  conversation past ~60 MB needs more, or its compress body can never be sent. */
     namedChars = MAX_NAMED_CHARS;
+    /** Whether a server has said its cap (an answer or a cap 400 carried it). */
+    capKnown = false;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
     unconfirmedPaused = new Map();
     constructor(enabled) {
@@ -103,7 +109,7 @@ export class MessageRefs {
             return { messages, refs: [] };
         }
         const never = this.never.get(lane);
-        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, this.namedChars);
+        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, this.capKnown ? this.namedChars : namedCharsFor(PROBE_SERVER_NAMED_CHARS));
     }
     /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
     pauseUnconfirmed(sessionId, messages, now = Date.now()) {
@@ -176,8 +182,10 @@ export class MessageRefs {
     noteServerCap(json) {
         const field = json?.[STORED_MESSAGES_FIELD];
         const cap = capOf(field?.[MAX_NAMED_CHARS_KEY]);
-        if (cap !== undefined)
-            this.namedChars = namedCharsFor(cap);
+        if (cap === undefined)
+            return;
+        this.namedChars = namedCharsFor(cap);
+        this.capKnown = true;
     }
     /** A text-cap 400: the cap it names (a newer server), else the default (an older one). */
     noteRefusedCap(bodyText) {
@@ -189,6 +197,8 @@ export class MessageRefs {
             // Not JSON: an older server's text.
         }
         this.namedChars = cap === undefined ? MAX_NAMED_CHARS : namedCharsFor(cap);
+        // An older server's refusal says no number, but its cap is the old one.
+        this.capKnown = true;
     }
     /** The conversation `messages` belong to, while refs may be named for it. */
     laneFor(sessionId, messages) {

@@ -50,6 +50,8 @@ export declare class MessageRefs {
     /** What one request's refs may expand to: the default until a server says its cap. A
      *  conversation past ~60 MB needs more, or its compress body can never be sent. */
     private namedChars;
+    /** Whether a server has said its cap (an answer or a cap 400 carried it). */
+    private capKnown;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
     private unconfirmedPaused;
     constructor(enabled: boolean);

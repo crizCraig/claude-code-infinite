@@ -319,9 +319,9 @@ test("a fresh process names a too-big conversation's unacked messages; a 409 sen
       undefined, meta));
     assert.equal(server.bodies.length, 2);
     assert.equal(server.bodies[0].status, 409, "every message named, one not stored");
-    assert.equal(server.bodies[0].refs, 29, "within the default 30 MiB cap");
+    assert.equal(server.bodies[0].refs, 36, "a server that never said its cap: 60 MiB probed");
     assert.equal(server.bodies[1].status, 200);
-    assert.equal(server.bodies[1].refs, 29, "the one it lacked inline, the next one named");
+    assert.equal(server.bodies[1].refs, 35, "the one it lacked inline, the rest named");
     assert.ok(server.bodies[1].bytes < 30 * MIB, `${server.bodies[1].bytes} bytes`);
     assert.deepEqual(server.bodies[1].rebuilt, messages, "the server's rebuild is the full body");
     assert.deepEqual(records.map((r) => r.ok), [true]);
@@ -384,6 +384,47 @@ test("unacked refs: a server lacking every one is not sent another 30 MiB body f
   }
 });
 
+test("unacked refs: a server whose cap is lower than the probe gets the turn replanned within it", async () => {
+  const MIB = 1024 * 1024;
+  const server = await fakeMemtree();
+  server.realMissing = true;
+  server.capChars = 32 * MIB;
+  try {
+    const messages = bigConversation(40);
+    for (const m of messages) server.store.set(refFor(m).digest, { message: m, ref: refFor(m) });
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true });
+    assert.ok(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000,
+      undefined, { sessionId: "sess-cap" }));
+    assert.deepEqual(server.bodies.map((b) => b.status), [400, 200]);
+    assert.ok(server.bodies[0].refs > server.bodies[1].refs && server.bodies[1].refs >= 29,
+      `${server.bodies[0].refs} then ${server.bodies[1].refs} refs`);
+  } finally {
+    await server.close();
+  }
+});
+
+test("refs answered without the ack field are not trusted (a server that ignores them)", async () => {
+  const server = await fakeMemtree();
+  server.legacy = true;
+  try {
+    const messages = bigConversation(36);
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true });
+    const meta = { sessionId: meta_id() };
+    await assert.rejects(client.callContextMemory(messages, 200_000,
+      { timeoutMs: 30_000, sessionId: meta.sessionId }), /does not show it resolved message refs/);
+    assert.equal(server.bodies.length, 1);
+    await assert.rejects(client.callContextMemory(messages, 200_000,
+      { timeoutMs: 30_000, sessionId: meta.sessionId }));
+    assert.equal(server.bodies.length, 1, "paused: not sent again");
+  } finally {
+    await server.close();
+  }
+});
+
+function meta_id() {
+  return `sess-${Math.random().toString(16).slice(2)}`;
+}
+
 test("off by default: no feature declared, nothing named", async () => {
   const server = await fakeMemtree();
   try {
@@ -403,7 +444,8 @@ test("off by default: no feature declared, nothing named", async () => {
 /** A MemTree that stores every message it is sent and serves refs back from them. */
 async function fakeMemtree() {
   const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false,
-    storedImages: [], imageMissingNext: false, realMissing: false, unmatchedOnce: new Set() };
+    storedImages: [], imageMissingNext: false, realMissing: false, unmatchedOnce: new Set(),
+    capChars: 0, legacy: false };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -429,6 +471,11 @@ async function fakeMemtree() {
         state.imageLimitNext = false;
         return reply(400, { detail: "Image references expand past the request size limit." });
       }
+      if (state.legacy) {
+        // A server that predates refs: it takes the hashes as messages.
+        return reply(200, { messages: json.messages, compressed: false,
+          usage: { prompt_tokens: 10, completion_tokens: 1 } });
+      }
       const lacking = state.realMissing
         ? refs.map((r) => r[REF_KEY]).filter((h) => !state.store.has(h)) : [];
       if (lacking.length) {
@@ -443,6 +490,12 @@ async function fakeMemtree() {
       if (refs.length && state.missingNext) {
         state.missingNext = false;
         return reply(409, { detail: { missing_message_hashes: [refs[0][REF_KEY]] } });
+      }
+      const named = refs.reduce((n, r) => n + (state.store.get(r[REF_KEY])?.ref?.chars ??
+        JSON.stringify(state.store.get(r[REF_KEY])?.message ?? "").length), 0);
+      if (state.capChars && named > state.capChars) {
+        return reply(400, { detail: { message: "Message refs expand past the request size limit.",
+          max_named_chars: state.capChars } });
       }
       const rebuilt = json.messages.map((m) => (m && REF_KEY in m ? rebuild(state.store, m) : m));
       entry.rebuilt = rebuilt;

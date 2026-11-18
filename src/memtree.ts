@@ -34,7 +34,8 @@ import {
 } from "./image-refs.js";
 import { planMemtreeBody, type BodyLimitNote, type PlannedBody } from "./memtree-body.js";
 import {
-  MESSAGE_REFS_FEATURE, MISSING_MESSAGES_STATUS, MessageRefs, missingMessageHashes, type Delta,
+  MESSAGE_REFS_FEATURE, MISSING_MESSAGES_STATUS, MessageRefs, STORED_MESSAGES_FIELD,
+  missingMessageHashes, type Delta,
 } from "./message-refs.js";
 import {
   stripCcSystemReminders,
@@ -1937,6 +1938,8 @@ export class MemtreeClient {
       unconfirmedMessageRefs?: string[];
       /** How many such resends came before this one (at most UNCONFIRMED_ROUNDS). */
       unconfirmedRound?: number;
+      /** This call is the one replan after a message refs cap 400. */
+      capReplanned?: boolean;
       /** False: name no message by ref (the resend after a refused one). */
       messageRefs?: boolean;
       /** The status that refused this call's refs (logged on its full resend). */
@@ -2013,31 +2016,36 @@ export class MemtreeClient {
     // Not on the final index: its body is prepared cooperatively (final-index.ts).
     let delta: Delta = opts.messageRefs === false || opts.finalIndex ? { messages, refs: [] }
       : this.messageRefs.delta(opts.sessionId, messages);
-    let sentMessages = delta.messages;
-    let namedUnconfirmed = false;
-    const plan = (refs: boolean): PlannedBody => planMemtreeBody({
-      body, messages: sentMessages, indexOnly: opts.indexOnly === true,
-      serialized: refs && opts.serializedMessages !== undefined && !delta.refs.length
+    const plan = (d: Delta, refs: boolean): PlannedBody => planMemtreeBody({
+      body, messages: d.messages, indexOnly: opts.indexOnly === true,
+      serialized: refs && opts.serializedMessages !== undefined && !d.refs.length
         ? { value: opts.serializedMessages, refs: opts.serializedImageRefs ?? [] } : undefined,
       imageRefs: refs ? this.imageRefs : undefined,
     });
-    let planned = plan(opts.imageRefs !== false);
+    // A compress over the limit is not sent at all: before that, try it with images
+    // the server has not listed as references too (a resumed session's first call).
+    const withImages = (d: Delta): { planned: PlannedBody; unconfirmed?: PlannedBody } => {
+      const first = plan(d, opts.imageRefs !== false);
+      const images = first.payload === undefined && !opts.indexOnly &&
+        opts.imageRefs !== false ? this.planUnconfirmed(body, d.messages) : undefined;
+      return images ? { planned: images, unconfirmed: images } : { planned: first };
+    };
+    let { planned, unconfirmed } = withImages(delta);
     // Over the limit even so: name every message that may be stored, acked or not (a fresh
-    // process has no acks; a 409 names what the server lacks, sent inline once).
+    // process has no acks; a 409 names what the server lacks, sent inline).
+    let namedUnconfirmed = false;
     const named = planned.payload === undefined && !opts.indexOnly && !opts.finalIndex &&
       opts.messageRefs !== false ? this.messageRefs.unconfirmedDelta(opts.sessionId, messages,
         new Set(opts.unconfirmedMessageRefs ?? [])) : undefined;
-    if (named && named.refs.length > delta.refs.length) {
-      delta = named;
-      sentMessages = named.messages;
-      namedUnconfirmed = true;
-      planned = plan(opts.imageRefs !== false);
+    if (named?.refs.length) {
+      const candidate = withImages(named);
+      if (candidate.planned.payload !== undefined) {
+        ({ planned, unconfirmed } = candidate);
+        delta = named;
+        namedUnconfirmed = true;
+      }
     }
-    // A compress over the limit is not sent at all: before that, try it with images
-    // the server has not listed as references too (a resumed session's first call).
-    const unconfirmed = planned.payload === undefined && !opts.indexOnly &&
-      opts.imageRefs !== false ? this.planUnconfirmed(body, sentMessages) : undefined;
-    if (unconfirmed) planned = unconfirmed;
+    const sentMessages = delta.messages;
     if (planned.payload === undefined) throw this.oversized(planned.limit, opts);
     const payload = planned.payload;
     // Fixed with the body: a transport retry of a delta body still declares refs.
@@ -2090,18 +2098,18 @@ export class MemtreeClient {
       if (delta.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
         const lacking = namedUnconfirmed && response.status === MISSING_MESSAGES_STATUS
-          ? missingMessageHashes(refusalText) : undefined;
-        if (lacking?.length) {
+          ? new Set(missingMessageHashes(refusalText) ?? []) : undefined;
+        if (lacking?.size) {
           // Unacked refs the server lacks (its 409s come in stages: rows, then re-hashes):
           // only those go inline, a few rounds at most, never "never" (they were never
           // acked, so the server's hashing is not in question). Lacking every one: deltas
           // are off or the lookup failed, so a while with no such bodies at all.
-          const all = delta.refs.every((ref) => lacking.includes(ref));
+          const all = delta.refs.every((ref) => lacking.has(ref));
           const round = (opts.unconfirmedRound ?? 0) + 1;
           if (all) this.messageRefs.pauseUnconfirmed(opts.sessionId, messages);
           if (!all && round <= UNCONFIRMED_ROUNDS) {
             resent = true;
-            this.log(`context_memory 409 on ${lacking.length} unacked refs: sending those inline`);
+            this.log(`context_memory 409 on ${lacking.size} unacked refs: sending those inline`);
             return await this.callContextMemory(messages, modelContextLimit, {
               ...opts, unconfirmedRound: round,
               unconfirmedMessageRefs: [...(opts.unconfirmedMessageRefs ?? []), ...lacking],
@@ -2109,7 +2117,19 @@ export class MemtreeClient {
             });
           }
         }
-        if (!lacking?.length && this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs,
+        if (!lacking?.size && namedUnconfirmed && !opts.capReplanned &&
+          capRefusal(response.status, refusalText)) {
+          // Past the server's cap (it says which; a lower one than this client named): the
+          // same turn planned again within it, once, keeping the refs.
+          this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs, response.status,
+            refusalText);
+          resent = true;
+          return await this.callContextMemory(messages, modelContextLimit, {
+            ...opts, capReplanned: true,
+            get timeoutMs() { return callDeadline - Date.now(); },
+          });
+        }
+        if (!lacking?.size && this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs,
           response.status, refusalText)) {
           // Sent again in full as its own call, within what is left of this call's budget.
           resent = true;
@@ -2134,11 +2154,14 @@ export class MemtreeClient {
             namesMissingImages(response.status, refusalText);
           // A delta body: sent again as this turn's ordinary body (no message refs, the
           // images it lacks now forgotten), so the usual size fallbacks plan it.
-          const plain = delta.refs.length > 0;
+          // Unacked message refs are kept (without them the body is over the limit again):
+          // the images it lacks go as bytes, once.
+          const plain = delta.refs.length > 0 && !namedUnconfirmed;
+          const keepNamed = namedUnconfirmed && !opts.unconfirmedRetry;
           return await this.callContextMemory(messages, modelContextLimit, {
             ...opts,
             ...(plain ? { messageRefs: false, refusedMessageRefs: response.status }
-              : keepRefs ? { unconfirmedRetry: true } : { imageRefs: false }),
+              : keepRefs || keepNamed ? { unconfirmedRetry: true } : { imageRefs: false }),
             get timeoutMs() { return callDeadline - Date.now(); },
           });
         }
@@ -2164,6 +2187,13 @@ export class MemtreeClient {
       }
 
       const json = (await response.json()) as CompressResult;
+      if (delta.refs.length &&
+        (json as unknown as Record<string, unknown>)?.[STORED_MESSAGES_FIELD] === undefined) {
+        // No proof the server put the named messages back: its answer may be built from
+        // hashes. Unacked naming stops for a while; the next turn goes the usual way.
+        this.messageRefs.pauseUnconfirmed(opts.sessionId, messages);
+        throw new Error("context_memory answer does not show it resolved message refs");
+      }
       if (unconfirmed && !ImageRefs.resolvedBy(json)) {
         // No proof the server put the images back: its result may hold references.
         this.imageRefs.disable();
@@ -2557,6 +2587,11 @@ function contentTextChars(value: unknown): number {
 }
 
 /** `baseMs` plus COMPRESS_TIMEOUT_MS_PER_KIB per KiB of `bytes`. */
+/** A 400 for message refs past the server's cap (not the images they bring back). */
+function capRefusal(status: number, text: string): boolean {
+  return status === 400 && /\brefs expand past/i.test(text);
+}
+
 /** Resends of a call naming unacked messages, each with what the last 409 named inline. */
 const UNCONFIRMED_ROUNDS = 3;
 
