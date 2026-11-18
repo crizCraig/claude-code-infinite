@@ -2376,17 +2376,18 @@ async function handleMessages(
   }
   const requestSessionKey = requestSessionId(req);
   const observed = opts.savings?.startTurn(requestSessionKey);
+  const possiblyResumed = !!requestSessionKey && state.resumableMainSession === requestSessionKey;
   if (sideRequest && clientInfo) {
     if (opts.savings && observed) {
       const savings = opts.savings;
       const lane = "side:" + body.model;
-      savingsDispatch.set(rec, at => observed.dispatched(lane, at));
-      settleSavings = () => savings.settle(observed, {request: rawBody,
-        usage: rec.savingsUsageComplete ? rec.usage : undefined,
-        model: body.model, requestModified: false, prefixRewritten: false,
-        contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
-          opts.nativeOneMillionContext !== false),
-        laneKey: lane, nowMs: observed.requestedAt}, rec.upstreamStatus ?? 0);
+      const input = {request:rawBody, model:body.model, requestModified:false, possiblyResumed,
+        contextWindow:contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
+          opts.nativeOneMillionContext !== false), laneKey:lane};
+      savingsDispatch.set(rec,{announce:() => observed.announce(lane),
+        sent:at => observed.dispatched({...input, nowMs:at})});
+      settleSavings = () => savings.settle(observed, {...input, nowMs:observed.requestedAt,
+        usage:rec.savingsUsageComplete ? rec.usage : undefined}, rec.upstreamStatus ?? 0);
     }
     if (typeof body.model === "string") rec.model = body.model;
     rec.stream = body.stream === true;
@@ -2459,7 +2460,7 @@ async function handleMessages(
     },
   }, state.countTokensCooldowns);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true,
-    typeof body.model === "string" ? body.model : undefined, !!observed);
+    typeof body.model === "string" ? body.model : undefined);
   if (carriesServerTools(body)) serverToolRecords.add(rec);
   const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey,
     body.model);
@@ -2480,20 +2481,13 @@ async function handleMessages(
     const savings = opts.savings;
     const lane = JSON.stringify([requestRouteLane, notConversation ?? null,
       isSubagentRequest ? agentAttributionId(req) : null]);
-    savingsDispatch.set(rec, at => observed.dispatched(lane, at));
-    let selected: RequestCandidate | undefined;
-    savingsSelections.set(rec, candidate => { selected = candidate; });
-    settleSavings = () => {
-      const modified = selected !== undefined && selected.kind !== "original";
-      const at = observed.requestedAt;
-      return savings.settle(observed, {request:rawBody,
-        usage:rec.savingsUsageComplete ? rec.usage : undefined, model:originalRequest.model,
-        contextWindow:modelContextLimit, outputReserve:sizingLimits().output, requestModified:modified,
-        prefixRewritten:selected?.kind === "replacement" || (!!selected && adoptedSavingsPrefixes.has(selected)),
-        forwardedRequest:modified ? selected?.body : undefined,
-        originalInputTokens:countSession.peekKey(originalCandidate.key)?.tokens,
-        laneKey:lane, nowMs:at}, rec.upstreamStatus ?? 0);
-    };
+    const input = () => ({request:rawBody, model:originalRequest.model, contextWindow:modelContextLimit,
+      outputReserve:sizingLimits().output, requestModified:savingsModified.has(rec), possiblyResumed,
+      originalInputTokens:countSession.peekKey(originalCandidate.key)?.tokens, laneKey:lane});
+    savingsDispatch.set(rec,{announce:() => observed.announce(lane),
+      sent:at => observed.dispatched({...input(), nowMs:at})});
+    settleSavings = () => savings.settle(observed, {...input(), nowMs:observed.requestedAt,
+      usage:rec.savingsUsageComplete ? rec.usage : undefined},rec.upstreamStatus ?? 0);
   }
   if (isMainRequest && requestSessionKey !== undefined) {
     adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
@@ -5468,7 +5462,6 @@ async function adoptEntry(
   }
   args.compaction.estimatedTokens = fit.tokens;
   args.compaction.estimatedBytes = fit.routed.raw.length;
-  adoptedSavingsPrefixes.add(fit.candidate);
   installPreparedPrefix(state, sessionId, entry);
   return { prefix: entry.prefix, routed: fit.routed };
 }
@@ -7631,7 +7624,7 @@ async function selectForwardCandidate(args: {
   if (preparedBase?.derived !== undefined && preparedBase.derived === candidate) {
     preparedBase.install();
   }
-  savingsSelections.get(args.rec)?.(candidate);
+  if (candidate.kind !== "original") savingsModified.add(args.rec);
   const changed = candidate !== preferred || intended !== args.preferredBody;
   if (changed) {
     policy.allowed.delete(args.preferredBody);
@@ -8080,9 +8073,8 @@ function noteAwayWarmsMain(
 }
 
 /** Account the candidate delivery selected after sizing and fallbacks. */
-const savingsDispatch = new WeakMap<MessagesRecord, (at: number) => void>();
-const adoptedSavingsPrefixes = new WeakSet<RequestCandidate>();
-const savingsSelections = new WeakMap<MessagesRecord, (candidate: RequestCandidate) => void>();
+const savingsDispatch = new WeakMap<MessagesRecord, {announce():Promise<void>; sent(at:number):void}>();
+const savingsModified = new WeakSet<MessagesRecord>();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap<MessagesRecord, (sent: Buffer) => void>();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
@@ -8265,7 +8257,9 @@ async function forwardRaw(
   // A late recovery's replacement went out instead: it installs as its route.
   const lateInstall = rec && selected !== bodyBuffer ? lateRouteInstalls.get(rec) : undefined;
   if (rec) lateRouteInstalls.delete(rec);
-  const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec,
+  const observation = rec && savingsDispatch.get(rec);
+  if (observation) await observation.announce();
+  const delivered = !res.destroyed && await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec,
     selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate);
   lateInstall?.settle(delivered, selected);
   if (delivered && rec) noteSelectedCandidateSize(rec);
@@ -8412,7 +8406,7 @@ function forwardAccepted(
 
     if (rec) {
       laneSendStamps.get(rec)?.(bodyBuffer);
-      savingsDispatch.get(rec)?.(Date.now());
+      savingsDispatch.get(rec)?.sent(Date.now());
     }
     upstreamReq = upstream.module.request(
       {

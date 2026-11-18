@@ -9,7 +9,8 @@ import {Diagnostics} from '../dist/diagnostics.js';
 const usage = {input:100, cache_read:20, cache_creation_5m:3, cache_creation_1h:4, output:25};
 const first = {turn_id:'ff0baa4e-c487-465f-87a6-8776d7525bbe',
   session_id:'12345678-1234-4123-8123-123456789abc', requested_at:'2026-11-16T23:59:59.900Z',
-  model:'claude-sonnet-4-6', fast_mode:false, window_crossing:false, actual:usage,
+  model:'claude-sonnet-4-6', fast_mode:false, window_crossing:false,
+  floor_read_possibly_uncached_tokens:12, floor_read_max_gap_seconds:600, actual:usage,
   plain:{...usage, input:1000}};
 function ack(ids) { return Response.json({acked_turn_ids:ids}); }
 async function harness(t, receive) {
@@ -47,6 +48,21 @@ test('independent writers publish one private JSONL line per turn with no prompt
     turns.sort((a,b) => a.turn_id.localeCompare(b.turn_id)));
 });
 
+test('legacy turns and nullable floor diagnostics survive replay; malformed metadata stays local', async t => {
+  const h = await harness(t);
+  const {floor_read_possibly_uncached_tokens, floor_read_max_gap_seconds, ...legacy} = first;
+  const absent = {...legacy, turn_id:randomUUID()};
+  const unknown = {...legacy, turn_id:randomUUID(), floor_read_possibly_uncached_tokens:null, floor_read_max_gap_seconds:null};
+  const invalid = {...legacy, turn_id:randomUUID()};
+  const client = h.client();
+  client.reportSavings(absent);
+  client.reportSavings(unknown);
+  client.reportSavings({...invalid, floor_read_possibly_uncached_tokens:21, floor_read_max_gap_seconds:'SECRET'});
+  await client.flush();
+  const ordered = records => records.sort((a,b) => a.turn_id.localeCompare(b.turn_id));
+  assert.deepEqual(ordered(h.posts.flatMap(p => p.turns)), ordered([absent, unknown, invalid]));
+});
+
 test('cancelling during a billable compression publishes no upstream turn', async t => {
   const {MemtreeClient} = await import('../dist/memtree.js');
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
@@ -69,7 +85,7 @@ test('cancelling during a billable compression publishes no upstream turn', asyn
     {sessionId:first.session_id, clientMeta:metadata});
   await sent;
   workTime += 10000; // Settlement after midnight still describes the submitted work.
-  const input = {request:{messages}, requestModified:true,prefixRewritten:true, contextWindow:200000};
+  const input = {request:{messages}, requestModified:true, contextWindow:200000};
   await tracker.settle(turn, input, 0);
   await tracker.settle(turn, input, 0);
   finish();
@@ -268,7 +284,7 @@ test('warm and expired conversation cache cost the same across launcher restarts
         const request = {model:first.model, messages, cache_control:{type:'ephemeral', ttl}};
         const input = {request, usage:{input_tokens:0,cache_creation_input_tokens:20000,cache_creation:{
           ephemeral_5m_input_tokens:ttl === '5m' ? 20000 : 0,ephemeral_1h_input_tokens:ttl === '1h' ? 20000 : 0},output_tokens:1},
-          contextWindow:200000,originalInputTokens:80000,requestModified:true,prefixRewritten:true,nowMs:1000};
+          contextWindow:200000,originalInputTokens:80000,requestModified:true,nowMs:1000};
         if (restart) {
           execFileSync(process.execPath, ['--input-type=module','-e',`
             import {Diagnostics} from './dist/diagnostics.js';
@@ -292,7 +308,7 @@ test('warm and expired conversation cache cost the same across launcher restarts
         results.push(h.posts.at(-1).turns[0].plain);
       }
       assert.deepEqual(results[0], results[1], ttl + ' gap ' + gap);
-      assert.equal(results[0].cache_read > 79000, gap < (ttl === '5m' ? 300000 : 3600000));
+      assert.equal(results[0].cache_read,80000);
     }
   }
 });
@@ -325,54 +341,53 @@ test('late background index refusal leaves the published turn independent of bil
 test('overlapping launchers use dispatch order and isolate credentials', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t);
-  const start = (session, key, at) => {
+  const start = (session, key, at, text) => {
     const diagnostics = h.client(key), tracker = new SavingsTracker({diagnostics});
     const observation = tracker.startTurn(session);
-    observation.dispatched('main', at);
-    return async (ttl, text) => {
-      const request = {model:first.model, cache_control:{type:'ephemeral',ttl}, messages:[
-        {role:'user',content:text.repeat(10000)}, {role:'assistant',content:'hi'},
-        {role:'user',content:'continue'}]};
-      await tracker.settle(observation,{request,requestModified:true,prefixRewritten:true,nowMs:at,contextWindow:200000,
-        usage:{input_tokens:0,cache_creation_input_tokens:2500,output_tokens:1},originalInputTokens:2500},200);
+    const request = {model:first.model, cache_control:{type:'ephemeral'}, messages:[
+      {role:'user',content:text.repeat(10000)}]};
+    const input = {request,requestModified:true,nowMs:at,contextWindow:200000,originalInputTokens:2500};
+    observation.dispatched(input);
+    return async () => {
+      await tracker.settle(observation,{...input,
+        usage:{input_tokens:0,cache_creation_input_tokens:2500,output_tokens:1}},200);
       await diagnostics.flush();
       return h.posts.at(-1).turns[0].plain;
     };
   };
   const id = randomUUID();
-  const older = start(id, 'A', 1000);
-  const later = await start(id, 'A', 301000)('5m','y');
-  assert.equal(later.cache_read,0,'an unsettled dispatch supplies no measured cache evidence');
-  await older('5m','x');
-  assert.equal((await start(id, 'A', 302000)('5m','y')).cache_read,2500);
-  assert.equal((await start(id, 'A', 603000)('5m','y')).cache_read,0);
-  assert.equal((await start(id, 'B', 303000)('5m','y')).cache_read,0,
+  const older = start(id, 'A', 1000,'x');
+  const later = await start(id, 'A', 301000,'y')();
+  assert.equal(later.cache_read,0,'a different prefix is new');
+  await older();
+  assert.equal((await start(id, 'A', 302000,'y')()).cache_read,2500);
+  assert.equal((await start(id, 'A', 603000,'y')()).cache_read,2500);
+  assert.equal((await start(id, 'B', 303000,'y')()).cache_read,0,
     'account B cannot reuse account A’s measured write');
 });
 
-test('an unreadable predecessor checkpoint cannot lose a measured turn', async t => {
+test('an unreadable or legacy send history cannot turn a possible hit into a write', async t => {
   const {writeFile} = await import('node:fs/promises');
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t), diagnostics = h.client();
   const tracker = new SavingsTracker({diagnostics});
   const session = randomUUID();
   const input = {request:{model:first.model,cache_control:{type:'ephemeral'},
-    messages:[{role:'user',content:'old'.repeat(3000)},{role:'assistant',content:'hi'},
-      {role:'user',content:'new'}]},requestModified:true,prefixRewritten:true,contextWindow:200000,
+    messages:[{role:'user',content:'old'.repeat(3000)}]},requestModified:true,contextWindow:200000,
     usage:{input_tokens:50,output_tokens:1}, originalInputTokens:2250, nowMs:1000};
   const firstTurn = tracker.startTurn(session);
   await tracker.settle(firstTurn,input,200);
   await diagnostics.flush();
   const paths = await readdir(h.configDir,{recursive:true});
-  const file = paths.find(f => f.endsWith(firstTurn.id));
+  const file = paths.find(f => f.endsWith('floor-v1.json'));
   await writeFile(join(h.configDir,file), JSON.stringify({at:1000,prefixes:[null],model:first.model}));
   await tracker.settle(tracker.startTurn(session),{...input,nowMs:400000},200);
   await diagnostics.flush();
   assert.equal(h.posts.length,2);
-  assert.equal(h.posts[1].turns[0].plain.cache_read,0);
+  assert.equal(h.posts[1].turns[0].plain.cache_read,2250);
 });
 
-test('dispatch and settlement leave checkpoint I/O and prompt hashing off the forwarding thread', async t => {
+test('dispatch and settlement leave prompt hashing and history updates on the worker', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const {existsSync} = await import('node:fs');
   const h = await harness(t), diagnostics = h.client();
@@ -387,10 +402,10 @@ test('dispatch and settlement leave checkpoint I/O and prompt hashing off the fo
   const bytes = Buffer.from(new SharedArrayBuffer(Buffer.byteLength(json)));
   bytes.write(json);
   const observation = tracker.startTurn(first.session_id);
-  observation.dispatched('main',1000);
+  observation.dispatched({request:bytes,requestModified:true,nowMs:1000,contextWindow:200000});
   // The forwarding stack schedules work and returns before settlement completes.
   const tick = new Promise(resolve => setImmediate(() => resolve(reported)));
-  const settled = tracker.settle(observation,{request:bytes,requestModified:true,prefixRewritten:true,nowMs:1000,
+  const settled = tracker.settle(observation,{request:bytes,requestModified:true,nowMs:1000,
     usage:{input_tokens:10,output_tokens:1},contextWindow:200000},200);
   assert.equal(await tick,false);
   await settled;
@@ -398,7 +413,7 @@ test('dispatch and settlement leave checkpoint I/O and prompt hashing off the fo
   assert.ok(existsSync(diagnostics.savingsCacheDirectory));
 });
 
-test('successive dispatches within one clock millisecond use their immediate predecessor', async t => {
+test('a prefix sent before an intervening edit is still a read, even within one clock millisecond', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t), diagnostics = h.client();
   const tracker = new SavingsTracker({diagnostics});
@@ -410,29 +425,29 @@ test('successive dispatches within one clock millisecond use their immediate pre
     await tracker.settle(tracker.startTurn(first.session_id),{...input,request},200);
   }
   await diagnostics.flush();
-  await tracker.settle(tracker.startTurn(first.session_id),{...input,requestModified:true,prefixRewritten:true,
+  await tracker.settle(tracker.startTurn(first.session_id),{...input,requestModified:true,
     originalInputTokens:30000},200);
   await diagnostics.flush();
-  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
+  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,30000);
 });
 
-test('a known in-flight predecessor supplies no unverified cache reads', async t => {
+test('the floor includes matching in-flight sends', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t), diagnostics = h.client();
   const tracker = new SavingsTracker({diagnostics});
   const pending = tracker.startTurn(first.session_id);
-  pending.dispatched('main',1000);
   const input = {request:{model:first.model,cache_control:{type:'ephemeral'},messages:[
     {role:'user',content:'b'.repeat(120000)}, {role:'assistant',content:'ok'}]},
-    requestModified:true,prefixRewritten:true,contextWindow:200000,originalInputTokens:30000,
+    requestModified:true,contextWindow:200000,originalInputTokens:30000,
     usage:{input_tokens:20,output_tokens:1},nowMs:11000};
+  pending.dispatched({...input,nowMs:1000});
   await tracker.settle(tracker.startTurn(first.session_id),input,200);
   await diagnostics.flush();
-  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
+  assert.equal(h.posts.at(-1).turns[0].plain.cache_read,30000);
   await tracker.settle(pending,{...input,nowMs:1000},200);
 });
 
-test('a refused dispatch neither displaces nor refreshes the last measured prefix on restart', async t => {
+test('a refused dispatch costs zero and its retry reads the prefix in a new launcher', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const h = await harness(t);
   const request = {model:first.model,cache_control:{type:'ephemeral'},
@@ -442,7 +457,7 @@ test('a refused dispatch neither displaces nor refreshes the last measured prefi
     const send = async (nowMs, status, usage, rewrite = false) => {
       const diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
       await tracker.settle(tracker.startTurn(session),{request, requestModified:rewrite,
-        prefixRewritten:rewrite, originalInputTokens:30000, contextWindow:200000, nowMs, usage},status);
+        originalInputTokens:30000, contextWindow:200000, nowMs, usage},status);
       await diagnostics.flush();
       return h.posts.at(-1).turns[0];
     };
@@ -452,27 +467,93 @@ test('a refused dispatch neither displaces nor refreshes the last measured prefi
       assert.deepEqual(Object.values(refused.plain),[0,0,0,0,0]);
     }
     const retry = await send(retryAt,200,{input_tokens:2000,output_tokens:1},true);
-    assert.equal(retry.plain.cache_read,retryAt === 3000 ? 30000 : 0);
+    assert.equal(retry.plain.cache_read,30000);
     assert.equal(retry.plain.cache_creation_5m,30000-retry.plain.cache_read);
   }
 });
 
-test('a refusal settled before the preceding write cannot hide that write from a later retry', async t => {
+test('the measured write, overlapping 429 and compressed retry have identical prices in every settlement order', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
-  const h = await harness(t), diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
+  const h = await harness(t);
   const request = {model:first.model,cache_control:{type:'ephemeral'},
-    messages:[{role:'user',content:'a'.repeat(120000)}]};
-  const args = {request,requestModified:false,contextWindow:200000,
-    usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:0}};
-  const write = tracker.startTurn(first.session_id);
-  write.dispatched('main',1000);
-  await tracker.settle(tracker.startTurn(first.session_id),{...args,nowMs:2000},429);
-  const retry = tracker.startTurn(first.session_id);
-  retry.dispatched('main',3000);
-  await tracker.settle(write,{...args,nowMs:1000},200);
-  await tracker.settle(retry,{...args,requestModified:true,prefixRewritten:true,
-    originalInputTokens:30000,nowMs:3000,usage:{input_tokens:2000,output_tokens:1}},200);
-  await diagnostics.flush();
-  const report = h.posts.flatMap(post => post.turns).find(turn => turn.turn_id === retry.id);
+    messages:[{role:'user',content:'word'.repeat(30000)}]};
+  for (const order of ['012','021','102','120','201','210']) {
+    const session = randomUUID(), diagnostics = h.client();
+    const tracker = new SavingsTracker({diagnostics});
+    const inputs = [
+      {nowMs:1000,requestModified:false,usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}},
+      {nowMs:2000,requestModified:true,originalInputTokens:30000},
+      {nowMs:3000,requestModified:true,originalInputTokens:30000,usage:{input_tokens:2000,output_tokens:1}},
+    ].map(input => ({...input,request,contextWindow:200000}));
+    const turns = inputs.map(input => {
+      const observation = tracker.startTurn(session);
+      observation.dispatched(input);
+      return observation;
+    });
+    for (const i of Array.from(order, Number)) {
+      await tracker.settle(turns[i],inputs[i],i === 1 ? 429 : 200);
+    }
+    await diagnostics.flush();
+    const reports = h.posts.flatMap(post => post.turns);
+    const retry = reports.find(turn => turn.turn_id === turns[2].id);
+    const refusal = reports.find(turn => turn.turn_id === turns[1].id);
+    assert.equal(retry.plain.cache_read,30000,order);
+    assert.equal(retry.plain.cache_creation_5m,0,order);
+    assert.deepEqual(Object.values(refusal.plain),[0,0,0,0,0],order);
+  }
+});
+
+test('a slow independent launcher cannot hide an earlier send from the floor', async t => {
+  const {spawn} = await import('node:child_process');
+  const {once} = await import('node:events');
+  const {SavingsObservation} = await import('../dist/savings-turn.js');
+  const h = await harness(t), session = randomUUID();
+  const cacheDir = h.client().savingsCacheDirectory;
+  const input = {request:{model:first.model, cache_control:{type:'ephemeral'},
+    messages:[{role:'user',content:'word'.repeat(30000)}]},requestModified:true,
+    nowMs:1000,contextWindow:200000,originalInputTokens:30000};
+  const source = `
+    import {SavingsObservation} from './dist/savings-turn.js';
+    import {once} from 'node:events';
+    const [[dir,session,input]] = await once(process,'message');
+    const observed = new SavingsObservation(session,()=>{},'child',dir);
+    await observed.announce('main');
+    process.send('ready');
+    // The send has a reservation; its accounting worker has yet to register it.
+    process.once('message',async () => {
+      observed.dispatched(input);
+      await observed.settle(input,429);
+      process.disconnect();
+    });
+  `;
+  const child = spawn(process.execPath,['--input-type=module','-e',source],{
+    cwd:new URL('../',import.meta.url),
+    stdio:['ignore','ignore','inherit','ipc']
+  });
+  t.after(() => child.kill());
+  child.send([cacheDir,session,input]);
+  const ready = await Promise.race([once(child,'message'),once(child,'exit')]);
+  assert.equal(ready[0],'ready');
+  let report;
+  const retry = new SavingsObservation(session,r=>report=r,'other',cacheDir);
+  await retry.announce('main');
+  const rewritten = {...input,nowMs:2000,usage:{input_tokens:2000,output_tokens:1}};
+  retry.dispatched(rewritten);
+  await retry.settle(rewritten,200);
   assert.equal(report.plain.cache_read,30000);
+  assert.equal(report.floor_read_max_gap_seconds,null);
+  const exit = once(child,'exit');
+  child.send('continue');
+  assert.equal((await exit)[0],0);
+});
+
+test('a worker accounting failure preserves an incomplete observation for the dispatched turn', async () => {
+  const {SavingsObservation} = await import('../dist/savings-turn.js');
+  let report;
+  const observation = new SavingsObservation(first.session_id,r=>report=r,randomUUID());
+  const input = {request:Buffer.from('invalid'),model:first.model,requestModified:true,nowMs:3000,
+    contextWindow:200000,usage:{input_tokens:20,output_tokens:1}};
+  await observation.settle(input,200);
+  assert.equal(report.turn_id,observation.id);
+  assert.equal(report.plain,null);
 });

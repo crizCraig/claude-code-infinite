@@ -424,11 +424,15 @@ test('a nullable creation total with both duration counts remains measured throu
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const usage = {input_tokens:21, output_tokens:4, cache_creation_input_tokens:null,
     cache_creation:{ephemeral_5m_input_tokens:10, ephemeral_1h_input_tokens:20}};
-  for (const stream of [false, true]) {
+  for (const mode of ['json','stream-start','stream-delta']) {
     const rec = {};
-    if (stream) {
-      mergeUsageFromSseEvent({type:'message_start',message:{usage}},rec);
-      mergeUsageFromSseEvent({type:'message_delta',usage:{output_tokens:4}},rec);
+    if (mode !== 'json') {
+      const lateSplit = mode === 'stream-delta';
+      const start = lateSplit ? {input_tokens:21,cache_creation_input_tokens:0} : usage;
+      mergeUsageFromSseEvent({type:'message_start',message:{usage:start}},rec);
+      const delta = lateSplit ? {...usage,input_tokens:null} : {output_tokens:4};
+      mergeUsageFromSseEvent({type:'message_delta',usage:delta},rec);
+      if (lateSplit) assert.equal(rec.usage.cache_creation_input_tokens,30);
       mergeUsageFromSseEvent({type:'message_stop'},rec);
     } else mergeUsageFromJsonBody(Buffer.from(JSON.stringify({type:'message',content:[],usage})),rec);
     assert.equal(rec.savingsUsageComplete,true);
@@ -436,6 +440,31 @@ test('a nullable creation total with both duration counts remains measured throu
     const tracker = new SavingsTracker({diagnostics:reporter(value => { report = value; })});
     await tracker.settle(tracker.startTurn(sessionId),{...input,usage:rec.usage},200);
     assert.deepEqual(report.actual,{input:21,cache_read:0,cache_creation_5m:10,cache_creation_1h:20,output:4});
-    assert.deepEqual(report.plain, report.actual);
+    assert.deepEqual(report.plain,{input:51,cache_read:0,cache_creation_5m:0,cache_creation_1h:0,output:4});
+  }
+});
+
+test('a cold compressed request reads the mixed-TTL plain prefix in every settlement order', async () => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const block = (text,ttl) => ({type:'text',text,cache_control:{type:'ephemeral',ttl}});
+  const request = {model:'claude-sonnet-4-6',messages:[{role:'user',content:[
+    block('main '.repeat(30000),'1h'),block('tail '.repeat(1000),'5m')]}]};
+  const original = {input_tokens:0,output_tokens:0,cache_creation_input_tokens:31000,
+    cache_creation:{ephemeral_1h_input_tokens:30000,ephemeral_5m_input_tokens:1000}};
+  const compressed = {input_tokens:0,output_tokens:0,cache_creation_input_tokens:2000};
+  for (const order of ['012','021','102','120','201','210']) {
+    const reports = new Map();
+    const tracker = new SavingsTracker({diagnostics:reporter(report => reports.set(report.turn_id,report))});
+    const inputs = [1000,2000,602000].map((nowMs,i) => ({request,nowMs,contextWindow:200000,
+      originalInputTokens:31000,requestModified:i>0,usage:i ? compressed : original}));
+    const turns = [];
+    for (const input of inputs) {
+      const observation = tracker.startTurn(sessionId);
+      await observation.dispatched(input);
+      turns.push(observation);
+    }
+    for (const i of Array.from(order, Number)) await tracker.settle(turns[i],inputs[i],200);
+    assert.deepEqual(reports.get(turns[2].id).plain,
+      {input:0,cache_read:31000,cache_creation_5m:0,cache_creation_1h:0,output:0},order);
   }
 });

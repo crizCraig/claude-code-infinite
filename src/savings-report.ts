@@ -21,6 +21,8 @@ export type SavingsRecord = LegacyPreflight | (SavingsIdentity & {
   model: string;
   fast_mode: boolean;
   window_crossing: boolean;
+  floor_read_possibly_uncached_tokens?: number | null;
+  floor_read_max_gap_seconds?: number | null;
   actual: SavingsUsage | null;
   plain: SavingsUsage | null;
 });
@@ -55,6 +57,14 @@ export function savingsReport(value: unknown): SavingsRecord | undefined {
       typeof v.fast_mode !== 'boolean' || typeof v.window_crossing !== 'boolean') return;
   const actual = usage(v.actual), plain = usage(v.plain);
   if (actual === undefined || plain === undefined) return;
-  return {...identity, model:v.model, fast_mode:v.fast_mode,
+  const report: SavingsRecord = {...identity, model:v.model, fast_mode:v.fast_mode,
     window_crossing:v.window_crossing, actual, plain};
+  for (const field of ['floor_read_possibly_uncached_tokens','floor_read_max_gap_seconds'] as const) {
+    const count = v[field];
+    const max = field === 'floor_read_max_gap_seconds' ? Number.MAX_SAFE_INTEGER : plain?.cache_read ?? 1_000_000_000;
+    if (count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && count <= max)) {
+      report[field] = count;
+    }
+  }
+  return report;
 }

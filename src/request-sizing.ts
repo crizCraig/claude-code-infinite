@@ -57,7 +57,7 @@ export class RequestSizing {
 
   /** `model` is the request's model: it picks the tokenizer family's ratio. */
   constructor(private readonly counts: CountTokensSession, private readonly enabled: boolean,
-    private readonly model?: string, private readonly shareCandidates = false) {}
+    private readonly model?: string) {}
 
   /** The first registration fixes both bytes and learned sample for this request. */
   register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate {
@@ -70,11 +70,7 @@ export class RequestSizing {
     const conservativeTokens = Math.min(plain,
       (extendsSample(snapshot, body, this.model) &&
         anchoredBound(snapshot, bodyShape(body)!, this.model)) || Infinity);
-    // Savings reads modified bytes on its worker after delivery. Share the
-    // existing owned snapshot so posting a large media turn never copies it again.
-    const owned = this.shareCandidates && kind !== "original"
-      ? Buffer.from(new SharedArrayBuffer(body.length)) : Buffer.allocUnsafe(body.length);
-    body.copy(owned);
+    const owned = Buffer.from(body);
     // The same totals and shape answer for the owned copy (reportedSample of the sent bytes).
     rememberImages(owned, this.model, images);
     rememberShape(owned, knownShape(body));

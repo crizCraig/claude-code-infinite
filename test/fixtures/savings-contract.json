@@ -8,6 +8,8 @@
         "model": "claude-sonnet-4-6",
         "fast_mode": false,
         "window_crossing": false,
+        "floor_read_possibly_uncached_tokens": 12,
+        "floor_read_max_gap_seconds": 600,
         "actual": {
           "input": 100,
           "cache_read": 20,

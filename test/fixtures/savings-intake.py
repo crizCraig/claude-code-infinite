@@ -60,6 +60,8 @@ async def main() -> None:
                 response = await http.post(wire["path"], json=wire["body"], headers=wire["headers"])
                 assert response.status_code == 200
     assert len(rows) == 1 and rows[turn["turn_id"]]["requested_at"].startswith("2026-11-16")
+    for key in ("floor_read_possibly_uncached_tokens", "floor_read_max_gap_seconds"):
+        assert rows[turn["turn_id"]][key] == turn[key]
     print(json.dumps({"status": response.status_code, "response": response.json()}))
 
 

@@ -1,26 +1,23 @@
 import type { SavingsReplay } from './savings-history.js';
 import type { SavingsUsage } from './savings-report.js';
 type SavingsTokens = SavingsUsage;
-interface SavedPrefix {
-    hash: string;
-    tokens: number;
-}
-export interface SavingsLane {
+interface SentPrefix {
     at: number;
+    ttl: number;
+    exact?: number;
+    upper: number;
+}
+interface SavingsLane {
     model: string;
     full_hash: string;
     removed: number;
-    hourEnd: number;
-    cacheEnd: number;
-    prefixes: SavedPrefix[];
+    sent: Record<string, SentPrefix>;
 }
 export interface SavingsState {
     lanes: Record<string, SavingsLane>;
+    unknownHistory?: boolean;
 }
 export interface SavingsTurnInput {
-    /** A new compression/preparation/truncation, as opposed to riding an existing prefix. */
-    prefixRewritten: boolean;
-    forwardedRequest?: unknown;
     replay?: SavingsReplay<SavingsPromptCheckpoint>;
     request: unknown;
     usage: unknown;
@@ -41,17 +38,17 @@ export interface SavingsTurn {
     actual_tokens?: SavingsTokens;
     fast_mode: boolean;
     window_crossing: boolean;
+    floor_read_possibly_uncached_tokens: number | null;
+    floor_read_max_gap_seconds: number | null;
 }
 export declare function isSavingsSessionId(value: unknown): value is string;
 export declare const savingsLaneKey: (s: string) => string;
-/** Old simulated checkpoints cannot establish measured coverage. */
-export declare function isSavingsLane(value: unknown, at: number): value is SavingsLane;
+export declare function isSavingsState(value: unknown): value is SavingsState;
 /** Cache creation total includes its duration buckets; never count it twice. */
 export declare function normalizeSavingsUsage(value: unknown): SavingsTokens | undefined;
 export declare function createSavingsState(): SavingsState;
 interface SourcePrefix {
     hash: string;
-    content: string;
     history: string;
     weight: number;
     ttl: number;
@@ -62,7 +59,9 @@ export interface SavingsPromptCheckpoint {
     frame: string;
     prefixes: SourcePrefix[];
 }
-/** Account one successfully forwarded response. The optional local replay cache holds prefix work. */
+/** A settlement can improve the size of an already recorded dispatch. It
+ * cannot change who last sent the prefix, its TTL, or the compaction cursor. */
+export declare function refineSavingsState(current: SavingsState, settled: SavingsState, dispatched: SavingsState): SavingsState;
 export declare function accountSavingsTurn(previous: SavingsState, input: SavingsTurnInput): {
     state: SavingsState;
     turn: SavingsTurn;

@@ -45,11 +45,10 @@ export declare class RequestSizing {
     private readonly counts;
     private readonly enabled;
     private readonly model?;
-    private readonly shareCandidates;
     private readonly candidates;
     private readonly excludedFallbacks;
     /** `model` is the request's model: it picks the tokenizer family's ratio. */
-    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined, shareCandidates?: boolean);
+    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined);
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */

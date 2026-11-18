@@ -18,6 +18,8 @@ export type SavingsRecord = LegacyPreflight | (SavingsIdentity & {
     model: string;
     fast_mode: boolean;
     window_crossing: boolean;
+    floor_read_possibly_uncached_tokens?: number | null;
+    floor_read_max_gap_seconds?: number | null;
     actual: SavingsUsage | null;
     plain: SavingsUsage | null;
 });

@@ -10,7 +10,7 @@ one-hour writes and output independently for each side. The aggregate creation c
 durations; it is not an additional bucket. Invalid, negative, fractional, or
 inconsistent usage marks that turn incomplete. When the creation total is null or absent, two measured duration counts supply the total. A missing cache-duration split
 uses the historical five-minute creation bucket. A stream can supply input on the
-start or final delta. A null field leaves an earlier measured count intact.
+start or final delta. A complete duration split on the delta supplies its creation total even when the start reported zero.
 
 Polychat computes each session and reporting period using the same formula.
 
@@ -61,19 +61,11 @@ billing adjustments are outside this comparison.
 
 ## Plain Claude counterfactual
 
-An unmodified request uses actual input usage (all input buckets summed) and
-actual cache/output buckets on both sides, including above the simulated compaction
-ceiling and after a previous compression. Only a delivered compressed context contributes
-an API cost difference. The status line shows progress until the first such turn.
-Modified requests use an exact
-original Count Tokens value when supplied; otherwise the module divides prompt
-string characters by four and rounds down. This modest estimate is deliberately
-separate from the high safety token estimator used to decide whether requests
-fit. Opaque images/documents/audio/video and base64 sources contribute zero to
-the fallback estimate. This can understate their baseline expense. Estimates
-remain estimates: four characters per token is not a tokenizer or a formal
-lower bound, and language/code mixes can differ. Callers must never pass a high safety sizing estimate as an
-exact original count.
+An unmodified request measures the original input directly. For a modified
+request, ccc uses the original Count Tokens value when available. Otherwise it
+retains known token boundaries and estimates the remaining text at four
+characters per token. Opaque media and base64 sources add zero to that estimate.
+Token density varies by language and content.
 
 Plain context is finite. Each lane has a ceiling equal to the smaller of 80% of
 the model window and the window minus reserved output. On crossing it, assume
@@ -88,31 +80,35 @@ quality, and subsequent outputs can differ. The `window_crossing` flag indicates
 an impossible unlimited context. Output tokens are held equal to the observed
 response because alternate plain outputs cannot be measured.
 
-Each turn uses the delivered request’s measured cache reads, five-minute writes,
-one-hour writes and ordinary input. A passthrough copies all five buckets exactly.
-On a stable compressed prefix, ccc aligns the original and forwarded prompts at
-their common head and tail. Those tokens keep their measured outcome. Within the
-part whose length changes, plain uses the same proportions as the measured upstream
-buckets. The API supplies whole-request counts, so the block boundaries used
-for alignment are estimates based on relative text length.
+Plain pays the read rate for every matching prefix it has sent in this
+conversation lane. A long gap, a 429, an intervening edit, or a cold compressed
+request can all precede a plain read. New tokens covered by an eligible cache
+marker use the duration requested on the original prompt. Other new tokens
+use ordinary input pricing. The actual side uses the delivered response’s
+measured buckets. On a passthrough those measurements also bound the price
+of the identical original request.
 
-A newly delivered compression, prepared prefix or truncation changes what ccc
-sends upstream. Plain would have kept its previous prefix, including any later
-blocks that the rewrite invalidated. ccc prices matching, cacheable blocks in
-that region as reads up to the coverage of the
-preceding measured request in the same conversation lane. Five-minute and one-hour
-writes establish their respective lifetimes. Read counts have no duration split,
-so ccc uses the cache markers on the preceding **forwarded** request to estimate
-which reads used the one-hour lifetime. At the TTL boundary the entry has expired.
-The remaining cacheable region takes the original request’s write duration.
-Unmarked input stays ordinary input.
+A fully counted prefix keeps its token boundary when text is appended. Where
+an interior boundary is unknown, ccc prices ambiguous overlap as reads up to
+the nearest measured upper bound. It promotes new tokens to a more expensive
+write tier only through a known boundary. A final marker covers the entire
+input. These choices can under-credit savings.
 
-The worker keeps dispatch order, local prefix digests and measured coverage in a
-private directory scoped to service, credential, session and lane. Launchers
-sharing that directory use the same evidence. A definitive nonbillable refusal
-records zero and leaves earlier evidence at its original timestamp. An unsettled,
-unmeasured or unavailable predecessor supplies no rewrite credit. Old checkpoints
-containing simulated entries likewise supply no measured coverage.
+The worker records plain sends at dispatch, including refused and in-flight
+requests. Before forwarding, the launcher announces the send with a private
+empty file. A concurrent launcher can then assume reads while the first
+worker is still hashing the request. The private history contains cumulative block digests, token
+boundaries, send times and requested durations scoped by account, session and
+lane. Restarts can reuse that history. Incomplete or legacy history favors a
+read when an earlier send is possible. Settlement supplies measured usage for
+the immutable report. A definitive nonbillable refusal costs zero on both sides.
+
+Two optional admin diagnostics count floor reads whose last send was longer ago
+than that send’s TTL and record the longest such gap in whole seconds. An
+unmarked send has zero TTL. Zero indicates no qualifying gap and null indicates
+missing evidence. For example, a known gap can accompany a null token count
+when the boundary between two durations was never measured. Neither field
+affects pricing.
 
 The virtual compacted token minimum can omit original tool/system overhead,
 which lowers the plain baseline; it is not an exact reconstruction of Claude's
@@ -123,8 +119,8 @@ mathematical lower bound or a claim of identical task quality.
 
 An attributable upstream response produces a new UUID and one immutable record.
 The UTC timestamp comes from upstream dispatch. The launcher validates the session
-UUID and copies only the model, fast-mode flag, native-window crossing flag and the
-five plain and actual token buckets. Missing final usage is represented by null. A definitive, nonbillable
+UUID and records the model, fast-mode flag, native-window crossing flag,
+five plain and actual token buckets, and the two numeric floor diagnostics. Missing final usage is represented by null. A definitive, nonbillable
 upstream rejection records zero on both sides. Cancellation before upstream
 dispatch produces no API turn. MemTree billing handles compression, indexing,
 reads and searches independently, including work completing after cancellation.
@@ -140,8 +136,7 @@ The sender posts up to 50 turns to `/v1/ccc/savings/turns`. Only IDs in a readab
 `acked_turn_ids` response are removed. The filename records the next eligible retry
 time, starting at one minute and doubling to a maximum of 30 minutes. Missing
 acknowledgements survive restarts. An invalid credential suspends the sender.
-Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. A launcher worker hashes the shared request bytes
-and handles dispatch checkpoints in the order the proxy queues them.
+Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. A launcher worker hashes the original request and maintains the private send history.
 
 ## Status line
 
@@ -155,16 +150,25 @@ percentage first on narrow terminals.
 
 ## Worked example
 
-At Sonnet 4.6’s $3 per million input tokens, a passthrough writes a 30,000-token
-prefix for five minutes. Both sides cost $0.112500. A 429 costs zero. Two seconds
-after the write, ccc rewrites that prefix. The successful retry reports 2,000
-ordinary input tokens and one output token, costing $0.006015. Plain would read
-the same 30,000-token prefix and produce the same output, costing $0.009015.
+Each row prices the affected turn at Sonnet 4.6 rates, then subtracts $0.050
+in MemTree charges. Previously billed setup turns are outside each row. A
+passthrough that establishes the initial measured write costs the same on both
+sides.
 
-Across the three requests, plain costs $0.121515 and ccc costs $0.118515.
-The $0.003 difference less $0.050 in billed MemTree charges gives **−$0.047 net**.
-The period is ineligible for a positive savings email. This example uses synthetic
-usage and the same token rates as the server.
+| Round 7 turn | Plain input | ccc input | Plain USD | Actual USD | Net USD |
+| --- | --- | --- | ---: | ---: | ---: |
+| Stable compressed request after ten minutes | 31,000 reads | 2,000 five-minute writes | 0.009300 | 0.007500 | **−0.048200** |
+| Rewrite overlapping a 429 | 30,000 reads | 2,000 ordinary | 0.009000 | 0.006000 | **−0.047000** |
+| Low-density append | 30,000 reads and 1,000 five-minute writes | 900 ordinary | 0.012765 | 0.002715 | **−0.039950** |
+
+In the first row, 30,000 plain tokens had a one-hour marker and 1,000 had a
+five-minute marker. The diagnostic flags only the latter 1,000 at a 600-second
+gap. Including the intermediate compressed turn adds another $0.001800
+gross, making the full three-dispatch sequence **−$0.046400** with the same
+$0.050 charge. In the second row, the 429 costs zero in every settlement order. In the third,
+the original prefix still measures 30,000 after the append takes the request to
+31,000. Both sides include one output token in this row. All three nets are
+negative and none qualifies for a savings email.
 
 The terminal integration includes attributable main, agent, recap and passthrough
 calls. The server can only price turns the client observed and delivered. Buffered

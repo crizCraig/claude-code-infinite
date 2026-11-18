@@ -15,15 +15,13 @@ export class RequestSizing {
     counts;
     enabled;
     model;
-    shareCandidates;
     candidates = new Map();
     excludedFallbacks = new Set();
     /** `model` is the request's model: it picks the tokenizer family's ratio. */
-    constructor(counts, enabled, model, shareCandidates = false) {
+    constructor(counts, enabled, model) {
         this.counts = counts;
         this.enabled = enabled;
         this.model = model;
-        this.shareCandidates = shareCandidates;
     }
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body, kind, sample) {
@@ -36,11 +34,7 @@ export class RequestSizing {
         const plain = conservativeBodyTokens(body, this.model);
         const conservativeTokens = Math.min(plain, (extendsSample(snapshot, body, this.model) &&
             anchoredBound(snapshot, bodyShape(body), this.model)) || Infinity);
-        // Savings reads modified bytes on its worker after delivery. Share the
-        // existing owned snapshot so posting a large media turn never copies it again.
-        const owned = this.shareCandidates && kind !== "original"
-            ? Buffer.from(new SharedArrayBuffer(body.length)) : Buffer.allocUnsafe(body.length);
-        body.copy(owned);
+        const owned = Buffer.from(body);
         // The same totals and shape answer for the owned copy (reportedSample of the sent bytes).
         rememberImages(owned, this.model, images);
         rememberShape(owned, knownShape(body));

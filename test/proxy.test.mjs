@@ -11965,11 +11965,10 @@ test('savings includes same-session monitor and title passthrough usage', async 
   } finally { proxy.close();upstream.close(); }
 });
 
-test('savings distinguishes a delivered compression from riding that same prefix', async () => {
+test('savings registers the original prompt on both a compression and a stable ride', async () => {
   const observations = [];
   const h = await startMidTurnHarness({defaultCompactTarget:null, savings:{
-    startTurn:() => ({dispatched(){}}), progress(){},
-    settle(_observation,input){observations.push(input)},
+    startTurn:() => ({announce(){},dispatched(input){observations.push(input)}}), progress(){}, settle(){},
   }});
   try {
     const headers = {'x-claude-code-session-id':'12345678-1234-4123-8123-123456789abc'};
@@ -11978,9 +11977,29 @@ test('savings distinguishes a delivered compression from riding that same prefix
     await postMessages(h.proxy.port,base,headers);
     await postMessages(h.proxy.port,withToolRound(base,'t1'),headers);
     await waitFor(() => observations.length === 2);
-    assert.deepEqual(observations.map(o => [o.requestModified,o.prefixRewritten]),[[true,true],[true,false]]);
-    const sent = observations[1].forwardedRequest;
-    assert.ok(sent.buffer instanceof SharedArrayBuffer);
-    assert.equal(JSON.stringify(JSON.parse(sent).messages),h.lastUpstream());
+    for (const [i, prompt] of [base, withToolRound(base,'t1')].entries()) {
+      const observation = observations[i];
+      assert.equal(observation.requestModified,true);
+      assert.ok(observation.request.buffer instanceof SharedArrayBuffer);
+      assert.deepEqual(JSON.parse(observation.request).messages,prompt);
+    }
   } finally { h.close(); }
+});
+
+test('a resumed one-message conversation with missing savings history assumes a plain read', async () => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const upstream = await mockUpstream();
+  let report;
+  const savings = new SavingsTracker({diagnostics:{savingsAccount:{},bindSavings:()=>r=>{report=r}}});
+  const proxy = await startProxy({memtree:new MemtreeClient({baseUrl:upstream.origin,apiKey:'test'}),
+    upstreamOrigin:upstream.origin,savings});
+  try {
+    const session = '12345678-1234-4123-8123-123456789abc';
+    await postHook(proxy,{hook_event_name:'SessionStart',source:'resume',session_id:session});
+    await postMessages(proxy.port,[{role:'user',content:'retry'}],{'x-claude-code-session-id':session});
+    await waitFor(()=>report);
+    assert.equal(report.actual.input,1);
+    assert.equal(report.plain.cache_read,1);
+    assert.equal(report.floor_read_max_gap_seconds,null);
+  } finally { proxy.close(); upstream.close(); }
 });

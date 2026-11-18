@@ -786,9 +786,16 @@ function mergeUsage(usage: unknown, rec: MessagesRecord): void {
   if (speed === "fast" || speed === "standard") (rec.usage ??= {}).speed = speed;
   const creation = (usage as Record<string, unknown>).cache_creation;
   if (creation && typeof creation === "object") {
+    const split = creation as Record<string, unknown>;
+    const {ephemeral_5m_input_tokens: five, ephemeral_1h_input_tokens: hour} = split;
+    if ((usage as Record<string, unknown>).cache_creation_input_tokens == null &&
+        validTokenCount(five) && validTokenCount(hour)) {
+      // A complete split measures this event's total, even after a zero on message_start.
+      (rec.usage ??= {}).cache_creation_input_tokens = five + hour;
+    }
     const target = ((rec.usage ??= {}).cache_creation ??= {});
     for (const key of ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] as const) {
-      const value = (creation as Record<string, unknown>)[key];
+      const value = split[key];
       if (typeof value === "number") target[key] = value;
     }
   }

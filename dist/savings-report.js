@@ -37,7 +37,15 @@ export function savingsReport(value) {
     const actual = usage(v.actual), plain = usage(v.plain);
     if (actual === undefined || plain === undefined)
         return;
-    return { ...identity, model: v.model, fast_mode: v.fast_mode,
+    const report = { ...identity, model: v.model, fast_mode: v.fast_mode,
         window_crossing: v.window_crossing, actual, plain };
+    for (const field of ['floor_read_possibly_uncached_tokens', 'floor_read_max_gap_seconds']) {
+        const count = v[field];
+        const max = field === 'floor_read_max_gap_seconds' ? Number.MAX_SAFE_INTEGER : plain?.cache_read ?? 1_000_000_000;
+        if (count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && count <= max)) {
+            report[field] = count;
+        }
+    }
+    return report;
 }
 //# sourceMappingURL=savings-report.js.map
