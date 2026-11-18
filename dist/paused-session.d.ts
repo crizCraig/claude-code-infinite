@@ -1,3 +1,4 @@
+import type { QuestionInput } from "./question-input.js";
 import type { AutoUpdateSetup } from "./auto-update-setup.js";
 import { type ClaudeLocation } from "./claude-locate.js";
 import { type Diagnostics } from "./diagnostics.js";
@@ -9,6 +10,7 @@ export type PausedSessionOptions = {
     autoUpdate: AutoUpdateSetup | null;
     /** The SessionStart banner (interactive only); undefined shows none. */
     banner?: string;
+    questionInput?: QuestionInput;
 };
 /** Run Claude Code as if ccc were not there, then exit with its status. Never returns. */
 export declare function runWithoutMemtree(opts: PausedSessionOptions): Promise<never>;

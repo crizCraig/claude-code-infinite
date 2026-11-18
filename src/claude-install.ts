@@ -15,8 +15,7 @@
  */
 
 import spawn from "cross-spawn";
-import * as path from "node:path";
-import { claudeMissingText, type ClaudeLocation } from "./claude-locate.js";
+import { claudeMissingText, system32Path, type ClaudeLocation } from "./claude-locate.js";
 
 /** Anthropic's official install one-liners (https://code.claude.com/docs/en/setup). */
 export const WINDOWS_INSTALL_SCRIPT = "irm https://claude.ai/install.ps1 | iex";
@@ -99,7 +98,7 @@ export function installerCommand(
 ): InstallerCommand {
   if (platform === "win32") {
     return {
-      command: windowsPowerShell(env),
+      command: system32Path(env, "WindowsPowerShell", "v1.0", "powershell.exe"),
       args: ["-NoProfile", "-Command", WINDOWS_INSTALL_SCRIPT],
       display: WINDOWS_INSTALL_SCRIPT,
       env: withoutPsModulePath(env),
@@ -169,16 +168,6 @@ function failureLine(run: InstallerRun, installer: InstallerCommand): string {
 }
 
 /**
- * Windows PowerShell, always by full path: PATH may be what is broken, and a
- * search by name would try the current folder (a project's powershell.exe) first.
- * Missing, the spawn fails and the manual steps are shown.
- */
-function windowsPowerShell(env: NodeJS.ProcessEnv): string {
-  const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
-  return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-
-/**
  * ccc started from PowerShell 7 inherits its PSModulePath, which makes Windows
  * PowerShell 5.1 load 7's modules and lose its own (the installer's Get-FileHash
  * is then "not recognized"). Without it, 5.1 builds its default path.
@@ -187,9 +176,4 @@ function withoutPsModulePath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(
     Object.entries(env).filter(([key]) => key.toUpperCase() !== "PSMODULEPATH")
   );
-}
-
-function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const key = Object.keys(env).find((k) => k.toUpperCase() === name.toUpperCase());
-  return key === undefined ? undefined : env[key];
 }

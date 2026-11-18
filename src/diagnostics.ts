@@ -6,7 +6,8 @@
  * terminal type, locale, and lifecycle and error events made of enums, status
  * codes, sizes and timings (diagnostics-schema.ts is the allowlist; polychat
  * enforces it again). Never prompts, paths, hostnames, usernames, env values,
- * keys or error message text.
+ * keys or error message text. The optional first-run answer is explicitly volunteered
+ * account metadata, sent once as first_run_answer (never taken from a session).
  *
  * Hard constraints, like reqlog.ts: never throw and never block. Events go into
  * a capped in-memory queue; batches are POSTed fire-and-forget (every

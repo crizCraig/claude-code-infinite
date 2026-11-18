@@ -223,6 +223,7 @@ Environment variables, set when launching `ccc`:
 | `CCC_AUTO_COMPACT=1` | Restores Claude Code's own auto-compaction and idle compaction settings ([details](#claude-code-auto-compaction)). |
 | `CCC_NO_UPDATE_CHECK=1` | Turns off the update check, and with it automatic updates ([details](#upgrading)). |
 | `CCC_DISABLE_AUTOUPDATE=1` | Keeps the update notice but never installs ([details](#automatic-updates)). |
+| `CCC_NO_FIRST_RUN_QUESTION=1` | Skips the optional first-run question about why you use ccc. |
 | `CCC_NO_DIAGNOSTICS=1` | Turns off diagnostics ([details](#diagnostics)). So do `DO_NOT_TRACK=1`, Claude Code's `DISABLE_TELEMETRY=1` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and `"diagnostics": false` in `~/.claude-code-infinite/config.json`. |
 
 Links are clickable in terminals that support OSC 8 hyperlinks (iTerm2, Ghostty, WezTerm,
@@ -430,6 +431,29 @@ environment get MemTree. Sessions in other environments are unchanged.
 
 ### Diagnostics
 
+On a genuinely new install's first launch, ccc can ask once what brings you to Claude Code
+Infinite. "New" means `~/.claude-code-infinite` was absent or empty before startup, or
+contains only `install_id`, `first_run_pending`, and this version's fresh-postinstall proof
+(`first-question-new-install`, matching the install ID). Any other pre-existing entry,
+including config, saved keys, sessions, logs, or unknown state, excludes the question.
+Old install IDs and pending markers alone never qualify; upgrading an existing install
+does not ask. Eligibility is checked before this launch writes state or saves its first key.
+
+Before Claude starts, press a number from 1 to 6 to send your choice. **6) Other** is a
+single keypress. Enter or Esc skips as soon as the menu appears. The menu also skips after
+45 seconds. Ctrl+C at the displayed menu records a skip and quits ccc with exit code 130.
+
+ccc waits for 400 ms of quiet before showing the menu. If you have already started typing,
+Claude receives your input, including Enter, and ccc permanently skips the question. Typing
+prompt text or pasting at the visible menu also passes it through to Claude. The choice or skip
+is recorded in `~/.claude-code-infinite/first-run-question.json`.
+A choice is optional account metadata sent once through diagnostics with your MemTree key.
+Skips stay local. Only an interactive `ccc` launch with zero arguments can show the question.
+Environment selectors (`staging`, `local`), flags (including `--debug`, `--resume`,
+`--continue` and `-p`), and positional arguments all skip it. CI runs and rejected keys skip it. On macOS and Linux, ccc also skips the
+question if Python 3 is unavailable to preserve terminal input. Set `CCC_NO_FIRST_RUN_QUESTION=1` to opt
+out. Disabling diagnostics also disables the question.
+
 `ccc` sends a few diagnostics to MemTree so we can see why a session fails to start or stalls:
 
 - versions (ccc, Claude Code, Node), how ccc was installed (npm, npx, linked), OS and CPU
@@ -444,9 +468,9 @@ environment get MemTree. Sessions in other environments are unchanged.
 - errors as codes, status numbers, sizes and timings (an Anthropic 401, a MemTree 402, a
   compression timeout).
 
-Never sent: your prompts or any conversation content, file paths, project or repository names,
-hostnames, usernames, environment values, keys or tokens, or error message text. Each event is
-checked against a fixed allowlist on your machine before it is queued, and again by the server.
+Diagnostics never include your prompts, conversation content, file paths, project or repository
+names, hostnames, usernames, environment values, keys or tokens, or error message text. Each
+event is checked against a fixed allowlist on your machine before it is queued, and again by the server.
 They are tied to your MemTree key when you have one, otherwise to a random install id in
 `~/.claude-code-infinite/install_id`. Sending is batched in the background and never slows a
 request; a failed send is dropped.

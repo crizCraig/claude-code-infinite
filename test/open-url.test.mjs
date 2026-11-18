@@ -13,8 +13,15 @@ test("each OS opens the URL with its own opener, the URL one argument (no shell)
   // rundll32 hands the URL to the default browser without cmd.exe parsing it,
   // System32's copy rather than one found on PATH.
   assert.deepEqual(browserOpenCommand(URL, "win32", { SystemRoot: "D:\\Win" }),
-    { command: "D:\\Win\\System32\\rundll32.exe", args: ["url.dll,FileProtocolHandler", URL] });
+    { command: "D:\\Win\\System32\\rundll32.exe", args: ["D:\\Win\\System32\\url.dll,FileProtocolHandler", URL] });
   assert.equal(browserOpenCommand(URL, "win32", {}).command, "C:\\Windows\\System32\\rundll32.exe");
+});
+
+test("Windows startup never resolves the browser opener from the project", () => {
+  for (const root of ["", ".", "D:relative", "\\relative"]) {
+    assert.equal(browserOpenCommand(URL, "win32", { SystemRoot: root }).command,
+      "C:\\Windows\\System32\\rundll32.exe", root);
+  }
 });
 
 test("only http(s) URLs are opened", () => {

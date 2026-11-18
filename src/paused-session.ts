@@ -13,6 +13,7 @@
  * MemTree is off for this session, and how to turn it back on.
  */
 import spawn from "cross-spawn";
+import type { QuestionInput } from "./question-input.js";
 import type { AutoUpdateSetup } from "./auto-update-setup.js";
 import {
   claudeExitFields,
@@ -42,6 +43,7 @@ export type PausedSessionOptions = {
   autoUpdate: AutoUpdateSetup | null;
   /** The SessionStart banner (interactive only); undefined shows none. */
   banner?: string;
+  questionInput?: QuestionInput;
 };
 
 /** Run Claude Code as if ccc were not there, then exit with its status. Never returns. */
@@ -51,8 +53,9 @@ export async function runWithoutMemtree(opts: PausedSessionOptions): Promise<nev
   const startedAt = Date.now();
   const child = spawn(opts.claude.command, args, {
     env: withClaudeOnPath(plainClaudeEnv(process.env), opts.claude),
-    stdio: "inherit",
+    stdio: [opts.questionInput?.fd ?? "inherit", "inherit", "inherit"],
   });
+  child.once("close", () => opts.questionInput?.close());
   const exited = new Promise<number>((resolve) => {
     child.on("error", (err: Error) => resolve(childStartFailed(err, opts.diagnostics)));
     child.on("exit", (code, signal) => {
