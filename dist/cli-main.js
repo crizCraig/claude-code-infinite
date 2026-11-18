@@ -937,6 +937,8 @@ async function main() {
 }
 main().catch(async (err) => {
     console.error(err);
+    // A piped stderr may still have Node diagnostics queued ahead of the startup error.
+    await writeStdout("", process.stderr);
     if (activeDiagnostics) {
         recordError(activeDiagnostics, "startup_failed", err);
         await activeDiagnostics.flush();

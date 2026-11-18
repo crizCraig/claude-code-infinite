@@ -20,7 +20,8 @@ function run(t, args, messages, env = {}, config = {
   mkdirSync(dir);
   writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
   const result = spawnSync(process.execPath, ["--import", mock, cli, "memtree-mcp", ...args], {
-    encoding: "utf8", timeout: 15000,
+    // NODE_DEBUG=* can log several MiB of ESM loader diagnostics before startup.
+    encoding: "utf8", timeout: 15000, maxBuffer: 32 * 1024 * 1024,
     env: { ...process.env, HOME: home, USERPROFILE: home,
       CCC_MEMTREE_PROXY: "http://proxy.invalid", ANTHROPIC_BASE_URL: "http://anthropic.invalid",
       CCC_MEMTREE_HOST_TOKEN: "stale", CLAUDE_CODE_SESSION_ID: session,
