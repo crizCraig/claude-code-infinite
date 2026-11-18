@@ -5,6 +5,7 @@ import test from "node:test";
 
 for (const scenario of [
   "before", "guard", "visible", "paste", "paste-split", "answer-burst",
+  "cli-debug", "cli-staging", "cli-local", "cli-resume", "cli-no-python",
   "cli", "cli-queued", "cli-paid", "cli-unpaid-ahead", "cli-unpaid-quit-ahead",
 ]) {
   test(`Claude receives the original terminal bytes: ${scenario}`, {

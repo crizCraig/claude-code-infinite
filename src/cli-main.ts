@@ -300,11 +300,15 @@ async function runPaymentGate(
     const link = await links.get();
     console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
     const prompt = paymentGatePrompt(link);
-    if (guardInput && !showPaymentPromptIfClear(process.stdin, prompt)) {
+    const guard = guardInput ? showPaymentPromptIfClear(process.stdin, prompt) : undefined;
+    if (guard === "queued") {
       console.log(resumed ? RESUMED_PAUSED_LINE : MEMTREE_OFF_LINE);
       return "queued";
     }
-    const choice = parsePaymentChoice(await askLine(prompt, input, guardInput));
+    if (guard === "unavailable") {
+      console.warn("The optional terminal helper is unavailable. Install Python 3 on PATH to enable the first-run input guard.");
+    }
+    const choice = parsePaymentChoice(await askLine(prompt, input, guard === "shown"));
     diagnostics.record("payment_gate", { choice });
     if (choice === "quit") {
       await diagnostics.flush();
@@ -517,7 +521,8 @@ async function main() {
   // when ComSpec is missing would repeat executable lookup from the project.
   if (process.platform === "win32") process.env.ComSpec = system32Path(process.env, "cmd.exe");
   const newInstall = takeNewInstall(getConfigDir());
-  const parsedArgs = parseWrapperArgs(process.argv.slice(2));
+  const launchArgs = process.argv.slice(2);
+  const parsedArgs = parseWrapperArgs(launchArgs);
   const isDebugMode = parsedArgs.debug;
   const filteredArgs = parsedArgs.claudeArgs;
 
@@ -640,7 +645,7 @@ async function main() {
   if (isDebugMode) console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
 
   const questionOptions = {
-    newInstall, configDir: getConfigDir(), args: claudeArgs, env: process.env, diagnostics,
+    newInstall, configDir: getConfigDir(), args: launchArgs, env: process.env, diagnostics,
     stdinIsTty: process.stdin.isTTY === true, stdoutIsTty: process.stdout.isTTY === true,
   };
   const promptStream = canAskFirstRunQuestion(questionOptions) ? startupPromptInput() : undefined;

@@ -49,6 +49,9 @@ if scenario == "cli-unpaid-quit-ahead":
     data = b"q\r"
 queued_at_key = scenario in ("cli-paid", "cli-unpaid-ahead", "cli-unpaid-quit-ahead")
 early = scenario in ("before", "guard", "cli-queued") or queued_at_key
+launch_args = {"cli-debug": ["--debug"], "cli-staging": ["staging"], "cli-local": ["local"],
+               "cli-resume": ["--resume"]}
+no_menu = scenario in launch_args or scenario == "cli-no-python"
 master, slave = pty.openpty()
 original = termios.tcgetattr(slave)
 screen = bytearray()
@@ -70,7 +73,7 @@ with tempfile.TemporaryDirectory() as directory:
                           "if (process.argv.includes('auth')) { console.log(JSON.stringify("
                           "{loggedIn:false,authMethod:'none'})); process.exit(0); }\n"
                           "if (process.argv.includes('--version')) { console.log('2.1.0'); process.exit(0); }\n"
-                          + receiver)
+                          + ("console.log('CHILD STARTED'); process.exit(0);" if no_menu else receiver))
         claude.chmod(0o755)
         preload = root / "fetch.mjs"
         paid = scenario == "cli-paid"
@@ -86,6 +89,9 @@ globalThis.fetch = async () => Response.json({paid: PAID});
                "CCC_NO_UPDATE_CHECK": "1", "TERM": "xterm-256color",
                **{k: env[k] for k in ["NO_COLOR", "FORCE_COLOR"] if k in env}}
         args = [node, "--import", str(preload), "dist/cli.js"]
+        args.extend(launch_args.get(scenario, []))
+        if scenario == "cli-no-python":
+            env["PATH"] = directory
         config_dir = root / ".claude-code-infinite"
     proc = subprocess.Popen(args, env=env, stdin=slave, stdout=slave, stderr=slave)
     os.close(slave)
@@ -103,12 +109,24 @@ globalThis.fetch = async () => Response.json({paid: PAID});
             until(b"in your browser")
             os.write(master, b"\r")
             until(b"paste it here")
-            os.write(master, b"test-key\r" + (data if queued_at_key else b""))
+            os.write(master, b"sk-" + b"1" * 32 + b"\r" + (data if queued_at_key else b""))
             if not queued_at_key:
                 until(b"[q] quit")
                 os.write(master, b"c\r" + (data if scenario == "cli-queued" else b""))
         else:
             until(b"STARTING")
+        if no_menu:
+            if scenario == "cli-resume":
+                until(b"Press Enter to continue to Claude Code")
+                os.write(master, b"\r")
+            until(b"CHILD STARTED")
+            assert proc.wait(timeout=3) == 0
+            assert menu not in screen, screen
+            if scenario == "cli-no-python":
+                assert b"Install Python 3 on PATH" in screen
+            if scenario in launch_args:
+                assert not (config_dir / "first-run-question.json").exists()
+            sys.exit(0)
         if scenario == "guard":
             until(b"\x1b[?2004h")
         elif not early:

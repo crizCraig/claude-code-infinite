@@ -34,16 +34,10 @@ interface QuestionOptions {
   ask: (question: string, signal: AbortSignal) => Promise<Selection>;
 }
 
-// Prompt-bearing, subcommand, and unfamiliar argument forms go directly to Claude.
-function isQuestionSession(args: string[]): boolean {
-  return args.length === 0 ||
-    (args.length === 1 && ["-c", "--continue", "-r", "--resume"].includes(args[0]));
-}
-
 export function canAskFirstRunQuestion(opts: Omit<QuestionOptions, "ask" | "keyCheck">): boolean {
   return (opts.platform ?? process.platform) !== "win32" && opts.newInstall &&
     opts.stdinIsTty && opts.stdoutIsTty && !isCi(opts.env) &&
-    isQuestionSession(opts.args) && opts.diagnostics.enabled &&
+    opts.args.length === 0 && opts.diagnostics.enabled &&
     !/^(1|true|yes|on)$/i.test(opts.env.CCC_NO_FIRST_RUN_QUESTION?.trim() ?? "");
 }
 

@@ -448,8 +448,9 @@ Claude receives your input, including Enter, and ccc permanently skips the quest
 prompt text or pasting at the visible menu also passes it through to Claude. The choice or skip
 is recorded in `~/.claude-code-infinite/first-run-question.json`.
 A choice is optional account metadata sent once through diagnostics with your MemTree key.
-Skips stay local. Only a bare interactive launch or a standalone continue/resume flag can
-show the question. CI runs and rejected keys skip it. On macOS and Linux, ccc also skips the
+Skips stay local. Only an interactive `ccc` launch with zero arguments can show the question.
+Environment selectors (`staging`, `local`), flags (including `--debug`, `--resume`,
+`--continue` and `-p`), and positional arguments all skip it. CI runs and rejected keys skip it. On macOS and Linux, ccc also skips the
 question if Python 3 is unavailable to preserve terminal input. Set `CCC_NO_FIRST_RUN_QUESTION=1` to opt
 out. Disabling diagnostics also disables the question.
 

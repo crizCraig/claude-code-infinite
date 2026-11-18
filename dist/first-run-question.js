@@ -14,15 +14,10 @@ export const FIRST_RUN_QUESTION = "\nOptional account metadata sent to MemTree; 
     "What brings you to Claude Code Infinite? (Press a number to choose, or Enter or Esc to skip. Skips after 45 seconds.)\n" +
     "  1) Long coding sessions  2) Agents that run for hours  3) Remembering past work\n" +
     "  4) Saving Claude usage   5) Just curious              6) Other\n> ";
-// Prompt-bearing, subcommand, and unfamiliar argument forms go directly to Claude.
-function isQuestionSession(args) {
-    return args.length === 0 ||
-        (args.length === 1 && ["-c", "--continue", "-r", "--resume"].includes(args[0]));
-}
 export function canAskFirstRunQuestion(opts) {
     return (opts.platform ?? process.platform) !== "win32" && opts.newInstall &&
         opts.stdinIsTty && opts.stdoutIsTty && !isCi(opts.env) &&
-        isQuestionSession(opts.args) && opts.diagnostics.enabled &&
+        opts.args.length === 0 && opts.diagnostics.enabled &&
         !/^(1|true|yes|on)$/i.test(opts.env.CCC_NO_FIRST_RUN_QUESTION?.trim() ?? "");
 }
 /** Hold raw mode during startup waits so the terminal can't translate Enter or edit a line. */

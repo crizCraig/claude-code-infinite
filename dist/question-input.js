@@ -42,12 +42,14 @@ const script = fileURLToPath(new URL("../scripts/question-input.py", import.meta
 /** Display the payment prompt at the queue check, before any subsequent input is read. */
 export function showPaymentPromptIfClear(input, prompt) {
     const python = posixPython();
-    if (!python || input.readableLength)
-        return false;
+    if (input.readableLength)
+        return "queued";
+    if (!python)
+        return "unavailable";
     const result = spawnSync(python, ["-I", "-S", script, "payment", prompt], {
         stdio: ["ignore", "inherit", "ignore", input], timeout: 2000,
     });
-    return result.status === 0;
+    return result.status === 0 ? "shown" : result.status === 42 ? "queued" : "unavailable";
 }
 /** The child keeps its own PID, inherited stdout/stderr, and a real terminal on fd 0. */
 export async function prepareQuestionInput(input, guardMs) {

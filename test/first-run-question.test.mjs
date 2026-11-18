@@ -70,7 +70,7 @@ const skips = [
   { newInstall: false }, { keyCheck: "invalid" },
   ...["-p", "--print", "--print=x", "-pc", "-cp", "-prsession"].map((flag) => ({ args: [flag] })),
   { args: ["--append-system-prompt", "--", "-cp"] },
-  ...["--help", "--version", "doctor", "mcp"].map((flag) => ({ args: [flag] })),
+  ...["--continue", "-c", "--resume", "-r", "--debug", "staging", "local", "--", "--help", "--version", "doctor", "mcp"].map((flag) => ({ args: [flag] })),
   ...[
     ["--append-system-prompt", "--", "--help"], ["--", "--version"], ["config"],
     ["auth", "status", "--json"], ["new-future-command"], ["--model", "sonnet", "doctor"],
@@ -109,7 +109,7 @@ test("Windows first-run input opens no console device and spawns no program", as
   try {
     assert.equal(startupPromptInput(), undefined);
     assert.equal(await prepareQuestionInput(process.stdin, 0), undefined);
-    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), false);
+    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), "unavailable");
     assert.equal(await readFirstRunAnswer("question", new AbortController().signal,
       process.stdin, process.stdout), "skipped");
     for (const call of [open, spawn, spawnSync]) assert.equal(call.mock.callCount(), 0);
@@ -134,7 +134,7 @@ test("first-run terminal helpers pass an absolute executable to every spawn", {
   syncBuiltinESMExports();
   try {
     process.env.PATH = ".:" + dir;
-    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), true);
+    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), "shown");
     await assert.rejects(prepareQuestionInput(process.stdin, 0), stop);
     assert.deepEqual(calls, [python, python]);
   } finally {
@@ -143,14 +143,6 @@ test("first-run terminal helpers pass an absolute executable to every spawn", {
     t.mock.restoreAll();
     syncBuiltinESMExports();
     rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("standalone continue and resume flags can show the question", async t => {
-  for (const flag of ["--continue", "-c", "--resume", "-r"]) {
-    const { opts, asked } = fixture(t, { args: [flag] });
-    await askFirstRunQuestion(opts);
-    assert.deepEqual(asked, [FIRST_RUN_QUESTION]);
   }
 });
 
