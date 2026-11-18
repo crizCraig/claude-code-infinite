@@ -113,11 +113,10 @@ import {
   writeStdout,
 } from "./cli-lifecycle.js";
 import {
-  getPolychatApiKey,
+  storedApiKey,
+  memtreeBaseUrlFor,
   setPolychatApiKey,
-  getLocalPolychatApiKey,
   setLocalPolychatApiKey,
-  getStagingPolychatApiKey,
   setStagingPolychatApiKey,
   getConfigDir,
   loadConfig,
@@ -179,10 +178,6 @@ import {
   startHttpsProxySession, type HttpsProxyChild, type HttpsProxySession,
 } from "./https-proxy-session.js";
 
-// MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
-const POLYCHAT_BASE_URL = "https://api.polychat.co";
-const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
-const LOCAL_BASE_URL = "http://localhost:8080";
 const SHUTDOWN_PROXY_DRAIN_MS = 5_000;
 const SHUTDOWN_LOG_FLUSH_MS = 2_000;
 /** Shutdown's wait for the child's exit and the resume hint's (asynchronous) write. */
@@ -492,11 +487,8 @@ function installedClaudeSupportsMessageDisplay(command: string): boolean {
 function linkDeps(mode: Mode): LinkDeps {
   return {
     fetch: globalThis.fetch,
-    baseUrl: mode === "local" ? LOCAL_BASE_URL : mode === "staging" ? STAGING_BASE_URL : POLYCHAT_BASE_URL,
-    apiKey:
-      mode === "local" ? getLocalPolychatApiKey() :
-      mode === "staging" ? getStagingPolychatApiKey() :
-      getPolychatApiKey(),
+    baseUrl: memtreeBaseUrlFor(mode, {}),
+    apiKey: storedApiKey(mode),
     command: mode === "production" ? "ccc" : `ccc ${mode}`,
     stdout: (text) => process.stdout.write(text),
     stderr: (text) => process.stderr.write(text),
@@ -513,14 +505,13 @@ async function main() {
   // when it is not running inside a ccc session.
   // `ccc memtree-mcp`: the `memtree` MCP server over stdio (memtree-mcp.ts),
   // for an --mcp-config a caller writes (e.g. the memory recall probe). It
-  // reads the tree through the ccc proxy in its inherited ANTHROPIC_BASE_URL.
-  // Both also follow `local`/`staging`, whose proxy the base URL already is.
+  // reads through the inherited ccc proxy, or uses the saved key in direct mode.
   const subcommand = subcommandArgs(filteredArgs);
   if (subcommand?.name === "fetch") {
     process.exit(await runMemtreeFetchCommand(subcommand.args));
   }
   if (subcommand?.name === "memtree-mcp") {
-    runMemtreeMcpServer();
+    runMemtreeMcpServer(process.env, subcommand.args, environmentOf(filteredArgs));
     return;
   }
 
@@ -1324,18 +1315,4 @@ function httpsProxyChild(
 function joinPromptLines(...lines: Array<string | null | undefined>): string | undefined {
   const present = lines.filter((line): line is string => typeof line === "string" && line !== "");
   return present.length ? present.join("\n") : undefined;
-}
-
-/** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
-function memtreeBaseUrlFor(mode: Mode): string {
-  return mode === "local" ? (process.env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
-    mode === "staging" ? STAGING_BASE_URL :
-    POLYCHAT_BASE_URL;
-}
-
-/** The saved MemTree key for a mode (separate keys per environment). */
-function storedApiKey(mode: Mode): string | undefined {
-  return mode === "local" ? getLocalPolychatApiKey() :
-    mode === "staging" ? getStagingPolychatApiKey() :
-    getPolychatApiKey();
 }

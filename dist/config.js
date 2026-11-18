@@ -66,4 +66,20 @@ export function setLocalPolychatApiKey(key) {
     config.localPolychatApiKey = key;
     saveConfig(config);
 }
+// MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
+const POLYCHAT_BASE_URL = "https://api.polychat.co";
+const STAGING_BASE_URL = "https://polychat-staging-421312241218.us-west2.run.app";
+const LOCAL_BASE_URL = "http://localhost:8080";
+/** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
+export function memtreeBaseUrlFor(mode, env = process.env) {
+    return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
+        mode === "staging" ? STAGING_BASE_URL :
+            POLYCHAT_BASE_URL;
+}
+/** The saved MemTree key for a mode (separate keys per environment). */
+export function storedApiKey(mode) {
+    return mode === "local" ? getLocalPolychatApiKey() :
+        mode === "staging" ? getStagingPolychatApiKey() :
+            getPolychatApiKey();
+}
 //# sourceMappingURL=config.js.map

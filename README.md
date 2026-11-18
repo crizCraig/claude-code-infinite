@@ -110,6 +110,22 @@ Hits name their node, so Claude goes from a search hit to the summary around it 
 exact lines. Type `/memtree-view` to open this session's tree in your browser. Details are under
 [Memory tools](#memory-tools).
 
+### Read ccc sessions from Codex or another MCP client
+
+Register `ccc memtree-mcp --direct` as a stdio MCP server. For an installed `ccc` on your PATH,
+add this to your Codex `config.toml`:
+
+```toml
+[mcp_servers.memtree]
+command = "ccc"
+args = ["memtree-mcp", "--direct"]
+```
+
+Direct mode uses the production key saved in `~/.claude-code-infinite/config.json`.
+Add `--env staging` to use your saved staging key, or set `CCC_MEMTREE_DIRECT=1` in the MCP
+server environment to enable direct mode without the flag. Use `list` or an unscoped `search`
+to find a tree or session id, then pass it to the read tools. Direct mode has no `current` tree.
+
 ## Long-session benchmark
 
 In a blind-graded benchmark on a 775k-token Claude Code session, MemTree matched full-context
