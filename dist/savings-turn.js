@@ -7,6 +7,7 @@ export class SavingsObservation {
     report;
     id = randomUUID();
     calls = 0;
+    firstSubmissionMs;
     closed = false;
     constructor(sessionId, enabled, report) {
         this.sessionId = sessionId;
@@ -25,6 +26,8 @@ export function beginSavingsSubmission(metadata) {
     const turn = metadata && work.get(metadata);
     if (!turn || turn.closed || !turn.enabled())
         return;
+    if (turn.calls === 0)
+        turn.firstSubmissionMs = Date.now();
     turn.calls++;
     return {
         metadata: { ...metadata, savings_turn_id: turn.id },

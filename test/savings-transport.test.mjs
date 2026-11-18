@@ -47,6 +47,34 @@ test('independent writers publish one private JSONL line per turn with no prompt
     turns.sort((a,b) => a.turn_id.localeCompare(b.turn_id)));
 });
 
+test('a tagged 413 refused before Claude dispatch delivers one terminal turn', async t => {
+  const {MemtreeClient} = await import('../dist/memtree.js');
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t);
+  const diagnostics = h.client();
+  const tracker = new SavingsTracker({diagnostics});
+  const turn = tracker.startTurn(first.session_id);
+  let workTime = Date.parse(first.requested_at);
+  t.mock.method(Date, 'now', () => workTime);
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    assert.equal(JSON.parse(init.headers['x-client-meta']).savings_turn_id, turn.id);
+    return Response.json({}, {status:413});
+  });
+  const client = new MemtreeClient({baseUrl:'https://example.test', apiKey:'A'});
+  const messages = [{role:'user', content:'private'}];
+  await client.compress(MemtreeClient.hashMessages(messages), messages, 200000, undefined,
+    {sessionId:first.session_id, clientMeta:turn.work({lane:'main'})});
+  workTime += 10000; // Settlement after midnight still describes the submitted work.
+  const input = {request:{messages}, requestModified:true, contextWindow:200000};
+  tracker.settle(turn, input, 0);
+  tracker.settle(turn, input, 0);
+  await diagnostics.flush();
+  assert.deepEqual(h.posts.flatMap(p => p.turns), [{
+    turn_id:turn.id, session_id:first.session_id, requested_at:first.requested_at,
+    expected_memtree_calls:1, outcome:'not_dispatched',
+  }]);
+});
+
 test('only named turns are removed after a committed ack; truncated replies survive restart and age', async t => {
   const second = {...first, turn_id:randomUUID()};
   const h = await harness(t, (p,n) => n === 1 ? ack([second.turn_id, randomUUID()])

@@ -5,6 +5,7 @@ export declare class SavingsObservation {
     readonly report: (value: unknown) => void;
     readonly id: `${string}-${string}-${string}-${string}-${string}`;
     calls: number;
+    firstSubmissionMs?: number;
     closed: boolean;
     constructor(sessionId: string, enabled: () => boolean, report: (value: unknown) => void);
     work(metadata: Record<string, string>): Record<string, string>;

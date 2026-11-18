@@ -44,12 +44,21 @@ export class SavingsTracker {
     if (report) return new SavingsObservation(id.toLowerCase(), enabled, report);
   }
 
-  /** Settle once. A request refused locally has no upstream timestamp to report. */
+  /** Settle once, including MemTree work for a request that never reached Claude. */
   settle(observation: SavingsObservation, input: SavingsTurnInput, status: number): void {
     if (observation.closed) return;
     observation.closed = true;
-    if (input.nowMs === undefined) return;
     try {
+      if (input.nowMs === undefined) {
+        if (observation.calls > 0 && observation.firstSubmissionMs !== undefined) {
+          observation.report({
+            turn_id:observation.id, session_id:observation.sessionId,
+            requested_at:new Date(observation.firstSubmissionMs).toISOString(),
+            expected_memtree_calls:observation.calls, outcome:'not_dispatched',
+          });
+        }
+        return;
+      }
       const session = this.session(observation.sessionId);
       const success = status >= 200 && status < 300;
       // A conclusive upstream request rejection used zero tokens. Network failures,

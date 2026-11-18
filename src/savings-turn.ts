@@ -6,6 +6,7 @@ const work = new WeakMap<Record<string, string>, SavingsObservation>();
 export class SavingsObservation {
   readonly id = randomUUID();
   calls = 0;
+  firstSubmissionMs?: number;
   closed = false;
 
   constructor(readonly sessionId: string, readonly enabled: () => boolean,
@@ -23,6 +24,7 @@ export class SavingsObservation {
 export function beginSavingsSubmission(metadata?: Record<string, string>) {
   const turn = metadata && work.get(metadata);
   if (!turn || turn.closed || !turn.enabled()) return;
+  if (turn.calls === 0) turn.firstSubmissionMs = Date.now();
   turn.calls++;
   return {
     metadata: {...metadata, savings_turn_id:turn.id},

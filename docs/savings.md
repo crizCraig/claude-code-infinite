@@ -126,8 +126,10 @@ MemTree submissions expected to produce usage rows. It tags those submissions wi
 the turn UUID. A definite pre-work validation or authentication rejection removes
 that submission from the expected count. Detached work has its own server timestamp.
 Missing final usage is represented by null. A definitive, nonbillable upstream
-rejection records zero on both sides. If Claude never received an upstream request,
-there is no dispatch timestamp and linked preflight work remains pending.
+rejection records zero on both sides. If a request ends before Claude dispatch
+with outstanding MemTree submissions, ccc records the `not_dispatched` outcome,
+turn and session IDs, first submission time and expected call count. Polychat
+counts the corresponding MemTree charges and assigns zero API usage to both sides.
 The plain-cache simulation retains bounded, per-lane observations in launcher memory.
 A resumed process starts its cache simulation from the evidence available on that turn.
 
