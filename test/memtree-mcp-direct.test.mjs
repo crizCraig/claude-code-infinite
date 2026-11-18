@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("./fixtures/direct-mcp-cli.mjs", import.meta.url));
 const mock = new URL("./fixtures/direct-mcp-https.mjs", import.meta.url).href;
 const tree = "abcd-v1-own";
 const session = "12345678-1234-1234-1234-123456789abc";
@@ -19,9 +19,9 @@ function run(t, args, messages, env = {}, config = {
   const dir = path.join(home, ".claude-code-infinite");
   mkdirSync(dir);
   writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
-  setupHome(home);
-  const result = spawnSync(process.execPath, [...nodeArgs, "--import", mock, cli, "memtree-mcp", ...args], {
-    cwd: home, // Keep any Node profile files inside the disposable directory.
+  const cwd = setupHome(home) ?? home;
+  const result = spawnSync(process.execPath, [...nodeArgs, cli, "memtree-mcp", ...args], {
+    cwd, // Keep any Node profile files inside the disposable directory.
     // NODE_DEBUG=* can log several MiB of ESM loader diagnostics before startup.
     encoding: "utf8", timeout: 15000, maxBuffer: 32 * 1024 * 1024,
     env: { ...process.env, HOME: home, USERPROFILE: home,
@@ -90,6 +90,26 @@ test("current and implicit current reads fail locally with guidance in direct mo
   }
 });
 
+test("invalid direct tree ids give the same guidance as current", t => {
+  const messages = [
+    call("handover", { tree: "current" }), call("search", { query: "deploy", tree: "bad/id" }),
+    call("read_node", { tree: 123, id: 0 }), call("read_lines", { tree: "bad/id", tail: true }),
+    call("user_messages", { tree: "bad/id" }),
+  ];
+  const [current, ...invalid] = results(run(t, ["--direct"], messages));
+  for (const reply of invalid) {
+    assert.equal(reply.isError, true);
+    assert.equal(reply.content[0].text, current.content[0].text);
+  }
+});
+
+test("direct CLI prints only usage for an unexpected positional key", t => {
+  const result = run(t, ["--direct", "positional-canary-key"], [], { CHECK_KEY_UNREAD: "1" });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr.trim(), "Usage: ccc memtree-mcp --direct [--env staging|production]");
+});
+
 test("direct mode reports a missing environment key or invalid --env without making a request", t => {
   for (const [env, message] of [["staging", /no.*key.*staging/i], ["other", /--env.*staging.*production/i]]) {
     const result = run(t, ["--direct", "--env", env], [], {}, { polychatApiKey: "fixture-production-key" });
@@ -135,7 +155,8 @@ for (const [variable, value] of [
     const result = run(t, ["--direct"], [call("list", {})], { [variable]: value });
     assert.equal(result.status, 1);
     assert.equal(result.stdout, "");
-    assert.ok(result.stderr.includes(`Unset ${variable}`));
+    if (variable === "NODE_DEBUG") assert.match(result.stderr, /Unset NODE_DEBUG/);
+    else assert.match(result.stderr, /direct mode accepts only/i);
   });
 }
 
@@ -159,17 +180,24 @@ for (const flag of [
       const result = run(t, ["--direct"], [{ method: "initialize" }], env, {}, nodeArgs);
       assert.equal(result.status, 1);
       assert.equal(result.stdout, "");
-      assert.match(result.stderr, /Node diagnostics can expose the MemTree key/);
+      assert.match(result.stderr, /direct mode accepts only/i);
     });
   }
 }
 
-test("direct mode accepts stack-only trace flags", t => {
+test("direct mode starts with the allowed flags in both sources", t => {
+  const flags = ["--max-old-space-size=256", "--no-warnings", "--trace-warnings", "--trace-deprecation"];
+  if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1")) flags.push("--disable-sigusr1");
   const result = run(t, ["--direct"], [call("list", {})], {
-    NODE_OPTIONS: "--trace-warnings --trace-deprecation --trace-uncaught --trace-exit",
-  });
-  assert.equal(result.status, 0, result.stderr);
-  assert.ok(!JSON.parse(result.stdout).result.isError);
+    NODE_OPTIONS: flags.map(flag => `"${flag}"`).join(" "),
+  }, undefined, flags);
+  assert.ok(!results(result)[0].isError);
+});
+
+test("direct mode handles SIGUSR1 before reading the key and keeps the inspector closed", {
+  skip: process.platform === "win32",
+}, t => {
+  assert.ok(!results(run(t, ["--direct"], [call("list", {})], { CHECK_SIGUSR1: "1" }))[0].isError);
 });
 
 const v8Options = spawnSync(process.execPath, ["--v8-options"], { encoding: "utf8" }).stdout;
@@ -183,7 +211,7 @@ for (const flag of ["--prof", "-prof-cpp", "--log-code", "--heap-snapshot-on-gc=
     const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1" },
       { polychatApiKey: "saved-canary-for-refusal" }, [flag]);
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Node diagnostics can expose the MemTree key/);
+    assert.match(result.stderr, /direct mode accepts only/i);
     assert.ok(!readdirSync(result.home).some(file => file.endsWith(".heapsnapshot")));
   });
 }
@@ -197,33 +225,45 @@ for (const selector of ["--experimental-config-file=node.config.json", "--experi
         writeFileSync(path.join(home, "node.config.json"), JSON.stringify({ nodeOptions: { "diagnostic-dir": "." } }));
       });
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Node config.file/i);
+    assert.match(result.stderr, /direct mode accepts only/i);
     assert.ok(!readdirSync(result.home).some(file => file.endsWith(".heapsnapshot")));
   });
 }
 
-// Some Node versions reject these in NODE_OPTIONS themselves, or run the log
-// processor instead of the entry point. Exercise the server's env check directly.
-for (const flag of ["--prof", "--prof-process", '"--experimental_"config_file=node.config.json',
-  "--default-config-file", "--trace-http2", "--trace-event-categories=node.http"]) {
-  test(`direct mode checks NODE_OPTIONS for ${flag}`, t => {
-    const preload = "data:text/javascript," + encodeURIComponent(`process.env.NODE_OPTIONS = ${JSON.stringify(flag)}`);
-    const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1" }, {}, ["--import", preload]);
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Unset NODE_OPTIONS/);
-  });
+// Inject options in the fixture so the application guard is exercised even when
+// this version of Node would reject the option before running the entry point.
+for (const flag of ["--print-maglev-code", "--redirect-code-traces", "--heap-snapshot-on-gc",
+  "--prof", "--inspect", "--made-up-flag=flag-value-canary", "--experimental-config-file=flag-value-canary",
+  "--import=flag-value-canary", "--max-old-space-size=flag-value-canary", "--trace-warnings=flag-value-canary",
+  "--abort-on-uncaught-exception"]) {
+  for (const source of ["execArgv", "NODE_OPTIONS"]) {
+    test(`direct mode refuses ${flag} from ${source} before reading the key`, t => {
+      const result = run(t, ["--direct"], [], { CHECK_KEY_UNREAD: "1",
+        [source === "execArgv" ? "TEST_EXEC_ARG" : "TEST_NODE_OPTIONS"]: flag });
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(result.stdout, "");
+      assert.ok(result.stderr.includes(flag.split("=")[0]));
+      assert.match(result.stderr, /direct mode accepts only/i);
+      assert.doesNotMatch(result.stderr, /flag-value-canary/);
+    });
+  }
 }
 
-for (const repo of ["owner/project", "owner/fixture-production-key"]) {
-  test(`direct list and search send key-free project attribution for ${repo}`, t => {
-    const replies = results(run(t, ["--direct"], [call("list", {}), call("search", { query: "deploy" })],
-      { EXPECT_PROJECT_META: "1", EXPECT_GIT_REPO: repo === "owner/project" ? repo : "" }, undefined, [], home => {
-        execFileSync("git", ["init", "--quiet"], { cwd: home });
-        execFileSync("git", ["remote", "add", "origin", `https://user:fixture-production-key@example.org/${repo}.git`], { cwd: home });
-      }));
-    for (const reply of replies) assert.ok(!reply.isError, reply.content[0].text);
-  });
-}
+test("direct list and search send only directory attribution and spawn no child process", t => {
+  const replies = results(run(t, ["--direct"], [call("list", {}), call("search", { query: "deploy" })],
+    { EXPECT_PROJECT_META: "1", CHECK_NO_SPAWN: "1" }));
+  for (const reply of replies) assert.ok(!reply.isError, reply.content[0].text);
+});
+
+test("direct finder omits attribution when the directory contains the saved key", t => {
+  const [reply] = results(run(t, ["--direct"], [call("list", {})], { EXPECT_PROJECT_META: "1" },
+    undefined, [], home => {
+      const cwd = path.join(home, "project-fixture-production-key");
+      mkdirSync(cwd);
+      return cwd;
+    }));
+  assert.ok(!reply.isError, reply.content[0].text);
+});
 
 test("direct requests bypass the global transport and environment proxy", t => {
   const [list] = results(run(t, ["--direct"], [call("list", {})], {

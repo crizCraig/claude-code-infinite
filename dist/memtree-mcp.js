@@ -42,7 +42,6 @@ import { text as readText } from "node:stream/consumers";
 import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
-import { readProjectMeta } from "./project-meta.js";
 import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
@@ -566,33 +565,30 @@ function proxyBase(deps) {
     }
     return base;
 }
-async function directFinderMeta(key) {
-    const meta = memtreeClientMeta({ project: await readProjectMeta() });
-    // A directory, branch or remote path can itself contain the saved key.
-    const fields = Object.entries(meta).filter(([, value]) => !value.includes(key));
-    return fields.length ? JSON.stringify(Object.fromEntries(fields)) : undefined;
-}
 /** Both transports return the same JSON. The proxy flattens the server's two route prefixes. */
-async function toolGet(deps, prefix, path, tool, timeoutMs) {
+async function toolGet(deps, prefix, route, tool, timeoutMs) {
     const headers = toolHeaders(tool, deps);
     if (deps.direct) {
         if (prefix === "/v1") {
-            deps.direct.finderMeta ??= directFinderMeta(deps.direct.apiKey);
-            const meta = await deps.direct.finderMeta;
-            if (meta)
-                headers["x-client-meta"] = meta;
+            // Never invoke git from the MCP client's working directory.
+            const meta = memtreeClientMeta({ project: { project_dir: path.basename(process.cwd()) } });
+            if (meta.project_dir && !meta.project_dir.includes(deps.direct.apiKey)) {
+                headers["x-client-meta"] = JSON.stringify(meta);
+            }
         }
         headers["x-client"] = CLIENT_NAME;
         headers["x-client-version"] = CLIENT_VERSION;
-        return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${path}`, headers, deps.direct.apiKey, timeoutMs);
+        return getDirectJson(`${deps.direct.baseUrl}${prefix}/memtree/${route}`, headers, deps.direct.apiKey, timeoutMs);
     }
-    return getJson(deps.fetch ?? fetch, `${proxyBase(deps)}/memtree/${path}`, headers, timeoutMs);
+    return getJson(deps.fetch ?? fetch, `${proxyBase(deps)}/memtree/${route}`, headers, timeoutMs);
+}
+class InvalidTreeIdError extends ToolInputError {
 }
 function checkTreeId(tree) {
     if (tree === undefined || tree === null || tree === "")
         return undefined;
     if (typeof tree !== "string" || !TREE_ID_RE.test(tree.trim())) {
-        throw new ToolInputError("tree must be a tree reference from list or search, or \"current\"");
+        throw new InvalidTreeIdError("tree must be a tree reference from list or search, or \"current\"");
     }
     return tree.trim();
 }
@@ -1035,7 +1031,8 @@ inert = false, direct = false) {
             catch (err) {
                 if (err instanceof UnknownToolError)
                     return fail(-32602, err.message);
-                const message = err instanceof Error ? err.message : String(err);
+                const message = direct && err instanceof InvalidTreeIdError ? DIRECT_TREE_GUIDANCE
+                    : err instanceof Error ? err.message : String(err);
                 const text = versionNote ? `${message}\n${versionNote}` : message;
                 return reply({ content: [{ type: "text", text: withNotice(text) }], isError: true });
             }
@@ -1242,25 +1239,56 @@ async function readLinesTool(args, tree) {
     const pick = (v, fallback) => (v === undefined || v === null ? fallback : Number(v));
     return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
+// These switches only suppress warnings, include their call stacks, or turn off
+// the inspector signal. The one valued flag only sets a numeric V8 heap limit.
+const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation", "--disable-sigusr1"];
+const DIRECT_USAGE = "Usage: ccc memtree-mcp --direct [--env staging|production]";
 function nodeOptionsArgs(options) {
-    // NODE_OPTIONS allows double-quoted parts of arguments, with escapes inside
-    // quotes. Keep quoted values together so a path containing a flag is harmless.
-    const args = options.match(/(?:[^ "]+|"(?:[^"\\]|\\.)*")+/gs) ?? [];
-    return args.map(arg => arg.replace(/["\\]/g, ""));
+    // Node splits on spaces outside double quotes. A backslash escapes the next
+    // character only inside quotes. Leave all other characters literal.
+    const args = [];
+    let quoted = false;
+    let arg = "";
+    for (let i = 0; i < options.length; i++) {
+        const c = options[i];
+        if (c === '"')
+            quoted = !quoted;
+        else if (quoted && c === "\\")
+            arg += options[++i] ?? "";
+        else if (!quoted && c === " ") {
+            if (arg)
+                args.push(arg);
+            arg = "";
+        }
+        else
+            arg += c;
+    }
+    // Node normally rejects unterminated quotes before it reaches the entry point.
+    if (quoted)
+        throw new Error("Invalid quoting in NODE_OPTIONS.");
+    if (arg)
+        args.push(arg);
+    return args;
 }
-function isNodeDiagnosticArg(arg) {
-    // V8 accepts a single leading dash and treats underscores as hyphens.
-    const flag = arg.split("=", 1)[0].replace(/^-(?=[^-])/, "--").replaceAll("_", "-");
-    // Neither execArgv nor NODE_OPTIONS lists settings loaded from a Node config file.
-    if (/^--(?:[a-z0-9-]+-)?config-file(?:-|$)/.test(flag))
-        return true;
-    // TLS/HTTP and event traces can record traffic. V8 heap, object and compiler
-    // traces can dump in-memory values. Stack-only traces (warnings, exits, etc.) are fine.
-    if (flag === "--trace" || /^--trace-(?:http|tls|event|heap|gc|regexp|deopt|turbo|maglev|generalization|migration|elements-transitions)/.test(flag))
-        return true;
-    return flag.startsWith("--inspect") ||
-        /^--(?:debug|heap-?snapshot|heap-prof(?:iler)?|cpu-prof|prof|log|logfile|report)(?:-|$)/.test(flag) ||
-        flag === "--diagnostic-dir" || flag === "--tls-keylog" || flag === "--node-memory-debug";
+function checkDirectNodeFlags(args) {
+    for (const arg of args) {
+        if (DIRECT_NODE_SWITCHES.includes(arg) || /^--max-old-space-size=[0-9]+$/.test(arg))
+            continue;
+        const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
+        throw new Error(`Unsupported Node flag ${name}. MemTree direct mode accepts only --max-old-space-size=N, ${DIRECT_NODE_SWITCHES.join(", ")}.`);
+    }
+}
+function directEnvironment(args, defaultEnv) {
+    try {
+        const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
+        const mode = values.env ?? defaultEnv;
+        if (mode === "production" || mode === "staging")
+            return mode;
+    }
+    catch {
+        // parseArgs includes the unexpected argument in its error. It may be a key.
+    }
+    return undefined;
 }
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "production") {
@@ -1278,17 +1306,17 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
         if (env.NODE_DEBUG !== undefined) {
             throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
         }
-        if (nodeOptionsArgs(env.NODE_OPTIONS ?? "").some(isNodeDiagnosticArg)) {
-            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove Node config-file selectors and diagnostic flags.");
+        checkDirectNodeFlags(process.execArgv);
+        checkDirectNodeFlags(nodeOptionsArgs(env.NODE_OPTIONS ?? ""));
+        const mode = directEnvironment(args, defaultEnv);
+        if (!mode) {
+            console.error(DIRECT_USAGE);
+            process.exitCode = 1;
+            return;
         }
-        if (process.execArgv.some(isNodeDiagnosticArg)) {
-            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove Node config-file selectors and diagnostic flags from the Node command line.");
-        }
-        const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
-        const mode = values.env ?? defaultEnv;
-        if (mode !== "production" && mode !== "staging") {
-            throw new Error("Usage: ccc memtree-mcp --direct [--env staging|production]");
-        }
+        // Node 20 lacks --disable-sigusr1. Claim the signal before loading the key.
+        if (process.platform !== "win32")
+            process.on("SIGUSR1", () => { });
         const savedKey = storedApiKey(mode);
         const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
         if (!apiKey) {

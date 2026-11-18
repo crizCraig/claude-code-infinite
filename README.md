@@ -126,6 +126,12 @@ Add `--env staging` to use your saved staging key. Direct reads connect to MemTr
 using Node’s bundled CA certificates and bypass environment proxies. Use `list` or an unscoped `search`
 to find a tree or session id, then pass it to the read tools. Direct mode has no `current` tree.
 
+Direct mode checks Node startup flags before reading the saved key. It accepts
+`--max-old-space-size=N` (heap limit), `--no-warnings` (suppress warnings),
+`--trace-warnings` and `--trace-deprecation` (warning stacks), and `--disable-sigusr1`
+on Node versions that support it. On macOS and Linux, direct mode handles SIGUSR1 before
+loading the key so the signal cannot start the inspector afterward.
+
 ## Long-session benchmark
 
 In a blind-graded benchmark on a 775k-token Claude Code session, MemTree matched full-context

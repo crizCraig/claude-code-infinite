@@ -1,6 +1,8 @@
 // Preloaded into the MCP subprocess. Substitute only the socket, so the real
 // https request and agent choose the destination, TLS options and HTTP headers.
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import inspector from "node:inspector";
 import fs, { readFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -10,12 +12,24 @@ import https from "node:https";
 import net from "node:net";
 import { rootCertificates } from "node:tls";
 
-if (process.env.CHECK_KEY_UNREAD === "1") {
+if (process.env.CHECK_NO_SPAWN === "1") {
+  for (const method of ["exec", "execFile", "execSync", "execFileSync", "fork", "spawn", "spawnSync"]) {
+    childProcess[method] = () => {
+      process.stderr.write(`Unexpected child_process.${method} in direct mode\n`);
+      process.exit(87);
+    };
+  }
+  syncBuiltinESMExports();
+}
+
+if (process.env.CHECK_KEY_UNREAD === "1" || process.env.CHECK_SIGUSR1 === "1") {
   const read = fs.readFileSync;
   fs.readFileSync = function (file, ...args) {
     if (file === path.join(homedir(), ".claude-code-infinite", "config.json")) {
-      process.stderr.write("Direct mode attempted to read the saved key\n");
-      process.exit(86);
+      if (process.env.CHECK_KEY_UNREAD === "1" || process.listenerCount("SIGUSR1") === 0) {
+        process.stderr.write("Direct mode attempted to read the saved key before startup checks\n");
+        process.exit(86);
+      }
     }
     return read.call(this, file, ...args);
   };
@@ -27,6 +41,11 @@ const expectedHost = staging ? "polychat-staging-421312241218.us-west2.run.app" 
 const key = staging ? "fixture-staging-key" : "fixture-production-key";
 
 const server = http.createServer(async (req, res) => {
+  if (process.env.CHECK_SIGUSR1 === "1") {
+    process.kill(process.pid, "SIGUSR1");
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(inspector.url(), undefined);
+  }
   const response = fixtureResponse(new URL(req.url, "https://" + req.headers.host), req.method, new Headers(req.headers));
   res.writeHead(response.status, Object.fromEntries(response.headers));
   res.end(await response.text());
@@ -54,10 +73,9 @@ function fixtureResponse(url, method, headers) {
   }
   if (process.env.EXPECT_PROJECT_META === "1" && url.pathname.startsWith("/v1/memtree/")) {
     const expected = { project_dir: path.basename(process.cwd()) };
-    if (process.env.EXPECT_GIT_REPO) expected.git_repo = process.env.EXPECT_GIT_REPO;
     const meta = headers.get("x-client-meta");
-    assert.ok(meta && !meta.includes(key), "missing or unsafe project metadata");
-    assert.deepEqual(JSON.parse(meta), expected);
+    if (expected.project_dir.includes(key)) assert.equal(meta, null);
+    else assert.deepEqual(JSON.parse(meta), expected);
   }
   switch (url.pathname) {
     case "/v1/memtree/sessions":
