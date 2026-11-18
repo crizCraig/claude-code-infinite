@@ -512,14 +512,17 @@ test("Windows CLI refuses a custom .bat with install and override instructions b
   const bin = path.join(root, "bin");
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, "claude.bat"), "@echo ran>marker");
-  // Isolate known install folders and the System32 reg.exe used for registry PATH fallback.
   const env = {
     Path: bin, PATHEXT: ".EXE;.BAT;.CMD", USERPROFILE: root, APPDATA: path.join(root, "Roaming"),
-    LOCALAPPDATA: path.join(root, "Local"), SystemRoot: root, TEMP: root, TMP: root,
+    LOCALAPPDATA: path.join(root, "Local"), SystemRoot: process.env.SystemRoot, TEMP: root, TMP: root,
     CCC_NO_UPDATE_CHECK: "1", CCC_NO_DIAGNOSTICS: "1",
   };
   const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
-  const result = spawnSync(process.execPath, [cli, "--version"], { cwd: root, env, encoding: "utf8" });
+  // Node needs the real SystemRoot to initialize crypto. Redirect ccc's System32
+  // reg.exe lookup after Node starts so this test cannot read the host registry PATH.
+  const isolateRegistry = "data:text/javascript,process.env.SystemRoot = process.env.USERPROFILE";
+  const result = spawnSync(process.execPath, ["--import", isolateRegistry, cli, "--version"],
+    { cwd: root, env, encoding: "utf8" });
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr.trim(), refusal);
   assert.doesNotMatch(result.stderr.trim(), /\n/);
