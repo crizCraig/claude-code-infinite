@@ -37,8 +37,5 @@
   },
   "engines": {
     "node": ">=20.3"
-  },
-  "dependencies": {
-    "cross-spawn": "7.0.6"
   }
 }

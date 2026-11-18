@@ -17,10 +17,10 @@
  * only when PATH has no `claude`.
  */
 /** Where Claude Code was found, for diagnostics (an enum, never a path). */
-export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
+export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override"];
 export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
-export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
+export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override", "desktop_only"];
 export interface ClaudeLocation {
     /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
     command: string;
@@ -34,7 +34,7 @@ export interface LocateClaudeOptions {
     homedir?: string;
     /** True when `file` exists and can be run. */
     isExecutable?: (file: string) => boolean;
-    /** Read the Windows shim and its adjacent Claude package manifest. */
+    /** Read a Windows package-manager shim. */
     readFile?: (file: string) => string;
     /** Windows: the user's and the machine's PATH from the registry. */
     registryPath?: () => string[];
@@ -48,7 +48,6 @@ export interface DesktopAppOptions {
     /** True when the path exists (file or folder). */
     exists?: (file: string) => boolean;
 }
-export declare function claudeNpmBin(command: string, readFile?: (file: string) => string): string | undefined;
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export declare function locateClaude(opts?: LocateClaudeOptions): ClaudeLocation | null;
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */

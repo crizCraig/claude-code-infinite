@@ -11,6 +11,7 @@
  * token never leaves this machine. polychat.co only ever sees message content
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
+import { ClaudeLocationError } from "./windows-claude-shim.js";
 import { spawnClaude, spawnClaudeSync } from "./claude-process.js";
 import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 import { readFileSync } from "node:fs";
@@ -940,7 +941,7 @@ async function main() {
     });
 }
 main().catch(async (err) => {
-    console.error(err);
+    console.error(err instanceof ClaudeLocationError ? err.message : err);
     // A piped stderr may still have Node diagnostics queued ahead of the startup error.
     await writeStdout("", process.stderr);
     if (activeDiagnostics) {

@@ -20,84 +20,38 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ClaudeLocationError, resolveWindowsClaude } from "./windows-claude-shim.js";
 /** Where Claude Code was found, for diagnostics (an enum, never a path). */
 export const CLAUDE_SOURCES = [
-    "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local",
+    "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override",
 ];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
 export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"];
-// npm's cmd-shim emits these fixed lines for native bins and Node shebangs.
-// Match the entire shim so a wrapper's setup, extra arguments or cleanup still run.
-const npmShimHeader = `@ECHO off
-GOTO start
-:find_dp0
-SET dp0=%~dp0
-EXIT /b
-:start
-SETLOCAL
-CALL :find_dp0
-`;
-const npmNodeLauncher = String.raw `IF EXIST "%dp0%\node.exe" (
-  SET "_prog=%dp0%\node.exe"
-) ELSE (
-  SET "_prog=node"
-  SET PATHEXT=%PATHEXT:;.JS;=;%
-)
-
-endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  `;
-export function claudeNpmBin(command, readFile = (file) => fs.readFileSync(file, "utf8")) {
-    if (!/\.cmd$/i.test(command))
-        return undefined; // npm only generates .cmd.
-    const shim = readFile(command).replace(/\r\n/g, "\n");
-    if (!shim.startsWith(npmShimHeader))
-        return undefined;
-    const body = shim.slice(npmShimHeader.length).trimStart();
-    const node = body.startsWith(npmNodeLauncher);
-    const invocation = node ? body.slice(npmNodeLauncher.length) : body;
-    const target = /^"%dp0%\\([^"%\r\n]+)" +%\*\n?$/.exec(invocation)?.[1];
-    if (!target || !(node ? /\.[cm]?js$/i : /\.exe$/i).test(target))
-        return undefined;
-    const { win32 } = path;
-    const dir = win32.dirname(command);
-    const modules = /[\\/]node_modules[\\/]\.bin$/i.test(dir) ? win32.dirname(dir) : win32.join(dir, "node_modules");
-    const pkg = win32.join(modules, "@anthropic-ai", "claude-code");
-    if (!target.toLowerCase().startsWith(win32.relative(dir, pkg).toLowerCase() + "\\"))
-        return undefined;
-    let manifest;
-    try {
-        manifest = readFile(win32.join(pkg, "package.json"));
-    }
-    catch (err) {
-        const code = err.code;
-        if (code === "ENOENT" || code === "ENOTDIR")
-            return undefined; // Standalone batch wrapper.
-        throw err;
-    }
-    const { bin } = JSON.parse(manifest);
-    const entry = typeof bin === "string" ? bin : bin?.claude;
-    if (typeof entry !== "string" || !/\.(?:[cm]?js|exe)$/i.test(entry)) {
-        throw new Error("Claude Code's npm package has no supported claude executable.");
-    }
-    const file = win32.resolve(pkg, entry);
-    if (win32.parse(entry).root || win32.relative(pkg, file).split(win32.sep)[0] === "..") {
-        throw new Error("Claude Code's npm executable must be inside its package.");
-    }
-    return win32.relative(file, win32.resolve(dir, target)) === "" ? file : undefined;
-}
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export function locateClaude(opts = {}) {
     const platform = opts.platform ?? process.platform;
     const env = opts.env ?? process.env;
     const isExecutable = opts.isExecutable ?? defaultIsExecutable(platform);
+    const override = platform === "win32" && envValue(env, "CCC_CLAUDE_PATH");
+    if (override) {
+        if (!path.win32.isAbsolute(override) || path.win32.parse(override).root.length <= 1 ||
+            !/\.(?:exe|[cm]?js)$/i.test(override) || !isExecutable(override)) {
+            throw new ClaudeLocationError("CCC_CLAUDE_PATH must be the absolute path of an existing claude.exe or JavaScript entry.");
+        }
+        return { command: override, source: "override" };
+    }
     const isRunnableClaude = (file) => {
         if (!isExecutable(file))
             return false;
+        if (platform !== "win32")
+            return true;
         try {
-            const bin = platform === "win32" ? claudeNpmBin(file, opts.readFile) : undefined;
-            return !bin || isExecutable(bin);
+            return !!resolveWindowsClaude(file, opts.readFile, isExecutable);
         }
-        catch {
-            return false; // Broken npm package. Try the next candidate.
+        catch (err) {
+            if (err instanceof ClaudeLocationError && /\.(cmd|bat)$/i.test(file))
+                throw err;
+            return false;
         }
     };
     const onPath = locateOnPath(pathDirs(env, platform), platform, env, isRunnableClaude);
@@ -278,7 +232,8 @@ function wingetPackageDirs(winget, opts) {
 function findOnPath(name, dirs, platform, env, isExecutable) {
     const p = pathFor(platform);
     const exts = platform === "win32"
-        ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";").filter(ext => /^\.(com|exe|bat|cmd)$/i.test(ext))
+        ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";")
+            .filter(ext => /^\.(com|exe|bat|cmd|ps1)$/i.test(ext)).concat(".ps1", "")
         : [""];
     for (const dir of dirs) {
         if (!dir || (platform === "win32" && !isWindowsSearchDir(dir, process.cwd())))

@@ -683,14 +683,14 @@ without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those
 To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
 then run `ccc` again, from your project folder.
 
-On Windows, when ccc recognizes an npm-generated shim, it reads the `claude` entry from the adjacent
-`@anthropic-ai/claude-code` package manifest. It runs a JavaScript entry with the absolute
-path of the Node executable running ccc, or launches a native `.exe` entry directly.
-For standalone `claude.cmd` or `claude.bat` wrappers, including pnpm and Yarn shims, ccc
-passes the wrapper's absolute path to `%SystemRoot%\System32\cmd.exe`.
-It sets `NoDefaultCurrentDirectoryInExePath=1` and removes relative paths and the working
-directory from the child's `PATH`, so a wrapper that runs `node` by name looks for it on
-the installed tool paths. Startup, sign-in checks, and resume all use the same launcher.
+On Windows, ccc reads npm, pnpm and Yarn shims and launches their JavaScript or native
+entry directly. It uses the adjacent `node.exe` when the shim selects it, otherwise the
+Node executable running ccc. Startup, sign-in checks and resume pass prompts as literal
+arguments, including line breaks. If a shim's target is missing, ccc keeps searching PATH.
+
+For a custom batch wrapper, install Claude Code with npm or the native installer, or set
+`CCC_CLAUDE_PATH` to the absolute path of `claude.exe` or its JavaScript entry. For example,
+in PowerShell run `$env:CCC_CLAUDE_PATH = 'C:\Tools\Claude Code\cli.mjs'` before starting ccc.
 
 ### "You've hit your Claude plan's usage limit" / "Anthropic is busy"
 
