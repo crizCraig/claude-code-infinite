@@ -61,7 +61,18 @@ function batchTarget(shim: string, body: string): ShimTarget | undefined {
   // Every forwarded branch must use the same quoted entry. Match the rest of
   // the batch file too: a custom wrapper's setup or fixed arguments matter.
   const token = /"([^"\r\n]+)" +%\*(?:\n|$)/.exec(body)?.[1];
-  const file = token && targetPath(shim, token);
+  if (!token) return undefined;
+  const pnpm = body.startsWith("@SETLOCAL\n");
+  const berry = body.startsWith(berryPrefix);
+  // npm initializes %dp0%. Classic and pnpm use %~dp0. Only pnpm and Berry
+  // emit literal absolute targets, and Berry always emits one.
+  if (absolute(token)) {
+    if (!pnpm && !berry) return undefined;
+  } else {
+    const prefix = body.startsWith("@ECHO off\n") ? "%dp0%\\" : "%~dp0\\";
+    if (berry || !token.startsWith(prefix)) return undefined;
+  }
+  const file = targetPath(shim, token);
   if (!file) return undefined;
   const js = /\.[cm]?js$/i.test(file);
   const native = /\.exe$/i.test(file);
@@ -72,7 +83,6 @@ function batchTarget(shim: string, body: string): ShimTarget | undefined {
 
   // pnpm starts with SETLOCAL and optionally sets PATH and NODE_PATH. Classic
   // puts SETLOCAL in the fallback branch. Both generate a direct native form.
-  const pnpm = body.startsWith("@SETLOCAL\n");
   if (pnpm) {
     body = body.slice("@SETLOCAL\n".length)
       .replace(/^@SET "PATH=[^"\n]+:%PATH%"\n/, "")
@@ -89,7 +99,7 @@ function batchTarget(shim: string, body: string): ShimTarget | undefined {
   if (body === "@<entry> %*" && (native || /\.cmd$/i.test(file))) return { file, preferLocalNode: false };
 
   // Berry's makePathWrapper uses absolute paths. pnpm can also pin nodeExecPath.
-  if (body.startsWith(berryPrefix)) body = body.slice(berryPrefix.length);
+  if (berry) body = body.slice(berryPrefix.length);
   else if (pnpm && body.startsWith("@")) body = body.slice(1);
   else return undefined;
   if (native && body === "<entry> %*") return { file, preferLocalNode: false };

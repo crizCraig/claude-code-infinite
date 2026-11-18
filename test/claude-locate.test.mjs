@@ -118,8 +118,9 @@ test("Windows refuses custom batch wrappers, including modified package-manager 
   for (const ext of [".bat", ".cmd"]) {
     const wrapper = W.join(dir, "claude" + ext);
     for (const body of ['@node "%~dp0custom.cjs" %*', stock.replace("SETLOCAL", "SETLOCAL\nSET CUSTOM=1"),
+      '@"%dp0%\\custom.exe" %*', '@"$basedir/custom.exe" %*', '@"D:\\bin\\custom.exe" %*',
       stock.replace("%*", "--custom %*"), stock + "@echo finished\r\n"]) {
-      const files = [wrapper, W.join(dir, globalTarget), "D:\\native\\claude.exe"];
+      const files = [wrapper, W.join(dir, "custom.exe"), W.join(dir, globalTarget), "D:\\native\\claude.exe"];
       assert.throws(() => locateWin(files, { env: { Path: dir + ";D:\\native" }, readFile: () => body }), refusal);
       assert.throws(() => claudeInvocation(wrapper, [], "win32", () => body, fakeFs(files, "win32")), refusal);
     }
