@@ -1399,14 +1399,18 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
   return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
 
-function hasNodeDiagnostics(options: string): boolean {
+function nodeOptionsArgs(options: string): string[] {
   // NODE_OPTIONS allows double-quoted parts of arguments, with escapes inside
   // quotes. Keep quoted values together so a path containing a flag is harmless.
   const args = options.match(/(?:[^ "]+|"(?:[^"\\]|\\.)*")+/gs) ?? [];
-  return args.some(arg => {
-    const flag = arg.split("=", 1)[0].replace(/["\\]/g, "").replaceAll("_", "-");
-    return /^--(?:debug|inspect|trace)(?:-|$)/.test(flag) || flag === "--tls-keylog" || flag === "--node-memory-debug";
-  });
+  return args.map(arg => arg.replace(/["\\]/g, ""));
+}
+
+function isNodeDiagnosticArg(arg: string): boolean {
+  const flag = arg.split("=", 1)[0].replaceAll("_", "-");
+  return flag.startsWith("--inspect") ||
+    /^--(?:debug|trace|heapsnapshot|heap-prof|cpu-prof|report)(?:-|$)/.test(flag) ||
+    flag === "--diagnostic-dir" || flag === "--tls-keylog" || flag === "--node-memory-debug";
 }
 
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
@@ -1423,20 +1427,24 @@ export function runMemtreeMcpServer(
     if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
       throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
     }
-    // Node can log raw request or response bytes before application-level redaction.
+    // Diagnostics can log raw traffic or capture the saved key from memory.
     if (env.NODE_DEBUG !== undefined) {
       throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
     }
-    if (hasNodeDiagnostics(env.NODE_OPTIONS ?? "")) {
+    if (nodeOptionsArgs(env.NODE_OPTIONS ?? "").some(isNodeDiagnosticArg)) {
       throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove its diagnostic flags.");
+    }
+    if (process.execArgv.some(isNodeDiagnosticArg)) {
+      throw new Error("Node diagnostics can expose the MemTree key in direct mode. Remove diagnostic flags from the Node command line.");
     }
     const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
     const mode = values.env ?? defaultEnv;
     if (mode !== "production" && mode !== "staging") {
       throw new Error("Usage: ccc memtree-mcp --direct [--env staging|production]");
     }
-    const apiKey = storedApiKey(mode);
-    if (typeof apiKey !== "string" || !apiKey.trim()) {
+    const savedKey = storedApiKey(mode);
+    const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
+    if (!apiKey) {
       throw new Error(`No MemTree key saved for ${mode}. Run ccc${mode === "staging" ? " staging" : ""} to save one.`);
     }
     deps = { direct: { baseUrl: memtreeBaseUrlFor(mode), apiKey } };

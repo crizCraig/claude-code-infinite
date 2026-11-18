@@ -13,13 +13,14 @@ const session = "12345678-1234-1234-1234-123456789abc";
 
 function run(t, args, messages, env = {}, config = {
   polychatApiKey: "fixture-production-key", stagingPolychatApiKey: "fixture-staging-key",
-}) {
+}, nodeArgs = []) {
   const home = mkdtempSync(path.join(tmpdir(), "ccc-direct-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const dir = path.join(home, ".claude-code-infinite");
   mkdirSync(dir);
   writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
-  const result = spawnSync(process.execPath, ["--import", mock, cli, "memtree-mcp", ...args], {
+  const result = spawnSync(process.execPath, [...nodeArgs, "--import", mock, cli, "memtree-mcp", ...args], {
+    cwd: home, // Keep any Node profile files inside the disposable directory.
     // NODE_DEBUG=* can log several MiB of ESM loader diagnostics before startup.
     encoding: "utf8", timeout: 15000, maxBuffer: 32 * 1024 * 1024,
     env: { ...process.env, HOME: home, USERPROFILE: home,
@@ -64,6 +65,17 @@ test("explicit direct mode selects the saved staging key and keeps it out of err
   assert.equal(error.isError, true);
   assert.match(error.content[0].text, /403/);
 });
+
+for (const [label, savedKey] of [
+  ["trailing space", "fixture-production-key "],
+  ["surrounding whitespace", "  fixture-production-key\r\n"],
+]) {
+  test(`direct mode authenticates and redacts with a saved key containing ${label}`, t => {
+    const [reply] = results(run(t, ["--direct"], [call("list", { q: "denied" })], {}, { polychatApiKey: savedKey }));
+    assert.equal(reply.isError, true);
+    assert.match(reply.content[0].text, /HTTP 403 \[redacted\]/);
+  });
+}
 
 test("current and implicit current reads fail locally with guidance in direct mode", t => {
   const messages = [
@@ -132,6 +144,24 @@ test("direct mode accepts unrelated NODE_OPTIONS", t => {
   }));
   assert.ok(!list.isError);
 });
+
+for (const flag of [
+  "--heapsnapshot-near-heap-limit=1", "--heap-prof", "--report-on-fatalerror",
+  "--inspect=127.0.0.1:0", "--cpu-prof", "--diagnostic-dir=.",
+]) {
+  for (const source of ["NODE_OPTIONS", "execArgv"]) {
+    // Older Node versions only accept the profiling flags on the command line.
+    if (source === "NODE_OPTIONS" && !process.allowedNodeEnvironmentFlags.has(flag)) continue;
+    test(`direct mode rejects ${flag} in ${source} before requiring a key`, t => {
+      const env = source === "NODE_OPTIONS" ? { NODE_OPTIONS: flag } : {};
+      const nodeArgs = source === "execArgv" ? [flag] : [];
+      const result = run(t, ["--direct"], [{ method: "initialize" }], env, {}, nodeArgs);
+      assert.equal(result.status, 1);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /Node diagnostics can expose the MemTree key/);
+    });
+  }
+}
 
 test("direct requests bypass the global transport and environment proxy", t => {
   const [list] = results(run(t, ["--direct"], [call("list", {})], {
