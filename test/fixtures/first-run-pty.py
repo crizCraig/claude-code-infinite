@@ -1,4 +1,5 @@
 """Drive the real question and paused-session launcher using a terminal on both sides."""
+import json
 import os
 from pathlib import Path
 import pty
@@ -44,6 +45,10 @@ process.stdin.on('data', chunk => {
 });
 """
 data = paste if scenario.startswith("paste") else payload
+if scenario == "cli-unpaid-quit-ahead":
+    data = b"q\r"
+queued_at_key = scenario in ("cli-paid", "cli-unpaid-ahead", "cli-unpaid-quit-ahead")
+early = scenario in ("before", "guard", "cli-queued") or queued_at_key
 master, slave = pty.openpty()
 original = termios.tcgetattr(slave)
 screen = bytearray()
@@ -98,17 +103,19 @@ globalThis.fetch = async () => Response.json({paid: PAID});
             until(b"in your browser")
             os.write(master, b"\r")
             until(b"paste it here")
-            os.write(master, b"test-key\r" + (data if paid else b""))
-            if not paid:
+            os.write(master, b"test-key\r" + (data if queued_at_key else b""))
+            if not queued_at_key:
                 until(b"[q] quit")
                 os.write(master, b"c\r" + (data if scenario == "cli-queued" else b""))
         else:
             until(b"STARTING")
         if scenario == "guard":
             until(b"\x1b[?2004h")
-        elif scenario not in ("before", "cli-queued", "cli-paid"):
+        elif not early:
             until(menu)
-        if scenario in ("cli-queued", "cli-paid"):
+        if scenario == "answer-burst":
+            os.write(master, b"3" + data)
+        elif scenario == "cli-queued" or queued_at_key:
             pass  # already typed in the same write as the preceding response
         elif scenario in ("before", "paste"):
             os.write(master, data)
@@ -122,10 +129,16 @@ globalThis.fetch = async () => Response.json({paid: PAID});
             os.write(master, data[1:])
         until(marker + data.hex().encode())
         assert proc.wait(timeout=3) == 0
+        if scenario.startswith("cli-unpaid-"):
+            assert b"[q] quit" not in screen, screen
         assert termios.tcgetattr(master)[:4] == original[:4], "terminal modes were not restored"
-        assert (menu in screen) == (scenario not in ("before", "guard", "cli-queued", "cli-paid")), screen
+        assert (menu in screen) == (not early), screen
         with (config_dir / "first-run-question.json").open() as claim:
-            assert '"skipped"' in claim.read()
+            receipt = json.load(claim)
+            if scenario == "answer-burst":
+                assert receipt == {"status": "answered", "answer": "remember"}, receipt
+            else:
+                assert receipt == {"status": "skipped"}, receipt
     finally:
         proc.kill()
         proc.wait()

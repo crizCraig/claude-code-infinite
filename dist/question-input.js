@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { closeSync, constants, openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ReadStream } from "node:tty";
+import { findPathExecutable } from "./claude-locate.js";
 /**
  * readline normally reads a whole paste before the callback for its first Enter.
  * Limit the native read to one byte so closing a required startup prompt leaves
@@ -12,10 +13,11 @@ class StartupPromptStream extends ReadStream {
     setRawMode() { return this; }
 }
 export function startupPromptInput() {
-    const path = process.platform === "win32" ? "CONIN$" : "/dev/fd/0";
+    if (process.platform === "win32")
+        return undefined;
     let fd;
     try {
-        fd = openSync(path, constants.O_RDONLY | constants.O_NOCTTY);
+        fd = openSync("/dev/fd/0", constants.O_RDONLY | constants.O_NOCTTY);
         const input = new StartupPromptStream(fd, { onread: {
                 buffer: Buffer.alloc(1),
                 callback(size, buffer) {
@@ -31,11 +33,29 @@ export function startupPromptInput() {
         return undefined;
     }
 }
+function posixPython() {
+    if (process.platform === "win32")
+        return undefined;
+    return findPathExecutable("python3", process.platform, process.env, process.cwd());
+}
+const script = fileURLToPath(new URL("../scripts/question-input.py", import.meta.url));
+/** Display the payment prompt at the queue check, before any subsequent input is read. */
+export function showPaymentPromptIfClear(input, prompt) {
+    const python = posixPython();
+    if (!python || input.readableLength)
+        return false;
+    const result = spawnSync(python, ["-I", "-S", script, "payment", prompt], {
+        stdio: ["ignore", "inherit", "ignore", input], timeout: 2000,
+    });
+    return result.status === 0;
+}
 /** The child keeps its own PID, inherited stdout/stderr, and a real terminal on fd 0. */
 export async function prepareQuestionInput(input, guardMs) {
-    const script = fileURLToPath(new URL("../scripts/question-input.py", import.meta.url));
+    const python = posixPython();
+    if (!python)
+        return undefined;
     const guard = input.readableLength ? -1 : guardMs;
-    const helper = spawn("python3", ["-I", "-S", script, String(guard)], {
+    const helper = spawn(python, ["-I", "-S", script, String(guard)], {
         stdio: ["pipe", "pipe", "ignore", input],
     });
     const sink = helper.stdin;
@@ -89,26 +109,5 @@ export async function prepareQuestionInput(input, guardMs) {
     finally {
         clearTimeout(startup);
     }
-}
-/** Windows can inspect the console input queue in place. Claude inherits it directly. */
-export async function readWindowsQuestion(question, signal, guard, quiet, timeout) {
-    const script = fileURLToPath(new URL("../scripts/question-input.ps1", import.meta.url));
-    const helper = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass", "-File", script, String(guard),
-        String(quiet), String(timeout)], {
-        stdio: ["inherit", "inherit", "ignore"], timeout: guard + timeout + 5000,
-        env: { ...process.env, CCC_QUESTION_TEXT: question },
-    });
-    const abort = () => { helper.kill(); };
-    signal.addEventListener("abort", abort, { once: true });
-    const result = new Promise(resolve => {
-        helper.once("error", () => resolve(null));
-        helper.once("exit", resolve);
-    });
-    if (signal.aborted)
-        abort();
-    const code = await result;
-    signal.removeEventListener("abort", abort);
-    return code;
 }
 //# sourceMappingURL=question-input.js.map

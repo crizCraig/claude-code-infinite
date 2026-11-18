@@ -18,6 +18,7 @@ import {
   locateClaude,
   parseRegQueryPath,
   withClaudeOnPath,
+  findPathExecutable,
 } from "../dist/claude-locate.js";
 import { CLAUDE_FOUND as SCHEMA_FOUND, sanitizeContext } from "../dist/diagnostics-schema.js";
 
@@ -45,19 +46,28 @@ function locateWin(files, extra = {}) {
   });
 }
 
-test("on PATH: spawned by name, as before (claude.cmd or claude.exe both count)", () => {
+test("Windows on PATH: spawn the resolved program, never a bare name", () => {
   const shim = "C:\\Program Files\\nodejs\\claude.cmd";
-  assert.deepEqual(locateWin([shim]), { command: "claude", source: "path" });
-  // A later desktop exe on PATH changes nothing: the first claude is still spawned by name.
+  assert.deepEqual(locateWin([shim]), { command: shim, source: "path" });
+  assert.equal(locateWin(["claude.exe", shim], { env: { ...WIN_ENV, Path: ".;" + WIN_ENV.Path } }).command, shim);
+  // A later desktop exe on PATH changes nothing: the first resolved CLI still wins.
   const desktopLater = locateClaude({
     platform: "win32", env: { ...WIN_ENV, Path: `${WIN_ENV.Path};C:\\Users\\ada\\AppData\\Local\\AnthropicClaude` },
     homedir: "C:\\Users\\ada", registryPath: () => [], listDir: () => [],
     isExecutable: fakeFs([shim, "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude\\claude.exe"], "win32"),
   });
-  assert.deepEqual(desktopLater, { command: "claude", source: "path" });
-  assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "claude", source: "path" });
+  assert.deepEqual(desktopLater, { command: shim, source: "path" });
+  assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "C:\\Windows\\system32\\claude.exe", source: "path" });
   // An extensionless `claude` (npm's script for Git Bash) is not something cmd can run.
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
+});
+
+test("Windows project metadata resolves git.exe outside the project", () => {
+  const env = { Path: ".;C:tools;\\tools;C:\\project;C:\\Git\\cmd" };
+  const checked = [];
+  const result = findPathExecutable("git.exe", "win32", env, "c:\\project", file => { checked.push(file); return true; });
+  assert.deepEqual(checked, ["C:\\Git\\cmd\\git.exe"]);
+  assert.equal(result, checked[0]);
 });
 
 test("Windows: the native installer's claude.exe off PATH is found and its folder added", () => {
@@ -241,7 +251,7 @@ test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   const env = { ...process.env, Path: `${npmDir};${process.env.Path ?? process.env.PATH}` };
   delete env.PATH;
   const location = locateClaude({ env, registryPath: () => [] });
-  assert.deepEqual(location, { command: "claude", source: "path" });
+  assert.deepEqual(location, { command: path.join(npmDir, "claude.cmd"), source: "path" });
   const { args, got } = launch(location, env, path.join(dir, "out.json"));
   assert.deepEqual(got, args);
 });

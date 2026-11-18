@@ -10,8 +10,7 @@
   "type": "module",
   "files": [
     "dist",
-    "scripts/question-input.py",
-    "scripts/question-input.ps1"
+    "scripts/question-input.py"
   ],
   "scripts": {
     "build": "tsc && node scripts/chmod-cli.mjs",

@@ -12,7 +12,6 @@
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
 import spawn from "cross-spawn";
-import { exec } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -20,7 +19,7 @@ import { MEMTREE_COMPACT_MIN_TOKENS, parseTokenCount, startProxy } from "./proxy
 import { MemtreeLinkStore } from "./memtree-links.js";
 import { FirstTreeMarker } from "./first-tree.js";
 import { askFirstRunQuestion, canAskFirstRunQuestion, keepQuestionInputRaw, QuestionInterrupted, readFirstRunAnswer, } from "./first-run-question.js";
-import { startupPromptInput } from "./question-input.js";
+import { showPaymentPromptIfClear, startupPromptInput } from "./question-input.js";
 import { takeNewInstall } from "./new-install.js";
 import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
@@ -55,7 +54,7 @@ import { getPolychatApiKey, setPolychatApiKey, getLocalPolychatApiKey, setLocalP
 import { repairStrandedResume, resumeSessionId } from "./resume-repair.js";
 import { Diagnostics, DiagnosticsRequestSink, recordError, SHUTDOWN_FLUSH_MS, } from "./diagnostics.js";
 import { PACKAGE_DIR, detectInstallMethod, takeUnreportedOutcome, updateFiles, } from "./auto-update.js";
-import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, } from "./claude-locate.js";
+import { claudeDesktopInstalled, claudeDesktopOnlyText, claudeMissingText, cwdHintText, locateClaude, withClaudeOnPath, system32Path, } from "./claude-locate.js";
 import { INSTALL_PROMPT_ENV, offerClaudeInstall, runInstaller } from "./claude-install.js";
 import { RateLimitNotices, rateLimitNoticeText } from "./rate-limit.js";
 import { apiKeyOverride, claudeAuthFromConfig, claudePlanFromConfig, claudeSubscriptionLogin, creditNoticeText, envApiKeySet, } from "./claude-auth.js";
@@ -63,7 +62,7 @@ import { CreditRefusalMemory, creditAdviceApplies, isInfoOnlyRun, readSeenClaude
 import { probeAnswersForSession, probeClaudeAuthStatus, skippedProbe, } from "./claude-auth-status.js";
 import { mayWaitForEnter, presentSignInNotice, sessionProbe, signInNotice, signInNoticeApplies, SignInTracker, } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
-import { urlOpenerFor } from "./open-url.js";
+import { browserOpener, urlOpenerFor } from "./open-url.js";
 import { desktopServiceDownLine, runDesktopCommand } from "./desktop-command.js";
 import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
 import { startHttpsProxySession, } from "./https-proxy-session.js";
@@ -81,13 +80,7 @@ const SUBSCRIBE_WAIT_MS = 180_000;
 const SUBSCRIBE_POLL_MS = 3_000;
 /** This launch's diagnostics, for the top-level error handler. */
 let activeDiagnostics = null;
-function openUrl(url) {
-    const platform = process.platform;
-    const command = platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
-    platform === "win32"
-        ? exec(`${command} "${url}"`, { shell: "cmd.exe" })
-        : exec(`${command} "${url}"`);
-}
+const openUrl = browserOpener(process.platform);
 async function promptForApiKey(mode, output, input = process.stdin) {
     const rl = readline.createInterface({ input, output });
     const url = mode === "local" ? LOCAL_KEY_PAGE_URL : KEY_PAGE_URL;
@@ -159,12 +152,17 @@ function paymentOnly(check) {
  * for the webhook to flip the key to paid), continue without MemTree (plain
  * Claude Code for this session), or quit. Resolves true when MemTree is on.
  */
-async function runPaymentGate(status, recheck, links, diagnostics, resumed, input) {
+async function runPaymentGate(status, recheck, links, diagnostics, resumed, input, guardInput) {
     const color = terminalSupportsColor();
     for (;;) {
         const link = await links.get();
         console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
-        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link), input));
+        const prompt = paymentGatePrompt(link);
+        if (guardInput && !showPaymentPromptIfClear(process.stdin, prompt)) {
+            console.log(resumed ? RESUMED_PAUSED_LINE : MEMTREE_OFF_LINE);
+            return "queued";
+        }
+        const choice = parsePaymentChoice(await askLine(prompt, input, guardInput));
         diagnostics.record("payment_gate", { choice });
         if (choice === "quit") {
             await diagnostics.flush();
@@ -240,13 +238,17 @@ function askAnswer(question, output) {
         });
     });
 }
-function askLine(question, input) {
+function askLine(question, input, alreadyShown = false) {
     const rl = readline.createInterface({ input, output: process.stdout });
     return new Promise((resolve) => {
-        rl.question(question, (answer) => {
-            rl.close();
-            resolve(answer);
-        });
+        const finish = (answer) => { rl.close(); resolve(answer); };
+        if (alreadyShown) {
+            rl.setPrompt(question); // retain the visible prompt on readline redraws
+            rl.once("line", finish);
+        }
+        else {
+            rl.question(question, finish);
+        }
     });
 }
 /**
@@ -343,6 +345,10 @@ function linkDeps(mode) {
     };
 }
 async function main() {
+    // cross-spawn starts cmd.exe for npm's Claude shim. Its bare-name fallback
+    // when ComSpec is missing would repeat executable lookup from the project.
+    if (process.platform === "win32")
+        process.env.ComSpec = system32Path(process.env, "cmd.exe");
     const newInstall = takeNewInstall(getConfigDir());
     const parsedArgs = parseWrapperArgs(process.argv.slice(2));
     const isDebugMode = parsedArgs.debug;
@@ -518,10 +524,13 @@ async function main() {
     // Unpaid: [c] (or any print run) is plain Claude Code for this session, with
     // no MemTree calls that would only answer 402 (paused-session.ts).
     let memtreeOff = false;
+    let queuedAtPayment = false;
     if (paymentStatus?.paid === false) {
         const key = polychatApiKey;
         if (interactiveUi) {
-            memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs), lineInput));
+            const payment = await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs), lineInput, Boolean(restoreRaw));
+            queuedAtPayment = payment === "queued";
+            memtreeOff = payment !== true;
         }
         else {
             console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
@@ -548,12 +557,16 @@ async function main() {
     recordAutoUpdateDecision(diagnostics, autoUpdate);
     // After key resolution, before either the normal or MemTree-paused Claude launch.
     promptStream?.destroy();
-    const questionInput = await askFirstRunQuestion({
+    const inheritedInput = queuedAtPayment && restoreRaw ? { fd: process.stdin.fd, close: restoreRaw } : undefined;
+    const surveyInput = await askFirstRunQuestion({
         ...questionOptions, keyCheck: checked.check,
-        ask: (question, signal) => restoreRaw
-            ? readFirstRunAnswer(question, signal, process.stdin, process.stdout, { restoreRaw })
-            : Promise.resolve("skipped"),
+        ask: async (question, signal) => {
+            if (!restoreRaw || queuedAtPayment)
+                return "skipped";
+            return readFirstRunAnswer(question, signal, process.stdin, process.stdout, { restoreRaw });
+        },
     });
+    const questionInput = inheritedInput ?? surveyInput;
     if (!questionInput)
         restoreRaw?.();
     // A resumed session may be past the window under MemTree; plain Claude Code

@@ -11,6 +11,7 @@
  */
 import { execFile } from "node:child_process";
 import path from "node:path";
+import { findPathExecutable } from "./claude-locate.js";
 /** What the server keeps: short printable ASCII (client_session.py). */
 const META_VALUE = /^[\x20-\x7e]{1,128}$/;
 const GIT_TIMEOUT_MS = 1_500;
@@ -70,7 +71,13 @@ export function repoNameFromRemote(remote) {
 function runGit(args, cwd) {
     return new Promise((resolve) => {
         try {
-            execFile("git", args, { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true }, (err, stdout) => resolve(err ? undefined : String(stdout).trim() || undefined));
+            const git = process.platform === "win32"
+                ? findPathExecutable("git.exe", "win32", process.env, cwd) : "git";
+            if (!git) {
+                resolve(undefined);
+                return;
+            }
+            execFile(git, args, { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true }, (err, stdout) => resolve(err ? undefined : String(stdout).trim() || undefined));
         }
         catch {
             resolve(undefined);

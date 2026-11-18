@@ -11,7 +11,7 @@
  */
 import { spawn as spawnPlain } from "node:child_process";
 import * as os from "node:os";
-import * as path from "node:path";
+import { system32Path } from "./claude-locate.js";
 import spawn from "cross-spawn";
 import { planFrom } from "./claude-auth.js";
 /**
@@ -153,8 +153,7 @@ function killTree(child) {
         return;
     try {
         if (process.platform === "win32") {
-            const root = process.env.SystemRoot ?? "C:\\Windows";
-            spawnPlain(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
+            spawnPlain(system32Path(process.env, "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
             return;
         }
         process.kill(-pid, "SIGKILL");

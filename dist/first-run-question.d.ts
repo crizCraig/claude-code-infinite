@@ -6,12 +6,15 @@ import type { KeyCheck } from "./key-status.js";
 export declare const FIRST_RUN_QUESTION_FILE = "first-run-question.json";
 export declare const TYPE_AHEAD_MS = 400;
 export declare const QUESTION_TIMEOUT_MS = 45000;
-export declare const PASTE_QUIET_MS = 100;
 export declare class QuestionInterrupted extends Error {
 }
 export declare const FIRST_RUN_QUESTION: string;
-type Selection = FirstRunAnswer | QuestionInput;
+type Selection = FirstRunAnswer | {
+    answer?: FirstRunAnswer;
+    input: QuestionInput;
+};
 interface QuestionOptions {
+    platform?: NodeJS.Platform;
     newInstall: boolean;
     keyCheck: KeyCheck;
     configDir: string;
@@ -27,7 +30,8 @@ export declare function canAskFirstRunQuestion(opts: Omit<QuestionOptions, "ask"
 export declare function keepQuestionInputRaw(input: ReadStream): (() => void) | undefined;
 /** Fail closed: inability to persist the claim means no question, never a startup failure. */
 export declare function askFirstRunQuestion(opts: QuestionOptions): Promise<QuestionInput | undefined>;
-export declare function readFirstRunAnswer(question: string, signal: AbortSignal, input: ReadStream, output: NodeJS.WritableStream, { prepare, restoreRaw }?: {
+export declare function readFirstRunAnswer(question: string, signal: AbortSignal, input: ReadStream, output: NodeJS.WritableStream, { platform, prepare, restoreRaw }?: {
+    platform?: NodeJS.Platform;
     prepare?: typeof prepareQuestionInput;
     restoreRaw?: () => void;
 }): Promise<Selection>;

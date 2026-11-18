@@ -1,13 +1,12 @@
 /** Optional account metadata, collected once per config directory; never session content. */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { prepareQuestionInput, readWindowsQuestion } from "./question-input.js";
+import { prepareQuestionInput } from "./question-input.js";
 import { isCi } from "./install-ping.js";
 import { FIRST_RUN_CHOICES } from "./diagnostics-schema.js";
 export const FIRST_RUN_QUESTION_FILE = "first-run-question.json";
 export const TYPE_AHEAD_MS = 400;
 export const QUESTION_TIMEOUT_MS = 45_000;
-export const PASTE_QUIET_MS = 100;
 export class QuestionInterrupted extends Error {
 }
 // Plain text in every terminal, including NO_COLOR.
@@ -21,7 +20,8 @@ function isQuestionSession(args) {
         (args.length === 1 && ["-c", "--continue", "-r", "--resume"].includes(args[0]));
 }
 export function canAskFirstRunQuestion(opts) {
-    return opts.newInstall && opts.stdinIsTty && opts.stdoutIsTty && !isCi(opts.env) &&
+    return (opts.platform ?? process.platform) !== "win32" && opts.newInstall &&
+        opts.stdinIsTty && opts.stdoutIsTty && !isCi(opts.env) &&
         isQuestionSession(opts.args) && opts.diagnostics.enabled &&
         !/^(1|true|yes|on)$/i.test(opts.env.CCC_NO_FIRST_RUN_QUESTION?.trim() ?? "");
 }
@@ -65,10 +65,10 @@ export async function askFirstRunQuestion(opts) {
     let handoff;
     try {
         const selection = await opts.ask(FIRST_RUN_QUESTION, controller.signal);
-        if (selection && typeof selection === "object" && "fd" in selection)
-            handoff = selection;
-        else
-            answer = FIRST_RUN_CHOICES.find(choice => choice === selection) ?? "skipped";
+        const response = typeof selection === "object" ? selection : undefined;
+        handoff = response?.input;
+        const choice = response?.answer ?? selection;
+        answer = FIRST_RUN_CHOICES.find(value => value === choice) ?? "skipped";
     }
     catch (error) {
         interrupted = error instanceof QuestionInterrupted;
@@ -91,8 +91,8 @@ export async function askFirstRunQuestion(opts) {
     }
     return handoff;
 }
-export async function readFirstRunAnswer(question, signal, input, output, { prepare = prepareQuestionInput, restoreRaw } = {}) {
-    if (!input.isTTY || signal.aborted)
+export async function readFirstRunAnswer(question, signal, input, output, { platform = process.platform, prepare = prepareQuestionInput, restoreRaw } = {}) {
+    if (platform === "win32" || !input.isTTY || signal.aborted)
         return "skipped";
     const rawMode = restoreRaw ?? keepQuestionInputRaw(input);
     if (!rawMode)
@@ -105,23 +105,9 @@ export async function readFirstRunAnswer(question, signal, input, output, { prep
             output.write("\x1b[?2004h", error => error ? reject(error) : resolve());
         });
         guardEnds = performance.now() + TYPE_AHEAD_MS;
-        if (process.platform === "win32" && input === process.stdin) {
-            const code = await readWindowsQuestion(question, signal, TYPE_AHEAD_MS, PASTE_QUIET_MS, QUESTION_TIMEOUT_MS);
-            if (code === 130)
-                throw new QuestionInterrupted();
-            if (code === 0)
-                return "skipped";
-            // Only explicit choice receipts (81..86) can become account metadata.
-            const answer = FIRST_RUN_CHOICES[(code ?? 0) - 81];
-            if (answer)
-                return answer;
-            prepared = "queued"; // input, or an unavailable console helper
-        }
-        else {
-            // Provision a relay before consuming any bytes. Usually early input is
-            // still in the kernel and Claude can simply inherit the original fd.
-            prepared = await prepare(input, TYPE_AHEAD_MS) ?? "queued";
-        }
+        // Provision a relay before consuming any bytes. Early input can usually
+        // stay in the kernel for Claude to inherit on the original fd.
+        prepared = await prepare(input, TYPE_AHEAD_MS) ?? "queued";
     }
     finally {
         if (!prepared) {
@@ -131,29 +117,26 @@ export async function readFirstRunAnswer(question, signal, input, output, { prep
     }
     if (prepared === "queued") {
         output.write("\x1b[?2004l");
-        return { fd: process.stdin.fd, close: restore };
+        return { input: { fd: process.stdin.fd, close: restore } };
     }
     const relay = prepared;
     return new Promise((resolve, reject) => {
         let displayed = false;
         let ready = false;
-        let pending;
         let timer;
-        let quiet;
         let done = false;
         function finish(result, interrupted = false) {
             if (done)
                 return;
             done = true;
             clearTimeout(timer);
-            clearTimeout(quiet);
             input.pause();
             input.off("data", onData);
             input.off("end", skip);
             input.off("error", skip);
             signal.removeEventListener("abort", skip);
             process.off("SIGINT", interrupt);
-            if (result !== relay) {
+            if (typeof result === "string") {
                 relay.close();
                 restore();
             }
@@ -168,8 +151,8 @@ export async function readFirstRunAnswer(question, signal, input, output, { prep
         function onData(chunk) {
             // An Esc can begin a paste whose suffix arrives arbitrarily late. Hand
             // it to Claude immediately, without inspecting anything inside the frame.
-            if (ready && !pending && chunk.length === 1) {
-                const key = chunk[0];
+            const key = chunk[0];
+            if (ready && chunk.length === 1) {
                 if (key === 3) {
                     interrupt();
                     return;
@@ -178,15 +161,15 @@ export async function readFirstRunAnswer(question, signal, input, output, { prep
                     skip();
                     return;
                 }
-                if (key >= 49 && key <= 54) {
-                    pending = chunk;
-                    quiet = setTimeout(() => finish(FIRST_RUN_CHOICES[key - 49]), PASTE_QUIET_MS);
-                    return;
-                }
             }
-            const prefix = pending ? Buffer.concat([pending, chunk]) : chunk;
-            finish(relay);
-            relay.forward(prefix, restore);
+            if (ready && key >= 49 && key <= 54) {
+                finish({ answer: FIRST_RUN_CHOICES[key - 49], input: relay });
+                relay.forward(chunk.subarray(1), restore);
+            }
+            else {
+                finish({ input: relay });
+                relay.forward(chunk, restore);
+            }
         }
         try {
             timer = setTimeout(() => {

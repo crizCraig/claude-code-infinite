@@ -22,7 +22,7 @@ export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
 export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
 export interface ClaudeLocation {
-    /** What to spawn: `claude` when it is on PATH, else its absolute path. */
+    /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
     command: string;
     source: ClaudeSource;
     /** Not on PATH: its directory, to put on the child's PATH. */
@@ -73,8 +73,12 @@ export declare function cwdHintText(cwd: string, opts?: {
     env?: NodeJS.ProcessEnv;
     homedir?: string;
 }): string | null;
+/** Resolve a helper without an implicit working-directory or relative PATH lookup. */
+export declare function findPathExecutable(filename: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, cwd: string, isExecutable?: (file: string) => boolean): string | undefined;
 /** `%USERPROFILE%\.local\bin` → its value; unknown names stay as written. */
 export declare function expandWindowsVars(value: string, env: NodeJS.ProcessEnv): string;
 /** The Path values in `reg query` output (REG_SZ or REG_EXPAND_SZ). */
 export declare function parseRegQueryPath(output: string): string | null;
+/** System tools always use a drive-qualified or UNC System32 directory. */
+export declare function system32Path(env: NodeJS.ProcessEnv, ...parts: string[]): string;
 //# sourceMappingURL=claude-locate.d.ts.map

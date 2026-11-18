@@ -3,7 +3,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import test from "node:test";
 
-for (const scenario of ["before", "guard", "visible", "paste", "paste-split", "cli", "cli-queued", "cli-paid"]) {
+for (const scenario of [
+  "before", "guard", "visible", "paste", "paste-split", "answer-burst",
+  "cli", "cli-queued", "cli-paid", "cli-unpaid-ahead", "cli-unpaid-quit-ahead",
+]) {
   test(`Claude receives the original terminal bytes: ${scenario}`, {
     skip: process.platform === "win32" && "POSIX PTY fixture",
   }, async () => {

@@ -1,4 +1,7 @@
 import test from "node:test";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
@@ -8,9 +11,10 @@ import { join } from "node:path";
 import { Diagnostics } from "../dist/diagnostics.js";
 import { sanitizeContext, sanitizeEvent } from "../dist/diagnostics-schema.js";
 import {
-  askFirstRunQuestion, FIRST_RUN_QUESTION, FIRST_RUN_QUESTION_FILE,
-  PASTE_QUIET_MS, QuestionInterrupted, QUESTION_TIMEOUT_MS, readFirstRunAnswer, TYPE_AHEAD_MS,
+  askFirstRunQuestion, canAskFirstRunQuestion, FIRST_RUN_QUESTION, FIRST_RUN_QUESTION_FILE,
+  QuestionInterrupted, QUESTION_TIMEOUT_MS, readFirstRunAnswer, TYPE_AHEAD_MS,
 } from "../dist/first-run-question.js";
+import { prepareQuestionInput, showPaymentPromptIfClear, startupPromptInput } from "../dist/question-input.js";
 import { hasNoInstallState, NEW_INSTALL_FILE, takeNewInstall } from "../dist/new-install.js";
 import { installBody } from "../dist/install-ping.js";
 
@@ -27,7 +31,7 @@ function fixture(t, overrides = {}) {
     },
   });
   const opts = {
-    configDir, newInstall: true, keyCheck: { paid: true }, args: [], env: {}, stdinIsTty: true, stdoutIsTty: true, diagnostics,
+    platform: "linux", configDir, newInstall: true, keyCheck: { paid: true }, args: [], env: {}, stdinIsTty: true, stdoutIsTty: true, diagnostics,
     ask: async (q) => { asked.push(q); return "long_agents"; }, ...overrides,
   };
   return { opts, asked, sent, file: join(configDir, FIRST_RUN_QUESTION_FILE) };
@@ -86,6 +90,61 @@ for (const override of skips) {
     assert.equal(existsSync(file), false);
   });
 }
+
+test("Windows uses normal startup stdin and skips the optional question before claiming it", async t => {
+  const { opts, asked, file } = fixture(t, { platform: "win32" });
+  assert.equal(canAskFirstRunQuestion(opts), false);
+  await askFirstRunQuestion(opts);
+  assert.deepEqual(asked, []);
+  assert.equal(existsSync(file), false);
+});
+
+test("Windows first-run input opens no console device and spawns no program", async t => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "win32" });
+  const open = t.mock.method(fs, "openSync", () => { throw Error("unexpected open"); });
+  const spawn = t.mock.method(childProcess, "spawn", () => { throw Error("unexpected spawn"); });
+  const spawnSync = t.mock.method(childProcess, "spawnSync", () => { throw Error("unexpected spawn"); });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(startupPromptInput(), undefined);
+    assert.equal(await prepareQuestionInput(process.stdin, 0), undefined);
+    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), false);
+    assert.equal(await readFirstRunAnswer("question", new AbortController().signal,
+      process.stdin, process.stdout), "skipped");
+    for (const call of [open, spawn, spawnSync]) assert.equal(call.mock.callCount(), 0);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("first-run terminal helpers pass an absolute executable to every spawn", {
+  skip: process.platform === "win32" && "no Windows terminal helpers",
+}, async t => {
+  const dir = mkdtempSync(join(tmpdir(), "ccc-helper-path-"));
+  const python = join(dir, "python3");
+  writeFileSync(python, "", { mode: 0o700 });
+  const previousPath = process.env.PATH;
+  const calls = [];
+  const stop = new Error("intercepted before launch");
+  t.mock.method(childProcess, "spawn", file => { calls.push(file); throw stop; });
+  t.mock.method(childProcess, "spawnSync", file => { calls.push(file); return { status: 0 }; });
+  syncBuiltinESMExports();
+  try {
+    process.env.PATH = ".:" + dir;
+    assert.equal(showPaymentPromptIfClear(process.stdin, "gate"), true);
+    await assert.rejects(prepareQuestionInput(process.stdin, 0), stop);
+    assert.deepEqual(calls, [python, python]);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("standalone continue and resume flags can show the question", async t => {
   for (const flag of ["--continue", "-c", "--resume", "-r"]) {
@@ -177,16 +236,18 @@ function terminal(t, buffered, display = (flushed) => flushed()) {
   const forwarded = [];
   const relay = {
     fd: 10, close() {},
-    forward(prefix) {
+    forward(prefix, restore) {
+      const receive = chunk => forwarded.push(chunk);
+      this.close = () => { input.off("data", receive); restore(); };
       forwarded.push(prefix);
-      input.on("data", chunk => forwarded.push(chunk));
+      input.on("data", receive);
       input.resume();
     },
   };
-  const result = readFirstRunAnswer(FIRST_RUN_QUESTION, controller.signal, input, output, { prepare: async () => relay });
+  const result = readFirstRunAnswer(FIRST_RUN_QUESTION, controller.signal, input, output, { platform: "linux", prepare: async () => relay });
   t.after(() => { controller.abort(); input.destroy(); output.destroy(); });
   function advance(ms) { t.mock.timers.tick(ms); }
-  function key(value) { input.write(value); advance(PASTE_QUIET_MS + 1); }
+  function key(value) { input.write(value); }
   return { input, result, controller, advance, key, relay, forwarded, screen: () => screen };
 }
 
@@ -197,7 +258,8 @@ for (const [i, label] of choices.entries()) {
     tty.advance(TYPE_AHEAD_MS + 1);
     tty.key(String(i + 1));
     tty.controller.abort(); // a pick must already have finished
-    assert.equal(await tty.result, label);
+    assert.deepEqual(await tty.result, { answer: label, input: tty.relay });
+    tty.relay.close();
     assert.equal(tty.input.isRaw, false);
     assert.equal(tty.input.listenerCount("data"), 0);
   });
@@ -210,7 +272,7 @@ for (const [name, bytes] of [
   test(`queued ${name} reaches Claude without showing the question`, async (t) => {
     const tty = terminal(t, bytes);
     await nextTurn();
-    assert.equal(await tty.result, tty.relay);
+    assert.deepEqual(await tty.result, { input: tty.relay });
     assert.deepEqual(Buffer.concat(tty.forwarded), bytes);
     tty.advance(QUESTION_TIMEOUT_MS);
     assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
@@ -224,7 +286,7 @@ test("typing during the guard bypasses the question and preserves subsequent rea
   tty.input.write("review ");
   tty.advance(1000);
   tty.input.write("file 3\r");
-  assert.equal(await tty.result, tty.relay);
+  assert.deepEqual(await tty.result, { input: tty.relay });
   assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
   assert.equal(Buffer.concat(tty.forwarded).toString(), "review file 3\r");
 });
@@ -236,19 +298,23 @@ test("a digit typed while menu output is queued belongs to Claude", async t => {
   tty.advance(TYPE_AHEAD_MS);
   tty.input.write("6");
   flush();
-  assert.equal(await tty.result, tty.relay);
+  assert.deepEqual(await tty.result, { input: tty.relay });
   assert.equal(Buffer.concat(tty.forwarded).toString(), "6");
   assert.ok(!tty.screen().includes(FIRST_RUN_QUESTION));
 });
 
-test("a pending digit followed by text is handed off with the text", async t => {
+test("a menu digit records its answer and hands the next read to Claude", async t => {
   const tty = terminal(t);
   await nextTurn();
   tty.advance(TYPE_AHEAD_MS);
+  const { opts, sent, file } = fixture(t, { ask: () => tty.result });
+  const handoff = askFirstRunQuestion(opts);
   tty.input.write("3");
   tty.input.write(" files\r");
-  assert.equal(await tty.result, tty.relay);
-  assert.equal(Buffer.concat(tty.forwarded).toString(), "3 files\r");
+  assert.equal(await handoff, tty.relay);
+  assert.deepEqual(JSON.parse(readFileSync(file)), { status: "answered", answer: "remember" });
+  assert.equal(sent[0].body.events[0].answer, "remember");
+  assert.equal(Buffer.concat(tty.forwarded).toString(), " files\r");
 });
 
 test("a deliberate Enter skips the displayed menu", async t => {
