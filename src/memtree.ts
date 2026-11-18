@@ -2226,7 +2226,8 @@ export class MemtreeClient {
         // No proof the server put the named messages back: its answer may be built from
         // hashes. Unacked naming stops for a while; the next turn goes the usual way.
         this.messageRefs.pauseUnconfirmed(opts.sessionId, messages);
-        throw new Error("context_memory answer does not show it resolved message refs");
+        throw Object.assign(new Error("context_memory answer does not show it resolved message refs"),
+          { status: response.status });
       }
       if (unconfirmed && !ImageRefs.resolvedBy(json)) {
         // No proof the server put the images back: its result may hold references.

@@ -667,3 +667,18 @@ test("only the structured slot-busy 503 keeps the shared outage cooldown clear",
     assert.equal(client.lastCompressFailureArming(hash, 200000), arming);
   }
 });
+
+test("a missing ack for unacked naming rejects the answer without arming the outage cooldown", async (t) => {
+  let named = 0;
+  const { client } = refsTransport(t, (messages) => {
+    named = messages.filter((m) => m[REF_KEY]).length;
+    return Response.json({ messages: [{ role: "user", content: "answer" }] });
+  });
+  const messages = bigConversation(35);
+  const hash = MemtreeClient.hashMessages(messages);
+  const meta = { sessionId: "missing-ack" };
+  assert.equal(await client.compress(hash, messages, 200000, undefined, meta), null);
+  assert.ok(named > 0, "the request used unacked refs");
+  assert.equal(client.lastCompressFailureArming(hash, 200000, meta), false);
+  assert.equal(client.lastCompressFailureStatus(hash, 200000, meta), 200);
+});
