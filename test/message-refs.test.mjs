@@ -426,7 +426,7 @@ test("unacked refs: a server whose cap is lower than the probe gets the turn rep
   }
 });
 
-test("refs answered without the ack field are not trusted (a server that ignores them)", async () => {
+test("unacked refs answered without the ack field are not trusted even after a positive status", async () => {
   const server = await fakeMemtree();
   server.legacy = true;
   try {
@@ -470,6 +470,10 @@ async function fakeMemtree() {
     storedImages: [], imageMissingNext: false, realMissing: false, unmatchedOnce: new Set(),
     capChars: 0, legacy: false };
   const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/context_memory/status") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ message_refs: true }));
+    }
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
     req.on("end", () => {
@@ -547,3 +551,119 @@ function rebuild(store, ref) {
   assert.ok(found, "the client named only what was stored");
   return found.message;
 }
+
+// Exercise the wire contract, including streamed uploads, without retaining large responses.
+function refsTransport(t, post, status = { message_refs: true }) {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    const request = new Request(url, init);
+    const path = new URL(url).pathname;
+    requests.push([request.method, path]);
+    assert.equal(request.headers.get("authorization"), "Bearer k");
+    if (request.method === "GET" && path === "/v1/context_memory/status") {
+      return Response.json(status);
+    }
+    assert.equal(path, "/v1/context_memory");
+    const { messages } = await request.json();
+    return post(messages);
+  });
+  return { client: new MemtreeClient({ baseUrl: "http://memtree.test", apiKey: "k",
+    messageRefs: true }), requests };
+}
+
+function refsAnswer(messages, cap) {
+  return Response.json({ messages: [{ role: "user", content: "answer" }],
+    [STORED_MESSAGES_FIELD]: { stored: true, messages: messages.length, max_named_chars: cap } });
+}
+
+for (const cachedCap of [undefined, 32 * 1024 * 1024]) {
+  test(`partial 409 keeps the exact refs with a ${cachedCap ? "reprobed" : "fresh"} cap`, async (t) => {
+    const sent = [];
+    const { client, requests } = refsTransport(t, (messages) => {
+      if (messages.length === 1) return refsAnswer(messages, cachedCap);
+      const refs = messages.map((m) => m[REF_KEY]).filter(Boolean);
+      sent.push(refs);
+      if (sent.length === 1) return Response.json({ detail: { missing_message_hashes: [refs[0]] } },
+        { status: 409 });
+      return refsAnswer(messages);
+    });
+    const opts = { sessionId: "large", timeoutMs: 30000 };
+    if (cachedCap) await client.callContextMemory([{ role: "user", content: "warmup" }], 200000, opts);
+    await client.callContextMemory(bigConversation(70), 200000, opts);
+    assert.ok(sent[0].length >= 59);
+    assert.deepEqual(sent[1], sent[0].slice(1), "the missing ref goes inline; the tail stays inline");
+    assert.equal(requests.filter(([method]) => method === "GET").length, cachedCap ? 0 : 1);
+  });
+}
+
+test("partial 409 reserves surviving refs before naming more to fit the wire limit", async (t) => {
+  const sent = [];
+  const messages = [{ role: "user", content: "start" }, ...[17, 2, 12, 7, 10, 5, 2].map(
+    (mib, i) => ({ role: "assistant", content: String(i).repeat(mib * 1024 * 1024) }))];
+  const { client } = refsTransport(t, (body) => {
+    if (body.length === 1) return refsAnswer(body, 32 * 1024 * 1024);
+    const indices = body.flatMap((m, i) => m[REF_KEY] ? [i] : []);
+    sent.push(indices);
+    if (sent.length === 1) return Response.json({ detail: { missing_message_hashes: [body[4][REF_KEY]] } },
+      { status: 409 });
+    return refsAnswer(body);
+  });
+  const opts = { sessionId: "large", timeoutMs: 30000 };
+  await client.callContextMemory(messages.slice(0, 1), 200000, opts);
+  await client.callContextMemory(messages, 200000, opts);
+  assert.deepEqual(sent, [[1, 2, 4, 7], [1, 2, 6, 7]]);
+});
+
+test("malformed unacked refs pause only that lane and preserve another lane's acks", async (t) => {
+  const counts = [];
+  const { client, requests } = refsTransport(t, (messages) => {
+    counts.push(messages.filter((m) => m[REF_KEY]).length);
+    if (messages[0].content === "other opening") {
+      return Response.json({ detail: "Malformed message refs: cache mark too deep" }, { status: 400 });
+    }
+    return refsAnswer(messages);
+  });
+  const opts = { sessionId: "shared", timeoutMs: 30000 };
+  const working = conversation();
+  await client.callContextMemory(working, 200000, opts);
+  const other = bigConversation(35);
+  other[0].content = "other opening";
+  await assert.rejects(client.callContextMemory(other, 200000, opts), { status: 400 });
+  await assert.rejects(client.callContextMemory(other, 200000, opts), { bodyLimit: true });
+  await client.callContextMemory(working, 200000, opts);
+  assert.ok(requests.every(([method]) => method === "POST"), "the other lane's ack established support");
+  assert.equal(counts.length, 3, "no resend or subsequent POST for the paused lane");
+  assert.ok(counts[1] > 0 && counts[2] > 0);
+});
+
+test("unknown ref support requires an explicit status advertisement before any unacked POST", async (t) => {
+  const { client, requests } = refsTransport(t, (messages) => refsAnswer(messages), { paid: true });
+  await assert.rejects(client.callContextMemory(bigConversation(35), 200000,
+    { sessionId: "fresh", timeoutMs: 30000 }), { bodyLimit: true });
+  assert.deepEqual(requests, [["GET", "/v1/context_memory/status"]]);
+});
+
+test("a fresh client uses the cap advertised by status before its first unacked POST", async (t) => {
+  const counts = [];
+  const { client, requests } = refsTransport(t, (messages) => {
+    counts.push(messages.filter((m) => m[REF_KEY]).length);
+    return refsAnswer(messages);
+  }, { message_refs: true, max_named_chars: 32 * 1024 * 1024 });
+  await client.callContextMemory(bigConversation(40), 200000, { sessionId: "fresh", timeoutMs: 30000 });
+  assert.deepEqual(requests, [["GET", "/v1/context_memory/status"], ["POST", "/v1/context_memory"]]);
+  assert.deepEqual(counts, [29]);
+});
+
+test("only the structured slot-busy 503 keeps the shared outage cooldown clear", async (t) => {
+  let detail;
+  const { client } = refsTransport(t, () => Response.json({ detail }, { status: 503 }));
+  const messages = conversation();
+  const hash = MemtreeClient.hashMessages(messages);
+  for (const [reason, arming] of [[{ reason: "large_rebuild_busy" }, false],
+    ["large_rebuild_busy", true], [{ reason: "overloaded" }, true]]) {
+    detail = reason;
+    assert.equal(await client.compress(hash, messages, 200000), null);
+    assert.equal(client.lastCompressFailureStatus(hash, 200000), 503);
+    assert.equal(client.lastCompressFailureArming(hash, 200000), arming);
+  }
+});

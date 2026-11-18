@@ -35,7 +35,7 @@ import {
 import { planMemtreeBody, type BodyLimitNote, type PlannedBody } from "./memtree-body.js";
 import {
   MESSAGE_REFS_FEATURE, MISSING_MESSAGES_STATUS, MessageRefs, STORED_MESSAGES_FIELD,
-  missingMessageHashes, type Delta,
+  missingMessageHashes, refFormatRefusal, type Delta, type UnconfirmedPlan,
 } from "./message-refs.js";
 import {
   stripCcSystemReminders,
@@ -1302,7 +1302,7 @@ export class MemtreeClient {
    * promise), not after awaiting other work; only that keeps the read paired
    * with the failure it describes.
    * Arming failures are evidence about the SERVER's health: no response at
-   * all (network error or the abort-budget timeout), any 5xx, and 402 —
+   * all (network error or the abort-budget timeout), 5xx except a busy rebuild slot, and 402 —
    * unpaid is global and persistent, so it must keep arming. Any other 4xx
    * came from a responsive server rejecting this one request and must not
    * open the shared fuse. Unclassified failures default to arming: muting
@@ -1391,7 +1391,7 @@ export class MemtreeClient {
       this.compressFailureArming.delete(cacheKey);
       this.compressFailureArming.set(
         cacheKey,
-        status === undefined || status >= 500 || status === 402
+        status === undefined || (status >= 500 && !err?.largeRebuildBusy) || status === 402
       );
       if (this.compressFailureArming.size > DEDUPE_CACHE_MAX) {
         const first = this.compressFailureArming.keys().next().value;
@@ -1936,6 +1936,8 @@ export class MemtreeClient {
       unconfirmedRetry?: boolean;
       /** A resend of a call that named unacked messages: every hash its 409s named. */
       unconfirmedMessageRefs?: string[];
+      /** The refs (by position) and cap chosen for this chain of unacked calls. */
+      unconfirmedPlan?: UnconfirmedPlan;
       /** How many such resends came before this one (at most UNCONFIRMED_ROUNDS). */
       unconfirmedRound?: number;
       /** This call is the one replan after a message refs cap 400. */
@@ -2014,8 +2016,12 @@ export class MemtreeClient {
     // Stored messages named by hash (message-refs.ts), stored images as references, and
     // never a body over the HTTP/1 limit (memtree-body.ts).
     // Not on the final index: its body is prepared cooperatively (final-index.ts).
-    let delta: Delta = opts.messageRefs === false || opts.finalIndex ? { messages, refs: [] }
-      : this.messageRefs.delta(opts.sessionId, messages);
+    const exclude = new Set(opts.unconfirmedMessageRefs);
+    const prior = opts.messageRefs === false ? undefined : opts.unconfirmedPlan;
+    let delta: Delta = prior
+      ? this.messageRefs.unconfirmedDelta(opts.sessionId, messages, exclude, false, prior)
+      : opts.messageRefs === false || opts.finalIndex ? { messages, refs: [] }
+        : this.messageRefs.delta(opts.sessionId, messages);
     const plan = (d: Delta, refs: boolean): PlannedBody => planMemtreeBody({
       body, messages: d.messages, indexOnly: opts.indexOnly === true,
       serialized: refs && opts.serializedMessages !== undefined && !d.refs.length
@@ -2035,21 +2041,31 @@ export class MemtreeClient {
     // process has no acks; a 409 names what the server lacks, sent inline).
     // Only for a body that would otherwise not be sent at all: one that fits the old way is
     // sent exactly as before.
-    let namedUnconfirmed = false;
-    const tooBig = planned.payload === undefined && !opts.indexOnly && !opts.finalIndex &&
-      opts.messageRefs !== false;
-    const exclude = new Set(opts.unconfirmedMessageRefs ?? []);
-    // The known cap first; then, rate-limited, the probe (the server's may have been raised).
-    for (const probe of tooBig ? [false, true] : []) {
-      if (probe && !this.messageRefs.mayReprobe()) break;
-      const named = this.messageRefs.unconfirmedDelta(opts.sessionId, messages, exclude, probe);
-      if (!named.refs.length) continue;
-      const candidate = withImages(named);
-      if (candidate.planned.payload === undefined) continue;
-      ({ planned, unconfirmed } = candidate);
-      delta = named;
-      namedUnconfirmed = true;
-      break;
+    let namedPlan = prior && delta.refs.length ? { ...prior, messages: delta.messages } : undefined;
+    const mayNameUnconfirmed = planned.payload === undefined && !opts.indexOnly && !opts.finalIndex &&
+      opts.messageRefs !== false && this.messageRefs.unconfirmedLane(opts.sessionId, messages);
+    let statusProbeMs = 0;
+    if (mayNameUnconfirmed && !this.messageRefs.supportConfirmed) {
+      const start = Date.now();
+      await this.checkMessageRefsStatus(opts.signal, opts.timeoutMs);
+      statusProbeMs = Date.now() - start;
+    }
+    if (mayNameUnconfirmed && this.messageRefs.supportConfirmed) {
+      // A chain keeps its own cap, even after another call learns a new one or this call
+      // spends the reprobe allowance. Only a server cap refusal replaces that cap.
+      for (const probe of [false, true]) {
+        if (probe && (prior || !this.messageRefs.mayReprobe())) break;
+        const maxChars = prior?.maxChars ?? this.messageRefs.unconfirmedCap(probe);
+        const named = this.messageRefs.unconfirmedDelta(opts.sessionId, messages, exclude, probe,
+          prior, true);
+        if (!named.refs.length) continue;
+        const candidate = withImages(named);
+        if (candidate.planned.payload === undefined) continue;
+        ({ planned, unconfirmed } = candidate);
+        delta = named;
+        namedPlan = { messages: named.messages, maxChars };
+        break;
+      }
     }
     const sentMessages = delta.messages;
     if (planned.payload === undefined) {
@@ -2069,7 +2085,8 @@ export class MemtreeClient {
     const started = Date.now();
     // Resends draw on what is left of this call's budget: one absolute deadline, so a
     // resend of a resend never counts the same time twice.
-    const callDeadline = started + opts.timeoutMs;
+    const remainingMs = opts.timeoutMs - statusProbeMs;
+    const callDeadline = started + remainingMs;
     let status: number | undefined;
     let ok = false;
     let keyRefused = false;
@@ -2086,10 +2103,10 @@ export class MemtreeClient {
     // A default compress budget grows with what it uploads and what its refs name (the
     // server reads and rebuilds those); an index call's, and any budget a caller set, is fixed.
     const timeoutMs = opts.scaleTimeout && !opts.indexOnly
-      ? scaledTimeout(opts.timeoutMs,
+      ? scaledTimeout(remainingMs,
         Buffer.byteLength(payload, "utf-8") + (delta.namedChars ?? 0),
         this.compressTimeoutMsPerKiB)
-      : opts.timeoutMs;
+      : remainingMs;
     const timeout = setTimeout(abort, timeoutMs);
     timeout.unref();
     opts.signal?.addEventListener("abort", abort, { once: true });
@@ -2107,7 +2124,7 @@ export class MemtreeClient {
       this.lastUnreachable = undefined;
       if (delta.refs.length && !response.ok) {
         refusalText = await readUnlessAborted(response, controller.signal);
-        const lacking = namedUnconfirmed && response.status === MISSING_MESSAGES_STATUS
+        const lacking = namedPlan && response.status === MISSING_MESSAGES_STATUS
           ? new Set(missingMessageHashes(refusalText) ?? []) : undefined;
         if (lacking?.size) {
           // Unacked refs the server lacks (its 409s come in stages: rows, then re-hashes):
@@ -2121,13 +2138,13 @@ export class MemtreeClient {
             resent = true;
             this.log(`context_memory 409 on ${lacking.size} unacked refs: sending those inline`);
             return await this.callContextMemory(messages, modelContextLimit, {
-              ...opts, unconfirmedRound: round,
+              ...opts, unconfirmedPlan: namedPlan, unconfirmedRound: round,
               unconfirmedMessageRefs: [...(opts.unconfirmedMessageRefs ?? []), ...lacking],
               get timeoutMs() { return callDeadline - Date.now(); },
             });
           }
         }
-        if (!lacking?.size && namedUnconfirmed && !opts.capReplanned &&
+        if (!lacking?.size && namedPlan && !opts.capReplanned &&
           capRefusal(response.status, refusalText)) {
           // Past the server's cap (it says which; a lower one than this client named): the
           // same turn planned again within it, once, keeping the refs.
@@ -2136,8 +2153,14 @@ export class MemtreeClient {
           resent = true;
           return await this.callContextMemory(messages, modelContextLimit, {
             ...opts, capReplanned: true,
+            unconfirmedPlan: { ...namedPlan, maxChars: this.messageRefs.maxNamedChars },
             get timeoutMs() { return callDeadline - Date.now(); },
           });
+        }
+        if (namedPlan && refFormatRefusal(response.status, refusalText)) {
+          this.messageRefs.pauseUnconfirmed(opts.sessionId, messages);
+          throw Object.assign(new Error(`context_memory 400: ${refusalText.slice(0, 300)}`),
+            { status: 400 });
         }
         if (!lacking?.size && this.messageRefs.noteRefusal(opts.sessionId, messages, delta.refs,
           response.status, refusalText)) {
@@ -2166,10 +2189,10 @@ export class MemtreeClient {
           // images it lacks now forgotten), so the usual size fallbacks plan it.
           // Unacked message refs are kept (without them the body is over the limit again):
           // the images it lacks go as bytes, once.
-          const plain = delta.refs.length > 0 && !namedUnconfirmed;
-          const keepNamed = namedUnconfirmed && !opts.unconfirmedRetry;
+          const plain = delta.refs.length > 0 && !namedPlan;
+          const keepNamed = namedPlan && !opts.unconfirmedRetry;
           return await this.callContextMemory(messages, modelContextLimit, {
-            ...opts,
+            ...opts, unconfirmedPlan: namedPlan,
             ...(plain ? { messageRefs: false, refusedMessageRefs: response.status }
               : keepRefs || keepNamed ? { unconfirmedRetry: true } : { imageRefs: false }),
             get timeoutMs() { return callDeadline - Date.now(); },
@@ -2190,6 +2213,7 @@ export class MemtreeClient {
         throw Object.assign(
           new Error(`context_memory ${response.status}: ${text.slice(0, 300)}`),
           { status: response.status,
+            largeRebuildBusy: isLargeRebuildBusy(response.status, text),
             indexWaitSeconds: indexWaitFrom413(response.status, text,
               response.headers.get("retry-after"), Date.now(),
               response.headers.get("x-polychat-index-pending")) }
@@ -2197,7 +2221,7 @@ export class MemtreeClient {
       }
 
       const json = (await response.json()) as CompressResult;
-      if (namedUnconfirmed &&
+      if (namedPlan &&
         (json as unknown as Record<string, unknown>)?.[STORED_MESSAGES_FIELD] === undefined) {
         // No proof the server put the named messages back: its answer may be built from
         // hashes. Unacked naming stops for a while; the next turn goes the usual way.
@@ -2302,6 +2326,20 @@ export class MemtreeClient {
         ...(opts.model && !opts.indexOnly ? { model: opts.model } : {}),
         ...diagnostics,
       });
+    }
+  }
+
+  /** A pre-ref server can store hash placeholders as ordinary messages. Check support
+   *  with a bounded, read-only request before the first otherwise-unsendable upload. */
+  private async checkMessageRefsStatus(signal: AbortSignal | undefined, budgetMs: number): Promise<void> {
+    signal?.throwIfAborted();
+    const timeout = AbortSignal.timeout(Math.max(0, Math.min(2000, Math.floor(budgetMs))));
+    try {
+      const status = await this.fetchMemTree("/v1/context_memory/status", "application/json",
+        signal ? AbortSignal.any([signal, timeout]) : timeout);
+      if (status.status === 200) this.messageRefs.noteStatus(JSON.parse(status.body.toString("utf8")));
+    } catch {
+      signal?.throwIfAborted();
     }
   }
 
@@ -2434,6 +2472,16 @@ export class MemtreeClient {
 
   private log(msg: string) {
     if (this.debug) console.error(`[ccc proxy] ${msg}`);
+  }
+}
+
+/** The rebuild slot only blocks another large request. Other 503s still arm the fuse. */
+function isLargeRebuildBusy(status: number, body: string): boolean {
+  if (status !== 503) return false;
+  try {
+    return JSON.parse(body)?.detail?.reason === "large_rebuild_busy";
+  } catch {
+    return false;
   }
 }
 

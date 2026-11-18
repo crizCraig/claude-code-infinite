@@ -36,6 +36,12 @@ export interface Delta {
     /** The named messages' JSON length: what the server rebuilds beyond the body. */
     namedChars?: number;
 }
+/** The exact message positions and rebuild budget chosen for one unacked resend chain. */
+export interface UnconfirmedPlan {
+    /** Only named positions differ from the corresponding original message objects. */
+    messages: Message[];
+    maxChars: number;
+}
 export declare class MessageRefs {
     readonly enabled: boolean;
     /** Per conversation (session and opening, as the server's scope): acked digests. */
@@ -52,6 +58,7 @@ export declare class MessageRefs {
     private namedChars;
     /** Whether a server has said its cap (an answer or a cap 400 carried it). */
     private capKnown;
+    private supportSeen;
     /** When a too-big body may next try the probe cap over a known lower one. */
     private reprobeAt;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
@@ -66,12 +73,17 @@ export declare class MessageRefs {
      * 409 named before): for a body too big to send otherwise, as a fresh process's first call
      * of a long conversation, which has no acks. The server's 409 names what it lacks.
      */
-    unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>, probe?: boolean): Delta;
+    unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>, probe?: boolean, prior?: UnconfirmedPlan, extend?: boolean): Delta;
+    unconfirmedLane(sessionId: string | undefined, messages: Message[]): string | undefined;
+    unconfirmedCap(probe?: boolean): number;
+    get supportConfirmed(): boolean;
+    /** A successful status GET explicitly advertising the message-ref protocol. */
+    noteStatus(status: Record<string, unknown> | null): void;
     /** Whether a too-big body may try the probe cap although a lower one is known (a server's
      *  cap may have been raised since): once per UNCONFIRMED_PAUSE_MS, and not when the known
      *  cap is the probe's already. */
     mayReprobe(now?: number): boolean;
-    /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
+    /** Pause this lane after an all-missing 409, a malformed ref, or a missing ack field. */
     pauseUnconfirmed(sessionId: string | undefined, messages: Message[], now?: number): void;
     /** What one request's refs may expand to now (for tests and the request log). */
     get maxNamedChars(): number;
@@ -93,6 +105,7 @@ export declare class MessageRefs {
     /** The server's cap from any answer that carries the field (whatever its lane, trimmed
      *  bodies included: the cap is the server's, not a conversation's). */
     noteServerCap(json: unknown): void;
+    private noteCap;
     /** A text-cap 400: the cap it names (a newer server), else the default (an older one). */
     private noteRefusedCap;
     /** The conversation `messages` belong to, while refs may be named for it. */
@@ -112,8 +125,8 @@ export declare class MessageRefs {
  * everything before it that is not a system/developer message.
  */
 export declare function buildDelta(messages: Message[], acked: {
-    has(digest: string): boolean;
-}, maxChars?: number, imageAware?: boolean): Delta;
+    has(digest: string, index: number): boolean;
+}, maxChars?: number, imageAware?: boolean, previous?: Message[], extend?: boolean): Delta;
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
  * message without its `cache_control` keys and, when `stripHeader` (no earlier message of
@@ -122,6 +135,8 @@ export declare function buildDelta(messages: Message[], acked: {
 export declare function refFor(message: Message, stripHeader?: boolean): Ref | undefined;
 /** The digests an answer's acks allow for `messages`, in the request's header order. */
 export declare function ackedDigests(messages: Message[], acks: Record<string, unknown>, known?: ReadonlySet<string>): string[];
+/** A message-ref format refusal, separate from the text and image size limits. */
+export declare function refFormatRefusal(status: number, bodyText: string): boolean;
 /** The hashes a 409 names, or undefined when it names none. */
 export declare function missingMessageHashes(bodyText: string): string[] | undefined;
 //# sourceMappingURL=message-refs.d.ts.map

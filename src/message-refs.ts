@@ -86,6 +86,13 @@ export interface Delta {
   namedChars?: number;
 }
 
+/** The exact message positions and rebuild budget chosen for one unacked resend chain. */
+export interface UnconfirmedPlan {
+  /** Only named positions differ from the corresponding original message objects. */
+  messages: Message[];
+  maxChars: number;
+}
+
 export class MessageRefs {
   /** Per conversation (session and opening, as the server's scope): acked digests. */
   private acked = new Map<string, Set<string>>();
@@ -101,6 +108,7 @@ export class MessageRefs {
   private namedChars = MAX_NAMED_CHARS;
   /** Whether a server has said its cap (an answer or a cap 400 carried it). */
   private capKnown = false;
+  private supportSeen = false;
   /** When a too-big body may next try the probe cap over a known lower one. */
   private reprobeAt = 0;
   /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
@@ -129,15 +137,35 @@ export class MessageRefs {
    * of a long conversation, which has no acks. The server's 409 names what it lacks.
    */
   unconfirmedDelta(sessionId: string | undefined, messages: Message[],
-                   exclude: ReadonlySet<string> = new Set(), probe = false): Delta {
-    const lane = this.laneFor(sessionId, messages);
-    if (!lane || (this.unconfirmedPaused.get(lane) ?? 0) > Date.now()) {
-      return { messages, refs: [] };
-    }
+                   exclude: ReadonlySet<string> = new Set(), probe = false,
+                   prior?: UnconfirmedPlan, extend = false): Delta {
+    const lane = this.unconfirmedLane(sessionId, messages);
+    if (!lane) return { messages, refs: [] };
     const never = this.never.get(lane);
-    const cap = this.capKnown && !probe ? this.namedChars
-      : namedCharsFor(PROBE_SERVER_NAMED_CHARS);
-    return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, cap, true);
+    return buildDelta(messages, { has: (digest, index) => {
+      const kept = prior && prior.messages[index] !== messages[index];
+      return !exclude.has(digest) && (kept || !never?.has(digest));
+    } }, prior?.maxChars ?? this.unconfirmedCap(probe), true, prior?.messages, extend);
+  }
+
+  unconfirmedLane(sessionId: string | undefined, messages: Message[]): string | undefined {
+    const lane = this.laneFor(sessionId, messages);
+    return lane && (this.unconfirmedPaused.get(lane) ?? 0) <= Date.now() ? lane : undefined;
+  }
+
+  unconfirmedCap(probe = false): number {
+    return this.capKnown && !probe ? this.namedChars : namedCharsFor(PROBE_SERVER_NAMED_CHARS);
+  }
+
+  get supportConfirmed(): boolean {
+    return this.supportSeen;
+  }
+
+  /** A successful status GET explicitly advertising the message-ref protocol. */
+  noteStatus(status: Record<string, unknown> | null): void {
+    if (status?.message_refs !== true) return;
+    this.supportSeen = true;
+    this.noteCap(status[MAX_NAMED_CHARS_KEY]);
   }
 
   /** Whether a too-big body may try the probe cap although a lower one is known (a server's
@@ -150,7 +178,7 @@ export class MessageRefs {
     return true;
   }
 
-  /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
+  /** Pause this lane after an all-missing 409, a malformed ref, or a missing ack field. */
   pauseUnconfirmed(sessionId: string | undefined, messages: Message[], now = Date.now()): void {
     const lane = this.laneFor(sessionId, messages);
     if (!lane) return;
@@ -200,7 +228,7 @@ export class MessageRefs {
       if (/\brefs expand past/i.test(bodyText)) this.noteRefusedCap(bodyText);
       return true;
     }
-    if (status === 400 && /message refs/i.test(bodyText)) {
+    if (refFormatRefusal(status, bodyText)) {
       this.disabled = true;
       this.acked.clear();
       return true;
@@ -217,7 +245,13 @@ export class MessageRefs {
    *  bodies included: the cap is the server's, not a conversation's). */
   noteServerCap(json: unknown): void {
     const field = (json as Record<string, unknown> | null)?.[STORED_MESSAGES_FIELD];
-    const cap = capOf((field as Record<string, unknown> | null)?.[MAX_NAMED_CHARS_KEY]);
+    if (!field || typeof field !== "object") return;
+    this.supportSeen = true;
+    this.noteCap((field as Record<string, unknown>)[MAX_NAMED_CHARS_KEY]);
+  }
+
+  private noteCap(value: unknown): void {
+    const cap = capOf(value);
     if (cap === undefined) return;
     this.namedChars = namedCharsFor(cap);
     this.capKnown = true;
@@ -301,37 +335,49 @@ export class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export function buildDelta(messages: Message[], acked: { has(digest: string): boolean },
-                           maxChars = MAX_NAMED_CHARS, imageAware = false): Delta {
+export function buildDelta(messages: Message[], acked: { has(digest: string, index: number): boolean },
+                           maxChars = MAX_NAMED_CHARS, imageAware = false,
+                           previous?: Message[], extend = false): Delta {
   const opening = messages.findIndex(isOpening);
   if (opening < 0) return { messages, refs: [] };
-  let headerSeen = false;
   let marks = 0;
   let chars = 0;
   let imageChars = 0;
-  const refs: string[] = [];
-  const out = messages.map((message, index) => {
-    const eligible = (index > opening || isSkipped(message)) && refs.length < MAX_REFS;
-    const ref = eligible ? refFor(message, !headerSeen) : undefined;
-    headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
-    if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS ||
-        (!imageAware && chars + ref.chars > maxChars)) return message;
-    const named = refJson(ref);
-    // A short message is smaller than its ref: sent as it is.
-    if (JSON.stringify(named).length >= ref.chars) return message;
-    const images = imageCharsOf(message);
-    if (imageChars + images > MAX_NAMED_IMAGE_CHARS) return message;
-    // `imageAware` (unacked naming): the server stores an image as a short ref, so a
-    // screenshot costs its text against the cap, its base64 only against the image cap.
-    const cost = imageAware ? storedChars(ref.chars, message, images) : ref.chars;
-    if (imageAware && chars + cost > maxChars) return message;
-    marks += ref.marks.length;
-    chars += cost;
-    imageChars += images;
-    refs.push(ref.digest);
-    return named;
-  });
-  return refs.length ? { messages: out, refs, namedChars: chars } : { messages, refs: [] };
+  let count = 0;
+  const out = messages.slice();
+  // A resend reserves every surviving occurrence first. Only an oversized resend gets a
+  // second pass over the formerly inline messages, spending the remaining budgets.
+  const select = (previouslyNamed: boolean) => {
+    let headerSeen = false;
+    for (const [index, message] of messages.entries()) {
+      if (count >= MAX_REFS) break;
+      const stripHeader = !headerSeen;
+      headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
+      if (index <= opening && !isSkipped(message)) continue;
+      if (previous && (previous[index] !== message) !== previouslyNamed) continue;
+      const ref = refFor(message, stripHeader);
+      if (!ref || !acked.has(ref.digest, index) || marks + ref.marks.length > MAX_MARKS ||
+          (!imageAware && chars + ref.chars > maxChars)) continue;
+      const named = refJson(ref);
+      // A short message costs less inline.
+      if (JSON.stringify(named).length >= ref.chars) continue;
+      const images = imageCharsOf(message);
+      if (imageChars + images > MAX_NAMED_IMAGE_CHARS) continue;
+      // Unacked naming counts an image as its short stored ref against the text cap.
+      const cost = imageAware ? storedChars(ref.chars, message, images) : ref.chars;
+      if (imageAware && chars + cost > maxChars) continue;
+      marks += ref.marks.length;
+      chars += cost;
+      imageChars += images;
+      count++;
+      out[index] = named;
+    }
+  };
+  if (previous) select(true);
+  if (!previous || extend) select(false);
+  if (!count) return { messages, refs: [] };
+  const refs = out.flatMap((m, i) => m === messages[i] ? [] : [m[REF_KEY]]);
+  return { messages: out, refs, namedChars: chars };
 }
 
 /**
@@ -367,6 +413,11 @@ export function ackedDigests(messages: Message[], acks: Record<string, unknown>,
     out.push(ref.digest);
   }
   return out;
+}
+
+/** A message-ref format refusal, separate from the text and image size limits. */
+export function refFormatRefusal(status: number, bodyText: string): boolean {
+  return status === 400 && /message refs/i.test(bodyText) && !/expand past/i.test(bodyText);
 }
 
 /** The hashes a 409 names, or undefined when it names none. */

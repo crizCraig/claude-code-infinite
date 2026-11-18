@@ -514,7 +514,7 @@ export declare class MemtreeClient {
      * promise), not after awaiting other work; only that keeps the read paired
      * with the failure it describes.
      * Arming failures are evidence about the SERVER's health: no response at
-     * all (network error or the abort-budget timeout), any 5xx, and 402 —
+     * all (network error or the abort-budget timeout), 5xx except a busy rebuild slot, and 402 —
      * unpaid is global and persistent, so it must keep arming. Any other 4xx
      * came from a responsive server rejecting this one request and must not
      * open the shared fuse. Unclassified failures default to arming: muting
@@ -672,6 +672,9 @@ export declare class MemtreeClient {
     private rememberInFlight;
     private remember;
     private callContextMemory;
+    /** A pre-ref server can store hash placeholders as ordinary messages. Check support
+     *  with a bounded, read-only request before the first otherwise-unsendable upload. */
+    private checkMessageRefsStatus;
     /** Remember a call's connection failure (memtree.unreachable); other errors are no news. */
     private noteUnreachable;
     /**

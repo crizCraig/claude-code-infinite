@@ -83,6 +83,7 @@ export class MessageRefs {
     namedChars = MAX_NAMED_CHARS;
     /** Whether a server has said its cap (an answer or a cap 400 carried it). */
     capKnown = false;
+    supportSeen = false;
     /** When a too-big body may next try the probe cap over a known lower one. */
     reprobeAt = 0;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
@@ -109,15 +110,32 @@ export class MessageRefs {
      * 409 named before): for a body too big to send otherwise, as a fresh process's first call
      * of a long conversation, which has no acks. The server's 409 names what it lacks.
      */
-    unconfirmedDelta(sessionId, messages, exclude = new Set(), probe = false) {
-        const lane = this.laneFor(sessionId, messages);
-        if (!lane || (this.unconfirmedPaused.get(lane) ?? 0) > Date.now()) {
+    unconfirmedDelta(sessionId, messages, exclude = new Set(), probe = false, prior, extend = false) {
+        const lane = this.unconfirmedLane(sessionId, messages);
+        if (!lane)
             return { messages, refs: [] };
-        }
         const never = this.never.get(lane);
-        const cap = this.capKnown && !probe ? this.namedChars
-            : namedCharsFor(PROBE_SERVER_NAMED_CHARS);
-        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, cap, true);
+        return buildDelta(messages, { has: (digest, index) => {
+                const kept = prior && prior.messages[index] !== messages[index];
+                return !exclude.has(digest) && (kept || !never?.has(digest));
+            } }, prior?.maxChars ?? this.unconfirmedCap(probe), true, prior?.messages, extend);
+    }
+    unconfirmedLane(sessionId, messages) {
+        const lane = this.laneFor(sessionId, messages);
+        return lane && (this.unconfirmedPaused.get(lane) ?? 0) <= Date.now() ? lane : undefined;
+    }
+    unconfirmedCap(probe = false) {
+        return this.capKnown && !probe ? this.namedChars : namedCharsFor(PROBE_SERVER_NAMED_CHARS);
+    }
+    get supportConfirmed() {
+        return this.supportSeen;
+    }
+    /** A successful status GET explicitly advertising the message-ref protocol. */
+    noteStatus(status) {
+        if (status?.message_refs !== true)
+            return;
+        this.supportSeen = true;
+        this.noteCap(status[MAX_NAMED_CHARS_KEY]);
     }
     /** Whether a too-big body may try the probe cap although a lower one is known (a server's
      *  cap may have been raised since): once per UNCONFIRMED_PAUSE_MS, and not when the known
@@ -130,7 +148,7 @@ export class MessageRefs {
         this.reprobeAt = now + UNCONFIRMED_PAUSE_MS;
         return true;
     }
-    /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
+    /** Pause this lane after an all-missing 409, a malformed ref, or a missing ack field. */
     pauseUnconfirmed(sessionId, messages, now = Date.now()) {
         const lane = this.laneFor(sessionId, messages);
         if (!lane)
@@ -182,7 +200,7 @@ export class MessageRefs {
                 this.noteRefusedCap(bodyText);
             return true;
         }
-        if (status === 400 && /message refs/i.test(bodyText)) {
+        if (refFormatRefusal(status, bodyText)) {
             this.disabled = true;
             this.acked.clear();
             return true;
@@ -200,7 +218,13 @@ export class MessageRefs {
      *  bodies included: the cap is the server's, not a conversation's). */
     noteServerCap(json) {
         const field = json?.[STORED_MESSAGES_FIELD];
-        const cap = capOf(field?.[MAX_NAMED_CHARS_KEY]);
+        if (!field || typeof field !== "object")
+            return;
+        this.supportSeen = true;
+        this.noteCap(field[MAX_NAMED_CHARS_KEY]);
+    }
+    noteCap(value) {
+        const cap = capOf(value);
         if (cap === undefined)
             return;
         this.namedChars = namedCharsFor(cap);
@@ -288,41 +312,58 @@ export class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS, imageAware = false) {
+export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS, imageAware = false, previous, extend = false) {
     const opening = messages.findIndex(isOpening);
     if (opening < 0)
         return { messages, refs: [] };
-    let headerSeen = false;
     let marks = 0;
     let chars = 0;
     let imageChars = 0;
-    const refs = [];
-    const out = messages.map((message, index) => {
-        const eligible = (index > opening || isSkipped(message)) && refs.length < MAX_REFS;
-        const ref = eligible ? refFor(message, !headerSeen) : undefined;
-        headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
-        if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS ||
-            (!imageAware && chars + ref.chars > maxChars))
-            return message;
-        const named = refJson(ref);
-        // A short message is smaller than its ref: sent as it is.
-        if (JSON.stringify(named).length >= ref.chars)
-            return message;
-        const images = imageCharsOf(message);
-        if (imageChars + images > MAX_NAMED_IMAGE_CHARS)
-            return message;
-        // `imageAware` (unacked naming): the server stores an image as a short ref, so a
-        // screenshot costs its text against the cap, its base64 only against the image cap.
-        const cost = imageAware ? storedChars(ref.chars, message, images) : ref.chars;
-        if (imageAware && chars + cost > maxChars)
-            return message;
-        marks += ref.marks.length;
-        chars += cost;
-        imageChars += images;
-        refs.push(ref.digest);
-        return named;
-    });
-    return refs.length ? { messages: out, refs, namedChars: chars } : { messages, refs: [] };
+    let count = 0;
+    const out = messages.slice();
+    // A resend reserves every surviving occurrence first. Only an oversized resend gets a
+    // second pass over the formerly inline messages, spending the remaining budgets.
+    const select = (previouslyNamed) => {
+        let headerSeen = false;
+        for (const [index, message] of messages.entries()) {
+            if (count >= MAX_REFS)
+                break;
+            const stripHeader = !headerSeen;
+            headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
+            if (index <= opening && !isSkipped(message))
+                continue;
+            if (previous && (previous[index] !== message) !== previouslyNamed)
+                continue;
+            const ref = refFor(message, stripHeader);
+            if (!ref || !acked.has(ref.digest, index) || marks + ref.marks.length > MAX_MARKS ||
+                (!imageAware && chars + ref.chars > maxChars))
+                continue;
+            const named = refJson(ref);
+            // A short message costs less inline.
+            if (JSON.stringify(named).length >= ref.chars)
+                continue;
+            const images = imageCharsOf(message);
+            if (imageChars + images > MAX_NAMED_IMAGE_CHARS)
+                continue;
+            // Unacked naming counts an image as its short stored ref against the text cap.
+            const cost = imageAware ? storedChars(ref.chars, message, images) : ref.chars;
+            if (imageAware && chars + cost > maxChars)
+                continue;
+            marks += ref.marks.length;
+            chars += cost;
+            imageChars += images;
+            count++;
+            out[index] = named;
+        }
+    };
+    if (previous)
+        select(true);
+    if (!previous || extend)
+        select(false);
+    if (!count)
+        return { messages, refs: [] };
+    const refs = out.flatMap((m, i) => m === messages[i] ? [] : [m[REF_KEY]]);
+    return { messages: out, refs, namedChars: chars };
 }
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
@@ -358,6 +399,10 @@ export function ackedDigests(messages, acks, known = new Set()) {
         out.push(ref.digest);
     }
     return out;
+}
+/** A message-ref format refusal, separate from the text and image size limits. */
+export function refFormatRefusal(status, bodyText) {
+    return status === 400 && /message refs/i.test(bodyText) && !/expand past/i.test(bodyText);
 }
 /** The hashes a 409 names, or undefined when it names none. */
 export function missingMessageHashes(bodyText) {
