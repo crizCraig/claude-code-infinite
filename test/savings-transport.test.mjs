@@ -202,3 +202,23 @@ test('an in-flight turn keeps its original writer across a credential change', a
   }
   assert.deepEqual(h.posts.map(p => [p.key,p.turns]), [['Bearer A',[first]]]);
 });
+
+test('shutdown drains a final turn queued while a previous batch is in flight', async t => {
+  let started, release;
+  const sending = new Promise(resolve => { started = resolve; });
+  const firstReply = new Promise(resolve => { release = resolve; });
+  const h = await harness(t, async (post, attempt) => {
+    if (attempt === 1) { started(); await firstReply; }
+    return ack(post.turns.map(r => r.turn_id));
+  });
+  const client = h.client();
+  client.reportSavings(first);
+  client.flushNow();
+  await sending;
+  const last = {...first,turn_id:randomUUID()};
+  client.reportSavings(last);
+  const shutdown = client.flush();
+  release();
+  await shutdown;
+  assert.deepEqual(h.posts.map(p => p.turns),[[first],[last]]);
+});

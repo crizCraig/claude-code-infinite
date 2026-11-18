@@ -6,6 +6,7 @@ export declare class SavingsOutbox {
     private readonly directory;
     private readonly writes;
     private drain?;
+    private appendedDuringDrain;
     private suspended;
     constructor(configDir: string, baseUrl: string, key: string, send: Send, now: () => number);
     get enabled(): boolean;
@@ -13,6 +14,7 @@ export declare class SavingsOutbox {
     append(value: unknown): void;
     private publish;
     flush(): Promise<void>;
+    private drainPending;
     private sendPending;
     private sendBatch;
 }

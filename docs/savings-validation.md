@@ -1,7 +1,7 @@
 # MemTree savings verification, 2026-11-17
 
-The turn-record rework has 74 passing focused tests with `NO_COLOR` unset and
-74 with `NO_COLOR=1`. Both runs include the cross-repository ASGI contract test
+The turn-record rework has 75 passing focused tests with `NO_COLOR` unset and
+75 with `NO_COLOR=1`. Both runs include the cross-repository ASGI contract test
 using the Polychat conda interpreter and its companion worktree.
 
 The focused command is `node --test test/savings*.test.mjs test/diagnostics.test.mjs test/request-sizing.test.mjs`.

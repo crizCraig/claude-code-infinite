@@ -15,6 +15,7 @@ export class SavingsOutbox {
     directory;
     writes = new Set();
     drain;
+    appendedDuringDrain = false;
     suspended = false;
     constructor(configDir, baseUrl, key, send, now) {
         this.send = send;
@@ -41,6 +42,8 @@ export class SavingsOutbox {
             return;
         const writing = this.publish(record).catch(() => { });
         this.writes.add(writing);
+        if (this.drain)
+            this.appendedDuringDrain = true;
         void writing.then(() => this.writes.delete(writing));
     }
     async publish(record) {
@@ -58,9 +61,15 @@ export class SavingsOutbox {
     }
     flush() {
         if (!this.drain) {
-            this.drain = this.sendPending().catch(() => { }).finally(() => { this.drain = undefined; });
+            this.drain = this.drainPending().finally(() => { this.drain = undefined; });
         }
         return this.drain;
+    }
+    async drainPending() {
+        do {
+            this.appendedDuringDrain = false;
+            await this.sendPending().catch(() => { });
+        } while (this.appendedDuringDrain && !this.suspended);
     }
     async sendPending() {
         await Promise.all(this.writes);
