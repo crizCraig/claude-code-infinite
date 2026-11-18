@@ -95,14 +95,16 @@ test("a conversation past 30 MiB names more once the server says its cap is high
   assert.ok(old > 0 && old < 31, `${old} refs under the old cap`);
   refs.noteAnswer("s", big, acks({ [MAX_NAMED_CHARS_KEY]: 128 * MIB }));
   assert.equal(refs.maxNamedChars, 120 * MIB, "15/16 of the server's cap");
-  assert.equal(refs.delta("s", big).refs.length, 70, "every big message named");
+  assert.equal(refs.delta("s", big).refs.length, old, "acked refs keep the old 30 MiB");
+  assert.equal(refs.unconfirmedDelta("s", big).refs.length, 70,
+    "a body too big that way names up to the server's cap");
   for (const bad of [16 * MIB, "128", 1.5e8 + 0.5, null]) {
     refs.noteAnswer("s", big, acks({ [MAX_NAMED_CHARS_KEY]: bad }));
     assert.equal(refs.maxNamedChars, 120 * MIB, `ignored: ${bad}`);
   }
   assert.equal(namedCharsFor(4096 * MIB), 256 * MIB, "never past the client's own ceiling");
-  const sent = refs.delta("s", big).refs;
-  assert.equal(refs.delta("s", big).namedChars > 30 * MIB, true, "named chars reported");
+  const sent = refs.unconfirmedDelta("s", big).refs;
+  assert.equal(refs.unconfirmedDelta("s", big).namedChars > 30 * MIB, true, "named chars reported");
   assert.ok(refs.noteRefusal("s", big, sent, 400,
     '{"detail":"Image references expand past the request size limit."}'), "resend");
   assert.equal(refs.maxNamedChars, 120 * MIB, "an image-cap 400 leaves the text cap alone");
@@ -118,6 +120,27 @@ test("a conversation past 30 MiB names more once the server says its cap is high
   assert.equal(refs.maxNamedChars, 60 * MIB, "any answer says the cap (a trimmed one too)");
   refs.noteAnswer(undefined, big, acks({ [MAX_NAMED_CHARS_KEY]: 128 * MIB }));
   assert.equal(refs.maxNamedChars, 120 * MIB, "with no session too");
+});
+
+test("unacked naming counts a screenshot as its stored ref, so later text still fits the cap", () => {
+  const MIB = 1024 * 1024;
+  const messages = [{ role: "user", content: "start" }];
+  for (let i = 0; i < 32; i++) messages.push({ role: "user", content: [{ type: "tool_result",
+    tool_use_id: `s${i}`, content: [{ type: "image", source: { type: "base64",
+      media_type: "image/png", data: `${i % 10}`.repeat(MIB) } }] }] });
+  for (let i = 0; i < 35; i++) messages.push({ role: i % 2 ? "user" : "assistant",
+    content: `${i} ${"t".repeat(MIB)}` });
+  const refs = new MessageRefs(true);
+  refs.noteServerCap({ [STORED_MESSAGES_FIELD]: { stored: false,
+    [MAX_NAMED_CHARS_KEY]: 32 * MIB } });
+  const named = refs.unconfirmedDelta("s", messages);
+  const shots = named.messages.slice(1, 33).filter((m) => REF_KEY in m).length;
+  const text = named.messages.slice(33).filter((m) => REF_KEY in m).length;
+  assert.equal(shots, 32, "every screenshot named (its images within the image cap)");
+  assert.ok(text >= 28, `${text} text messages named within the 30 MiB of the 32 MiB cap`);
+  assert.ok(named.namedChars <= 30 * MIB, `${named.namedChars}`);
+  assert.equal(buildDelta(messages, { has: () => true }).refs.length < 32, true,
+    "the acked path's accounting is unchanged (base64 counts)");
 });
 
 test("named images stay within the server's 64 MiB for served images", () => {

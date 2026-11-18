@@ -63,6 +63,8 @@ export const MAX_NAMED_CHARS = namedCharsFor(DEFAULT_SERVER_NAMED_CHARS);
 /** Base64 image characters the named messages may hold: the server resolves served images
  *  within its own 64 MiB (polychat MAX_RESOLVED_CHARS), whatever the text cap. */
 export const MAX_NAMED_IMAGE_CHARS = 60 * MIB;
+/** A stored image ref's length (`memtree-image:sha256:<64 hex>` in its block), rounded up. */
+const STORED_IMAGE_REF_CHARS = 100;
 /** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
 const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
@@ -81,6 +83,8 @@ export class MessageRefs {
     namedChars = MAX_NAMED_CHARS;
     /** Whether a server has said its cap (an answer or a cap 400 carried it). */
     capKnown = false;
+    /** When a too-big body may next try the probe cap over a known lower one. */
+    reprobeAt = 0;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
     unconfirmedPaused = new Map();
     constructor(enabled) {
@@ -96,20 +100,35 @@ export class MessageRefs {
         const acked = lane ? this.acked.get(lane) : undefined;
         if (!acked || acked.size === 0)
             return { messages, refs: [] };
-        return buildDelta(messages, acked, this.namedChars);
+        // Acked refs stay within the old 30 MiB whatever the server's cap: a body that fits that
+        // way is sent exactly as before (the larger cap is only for bodies that wouldn't fit).
+        return buildDelta(messages, acked);
     }
     /**
      * Every message that may be stored named by ref, acked or not (except `exclude` and what a
      * 409 named before): for a body too big to send otherwise, as a fresh process's first call
      * of a long conversation, which has no acks. The server's 409 names what it lacks.
      */
-    unconfirmedDelta(sessionId, messages, exclude = new Set()) {
+    unconfirmedDelta(sessionId, messages, exclude = new Set(), probe = false) {
         const lane = this.laneFor(sessionId, messages);
         if (!lane || (this.unconfirmedPaused.get(lane) ?? 0) > Date.now()) {
             return { messages, refs: [] };
         }
         const never = this.never.get(lane);
-        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, this.capKnown ? this.namedChars : namedCharsFor(PROBE_SERVER_NAMED_CHARS));
+        const cap = this.capKnown && !probe ? this.namedChars
+            : namedCharsFor(PROBE_SERVER_NAMED_CHARS);
+        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, cap, true);
+    }
+    /** Whether a too-big body may try the probe cap although a lower one is known (a server's
+     *  cap may have been raised since): once per UNCONFIRMED_PAUSE_MS, and not when the known
+     *  cap is the probe's already. */
+    mayReprobe(now = Date.now()) {
+        if (!this.capKnown || this.namedChars >= namedCharsFor(PROBE_SERVER_NAMED_CHARS))
+            return false;
+        if (now < this.reprobeAt)
+            return false;
+        this.reprobeAt = now + UNCONFIRMED_PAUSE_MS;
+        return true;
     }
     /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
     pauseUnconfirmed(sessionId, messages, now = Date.now()) {
@@ -269,7 +288,7 @@ export class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
+export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS, imageAware = false) {
     const opening = messages.findIndex(isOpening);
     if (opening < 0)
         return { messages, refs: [] };
@@ -283,7 +302,7 @@ export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
         const ref = eligible ? refFor(message, !headerSeen) : undefined;
         headerSeen = headerSeen || billingHeaderOf(message) !== undefined;
         if (!ref || !acked.has(ref.digest) || marks + ref.marks.length > MAX_MARKS ||
-            chars + ref.chars > maxChars)
+            (!imageAware && chars + ref.chars > maxChars))
             return message;
         const named = refJson(ref);
         // A short message is smaller than its ref: sent as it is.
@@ -292,8 +311,13 @@ export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
         const images = imageCharsOf(message);
         if (imageChars + images > MAX_NAMED_IMAGE_CHARS)
             return message;
+        // `imageAware` (unacked naming): the server stores an image as a short ref, so a
+        // screenshot costs its text against the cap, its base64 only against the image cap.
+        const cost = imageAware ? storedChars(ref.chars, message, images) : ref.chars;
+        if (imageAware && chars + cost > maxChars)
+            return message;
         marks += ref.marks.length;
-        chars += ref.chars;
+        chars += cost;
         imageChars += images;
         refs.push(ref.digest);
         return named;
@@ -459,6 +483,21 @@ function imageShas(value, out = []) {
             imageShas(item, out);
     }
     return out;
+}
+/** What the server stores for a message of `chars` holding `images` base64 characters: its
+ *  JSON with each image as a ~100-character ref. */
+function storedChars(chars, message, images) {
+    return images ? chars - images + STORED_IMAGE_REF_CHARS * imageCountOf(message) : chars;
+}
+function imageCountOf(value) {
+    if (Array.isArray(value))
+        return value.reduce((n, item) => n + imageCountOf(item), 0);
+    if (!value || typeof value !== "object")
+        return 0;
+    const block = value;
+    if (block.type === "image" && block.source?.type === "base64")
+        return 1;
+    return Object.values(block).reduce((n, item) => n + imageCountOf(item), 0);
 }
 /** A cap a server named: a whole number no lower than the old one (anything else: none). */
 function capOf(value) {

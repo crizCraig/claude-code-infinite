@@ -1649,20 +1649,33 @@ export class MemtreeClient {
         let { planned, unconfirmed } = withImages(delta);
         // Over the limit even so: name every message that may be stored, acked or not (a fresh
         // process has no acks; a 409 names what the server lacks, sent inline).
+        // Only for a body that would otherwise not be sent at all: one that fits the old way is
+        // sent exactly as before.
         let namedUnconfirmed = false;
-        const named = planned.payload === undefined && !opts.indexOnly && !opts.finalIndex &&
-            opts.messageRefs !== false ? this.messageRefs.unconfirmedDelta(opts.sessionId, messages, new Set(opts.unconfirmedMessageRefs ?? [])) : undefined;
-        if (named?.refs.length) {
+        const tooBig = planned.payload === undefined && !opts.indexOnly && !opts.finalIndex &&
+            opts.messageRefs !== false;
+        const exclude = new Set(opts.unconfirmedMessageRefs ?? []);
+        // The known cap first; then, rate-limited, the probe (the server's may have been raised).
+        for (const probe of tooBig ? [false, true] : []) {
+            if (probe && !this.messageRefs.mayReprobe())
+                break;
+            const named = this.messageRefs.unconfirmedDelta(opts.sessionId, messages, exclude, probe);
+            if (!named.refs.length)
+                continue;
             const candidate = withImages(named);
-            if (candidate.planned.payload !== undefined) {
-                ({ planned, unconfirmed } = candidate);
-                delta = named;
-                namedUnconfirmed = true;
-            }
+            if (candidate.planned.payload === undefined)
+                continue;
+            ({ planned, unconfirmed } = candidate);
+            delta = named;
+            namedUnconfirmed = true;
+            break;
         }
         const sentMessages = delta.messages;
-        if (planned.payload === undefined)
+        if (planned.payload === undefined) {
+            // Nothing fit: images the server said it lacks may be referenced again next time.
+            this.imageRefs.retryMissing();
             throw this.oversized(planned.limit, opts);
+        }
         const payload = planned.payload;
         // Fixed with the body: a transport retry of a delta body still declares refs.
         const features = delta.refs.length || this.messageRefs.active
@@ -1786,7 +1799,7 @@ export class MemtreeClient {
                     indexWaitSeconds: indexWaitFrom413(response.status, text, response.headers.get("retry-after"), Date.now(), response.headers.get("x-polychat-index-pending")) });
             }
             const json = (await response.json());
-            if (delta.refs.length &&
+            if (namedUnconfirmed &&
                 json?.[STORED_MESSAGES_FIELD] === undefined) {
                 // No proof the server put the named messages back: its answer may be built from
                 // hashes. Unacked naming stops for a while; the next turn goes the usual way.
@@ -1987,9 +2000,10 @@ export class MemtreeClient {
         const referenced = this.imageRefs.referenceUnconfirmed(messages);
         const planned = referenced.refs.length
             ? planMemtreeBody({ body, messages: referenced.value, indexOnly: false }) : undefined;
+        // Not fitting: the caller clears what the server said it lacks once no plan fits (a
+        // later candidate, as unacked message refs, still needs it).
         if (planned?.payload !== undefined)
             return { ...planned, refs: referenced.refs };
-        this.imageRefs.retryMissing();
         return undefined;
     }
     /**

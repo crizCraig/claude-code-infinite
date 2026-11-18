@@ -52,6 +52,8 @@ export declare class MessageRefs {
     private namedChars;
     /** Whether a server has said its cap (an answer or a cap 400 carried it). */
     private capKnown;
+    /** When a too-big body may next try the probe cap over a known lower one. */
+    private reprobeAt;
     /** Per conversation: when it may name unacked messages again (UNCONFIRMED_PAUSE_MS). */
     private unconfirmedPaused;
     constructor(enabled: boolean);
@@ -64,7 +66,11 @@ export declare class MessageRefs {
      * 409 named before): for a body too big to send otherwise, as a fresh process's first call
      * of a long conversation, which has no acks. The server's 409 names what it lacks.
      */
-    unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>): Delta;
+    unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>, probe?: boolean): Delta;
+    /** Whether a too-big body may try the probe cap although a lower one is known (a server's
+     *  cap may have been raised since): once per UNCONFIRMED_PAUSE_MS, and not when the known
+     *  cap is the probe's already. */
+    mayReprobe(now?: number): boolean;
     /** A 409 named every unacked message a call sent: name none for UNCONFIRMED_PAUSE_MS. */
     pauseUnconfirmed(sessionId: string | undefined, messages: Message[], now?: number): void;
     /** What one request's refs may expand to now (for tests and the request log). */
@@ -107,7 +113,7 @@ export declare class MessageRefs {
  */
 export declare function buildDelta(messages: Message[], acked: {
     has(digest: string): boolean;
-}, maxChars?: number): Delta;
+}, maxChars?: number, imageAware?: boolean): Delta;
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
  * message without its `cache_control` keys and, when `stripHeader` (no earlier message of
