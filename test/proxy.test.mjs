@@ -11964,3 +11964,23 @@ test('savings includes same-session monitor and title passthrough usage', async 
     assert.notEqual(settled[0].input.laneKey,settled[1].input.laneKey);
   } finally { proxy.close();upstream.close(); }
 });
+
+test('savings distinguishes a delivered compression from riding that same prefix', async () => {
+  const observations = [];
+  const h = await startMidTurnHarness({defaultCompactTarget:null, savings:{
+    startTurn:() => ({dispatched(){}}), progress(){},
+    settle(_observation,input){observations.push(input)},
+  }});
+  try {
+    const headers = {'x-claude-code-session-id':'12345678-1234-4123-8123-123456789abc'};
+    const base = followupTurn('turn two');
+    await armMainTurn(h.proxy,'turn two','prompt-two');
+    await postMessages(h.proxy.port,base,headers);
+    await postMessages(h.proxy.port,withToolRound(base,'t1'),headers);
+    await waitFor(() => observations.length === 2);
+    assert.deepEqual(observations.map(o => [o.requestModified,o.prefixRewritten]),[[true,true],[true,false]]);
+    const sent = observations[1].forwardedRequest;
+    assert.ok(sent.buffer instanceof SharedArrayBuffer);
+    assert.equal(JSON.stringify(JSON.parse(sent).messages),h.lastUpstream());
+  } finally { h.close(); }
+});

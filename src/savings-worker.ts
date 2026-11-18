@@ -1,4 +1,4 @@
-import {mkdirSync, readdirSync, unlinkSync, writeFileSync} from 'node:fs';
+import {lstatSync, mkdirSync, readdirSync, unlinkSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {readPrivateFile, writeAtomically} from './prefix-store.js';
 import {parentPort} from 'node:worker_threads';
@@ -10,7 +10,8 @@ import {accountSavingsTurn, createSavingsState, isSavingsLane, savingsLaneKey,
 interface Dispatch {
   dir: string;
   file: string;
-  previous?: {file: string; at: number; lane?: SavingsLane};
+  at: number;
+  sequence: string;
 }
 
 // This worker consumes dispatch and settlement messages in forwarding order.
@@ -24,7 +25,7 @@ function readLane(file: string, at: number): SavingsLane | undefined {
   try {
     const lane: unknown = JSON.parse(body);
     if (isSavingsLane(lane, at)) return lane;
-  } catch { /* The filename still gives us its dispatch time. */ }
+  } catch { /* No usable measurement. */ }
 }
 
 // Older launchers used <millis>.<uuid>. For equal wall-clock timestamps, new
@@ -37,22 +38,30 @@ function checkpoint({cacheDirectory, sessionId, laneKey, at, order, id}: Extract
     const sequence = order.toString().padStart(20,'0');
     const file = join(dir, [at,sequence,id].join('.'));
     writeFileSync(file, '', {mode:0o600, flag:'wx'});
-    const older = readdirSync(dir).flatMap(name => {
-      const match = checkpointName.exec(name);
-      if (!match) return [];
-      const time = Number(match[1]), tie = match[2] ?? '';
-      return time < at || (time === at && tie < sequence) ? [{name,time,tie}] : [];
-    }).sort((a,b) => b.time - a.time || b.tie.localeCompare(a.tie));
-    const dispatch: Dispatch = {dir, file};
-    if (!older.length) return dispatch;
-    const previous = older[0];
-    const previousFile = join(dir,previous.name);
-    dispatch.previous = {file:previousFile, at:previous.time, lane:readLane(previousFile,previous.time)};
-    for (const {name} of older.slice(1)) {
-      try { unlinkSync(join(dir, name)); } catch { /* A sibling pruned it. */ }
+    const dispatch = {dir,file,at,sequence};
+    // Keep the predecessor of every still-open turn. A refused dispatch disappears
+    // on settlement, so the last measured write may be several files behind it.
+    let keepPrevious = true;
+    for (const older of preceding(dispatch)) {
+      try {
+        const pending = lstatSync(older.file).size === 0;
+        if (!keepPrevious && (!pending || at - older.at > 86_400_000)) unlinkSync(older.file);
+        keepPrevious = pending;
+      } catch { /* A sibling settled or pruned it. */ }
     }
     return dispatch;
-  } catch { /* Missing cache evidence falls back to the observed median. */ }
+  } catch { /* A missing checkpoint supplies no cache evidence. */ }
+}
+
+function preceding({dir,at,sequence}: Dispatch) {
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  return names.flatMap(name => {
+    const match = checkpointName.exec(name);
+    if (!match) return [];
+    const time = Number(match[1]), tie = match[2] ?? '';
+    return time < at || (time === at && tie < sequence) ? [{file:join(dir,name),at:time,tie}] : [];
+  }).sort((a,b) => b.at - a.at || b.tie.localeCompare(a.tie));
 }
 
 function settle(job: Extract<SavingsJob,{kind:'settle'}>) {
@@ -63,27 +72,33 @@ function settle(job: Extract<SavingsJob,{kind:'settle'}>) {
   const lane = input.laneKey ?? 'main';
   const key = savingsLaneKey(lane);
   const success = status >= 200 && status < 300;
-  const usage = success ? input.usage : [400,401,403,404,413,422,429].includes(status)
+  const refused = [400,401,403,404,413,422,429].includes(status);
+  const usage = success ? input.usage : refused
     ? {input_tokens:0,output_tokens:0} : undefined;
   const bytes = input.request instanceof Uint8Array
     ? Buffer.from(input.request.buffer, input.request.byteOffset, input.request.byteLength) : undefined;
   const request = bytes ? JSON.parse(bytes.toString('utf8')) : input.request;
-  const previous = dispatch?.previous;
-  // The predecessor can settle while this response is streaming.
-  const previousLane = previous && (previous.lane ?? readLane(previous.file,previous.at));
+  const forwarded = success ? input.forwardedRequest : undefined;
+  const forwardedRequest = forwarded instanceof Uint8Array
+    ? JSON.parse(Buffer.from(forwarded.buffer,forwarded.byteOffset,forwarded.byteLength).toString('utf8')) : forwarded;
+  const previous = dispatch && preceding(dispatch)[0];
+  const previousLane = previous && readLane(previous.file,previous.at);
   const baseline = dispatch ? {lanes:previousLane ? {[key]:previousLane} : {}}
     : baselines.get(session) ?? createSavingsState();
   const replay = bytes && success && input.requestModified ? history.request(session + '/' + key,bytes) : undefined;
-  const {state,turn} = accountSavingsTurn(baseline,{...input, request, replay, usage,
-    requestModified:success && input.requestModified, previousAt:previous?.at, unverifiedPredecessor:!!previous && !previousLane});
-  if (success && turn.actual_tokens) {
-    if (dispatch) {
-      const lane = state.lanes[key];
-      if (isSavingsLane(lane,lane.at)) writeAtomically(dispatch.dir,dispatch.file,JSON.stringify(lane));
+  const {state,turn} = accountSavingsTurn(baseline,{...input, request, forwardedRequest, replay, usage,
+    requestModified:success && input.requestModified});
+  if (dispatch) {
+    if (refused) {
+      try { unlinkSync(dispatch.file); } catch { /* Directory already cleaned. */ }
     } else {
-      baselines.set(session,state);
-      if (baselines.size > 200) baselines.delete(baselines.keys().next().value!);
+      const checkpoint = success && turn.actual_tokens && state.lanes[key];
+      writeAtomically(dispatch.dir,dispatch.file,JSON.stringify(checkpoint || null));
     }
+  } else if (!refused) {
+    if (!success || !turn.actual_tokens) delete state.lanes[key];
+    baselines.set(session,state);
+    if (baselines.size > 200) baselines.delete(baselines.keys().next().value!);
   }
   return {
     turn_id:job.id, session_id:job.sessionId, requested_at:new Date(input.nowMs!).toISOString(),

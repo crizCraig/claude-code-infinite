@@ -1,53 +1,48 @@
-/** Prompt cache model for a single turn's plain-Claude-Code counterfactual. */
+/** Price one plain Claude Code turn from the delivered request's measured cache usage. */
 import { createHash } from 'node:crypto';
+import { DEFAULT_CACHE_TTL_MS, LONG_CACHE_TTL_MS } from './cold-cache.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isSavingsSessionId(value) {
     return typeof value === 'string' && value.length === 36 && UUID.test(value);
 }
 const MAX_TOKENS = 1_000_000_000;
 const MAX_LANES = 32;
-const MAX_PREFIXES = 128;
-// A passthrough has no modeled breakpoint history. Keep content identities even
-// for early blocks in long prompts, bounded to fit the worker's 8 MiB private file.
-const MAX_WARM_PREFIXES = 65_536;
+const MAX_PREFIXES = 65_536;
 const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const count = (v) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKENS;
 const hash = (s) => createHash('sha256').update(s).digest('hex');
 export const savingsLaneKey = hash;
-// Median observed gap in milliseconds for each conversation lane (see docs/savings.md).
-const medianGapMs = { main: 10_278.5, agent: 6_624.5, away: 1_986_285 };
 const totalInput = (v) => v.input + v.cache_read + v.cache_creation_5m + v.cache_creation_1h;
-/** Reject partial or obsolete checkpoints without discarding their known dispatch time. */
+/** Old simulated checkpoints cannot establish measured coverage. */
 export function isSavingsLane(value, at) {
     const digest = (v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
-    if (!record(value) || value.at !== at || !digest(value.full_hash) || !count(value.removed) ||
-        typeof value.model !== 'string' || !/^[a-zA-Z0-9._-]{1,96}$/.test(value.model) ||
-        !Array.isArray(value.prefixes) || value.prefixes.length > MAX_PREFIXES)
-        return false;
-    const warm = value.warm;
-    return (warm === undefined || (record(warm) && warm.at === at && count(warm.five) && count(warm.hour) &&
-        (warm.prefixes === undefined || (Array.isArray(warm.prefixes) && warm.prefixes.length <= MAX_WARM_PREFIXES &&
-            warm.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens)))))) &&
-        value.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens) &&
-            (p.ttl === 300_000 || p.ttl === 3_600_000) && Number.isSafeInteger(p.at) && p.at <= at);
+    return record(value) && value.at === at && digest(value.full_hash) && count(value.removed) &&
+        typeof value.model === 'string' && /^[a-zA-Z0-9._-]{1,96}$/.test(value.model) &&
+        count(value.hourEnd) && count(value.cacheEnd) && value.hourEnd <= value.cacheEnd &&
+        Array.isArray(value.prefixes) && value.prefixes.length <= MAX_PREFIXES &&
+        value.prefixes.every(p => record(p) && digest(p.hash) && count(p.tokens));
 }
 /** Cache creation total includes its duration buckets; never count it twice. */
 export function normalizeSavingsUsage(value) {
     if (!record(value) || !count(value.input_tokens) || !count(value.output_tokens))
         return;
     const read = value.cache_read_input_tokens ?? 0;
-    const creation = value.cache_creation_input_tokens ?? 0;
-    if (!count(read) || !count(creation))
+    if (!count(read))
         return;
-    let five = creation, hour = 0;
-    if (value.cache_creation != null) {
-        if (!record(value.cache_creation))
-            return;
-        five = value.cache_creation.ephemeral_5m_input_tokens ?? 0;
-        hour = value.cache_creation.ephemeral_1h_input_tokens ?? 0;
-        if (!count(five) || !count(hour) || five + hour !== creation)
-            return;
-    }
+    const split = value.cache_creation;
+    if (split != null && !record(split))
+        return;
+    const measuredSplit = count(split?.ephemeral_5m_input_tokens) && count(split?.ephemeral_1h_input_tokens);
+    if (value.cache_creation_input_tokens == null && split != null && !measuredSplit)
+        return;
+    const creation = value.cache_creation_input_tokens ??
+        ((split?.ephemeral_5m_input_tokens ?? 0) + (split?.ephemeral_1h_input_tokens ?? 0));
+    if (!count(creation))
+        return;
+    const five = split == null ? creation : split.ephemeral_5m_input_tokens ?? 0;
+    const hour = split?.ephemeral_1h_input_tokens ?? 0;
+    if (!count(five) || !count(hour) || five + hour !== creation)
+        return;
     if (value.input_tokens + read + creation > MAX_TOKENS)
         return;
     return { input: value.input_tokens, cache_read: read, cache_creation_5m: five, cache_creation_1h: hour, output: value.output_tokens };
@@ -69,7 +64,7 @@ function textWeight(value) {
     return Object.entries(value).reduce((n, [k, v]) => n + (['cache_control', 'source', 'signature'].includes(k) ? 0 : textWeight(v)), 0);
 }
 const cacheTtl = (value) => record(value) && value.type === 'ephemeral'
-    ? value.ttl === '1h' ? 3_600_000 : value.ttl === undefined || value.ttl === '5m' ? 300_000 : undefined : undefined;
+    ? value.ttl === '1h' ? LONG_CACHE_TTL_MS : value.ttl === undefined || value.ttl === '5m' ? DEFAULT_CACHE_TTL_MS : undefined : undefined;
 /** Only API content blocks carry cache markers. Tool input/schema keys are prompt content. */
 function withoutControls(value) {
     if (!record(value))
@@ -87,13 +82,11 @@ function promptPrefixes(request, model, replay) {
         const last = prefixes.at(-1);
         const content = hash(JSON.stringify(part.value));
         const history = last?.history ?? '';
-        prefixes.push({ hash: hash((last?.hash ?? '') + content),
+        prefixes.push({ content, hash: hash((last?.hash ?? '') + content),
             history: message ? hash(history + content) : history,
-            weight: (last?.weight ?? 0) + textWeight(part.value), index: (last?.index ?? -1) + 1,
-            position: (last?.position ?? 0) + Number(!part.toolRun || last?.toolRun !== part.toolRun),
-            messageIndex: part.messageIndex ?? -1, toolRun: part.toolRun, ttl: part.ttl ?? 0, cacheable: part.cacheable });
+            weight: (last?.weight ?? 0) + (last ? textWeight(part.value) : 0), ttl: part.ttl ?? 0, cacheable: part.cacheable });
     };
-    const blockPart = (value, role, system = false, messageIndex = -1) => {
+    const blockPart = (value, role, system = false) => {
         if (system || role === 'system') {
             const text = record(value) ? value.text : value;
             if (typeof text === 'string' && text.startsWith('x-anthropic-billing-header:')) {
@@ -103,9 +96,8 @@ function promptPrefixes(request, model, replay) {
         }
         const cacheable = !(record(value) && ['thinking', 'redacted_thinking'].includes(value.type)) &&
             !(typeof value === 'string' && !value.length) && !(record(value) && value.type === 'text' && value.text === '');
-        append({ messageIndex, value: role === undefined ? withoutControls(value) : { role, content: withoutControls(value) },
-            ttl: cacheable && record(value) ? cacheTtl(value.cache_control) : undefined, cacheable,
-            toolRun: role && record(value) && ['tool_use', 'tool_result'].includes(value.type) ? value.type : undefined }, role !== undefined);
+        append({ value: role === undefined ? withoutControls(value) : { role, content: withoutControls(value) },
+            ttl: cacheable && record(value) ? cacheTtl(value.cache_control) : undefined, cacheable }, role !== undefined);
     };
     const messages = Array.isArray(request.messages) ? request.messages : [];
     const cached = replay?.prefix();
@@ -134,16 +126,9 @@ function promptPrefixes(request, model, replay) {
     for (let i = reuse?.count ?? 0; i < messages.length; i++) {
         const message = messages[i];
         for (const block of Array.isArray(message.content) ? message.content : [message.content])
-            blockPart(block, message.role, false, i);
-        if (replay && i + 1 === checkpoint) {
-            // Keep the lookback for each explicit breakpoint and the live tail. The
-            // full message payloads and older non-cacheable positions are discarded.
-            const end = prefixes.at(-1);
-            const lastCacheable = prefixes.findLast(p => p.cacheable);
-            const breaks = prefixes.filter(p => p.ttl || p === lastCacheable);
-            const kept = prefixes.filter(p => p.position > end.position - 20 ||
-                breaks.some(e => p.index <= e.index && p.position > e.position - 20));
-            replay.remember(checkpoint, { model, frame, prefixes: kept });
+            blockPart(block, message.role);
+        if (replay && i + 1 === checkpoint && prefixes.length <= MAX_PREFIXES) {
+            replay.remember(checkpoint, { model, frame, prefixes: [...prefixes] });
         }
     }
     const automatic = cacheTtl(request.cache_control);
@@ -164,6 +149,63 @@ function minimumCacheTokens(model) {
         return 512;
     return 1024;
 }
+/** Align unchanged blocks at the two ends. Relative text weights estimate token
+ * positions because the API supplies whole-request counts, never per-block usage. */
+function changedRegion(source, sent, plainSize, sentSize) {
+    if (!sent)
+        return { start: 0, plainEnd: plainSize, sentEnd: sentSize };
+    const weight = sent.at(-1)?.weight || 1;
+    const sentAt = (i) => Math.round(sentSize * (sent[i]?.weight ?? 0) / weight);
+    let head = 0;
+    while (head < source.length && head < sent.length && source[head].hash === sent[head].hash)
+        head++;
+    const start = Math.min(source[head - 1]?.tokens ?? 0, sentAt(head - 1));
+    let plainLast = source.length - 1;
+    let sentLast = sent.length - 1;
+    while (plainLast >= head && sentLast >= head && source[plainLast].content === sent[sentLast].content) {
+        plainLast--;
+        sentLast--;
+    }
+    const tail = Math.min(plainSize - (source[plainLast]?.tokens ?? 0), sentSize - sentAt(sentLast), plainSize - start, sentSize - start);
+    return { start, plainEnd: plainSize - tail, sentEnd: sentSize - tail };
+}
+/** Change prices only inside the part ccc rewrote. Outside it both prompts
+ * keep the current response's measured cache outcome, including fresh suffixes. */
+function priceRewrite(plain, source, model, region, now, prior) {
+    const minimum = minimumCacheTokens(model);
+    const marked = source.filter(p => p.ttl && p.tokens >= minimum);
+    const cacheableEnd = marked.at(-1)?.tokens ?? 0;
+    const verifiedEnd = Math.min(cacheableEnd, previousCoverage(source, prior, now));
+    // Changing an earlier block invalidates later cached blocks too. Restore that
+    // tail only as far as the previous observation actually covered it.
+    const start = region.start;
+    const end = Math.max(region.plainEnd, verifiedEnd);
+    const clip = (n) => Math.min(end, Math.max(start, n));
+    const readEnd = clip(plain.cache_read);
+    const hourEnd = clip(plain.cache_read + plain.cache_creation_1h);
+    const cacheEnd = clip(plain.cache_read + plain.cache_creation_1h + plain.cache_creation_5m);
+    const writeEnd = clip(cacheableEnd);
+    const longEnd = clip(marked.findLast(p => p.ttl === LONG_CACHE_TTL_MS)?.tokens ?? 0);
+    const liveEnd = clip(verifiedEnd);
+    const longWriteEnd = Math.max(liveEnd, longEnd);
+    plain.cache_read += liveEnd - readEnd;
+    plain.cache_creation_1h += (longWriteEnd - liveEnd) - (hourEnd - readEnd);
+    plain.cache_creation_5m += (writeEnd - longWriteEnd) - (cacheEnd - hourEnd);
+    plain.input += cacheEnd - writeEnd;
+}
+/** Only the preceding response can establish warmth for the rewrite exception. */
+function previousCoverage(source, prior, now) {
+    if (!prior || now < prior.at)
+        return 0;
+    const age = now - prior.at;
+    const coverage = age < DEFAULT_CACHE_TTL_MS ? prior.cacheEnd : age < LONG_CACHE_TTL_MS ? prior.hourEnd : 0;
+    if (!coverage)
+        return 0;
+    const matched = new Map(prior.prefixes.map(p => [p.hash, p.tokens]));
+    // Prefix hashes are cumulative. The last match proves all earlier blocks.
+    const end = source.findLast(p => matched.has(p.hash));
+    return end ? Math.min(coverage, end.tokens, matched.get(end.hash)) : 0;
+}
 /** Account one successfully forwarded response. The optional local replay cache holds prefix work. */
 export function accountSavingsTurn(previous, input) {
     const request = record(input.request) ? input.request : {};
@@ -173,21 +215,13 @@ export function accountSavingsTurn(previous, input) {
     const prior = previous.lanes[laneKey];
     const warmTokens = actual && actual.cache_read + actual.cache_creation_5m + actual.cache_creation_1h;
     const partsNeeded = input.requestModified || !!warmTokens || !!prior?.removed;
-    // Replay checkpoints omit older unmarked blocks. A passthrough can share any
-    // content boundary, including one before the next explicit breakpoint.
-    let parts = partsNeeded ? promptPrefixes(request, model, input.requestModified && !prior?.warm ? input.replay : undefined) : [];
-    if (input.requestModified && prior?.removed && prior.model === model && input.replay?.prefix() &&
-        !parts.some(p => p.history === prior.full_hash)) {
-        parts = promptPrefixes(request, model);
-    }
+    const parts = partsNeeded ? promptPrefixes(request, model, input.replay) : [];
     const weight = parts.at(-1)?.weight ?? 0;
     const inputSource = !input.requestModified && actual ? 'actual' : count(input.originalInputTokens) ? 'counted' : 'estimated';
     const original = inputSource === 'actual' ? totalInput(actual) : inputSource === 'counted' ? input.originalInputTokens : Math.min(MAX_TOKENS, Math.floor(weight / 4));
     const now = input.nowMs ?? Date.now();
-    const sourcePrefixes = parts.map(p => ({ ...p, tokens: Math.floor(original * p.weight / (weight || 1)),
-        eligible: p.ttl > 0 }));
-    const comparable = prior?.model === model;
-    const extendsPrior = comparable && sourcePrefixes.some(p => p.history === prior.full_hash);
+    const comparable = prior !== undefined && prior.model === model;
+    const extendsPrior = comparable && parts.some(p => p.history === prior.full_hash);
     // On edits or observed Claude compaction discard the virtual reduction. A growing source
     // transcript retains the removed count, so a synthetic plain compaction really resets growth.
     let removed = comparable && extendsPrior ? prior.removed : 0;
@@ -195,89 +229,57 @@ export function accountSavingsTurn(previous, input) {
     const reserveValue = input.outputReserve ?? request.max_tokens ?? Math.min(32_000, Math.floor(window * .2));
     const reserve = count(reserveValue) ? Math.min(reserveValue, window - 1) : Math.min(32_000, window - 1);
     const ceiling = Math.max(1, Math.floor(Math.min(window - reserve, window * .8)));
-    let plainInput = Math.max(0, original - removed);
+    let plainInput = input.requestModified ? Math.max(0, original - removed) : original;
     const compacted = input.requestModified && plainInput > ceiling;
     if (compacted) {
         // Free compaction and a deliberately small summary plus tail favor plain Claude.
         plainInput = Math.min(plainInput, Math.min(1024, Math.floor(ceiling * .1)) + Math.floor(ceiling * .1));
         removed = original - plainInput;
     }
-    // A compaction creates a new virtual prefix identity. It cannot read the old
-    // full-history cache, but it can write a new entry and reuse it on later turns.
-    const virtualPrefixes = sourcePrefixes.map(p => ({ ...p, tokens: Math.max(0, p.tokens - removed),
-        hash: removed ? hash(`compact:${removed}:${p.hash}`) : p.hash }));
-    const eligible = virtualPrefixes.filter(p => p.eligible && p.tokens >= minimumCacheTokens(model));
-    const priorEntries = comparable && !compacted && !prior.warm ? prior.prefixes : [];
-    const previousAt = input.previousAt ?? prior?.at;
-    const gap = previousAt === undefined ? undefined : Math.max(0, now - previousAt);
-    const effectiveGap = gap ?? medianGapMs[input.laneKind ?? 'main'];
-    const warm = (ttl) => effectiveGap < ttl;
-    const liveEndpoints = eligible.filter(p => warm(p.ttl));
-    let cached = 0;
-    for (const endpoint of liveEndpoints) {
-        for (const candidate of virtualPrefixes.filter(p => p.index <= endpoint.index && p.position > endpoint.position - 20)) {
-            for (const entry of priorEntries) {
-                if (entry.hash === candidate.hash && now >= entry.at && now - entry.at < entry.ttl)
-                    cached = Math.max(cached, Math.min(entry.tokens, candidate.tokens));
-            }
-        }
-    }
-    const liveEnd = liveEndpoints.at(-1)?.tokens ?? 0;
-    if (!prior && !input.unverifiedPredecessor && !removed && liveEnd) {
-        // A resume may predate local observations. The conversation through the last
-        // user request could have been cached. Its reply and the new input are fresh.
-        const messages = Array.isArray(request.messages) ? request.messages : [];
-        const assistant = messages.findLastIndex((m) => m.role === 'assistant');
-        const history = assistant >= 0
-            ? virtualPrefixes.findLast(p => p.messageIndex < assistant)?.tokens ?? 0 : 0;
-        cached = Math.min(liveEnd, Math.max(history, actual?.cache_read ?? 0));
-    }
-    if (comparable && prior.warm && !removed && liveEnd) {
-        const age = now - prior.warm.at;
-        const coverage = age >= 0 && age < 3_600_000
-            ? prior.warm.hour + (age < 300_000 ? prior.warm.five : 0) : 0;
-        const previousTokens = new Map(prior.warm.prefixes?.map(p => [p.hash, p.tokens]));
-        for (const part of virtualPrefixes) {
-            const matched = previousTokens.get(part.hash);
-            if (matched !== undefined)
-                cached = Math.max(cached, Math.min(matched, part.tokens, coverage, liveEnd));
-        }
-    }
-    cached = Math.min(cached, plainInput);
-    const hourEnd = Math.max(cached, ...eligible.filter(p => p.ttl === 3_600_000).map(p => p.tokens));
-    const cacheEnd = Math.max(hourEnd, ...eligible.map(p => p.tokens));
-    let plain = { input: plainInput - cacheEnd, cache_read: cached,
-        cache_creation_1h: hourEnd - cached, cache_creation_5m: cacheEnd - hourEnd, output: actual?.output ?? 0 };
-    if (!input.requestModified && actual)
-        plain = actual;
-    // Preserve only entries still represented by this source and refresh reads.
-    const usedHashes = new Set(virtualPrefixes.filter(p => p.tokens <= cached).map(p => p.hash));
-    const entries = priorEntries.filter(p => now >= p.at && now - p.at < p.ttl)
-        .map(p => usedHashes.has(p.hash) ? { ...p, at: now } : p);
-    for (const endpoint of eligible) {
-        const entry = { hash: endpoint.hash, tokens: endpoint.tokens, ttl: endpoint.ttl, at: now };
-        const index = entries.findIndex(p => p.hash === entry.hash);
-        if (index >= 0)
-            entries[index] = endpoint.tokens <= cached ? { ...entries[index], at: now } : entry;
-        else
-            entries.push(entry);
+    const measured = actual ?? { input: 0, cache_read: 0, cache_creation_5m: 0, cache_creation_1h: 0, output: 0 };
+    const actualSize = totalInput(measured);
+    const sent = record(input.forwardedRequest) ? promptPrefixes(input.forwardedRequest, model) : undefined;
+    const source = parts.map(p => ({ ...p, tokens: Math.max(0, Math.floor(original * p.weight / (weight || 1)) - removed) }));
+    const region = changedRegion(source, sent, plainInput, actualSize);
+    // Project observed bucket boundaries through the resized prefix. Identical head
+    // and tail blocks retain their measured traffic. Within the resized part only
+    // the upstream proportions are known.
+    const project = (n) => {
+        if (!input.requestModified)
+            return n;
+        if (n <= region.start)
+            return n;
+        if (n >= region.sentEnd)
+            return Math.min(plainInput, region.plainEnd + n - region.sentEnd);
+        return region.start + Math.round((n - region.start) * (region.plainEnd - region.start) /
+            (region.sentEnd - region.start));
+    };
+    const readEnd = project(measured.cache_read);
+    const writeHourEnd = project(measured.cache_read + measured.cache_creation_1h);
+    const cacheEnd = project(actualSize - measured.input);
+    const plain = { cache_read: readEnd, cache_creation_1h: writeHourEnd - readEnd,
+        cache_creation_5m: cacheEnd - writeHourEnd, input: plainInput - cacheEnd, output: measured.output };
+    if (input.requestModified && input.prefixRewritten) {
+        priceRewrite(plain, source, model, region, now, comparable && !compacted && removed === prior.removed ? prior : undefined);
     }
     const reportedSpeed = record(input.usage) ? input.usage.speed : undefined;
     const fast = (reportedSpeed ?? request.speed) === 'fast';
     const lanes = { ...previous.lanes };
     if (!(laneKey in lanes) && Object.keys(lanes).length >= MAX_LANES)
         delete lanes[Object.keys(lanes).sort((a, b) => lanes[a].at - lanes[b].at)[0]];
-    if (input.requestModified) {
-        lanes[laneKey] = {
-            prefixes: entries.slice(-MAX_PREFIXES), full_hash: sourcePrefixes.at(-1).history || hash(''),
-            at: Number.isFinite(now) ? now : 0, removed, model,
-        };
-    }
-    else if (actual) {
-        const prefixes = sourcePrefixes.filter(p => p.cacheable).slice(0, MAX_WARM_PREFIXES)
-            .map(({ hash, tokens }) => ({ hash, tokens }));
-        lanes[laneKey] = { prefixes: [], full_hash: sourcePrefixes.at(-1)?.history || hash(''), removed, model,
-            at: now, warm: { at: now, five: actual.cache_creation_5m, hour: actual.cache_creation_1h + actual.cache_read, prefixes } };
+    if (actual) {
+        const sentParts = sent ?? parts;
+        const longMarker = sentParts.findLast(p => p.ttl === LONG_CACHE_TTL_MS);
+        const sentWeight = sentParts.at(-1)?.weight ?? 0;
+        // Usage splits writes exactly. Reads have no TTL field. Attribute only the
+        // read span covered by a one-hour marker on the request that actually went out.
+        const longRead = longMarker && sentWeight ? Math.min(actual.cache_read, Math.round(actualSize * longMarker.weight / sentWeight)) : 0;
+        const hourEnd = actual.cache_creation_1h ? writeHourEnd : project(longRead);
+        const passthroughReduction = input.requestModified ? 0 : removed;
+        lanes[laneKey] = { at: now, model, removed, full_hash: parts.at(-1)?.history || hash(''),
+            hourEnd: Math.max(0, hourEnd - passthroughReduction),
+            cacheEnd: Math.max(0, cacheEnd - passthroughReduction),
+            prefixes: cacheEnd ? source.slice(0, MAX_PREFIXES).map(({ hash, tokens }) => ({ hash, tokens })) : [] };
     }
     return { state: { lanes }, turn: {
             original_input_tokens: original, plain_input_tokens: plainInput, input_source: inputSource,

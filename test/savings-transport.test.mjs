@@ -69,7 +69,7 @@ test('cancelling during a billable compression publishes no upstream turn', asyn
     {sessionId:first.session_id, clientMeta:metadata});
   await sent;
   workTime += 10000; // Settlement after midnight still describes the submitted work.
-  const input = {request:{messages}, requestModified:true, contextWindow:200000};
+  const input = {request:{messages}, requestModified:true,prefixRewritten:true, contextWindow:200000};
   await tracker.settle(turn, input, 0);
   await tracker.settle(turn, input, 0);
   finish();
@@ -266,8 +266,9 @@ test('warm and expired conversation cache cost the same across launcher restarts
         const session = randomUUID();
         const diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
         const request = {model:first.model, messages, cache_control:{type:'ephemeral', ttl}};
-        const input = {request, usage:{input_tokens:10000,cache_read_input_tokens:10000,output_tokens:1},
-          contextWindow:200000,originalInputTokens:80000,requestModified:true,nowMs:1000};
+        const input = {request, usage:{input_tokens:0,cache_creation_input_tokens:20000,cache_creation:{
+          ephemeral_5m_input_tokens:ttl === '5m' ? 20000 : 0,ephemeral_1h_input_tokens:ttl === '1h' ? 20000 : 0},output_tokens:1},
+          contextWindow:200000,originalInputTokens:80000,requestModified:true,prefixRewritten:true,nowMs:1000};
         if (restart) {
           execFileSync(process.execPath, ['--input-type=module','-e',`
             import {Diagnostics} from './dist/diagnostics.js';
@@ -332,8 +333,8 @@ test('overlapping launchers use dispatch order and isolate credentials', async t
       const request = {model:first.model, cache_control:{type:'ephemeral',ttl}, messages:[
         {role:'user',content:text.repeat(10000)}, {role:'assistant',content:'hi'},
         {role:'user',content:'continue'}]};
-      await tracker.settle(observation,{request,requestModified:true,nowMs:at,contextWindow:200000,
-        usage:{input_tokens:10,output_tokens:1},originalInputTokens:2500},200);
+      await tracker.settle(observation,{request,requestModified:true,prefixRewritten:true,nowMs:at,contextWindow:200000,
+        usage:{input_tokens:0,cache_creation_input_tokens:2500,output_tokens:1},originalInputTokens:2500},200);
       await diagnostics.flush();
       return h.posts.at(-1).turns[0].plain;
     };
@@ -341,12 +342,12 @@ test('overlapping launchers use dispatch order and isolate credentials', async t
   const id = randomUUID();
   const older = start(id, 'A', 1000);
   const later = await start(id, 'A', 301000)('5m','y');
-  assert.equal(later.cache_read,0,'even an unsettled dispatch supplies a known cold gap');
+  assert.equal(later.cache_read,0,'an unsettled dispatch supplies no measured cache evidence');
   await older('5m','x');
   assert.equal((await start(id, 'A', 302000)('5m','y')).cache_read,2500);
   assert.equal((await start(id, 'A', 603000)('5m','y')).cache_read,0);
-  assert.ok((await start(id, 'B', 910000)('5m','y')).cache_read>2400,
-    'account B uses its own unknown-gap median');
+  assert.equal((await start(id, 'B', 303000)('5m','y')).cache_read,0,
+    'account B cannot reuse account A’s measured write');
 });
 
 test('an unreadable predecessor checkpoint cannot lose a measured turn', async t => {
@@ -357,7 +358,7 @@ test('an unreadable predecessor checkpoint cannot lose a measured turn', async t
   const session = randomUUID();
   const input = {request:{model:first.model,cache_control:{type:'ephemeral'},
     messages:[{role:'user',content:'old'.repeat(3000)},{role:'assistant',content:'hi'},
-      {role:'user',content:'new'}]},requestModified:true,contextWindow:200000,
+      {role:'user',content:'new'}]},requestModified:true,prefixRewritten:true,contextWindow:200000,
     usage:{input_tokens:50,output_tokens:1}, originalInputTokens:2250, nowMs:1000};
   const firstTurn = tracker.startTurn(session);
   await tracker.settle(firstTurn,input,200);
@@ -389,7 +390,7 @@ test('dispatch and settlement leave checkpoint I/O and prompt hashing off the fo
   observation.dispatched('main',1000);
   // The forwarding stack schedules work and returns before settlement completes.
   const tick = new Promise(resolve => setImmediate(() => resolve(reported)));
-  const settled = tracker.settle(observation,{request:bytes,requestModified:true,nowMs:1000,
+  const settled = tracker.settle(observation,{request:bytes,requestModified:true,prefixRewritten:true,nowMs:1000,
     usage:{input_tokens:10,output_tokens:1},contextWindow:200000},200);
   assert.equal(await tick,false);
   await settled;
@@ -409,7 +410,7 @@ test('successive dispatches within one clock millisecond use their immediate pre
     await tracker.settle(tracker.startTurn(first.session_id),{...input,request},200);
   }
   await diagnostics.flush();
-  await tracker.settle(tracker.startTurn(first.session_id),{...input,requestModified:true,
+  await tracker.settle(tracker.startTurn(first.session_id),{...input,requestModified:true,prefixRewritten:true,
     originalInputTokens:30000},200);
   await diagnostics.flush();
   assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
@@ -423,10 +424,55 @@ test('a known in-flight predecessor supplies no unverified cache reads', async t
   pending.dispatched('main',1000);
   const input = {request:{model:first.model,cache_control:{type:'ephemeral'},messages:[
     {role:'user',content:'b'.repeat(120000)}, {role:'assistant',content:'ok'}]},
-    requestModified:true,contextWindow:200000,originalInputTokens:30000,
+    requestModified:true,prefixRewritten:true,contextWindow:200000,originalInputTokens:30000,
     usage:{input_tokens:20,output_tokens:1},nowMs:11000};
   await tracker.settle(tracker.startTurn(first.session_id),input,200);
   await diagnostics.flush();
   assert.equal(h.posts.at(-1).turns[0].plain.cache_read,0);
   await tracker.settle(pending,{...input,nowMs:1000},200);
+});
+
+test('a refused dispatch neither displaces nor refreshes the last measured prefix on restart', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t);
+  const request = {model:first.model,cache_control:{type:'ephemeral'},
+    messages:[{role:'user',content:'a'.repeat(120000)}]};
+  for (const retryAt of [3000,301000]) {
+    const session = randomUUID();
+    const send = async (nowMs, status, usage, rewrite = false) => {
+      const diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
+      await tracker.settle(tracker.startTurn(session),{request, requestModified:rewrite,
+        prefixRewritten:rewrite, originalInputTokens:30000, contextWindow:200000, nowMs, usage},status);
+      await diagnostics.flush();
+      return h.posts.at(-1).turns[0];
+    };
+    await send(1000,200,{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:0});
+    for (const at of [retryAt-2,retryAt-1]) {
+      const refused = await send(at,429,undefined,true);
+      assert.deepEqual(Object.values(refused.plain),[0,0,0,0,0]);
+    }
+    const retry = await send(retryAt,200,{input_tokens:2000,output_tokens:1},true);
+    assert.equal(retry.plain.cache_read,retryAt === 3000 ? 30000 : 0);
+    assert.equal(retry.plain.cache_creation_5m,30000-retry.plain.cache_read);
+  }
+});
+
+test('a refusal settled before the preceding write cannot hide that write from a later retry', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client(), tracker = new SavingsTracker({diagnostics});
+  const request = {model:first.model,cache_control:{type:'ephemeral'},
+    messages:[{role:'user',content:'a'.repeat(120000)}]};
+  const args = {request,requestModified:false,contextWindow:200000,
+    usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:0}};
+  const write = tracker.startTurn(first.session_id);
+  write.dispatched('main',1000);
+  await tracker.settle(tracker.startTurn(first.session_id),{...args,nowMs:2000},429);
+  const retry = tracker.startTurn(first.session_id);
+  retry.dispatched('main',3000);
+  await tracker.settle(write,{...args,nowMs:1000},200);
+  await tracker.settle(retry,{...args,requestModified:true,prefixRewritten:true,
+    originalInputTokens:30000,nowMs:3000,usage:{input_tokens:2000,output_tokens:1}},200);
+  await diagnostics.flush();
+  const report = h.posts.flatMap(post => post.turns).find(turn => turn.turn_id === retry.id);
+  assert.equal(report.plain.cache_read,30000);
 });

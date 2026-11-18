@@ -8,7 +8,7 @@ ccc uses the original Claude request and the delivered response to estimate a pl
 counterfactual. Polychat prices the ordinary input, cache reads, five-minute writes,
 one-hour writes and output independently for each side. The aggregate creation count includes both creation
 durations; it is not an additional bucket. Invalid, negative, fractional, or
-inconsistent usage marks that turn incomplete. A missing cache-duration split
+inconsistent usage marks that turn incomplete. When the creation total is null or absent, two measured duration counts supply the total. A missing cache-duration split
 uses the historical five-minute creation bucket. A stream can supply input on the
 start or final delta. A null field leaves an earlier measured count intact.
 
@@ -88,51 +88,31 @@ quality, and subsequent outputs can differ. The `window_crossing` flag indicates
 an impossible unlimited context. Output tokens are held equal to the observed
 response because alternate plain outputs cannot be measured.
 
-Cache behavior follows [Anthropic's prompt-caching rules](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
-Only explicit tool/system/content breakpoints, or the last cacheable block under
-top-level automatic caching, create entries. Subsequent reads require a matching
-previously written prefix within the twenty-block lookup range and its own
-five-minute or one-hour TTL. Consecutive parallel tool calls count as one
-lookback position, and consecutive tool results count as another. Mixed-duration writes occupy disjoint token ranges;
-new one-hour coverage costs 2x and new five-minute coverage costs 1.25x. Reads
-refresh an existing entry's duration. No controls means no modeled caching.
-Model minimums are 512 tokens for newer 5-series models except Sonnet 5 (1,024),
-2,048 for Opus 4.7, 4,096 for Opus 4.5/4.6 and Haiku 4.5, and 1,024 for the
-remaining supported models.
+Each turn uses the delivered request’s measured cache reads, five-minute writes,
+one-hour writes and ordinary input. A passthrough copies all five buckets exactly.
+On a stable compressed prefix, ccc aligns the original and forwarded prompts at
+their common head and tail. Those tokens keep their measured outcome. Within the
+part whose length changes, plain uses the same proportions as the measured upstream
+buckets. The API supplies whole-request counts, so the block boundaries used
+for alignment are estimates based on relative text length.
 
-The launcher records upstream dispatch time in a private directory scoped to the
-service, credential, session and conversation lane. Launchers sharing that directory
-use the most recent preceding dispatch, even if its response has not settled.
-A completed checkpoint holds prefix hashes, token counts and virtual compaction
-state. Each writer updates only its own file. Prefix positions use relative text
-weights even when the whole-prompt count is exact.
+A newly delivered compression, prepared prefix or truncation changes what ccc
+sends upstream. Plain would have kept its previous prefix, including any later
+blocks that the rewrite invalidated. ccc prices matching, cacheable blocks in
+that region as reads up to the coverage of the
+preceding measured request in the same conversation lane. Five-minute and one-hour
+writes establish their respective lifetimes. Read counts have no duration split,
+so ccc uses the cache markers on the preceding **forwarded** request to estimate
+which reads used the one-hour lifetime. At the TTL boundary the entry has expired.
+The remaining cacheable region takes the original request’s write duration.
+Unmarked input stays ordinary input.
 
-Warmth uses the gap since the previous dispatch and the TTL on each eligible
-breakpoint of the original request. At exactly the TTL the prefix has expired.
-If the predecessor time is unavailable, the fallback is the median observed gap
-for that lane. The main median is **10,278.5 ms** (278 samples, one-hour TTL).
-The agent median is **6,624.5 ms** (182 samples, five-minute TTL). These are
-fixed calibrations from the two retained local ccc request logs through
-2026-11-17 UTC. Select numeric `coldCache.gapMs` records, group by `routeLane`,
-sort the gaps in milliseconds and take the middle value or average the middle
-pair. These November 15–16 samples measure time from the lane's prior upstream
-send to arrival of its next request.
-
-Away recaps had no recorded `coldCache` samples. Their fallback is **1,986,285
-ms** (33 min 6 s). In the same logs, group successful away messages by launcher
-PID and difference consecutive request start estimates (`ts - totalMs`) in
-time order. The median covers 113 gaps from 15 launchers, November 4–16. A known
-gap always supersedes the calibration. In particular, an unknown away gap is
-cold for a five-minute breakpoint and warm for a one-hour breakpoint.
-
-After a passthrough, observed cache coverage is capped at the longest verified
-common content prefix of the two requests. Older passthrough checkpoints without
-content hashes supply no verified reads.
-
-When a predecessor is unknown, estimate the reusable history
-through the input preceding the latest assistant reply, capped at the cacheable
-breakpoint. The new reply and follow-up still require writes. Observed reads can
-also establish reusable coverage. A synthetic compaction starts a new cache.
+The worker keeps dispatch order, local prefix digests and measured coverage in a
+private directory scoped to service, credential, session and lane. Launchers
+sharing that directory use the same evidence. A definitive nonbillable refusal
+records zero and leaves earlier evidence at its original timestamp. An unsettled,
+unmeasured or unavailable predecessor supplies no rewrite credit. Old checkpoints
+containing simulated entries likewise supply no measured coverage.
 
 The virtual compacted token minimum can omit original tool/system overhead,
 which lowers the plain baseline; it is not an exact reconstruction of Claude's
@@ -175,13 +155,16 @@ percentage first on narrow terminals.
 
 ## Worked example
 
-At Sonnet's $3/million base input rate, one plain turn with 10,000 uncached input,
-90,000 cache reads, 20,000 five-minute writes, 5,000 one-hour writes and 2,000 output
-costs `(10000 + .1*90000 + 1.25*20000 + 2*5000 + 5*2000)*3/1e6 = $0.192`.
-The ccc response reports 2,000 input, 30,000 reads, 4,000 five-minute writes,
-1,000 one-hour writes and the same 2,000 output: `$0.066`. Gross savings are `$0.126`. With `$0.016` billed by MemTree for work
-in the period, net savings are `$0.110`, or `57.3%` of plain cost (`.110/.192`).
-These are synthetic arithmetic examples, not measurements from customer sessions.
+At Sonnet 4.6’s $3 per million input tokens, a passthrough writes a 30,000-token
+prefix for five minutes. Both sides cost $0.112500. A 429 costs zero. Two seconds
+after the write, ccc rewrites that prefix. The successful retry reports 2,000
+ordinary input tokens and one output token, costing $0.006015. Plain would read
+the same 30,000-token prefix and produce the same output, costing $0.009015.
+
+Across the three requests, plain costs $0.121515 and ccc costs $0.118515.
+The $0.003 difference less $0.050 in billed MemTree charges gives **−$0.047 net**.
+The period is ineligible for a positive savings email. This example uses synthetic
+usage and the same token rates as the server.
 
 The terminal integration includes attributable main, agent, recap and passthrough
 calls. The server can only price turns the client observed and delivered. Buffered

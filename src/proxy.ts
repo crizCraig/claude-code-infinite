@@ -2383,7 +2383,7 @@ async function handleMessages(
       savingsDispatch.set(rec, at => observed.dispatched(lane, at));
       settleSavings = () => savings.settle(observed, {request: rawBody,
         usage: rec.savingsUsageComplete ? rec.usage : undefined,
-        model: body.model, requestModified: false,
+        model: body.model, requestModified: false, prefixRewritten: false,
         contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
           opts.nativeOneMillionContext !== false),
         laneKey: lane, nowMs: observed.requestedAt}, rec.upstreamStatus ?? 0);
@@ -2459,7 +2459,7 @@ async function handleMessages(
     },
   }, state.countTokensCooldowns);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true,
-    typeof body.model === "string" ? body.model : undefined);
+    typeof body.model === "string" ? body.model : undefined, !!observed);
   if (carriesServerTools(body)) serverToolRecords.add(rec);
   const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey,
     body.model);
@@ -2481,15 +2481,18 @@ async function handleMessages(
     const lane = JSON.stringify([requestRouteLane, notConversation ?? null,
       isSubagentRequest ? agentAttributionId(req) : null]);
     savingsDispatch.set(rec, at => observed.dispatched(lane, at));
-    let modified = false;
-    savingsSelections.set(rec, candidate => { modified = candidate.kind !== "original"; });
+    let selected: RequestCandidate | undefined;
+    savingsSelections.set(rec, candidate => { selected = candidate; });
     settleSavings = () => {
+      const modified = selected !== undefined && selected.kind !== "original";
       const at = observed.requestedAt;
       return savings.settle(observed, {request:rawBody,
         usage:rec.savingsUsageComplete ? rec.usage : undefined, model:originalRequest.model,
         contextWindow:modelContextLimit, outputReserve:sizingLimits().output, requestModified:modified,
+        prefixRewritten:selected?.kind === "replacement" || (!!selected && adoptedSavingsPrefixes.has(selected)),
+        forwardedRequest:modified ? selected?.body : undefined,
         originalInputTokens:countSession.peekKey(originalCandidate.key)?.tokens,
-        laneKind:requestRouteLane, laneKey:lane, nowMs:at}, rec.upstreamStatus ?? 0);
+        laneKey:lane, nowMs:at}, rec.upstreamStatus ?? 0);
     };
   }
   if (isMainRequest && requestSessionKey !== undefined) {
@@ -5465,6 +5468,7 @@ async function adoptEntry(
   }
   args.compaction.estimatedTokens = fit.tokens;
   args.compaction.estimatedBytes = fit.routed.raw.length;
+  adoptedSavingsPrefixes.add(fit.candidate);
   installPreparedPrefix(state, sessionId, entry);
   return { prefix: entry.prefix, routed: fit.routed };
 }
@@ -8077,6 +8081,7 @@ function noteAwayWarmsMain(
 
 /** Account the candidate delivery selected after sizing and fallbacks. */
 const savingsDispatch = new WeakMap<MessagesRecord, (at: number) => void>();
+const adoptedSavingsPrefixes = new WeakSet<RequestCandidate>();
 const savingsSelections = new WeakMap<MessagesRecord, (candidate: RequestCandidate) => void>();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap<MessagesRecord, (sent: Buffer) => void>();

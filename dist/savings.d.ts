@@ -1,37 +1,26 @@
 import type { SavingsReplay } from './savings-history.js';
 import type { SavingsUsage } from './savings-report.js';
 type SavingsTokens = SavingsUsage;
-interface Prefix {
+interface SavedPrefix {
     hash: string;
     tokens: number;
-    ttl: number;
-    at: number;
-}
-interface WarmCoverage {
-    five: number;
-    hour: number;
-    at: number;
-    prefixes?: {
-        hash: string;
-        tokens: number;
-    }[];
 }
 export interface SavingsLane {
-    prefixes: Prefix[];
-    full_hash: string;
     at: number;
-    removed: number;
     model: string;
-    warm?: WarmCoverage;
+    full_hash: string;
+    removed: number;
+    hourEnd: number;
+    cacheEnd: number;
+    prefixes: SavedPrefix[];
 }
 export interface SavingsState {
     lanes: Record<string, SavingsLane>;
 }
-type LaneKind = 'main' | 'agent' | 'away';
 export interface SavingsTurnInput {
-    laneKind?: LaneKind;
-    /** A recorded dispatch with no completed checkpoint has no verifiable overlap. */
-    unverifiedPredecessor?: boolean;
+    /** A new compression/preparation/truncation, as opposed to riding an existing prefix. */
+    prefixRewritten: boolean;
+    forwardedRequest?: unknown;
     replay?: SavingsReplay<SavingsPromptCheckpoint>;
     request: unknown;
     usage: unknown;
@@ -42,7 +31,6 @@ export interface SavingsTurnInput {
     originalInputTokens?: number;
     nowMs?: number;
     laneKey?: string;
-    previousAt?: number;
 }
 export interface SavingsTurn {
     original_input_tokens: number;
@@ -56,21 +44,18 @@ export interface SavingsTurn {
 }
 export declare function isSavingsSessionId(value: unknown): value is string;
 export declare const savingsLaneKey: (s: string) => string;
-/** Reject partial or obsolete checkpoints without discarding their known dispatch time. */
+/** Old simulated checkpoints cannot establish measured coverage. */
 export declare function isSavingsLane(value: unknown, at: number): value is SavingsLane;
 /** Cache creation total includes its duration buckets; never count it twice. */
 export declare function normalizeSavingsUsage(value: unknown): SavingsTokens | undefined;
 export declare function createSavingsState(): SavingsState;
 interface SourcePrefix {
     hash: string;
+    content: string;
     history: string;
     weight: number;
-    position: number;
-    index: number;
     ttl: number;
-    toolRun?: string;
     cacheable: boolean;
-    messageIndex: number;
 }
 export interface SavingsPromptCheckpoint {
     model: string;

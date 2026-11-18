@@ -419,3 +419,23 @@ test('only an authoritative session-unavailable response withdraws a cached tota
     now += 10001;
   }
 });
+
+test('a nullable creation total with both duration counts remains measured through settlement', async () => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const usage = {input_tokens:21, output_tokens:4, cache_creation_input_tokens:null,
+    cache_creation:{ephemeral_5m_input_tokens:10, ephemeral_1h_input_tokens:20}};
+  for (const stream of [false, true]) {
+    const rec = {};
+    if (stream) {
+      mergeUsageFromSseEvent({type:'message_start',message:{usage}},rec);
+      mergeUsageFromSseEvent({type:'message_delta',usage:{output_tokens:4}},rec);
+      mergeUsageFromSseEvent({type:'message_stop'},rec);
+    } else mergeUsageFromJsonBody(Buffer.from(JSON.stringify({type:'message',content:[],usage})),rec);
+    assert.equal(rec.savingsUsageComplete,true);
+    let report;
+    const tracker = new SavingsTracker({diagnostics:reporter(value => { report = value; })});
+    await tracker.settle(tracker.startTurn(sessionId),{...input,usage:rec.usage},200);
+    assert.deepEqual(report.actual,{input:21,cache_read:0,cache_creation_5m:10,cache_creation_1h:20,output:4});
+    assert.deepEqual(report.plain, report.actual);
+  }
+});

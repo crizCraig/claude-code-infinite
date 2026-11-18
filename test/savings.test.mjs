@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSavingsState, accountSavingsTurn, normalizeSavingsUsage } from '../dist/savings.js';
-const id = '12345678-1234-4123-8123-123456789abc';
 const usage = { input_tokens: 100, cache_read_input_tokens: 200, cache_creation_input_tokens: 30, cache_creation: { ephemeral_5m_input_tokens: 10, ephemeral_1h_input_tokens: 20 }, output_tokens: 50 };
 const request = (text = 'a'.repeat(4000)) => ({model:'claude-sonnet-4-6', messages:[{role:'user',content:text}]});
-const turn = (state, options={}) => accountSavingsTurn(state,{request:request(),usage,contextWindow:200000,requestModified:true,originalInputTokens:1000,nowMs:1000,...options});
+const turn = (state, options={}) => accountSavingsTurn(state,{request:request(),usage,contextWindow:200000,requestModified:true,prefixRewritten:true,originalInputTokens:1000,nowMs:1000,...options});
 test('usage validates disjoint cache buckets and all required counts',()=>{
  assert.deepEqual(normalizeSavingsUsage(usage),{input:100,cache_read:200,cache_creation_5m:10,cache_creation_1h:20,output:50});
  for(const bad of [{}, {...usage,input_tokens:-1}, {...usage,output_tokens:NaN}, {...usage,cache_creation_input_tokens:31}, {...usage,cache_read_input_tokens:'200'}, {...usage,output_tokens:1.5}]) assert.equal(normalizeSavingsUsage(bad),undefined);
@@ -18,12 +17,12 @@ test('unmodified request uses actual counts and has exactly zero API savings',()
 });
 test('prefix cache matches content and model, expires, and isolates lanes',()=>{
  const cachedRequest={...request('a'.repeat(8000)),cache_control:{type:'ephemeral'}};
- const opts={request:cachedRequest,originalInputTokens:2000};
+ const opts={request:cachedRequest,originalInputTokens:2000,usage:{input_tokens:0,cache_creation_input_tokens:2000,output_tokens:5}};
  const first=turn(createSavingsState(),opts);
  const hit=turn(first.state,{...opts,nowMs:2000});
  assert.equal(hit.turn.plain_tokens.cache_read,2000);
  for(const options of [{nowMs:302000},{request:{...cachedRequest,messages:request('b'.repeat(8000)).messages}},{model:'claude-opus-4-6'}]) assert.equal(turn(first.state,{...opts,...options}).turn.plain_tokens.cache_read,0);
- assert.equal(turn(first.state,{...opts,laneKey:'other'}).turn.plain_tokens.cache_read,200,'first-observation warm read only');
+ assert.equal(turn(first.state,{...opts,laneKey:'other'}).turn.plain_tokens.cache_read,0,'no predecessor on the other lane');
 });
 test('finite plain compaction resets growth at window minus reserve',()=>{
  let state=createSavingsState(); let crossed=false;
@@ -43,14 +42,15 @@ test('fallback is explicitly estimated and does not use high safety sizing',()=>
 });
 test('mixed TTLs create disjoint buckets and only live prefixes are read',()=>{
  const mixed={...request(),system:[{type:'text',text:'x'.repeat(8000),cache_control:{type:'ephemeral',ttl:'1h'}}],messages:[{role:'user',content:[{type:'text',text:'y'.repeat(8000),cache_control:{type:'ephemeral'}}]}]};
- const args={request:mixed,originalInputTokens:4000,usage:{input_tokens:10,output_tokens:5}};
+ const args={request:mixed,originalInputTokens:4000,usage:{input_tokens:0,output_tokens:5,
+   cache_creation_input_tokens:4000,cache_creation:{ephemeral_1h_input_tokens:2000,ephemeral_5m_input_tokens:2000}}};
  const first=turn(createSavingsState(),args);
  assert.ok(first.turn.plain_tokens.cache_creation_1h>1900);
  assert.equal(first.turn.plain_tokens.cache_creation_5m+first.turn.plain_tokens.cache_creation_1h,4000);
  const next=turn(first.state,{...args,nowMs:600001});
- assert.equal(next.turn.plain_tokens.cache_read,first.turn.plain_tokens.cache_creation_1h);
+ assert.equal(next.turn.plain_tokens.cache_read,2000);
  assert.equal(next.turn.plain_tokens.cache_creation_1h,0);
- assert.equal(next.turn.plain_tokens.cache_creation_5m,first.turn.plain_tokens.cache_creation_5m);
+ assert.equal(next.turn.plain_tokens.cache_creation_5m,2000);
  const expired=turn(first.state,{...args,nowMs:3601001});
  assert.equal(expired.turn.plain_tokens.cache_read,0);
  assert.ok(!JSON.stringify(next.state).includes('xxxxx'));
@@ -58,7 +58,7 @@ test('mixed TTLs create disjoint buckets and only live prefixes are read',()=>{
 test('automatic caching writes then reads only prior eligible prefixes and honors minimums',()=>{
  const uncached={...request('x'.repeat(8000))};
  const automatic={...uncached,cache_control:{type:'ephemeral'}};
- const args={request:automatic,originalInputTokens:2000,usage:{input_tokens:10,output_tokens:5}};
+ const args={request:automatic,originalInputTokens:2000,usage:{input_tokens:0,cache_creation_input_tokens:2000,output_tokens:5}};
  const first=turn(createSavingsState(),args);
  assert.equal(first.turn.plain_tokens.cache_creation_5m,2000);
  assert.equal(first.turn.plain_tokens.input,0);
@@ -125,12 +125,13 @@ test('an attribution change and append keep the plain compaction boundary', () =
  assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
 });
 
-test('parallel tool calls and results each occupy one cache lookback position', () => {
+test('a stable ride with 21 parallel tool calls and results follows the observed cache hit', () => {
  const req={...request('x'.repeat(120000)),cache_control:{type:'ephemeral'}};
  const first=turn(createSavingsState(),{request:req,originalInputTokens:30000});
  const calls=Array.from({length:21},(_,i)=>({type:'tool_use',id:String(i),name:'test',input:{}}));
  const results=calls.map(call=>({type:'tool_result',tool_use_id:call.id,content:'ok'}));
- const next=turn(first.state,{originalInputTokens:30500,request:{...req,messages:[...req.messages,
+ const next=turn(first.state,{originalInputTokens:30500,prefixRewritten:false,
+   usage:{input_tokens:500,cache_read_input_tokens:30000,output_tokens:10},request:{...req,messages:[...req.messages,
    {role:'assistant',content:calls},{role:'user',content:results}]}});
  assert.ok(next.turn.plain_tokens.cache_read>=29900);
 });
@@ -161,27 +162,15 @@ test('changing the request frame does not replay plain compaction on the same hi
  assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
 });
 
-test('an unknown predecessor uses median lane gap on the existing transcript prefix', () => {
+test('a first-seen rewrite has no prior cache evidence regardless of lane or marker', () => {
  const messages = [...request('x'.repeat(320000)).messages,
    {role:'assistant',content:'done'},{role:'user',content:'continue'}];
- for(const ttl of ['5m','1h']){
-   const result=turn(createSavingsState(),{request:{...request(),messages,cache_control:{type:'ephemeral',ttl}},
+ for (const ttl of ['5m','1h']) for (const laneKey of ['main','away']) {
+   const result=turn(createSavingsState(),{laneKey,request:{...request(),messages,cache_control:{type:'ephemeral',ttl}},
      originalInputTokens:80010,usage:{input_tokens:2000,output_tokens:5}});
-   assert.ok(result.turn.plain_tokens.cache_read >= 79990);
-   assert.ok(result.turn.plain_tokens.cache_read < 80010,'new content still incurs a write');
+   assert.equal(result.turn.plain_tokens.cache_read,0);
+   assert.equal(result.turn.plain_tokens['cache_creation_'+ttl],80010);
  }
-});
-
-test('unknown away gap exceeds five minutes but fits an hour; a known gap takes precedence', () => {
- const opts = {laneKind:'away', requestModified:true, originalInputTokens:80010,
-   nowMs:4000000, usage:{input_tokens:2000,output_tokens:5}};
- const price = (ttl, previousAt) => turn(createSavingsState(), {...opts, previousAt, request:{
-   ...request(),messages:[...request('x'.repeat(320000)).messages,{role:'assistant',content:'done'},
-     {role:'user',content:'continue'}],cache_control:{type:'ephemeral',ttl}}}).turn.plain_tokens;
- assert.equal(price('5m').cache_read,0);
- assert.ok(price('1h').cache_read>79000);
- assert.ok(price('5m',3999000).cache_read>79000);
- assert.equal(price('1h',1000).cache_read,0);
 });
 
 test('warm passthrough coverage stops at the last matching content block', () => {
@@ -206,4 +195,89 @@ test('a long passthrough retains its shared head when the rest of the conversati
     usage:{input_tokens:0,cache_creation_input_tokens:12000,output_tokens:0}});
   const next = turn(first.state, {request:prompt('c'), originalInputTokens:12000,nowMs:11000});
   assert.ok(next.turn.plain_tokens.cache_read > 5800 && next.turn.plain_tokens.cache_read < 6100);
+});
+
+test('stable compressed rides follow measured reads and writes regardless of gaps and markers', () => {
+  const req = {...request(),cache_control:{type:'ephemeral',ttl:'1h'}};
+  const args = {request:req,originalInputTokens:1000,prefixRewritten:false};
+  const mixed = {input_tokens:0,cache_read_input_tokens:200,cache_creation_input_tokens:300,
+    cache_creation:{ephemeral_5m_input_tokens:200,ephemeral_1h_input_tokens:100},output_tokens:7};
+  const first = turn(createSavingsState(),{...args,usage:mixed});
+  for (const nowMs of [1001,3601001]) {
+    const next = turn(first.state,{...args,usage:mixed,nowMs});
+    assert.deepEqual(next.turn.plain_tokens,
+      {input:0,cache_read:400,cache_creation_5m:400,cache_creation_1h:200,output:7});
+    const miss = turn(first.state,{...args,usage:{input_tokens:10,output_tokens:1},nowMs});
+    assert.equal(miss.turn.plain_tokens.input,1000);
+  }
+});
+
+test('a five-minute write followed by a hit cannot become a one-hour entry on rewrite', () => {
+  const req = {...request('a'.repeat(120000)),cache_control:{type:'ephemeral'}};
+  const args = {request:req,originalInputTokens:30000,requestModified:false};
+  const written = turn(createSavingsState(),{...args,usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:0}});
+  const hit = turn(written.state,{...args,usage:{input_tokens:0,cache_read_input_tokens:30000,output_tokens:0},nowMs:2000});
+  const next = turn(hit.state,{...args,requestModified:true,prefixRewritten:true,nowMs:602000,
+    request:{...req,cache_control:{type:'ephemeral',ttl:'1h'}},usage:{input_tokens:2000,output_tokens:1}});
+  assert.equal(next.turn.plain_tokens.cache_read,0);
+  assert.equal(next.turn.plain_tokens.cache_creation_1h,30000);
+});
+
+test('shared system and fresh suffix keep their measured buckets on both a ride and a rewrite', () => {
+  // Text lengths include the four characters of each user role in the position estimate.
+  const prompt = size => ({...request(),cache_control:{type:'ephemeral'},system:'s'.repeat(2000),
+    messages:[...request('x'.repeat(size-4)).messages,...request('z'.repeat(996)).messages]});
+  const args = {request:prompt(4000),forwardedRequest:prompt(2000),originalInputTokens:7000,
+    usage:{input_tokens:1000,cache_read_input_tokens:4000,output_tokens:11}};
+  const ride = turn(createSavingsState(),{...args,prefixRewritten:false});
+  assert.deepEqual(ride.turn.plain_tokens,{input:1000,cache_read:6000,cache_creation_1h:0,
+    cache_creation_5m:0,output:11});
+  const rewrite = turn(createSavingsState(),{...args,prefixRewritten:true});
+  assert.deepEqual(rewrite.turn.plain_tokens,{input:1000,cache_read:2000,cache_creation_1h:0,
+    cache_creation_5m:4000,output:11});
+});
+
+test('a rewrite uses the TTL observed on the preceding wire request', () => {
+  const original = {...request('a'.repeat(120000)),cache_control:{type:'ephemeral',ttl:'1h'}};
+  for (const ttl of ['5m','1h']) {
+    const sent = {...request('z'.repeat(8000)),cache_control:{type:'ephemeral',ttl}};
+    const args = {request:original,forwardedRequest:sent,originalInputTokens:30000};
+    const first = turn(createSavingsState(),{...args,prefixRewritten:false,
+      usage:{input_tokens:0,cache_read_input_tokens:2000,output_tokens:1}});
+    const next = turn(first.state,{...args,nowMs:601000,prefixRewritten:true,
+      usage:{input_tokens:2000,output_tokens:1}});
+    assert.equal(next.turn.plain_tokens.cache_read,ttl === '5m' ? 0 : 30000);
+  }
+});
+
+test('a passthrough reports measured usage and preserves plain compaction for the next ride', () => {
+  const messages = request('x'.repeat(20000)).messages;
+  const args = {request:{...request(),messages},contextWindow:5000,originalInputTokens:5000};
+  const first = turn(createSavingsState(),args);
+  assert.equal(first.turn.compacted,true);
+  const pass = turn(first.state,{...args,requestModified:false,usage:{input_tokens:5000,output_tokens:10}});
+  assert.deepEqual(pass.turn.plain_tokens,pass.turn.actual_tokens);
+  const next = turn(pass.state,{...args,request:{...request(),messages:[...messages,{role:'user',content:'next'}]},
+    originalInputTokens:5010,prefixRewritten:false});
+  assert.equal(next.turn.compacted,false);
+  assert.equal(next.turn.plain_input_tokens,first.turn.plain_input_tokens+10);
+});
+
+test('a rewrite can invalidate the cached suffix after the edited block upstream', () => {
+  const prompt = middle => ({...request(),cache_control:{type:'ephemeral'},
+    messages:[...request(middle.repeat(4000)).messages,...request('tail'.repeat(2000)).messages]});
+  const req = prompt('a');
+  const prior = turn(createSavingsState(),{request:req,requestModified:false,
+    usage:{input_tokens:0,cache_creation_input_tokens:3000,output_tokens:1}});
+  const next = turn(prior.state,{request:req,forwardedRequest:prompt('b'),originalInputTokens:3000,
+    usage:{input_tokens:0,cache_creation_input_tokens:3000,output_tokens:1},nowMs:2000});
+  assert.equal(next.turn.plain_tokens.cache_read,3000);
+  assert.equal(next.turn.plain_tokens.cache_creation_5m,0);
+});
+
+test('one zero duration count cannot supply a missing creation total', () => {
+  for (const present of ['ephemeral_1h_input_tokens','ephemeral_5m_input_tokens']) {
+    assert.equal(normalizeSavingsUsage({...usage,cache_creation_input_tokens:null,
+      cache_creation:{[present]:0}}),undefined);
+  }
 });
