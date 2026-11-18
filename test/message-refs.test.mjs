@@ -299,6 +299,41 @@ test("an image-ref 409 on a delta body is sent again as the turn's ordinary body
   }
 });
 
+test("a fresh process names a too-big conversation's unacked messages; a 409 sends only those inline", async () => {
+  const MIB = 1024 * 1024;
+  const server = await fakeMemtree();
+  server.realMissing = true;
+  const records = [];
+  try {
+    const messages = [{ role: "user", content: "start" }];
+    for (let i = 0; i < 36; i++) messages.push({ role: i % 2 ? "user" : "assistant",
+      content: `${i} ${`${i % 10}`.repeat(MIB)}` });
+    // An earlier process stored all but one of them; this one has no acks.
+    for (const m of messages) {
+      if (m !== messages[3]) server.store.set(refFor(m).digest, { message: m });
+    }
+    const client = new MemtreeClient({ baseUrl: server.origin, apiKey: "k", messageRefs: true,
+      reqlog: { log: (r) => records.push(r) } });
+    const meta = { sessionId: "sess-fresh" };
+    assert.ok(await client.compress(MemtreeClient.hashMessages(messages), messages, 200_000,
+      undefined, meta));
+    assert.equal(server.bodies.length, 2);
+    assert.equal(server.bodies[0].status, 409, "every message named, one not stored");
+    assert.equal(server.bodies[0].refs, 29, "within the default 30 MiB cap");
+    assert.equal(server.bodies[1].status, 200);
+    assert.equal(server.bodies[1].refs, 29, "the one it lacked inline, the next one named");
+    assert.ok(server.bodies[1].bytes < 30 * MIB, `${server.bodies[1].bytes} bytes`);
+    assert.deepEqual(server.bodies[1].rebuilt, messages, "the server's rebuild is the full body");
+    assert.deepEqual(records.map((r) => r.ok), [true]);
+    const next = [...messages, { role: "assistant", content: "done" }];
+    assert.ok(await client.compress(MemtreeClient.hashMessages(next), next, 200_000, undefined,
+      meta));
+    assert.equal(server.bodies[2].status, 200, "acked now: the next turn is an ordinary delta");
+  } finally {
+    await server.close();
+  }
+});
+
 test("off by default: no feature declared, nothing named", async () => {
   const server = await fakeMemtree();
   try {
@@ -318,7 +353,7 @@ test("off by default: no feature declared, nothing named", async () => {
 /** A MemTree that stores every message it is sent and serves refs back from them. */
 async function fakeMemtree() {
   const state = { bodies: [], store: new Map(), missingNext: false, imageLimitNext: false,
-    storedImages: [], imageMissingNext: false };
+    storedImages: [], imageMissingNext: false, realMissing: false };
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
@@ -343,6 +378,11 @@ async function fakeMemtree() {
       if (refs.length && state.imageLimitNext) {
         state.imageLimitNext = false;
         return reply(400, { detail: "Image references expand past the request size limit." });
+      }
+      const lacking = state.realMissing
+        ? refs.map((r) => r[REF_KEY]).filter((h) => !state.store.has(h)) : [];
+      if (lacking.length) {
+        return reply(409, { detail: { message: "x", missing_message_hashes: lacking } });
       }
       if (refs.length && state.missingNext) {
         state.missingNext = false;

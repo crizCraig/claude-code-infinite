@@ -87,6 +87,18 @@ export class MessageRefs {
             return { messages, refs: [] };
         return buildDelta(messages, acked, this.namedChars);
     }
+    /**
+     * Every message that may be stored named by ref, acked or not (except `exclude` and what a
+     * 409 named before): for a body too big to send otherwise, as a fresh process's first call
+     * of a long conversation, which has no acks. The server's 409 names what it lacks.
+     */
+    unconfirmedDelta(sessionId, messages, exclude = new Set()) {
+        const lane = this.laneFor(sessionId, messages);
+        if (!lane)
+            return { messages, refs: [] };
+        const never = this.never.get(lane);
+        return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) }, this.namedChars);
+    }
     /** What one request's refs may expand to now (for tests and the request log). */
     get maxNamedChars() {
         return this.namedChars;
@@ -126,7 +138,7 @@ export class MessageRefs {
         // Over a size cap (stored text or the images the refs bring back): this call only. Past
         // the text cap, the cap the refusal names (it may have been lowered), else the default.
         if (status === 400 && /expand past/i.test(bodyText)) {
-            if (/message refs expand past/i.test(bodyText))
+            if (/\brefs expand past/i.test(bodyText))
                 this.noteRefusedCap(bodyText);
             return true;
         }

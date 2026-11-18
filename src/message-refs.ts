@@ -106,6 +106,20 @@ export class MessageRefs {
     return buildDelta(messages, acked, this.namedChars);
   }
 
+  /**
+   * Every message that may be stored named by ref, acked or not (except `exclude` and what a
+   * 409 named before): for a body too big to send otherwise, as a fresh process's first call
+   * of a long conversation, which has no acks. The server's 409 names what it lacks.
+   */
+  unconfirmedDelta(sessionId: string | undefined, messages: Message[],
+                   exclude: ReadonlySet<string> = new Set()): Delta {
+    const lane = this.laneFor(sessionId, messages);
+    if (!lane) return { messages, refs: [] };
+    const never = this.never.get(lane);
+    return buildDelta(messages, { has: (d) => !exclude.has(d) && !never?.has(d) },
+      this.namedChars);
+  }
+
   /** What one request's refs may expand to now (for tests and the request log). */
   get maxNamedChars(): number {
     return this.namedChars;
@@ -144,7 +158,7 @@ export class MessageRefs {
     // Over a size cap (stored text or the images the refs bring back): this call only. Past
     // the text cap, the cap the refusal names (it may have been lowered), else the default.
     if (status === 400 && /expand past/i.test(bodyText)) {
-      if (/message refs expand past/i.test(bodyText)) this.noteRefusedCap(bodyText);
+      if (/\brefs expand past/i.test(bodyText)) this.noteRefusedCap(bodyText);
       return true;
     }
     if (status === 400 && /message refs/i.test(bodyText)) {
@@ -244,7 +258,7 @@ export class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export function buildDelta(messages: Message[], acked: ReadonlySet<string>,
+export function buildDelta(messages: Message[], acked: { has(digest: string): boolean },
                            maxChars = MAX_NAMED_CHARS): Delta {
   const opening = messages.findIndex(isOpening);
   if (opening < 0) return { messages, refs: [] };

@@ -52,6 +52,12 @@ export declare class MessageRefs {
     get active(): boolean;
     /** `messages` with every acked message after the opening as a ref (none: the same list). */
     delta(sessionId: string | undefined, messages: Message[]): Delta;
+    /**
+     * Every message that may be stored named by ref, acked or not (except `exclude` and what a
+     * 409 named before): for a body too big to send otherwise, as a fresh process's first call
+     * of a long conversation, which has no acks. The server's 409 names what it lacks.
+     */
+    unconfirmedDelta(sessionId: string | undefined, messages: Message[], exclude?: ReadonlySet<string>): Delta;
     /** What one request's refs may expand to now (for tests and the request log). */
     get maxNamedChars(): number;
     /**
@@ -90,7 +96,9 @@ export declare class MessageRefs {
  * first message that is not system/developer and not only <system-reminder> blocks) and
  * everything before it that is not a system/developer message.
  */
-export declare function buildDelta(messages: Message[], acked: ReadonlySet<string>, maxChars?: number): Delta;
+export declare function buildDelta(messages: Message[], acked: {
+    has(digest: string): boolean;
+}, maxChars?: number): Delta;
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
  * message without its `cache_control` keys and, when `stripHeader` (no earlier message of
