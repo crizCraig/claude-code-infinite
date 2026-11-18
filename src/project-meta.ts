@@ -9,8 +9,10 @@
  * optional: outside a git repository, with git missing, or when a command is
  * slow, the part is simply left out. Never throws.
  */
+import { executablePath } from "./executable-path.js";
 import { execFile } from "node:child_process";
 import path from "node:path";
+import { findPathExecutable } from "./claude-locate.js";
 
 export interface ProjectMeta {
   project_dir?: string;
@@ -80,8 +82,11 @@ export function repoNameFromRemote(remote: string): string | undefined {
 function runGit(args: string[], cwd: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     try {
+      const git = process.platform === "win32"
+        ? findPathExecutable("git.exe", "win32", process.env, cwd) : "git";
+      if (!git) { resolve(undefined); return; }
       execFile(
-        "git",
+        executablePath(git),
         args,
         { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true },
         (err, stdout) => resolve(err ? undefined : String(stdout).trim() || undefined)

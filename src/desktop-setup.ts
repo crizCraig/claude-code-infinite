@@ -4,6 +4,7 @@
  * dropped at once; only the leaf key is kept, 0600), the Bash env file, the launchd agent
  * and the user-scope `memtree` MCP server. The service itself is desktop-service.ts.
  */
+import { executablePath } from "./executable-path.js";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -263,25 +264,25 @@ export function installLaunchAgent(mode: DesktopMode, paths: DesktopPaths, cliPa
   fs.mkdirSync(path.dirname(paths.plist), { recursive: true });
   fs.writeFileSync(paths.plist, launchdPlist(mode, paths, cliPath), { mode: 0o644 });
   const domain = `gui/${process.getuid?.() ?? 501}`;
-  spawnSync("launchctl", ["bootout", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" });
+  spawnSync(executablePath("launchctl"), ["bootout", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" });
   // bootout returns before the job is fully gone (it may take its ExitTimeOut to final-index);
   // wait for it to leave, then bootstrap, retrying the transient 5/37 errors.
-  for (let i = 0; i < 200 && spawnSync("launchctl", ["print", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" }).status === 0; i++) {
-    spawnSync("sleep", ["0.25"]);
+  for (let i = 0; i < 200 && spawnSync(executablePath("launchctl"), ["print", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" }).status === 0; i++) {
+    spawnSync(executablePath("sleep"), ["0.25"]);
   }
   let last = "";
   for (let attempt = 0; attempt < 40; attempt++) {
-    const r = spawnSync("launchctl", ["bootstrap", domain, paths.plist], { encoding: "utf8" });
+    const r = spawnSync(executablePath("launchctl"), ["bootstrap", domain, paths.plist], { encoding: "utf8" });
     if (r.status === 0) return;
     last = `${r.status}: ${(r.stderr || "").trim()}`;
-    spawnSync("sleep", ["0.25"]);
+    spawnSync(executablePath("sleep"), ["0.25"]);
   }
   throw new Error(`launchctl bootstrap failed (${last})`);
 }
 
 export function uninstallLaunchAgent(mode: DesktopMode, paths: DesktopPaths): void {
   const domain = `gui/${process.getuid?.() ?? 501}`;
-  spawnSync("launchctl", ["bootout", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" });
+  spawnSync(executablePath("launchctl"), ["bootout", `${domain}/${desktopLaunchdLabel(mode)}`], { stdio: "ignore" });
   fs.rmSync(paths.plist, { force: true });
 }
 
@@ -335,9 +336,9 @@ export function registerDesktopMcp(
     return { ok: false, reason: "a user-scope MCP server named `memtree` that ccc didn't add already exists" };
   }
   if (owner === "ccc-desktop") {
-    spawnSync(claudeCommand, ["mcp", "remove", "--scope", "user", MEMTREE_MCP_SERVER_NAME], { stdio: "ignore", env });
+    spawnSync(executablePath(claudeCommand), ["mcp", "remove", "--scope", "user", MEMTREE_MCP_SERVER_NAME], { stdio: "ignore", env });
   }
-  const r = spawnSync(claudeCommand, [
+  const r = spawnSync(executablePath(claudeCommand), [
     "mcp", "add-json", "--scope", "user", MEMTREE_MCP_SERVER_NAME, desktopMcpServerJson(),
   ], { stdio: "inherit", env });
   return r.status === 0 ? { ok: true } : { ok: false, reason: `\`claude mcp add-json\` exited ${r.status}` };
@@ -348,6 +349,6 @@ export function unregisterDesktopMcp(
   claudeCommand: string, otherModesInstalled: boolean, env: NodeJS.ProcessEnv = process.env
 ): void {
   if (otherModesInstalled || userMcpOwner(userClaudeJsonPath(env)) !== "ccc-desktop") return;
-  spawnSync(claudeCommand, ["mcp", "remove", "--scope", "user", MEMTREE_MCP_SERVER_NAME], { stdio: "ignore", env });
+  spawnSync(executablePath(claudeCommand), ["mcp", "remove", "--scope", "user", MEMTREE_MCP_SERVER_NAME], { stdio: "ignore", env });
 }
 

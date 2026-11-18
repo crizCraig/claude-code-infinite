@@ -3,12 +3,13 @@
 // its memtree MCP tools by default, exactly as in interactive sessions.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { routeConsoleToStderr, stripAnsi } from "../dist/cli-output.js";
 import { subcommandArgs } from "../dist/cli-args.js";
 
@@ -50,7 +51,7 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } = {}) {
+function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
@@ -259,4 +260,53 @@ test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session
   } finally {
     server.close();
   }
+});
+
+test("ccc --resume <id> forwards the existing session and uses absolute Windows executables", async t => {
+  const { home, bin } = fakeClaudeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const projects = path.join(home, ".claude", "projects", "test-project");
+  fs.mkdirSync(projects, { recursive: true });
+  const id = "e32c1f3e-f811-468a-8d31-e4967cbf1219";
+  const transcript = path.join(projects, id + ".jsonl");
+  fs.writeFileSync(transcript, '{"type":"user"}\n');
+  fs.writeFileSync(path.join(home, ".claude-code-infinite", "config.json"),
+    JSON.stringify({ polychatApiKey: "sk-" + "1".repeat(32), diagnostics: false, updateCheck: false }));
+
+  const preload = path.join(home, "capture.mjs");
+  fs.writeFileSync(preload, `
+    import cp from "node:child_process";
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    import { Server } from "node:net";
+    Server.prototype.listen = function(port, host, ready) { queueMicrotask(ready); return this; };
+    Server.prototype.address = () => ({ port: 12345 });
+    globalThis.fetch = async () => Response.json({ paid: true });
+    for (const method of ["spawn", "spawnSync", "execFile", "execFileSync"]) {
+      const original = cp[method];
+      cp[method] = function(file, ...args) {
+        fs.appendFileSync(process.env.CCC_TEST_SPAWNS, JSON.stringify(file) + "\\n");
+        return original.call(this, file, ...args);
+      };
+    }
+    syncBuiltinESMExports();
+  `);
+  const log = path.join(home, "spawns");
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+    PATH: bin + path.delimiter + process.env.PATH, CCC_TEST_SPAWNS: log };
+  // Child env keys are case-insensitive on Windows. Keep one spelling of PATH.
+  for (const key of Object.keys(env)) if (key !== "PATH" && key.toUpperCase() === "PATH") delete env[key];
+  const { stdout } = await promisify(execFile)(process.execPath,
+    ["--import", pathToFileURL(preload).href, CLI, "--resume", id], { env, cwd: home, timeout: 10000 });
+  const args = JSON.parse(stdout).args;
+  assert.deepEqual(args.slice(args.indexOf("--resume")), ["--resume", id]);
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(calls.length > 0);
+  if (process.platform === "win32") {
+    for (const file of calls) {
+      assert.ok(path.isAbsolute(file) && path.parse(file).root.length > 1, file);
+      assert.doesNotMatch(path.basename(file), /^(ps|lsof)(\.exe)?$/i);
+    }
+  }
+  assert.equal(fs.readFileSync(transcript, "utf8"), '{"type":"user"}\n');
 });

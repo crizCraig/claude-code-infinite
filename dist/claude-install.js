@@ -13,9 +13,9 @@
  * (the CI check of this flow); it still installs only on a yes. The answer is read
  * with readline, which takes all of piped stdin, so don't also pipe a prompt then.
  */
-import spawn from "cross-spawn";
-import * as path from "node:path";
-import { claudeMissingText } from "./claude-locate.js";
+import { executablePath } from "./executable-path.js";
+import { spawn } from "node:child_process";
+import { claudeMissingText, system32Path } from "./claude-locate.js";
 /** Anthropic's official install one-liners (https://code.claude.com/docs/en/setup). */
 export const WINDOWS_INSTALL_SCRIPT = "irm https://claude.ai/install.ps1 | iex";
 export const POSIX_INSTALL_SCRIPT = "curl -fsSL https://claude.ai/install.sh | bash";
@@ -55,7 +55,7 @@ export function isYes(answer) {
 export function installerCommand(platform = process.platform, env = process.env) {
     if (platform === "win32") {
         return {
-            command: windowsPowerShell(env),
+            command: system32Path(env, "WindowsPowerShell", "v1.0", "powershell.exe"),
             args: ["-NoProfile", "-Command", WINDOWS_INSTALL_SCRIPT],
             display: WINDOWS_INSTALL_SCRIPT,
             env: withoutPsModulePath(env),
@@ -75,7 +75,7 @@ export function installerCommand(platform = process.platform, env = process.env)
 export function runInstaller(installer, toStderr = false) {
     return new Promise((resolve) => {
         try {
-            const child = spawn(installer.command, installer.args, {
+            const child = spawn(executablePath(installer.command), installer.args, {
                 stdio: ["inherit", toStderr ? process.stderr : "inherit", "inherit"],
                 ...(installer.env ? { env: installer.env } : {}),
             });
@@ -119,24 +119,11 @@ function failureLine(run, installer) {
     return "Claude Code's installer finished, but ccc still can't find `claude`.";
 }
 /**
- * Windows PowerShell, always by full path: PATH may be what is broken, and a
- * search by name would try the current folder (a project's powershell.exe) first.
- * Missing, the spawn fails and the manual steps are shown.
- */
-function windowsPowerShell(env) {
-    const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
-    return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-/**
  * ccc started from PowerShell 7 inherits its PSModulePath, which makes Windows
  * PowerShell 5.1 load 7's modules and lose its own (the installer's Get-FileHash
  * is then "not recognized"). Without it, 5.1 builds its default path.
  */
 function withoutPsModulePath(env) {
     return Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== "PSMODULEPATH"));
-}
-function envValue(env, name) {
-    const key = Object.keys(env).find((k) => k.toUpperCase() === name.toUpperCase());
-    return key === undefined ? undefined : env[key];
 }
 //# sourceMappingURL=claude-install.js.map

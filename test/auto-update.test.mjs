@@ -398,12 +398,12 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   const { spawnImpl, calls } = mockSpawn({ pid: 777 });
   const result = startAutoUpdateInstall({
     decision, files, spawnImpl, env: { PATH: "/usr/bin" },
-    execPath: "/opt/node/bin/node", npmPath: "/opt/node/bin/npm",
+    execPath: process.execPath, npmPath: "/opt/node/bin/npm",
   });
   assert.equal(result, "started");
   assert.equal(calls.length, 1);
   const [{ command, args, options, child }] = calls;
-  assert.equal(command, "/opt/node/bin/node");
+  assert.equal(command, process.execPath);
   assert.equal(args[0], "-e");
   assert.equal(args[1], RUNNER_SOURCE);
   const config = JSON.parse(args[2]);
@@ -414,7 +414,7 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   assert.equal(config.packageDir, g.packageDir);
   assert.equal(options.detached, true);
   assert.equal(options.stdio, "ignore");
-  assert.equal(options.env.PATH, `/opt/node/bin${path.delimiter}/usr/bin`, "npm's shebang finds this Node");
+  assert.equal(options.env.PATH, `${path.dirname(process.execPath)}${path.delimiter}/usr/bin`, "npm's shebang finds this Node");
   assert.ok(child.unrefCalled, "never keeps ccc alive");
   const state = readUpdateState(files.stateFile);
   assert.deepEqual(state.attempts, { "1.0.21": 1 });

@@ -5,6 +5,9 @@
  */
 export declare const KEY_PAGE_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
 export declare const LOCAL_KEY_PAGE_URL = "http://local.polychat.co:5173/memtree-api";
+/** The account key issued by Open WebUI: sk- followed by a UUID without hyphens. */
+export declare function isMemtreeKey(value: unknown): value is string;
+export declare const KEY_FORMAT_HINT = "Paste the MemTree API key starting with sk- followed by 32 hexadecimal digits.";
 /**
  * Whether a MemTree answer says the key itself is unknown or revoked. polychat
  * answers 401 for that. A 403 counts only with polychat's own "Invalid API

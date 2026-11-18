@@ -8,6 +8,13 @@
 export const KEY_PAGE_URL = "https://polychat.co/auth?memtree=true&utm_source=ccc";
 export const LOCAL_KEY_PAGE_URL = "http://local.polychat.co:5173/memtree-api";
 
+/** The account key issued by Open WebUI: sk- followed by a UUID without hyphens. */
+export function isMemtreeKey(value: unknown): value is string {
+  return typeof value === "string" && value.length === 35 && /^sk-[0-9a-f]{32}$/.test(value);
+}
+
+export const KEY_FORMAT_HINT = "Paste the MemTree API key starting with sk- followed by 32 hexadecimal digits.";
+
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 // polychat's FastAPI detail for an unknown or revoked key.

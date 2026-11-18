@@ -1,12 +1,15 @@
 /** Conservative filesystem boundary for optional transcript repair. */
+import { executablePath } from "./executable-path.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 /** Possible writers include Claude binaries and JS runtimes; uncertainty skips repair. */
 export function transcriptIsQuiescent(file) {
+    if (process.platform === "win32")
+        return false; // no POSIX writer check
     try {
-        const processes = execFileSync("ps", ["-axo", "pid=,comm="], {
+        const processes = execFileSync(executablePath("ps"), ["-axo", "pid=,comm="], {
             encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
         });
         if (!processes.trim())
@@ -21,7 +24,7 @@ export function transcriptIsQuiescent(file) {
                 return false;
         }
         try {
-            execFileSync("lsof", ["-t", "--", file], {
+            execFileSync(executablePath("lsof"), ["-t", "--", file], {
                 timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
             });
             return false; // Any open descriptor means a possible writer.

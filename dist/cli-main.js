@@ -11,8 +11,9 @@
  * token never leaves this machine. polychat.co only ever sees message content
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
-import spawn from "cross-spawn";
-import { exec } from "node:child_process";
+import { spawnClaude, spawnClaudeSync } from "./claude-process.js";
+import { askFreshKeyLine } from "./key-input.js";
+import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -60,7 +61,7 @@ import { CreditRefusalMemory, creditAdviceApplies, isInfoOnlyRun, readSeenClaude
 import { probeAnswersForSession, probeClaudeAuthStatus, skippedProbe, } from "./claude-auth-status.js";
 import { mayWaitForEnter, presentSignInNotice, sessionProbe, signInNotice, signInNoticeApplies, SignInTracker, } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
-import { urlOpenerFor } from "./open-url.js";
+import { browserOpener, urlOpenerFor } from "./open-url.js";
 import { desktopServiceDownLine, runDesktopCommand } from "./desktop-command.js";
 import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
 import { startHttpsProxySession, } from "./https-proxy-session.js";
@@ -74,29 +75,21 @@ const SUBSCRIBE_WAIT_MS = 180_000;
 const SUBSCRIBE_POLL_MS = 3_000;
 /** This launch's diagnostics, for the top-level error handler. */
 let activeDiagnostics = null;
-function openUrl(url) {
-    const platform = process.platform;
-    const command = platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
-    platform === "win32"
-        ? exec(`${command} "${url}"`, { shell: "cmd.exe" })
-        : exec(`${command} "${url}"`);
-}
+const openUrl = browserOpener(process.platform);
 async function promptForApiKey(mode, output) {
-    const rl = readline.createInterface({ input: process.stdin, output });
     const url = mode === "local" ? LOCAL_KEY_PAGE_URL : KEY_PAGE_URL;
     // The label is a clickable link (OSC 8) where the terminal supports it, and
     // the URL is printed too, for other terminals and for opening it elsewhere.
     console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
-    await new Promise((resolve) => {
-        rl.question(`\nPress Enter to open it in your browser...`, () => resolve());
-    });
+    if (await askAnswer("\nPress Enter to open it in your browser...", output) === null)
+        return "";
     openUrl(url);
-    return new Promise((resolve) => {
-        rl.question("Copy your API key and paste it here: ", (answer) => {
-            rl.close();
-            resolve(answer.trim());
-        });
-    });
+    for (;;) {
+        const key = await askFreshKeyLine("Copy your API key and paste it here: ", output);
+        if (!key || isMemtreeKey(key))
+            return key;
+        output.write(KEY_FORMAT_HINT + "\n");
+    }
 }
 /**
  * The startup check said the key is invalid (401/403): interactive runs get
@@ -114,7 +107,7 @@ async function handleInvalidKey(check, ctx) {
         keyPageUrl: keyPageUrl(ctx.baseUrl),
         // console.log is routed to stderr (uncoloured off a terminal) in print/non-TTY runs.
         stderrLine: (text) => console.log(text),
-        ask: askLine,
+        ask: askFreshKeyLine,
         open: openUrl,
         warn: (text) => console.warn(color ? `\x1b[1;33m${text}\x1b[0m` : text),
         say: (text) => console.log(text),
@@ -310,12 +303,12 @@ function printVersions() {
         console.error(claudeDesktopInstalled() ? claudeDesktopOnlyText() : claudeMissingText());
         return;
     }
-    spawn.sync(claude.command, ["--version"], { stdio: "inherit" });
+    spawnClaudeSync(claude.command, ["--version"], { stdio: "inherit" });
 }
 /** Unknown/old versions get the longstanding Stop fallback only. */
 function installedClaudeSupportsMessageDisplay(command) {
     try {
-        const result = spawn.sync(command, ["--version"], { encoding: "utf-8" });
+        const result = spawnClaudeSync(command, ["--version"], { encoding: "utf-8" });
         return supportsMessageDisplay(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
     }
     catch {
@@ -801,7 +794,7 @@ async function main() {
     // native login and sends its own OAuth bearer to the local base URL.
     const claudeStartedAt = Date.now();
     proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
-    const child = spawn(claude.command, childArgs, {
+    const child = spawnClaude(claude.command, childArgs, {
         env: withClaudeOnPath(claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild), claude),
         stdio: "inherit",
     });

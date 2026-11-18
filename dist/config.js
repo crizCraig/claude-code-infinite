@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isMemtreeKey } from "./key-page.js";
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 // The config holds MemTree API keys: owner-only, so other users on a shared
@@ -43,7 +44,8 @@ function restrictConfigPermissions() {
     }
 }
 export function getPolychatApiKey() {
-    return loadConfig().polychatApiKey;
+    const key = loadConfig().polychatApiKey;
+    return isMemtreeKey(key) ? key : undefined;
 }
 export function setPolychatApiKey(key) {
     const config = loadConfig();
@@ -51,7 +53,8 @@ export function setPolychatApiKey(key) {
     saveConfig(config);
 }
 export function getStagingPolychatApiKey() {
-    return loadConfig().stagingPolychatApiKey;
+    const key = loadConfig().stagingPolychatApiKey;
+    return isMemtreeKey(key) ? key : undefined;
 }
 export function setStagingPolychatApiKey(key) {
     const config = loadConfig();
@@ -59,7 +62,8 @@ export function setStagingPolychatApiKey(key) {
     saveConfig(config);
 }
 export function getLocalPolychatApiKey() {
-    return loadConfig().localPolychatApiKey;
+    const key = loadConfig().localPolychatApiKey;
+    return isMemtreeKey(key) ? key : undefined;
 }
 export function setLocalPolychatApiKey(key) {
     const config = loadConfig();

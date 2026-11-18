@@ -2,6 +2,7 @@ import type { CccEnvironment } from "./cli-args.js";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isMemtreeKey } from "./key-page.js";
 
 export interface Config {
   polychatApiKey?: string;
@@ -67,7 +68,8 @@ function restrictConfigPermissions(): void {
 }
 
 export function getPolychatApiKey(): string | undefined {
-  return loadConfig().polychatApiKey;
+  const key = loadConfig().polychatApiKey;
+  return isMemtreeKey(key) ? key : undefined;
 }
 
 export function setPolychatApiKey(key: string): void {
@@ -77,7 +79,8 @@ export function setPolychatApiKey(key: string): void {
 }
 
 export function getStagingPolychatApiKey(): string | undefined {
-  return loadConfig().stagingPolychatApiKey;
+  const key = loadConfig().stagingPolychatApiKey;
+  return isMemtreeKey(key) ? key : undefined;
 }
 
 export function setStagingPolychatApiKey(key: string): void {
@@ -87,7 +90,8 @@ export function setStagingPolychatApiKey(key: string): void {
 }
 
 export function getLocalPolychatApiKey(): string | undefined {
-  return loadConfig().localPolychatApiKey;
+  const key = loadConfig().localPolychatApiKey;
+  return isMemtreeKey(key) ? key : undefined;
 }
 
 export function setLocalPolychatApiKey(key: string): void {

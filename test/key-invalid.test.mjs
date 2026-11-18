@@ -24,6 +24,9 @@ import {
   runKeyGate,
 } from "../dist/key-status.js";
 
+const accountKey = "sk-" + "1".repeat(32);
+const revokedKey = "sk-" + "2".repeat(32);
+
 async function serve(handler) {
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -74,7 +77,7 @@ test("startup check: a bare 403 (WAF, proxy) stays unknown", async () => {
     res.end("<html>Attention Required! | Cloudflare</html>");
   });
   try {
-    assert.equal(await fetchKeyStatus(server.url, "k"), null);
+    assert.equal(await fetchKeyStatus(server.url, accountKey), null);
   } finally { server.close(); }
 });
 
@@ -83,7 +86,7 @@ for (const status of [401, 403]) {
     const server = await statusServer(status, { detail: "Invalid API key" });
     const diagnostics = recorder();
     try {
-      assert.equal(await fetchKeyStatus(server.url, "bad", { diagnostics }), "invalid");
+      assert.equal(await fetchKeyStatus(server.url, accountKey, { diagnostics }), "invalid");
       assert.deepEqual(diagnostics.events, [{ name: "key_status", result: "invalid", status }]);
     } finally { server.close(); }
   });
@@ -94,7 +97,7 @@ for (const status of [400, 403, 404, 405, 429, 500, 502, 503]) {
     const server = await statusServer(status, { detail: "nope" });
     const diagnostics = recorder();
     try {
-      assert.equal(await fetchKeyStatus(server.url, "k", { diagnostics }), null);
+      assert.equal(await fetchKeyStatus(server.url, accountKey, { diagnostics }), null);
       assert.equal(diagnostics.events[0].result, "unknown");
     } finally { server.close(); }
   });
@@ -105,7 +108,7 @@ test("startup check: a network error stays unknown", async () => {
   const url = server.url;
   server.close();
   const diagnostics = recorder();
-  assert.equal(await fetchKeyStatus(url, "k", { diagnostics }), null);
+  assert.equal(await fetchKeyStatus(url, accountKey, { diagnostics }), null);
   assert.equal(diagnostics.events[0].name, "error");
 });
 
@@ -114,8 +117,8 @@ test("startup check: paid and unpaid bodies parse as before", async () => {
   const unpaid = await statusServer(200, { paid: false, payment_message: "Pay",
     payment_url: "https://x/payment?u=1" });
   try {
-    assert.deepEqual(await fetchKeyStatus(paid.url, "k"), { paid: true, message: null, url: null });
-    const status = await fetchKeyStatus(unpaid.url, "k");
+    assert.deepEqual(await fetchKeyStatus(paid.url, accountKey), { paid: true, message: null, url: null });
+    const status = await fetchKeyStatus(unpaid.url, accountKey);
     assert.equal(status.paid, false);
     assert.equal(status.url, "https://x/payment?u=1&source=ccc");
   } finally { paid.close(); unpaid.close(); }
@@ -171,16 +174,16 @@ test("gate: c starts claude without MemTree, as the payment gate does", async ()
 
 test("gate: a pasted key that works is saved and its status returned", async () => {
   const paid = { paid: true, message: null, url: null };
-  const { deps, log } = gateDeps(["", " good-key "], { "good-key": paid });
-  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: "good-key", check: paid });
+  const { deps, log } = gateDeps(["", accountKey], { [accountKey]: paid });
+  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: accountKey, check: paid });
   assert.deepEqual(log.opened, [KEY_PAGE_URL]);
-  assert.deepEqual(log.saved, ["good-key"]);
+  assert.deepEqual(log.saved, [accountKey]);
 });
 
 test("gate: an empty paste or another invalid key asks again; the bad key is never saved", async () => {
-  const { deps, log } = gateDeps(["", "", "p", "still-bad", "", "ok"], { "still-bad": "invalid" });
-  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: "ok", check: null });
-  assert.deepEqual(log.saved, ["ok"], "an unknown status (network) still saves the pasted key");
+  const { deps, log } = gateDeps(["", "", "p", revokedKey, "", accountKey], { [revokedKey]: "invalid" });
+  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: accountKey, check: null });
+  assert.deepEqual(log.saved, [accountKey], "an unknown status (network) still saves the pasted key");
   assert.equal(log.warned.length, 3, "the headline again after each failed attempt");
   assert.deepEqual(log.opened, [KEY_PAGE_URL], "the key page opens once, not per attempt");
   assert.match(log.warned[2], /^⚠ That key isn't valid either\. Get a new one at /);
@@ -213,8 +216,8 @@ test("resolveInvalidKey: a known status passes through; interactive gates re-key
     { apiKey: "k", check: "invalid" });
   // A new key that is unpaid comes back unpaid, for the payment gate next.
   assert.deepEqual(await resolveInvalidKey("invalid", "k",
-    { ...gateDeps(["", "new"], { new: unpaid }).deps, ...base }),
-  { apiKey: "new", check: unpaid });
+    { ...gateDeps(["", accountKey], { [accountKey]: unpaid }).deps, ...base }),
+  { apiKey: accountKey, check: unpaid });
 });
 
 // ---------------------------------------------------------------- mid-session
@@ -456,4 +459,20 @@ test("an invalid-key refusal in a subagent's lane keeps the user's key notice du
     const shown = await display(h, "p1");
     assert.match(shown.body.hookSpecificOutput.displayContent, /isn't valid/);
   } finally { h.close(); }
+});
+
+test("malformed pasted keys never leave the recovery gate", async () => {
+  const key = "sk-" + "a".repeat(32);
+  for (const text of ["review files", "review", key + " ", " " + key, key + "x", key.slice(1)]) {
+    const { deps, log } = gateDeps(["", text, "q"]);
+    deps.check = () => assert.fail("malformed key reached the status check");
+    assert.deepEqual(await runKeyGate(deps), { action: "quit" });
+    assert.deepEqual(log.saved, []);
+  }
+});
+
+test("the status transport rejects malformed keys before calling fetch", async t => {
+  const send = t.mock.method(globalThis, "fetch", async () => Response.json({ paid: true }));
+  assert.equal(await fetchKeyStatus("https://example.invalid", "review files"), "invalid");
+  assert.equal(send.mock.callCount(), 0);
 });

@@ -8,7 +8,7 @@ import { join } from "node:path";
 const home = mkdtempSync(join(tmpdir(), "ccc-config-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
-const { getPolychatApiKey, setPolychatApiKey } = await import("../dist/config.js");
+const { getPolychatApiKey, getStagingPolychatApiKey, getLocalPolychatApiKey, setPolychatApiKey } = await import("../dist/config.js");
 const dir = join(home, ".claude-code-infinite");
 const file = join(dir, "config.json");
 const mode = (path) => statSync(path).mode & 0o777;
@@ -25,10 +25,20 @@ test("an existing world-readable config is tightened when read", {
   skip: process.platform === "win32" && "Windows has no POSIX mode bits",
 }, () => {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(file, JSON.stringify({ polychatApiKey: "sk-old" }));
+  writeFileSync(file, JSON.stringify({ polychatApiKey: "sk-00000000000000000000000000000000" }));
   chmodSync(file, 0o644);
   chmodSync(dir, 0o755);
-  assert.equal(getPolychatApiKey(), "sk-old");
+  assert.equal(getPolychatApiKey(), "sk-00000000000000000000000000000000");
   assert.equal(mode(dir), 0o700);
   assert.equal(mode(file), 0o600);
+});
+
+test("legacy config values outside the account key format cannot be used as credentials", () => {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, JSON.stringify({
+    polychatApiKey: "review files", stagingPolychatApiKey: "unknown", localPolychatApiKey: "sk-short",
+  }));
+  for (const read of [getPolychatApiKey, getStagingPolychatApiKey, getLocalPolychatApiKey]) {
+    assert.equal(read(), undefined);
+  }
 });

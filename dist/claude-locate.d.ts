@@ -1,7 +1,7 @@
 /**
  * Finding Claude Code to launch, however it was installed.
  *
- * ccc launches `claude` through cross-spawn, which finds it on PATH (with
+ * ccc locates `claude` on PATH (with
  * PATHEXT on Windows, so npm's `claude.cmd` shim and the native `claude.exe`
  * both run). What it cannot do is find a Claude Code that is installed but not
  * on this terminal's PATH. On Windows that is the common case: the native
@@ -22,7 +22,7 @@ export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
 export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
 export interface ClaudeLocation {
-    /** What to spawn: `claude` when it is on PATH, else its absolute path. */
+    /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
     command: string;
     source: ClaudeSource;
     /** Not on PATH: its directory, to put on the child's PATH. */
@@ -73,8 +73,14 @@ export declare function cwdHintText(cwd: string, opts?: {
     env?: NodeJS.ProcessEnv;
     homedir?: string;
 }): string | null;
+/** Resolve a helper without an implicit working-directory or relative PATH lookup. */
+export declare function findPathExecutable(filename: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, cwd: string, isExecutable?: (file: string) => boolean): string | undefined;
+/** cmd must not look up a shim's tools in the project, implicitly or via PATH. */
+export declare function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv;
 /** `%USERPROFILE%\.local\bin` → its value; unknown names stay as written. */
 export declare function expandWindowsVars(value: string, env: NodeJS.ProcessEnv): string;
 /** The Path values in `reg query` output (REG_SZ or REG_EXPAND_SZ). */
 export declare function parseRegQueryPath(output: string): string | null;
+/** System tools always use a drive-qualified or UNC System32 directory. */
+export declare function system32Path(env: NodeJS.ProcessEnv, ...parts: string[]): string;
 //# sourceMappingURL=claude-locate.d.ts.map

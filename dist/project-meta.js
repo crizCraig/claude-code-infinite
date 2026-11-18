@@ -9,8 +9,10 @@
  * optional: outside a git repository, with git missing, or when a command is
  * slow, the part is simply left out. Never throws.
  */
+import { executablePath } from "./executable-path.js";
 import { execFile } from "node:child_process";
 import path from "node:path";
+import { findPathExecutable } from "./claude-locate.js";
 /** What the server keeps: short printable ASCII (client_session.py). */
 const META_VALUE = /^[\x20-\x7e]{1,128}$/;
 const GIT_TIMEOUT_MS = 1_500;
@@ -70,7 +72,13 @@ export function repoNameFromRemote(remote) {
 function runGit(args, cwd) {
     return new Promise((resolve) => {
         try {
-            execFile("git", args, { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true }, (err, stdout) => resolve(err ? undefined : String(stdout).trim() || undefined));
+            const git = process.platform === "win32"
+                ? findPathExecutable("git.exe", "win32", process.env, cwd) : "git";
+            if (!git) {
+                resolve(undefined);
+                return;
+            }
+            execFile(executablePath(git), args, { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true }, (err, stdout) => resolve(err ? undefined : String(stdout).trim() || undefined));
         }
         catch {
             resolve(undefined);

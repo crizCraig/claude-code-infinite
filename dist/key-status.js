@@ -13,7 +13,7 @@ import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
 import { parsePaymentStatus } from "./payment-gate.js";
 import { PAYMENT_CONTINUES_LINE } from "./payment-notice.js";
 import { recordError } from "./diagnostics.js";
-import { isKeyRejected } from "./key-page.js";
+import { isKeyRejected, isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 export { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, isKeyRejected, keyPageUrl } from "./key-page.js";
 export const KEY_INVALID_TEXT = "Your MemTree key isn't valid (revoked or mistyped)";
 export const KEY_GATE_PROMPT = "[Enter] paste a new key   [c] use claude without MemTree   [q] quit: ";
@@ -26,6 +26,8 @@ const DEFAULT_TIMEOUT_MS = 2000;
  * other status, a network error, a timeout or an unexpected body → null.
  */
 export async function fetchKeyStatus(baseUrl, apiKey, options = {}) {
+    if (!isMemtreeKey(apiKey))
+        return "invalid";
     const { diagnostics } = options;
     try {
         const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/context_memory/status`, {
@@ -78,9 +80,11 @@ export async function runKeyGate(deps) {
         if (!opened)
             deps.open(deps.keyPageUrl);
         opened = true;
-        const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
-        if (!apiKey)
+        const apiKey = await deps.ask(KEY_PASTE_PROMPT);
+        if (!isMemtreeKey(apiKey)) {
+            headline = KEY_FORMAT_HINT;
             continue;
+        }
         const check = await deps.check(apiKey);
         if (check === "invalid") {
             headline = `⚠ ${KEY_STILL_INVALID} Get a new one at ${deps.keyPageUrl}`;

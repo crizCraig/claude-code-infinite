@@ -1,7 +1,7 @@
 /**
  * Finding Claude Code to launch, however it was installed.
  *
- * ccc launches `claude` through cross-spawn, which finds it on PATH (with
+ * ccc locates `claude` on PATH (with
  * PATHEXT on Windows, so npm's `claude.cmd` shim and the native `claude.exe`
  * both run). What it cannot do is find a Claude Code that is installed but not
  * on this terminal's PATH. On Windows that is the common case: the native
@@ -31,7 +31,7 @@ export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"] as const;
 
 export interface ClaudeLocation {
-  /** What to spawn: `claude` when it is on PATH, else its absolute path. */
+  /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
   command: string;
   source: ClaudeSource;
   /** Not on PATH: its directory, to put on the child's PATH. */
@@ -234,9 +234,8 @@ function isDesktopAppExe(file: string, platform: NodeJS.Platform): boolean {
 }
 
 /**
- * `claude` on PATH, skipping the desktop app's exe. Spawned by name when it is
- * the first `claude` on PATH (as before); by full path when the desktop app's
- * comes first, since spawning by name would start the app.
+ * Skip the desktop app. On Windows, launch the resolved CLI by absolute
+ * path so spawning cannot repeat the search from the project directory.
  */
 function locateOnPath(
   dirs: string[],
@@ -249,7 +248,7 @@ function locateOnPath(
     const file = findOnPath("claude", [dir], platform, env, isExecutable);
     if (!file) continue;
     if (isDesktopAppExe(file, platform)) { skipped = true; continue; }
-    if (!skipped) return { command: "claude", source: "path" };
+    if (!skipped) return { command: platform === "win32" ? file : "claude", source: "path" };
     return { command: file, source: "path", dir: pathFor(platform).dirname(file) };
   }
   return null;
@@ -278,16 +277,51 @@ function findOnPath(
 ): string | null {
   const p = pathFor(platform);
   const exts = platform === "win32"
-    ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";").filter(ext => /^\.(com|exe|bat|cmd)$/i.test(ext))
     : [""];
   for (const dir of dirs) {
-    if (!dir) continue;
+    if (!dir || (platform === "win32" && !isWindowsSearchDir(dir, process.cwd()))) continue;
     for (const ext of exts) {
       const file = p.join(dir, name + ext.toLowerCase());
       if (isExecutable(file)) return file;
     }
   }
   return null;
+}
+
+// A drive-relative or root-relative Windows path still depends on cwd.
+function isWindowsSearchDir(dir: string, cwd: string): boolean {
+  const root = path.win32.parse(dir).root;
+  return root.length > 1 && path.win32.isAbsolute(dir) && path.win32.relative(cwd, dir) !== "";
+}
+
+/** Resolve a helper without an implicit working-directory or relative PATH lookup. */
+export function findPathExecutable(
+  filename: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, cwd: string,
+  isExecutable = defaultIsExecutable(platform),
+): string | undefined {
+  const p = pathFor(platform);
+  for (const dir of pathDirs(env, platform)) {
+    const usable = platform === "win32" ? isWindowsSearchDir(dir, cwd) :
+      p.isAbsolute(dir) && p.relative(cwd, dir) !== "";
+    if (!usable) continue;
+    const file = p.join(dir, filename);
+    if (isExecutable(file)) return file;
+  }
+  return undefined;
+}
+
+/** cmd must not look up a shim's tools in the project, implicitly or via PATH. */
+export function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
+  const key = pathKey(env, "win32");
+  const rest = Object.fromEntries(Object.entries(env).filter(([name]) =>
+    !["PATH", "COMSPEC", "NODEFAULTCURRENTDIRECTORYINEXEPATH"].includes(name.toUpperCase())));
+  return {
+    ...rest,
+    [key]: pathDirs(env, "win32").filter(dir => isWindowsSearchDir(dir, cwd)).join(";"),
+    NoDefaultCurrentDirectoryInExePath: "1",
+    ComSpec: system32Path(env, "cmd.exe"),
+  };
 }
 
 function pathDirs(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
@@ -323,10 +357,14 @@ export function parseRegQueryPath(output: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-function readRegistryPath(env: NodeJS.ProcessEnv): string[] {
-  // By full path: PATH is what may be broken here.
+/** System tools always use a drive-qualified or UNC System32 directory. */
+export function system32Path(env: NodeJS.ProcessEnv, ...parts: string[]): string {
   const root = envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows";
-  const reg = path.win32.join(root, "System32", "reg.exe");
+  const absolute = path.win32.isAbsolute(root) && path.win32.parse(root).root.length > 1;
+  return path.win32.join(absolute ? root : "C:\\Windows", "System32", ...parts);
+}
+
+function readRegistryPath(env: NodeJS.ProcessEnv): string[] {
   const keys = [
     "HKCU\\Environment",
     "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
@@ -334,7 +372,7 @@ function readRegistryPath(env: NodeJS.ProcessEnv): string[] {
   const out: string[] = [];
   for (const key of keys) {
     try {
-      const result = spawnSync(reg, ["query", key, "/v", "Path"], {
+      const result = spawnSync(system32Path(env, "reg.exe"), ["query", key, "/v", "Path"], {
         encoding: "utf8", timeout: 2000, windowsHide: true,
       });
       const value = result.status === 0 ? parseRegQueryPath(result.stdout ?? "") : null;

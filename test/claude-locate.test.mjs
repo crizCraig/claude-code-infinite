@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import crossSpawn from "cross-spawn";
+import { spawnClaudeSync } from "../dist/claude-process.js";
 import {
   CLAUDE_FOUND,
   CLAUDE_SOURCES,
@@ -18,6 +18,7 @@ import {
   locateClaude,
   parseRegQueryPath,
   withClaudeOnPath,
+  findPathExecutable,
 } from "../dist/claude-locate.js";
 import { CLAUDE_FOUND as SCHEMA_FOUND, sanitizeContext } from "../dist/diagnostics-schema.js";
 
@@ -45,19 +46,28 @@ function locateWin(files, extra = {}) {
   });
 }
 
-test("on PATH: spawned by name, as before (claude.cmd or claude.exe both count)", () => {
+test("Windows on PATH: spawn the resolved program, never a bare name", () => {
   const shim = "C:\\Program Files\\nodejs\\claude.cmd";
-  assert.deepEqual(locateWin([shim]), { command: "claude", source: "path" });
-  // A later desktop exe on PATH changes nothing: the first claude is still spawned by name.
+  assert.deepEqual(locateWin([shim]), { command: shim, source: "path" });
+  assert.equal(locateWin(["claude.exe", shim], { env: { ...WIN_ENV, Path: ".;" + WIN_ENV.Path } }).command, shim);
+  // A later desktop exe on PATH changes nothing: the first resolved CLI still wins.
   const desktopLater = locateClaude({
     platform: "win32", env: { ...WIN_ENV, Path: `${WIN_ENV.Path};C:\\Users\\ada\\AppData\\Local\\AnthropicClaude` },
     homedir: "C:\\Users\\ada", registryPath: () => [], listDir: () => [],
     isExecutable: fakeFs([shim, "C:\\Users\\ada\\AppData\\Local\\AnthropicClaude\\claude.exe"], "win32"),
   });
-  assert.deepEqual(desktopLater, { command: "claude", source: "path" });
-  assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "claude", source: "path" });
+  assert.deepEqual(desktopLater, { command: shim, source: "path" });
+  assert.deepEqual(locateWin(["C:\\Windows\\system32\\CLAUDE.EXE"]), { command: "C:\\Windows\\system32\\claude.exe", source: "path" });
   // An extensionless `claude` (npm's script for Git Bash) is not something cmd can run.
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
+});
+
+test("Windows project metadata resolves git.exe outside the project", () => {
+  const env = { Path: ".;C:tools;\\tools;C:\\project;C:\\Git\\cmd" };
+  const checked = [];
+  const result = findPathExecutable("git.exe", "win32", env, "c:\\project", file => { checked.push(file); return true; });
+  assert.deepEqual(checked, ["C:\\Git\\cmd\\git.exe"]);
+  assert.equal(result, checked[0]);
 });
 
 test("Windows: the native installer's claude.exe off PATH is found and its folder added", () => {
@@ -207,7 +217,7 @@ test("desktop app only: one message naming the app and the terminal install", ()
 });
 
 // ---------------------------------------------------------------------------
-// Real launches (Windows): what cross-spawn runs for each install shape
+// Real launches (Windows): the production launcher for each install shape
 // ---------------------------------------------------------------------------
 
 function tmpdir() {
@@ -217,7 +227,7 @@ function tmpdir() {
 /** Run what locate found the way ccc does, with args that cmd.exe would mangle unescaped. */
 function launch(location, env, outFile) {
   const args = ["--plugin-dir", "C:\\a dir\\x", "say \"hi\" & echo pwned", "100%"];
-  const result = crossSpawn.sync(location.command, args, {
+  const result = spawnClaudeSync(location.command, args, {
     env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: outFile }, encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stderr}`);
@@ -241,7 +251,7 @@ test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   const env = { ...process.env, Path: `${npmDir};${process.env.Path ?? process.env.PATH}` };
   delete env.PATH;
   const location = locateClaude({ env, registryPath: () => [] });
-  assert.deepEqual(location, { command: "claude", source: "path" });
+  assert.deepEqual(location, { command: path.join(npmDir, "claude.cmd"), source: "path" });
   const { args, got } = launch(location, env, path.join(dir, "out.json"));
   assert.deepEqual(got, args);
 });
@@ -264,7 +274,7 @@ test("Windows: the native claude.exe in %USERPROFILE%\\.local\\bin, not on PATH,
   assert.equal(location.command.toLowerCase(), exe.toLowerCase());
   const out = path.join(profile, "out.json");
   const record = RECORD_ARGS.replace("slice(2)", "slice(1)"); // `node -e`: no script path
-  const result = crossSpawn.sync(location.command, ["-e", record, "--", "a b", "c&d"], {
+  const result = spawnClaudeSync(location.command, ["-e", record, "--", "a b", "c&d"], {
     env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: out }, encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
@@ -300,4 +310,21 @@ test("Windows: only the desktop app's claude.exe (on PATH, real files): not laun
   assert.equal(claudeDesktopInstalled({
     env: { ...env, LOCALAPPDATA: path.join(profile, "none") }, homedir: profile,
   }), false);
+});
+
+test("Windows batch shims use System32 cmd directly and preserve cross-spawn argument escaping", async () => {
+  const { claudeInvocation } = await import("../dist/claude-process.js");
+  const { default: escape } = await import("cross-spawn/lib/util/escape.js");
+  const file = "C:\\Tools With Spaces\\node_modules\\.bin\\claude.cmd";
+  const args = ["--resume", "a & b", 'say "hello"'];
+  const env = { SystemRoot: "D:\\Windows", ComSpec: "cmd", Path: ".;C:\\project;C:\\Tools" };
+  const job = claudeInvocation(file, args, env, "win32", "C:\\project");
+  assert.equal(job.command, "D:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(job.args, ["/d", "/s", "/c", '"' +
+    [escape.command(file), ...args.map(a => escape.argument(a, true))].join(" ") + '"']);
+  assert.equal(job.options.windowsVerbatimArguments, true);
+  assert.equal(job.options.env.Path, "C:\\Tools");
+  assert.equal(job.options.env.NoDefaultCurrentDirectoryInExePath, "1");
+  assert.equal(claudeInvocation("C:\\Tools\\claude.exe", args, env, "win32").command, "C:\\Tools\\claude.exe");
+  assert.throws(() => claudeInvocation("claude.cmd", args, env, "win32"));
 });

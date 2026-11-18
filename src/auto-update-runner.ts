@@ -36,6 +36,9 @@
  * reached by a live runner.
  */
 
+import { executablePath } from "./executable-path.js";
+import { system32Path } from "./claude-locate.js";
+
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
   npm: string;
@@ -63,11 +66,14 @@ export interface RunnerConfig {
   pipeGraceMs?: number;
 }
 
+// The detached runner cannot import from the installation it replaces. Embed
+// the same executable check; its only module dependency is node:path below.
 export const RUNNER_SOURCE = String.raw`"use strict";
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const executablePath = ${executablePath.toString()};
 
 const VERSION_RE = /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/;
 const ROOT_TIMEOUT_MS = 60000;
@@ -120,8 +126,8 @@ function groupAlive(pgid) {
 function signalGroup(pgid, signal) {
   if (IS_WINDOWS) {
     try {
-      const taskkill = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
-      require("node:child_process").spawnSync(taskkill, ["/PID", String(pgid), "/T", "/F"], {
+      const taskkill = ${JSON.stringify(system32Path(process.env, "taskkill.exe"))};
+      require("node:child_process").spawnSync(executablePath(taskkill), ["/PID", String(pgid), "/T", "/F"], {
         stdio: "ignore", windowsHide: true, timeout: 10000,
       });
     } catch {}
@@ -233,7 +239,7 @@ function run(command, args, timeoutMs, capture) {
       return;
     }
     try {
-      child = spawn(command, args, {
+      child = spawn(executablePath(command), args, {
         cwd: os.homedir(),
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
