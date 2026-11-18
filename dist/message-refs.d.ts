@@ -15,6 +15,9 @@ export declare const MAX_NAMED_CHARS_KEY = "max_named_chars";
 export declare function namedCharsFor(serverChars: number): number;
 /** The default: 30 MiB, under the old 32 MiB rebuild cap. */
 export declare const MAX_NAMED_CHARS: number;
+/** Base64 image characters the named messages may hold: the server resolves served images
+ *  within its own 64 MiB (polychat MAX_RESOLVED_CHARS), whatever the text cap. */
+export declare const MAX_NAMED_IMAGE_CHARS: number;
 /** A message's ref as the server hashes it. `marks`: [path, position, value]. */
 export interface Ref {
     digest: string;
@@ -27,6 +30,8 @@ export interface Ref {
 export interface Delta {
     messages: Message[];
     refs: string[];
+    /** The named messages' JSON length: what the server rebuilds beyond the body. */
+    namedChars?: number;
 }
 export declare class MessageRefs {
     readonly enabled: boolean;
@@ -64,9 +69,11 @@ export declare class MessageRefs {
      * images the refs brought back only resends.
      */
     noteRefusal(sessionId: string | undefined, messages: Message[], refs: readonly string[], status: number, bodyText: string): boolean;
-    /** A server's cap from an answer: any whole number at least the old one (a server never
-     *  allows less; anything else is ignored). */
-    private noteCap;
+    /** The server's cap from any answer that carries the field (whatever its lane, trimmed
+     *  bodies included: the cap is the server's, not a conversation's). */
+    noteServerCap(json: unknown): void;
+    /** A text-cap 400: the cap it names (a newer server), else the default (an older one). */
+    private noteRefusedCap;
     /** The conversation `messages` belong to, while refs may be named for it. */
     private laneFor;
     /**

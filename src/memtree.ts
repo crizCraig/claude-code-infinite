@@ -2047,10 +2047,11 @@ export class MemtreeClient {
     } = {};
     const controller = new AbortController();
     const abort = () => controller.abort();
-    // A default compress budget grows with what it uploads; an index call's,
-    // and any budget a caller set, is fixed.
+    // A default compress budget grows with what it uploads and what its refs name (the
+    // server reads and rebuilds those); an index call's, and any budget a caller set, is fixed.
     const timeoutMs = opts.scaleTimeout && !opts.indexOnly
-      ? scaledTimeout(opts.timeoutMs, Buffer.byteLength(payload, "utf-8"),
+      ? scaledTimeout(opts.timeoutMs,
+        Buffer.byteLength(payload, "utf-8") + (delta.namedChars ?? 0),
         this.compressTimeoutMsPerKiB)
       : opts.timeoutMs;
     const timeout = setTimeout(abort, timeoutMs);
@@ -2131,8 +2132,10 @@ export class MemtreeClient {
         throw new Error("context_memory answer does not show it resolves image references");
       }
       this.imageRefs.noteAnswer(json);
-      // A trimmed body stored other messages than these: nothing is acked from it.
-      if (planned.limit?.action !== "trimmed") {
+      // A trimmed body stored other messages than these: nothing is acked from it (the
+      // server's cap still holds).
+      if (planned.limit?.action === "trimmed") this.messageRefs.noteServerCap(json);
+      else {
         this.messageRefs.noteAnswer(opts.sessionId, messages, json,
           { finalIndex: opts.finalIndex === true, sentRefs: delta.refs.length });
       }

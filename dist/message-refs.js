@@ -53,6 +53,9 @@ export function namedCharsFor(serverChars) {
 }
 /** The default: 30 MiB, under the old 32 MiB rebuild cap. */
 export const MAX_NAMED_CHARS = namedCharsFor(DEFAULT_SERVER_NAMED_CHARS);
+/** Base64 image characters the named messages may hold: the server resolves served images
+ *  within its own 64 MiB (polychat MAX_RESOLVED_CHARS), whatever the text cap. */
+export const MAX_NAMED_IMAGE_CHARS = 60 * MIB;
 /** A character both JS trim and Python strip keep (Python also strips \x1c-\x1f, \x85). */
 const SUBSTANCE_RE = /[^\s\x1c-\x1f\x85]/;
 export class MessageRefs {
@@ -93,6 +96,7 @@ export class MessageRefs {
      * `finalIndex`: the early answer to an exit index, which never carries the field.
      */
     noteAnswer(sessionId, messages, json, opts = {}) {
+        this.noteServerCap(json);
         const lane = this.laneFor(sessionId, messages);
         if (!lane)
             return;
@@ -106,7 +110,6 @@ export class MessageRefs {
         if (opts.sentRefs)
             this.allMissing.delete(lane);
         const acks = field;
-        this.noteCap(acks?.[MAX_NAMED_CHARS_KEY]);
         if (!acks || acks.stored !== true || acks.messages !== messages.length)
             return;
         this.remember(lane, ackedDigests(messages, acks, this.acked.get(lane)));
@@ -120,10 +123,11 @@ export class MessageRefs {
     noteRefusal(sessionId, messages, refs, status, bodyText) {
         if (refs.length === 0)
             return false;
-        // Over a size cap (stored text or the images the refs bring back): this call only, and
-        // the default cap until an answer says the server's again (it may have been lowered).
+        // Over a size cap (stored text or the images the refs bring back): this call only. Past
+        // the text cap, the cap the refusal names (it may have been lowered), else the default.
         if (status === 400 && /expand past/i.test(bodyText)) {
-            this.namedChars = MAX_NAMED_CHARS;
+            if (/message refs expand past/i.test(bodyText))
+                this.noteRefusedCap(bodyText);
             return true;
         }
         if (status === 400 && /message refs/i.test(bodyText)) {
@@ -140,14 +144,24 @@ export class MessageRefs {
             this.noteMissing(lane, refs, missing);
         return true;
     }
-    /** A server's cap from an answer: any whole number at least the old one (a server never
-     *  allows less; anything else is ignored). */
-    noteCap(value) {
-        if (typeof value !== "number" || !Number.isSafeInteger(value))
-            return;
-        if (value < DEFAULT_SERVER_NAMED_CHARS)
-            return;
-        this.namedChars = namedCharsFor(value);
+    /** The server's cap from any answer that carries the field (whatever its lane, trimmed
+     *  bodies included: the cap is the server's, not a conversation's). */
+    noteServerCap(json) {
+        const field = json?.[STORED_MESSAGES_FIELD];
+        const cap = capOf(field?.[MAX_NAMED_CHARS_KEY]);
+        if (cap !== undefined)
+            this.namedChars = namedCharsFor(cap);
+    }
+    /** A text-cap 400: the cap it names (a newer server), else the default (an older one). */
+    noteRefusedCap(bodyText) {
+        let cap;
+        try {
+            cap = capOf(JSON.parse(bodyText)?.detail?.[MAX_NAMED_CHARS_KEY]);
+        }
+        catch {
+            // Not JSON: an older server's text.
+        }
+        this.namedChars = cap === undefined ? MAX_NAMED_CHARS : namedCharsFor(cap);
     }
     /** The conversation `messages` belong to, while refs may be named for it. */
     laneFor(sessionId, messages) {
@@ -225,6 +239,7 @@ export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
     let headerSeen = false;
     let marks = 0;
     let chars = 0;
+    let imageChars = 0;
     const refs = [];
     const out = messages.map((message, index) => {
         const eligible = (index > opening || isSkipped(message)) && refs.length < MAX_REFS;
@@ -237,12 +252,16 @@ export function buildDelta(messages, acked, maxChars = MAX_NAMED_CHARS) {
         // A short message is smaller than its ref: sent as it is.
         if (JSON.stringify(named).length >= ref.chars)
             return message;
+        const images = imageCharsOf(message);
+        if (imageChars + images > MAX_NAMED_IMAGE_CHARS)
+            return message;
         marks += ref.marks.length;
         chars += ref.chars;
+        imageChars += images;
         refs.push(ref.digest);
         return named;
     });
-    return refs.length ? { messages: out, refs } : { messages, refs: [] };
+    return refs.length ? { messages: out, refs, namedChars: chars } : { messages, refs: [] };
 }
 /**
  * A message's ref as the server's store hashes it: sha256 of the compact JSON of the
@@ -403,6 +422,24 @@ function imageShas(value, out = []) {
             imageShas(item, out);
     }
     return out;
+}
+/** A cap a server named: a whole number no lower than the old one (anything else: none). */
+function capOf(value) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value))
+        return undefined;
+    return value >= DEFAULT_SERVER_NAMED_CHARS ? value : undefined;
+}
+/** Base64 characters of the message's images (what the server resolves when it is named). */
+function imageCharsOf(value) {
+    if (Array.isArray(value))
+        return value.reduce((n, item) => n + imageCharsOf(item), 0);
+    if (!value || typeof value !== "object")
+        return 0;
+    const block = value;
+    const data = block.type === "image" ? block.source?.data : undefined;
+    if (block.source?.type === "base64" && typeof data === "string")
+        return data.length;
+    return Object.values(block).reduce((n, item) => n + imageCharsOf(item), 0);
 }
 function stringsOf(value) {
     return Array.isArray(value) ? value.filter((v) => typeof v === "string") : [];

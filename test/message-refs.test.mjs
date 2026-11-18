@@ -102,12 +102,33 @@ test("a conversation past 30 MiB names more once the server says its cap is high
   }
   assert.equal(namedCharsFor(4096 * MIB), 256 * MIB, "never past the client's own ceiling");
   const sent = refs.delta("s", big).refs;
+  assert.equal(refs.delta("s", big).namedChars > 30 * MIB, true, "named chars reported");
+  assert.ok(refs.noteRefusal("s", big, sent, 400,
+    '{"detail":"Image references expand past the request size limit."}'), "resend");
+  assert.equal(refs.maxNamedChars, 120 * MIB, "an image-cap 400 leaves the text cap alone");
+  assert.ok(refs.noteRefusal("s", big, sent, 400, JSON.stringify({ detail: {
+    message: "Message refs expand past the request size limit.",
+    [MAX_NAMED_CHARS_KEY]: 64 * MIB } })), "resend");
+  assert.equal(refs.maxNamedChars, 60 * MIB, "the cap a newer server's refusal names");
   assert.ok(refs.noteRefusal("s", big, sent, 400,
     '{"detail":"Message refs expand past the request size limit."}'), "resend");
-  assert.equal(refs.maxNamedChars, MAX_NAMED_CHARS, "back to the default until told again");
-  refs.noteAnswer("s", big, { [STORED_MESSAGES_FIELD]: { stored: false,
+  assert.equal(refs.maxNamedChars, MAX_NAMED_CHARS, "an older server's refusal: the default");
+  refs.noteServerCap({ [STORED_MESSAGES_FIELD]: { stored: false,
     [MAX_NAMED_CHARS_KEY]: 64 * MIB } });
-  assert.equal(refs.maxNamedChars, 60 * MIB, "a not-stored answer still says the cap");
+  assert.equal(refs.maxNamedChars, 60 * MIB, "any answer says the cap (a trimmed one too)");
+  refs.noteAnswer(undefined, big, acks({ [MAX_NAMED_CHARS_KEY]: 128 * MIB }));
+  assert.equal(refs.maxNamedChars, 120 * MIB, "with no session too");
+});
+
+test("named images stay within the server's 64 MiB for served images", () => {
+  const MIB = 1024 * 1024;
+  const shot = (i) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: `t${i}`,
+    content: [{ type: "image", source: { type: "base64", media_type: "image/png",
+      data: "A".repeat(10 * MIB) } }] }] });
+  const shots = [{ role: "user", content: "start" }];
+  for (let i = 0; i < 9; i++) shots.push(shot(i));
+  const delta = buildDelta(shots, new Set(shots.map((m) => refFor(m).digest)), 120 * MIB);
+  assert.equal(delta.refs.length, 6, "60 MiB of images named, the rest inline");
 });
 
 test("only the request's first billing header is split", () => {
