@@ -34,8 +34,8 @@ export interface LocateClaudeOptions {
     homedir?: string;
     /** True when `file` exists and can be run. */
     isExecutable?: (file: string) => boolean;
-    /** The adjacent Claude npm package manifest for a Windows shim. */
-    readManifest?: (file: string) => string;
+    /** Read the Windows shim and its adjacent Claude package manifest. */
+    readFile?: (file: string) => string;
     /** Windows: the user's and the machine's PATH from the registry. */
     registryPath?: () => string[];
     /** Directory entries (winget's package folders); [] when unreadable. */
@@ -48,7 +48,7 @@ export interface DesktopAppOptions {
     /** True when the path exists (file or folder). */
     exists?: (file: string) => boolean;
 }
-export declare function claudeNpmBin(command: string, readManifest?: (file: string) => string): string | undefined;
+export declare function claudeNpmBin(command: string, readFile?: (file: string) => string): string | undefined;
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export declare function locateClaude(opts?: LocateClaudeOptions): ClaudeLocation | null;
 /** The child's environment with `location.dir` first on PATH, when it was not on PATH. */

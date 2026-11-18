@@ -2,7 +2,7 @@
 // launch of the shapes Windows installs leave behind: npm's claude.cmd shim on
 // PATH and the native installer's claude.exe in %USERPROFILE%\.local\bin.
 import test from "node:test";
-import { installNpmClaude } from "./fixtures/npm-claude.mjs";
+import { installNpmClaude, npmShimText } from "./fixtures/npm-claude.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -44,10 +44,15 @@ function npmShimFiles(shim) {
   return [shim, W.join(W.dirname(shim), "node_modules", "@anthropic-ai", "claude-code", "cli.js")];
 }
 
+const globalTarget = W.join("node_modules", "@anthropic-ai", "claude-code", "cli.js");
+function readNpmFile(file) {
+  return file.endsWith(".cmd") ? npmShimText(globalTarget) : JSON.stringify({ bin: { claude: "./cli.js" } });
+}
+
 function locateWin(files, extra = {}) {
   return locateClaude({
     platform: "win32", env: WIN_ENV, homedir: "C:\\Users\\ada",
-    readManifest: () => JSON.stringify({ bin: { claude: "./cli.js" } }),
+    readFile: readNpmFile,
     isExecutable: fakeFs(files, "win32"), registryPath: () => [], listDir: () => [], ...extra,
   });
 }
@@ -67,7 +72,8 @@ test("Windows on PATH: spawn the resolved program, never a bare name", () => {
   assert.equal(locateWin(["C:\\Program Files\\nodejs\\claude"]), null);
 });
 
-function missingManifest() {
+function standaloneFile(file) {
+  if (/\.(cmd|bat)$/i.test(file)) return '@node "%~dp0record.cjs" %*\r\n';
   throw Object.assign(new Error("missing package.json"), { code: "ENOENT" });
 }
 
@@ -78,7 +84,7 @@ test("Windows: standalone wrappers are found on PATH without an npm manifest", (
     const later = "C:\\native\\claude.exe";
     const env = { ...WIN_ENV, Path: `.;${dir};${W.dirname(later)}` };
     for (const files of [[wrapper], [wrapper, later]]) {
-      assert.deepEqual(locateWin(files, { env, readManifest: missingManifest }),
+      assert.deepEqual(locateWin(files, { env, readFile: standaloneFile }),
         { command: wrapper, source: "path" });
     }
   }
@@ -90,12 +96,51 @@ test("Windows: standalone wrappers use System32 cmd and exclude the child cwd fr
     NODEFAULTCURRENTDIRECTORYINEXEPATH: "0", CLAUDE_CONFIG_DIR: "D:\\config" };
   for (const ext of [".cmd", ".bat"]) {
     const wrapper = W.join("D:\\bin", "claude" + ext);
-    const job = claudeInvocation(wrapper, ["--resume", "a & b"], "win32", missingManifest, { env, cwd });
+    const job = claudeInvocation(wrapper, ["--resume", "a & b"], "win32", standaloneFile, { env, cwd });
     assert.equal(job.command, "D:\\Windows\\System32\\cmd.exe");
-    assert.deepEqual(job.args, ["/d", "/s", "/c", `"${wrapper} ^"--resume^" ^"a^ ^&^ b^""`]);
+    assert.deepEqual(job.args, ["/d", "/s", "/c", `"${wrapper} ^^^"--resume^^^" ^^^"a^^^ ^^^&^^^ b^^^""`]);
     assert.equal(job.options.windowsVerbatimArguments, true);
     assert.deepEqual(job.options.env, { SystemRoot: env.SystemRoot, ComSpec: job.command,
       Path: "D:\\bin", NoDefaultCurrentDirectoryInExePath: "1", CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR });
+  }
+});
+
+const batchArgs = ['a"&echo pwned', '5" > out', "%PATH%", "^", '{"prompt":"say hello"}'];
+const escapedBatchArgs = [
+  String.raw`^^^"a\^^^"^^^&echo^^^ pwned^^^"`,
+  String.raw`^^^"5\^^^"^^^ ^^^>^^^ out^^^"`,
+  '^^^"^^^%PATH^^^%^^^"',
+  '^^^"^^^^^^^"',
+  String.raw`^^^"{\^^^"prompt\^^^":\^^^"say^^^ hello\^^^"}^^^"`,
+];
+
+test("Windows: every batch wrapper double-escapes forwarded arguments", () => {
+  for (const dir of [String.raw`D:\pnpm`, String.raw`D:\Yarn\bin`, String.raw`D:\project\node_modules\.bin`]) {
+    for (const ext of [".cmd", ".bat"]) {
+      const wrapper = W.join(dir, "claude" + ext);
+      const job = claudeInvocation(wrapper, batchArgs, "win32", standaloneFile);
+      assert.deepEqual(job.args, ["/d", "/s", "/c", `"${wrapper} ${escapedBatchArgs.join(" ")}"`]);
+    }
+  }
+});
+
+test("Windows: a neighboring npm package cannot replace a custom wrapper", () => {
+  const dir = String.raw`D:\npm`;
+  const shim = W.join(dir, "claude.cmd");
+  const stock = npmShimText(globalTarget);
+  for (const [wrapper, body] of [
+    [W.join(dir, "claude.bat"), stock],
+    [shim, '@node "%~dp0custom.cjs" %*'],
+    [shim, stock.replace("SETLOCAL", "SETLOCAL\r\nSET WRAPPER_ACTIVE=1")],
+    [shim, stock.replace("%*", "--custom %*")],
+    [shim, stock + "@echo finished\r\n"],
+    [shim, npmShimText(globalTarget.replace("cli.js", "other.js"))],
+  ]) {
+    const readFile = file => file === wrapper ? body : readNpmFile(file);
+    const env = { ...WIN_ENV, Path: dir };
+    const location = locateWin([wrapper, W.join(dir, globalTarget)], { env, readFile });
+    assert.equal(location?.command, wrapper);
+    assert.equal(claudeInvocation(location.command, [], "win32", readFile, { env }).args[3], `"${wrapper}"`);
   }
 });
 
@@ -103,18 +148,16 @@ test("Windows: a broken Claude shim cannot hide a runnable native CLI", () => {
   const wrapper = "C:\\wrappers";
   const native = "D:\\native";
   const bin = W.join(wrapper, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
-  for (const ext of [".cmd", ".bat"]) {
-    const shim = W.join(wrapper, "claude" + ext);
-    for (const dir of [wrapper, native]) {
-      const exe = W.join(dir, "claude.exe");
-      const env = { ...WIN_ENV, Path: wrapper + ";" + native, PATHEXT: ".CMD;.BAT;.EXE" };
-      for (const [manifest, files] of [
-        ["{", []], ['{"bin":{"claude":"cli.js"}}', []],
-        ['{"bin":"../outside.js"}', [W.resolve(W.dirname(bin), "../outside.js")]],
-      ]) {
-        const found = locateWin([shim, exe, ...files], { env, readManifest: () => manifest });
-        assert.equal(found?.command, exe);
-      }
+  const shim = W.join(wrapper, "claude.cmd");
+  for (const dir of [wrapper, native]) {
+    const exe = W.join(dir, "claude.exe");
+    const env = { ...WIN_ENV, Path: wrapper + ";" + native, PATHEXT: ".CMD;.BAT;.EXE" };
+    for (const [manifest, files] of [
+      ["{", []], ['{"bin":{"claude":"cli.js"}}', []],
+      ['{"bin":"../outside.js"}', [W.resolve(W.dirname(bin), "../outside.js")]],
+    ]) {
+      const readFile = file => file === shim ? npmShimText(globalTarget) : manifest;
+      assert.equal(locateWin([shim, exe, ...files], { env, readFile })?.command, exe);
     }
   }
 });
@@ -306,7 +349,7 @@ test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   assert.deepEqual(got, args);
 });
 
-test("Windows: a standalone wrapper forwards arguments using node from PATH", {
+test("Windows: standalone .bat forwards literal argv through node on PATH without side effects", {
   skip: !isWindows && "Windows only",
 }, (t) => {
   const dir = tmpdir();
@@ -316,15 +359,25 @@ test("Windows: a standalone wrapper forwards arguments using node from PATH", {
   fs.mkdirSync(bin);
   fs.mkdirSync(cwd);
   fs.writeFileSync(path.join(bin, "claude.bat"), '@node "%~dp0record.cjs" %*\r\n');
-  fs.writeFileSync(path.join(bin, "record.cjs"), "const fs = require('node:fs'); " + RECORD_ARGS);
+  fs.writeFileSync(path.join(bin, "record.cjs"), "process.stdout.write(JSON.stringify(process.argv.slice(2)))");
+  // A real package beside the selected .bat must not divert the launch to npm's bin.
+  installNpmClaude(bin, "process.exit(43)");
+  fs.unlinkSync(path.join(bin, "claude.cmd"));
   fs.writeFileSync(path.join(cwd, "node.cmd"), "@exit /b 42\r\n");
   const env = { ...process.env, Path: [cwd, bin, path.dirname(process.execPath)].join(";"),
     PATHEXT: ".CMD;.BAT;.EXE" };
   delete env.PATH;
   const found = locateClaude({ env, registryPath: () => [] });
   assert.equal(found?.command, path.join(bin, "claude.bat"));
-  const { got, args } = launch(found, env, path.join(dir, "out.json"), cwd);
-  assert.deepEqual(got, args);
+  const options = { env, cwd, encoding: "utf8" };
+  const job = claudeInvocation(found.command, batchArgs, "win32", undefined, options);
+  assert.ok(job.args[3].endsWith(` ${escapedBatchArgs.join(" ")}"`));
+  const result = spawnClaudeSync(found.command, batchArgs, options);
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.equal(result.stdout, JSON.stringify(batchArgs));
+  assert.deepEqual(fs.readdirSync(cwd), ["node.cmd"]);
 });
 
 test("Windows: the native claude.exe in %USERPROFILE%\\.local\\bin, not on PATH, launches", {
@@ -390,6 +443,7 @@ test("Windows npm global and local shims launch the declared bin directly", () =
   for (const shim of [W.join(W.dirname(modules), "claude.cmd"), W.join(modules, ".bin", "claude.cmd")]) {
     for (const bin of ["./cli.js", "./bin/claude.exe"]) {
       const job = claudeInvocation(shim, args, "win32", file => {
+        if (file === shim) return npmShimText(W.relative(W.dirname(shim), W.join(pkg, bin)));
         assert.equal(file, W.join(pkg, "package.json"));
         return JSON.stringify({ bin: { claude: bin } });
       });

@@ -44,8 +44,8 @@ export interface LocateClaudeOptions {
   homedir?: string;
   /** True when `file` exists and can be run. */
   isExecutable?: (file: string) => boolean;
-  /** The adjacent Claude npm package manifest for a Windows shim. */
-  readManifest?: (file: string) => string;
+  /** Read the Windows shim and its adjacent Claude package manifest. */
+  readFile?: (file: string) => string;
   /** Windows: the user's and the machine's PATH from the registry. */
   registryPath?: () => string[];
   /** Directory entries (winget's package folders); [] when unreadable. */
@@ -60,18 +60,44 @@ export interface DesktopAppOptions {
   exists?: (file: string) => boolean;
 }
 
-export function claudeNpmBin(command: string, readManifest = (file: string) => fs.readFileSync(file, "utf8")): string | undefined {
-  if (!/\.(cmd|bat)$/i.test(command)) return undefined;
-  // npm places global shims in the prefix and local ones in node_modules/.bin.
-  // Its JS shim can invoke bare `node`, so resolve the package's bin without
-  // executing batch code or passing Claude's arguments through cmd.exe.
+// npm's cmd-shim emits these fixed lines for native bins and Node shebangs.
+// Match the entire shim so a wrapper's setup, extra arguments or cleanup still run.
+const npmShimHeader = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+`;
+const npmNodeLauncher = String.raw`IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  `;
+
+export function claudeNpmBin(command: string, readFile = (file: string) => fs.readFileSync(file, "utf8")): string | undefined {
+  if (!/\.cmd$/i.test(command)) return undefined; // npm only generates .cmd.
+  const shim = readFile(command).replace(/\r\n/g, "\n");
+  if (!shim.startsWith(npmShimHeader)) return undefined;
+  const body = shim.slice(npmShimHeader.length).trimStart();
+  const node = body.startsWith(npmNodeLauncher);
+  const invocation = node ? body.slice(npmNodeLauncher.length) : body;
+  const target = /^"%dp0%\\([^"%\r\n]+)" +%\*\n?$/.exec(invocation)?.[1];
+  if (!target || !(node ? /\.[cm]?js$/i : /\.exe$/i).test(target)) return undefined;
+
   const { win32 } = path;
   const dir = win32.dirname(command);
   const modules = /[\\/]node_modules[\\/]\.bin$/i.test(dir) ? win32.dirname(dir) : win32.join(dir, "node_modules");
   const pkg = win32.join(modules, "@anthropic-ai", "claude-code");
+  if (!target.toLowerCase().startsWith(win32.relative(dir, pkg).toLowerCase() + "\\")) return undefined;
   let manifest: string;
   try {
-    manifest = readManifest(win32.join(pkg, "package.json"));
+    manifest = readFile(win32.join(pkg, "package.json"));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return undefined; // Standalone batch wrapper.
@@ -86,7 +112,7 @@ export function claudeNpmBin(command: string, readManifest = (file: string) => f
   if (win32.parse(entry).root || win32.relative(pkg, file).split(win32.sep)[0] === "..") {
     throw new Error("Claude Code's npm executable must be inside its package.");
   }
-  return file;
+  return win32.relative(file, win32.resolve(dir, target)) === "" ? file : undefined;
 }
 
 /** Claude Code to launch, or null when it is not installed anywhere known. */
@@ -97,7 +123,7 @@ export function locateClaude(opts: LocateClaudeOptions = {}): ClaudeLocation | n
   const isRunnableClaude = (file: string) => {
     if (!isExecutable(file)) return false;
     try {
-      const bin = platform === "win32" ? claudeNpmBin(file, opts.readManifest) : undefined;
+      const bin = platform === "win32" ? claudeNpmBin(file, opts.readFile) : undefined;
       return !bin || isExecutable(bin);
     } catch {
       return false; // Broken npm package. Try the next candidate.

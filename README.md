@@ -683,11 +683,11 @@ without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those
 To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
 then run `ccc` again, from your project folder.
 
-On Windows, when ccc finds an npm shim, it reads the `claude` entry from the adjacent
+On Windows, when ccc recognizes an npm-generated shim, it reads the `claude` entry from the adjacent
 `@anthropic-ai/claude-code` package manifest. It runs a JavaScript entry with the absolute
 path of the Node executable running ccc, or launches a native `.exe` entry directly.
-For standalone `claude.cmd` or `claude.bat` wrappers, including pnpm and Yarn shims
-without that manifest, ccc passes the wrapper's absolute path to `%SystemRoot%\System32\cmd.exe`.
+For standalone `claude.cmd` or `claude.bat` wrappers, including pnpm and Yarn shims, ccc
+passes the wrapper's absolute path to `%SystemRoot%\System32\cmd.exe`.
 It sets `NoDefaultCurrentDirectoryInExePath=1` and removes relative paths and the working
 directory from the child's `PATH`, so a wrapper that runs `node` by name looks for it on
 the installed tool paths. Startup, sign-in checks, and resume all use the same launcher.

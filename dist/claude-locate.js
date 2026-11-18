@@ -26,19 +26,46 @@ export const CLAUDE_SOURCES = [
 ];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
 export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"];
-export function claudeNpmBin(command, readManifest = (file) => fs.readFileSync(file, "utf8")) {
-    if (!/\.(cmd|bat)$/i.test(command))
+// npm's cmd-shim emits these fixed lines for native bins and Node shebangs.
+// Match the entire shim so a wrapper's setup, extra arguments or cleanup still run.
+const npmShimHeader = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+`;
+const npmNodeLauncher = String.raw `IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  `;
+export function claudeNpmBin(command, readFile = (file) => fs.readFileSync(file, "utf8")) {
+    if (!/\.cmd$/i.test(command))
+        return undefined; // npm only generates .cmd.
+    const shim = readFile(command).replace(/\r\n/g, "\n");
+    if (!shim.startsWith(npmShimHeader))
         return undefined;
-    // npm places global shims in the prefix and local ones in node_modules/.bin.
-    // Its JS shim can invoke bare `node`, so resolve the package's bin without
-    // executing batch code or passing Claude's arguments through cmd.exe.
+    const body = shim.slice(npmShimHeader.length).trimStart();
+    const node = body.startsWith(npmNodeLauncher);
+    const invocation = node ? body.slice(npmNodeLauncher.length) : body;
+    const target = /^"%dp0%\\([^"%\r\n]+)" +%\*\n?$/.exec(invocation)?.[1];
+    if (!target || !(node ? /\.[cm]?js$/i : /\.exe$/i).test(target))
+        return undefined;
     const { win32 } = path;
     const dir = win32.dirname(command);
     const modules = /[\\/]node_modules[\\/]\.bin$/i.test(dir) ? win32.dirname(dir) : win32.join(dir, "node_modules");
     const pkg = win32.join(modules, "@anthropic-ai", "claude-code");
+    if (!target.toLowerCase().startsWith(win32.relative(dir, pkg).toLowerCase() + "\\"))
+        return undefined;
     let manifest;
     try {
-        manifest = readManifest(win32.join(pkg, "package.json"));
+        manifest = readFile(win32.join(pkg, "package.json"));
     }
     catch (err) {
         const code = err.code;
@@ -55,7 +82,7 @@ export function claudeNpmBin(command, readManifest = (file) => fs.readFileSync(f
     if (win32.parse(entry).root || win32.relative(pkg, file).split(win32.sep)[0] === "..") {
         throw new Error("Claude Code's npm executable must be inside its package.");
     }
-    return file;
+    return win32.relative(file, win32.resolve(dir, target)) === "" ? file : undefined;
 }
 /** Claude Code to launch, or null when it is not installed anywhere known. */
 export function locateClaude(opts = {}) {
@@ -66,7 +93,7 @@ export function locateClaude(opts = {}) {
         if (!isExecutable(file))
             return false;
         try {
-            const bin = platform === "win32" ? claudeNpmBin(file, opts.readManifest) : undefined;
+            const bin = platform === "win32" ? claudeNpmBin(file, opts.readFile) : undefined;
             return !bin || isExecutable(bin);
         }
         catch {

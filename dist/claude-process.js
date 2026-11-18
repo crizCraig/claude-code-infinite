@@ -6,11 +6,11 @@ import { win32 } from "node:path";
 import { executablePath } from "./executable-path.js";
 import { claudeNpmBin, windowsShellEnv } from "./claude-locate.js";
 const require = createRequire(import.meta.url);
-export function claudeInvocation(command, args, platform = process.platform, readManifest, options = {}) {
+export function claudeInvocation(command, args, platform = process.platform, readFile, options = {}) {
     executablePath(command, platform);
     if (platform !== "win32" || !/\.(cmd|bat)$/i.test(command))
         return { command, args };
-    const file = claudeNpmBin(command, readManifest);
+    const file = claudeNpmBin(command, readFile);
     if (file) {
         return /\.exe$/i.test(file) ? { command: file, args } : { command: process.execPath, args: [file, ...args] };
     }
@@ -18,8 +18,8 @@ export function claudeInvocation(command, args, platform = process.platform, rea
     const env = windowsShellEnv(options.env ?? process.env, typeof cwd === "string" ? cwd : fileURLToPath(cwd));
     // Use cross-spawn's batch quoting only. We already resolved both the shell and the wrapper.
     const escape = require("cross-spawn/lib/util/escape.js");
-    const doubleEscape = /[\\/]node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i.test(command);
-    const line = [escape.command(win32.normalize(command)), ...args.map(arg => escape.argument(arg, doubleEscape))].join(" ");
+    // cmd parses the launch line, then parses the forwarded %* inside the wrapper.
+    const line = [escape.command(win32.normalize(command)), ...args.map(arg => escape.argument(arg, true))].join(" ");
     return {
         command: env.ComSpec,
         args: ["/d", "/s", "/c", `"${line}"`],
