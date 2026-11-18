@@ -1225,6 +1225,15 @@ async function readLinesTool(args, tree) {
     const pick = (v, fallback) => (v === undefined || v === null ? fallback : Number(v));
     return formatLines(index, pick(args.block, block), pick(args.start, start), pick(args.end, end), ref);
 }
+function hasNodeDiagnostics(options) {
+    // NODE_OPTIONS allows double-quoted parts of arguments, with escapes inside
+    // quotes. Keep quoted values together so a path containing a flag is harmless.
+    const args = options.match(/(?:[^ "]+|"(?:[^"\\]|\\.)*")+/gs) ?? [];
+    return args.some(arg => {
+        const flag = arg.split("=", 1)[0].replace(/["\\]/g, "").replaceAll("_", "-");
+        return /^--(?:debug|inspect|trace)(?:-|$)/.test(flag) || flag === "--tls-keylog" || flag === "--node-memory-debug";
+    });
+}
 /** Serve MCP over this process's stdin/stdout until stdin closes. */
 export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "production") {
     const endOptions = args.indexOf("--");
@@ -1236,6 +1245,13 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     if (direct) {
         if (env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
             throw new Error("MemTree direct mode requires TLS verification. Unset NODE_TLS_REJECT_UNAUTHORIZED=0.");
+        }
+        // Node can log raw request or response bytes before application-level redaction.
+        if (env.NODE_DEBUG !== undefined) {
+            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_DEBUG.");
+        }
+        if (hasNodeDiagnostics(env.NODE_OPTIONS ?? "")) {
+            throw new Error("Node diagnostics can expose the MemTree key in direct mode. Unset NODE_OPTIONS or remove its diagnostic flags.");
         }
         const { values } = parseArgs({ args, options: { direct: { type: "boolean" }, env: { type: "string" } } });
         const mode = values.env ?? defaultEnv;

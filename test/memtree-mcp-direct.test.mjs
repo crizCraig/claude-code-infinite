@@ -112,6 +112,26 @@ test("direct mode refuses disabled TLS verification at startup", t => {
   assert.match(result.stderr, /NODE_TLS_REJECT_UNAUTHORIZED/);
 });
 
+for (const [variable, value] of [
+  ...["stream", "http", "net", "tls", "*", "other"].map(value => ["NODE_DEBUG", value]),
+  ["NODE_OPTIONS", "--inspect=127.0.0.1:0"],
+  ["NODE_OPTIONS", '--no-warnings "--trace_tls"'],
+]) {
+  test(`direct mode refuses ${variable}=${value} at startup`, t => {
+    const result = run(t, ["--direct"], [call("list", {})], { [variable]: value });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.ok(result.stderr.includes(`Unset ${variable}`));
+  });
+}
+
+test("direct mode accepts unrelated NODE_OPTIONS", t => {
+  const [list] = results(run(t, ["--direct"], [call("list", {})], {
+    NODE_OPTIONS: "--max-old-space-size=256 --no-warnings",
+  }));
+  assert.ok(!list.isError);
+});
+
 test("direct requests bypass the global transport and environment proxy", t => {
   const [list] = results(run(t, ["--direct"], [call("list", {})], {
     NODE_USE_ENV_PROXY: "1",
