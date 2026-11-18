@@ -112,27 +112,33 @@ exact lines. Type `/memtree-view` to open this session's tree in your browser. D
 
 ### Read ccc sessions from Codex or another MCP client
 
-Register MemTree as a stdio server in your Codex `config.toml`. From a trusted directory,
-run `node -p "process.execPath"` to find your Node executable and `npm root -g` to find the
-global packages directory for your ccc installation. Append `claude-code-infinite/dist/cli.js`
-to the latter path. Use both absolute paths so the MCP client launches your trusted Node and ccc
-even when it starts in an untrusted workspace.
+Generate the registration from a trusted directory.
 
-On macOS or Linux, replace both example paths with yours.
+```sh
+ccc memtree-mcp --print-config
+```
+
+Paste the output into your Codex `config.toml`. For a client that uses an `mcpServers` JSON
+object, add `--format json`. Add `--env staging` to generate a staging registration. The
+command finds the running Node executable and this installation’s `dist/cli.js` without
+reading your saved key. Rerun it if upgrading Node or ccc moves either path.
+
+The Node command line must come from trusted configuration. Keep `NODE_OPTIONS` empty in
+the server environment so a client cannot forward preload options that run workspace code
+before ccc starts.
+
+For manual setup, replace both absolute paths in this example with the paths to your trusted
+Node executable and your installed ccc entry point.
 
 ```toml
 [mcp_servers.memtree]
-command = "/usr/local/bin/node"
-args = ["/usr/local/lib/node_modules/claude-code-infinite/dist/cli.js", "memtree-mcp", "--direct"]
+command = '/usr/local/bin/node'
+args = ['/usr/local/lib/node_modules/claude-code-infinite/dist/cli.js', 'memtree-mcp', '--direct']
+env = { NODE_OPTIONS = "" }
 ```
 
-On Windows, substitute your own paths and double each backslash inside TOML double quotes.
-
-```toml
-[mcp_servers.memtree]
-command = "C:\\Program Files\\nodejs\\node.exe"
-args = ["C:\\Users\\Alex\\AppData\\Roaming\\npm\\node_modules\\claude-code-infinite\\dist\\cli.js", "memtree-mcp", "--direct"]
-```
+On Windows, use the same TOML literal strings with single backslashes, for example
+`'C:\Program Files\nodejs\node.exe'`.
 
 Direct mode uses the production key saved in `~/.claude-code-infinite/config.json`.
 Add `--env staging` to use your saved staging key. Direct reads connect to MemTree over HTTPS

@@ -90,6 +90,7 @@ import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
 import {
   planMemtreeMcp,
+  printDirectMcpConfig,
   withMemtreeMcpArgs,
   writeMemtreeMcpConfig,
   type MemtreeMcpConfigFile,
@@ -511,7 +512,12 @@ async function main() {
     process.exit(await runMemtreeFetchCommand(subcommand.args));
   }
   if (subcommand?.name === "memtree-mcp") {
-    runMemtreeMcpServer(process.env, subcommand.args, environmentOf(filteredArgs));
+    const mode = environmentOf(filteredArgs);
+    if (subcommand.args[0] === "--print-config") {
+      process.exitCode = printDirectMcpConfig(subcommand.args.slice(1), mode);
+    } else {
+      runMemtreeMcpServer(process.env, subcommand.args, mode);
+    }
     return;
   }
 

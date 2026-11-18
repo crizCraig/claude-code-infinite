@@ -1,9 +1,15 @@
+import type { CccEnvironment } from "./cli-args.js";
 /** `x-memtree-tools` value. */
 export declare const MEMTREE_TOOLS_HEADER_VALUE: string;
 /** Claude Code's names for the tools, for `--allowedTools`. */
 export declare const MEMTREE_ALLOWED_TOOLS: string[];
 export declare const MEMTREE_MCP_SCRIPT: string;
 export declare function memtreeMcpEnabledByEnv(env: NodeJS.ProcessEnv): boolean;
+/** Prefer a stable installation symlink only if it identifies the running binary.
+ * Never obtain the registered command from PATH or the working directory. */
+export declare function directMcpNodePath(realNode: string): string;
+export declare function formatDirectMcpConfig(format: "codex" | "json", command: string, cli: string, mode: "production" | "staging"): string;
+export declare function printDirectMcpConfig(args: string[], defaultEnv: CccEnvironment): number;
 /** The `--mcp-config` JSON for this ccc's server, bound to its proxy. */
 export declare function memtreeMcpConfig(proxyUrl: string, hostToken?: string): object;
 export interface MemtreeMcpConfigFile {

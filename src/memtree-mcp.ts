@@ -1419,7 +1419,8 @@ async function readLinesTool(args: Record<string, unknown>, tree: TreeSource): P
 
 // These switches only suppress warnings, include their call stacks, or turn off
 // the inspector signal. The one valued flag only sets a numeric V8 heap limit.
-const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation", "--disable-sigusr1"];
+const DIRECT_NODE_SWITCHES = ["--no-warnings", "--trace-warnings", "--trace-deprecation"];
+if (process.allowedNodeEnvironmentFlags.has("--disable-sigusr1")) DIRECT_NODE_SWITCHES.push("--disable-sigusr1");
 const DIRECT_USAGE = "Usage: ccc memtree-mcp --direct [--env staging|production]";
 
 function nodeOptionsArgs(options: string): string[] {
@@ -1448,7 +1449,7 @@ function checkDirectNodeFlags(args: string[], source: "NODE_OPTIONS" | "Node com
     if (DIRECT_NODE_SWITCHES.includes(arg) || /^--(?:max-old-space-size|max_old_space_size)=[0-9]+$/.test(arg)) continue;
     const name = /^-{1,2}[a-zA-Z0-9_-]+/.exec(arg)?.[0] ?? "(unnamed argument)";
     const fix = source === "NODE_OPTIONS"
-      ? "Set NODE_OPTIONS to empty in this MCP server's environment."
+      ? "Remove the flag from NODE_OPTIONS or clear NODE_OPTIONS in this MCP server's environment."
       : "Remove the flag from the Node command line.";
     throw new Error(`Unsupported Node flag ${name} in ${source}. ${fix} MemTree direct mode accepts only --max-old-space-size=N (or --max_old_space_size=N), ${DIRECT_NODE_SWITCHES.join(", ")}.`);
   }

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +41,95 @@ function results(proc) {
   assert.equal(proc.stderr, "");
   return proc.stdout.trim().split("\n").map(line => JSON.parse(line).result);
 }
+
+const installedCli = realpathSync(fileURLToPath(new URL("../dist/cli.js", import.meta.url)));
+const printEnv = { CHECK_KEY_UNREAD: "1", CHECK_NO_SPAWN: "1", CCC_MEMTREE_MCP_DESKTOP: "1" };
+
+test("--print-config emits Codex TOML by default, without reading the key", t => {
+  const result = run(t, ["--print-config"], [], printEnv);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^\[mcp_servers\.memtree\]$/m);
+  const node = /^command = '([^']+)'$/m.exec(result.stdout)?.[1];
+  assert.ok(node && path.isAbsolute(node));
+  assert.equal(realpathSync(node), realpathSync(process.execPath));
+  assert.ok(result.stdout.includes(`args = ['${installedCli}', 'memtree-mcp', '--direct']`));
+  assert.match(result.stdout, /^env = \{ NODE_OPTIONS = "" \}$/m);
+  const explicit = run(t, ["--print-config", "--format", "codex"], [], printEnv);
+  assert.equal(explicit.stdout, result.stdout);
+});
+
+test("--print-config emits pasteable JSON for staging without reading the key", t => {
+  const result = run(t, ["--print-config", "--format", "json", "--env", "staging"], [], printEnv);
+  assert.equal(result.status, 0, result.stderr);
+  const { mcpServers: { memtree } } = JSON.parse(result.stdout);
+  assert.ok(path.isAbsolute(memtree.command));
+  assert.equal(realpathSync(memtree.command), realpathSync(process.execPath));
+  assert.deepEqual(memtree.args, [installedCli, "memtree-mcp", "--direct", "--env", "staging"]);
+  assert.deepEqual(memtree.env, { NODE_OPTIONS: "" });
+});
+
+test("--print-config explains the resolved Node fallback and keeps JSON parseable", t => {
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ccc-node-")));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const node = path.join(dir, "node");
+  writeFileSync(node, "");
+  for (const format of ["codex", "json"]) {
+    const result = run(t, ["--print-config", "--format", format], [], { ...printEnv, TEST_NODE_BINARY: node });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(format === "json" ? result.stderr : result.stdout, /^# .*resolved Node.*--print-config/m);
+    if (format === "json") assert.equal(JSON.parse(result.stdout).mcpServers.memtree.command, node);
+    else assert.ok(result.stdout.includes(`command = '${node}'`));
+  }
+});
+
+test("--print-config rejects invalid options without echoing their values", t => {
+  for (const args of [["--format", "fixture-production-key"], ["--env", "local"], ["--direct"]]) {
+    const result = run(t, ["--print-config", ...args], [], printEnv);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /^Usage: ccc memtree-mcp --print-config/);
+  }
+});
+
+test("--print-config quotes Windows paths and paths containing apostrophes", async () => {
+  const { formatDirectMcpConfig } = await import("../dist/memtree-mcp-config.js");
+  const node = String.raw`C:\Program Files\nodejs\node.exe`;
+  const cli = String.raw`C:\Users\Alex\MemTree\dist\cli.js`;
+  const toml = formatDirectMcpConfig("codex", node, cli, "staging");
+  assert.ok(toml.includes(`command = '${node}'`));
+  assert.ok(toml.includes(`args = ['${cli}', 'memtree-mcp', '--direct', '--env', 'staging']`));
+  const unusual = cli.replace("Alex", "O'Brien");
+  assert.ok(formatDirectMcpConfig("codex", node, unusual, "production").includes(JSON.stringify(unusual)));
+});
+
+test("--print-config prefers a Homebrew symlink only while it resolves to this Node", {
+  skip: process.platform === "win32",
+}, async t => {
+  const { directMcpNodePath } = await import("../dist/memtree-mcp-config.js");
+  const prefix = realpathSync(mkdtempSync(path.join(tmpdir(), "ccc-brew-")));
+  t.after(() => rmSync(prefix, { recursive: true, force: true }));
+  const node = path.join(prefix, "Cellar", "node", "24.0.0", "bin", "node");
+  const stable = path.join(prefix, "bin", "node");
+  mkdirSync(path.dirname(node), { recursive: true });
+  mkdirSync(path.dirname(stable));
+  writeFileSync(node, "");
+  symlinkSync(node, stable);
+  assert.equal(directMcpNodePath(node), stable);
+  rmSync(stable);
+  writeFileSync(stable, "");
+  assert.equal(directMcpNodePath(node), node);
+});
+
+test("direct refusal lists --disable-sigusr1 only when supported", t => {
+  for (const unsupported of [false, true]) {
+    const result = run(t, ["--direct"], [], {
+      TEST_EXEC_ARG: "--title=fixture", TEST_NO_DISABLE_SIGUSR1: unsupported ? "1" : "",
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.includes("--disable-sigusr1"),
+      !unsupported && process.allowedNodeEnvironmentFlags.has("--disable-sigusr1"));
+  }
+});
 
 test("direct CLI reads all six tools with the saved production key, including by session id", t => {
   const replies = results(run(t, ["--direct"], [
@@ -251,7 +340,7 @@ for (const flag of ["--print-maglev-code", "--redirect-code-traces", "--heap-sna
       assert.equal(result.stdout, "");
       assert.ok(result.stderr.includes(flag.split("=")[0]));
       assert.match(result.stderr, /direct mode accepts only/i);
-      assert.match(result.stderr, source === "execArgv" ? /remove.*Node command line/i : /set NODE_OPTIONS to empty/i);
+      assert.match(result.stderr, source === "execArgv" ? /remove.*Node command line/i : /remove the flag from NODE_OPTIONS/i);
       assert.equal(result.stderr.trim().split("\n").length, 1);
       assert.doesNotMatch(result.stderr, /flag-value-canary/);
     });

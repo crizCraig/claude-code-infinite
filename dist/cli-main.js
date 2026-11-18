@@ -45,7 +45,7 @@ import { runLinkCommand } from "./link-command.js";
 import { runMemtreeMcpServer } from "./memtree-mcp.js";
 import { readProjectMeta } from "./project-meta.js";
 import { projectTreesHintFor } from "./project-trees.js";
-import { planMemtreeMcp, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
+import { planMemtreeMcp, printDirectMcpConfig, withMemtreeMcpArgs, writeMemtreeMcpConfig, } from "./memtree-mcp-config.js";
 import { claudeChildEnv, claudeNativeOneMillionContextEnabled, } from "./claude-env.js";
 import { createSignalShutdownHandler, claudeExitFields, exitCodeForChild, closeBoundedMs, CONSOLE_CLOSE_MARKS_MS, HANGUP_MEMTREE_DRAIN_MS, childExitMeansHangup, ignoreStreamErrors, onHangup, settleWithin, shutdownMemtreeDrainMs, writeStdout, } from "./cli-lifecycle.js";
 import { storedApiKey, memtreeBaseUrlFor, setPolychatApiKey, setLocalPolychatApiKey, setStagingPolychatApiKey, getConfigDir, loadConfig, } from "./config.js";
@@ -348,7 +348,13 @@ async function main() {
         process.exit(await runMemtreeFetchCommand(subcommand.args));
     }
     if (subcommand?.name === "memtree-mcp") {
-        runMemtreeMcpServer(process.env, subcommand.args, environmentOf(filteredArgs));
+        const mode = environmentOf(filteredArgs);
+        if (subcommand.args[0] === "--print-config") {
+            process.exitCode = printDirectMcpConfig(subcommand.args.slice(1), mode);
+        }
+        else {
+            runMemtreeMcpServer(process.env, subcommand.args, mode);
+        }
         return;
     }
     if (isVersionRequest(filteredArgs)) {
