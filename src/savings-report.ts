@@ -1,36 +1,53 @@
-/** Wire allowlist: content and local cache fingerprints never leave this boundary. */
-import { isSavingsSessionId } from './savings.js';
+/** The only savings fields that may reach disk or the authenticated turn endpoint. */
+import {isSavingsSessionId} from './savings.js';
 
-export interface SavingsReport {
-  schema: 1;
-  session_id: string;
-  sequence: number;
-  plain_api_usd: number;
-  actual_api_usd: number;
-  costs_complete: boolean;
-  turns: number;
-  window_crossings: number;
-  token_counts: Record<string, number>;
+export interface SavingsUsage {
+  input: number;
+  cache_read: number;
+  cache_creation_5m: number;
+  cache_creation_1h: number;
+  output: number;
 }
-export function savingsReport(value: unknown): SavingsReport | undefined {
+
+export interface SavingsRecord {
+  turn_id: string;
+  session_id: string;
+  requested_at: string;
+  model: string;
+  fast_mode: boolean;
+  expected_memtree_calls?: number;
+  window_crossing: boolean;
+  actual: SavingsUsage | null;
+  plain: SavingsUsage | null;
+}
+
+function usage(value: unknown): SavingsUsage | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== 'object') return;
+  const result = {} as SavingsUsage;
+  for (const key of ['input','cache_read','cache_creation_5m','cache_creation_1h','output'] as const) {
+    const count = (value as Record<string, unknown>)[key];
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) ||
+        count < 0 || count > 1_000_000_000) return;
+    result[key] = count;
+  }
+  return result;
+}
+
+export function savingsReport(value: unknown): SavingsRecord | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Record<string, unknown>;
-  if (v.schema !== 1 || !isSavingsSessionId(v.session_id) ||
-      typeof v.costs_complete !== 'boolean') return;
-  for (const key of ['sequence','plain_api_usd','actual_api_usd','turns','window_crossings']) {
-    if (typeof v[key] !== 'number' || !Number.isFinite(v[key]) || v[key] < 0) return;
-  }
-  if (!Number.isSafeInteger(v.sequence) || !Number.isSafeInteger(v.turns) ||
-      !Number.isSafeInteger(v.window_crossings)) return;
-  const counts = v.token_counts as Record<string, unknown> | undefined;
-  const token_counts: Record<string, number> = {};
-  for (const key of ['input','cache_read','cache_creation_5m','cache_creation_1h','output']) {
-    const n = counts?.[key];
-    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return;
-    token_counts[key] = n;
-  }
-  return {schema:1, session_id:v.session_id,sequence:v.sequence as number,
-    plain_api_usd:v.plain_api_usd as number, actual_api_usd:v.actual_api_usd as number,
-    costs_complete:v.costs_complete,turns:v.turns as number,
-    window_crossings:v.window_crossings as number, token_counts};
+  if (!isSavingsSessionId(v.turn_id) || !isSavingsSessionId(v.session_id) ||
+      typeof v.requested_at !== 'string' || !Number.isFinite(Date.parse(v.requested_at)) ||
+      typeof v.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(v.model) ||
+      typeof v.fast_mode !== 'boolean' || typeof v.window_crossing !== 'boolean') return;
+  const expected = v.expected_memtree_calls;
+  if (expected !== undefined && (typeof expected !== 'number' ||
+      !Number.isSafeInteger(expected) || expected < 0)) return;
+  const actual = usage(v.actual), plain = usage(v.plain);
+  if (actual === undefined || plain === undefined) return;
+  return {turn_id:v.turn_id.toLowerCase(), session_id:v.session_id,
+    requested_at:new Date(v.requested_at).toISOString(), model:v.model, fast_mode:v.fast_mode,
+    window_crossing:v.window_crossing, actual, plain,
+    ...(expected === undefined ? {} : {expected_memtree_calls:expected})};
 }

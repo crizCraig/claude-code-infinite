@@ -20,7 +20,7 @@ export declare function statuslinePaths(env?: NodeJS.ProcessEnv): StatuslinePath
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
 export declare function statuslineMain(args: string[], paths?: StatuslinePaths, out?: (text: string) => boolean): Promise<number>;
 /** The status line: the wrapped command's output, then the session's link. */
-export declare function renderStatusline(input: string, paths: StatuslinePaths, env?: NodeJS.ProcessEnv): Promise<string>;
+export declare function renderStatusline(input: string, paths: StatuslinePaths, env?: NodeJS.ProcessEnv, get?: typeof fetch): Promise<string>;
 /** ` 🌿 tree` linked to the session's page, or the URL; "" with no cached link. */
 export declare function linkSegment(sessionId: unknown, env?: NodeJS.ProcessEnv, dir?: string): string;
 /**

@@ -61,6 +61,8 @@ export declare const FINAL_INDEX_EXIT_SESSIONS = 3;
 export interface MemtreeOptions {
     baseUrl: string;
     apiKey: string;
+    /** Let the launcher suspend reporting for an explicitly rejected credential. */
+    onInvalidKey?: () => void;
     compressTimeoutMs?: number;
     /** The long budget (see DEFAULT_LONG_COMPRESS_TIMEOUT_MS); tests set it small. */
     longCompressTimeoutMs?: number;
@@ -345,6 +347,7 @@ export declare function normalizeMessagesForMemtree(messages: Message[]): Messag
 export declare class MemtreeClient {
     private baseUrl;
     private apiKey;
+    private readonly onInvalidKey?;
     private compressTimeoutMs;
     private compressSuccessAt;
     private longCompressTimeoutMs;

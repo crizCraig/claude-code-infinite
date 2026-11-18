@@ -161,7 +161,6 @@ export const RETRYABLE_COUNT_OUTCOMES = new Set(["timeout", "deadline", "network
  * counts (a compression before the replacement is counted) is not charged.
  */
 export function createCountTokensSession(options, cooldowns = new CountTokensCooldowns()) {
-    const keyOf = options.bodyKey ?? bodyHash;
     const pending = new Map();
     const completed = new Map();
     const account = countAccountKey(options);
@@ -169,11 +168,10 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
     let allowance = 0;
     let retried = false;
     return {
-        bodyKey: keyOf,
         peekKey: (key) => completed.get(key),
-        peek: (body) => completed.get(keyOf(body)),
+        peek: (body) => completed.get(bodyHash(body)),
         retry: (body) => {
-            const key = keyOf(body);
+            const key = bodyHash(body);
             const prior = completed.get(key);
             if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
                 options.signal?.aborted || cooldowns.active(account))
@@ -187,7 +185,7 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
             return attempt;
         },
         count: (body) => {
-            const key = keyOf(body);
+            const key = bodyHash(body);
             const existing = pending.get(key);
             if (existing)
                 return existing;

@@ -185,7 +185,6 @@ import {
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
-import { isSavingsSessionId } from "./savings.js";
 import type { SavingsTracker } from "./savings-tracker.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
@@ -1434,6 +1433,12 @@ async function handleRequest(
         : opts.transcriptUsage?.finalReply?.(sessionId!)));
   }
 
+  if (req.method === "GET" && url.pathname === "/memtree/savings") {
+    const view = await opts.savings?.view(url.searchParams.get("session"));
+    res.writeHead(view ? 200 : 404, {"content-type":"application/json"});
+    res.end(JSON.stringify(view ?? null));
+    return;
+  }
   if (req.method === "GET" && url.pathname === MEMTREE_HOST_SESSION_PATH) {
     return handleMemTreeHostSession(req, res, state, url);
   }
@@ -2259,14 +2264,17 @@ async function handleMessages(
   noticeContexts.set(rec, { promptId: state.mainPromptId, generation: state.mainPromptGeneration });
   // An index wait may hold this request (runBlockingCompression) until Claude Code leaves.
   indexHolds.set(rec, { started: received, closed: closedSignal(res) });
-  let settleSavings: (() => void | Promise<void>) | undefined;
+  let settleSavings: ((at: number | undefined) => void) | undefined;
   const logged = async (forward: Promise<unknown>): Promise<void> => {
     try {
       await forward;
     } finally {
       if (rec.totalMs === undefined) rec.totalMs = Date.now() - received;
       noteForwardedSize(state, rec, requestSessionId(req));
-      await settleSavings?.();
+      const at = upstreamSavingsTime.get(rec);
+      if (settleSavings) {
+        try { settleSavings(at); } catch { /* Savings is a best-effort delivery observer. */ }
+      }
       opts.reqlog?.log(rec);
     }
   };
@@ -2362,23 +2370,17 @@ async function handleMessages(
       // never let the format check affect the request
     }
   }
+  const requestSessionKey = requestSessionId(req);
+  const observed = opts.savings?.startTurn(requestSessionKey);
   if (sideRequest && clientInfo) {
-    const sideSession = requestSessionId(req);
-    if (opts.savings && isSavingsSessionId(sideSession)) {
+    if (opts.savings && observed) {
       const savings = opts.savings;
-      await savings.begin(sideSession);
-      settleSavings = () => {
-        if (!(rec.forwardedBytes! > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
-          savings.cancel(sideSession);
-          return;
-        }
-        return savings.settle(sideSession, {request: originalRequest,
-          usage: rec.savingsUsageComplete ? rec.usage : undefined,
-          model: body.model, requestModified: false,
-          contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
-            opts.nativeOneMillionContext !== false),
-          laneKey: "side:" + body.model, nowMs: received});
-      };
+      settleSavings = at => savings.settle(observed, {request: originalRequest,
+        usage: rec.savingsUsageComplete ? rec.usage : undefined,
+        model: body.model, requestModified: false,
+        contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"),
+          opts.nativeOneMillionContext !== false),
+        laneKey: "side:" + body.model, nowMs: at}, rec.upstreamStatus ?? 0);
     }
     if (typeof body.model === "string") rec.model = body.model;
     rec.stream = body.stream === true;
@@ -2442,11 +2444,7 @@ async function handleMessages(
   if (isMainRequest) rec.contextWindow = modelContextLimit;
   // Before anything reads the size sample: replace an unknown or stale
   // estimate with an exact count where it would decide the outcome.
-  const requestSessionKey = requestSessionId(req);
-  const savingsReplay = isSavingsSessionId(requestSessionKey) && !notConversation
-    ? opts.savings?.history?.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
   const countSession = createCountTokensSession({
-    bodyKey: savingsReplay?.bodyKey,
     upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
     signal: state.shutdownSignal,
     onAttempt: (result) => {
@@ -2469,28 +2467,22 @@ async function handleMessages(
     output: bodyOutputReservation(body),
     recountOutput: outputReservation(undefined, body.max_tokens), // full max_tokens
   });
-  if (opts.savings && isSavingsSessionId(requestSessionKey)) {
+  if (opts.savings && isMainRequest && !notConversation) {
+    opts.savings.progress(requestSessionKey, originalCandidate.estimate.tokens, sizingLimits().budget);
+  }
+  if (opts.savings && observed) {
     const savings = opts.savings;
-    const tracksProgress = isMainRequest && !notConversation;
     let modified = false;
-    savingsSelections.set(rec, candidate => {
-      modified = candidate.kind !== "original" && !wholeHistoryCandidates.has(candidate);
-    });
-    await savings.begin(requestSessionKey, tracksProgress ? originalCandidate.estimate.tokens : undefined,
-      tracksProgress ? sizingLimits().budget : undefined);
-    settleSavings = () => {
-      savingsSelections.delete(rec);
-      if (!(rec.forwardedBytes! > 0) || !rec.upstreamStatus || rec.upstreamStatus >= 300) {
-        savings.cancel(requestSessionKey);
-        return;
-      }
-      const exact = countSession.peekKey(originalCandidate.key)?.tokens;
-      return savings.settle(requestSessionKey, {request:originalRequest,replay:savingsReplay,usage:rec.savingsUsageComplete ? rec.usage : undefined,
-        model:originalRequest.model,contextWindow:modelContextLimit,
-        outputReserve:sizingLimits().output,requestModified:modified,originalInputTokens:exact,
-        laneKey:notConversation ? "fragment:" + requestRouteKey : requestRouteKey,nowMs:received,
-        ...(tracksProgress ? {progress_tokens:exact ?? originalCandidate.estimate.tokens,
-          budget_tokens:sizingLimits().budget} : {})});
+    savingsSelections.set(rec, candidate => { modified = candidate.kind !== "original"; });
+    settleSavings = at => {
+      // Only a modified turn needs the plain prompt. Verify its replay prefix after delivery.
+      const replay = at !== undefined && modified && !notConversation
+        ? savings.history.request(requestSessionKey + "/" + requestRouteKey, rawBody) : undefined;
+      savings.settle(observed, {request:originalRequest, replay,
+        usage:rec.savingsUsageComplete ? rec.usage : undefined, model:originalRequest.model,
+        contextWindow:modelContextLimit, outputReserve:sizingLimits().output, requestModified:modified,
+        originalInputTokens:countSession.peekKey(originalCandidate.key)?.tokens,
+        laneKey:notConversation ? "fragment:" + requestRouteKey : requestRouteKey, nowMs:at}, rec.upstreamStatus ?? 0);
     };
   }
   if (isMainRequest && requestSessionKey !== undefined) {
@@ -2510,7 +2502,7 @@ async function handleMessages(
   noteLaneCache(opts, state, rec, requestRouteKey, body, notConversation !== undefined);
   // Stored by the server on the usage row (client_meta): which Claude Code,
   // lane, agent and model produced this request.
-  const clientMeta = memtreeClientMeta({
+  const sessionMeta = memtreeClientMeta({
     info: clientInfo,
     lane: requestRouteLane,
     agentId: firstNonEmptyHeader(req, "x-claude-code-agent-id"),
@@ -2518,6 +2510,7 @@ async function handleMessages(
     model: body.model,
     project: opts.projectMeta,
   }) as Record<string, string>;
+  const clientMeta = observed?.work(sessionMeta) ?? sessionMeta;
   // API identity and validated history alone govern route eligibility.
   const rideableCandidate = getMemoryRoute(state, requestRouteKey);
   const existingRide = rideableCandidate && memoryRoutedToolBody(
@@ -2610,7 +2603,7 @@ async function handleMessages(
     opts.memtree.noteMainConversation(mainSessionId, {
       messages: msgsForMemtree,
       modelContextLimit,
-      clientMeta,
+      clientMeta: sessionMeta, // The Stop/exit index is a separate submission.
       messageTimesFor: transcriptTimesFor(opts, mainSessionId),
       readReply: (signal) => opts.transcriptUsage?.finalReplyAsync
         ? opts.transcriptUsage.finalReplyAsync(mainSessionId, signal)
@@ -5638,8 +5631,10 @@ function indexTurn(args: {
   sessionId: string | undefined; clientMeta?: Record<string, string>;
 }): void {
   const { opts, state, req, sessionId } = args;
+  // A hook/eviction flush is detached from the model turn that retained this history.
   const send = (mode?: DeferredSend) => opts.memtree.indexInBackground(args.hash,
-    args.msgsForMemtree, args.modelContextLimit, sessionId, args.clientMeta,
+    args.msgsForMemtree, args.modelContextLimit, sessionId,
+    mode && args.clientMeta ? {...args.clientMeta} : args.clientMeta,
     transcriptTimesFor(opts, sessionId, agentAttributionId(req)),
     mode === "final" ? { finalIndex: true } : mode === "flush" ? { force: true } : {});
   // Only a request with its own agent id (the one SubagentStop names) waits for its end; one
@@ -8075,6 +8070,7 @@ function noteAwayWarmsMain(
 }
 
 /** Account the candidate delivery selected after sizing and fallbacks. */
+const upstreamSavingsTime = new WeakMap<MessagesRecord, number>();
 const savingsSelections = new WeakMap<MessagesRecord, (candidate: RequestCandidate) => void>();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap<MessagesRecord, (sent: Buffer) => void>();
@@ -8405,6 +8401,7 @@ function forwardAccepted(
 
     if (rec) {
       laneSendStamps.get(rec)?.(bodyBuffer);
+      if (opts.savings) upstreamSavingsTime.set(rec, Date.now());
     }
     upstreamReq = upstream.module.request(
       {

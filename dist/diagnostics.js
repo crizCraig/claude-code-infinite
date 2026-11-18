@@ -18,9 +18,8 @@
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
 import { SavingsOutbox } from "./savings-outbox.js";
-import { savingsReport } from "./savings-report.js";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { DIAGNOSTICS_SCHEMA, TERMINALS, TURN_TYPES, errnoName, errorClassName, sanitizeContext, sanitizeEvent, threePartVersion, } from "./diagnostics-schema.js";
@@ -39,8 +38,6 @@ export const SEND_TIMEOUT_MS = 3_000;
 export const SHUTDOWN_FLUSH_MS = 1_000;
 /** Repeats of one error kind (event + status) reported per process. */
 export const MAX_REPEATS = 5;
-const LEGACY_MAX_DELAY_MS = 30 * 60_000;
-const LEGACY_MAX_AGE_MS = 4 * 3_600_000;
 const OPT_OUT_ENV = [
     "CCC_NO_DIAGNOSTICS", "DO_NOT_TRACK", "DISABLE_TELEMETRY",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
@@ -62,8 +59,6 @@ export class Diagnostics {
     installId;
     queue = [];
     outbox;
-    savings = new Map();
-    sendingSavings = new Set();
     inFlight = new Set();
     repeats = new Map();
     context = {};
@@ -87,12 +82,27 @@ export class Diagnostics {
     setApiKey(apiKey) {
         if (this.apiKey === apiKey)
             return;
-        const unassigned = this.apiKey ? [] : [...this.savings.values()];
         this.apiKey = apiKey;
-        this.outbox = apiKey && this.enabled ? new SavingsOutbox(this.opts.configDir, this.opts.baseUrl, apiKey) : undefined;
-        this.savings = this.outbox?.restore() ?? new Map();
-        for (const { report } of unassigned)
-            this.reportSavings(report);
+        this.outbox = undefined;
+        if (!apiKey || !this.enabled)
+            return;
+        const url = this.opts.baseUrl.replace(/\/$/, "") + "/v1/ccc/savings/turns";
+        const headers = this.headers(); // This queue always uses the credential that created it.
+        this.outbox = new SavingsOutbox(this.opts.configDir, this.opts.baseUrl, apiKey, turns => (this.opts.fetchImpl ?? fetch)(url, { method: "POST", headers,
+            signal: AbortSignal.timeout(SEND_TIMEOUT_MS), body: JSON.stringify({ turns }) }), () => this.now());
+    }
+    get savingsEnabled() { return this.outbox?.enabled ?? false; }
+    get savingsAccount() {
+        return this.savingsEnabled ? this.outbox : undefined;
+    }
+    /** A turn that finishes after re-keying still belongs to the key it started with. */
+    bindSavings() {
+        const outbox = this.outbox;
+        if (outbox?.enabled)
+            return value => outbox.append(value);
+    }
+    suspendSavings() {
+        this.outbox?.suspend();
     }
     /** Add context fields (allowlisted; later values win). */
     setContext(fields) {
@@ -122,19 +132,8 @@ export class Diagnostics {
             // Never break the caller.
         }
     }
-    /** Cumulative, retryable metadata; bounded and never sent without a user key. */
     reportSavings(value) {
-        if (!this.enabled)
-            return;
-        const report = savingsReport(value);
-        if (!report)
-            return;
-        const old = this.savings.get(report.session_id);
-        if (old && old.report.sequence >= report.sequence)
-            return;
-        this.savings.set(report.session_id, { report });
-        if (this.outbox?.save(report) && old)
-            this.outbox.remove(old.report);
+        this.outbox?.append(value);
     }
     /** Like record, but at most MAX_REPEATS times per `key` in this process. */
     recordLimited(key, name, fields = {}) {
@@ -155,10 +154,8 @@ export class Diagnostics {
     flushNow() {
         if (!this.enabled)
             return;
-        if (this.apiKey)
-            for (const pending of this.savings.values()) {
-                this.flushSavings(pending);
-            }
+        if (this.outbox)
+            this.track(this.outbox.flush());
         while (this.queue.length > 0) {
             this.track(this.send(this.queue.splice(0, BATCH_SIZE)));
         }
@@ -201,68 +198,6 @@ export class Diagnostics {
         catch {
             // Dropped: diagnostics never retry or surface errors.
         }
-    }
-    flushSavings(pending) {
-        if (pending.retry && this.now() < pending.retry.next)
-            return;
-        if (!this.sendingSavings.has(pending.report.session_id))
-            this.track(this.sendSavings(pending));
-    }
-    async sendSavings(pending) {
-        const { report } = pending;
-        const outbox = this.outbox;
-        this.sendingSavings.add(report.session_id);
-        try {
-            const response = await (this.opts.fetchImpl ?? fetch)(`${this.opts.baseUrl.replace(/\/$/, "")}${DIAGNOSTICS_PATH}`, {
-                method: "POST", headers: this.headers(), signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-                body: JSON.stringify({ schema: DIAGNOSTICS_SCHEMA, install_id: this.installId,
-                    context: this.context, events: [], savings: report }),
-            });
-            if (!response.ok)
-                return;
-            const body = await response.json().catch(() => null);
-            const ack = body?.savings_stored;
-            if (ack?.session_id === report.session_id && Number.isSafeInteger(ack.sequence) &&
-                ack.sequence >= report.sequence) {
-                outbox?.remove(report);
-                if (this.savings.get(report.session_id) === pending)
-                    this.savings.delete(report.session_id);
-            }
-            else if (this.savings.get(report.session_id) === pending) {
-                if (ack === undefined)
-                    this.deferLegacyReport(pending);
-                else if (pending.retry) {
-                    // This server speaks the protocol. A refused write remains pending.
-                    delete pending.retry;
-                    outbox?.clearRetry(report);
-                }
-            }
-        }
-        catch { /* Keep the snapshot after a failed POST. */ }
-        finally {
-            this.sendingSavings.delete(report.session_id);
-            const newer = this.savings.get(report.session_id);
-            if (newer && newer !== pending && this.apiKey)
-                this.flushSavings(newer);
-        }
-    }
-    deferLegacyReport(pending) {
-        const now = this.now();
-        const { report, retry } = pending;
-        const since = retry?.since ?? now;
-        if (now - since >= LEGACY_MAX_AGE_MS) {
-            this.outbox?.remove(report);
-            this.savings.delete(report.session_id);
-            try {
-                appendFileSync(join(this.opts.configDir, "savings.log"), `${new Date(now).toISOString()} Dropped savings report ${report.session_id} sequence ${report.sequence} after four hours without server acknowledgement.\n`, { mode: 0o600 });
-            }
-            catch { /* Diagnostics must never interrupt a turn. */ }
-            return;
-        }
-        const attempts = (retry?.attempts ?? 0) + 1;
-        const delay = Math.min(LEGACY_MAX_DELAY_MS, 60_000 * 2 ** (attempts - 1));
-        pending.retry = { since, attempts, next: Math.min(now + delay, since + LEGACY_MAX_AGE_MS) };
-        this.outbox?.saveRetry(report, pending.retry);
     }
     headers() {
         return {

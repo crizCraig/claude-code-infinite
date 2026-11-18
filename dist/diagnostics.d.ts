@@ -69,8 +69,6 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     private readonly installId;
     private readonly queue;
     private outbox?;
-    private savings;
-    private readonly sendingSavings;
     private readonly inFlight;
     private readonly repeats;
     private context;
@@ -78,10 +76,14 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     private timer;
     constructor(opts: DiagnosticsOptions);
     setApiKey(apiKey: string | undefined): void;
+    get savingsEnabled(): boolean;
+    get savingsAccount(): object | undefined;
+    /** A turn that finishes after re-keying still belongs to the key it started with. */
+    bindSavings(): ((value: unknown) => void) | undefined;
+    suspendSavings(): void;
     /** Add context fields (allowlisted; later values win). */
     setContext(fields: Record<string, unknown>): void;
     record(name: string, fields?: Record<string, unknown>): void;
-    /** Cumulative, retryable metadata; bounded and never sent without a user key. */
     reportSavings(value: unknown): void;
     /** Like record, but at most MAX_REPEATS times per `key` in this process. */
     recordLimited(key: string, name: string, fields?: Record<string, unknown>): void;
@@ -94,9 +96,6 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     /** The exact JSON body a batch of these events is sent as (tests read it). */
     batchBody(events: DiagnosticsEvent[]): string;
     private send;
-    private flushSavings;
-    private sendSavings;
-    private deferLegacyReport;
     private headers;
     private track;
     private now;

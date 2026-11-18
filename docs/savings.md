@@ -4,15 +4,14 @@ This is an estimated comparison with plain Claude Code, expressed in API-price
 USD. It does not measure a Claude subscription bill. `src/savings.ts` is display
 accounting only and never changes routing or context sizing.
 
-For each successful forwarded response, take the original request snapshot before
-MemTree transforms it. Price the plain counterfactual against actual Anthropic
-response usage. Input, cache reads, five-minute writes, one-hour writes, and
-output are distinct buckets. The aggregate creation count includes both creation
+ccc uses the original Claude request and the delivered response to estimate a plain
+counterfactual. Polychat prices the ordinary input, cache reads, five-minute writes,
+one-hour writes and output independently for each side. The aggregate creation count includes both creation
 durations; it is not an additional bucket. Invalid, negative, fractional, or
-inconsistent usage makes the session incomplete. A missing cache-duration split
+inconsistent usage marks that turn incomplete. A missing cache-duration split
 uses the historical five-minute creation bucket; missing input/output is invalid.
 
-The session arithmetic is:
+Polychat computes each session and reporting period using the same formula.
 
 ```
 PURE = cumulative plain API cost - cumulative actual API cost
@@ -21,12 +20,10 @@ NET  = PURE - authoritative MemTree user charges
 Less Usage percent = 100 * NET / cumulative plain API cost
 ```
 
-Compression API cost and MemTree charges come only from the authenticated server
-snapshot. They are not reconstructed from client bytes, elapsed time, or local
-estimates. An absent/incomplete snapshot, an unknown model, or missing actual
-usage suppresses the monetary result rather than silently counting an expense as
-zero. Negative savings remain negative. Actual and plain USD totals exclude the
-server compression charge, so it is subtracted exactly once.
+Polychat prices both sets of buckets, subtracts its recorded compression costs and
+MemTree charges, and returns the session estimate. An unknown bucket or price, or
+incomplete charge coverage, suppresses the monetary claim. Signed values are retained
+for period arithmetic.
 
 ## Price policy
 
@@ -70,8 +67,6 @@ An unmodified request uses actual input usage (all input buckets summed) and
 actual cache/output buckets on both sides, including above the simulated compaction
 ceiling and after a previous compression. Only a delivered compressed context contributes
 an API cost difference. The status line shows progress until the first such turn.
-Snapshots from clients that did not record compression retain their cumulative counts
-and sequence. Their historical monetary comparison is marked incomplete.
 Modified requests use an exact
 original Count Tokens value when supplied; otherwise the module divides prompt
 string characters by four and rounds down. This modest estimate is deliberately
@@ -79,8 +74,7 @@ separate from the high safety token estimator used to decide whether requests
 fit. Opaque images/documents/audio/video and base64 sources contribute zero to
 the fallback estimate. This can understate their baseline expense. Estimates
 remain estimates: four characters per token is not a tokenizer or a formal
-lower bound, and language/code mixes can differ. The state counts estimated
-turns for display. Callers must never pass a high safety sizing estimate as an
+lower bound, and language/code mixes can differ. Callers must never pass a high safety sizing estimate as an
 exact original count.
 
 Plain context is finite. Each lane has a ceiling equal to the smaller of 80% of
@@ -92,9 +86,7 @@ Another simulated threshold crossing compacts again. Observed edits or transcrip
 the virtual removal. Request framing and changing Claude Code billing attribution
 such as `cch` do not alter that conversation boundary. This deliberately inexpensive summary and free compaction
 favor plain Claude; actual Claude Code's trigger, summary size, generation cost,
-quality, and subsequent outputs can differ. The cumulative `window_crossings` counter counts observed original requests
-whose input exceeds the full native model window; an early simulated compaction
-at 80% does not increment it. No baseline request is priced as
+quality, and subsequent outputs can differ. The `window_crossing` flag indicates that the original input exceeded the full native model window. No baseline request is priced as
 an impossible unlimited context. Output tokens are held equal to the observed
 response because alternate plain outputs cannot be measured.
 
@@ -117,73 +109,50 @@ establish warm original-prefix coverage. After a passthrough, the simulation giv
 plain the benefit of observed cache coverage for its possible lifetime. An upstream
 read of unknown age or duration is allowed up to one hour. This can lower the baseline. Synthetic compaction changes cache
 identity and cannot inherit those reads; it must write new eligible entries
-before reusing them. Hashes never leave the local accounting file.
+before reusing them. The launcher keeps these hashes in memory.
 
 The virtual compacted token minimum can omit original tool/system overhead,
 which lowers the plain baseline; it is not an exact reconstruction of Claude's
 compacted prompt. Consequently the comparison is an estimate, not a guaranteed
 mathematical lower bound or a claim of identical task quality.
 
-## Persistence and integration
+## Turn log and delivery
 
-`accountSavingsTurn(state, input)` returns immutable `{state, turn}`. Call it
-once per successful, billable response. The tracker serializes settlements across processes
-with private per-contender lock markers, reloads the latest state, then commits the new
-sequence and totals by atomic rename. A process that encounters contention retries after
-a randomized delay. Dead writers' unique markers can be removed safely.
-Use a distinct `laneKey` for each agent conversation; main is the default.
-Capture the original request before mutation. `requestModified` describes the
-request actually forwarded. `contextWindow` is the active model window, and
-`outputReserve` may override the original `max_tokens`. Optional
-`progress_tokens` and `budget_tokens` preserve display progress.
+An attributable upstream response produces a new UUID and one immutable record.
+The UTC timestamp comes from upstream dispatch. The launcher validates the session
+UUID and copies only the model, fast-mode flag, native-window crossing flag and the
+five plain and actual token buckets. ccc also records the number of attributable
+MemTree submissions expected to produce usage rows. It tags those submissions with
+the turn UUID. A definite pre-work validation or authentication rejection removes
+that submission from the expected count. Detached work has its own server timestamp.
+Missing final usage is represented by null. A definitive, nonbillable upstream
+rejection records zero on both sides. If Claude never received an upstream request,
+there is no dispatch timestamp and linked preflight work remains pending.
+The plain-cache simulation retains bounded, per-lane observations in launcher memory.
+A resumed process starts its cache simulation from the evidence available on that turn.
 
-`createSavingsState(sessionId)`, `loadSavingsState(directory, sessionId)`, and
-`saveSavingsState(directory, state)` use UUID session identity. Loading and
-saving fail closed without throwing; creating a state rejects a non-UUID.
-Persistence uses an injected directory, private 0600 files, a 0700 newly created
-directory, exclusive temporary-file creation, and atomic rename. Files larger
-than 600 KB, symlinks, unexpected fields, malformed values, and foreign session
-IDs are rejected. Hourly background maintenance retains the newest 512 session files of each kind
-and rechecks a file's modification time under the session lock before deletion. Each
-session holds at most 32 lanes and 128 prefix checkpoints per lane. Evicted lane
-history loses its cache/compaction model; cumulative monetary totals survive.
-Before pruning a full session file, ccc saves its cumulative counters, completeness
-and sequence in a private, compact per-session file under `savings-totals/`. A
-resumed session continues from those totals and rebuilds evicted lane history.
+Each account log is a directory of private one-line JSONL segments. The directory
+is scoped by a digest of the service URL and credential. A writer exclusively creates a private segment, appends one line and syncs it. Readers
+consume only newline-terminated records. The
+background sender can therefore remove individual acknowledged turns while another
+process appends or drains its own records. The original record never changes.
+Concurrent deliveries of the same ID are safe to replay.
 
-No prompt, message, tool result, credential, or tool argument is persisted by
-this module. Local hashes and model IDs are accounting metadata. Send only the
-explicit server savings projection (schema, session_id, sequence, totals,
-completeness, turns, crossings, actual token counts); never send local prefix
-hashes or lane state. The UUID is needed to associate authoritative server costs
-with the same session. The tracker validates it before bookkeeping, reporting or fetching costs.
+The sender posts up to 50 turns to `/v1/ccc/savings/turns`. Only IDs in a readable
+`acked_turn_ids` response are removed. The filename records the next eligible retry
+time, starting at one minute and doubling to a maximum of 30 minutes. Missing
+acknowledgements survive restarts. An invalid credential suspends the sender.
+Savings reporting honors the existing diagnostics opt-outs. A failing disk or an
+unreachable service cannot hold up the upstream request.
 
-Diagnostics stores the latest pending cumulative report per session in a private outbox,
-scoped to the service URL and credential. A successful POST must acknowledge durable
-storage (or an already-stored newer sequence) for the same UUID. The response contract is
+## Status line
 
-```json
-{"savings_stored":{"session_id":"12345678-1234-4123-8123-123456789abc","sequence":42}}
-```
-
-A lower sequence or explicit storage failure keeps the report pending. An older
-server that omits the acknowledgement field gets retries starting at one minute,
-doubling to a maximum of 30 minutes. The retry schedule survives restarts.
-After four hours, another response without the field drops that sequence and writes
-a local entry to `savings.log` in the config directory. A new cumulative sequence
-can be sent immediately. Each sequence has a distinct filename, so an earlier
-acknowledgement cannot delete a newer report.
-
-Trackers serialize provisional progress and settled updates with the session lock.
-Each published turn has a generation ID. A background billing refresh can update
-the status view only while both its settled sequence and generation are current.
-
-Savings reuses the parsed request and the delivery planner's selected candidate. A
-passthrough needs only observed usage. On large modified requests, the existing sizing
-fingerprint also verifies the previous message bytes. Verified appends resume the prefix
-hashes and text weights at the checkpoint and process new blocks. An edit rebuilds the
-affected history. Cold or evicted checkpoints require a full observation. The local
-replay cache holds hashes, weights and cache positions for up to 32 lanes.
+The hook asks its launcher's loopback proxy for the current session view. The proxy
+fetches the authenticated server session total with a ten-second cache. It combines
+that value with the main conversation's local progress toward its compression budget.
+An offline refresh can reuse the last known value. Missing, incomplete and nonpositive
+results use the progress display. The status line budgets terminal cells and drops the
+percentage first on narrow terminals.
 
 ## Worked example
 
@@ -196,11 +165,7 @@ compression API cost and `$0.016` MemTree charges, gross is `$0.116`, net is
 `$0.100`, and estimated plan-usage reduction is `52.1%` (`.100/.192`).
 These are synthetic arithmetic examples, not measurements from customer sessions.
 
-The terminal integration includes attributable main, agent, recap, and passthrough
-calls. A new request invalidates the current billing view until an authoritative
-response arrives for the settled local generation. Local token totals update at
-response completion; pending costs show progress. After the final turn, billing
-refreshes are bounded to six further one-minute polls. Recorded read/search charges
-can lag by about six minutes under the server's existing ledger. Reporting honors
-all existing diagnostics opt-outs; retrieving the user's own costs remains available.
-No historical turns before this feature began observing the session are reconstructed.
+The terminal integration includes attributable main, agent, recap and passthrough
+calls. The server can only price turns the client observed and delivered. Buffered
+read/search charges can arrive after the turn. Periods are recomputed from the work's
+UTC timestamps as further records and charges become available.

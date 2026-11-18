@@ -1,43 +1,35 @@
 {
   "request": {
-    "schema": 1,
-    "install_id": "3f2b8c1e-9d4a-4b7e-8c21-5a6f0e9d1b23",
-    "context": {
-      "ccc_version": "1.0.0",
-      "node": "24.0.0",
-      "os": "linux",
-      "os_release": "6.1",
-      "arch": "x64",
-      "terminal": "none",
-      "locale": "en-US",
-      "wsl": false
-    },
-    "events": [],
-    "savings": {
-      "schema": 1,
-      "session_id": "12345678-1234-4123-8123-123456789abc",
-      "sequence": 42,
-      "plain_api_usd": 10,
-      "actual_api_usd": 4,
-      "costs_complete": true,
-      "turns": 42,
-      "window_crossings": 1,
-      "token_counts": {
-        "input": 100,
-        "cache_read": 20,
-        "cache_creation_5m": 3,
-        "cache_creation_1h": 4,
-        "output": 25
+    "turns": [
+      {
+        "turn_id": "ff0baa4e-c487-465f-87a6-8776d7525bbe",
+        "session_id": "12345678-1234-4123-8123-123456789abc",
+        "requested_at": "2026-11-16T23:59:59.900Z",
+        "model": "claude-sonnet-4-6",
+        "fast_mode": false,
+        "window_crossing": false,
+        "actual": {
+          "input": 100,
+          "cache_read": 20,
+          "cache_creation_5m": 3,
+          "cache_creation_1h": 4,
+          "output": 25
+        },
+        "plain": {
+          "input": 1000,
+          "cache_read": 20,
+          "cache_creation_5m": 3,
+          "cache_creation_1h": 4,
+          "output": 25
+        },
+        "expected_memtree_calls": 1
       }
-    }
+    ]
   },
-  "status": 202,
+  "status": 200,
   "response": {
-    "accepted": 0,
-    "dropped": 0,
-    "savings_stored": {
-      "session_id": "12345678-1234-4123-8123-123456789abc",
-      "sequence": 42
-    }
+    "acked_turn_ids": [
+      "ff0baa4e-c487-465f-87a6-8776d7525bbe"
+    ]
   }
 }

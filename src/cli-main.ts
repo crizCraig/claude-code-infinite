@@ -15,6 +15,7 @@
 
 import spawn from "cross-spawn";
 import { SavingsTracker } from "./savings-tracker.js";
+import { isKeyRejected } from "./key-page.js";
 import { exec } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
@@ -241,6 +242,7 @@ async function handleInvalidKey(
   ctx: { mode: Mode; baseUrl: string; apiKey: string; interactive: boolean;
     diagnostics: Diagnostics }
 ): Promise<{ apiKey: string; check: KeyCheck }> {
+  if (check === "invalid") ctx.diagnostics.suspendSavings();
   if (check === "invalid" && ctx.interactive) ctx.diagnostics.flushNow(); // may quit at the gate
   const color = terminalSupportsColor();
   const result = await resolveInvalidKey(check, ctx.apiKey, {
@@ -772,11 +774,16 @@ async function main() {
 
   // Start the local proxy. Claude Code's OAuth token flows through it straight
   // to api.anthropic.com and never reaches polychat.co.
+  let savingsKeyInvalid = checked.check === "invalid";
+  const suspendSavings = () => {
+    savingsKeyInvalid = true;
+    diagnostics.suspendSavings();
+  };
   const memtree = new MemtreeClient({
     baseUrl: memtreeBaseUrl,
     apiKey: polychatApiKey,
     debug: isDebugMode,
-    reqlog: observedLog,
+    reqlog: observedLog, onInvalidKey: suspendSavings,
     // Mutable below: a failed config write withdraws it before any call.
     memtreeTools: memtreeMcpPlan.tools.length ? memtreeMcpPlan.tools.join(",") : undefined,
     paymentLinks,
@@ -866,11 +873,17 @@ async function main() {
     newestTrees: new NewestTreeLookup((path, signal) =>
       memtree.fetchMemTree(path, "application/json", signal)
     ),
-    // Local API-equivalent totals; authoritative MemTree bills refresh in the background.
+    // Each launcher holds the plain prompt cache for its own account and sessions.
     savings: new SavingsTracker({ usageUrl: memtree.usageDashboardUrl, diagnostics,
-      fetchCosts: async (sessionId: string) => {
+      fetchTotal: async (sessionId: string) => {
+        const unavailable = {session_id:sessionId.toLowerCase(), costs_complete:false};
+        if (savingsKeyInvalid || !diagnostics.savingsEnabled) return unavailable;
         const result = await memtree.fetchMemTree(
-          `/v1/ccc/savings/${encodeURIComponent(sessionId)}`, "application/json", AbortSignal.timeout(3000));
+          `/v1/ccc/savings/${encodeURIComponent(sessionId.toLowerCase())}`, "application/json", AbortSignal.timeout(1000));
+        if (isKeyRejected(result.status, result.body.toString("utf-8"))) {
+          suspendSavings();
+          return unavailable;
+        }
         return result.status === 200 ? JSON.parse(result.body.toString("utf-8")) : undefined;
       } }),
     // The link Claude Code's status line shows, refreshed as trees finish.

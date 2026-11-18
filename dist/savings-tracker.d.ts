@@ -1,30 +1,29 @@
-import { type SavingsTurnInput, type SavingsPromptCheckpoint } from './savings.js';
+import { SavingsObservation } from './savings-turn.js';
+import type { Diagnostics } from './diagnostics.js';
 import { SavingsHistory } from './savings-history.js';
-import type { DiagnosticsRecorder } from './diagnostics.js';
-export interface SavingsTrackerOptions {
-    dir?: string;
+import type { SavingsView } from './savings-status.js';
+import { type SavingsPromptCheckpoint, type SavingsTurnInput } from './savings.js';
+interface SavingsTrackerOptions {
     usageUrl?: string;
-    diagnostics?: DiagnosticsRecorder;
-    fetchCosts?: (sessionId: string) => Promise<unknown>;
+    diagnostics?: Pick<Diagnostics, 'savingsAccount' | 'bindSavings'>;
+    fetchTotal?: (sessionId: string) => Promise<unknown>;
+    now?: () => number;
 }
 export declare class SavingsTracker {
     private readonly opts;
     readonly history: SavingsHistory<SavingsPromptCheckpoint>;
-    private readonly states;
-    private readonly epochs;
-    private readonly active;
-    private readonly inFlight;
-    private readonly timers;
-    private readonly remote;
-    private readonly dir;
+    private readonly sessions;
+    private readonly account?;
     constructor(opts?: SavingsTrackerOptions);
-    /** Invalidate the previous billing view before this turn can start new MemTree work. */
-    begin(id: string, progress?: number, budget?: number): Promise<void>;
-    settle(id: string, input: SavingsTurnInput): Promise<void>;
-    cancel(id: string): void;
-    private endAttempt;
-    private get;
-    private publish;
+    /** Only a main conversation request updates the launcher's budget indicator. */
+    progress(id: unknown, tokens: number, budget: number): void;
+    startTurn(id: unknown): SavingsObservation | undefined;
+    /** Settle once. A request refused locally has no upstream timestamp to report. */
+    settle(observation: SavingsObservation, input: SavingsTurnInput, status: number): void;
+    /** Called only by the status line. One fetch per session per ten seconds, including failures. */
+    view(id: unknown): Promise<SavingsView | undefined>;
     private refresh;
+    private session;
 }
+export {};
 //# sourceMappingURL=savings-tracker.d.ts.map

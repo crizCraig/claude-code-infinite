@@ -1,23 +1,20 @@
-import { type SavingsReport } from './savings-report.js';
-export interface LegacyRetry {
-    since: number;
-    next: number;
-    attempts: number;
-}
-export interface PendingSavings {
-    report: SavingsReport;
-    retry?: LegacyRetry;
-}
+import { type SavingsRecord } from './savings-report.js';
+type Send = (turns: SavingsRecord[]) => Promise<Response>;
 export declare class SavingsOutbox {
+    private readonly send;
+    private readonly now;
     private readonly directory;
-    constructor(configDir: string, baseUrl: string, apiKey: string);
-    restore(): Map<string, PendingSavings>;
-    private readRetry;
-    saveRetry(report: SavingsReport, retry: LegacyRetry): void;
-    clearRetry(report: SavingsReport): void;
-    save(report: SavingsReport): boolean;
-    private write;
-    remove(report: SavingsReport): void;
-    private file;
+    private readonly writes;
+    private drain?;
+    private suspended;
+    constructor(configDir: string, baseUrl: string, key: string, send: Send, now: () => number);
+    get enabled(): boolean;
+    suspend(): void;
+    append(value: unknown): void;
+    private publish;
+    flush(): Promise<void>;
+    private sendPending;
+    private sendBatch;
 }
+export {};
 //# sourceMappingURL=savings-outbox.d.ts.map

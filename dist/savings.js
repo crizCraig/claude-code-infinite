@@ -1,7 +1,5 @@
-/** Display-only session accounting. Never controls routing, context sizing, or billing. */
-import { createHash, randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
+/** Process-local prompt cache model for a single turn's plain-Claude-Code counterfactual. */
+import { createHash } from 'node:crypto';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isSavingsSessionId(value) {
     return typeof value === 'string' && value.length === 36 && UUID.test(value);
@@ -9,14 +7,10 @@ export function isSavingsSessionId(value) {
 const MAX_TOKENS = 1_000_000_000;
 const MAX_LANES = 32;
 const MAX_PREFIXES = 128;
-const MAX_FILE_BYTES = 600_000;
-const zero = () => ({ input: 0, cache_read: 0, cache_creation_5m: 0, cache_creation_1h: 0, output: 0 });
 const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const count = (v) => Number.isSafeInteger(v) && v >= 0 && v <= MAX_TOKENS;
-const money = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1e12;
 const hash = (s) => createHash('sha256').update(s).digest('hex');
 const totalInput = (v) => v.input + v.cache_read + v.cache_creation_5m + v.cache_creation_1h;
-const add = (a, b) => Object.fromEntries(Object.keys(a).map(k => [k, a[k] + b[k]]));
 /** Cache creation total includes its duration buckets; never count it twice. */
 export function normalizeSavingsUsage(value) {
     if (!record(value) || !count(value.input_tokens) || !count(value.output_tokens))
@@ -38,36 +32,8 @@ export function normalizeSavingsUsage(value) {
         return;
     return { input: value.input_tokens, cache_read: read, cache_creation_5m: five, cache_creation_1h: hour, output: value.output_tokens };
 }
-const standardRates = {
-    'opus/5.5': 4, 'sonnet/5.5': 2, 'sonnet/5.0': 2,
-    'fable/5.2': 8, 'mythos/5.2': 8, 'fable/5.1': 10, 'mythos/5.1': 10, 'fable/5.0': 10, 'mythos/5.0': 10,
-    'opus/5.0': 5, 'opus/4.5': 5, 'opus/4.6': 5, 'opus/4.7': 5, 'opus/4.8': 5,
-    'opus/4.0': 15, 'opus/4.1': 15, 'sonnet/4.0': 3, 'sonnet/4.5': 3, 'sonnet/4.6': 3, 'haiku/4.5': 1,
-};
-const fastRates = {
-    'opus/5.5': 8, 'opus/5.0': 10, 'opus/4.8': 10, 'fable/5.2': 16, 'mythos/5.2': 16,
-};
-/** Published base input prices, checked 2026-11-17. Unknown generations are unpriced. */
-export function modelInputPriceUsd(model, inputTokens, fast = false) {
-    const m = /^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[-.](\d{1,2})(?=$|-))?(?:-(?:\d{8}|latest))?$/.exec(model.toLowerCase());
-    if (!m)
-        return;
-    const family = m[1], version = `${m[2]}.${m[3] ?? '0'}`;
-    if (fast)
-        return fastRates[`${family}/${version}`];
-    if (family === 'haiku' && version === '5.5')
-        return inputTokens <= 100_000 ? .1 : .5;
-    return standardRates[`${family}/${version}`];
-}
-function cost(tokens, price) {
-    // Craig's explicit comparison policy; some current published cache rates differ.
-    return price * (tokens.input + .1 * tokens.cache_read + 1.25 * tokens.cache_creation_5m + 2 * tokens.cache_creation_1h + 5 * tokens.output) / 1e6;
-}
-export function createSavingsState(sessionId) {
-    if (!isSavingsSessionId(sessionId))
-        throw new Error('Savings session ID must be a UUID');
-    return { schema: 1, session_id: sessionId, sequence: 0, costs_complete: true, has_compressed: false, turns: 0, window_crossings: 0,
-        plain_api_usd: 0, actual_api_usd: 0, token_counts: zero(), plain_token_counts: zero(), estimated_turns: 0, lanes: {} };
+export function createSavingsState() {
+    return { lanes: {} };
 }
 /** A modest text estimate, intentionally unrelated to the high safety fit estimator.
  * Opaque media contributes zero; exclude API controls and base64 rather than inflate savings. */
@@ -261,12 +227,6 @@ export function accountSavingsTurn(previous, input) {
     }
     const reportedSpeed = record(input.usage) ? input.usage.speed : undefined;
     const fast = (reportedSpeed ?? request.speed) === 'fast';
-    const actualRate = actual ? modelInputPriceUsd(model, totalInput(actual), fast) : undefined;
-    const plainRate = modelInputPriceUsd(model, plainInput, fast);
-    const complete = actual !== undefined && actualRate !== undefined && plainRate !== undefined && count(input.contextWindow) && input.contextWindow > 0 && Number.isFinite(now);
-    const actualCost = actual && actualRate !== undefined ? cost(actual, actualRate) : 0;
-    // Incomplete observations never manufacture a positive delta.
-    const plainCost = complete ? cost(plain, plainRate) : actualCost;
     const lanes = { ...previous.lanes };
     if (!(laneKey in lanes) && Object.keys(lanes).length >= MAX_LANES)
         delete lanes[Object.keys(lanes).sort((a, b) => lanes[a].at - lanes[b].at)[0]];
@@ -281,122 +241,9 @@ export function accountSavingsTurn(previous, input) {
         lanes[laneKey] = { ...lane, at: now, warm: { at: now, five: actual.cache_creation_5m,
                 hour: actual.cache_creation_1h + actual.cache_read } };
     }
-    const state = { ...previous, sequence: previous.sequence + 1, turns: previous.turns + 1,
-        has_compressed: previous.has_compressed === true || input.requestModified,
-        costs_complete: previous.costs_complete && complete, window_crossings: previous.window_crossings + Number(original > window),
-        plain_api_usd: previous.plain_api_usd + plainCost, actual_api_usd: previous.actual_api_usd + actualCost,
-        token_counts: add(previous.token_counts, actual ?? zero()), plain_token_counts: add(previous.plain_token_counts, plain),
-        estimated_turns: previous.estimated_turns + Number(inputSource === 'estimated'), lanes };
-    if (count(input.progress_tokens))
-        state.progress_tokens = input.progress_tokens;
-    if (count(input.budget_tokens))
-        state.budget_tokens = input.budget_tokens;
-    return { state, turn: { original_input_tokens: original, plain_input_tokens: plainInput, input_source: inputSource,
-            compacted, plain_tokens: plain, actual_tokens: actual, plain_api_usd: plainCost, actual_api_usd: actualCost, costs_complete: complete } };
-}
-export function savingsSummary(state, remote) {
-    const complete = state.costs_complete && remote?.costs_complete === true && money(remote.memtree_charged_usd) && money(remote.compression_api_usd);
-    const pure = complete && state.has_compressed ? state.plain_api_usd - state.actual_api_usd - remote.compression_api_usd : null;
-    const net = pure === null ? null : pure - remote.memtree_charged_usd;
-    return { pure_usd: pure, net_usd: net, net_percent: net !== null && state.plain_api_usd > 0 ? 100 * net / state.plain_api_usd : null,
-        less_usage_percent: net !== null && state.plain_api_usd > 0 ? 100 * net / state.plain_api_usd : null,
-        costs_complete: complete, estimated: state.estimated_turns > 0, plain_api_usd: state.plain_api_usd, actual_api_usd: state.actual_api_usd };
-}
-const onlyKeys = (v, keys) => Object.keys(v).every(k => keys.includes(k));
-function validState(value, sessionId) {
-    if (!record(value) || value.schema !== 1 || value.session_id !== sessionId || typeof value.costs_complete !== 'boolean')
-        return false;
-    if (!onlyKeys(value, ['schema', 'session_id', 'sequence', 'costs_complete', 'turns', 'window_crossings', 'plain_api_usd', 'actual_api_usd', 'token_counts', 'plain_token_counts', 'estimated_turns', 'has_compressed', 'progress_tokens', 'budget_tokens', 'lanes']))
-        return false;
-    if (!['sequence', 'turns', 'window_crossings', 'estimated_turns'].every(k => count(value[k])))
-        return false;
-    if (value.has_compressed !== undefined && typeof value.has_compressed !== 'boolean')
-        return false;
-    if (!money(value.plain_api_usd) || !money(value.actual_api_usd))
-        return false;
-    for (const name of ['token_counts', 'plain_token_counts']) {
-        if (!record(value[name]) || !onlyKeys(value[name], Object.keys(zero())) || !Object.keys(zero()).every(k => typeof value[name][k] === 'number' && Number.isSafeInteger(value[name][k]) && value[name][k] >= 0))
-            return false;
-    }
-    if (!record(value.lanes) || Object.keys(value.lanes).length > MAX_LANES)
-        return false;
-    if ([value.progress_tokens, value.budget_tokens].some(v => v !== undefined && !count(v)))
-        return false;
-    return Object.entries(value.lanes).every(([key, lane]) => /^[a-f0-9]{64}$/.test(key) && record(lane) &&
-        onlyKeys(lane, ['prefixes', 'full_hash', 'at', 'removed', 'model', 'warm']) &&
-        (lane.warm === undefined || record(lane.warm) && onlyKeys(lane.warm, ['five', 'hour', 'at']) &&
-            count(lane.warm.five) && count(lane.warm.hour) && Number.isSafeInteger(lane.warm.at) && lane.warm.at >= 0) &&
-        typeof lane.model === 'string' && lane.model.length <= 100 && Number.isSafeInteger(lane.at) && lane.at >= 0 && count(lane.removed) &&
-        typeof lane.full_hash === 'string' && /^[a-f0-9]{64}$/.test(lane.full_hash) && Array.isArray(lane.prefixes) && lane.prefixes.length <= MAX_PREFIXES &&
-        lane.prefixes.every((p) => record(p) && onlyKeys(p, ['hash', 'tokens', 'ttl', 'at']) && [300_000, 3_600_000].includes(p.ttl) && Number.isSafeInteger(p.at) && p.at >= 0 && typeof p.hash === 'string' && /^[a-f0-9]{64}$/.test(p.hash) && count(p.tokens)));
-}
-/** Fail closed on corrupt, oversized, redirected, or foreign-session files. */
-export function loadSavingsState(directory, sessionId) {
-    if (!isSavingsSessionId(sessionId))
-        return;
-    let fd;
-    try {
-        if (!fs.lstatSync(directory).isDirectory())
-            return;
-        const name = `${sessionId}.savings.json`;
-        let file = path.join(directory, name);
-        let stat = fs.lstatSync(file, { throwIfNoEntry: false });
-        if (!stat) {
-            const totalsDir = path.join(directory, 'savings-totals');
-            if (!fs.lstatSync(totalsDir).isDirectory())
-                return;
-            file = path.join(totalsDir, name);
-            stat = fs.lstatSync(file);
-        }
-        if (!stat.isFile())
-            return;
-        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-        if (fs.fstatSync(fd).size > MAX_FILE_BYTES)
-            return;
-        const value = JSON.parse(fs.readFileSync(fd, 'utf8'));
-        if (!validState(value, sessionId))
-            return;
-        // Older totals cannot distinguish a cache-write estimate from observed savings.
-        if (value.has_compressed === undefined && value.turns > 0)
-            value.costs_complete = false;
-        return value;
-    }
-    catch {
-        return;
-    }
-    finally {
-        if (fd !== undefined)
-            fs.closeSync(fd);
-    }
-}
-/** One writer per session; callers serialize settlement. Atomic rename protects resumed readers. */
-export function saveSavingsState(directory, state) {
-    if (!isSavingsSessionId(state.session_id) || !validState(state, state.session_id))
-        return false;
-    let temp;
-    try {
-        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-        if (!fs.lstatSync(directory).isDirectory())
-            return false;
-        const serialized = JSON.stringify(state);
-        if (Buffer.byteLength(serialized) > MAX_FILE_BYTES)
-            return false;
-        temp = path.join(directory, `.${state.session_id}.${randomUUID()}.tmp`);
-        fs.writeFileSync(temp, serialized, { flag: 'wx', mode: 0o600 });
-        fs.renameSync(temp, path.join(directory, `${state.session_id}.savings.json`));
-        temp = undefined;
-        return true;
-    }
-    catch {
-        return false;
-    }
-    finally {
-        if (temp) {
-            try {
-                fs.unlinkSync(temp);
-            }
-            catch { /* best effort */ }
-        }
-    }
+    return { state: { lanes }, turn: {
+            original_input_tokens: original, plain_input_tokens: plainInput, input_source: inputSource,
+            compacted, plain_tokens: plain, actual_tokens: actual, fast_mode: fast, window_crossing: original > window,
+        } };
 }
 //# sourceMappingURL=savings.js.map

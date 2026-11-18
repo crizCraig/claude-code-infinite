@@ -11937,7 +11937,8 @@ test('savings includes same-session monitor and title passthrough usage', async 
   const proxy = await startProxy({
     memtree: new MemtreeClient({baseUrl:upstream.origin,apiKey:'test'}),
     upstreamOrigin:upstream.origin,
-    savings: {begin(...args){starts.push(args)},cancel(){},settle(id,input){settled.push({id,input})}},
+    savings: {startTurn(sessionId){return {sessionId,work:meta=>meta}},progress(...args){starts.push(args)},
+      settle(observed,input){settled.push({id:observed.sessionId,input})}},
   });
   try {
     for (const [system,content] of [
@@ -11956,7 +11957,7 @@ test('savings includes same-session monitor and title passthrough usage', async 
     assert.equal(settled[1].input.requestModified,false);
     assert.equal(settled[0].input.usage.input_tokens,1);
     assert.equal(settled[1].input.usage.output_tokens,1);
-    assert.ok(starts.every(([,progress,budget])=>progress===undefined && budget===undefined));
+    assert.deepEqual(starts,[]);
     assert.ok(settled.every(({input})=>input.progress_tokens===undefined && input.budget_tokens===undefined));
     assert.notEqual(settled[0].input.laneKey,settled[1].input.laneKey);
   } finally { proxy.close();upstream.close(); }

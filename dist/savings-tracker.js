@@ -1,151 +1,124 @@
-/** Proxy settlement adapter: local totals first; authoritative billing refresh in background. */
-import { randomUUID } from 'node:crypto';
-import { createSavingsState, accountSavingsTurn, loadSavingsState, saveSavingsState, isSavingsSessionId, savingsSummary } from './savings.js';
+import { SavingsObservation } from './savings-turn.js';
 import { SavingsHistory } from './savings-history.js';
-import { scheduleSavingsPrune, withSavingsLock } from './savings-storage.js';
-import { statusLinkDir } from './status-link.js';
-import { readSavingsView, writeSavingsView } from './savings-status.js';
+import { accountSavingsTurn, createSavingsState, isSavingsSessionId } from './savings.js';
 export class SavingsTracker {
     opts;
     history = new SavingsHistory();
-    states = new Map();
-    epochs = new Map();
-    active = new Map();
-    inFlight = new Set();
-    timers = new Map();
-    remote = new Map();
-    dir;
+    sessions = new Map();
+    account;
     constructor(opts = {}) {
         this.opts = opts;
-        this.dir = opts.dir ?? statusLinkDir();
+        this.account = opts.diagnostics?.savingsAccount;
     }
-    /** Invalidate the previous billing view before this turn can start new MemTree work. */
-    async begin(id, progress, budget) {
-        if (!isSavingsSessionId(id))
+    /** Only a main conversation request updates the launcher's budget indicator. */
+    progress(id, tokens, budget) {
+        if (!isSavingsSessionId(id) || !(budget > 0) || !Number.isFinite(tokens))
+            return;
+        const session = this.session(id);
+        session.progress = Math.max(0, Math.floor(tokens));
+        session.budget = budget;
+    }
+    startTurn(id) {
+        const enabled = () => this.account !== undefined && this.account === this.opts.diagnostics?.savingsAccount;
+        if (!isSavingsSessionId(id) || !enabled())
+            return;
+        const report = this.opts.diagnostics?.bindSavings();
+        if (report)
+            return new SavingsObservation(id.toLowerCase(), enabled, report);
+    }
+    /** Settle once. A request refused locally has no upstream timestamp to report. */
+    settle(observation, input, status) {
+        if (observation.closed)
+            return;
+        observation.closed = true;
+        if (input.nowMs === undefined)
             return;
         try {
-            await withSavingsLock(this.dir, id, () => {
-                const state = this.get(id);
-                const saved = loadSavingsState(this.dir, id);
-                if (saved && saved.sequence > state.sequence)
-                    Object.assign(state, saved);
-                if (progress !== undefined)
-                    state.progress_tokens = Math.max(0, Math.floor(progress));
-                if (budget !== undefined)
-                    state.budget_tokens = Math.max(1, Math.floor(budget));
-                this.epochs.set(id, randomUUID());
-                this.active.set(id, (this.active.get(id) ?? 0) + 1);
-                this.remote.delete(id);
-                this.publish(state);
+            const session = this.session(observation.sessionId);
+            const success = status >= 200 && status < 300;
+            // A conclusive upstream request rejection used zero tokens. Network failures,
+            // timeouts and server errors leave the actual bill unknown.
+            const usage = [400, 401, 403, 404, 413, 422, 429].includes(status)
+                ? { input_tokens: 0, output_tokens: 0 } : undefined;
+            const measured = success ? input : { ...input, requestModified: false, usage };
+            const { state, turn } = accountSavingsTurn(session.baseline, measured);
+            if (success && turn.actual_tokens)
+                session.baseline = state;
+            const model = input.model ?? input.request?.model;
+            observation.report({
+                turn_id: observation.id, session_id: observation.sessionId,
+                requested_at: new Date(input.nowMs).toISOString(), expected_memtree_calls: observation.calls,
+                model, fast_mode: turn.fast_mode, actual: turn.actual_tokens ?? null,
+                plain: turn.actual_tokens ? turn.plain_tokens : null, window_crossing: success && turn.window_crossing,
             });
         }
-        catch { /* Unsupported session identifiers never name files. */ }
+        catch { /* Accounting never determines request delivery. */ }
     }
-    async settle(id, input) {
+    /** Called only by the status line. One fetch per session per ten seconds, including failures. */
+    async view(id) {
         if (!isSavingsSessionId(id))
             return;
+        const session = this.session(id);
+        const now = (this.opts.now ?? Date.now)();
+        const owner = this.opts.diagnostics?.savingsAccount;
+        if (owner && owner !== this.account)
+            return;
+        if (this.opts.diagnostics && !owner) {
+            return { net_usd: null, less_usage_percent: null, costs_complete: false,
+                progress_tokens: session.progress, budget_tokens: session.budget };
+        }
+        if (this.opts.fetchTotal && !session.pending && now >= session.refreshAt) {
+            session.refreshAt = now + 10_000;
+            session.pending = this.refresh(id, session).finally(() => { session.pending = undefined; });
+        }
+        if (session.pending) {
+            let timer;
+            try {
+                await Promise.race([session.pending, new Promise(resolve => {
+                        timer = setTimeout(resolve, 100);
+                    })]);
+            }
+            finally {
+                clearTimeout(timer);
+            }
+        }
+        if (this.account !== this.opts.diagnostics?.savingsAccount)
+            return;
+        return {
+            ...(session.total ?? { net_usd: null, less_usage_percent: null, costs_complete: false }),
+            progress_tokens: session.progress, budget_tokens: session.budget,
+            url: this.opts.usageUrl && this.opts.usageUrl + '#savings',
+        };
+    }
+    async refresh(id, session) {
         try {
-            await withSavingsLock(this.dir, id, () => {
-                const local = this.get(id);
-                const previous = loadSavingsState(this.dir, id) ?? local;
-                const { state } = accountSavingsTurn(previous, input);
-                if (!saveSavingsState(this.dir, state))
-                    throw Error('Savings state write failed');
-                this.endAttempt(id);
-                this.epochs.set(id, randomUUID());
-                // A helper can settle while a main request is still showing provisional progress.
-                const view = this.active.get(id) && input.progress_tokens === undefined && local.sequence === previous.sequence
-                    ? { ...state, progress_tokens: local.progress_tokens, budget_tokens: local.budget_tokens } : state;
-                this.states.set(id, view);
-                this.opts.diagnostics?.reportSavings?.(state);
-                this.publish(view);
-            });
-            scheduleSavingsPrune(this.dir);
-            this.refresh(id);
+            const value = await this.opts.fetchTotal(id);
+            if (!value || typeof value !== 'object')
+                return;
+            const row = value;
+            if (!isSavingsSessionId(row.session_id) || row.session_id.toLowerCase() !== id.toLowerCase() ||
+                typeof row.costs_complete !== 'boolean')
+                return;
+            if (row.costs_complete && (typeof row.net_usd !== 'number' || !Number.isFinite(row.net_usd)))
+                return;
+            session.total = {
+                costs_complete: row.costs_complete, net_usd: row.costs_complete ? row.net_usd : null,
+                less_usage_percent: typeof row.net_percent === 'number' && Number.isFinite(row.net_percent)
+                    ? row.net_percent : null,
+            };
         }
-        catch {
-            this.endAttempt(id);
+        catch { /* Keep the last answer or show main-turn progress. */ }
+    }
+    session(id) {
+        id = id.toLowerCase();
+        let session = this.sessions.get(id);
+        if (!session) {
+            session = { baseline: createSavingsState(), progress: 0, budget: 1, refreshAt: 0 };
+            this.sessions.set(id, session);
+            if (this.sessions.size > 200)
+                this.sessions.delete(this.sessions.keys().next().value);
         }
+        return session;
     }
-    cancel(id) {
-        if (!isSavingsSessionId(id))
-            return;
-        this.endAttempt(id);
-        this.refresh(id);
-    }
-    endAttempt(id) {
-        this.active.set(id, Math.max(0, (this.active.get(id) ?? 0) - 1));
-        this.remote.delete(id);
-    }
-    get(id) {
-        let state = this.states.get(id);
-        if (!state) {
-            state = loadSavingsState(this.dir, id) ?? createSavingsState(id);
-            this.states.set(id, state);
-            if (this.states.size > 200) {
-                const oldest = this.states.keys().next().value;
-                this.states.delete(oldest);
-                this.epochs.delete(oldest);
-                this.remote.delete(oldest);
-                this.active.delete(oldest);
-                clearTimeout(this.timers.get(oldest));
-                this.timers.delete(oldest);
-            }
-        }
-        return state;
-    }
-    publish(state) {
-        const summary = savingsSummary(state, this.active.get(state.session_id) ? undefined : this.remote.get(state.session_id));
-        writeSavingsView(state.session_id, { ...summary, generation: this.epochs.get(state.session_id), less_usage_percent: summary.net_percent,
-            progress_tokens: state.progress_tokens ?? 0, budget_tokens: state.budget_tokens ?? 1,
-            url: this.opts.usageUrl ? `${this.opts.usageUrl}#savings` : undefined }, this.dir);
-    }
-    refresh(id, attempt = 0) {
-        if (!isSavingsSessionId(id) || !this.opts.fetchCosts || this.inFlight.has(id) || this.active.get(id))
-            return;
-        clearTimeout(this.timers.get(id));
-        this.timers.delete(id);
-        const epoch = this.epochs.get(id);
-        this.inFlight.add(id);
-        void this.opts.fetchCosts(id).then(value => withSavingsLock(this.dir, id, () => {
-            if (this.epochs.get(id) !== epoch || !this.states.has(id))
-                return;
-            const state = this.states.get(id);
-            if ((loadSavingsState(this.dir, id)?.sequence ?? 0) !== state.sequence)
-                return;
-            // A sibling begin can replace the view without advancing the settled sequence.
-            if (readSavingsView(id, this.dir)?.generation !== epoch)
-                return;
-            const costs = validCosts(value);
-            if (costs)
-                this.remote.set(id, costs);
-            this.publish(state);
-        })).catch(() => { }).finally(() => {
-            this.inFlight.delete(id);
-            if (this.epochs.get(id) !== epoch) {
-                this.refresh(id);
-                return;
-            }
-            // Bounded background refresh lets late index/billing rows catch up on the final turn.
-            if (attempt < 6 && this.states.has(id)) {
-                const timer = setTimeout(() => this.refresh(id, attempt + 1), 60_000);
-                timer.unref();
-                this.timers.set(id, timer);
-            }
-        });
-    }
-}
-function validCosts(value) {
-    if (!value || typeof value !== 'object')
-        return;
-    const v = value;
-    if (typeof v.costs_complete !== 'boolean')
-        return;
-    for (const k of ['memtree_charged_usd', 'compression_api_usd']) {
-        if (typeof v[k] !== 'number' || !Number.isFinite(v[k]) || v[k] < 0)
-            return;
-    }
-    return { costs_complete: v.costs_complete, memtree_charged_usd: v.memtree_charged_usd,
-        compression_api_usd: v.compression_api_usd };
 }
 //# sourceMappingURL=savings-tracker.js.map

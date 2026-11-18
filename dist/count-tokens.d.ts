@@ -100,7 +100,6 @@ export declare class CountTokensCooldowns {
     record(key: string, result: CountTokensResult): void;
 }
 export interface CountTokensSessionOptions {
-    bodyKey?: (bytes: Buffer) => string;
     upstream: CountTokensUpstream;
     headers: Record<string, string>;
     requestUrl: string | undefined;
@@ -113,7 +112,6 @@ export interface CountTokensSessionOptions {
     onAttempt?: (result: CountTokensResult) => void;
 }
 export interface CountTokensSession {
-    bodyKey?: (bytes: Buffer) => string;
     count(body: Buffer): Promise<CountTokensResult>;
     peekKey(key: string): CountTokensResult | undefined;
     peek(body: Buffer): CountTokensResult | undefined;

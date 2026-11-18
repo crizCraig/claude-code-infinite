@@ -4,8 +4,8 @@
  * - `ccc statusline` is a status-line command: it reads Claude Code's JSON from stdin,
  *   runs the user's own status-line command (if `install` wrapped one) with the same
  *   input, and appends ` | 🌿 tree` (an OSC 8 link to the session's newest MemTree page;
- *   the bare URL where the terminal has no hyperlinks). It only reads the cached link the
- *   proxy writes (status-link.ts): never a server call, so the status line stays fast.
+ *   the bare URL where the terminal has no hyperlinks). It reads the cached tree link and asks its own
+ *   ccc launcher for session savings.
  * - `ccc statusline install` points Claude Code's `statusLine` at it, keeping the existing
  *   command, which it wraps rather than replaces; settings.json is backed up first. The
  *   first interactive run does it once by default (statusline-auto.ts).
@@ -62,7 +62,7 @@ export async function statuslineMain(args, paths = statuslinePaths(), out = (tex
     return 0;
 }
 /** The status line: the wrapped command's output, then the session's link. */
-export async function renderStatusline(input, paths, env = process.env) {
+export async function renderStatusline(input, paths, env = process.env, get = fetch) {
     if (env[WRAPPED_ENV])
         return "";
     const wrapped = savedStatusLine(savedFile(paths));
@@ -73,7 +73,7 @@ export async function renderStatusline(input, paths, env = process.env) {
     const available = columns - visibleWidth(base) - (base ? visibleWidth(STATUSLINE_SEPARATOR) : 0);
     const tree = visibleWidth(link) <= available ? link : "";
     const remaining = available - (tree ? visibleWidth(tree) + 3 : 0);
-    const savings = renderSavingsSegment(readSavingsView(id, paths.links), env, remaining);
+    const savings = renderSavingsSegment(await readSavingsView(id, env, get), env, remaining);
     const segment = [savings, tree].filter(Boolean).join(" · ");
     if (!segment)
         return base;

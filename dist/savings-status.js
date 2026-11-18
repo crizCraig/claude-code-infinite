@@ -1,40 +1,21 @@
-/** Local-only status view. No network calls on Claude Code's status-line path. */
-import fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { terminalSupportsHyperlinks } from './hooks.js';
-import { statusLinkDir } from './status-link.js';
-const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-export function readSavingsView(id, dir = statusLinkDir()) {
-    if (typeof id !== 'string' || !ID.test(id))
+import { isSavingsSessionId } from './savings.js';
+/** Query this Claude Code process's ccc launcher (base-URL and HTTPS-proxy modes).
+ * The launcher owns the authenticated MemTree client and caches server answers. */
+export async function readSavingsView(id, env, get = fetch) {
+    if (!isSavingsSessionId(id))
+        return;
+    const origin = (env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL === '1' && env.ANTHROPIC_BASE_URL)
+        || env.CCC_MEMTREE_PROXY;
+    if (!origin || !/^http:\/\/127\.0\.0\.1:\d+$/.test(origin))
         return;
     try {
-        const file = path.join(dir, `${id}.savings-view.json`);
-        if (fs.statSync(file).size > 4096)
-            return;
-        const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (!value || typeof value.costs_complete !== 'boolean' ||
-            !Number.isFinite(value.progress_tokens) || !Number.isFinite(value.budget_tokens))
-            return;
-        return value.schema === 2 ? value : { ...value, costs_complete: false, net_usd: null, less_usage_percent: null };
+        const response = await get(origin + '/memtree/savings?session=' + id, { signal: AbortSignal.timeout(1500), redirect: 'error' });
+        if (response.ok)
+            return await response.json();
     }
-    catch {
-        return;
-    }
-}
-export function writeSavingsView(id, view, dir = statusLinkDir()) {
-    if (!ID.test(id))
-        return;
-    try {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-        const file = path.join(dir, `${id}.savings-view.json`);
-        const tmp = `${file}.${randomUUID()}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify({ ...view, schema: 2 }), { mode: 0o600, flag: 'wx' });
-        fs.chmodSync(tmp, 0o600);
-        fs.renameSync(tmp, file);
-    }
-    catch { /* Convenience display never breaks the proxy. */ }
+    catch { /* A stopped launcher leaves the user's other status segments available. */ }
 }
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const wide = /[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303f\uff01-\uff60\uffe0-\uffe6]/u;

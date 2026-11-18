@@ -1,7 +1,4 @@
-/** Verify an append during the full-body fingerprint that request sizing already needs.
- * Every candidate in one request uses the same byte ranges. The range digests
- * identify all its bytes, including the bytes on either side of the messages.
- * The digests also verify which prompt checkpoints can be reused. */
+/** Verify reusable plain-prompt checkpoints after a modified request has been forwarded. */
 import { createHash } from 'node:crypto';
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const white = (c) => c === 32 || c === 9 || c === 13 || c === 10;
@@ -94,11 +91,16 @@ export class SavingsHistory {
             ? digest(bytes.subarray(0, previous.start)) : undefined;
         const knownHead = previous && previous.headDigest === headHint;
         let start = knownHead ? previous.start : previous && messagesStart(bytes);
-        const offset = start;
         const expectedClose = previous ? bytes.length - previous.tailLength : -1;
         let verified;
-        let headDigest;
-        let tailDigest;
+        const headDigest = knownHead ? headHint : start === undefined ? undefined : digest(bytes.subarray(0, start));
+        const tailDigest = expectedClose < 0 ? undefined : digest(bytes.subarray(expectedClose));
+        if (previous && start !== undefined) {
+            const end = start + previous.length;
+            if ([COMMA, ARRAY_END].includes(bytes[skipSpace(bytes, end)]) &&
+                digest(bytes.subarray(start, end)) === previous.digest)
+                verified = previous;
+        }
         let close;
         let valid;
         const usable = (end) => {
@@ -107,23 +109,8 @@ export class SavingsHistory {
             return valid ??= close >= 0 && (knownTail || finalMessagesProperty(bytes, close));
         };
         return {
-            bodyKey: previous && offset !== undefined ? (body => {
-                const end = offset + previous.length;
-                const tail = Math.max(end, expectedClose);
-                const head = body === bytes && knownHead ? headHint : digest(body.subarray(0, offset));
-                const middle = digest(body.subarray(offset, end));
-                const rest = digest(body.subarray(tail));
-                if (body === bytes) {
-                    headDigest = head;
-                    tailDigest = rest;
-                    if (middle === previous.digest && [COMMA, ARRAY_END].includes(body[skipSpace(body, end)])) {
-                        verified = previous;
-                    }
-                }
-                return head + middle + digest(body.subarray(end, tail)) + rest;
-            }) : undefined,
             prefix: () => {
-                if (!verified || !usable(offset + verified.length))
+                if (!verified || start === undefined || !usable(start + verified.length))
                     return;
                 const sameFrame = headDigest === verified.headDigest && close === expectedClose &&
                     tailDigest === verified.tailDigest;

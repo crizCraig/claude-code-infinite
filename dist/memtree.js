@@ -22,6 +22,7 @@ import { createRequire } from "node:module";
 import { usageDashboardUrl } from "./usage-link.js";
 import { extendsHistory, mediaFreeMessageHash } from "./route-identity.js";
 import { withShortPaymentUrl } from "./payment-gate.js";
+import { beginSavingsSubmission } from "./savings-turn.js";
 import { isKeyRejected, keyPageUrl } from "./key-page.js";
 import { indexWaitFrom413 } from "./index-wait-413.js";
 import { networkFailureOf } from "./network-failure.js";
@@ -774,6 +775,7 @@ function transmittedTools(tools) {
 export class MemtreeClient {
     baseUrl;
     apiKey;
+    onInvalidKey;
     compressTimeoutMs;
     compressSuccessAt = 0;
     longCompressTimeoutMs;
@@ -972,6 +974,7 @@ export class MemtreeClient {
     constructor(opts) {
         this.baseUrl = opts.baseUrl.replace(/\/$/, "");
         this.apiKey = opts.apiKey;
+        this.onInvalidKey = opts.onInvalidKey;
         this.compressTimeoutMs =
             opts.compressTimeoutMs ??
                 Number(process.env.CCC_COMPRESS_TIMEOUT_MS || DEFAULT_COMPRESS_TIMEOUT_MS);
@@ -1798,6 +1801,12 @@ export class MemtreeClient {
             if (news && (status !== undefined || !opts.signal?.aborted)) {
                 this.lastAnswerUnpaid = status === 402;
                 this.lastAnswerKeyInvalid = keyRefused;
+                if (keyRefused) {
+                    try {
+                        this.onInvalidKey?.();
+                    }
+                    catch { /* Optional reporting observer. */ }
+                }
             }
             // Availability, unlike payment, counts a failed background index too.
             if (!resent && (status !== undefined || !opts.signal?.aborted))
@@ -1867,12 +1876,14 @@ export class MemtreeClient {
      * or more goes as a stream and `upload.done` turns true once its last byte was handed
      * over (a smaller one counts as handed over at once).
      */
-    postContextMemory(payload, opts, signal, upload) {
+    async postContextMemory(payload, opts, signal, upload) {
         const bytes = Buffer.from(payload, "utf-8");
         const streamed = upload !== undefined && bytes.length >= STREAMED_UPLOAD_MIN_BYTES;
         if (upload && !streamed)
             upload.done = true;
-        return fetch(`${this.baseUrl}/v1/context_memory`, {
+        const submission = beginSavingsSubmission(opts.clientMeta);
+        const clientMeta = submission?.metadata ?? opts.clientMeta;
+        const request = fetch(`${this.baseUrl}/v1/context_memory`, {
             method: "POST",
             headers: {
                 authorization: `Bearer ${this.apiKey}`,
@@ -1882,8 +1893,8 @@ export class MemtreeClient {
                 "x-client-version": CLIENT_VERSION,
                 "x-client-features": opts.features ?? CLIENT_FEATURES,
                 ...(opts.sessionId ? { "x-claude-code-session-id": opts.sessionId } : {}),
-                ...(opts.clientMeta && Object.keys(opts.clientMeta).length
-                    ? { "x-client-meta": JSON.stringify(opts.clientMeta) }
+                ...(clientMeta && Object.keys(clientMeta).length
+                    ? { "x-client-meta": JSON.stringify(clientMeta) }
                     : {}),
                 // Compress calls only: an index-only call returns no memory.
                 ...(this.memtreeTools && !opts.indexOnly
@@ -1894,6 +1905,21 @@ export class MemtreeClient {
             ...(streamed ? { duplex: "half" } : {}),
             signal,
         });
+        if (!submission)
+            return request;
+        try {
+            const response = await request;
+            // Auth, input validation or missing references. A 413 can queue indexing.
+            if ([400, 401, 402, 403, 409, 422].includes(response.status))
+                submission.unbilled();
+            return response;
+        }
+        catch (error) {
+            if (isStreamedBodyAuthChallenge(error) || (upload && !upload.done && isDroppedConnection(error))) {
+                submission.unbilled();
+            }
+            throw error;
+        }
     }
     /**
      * Whether a failed answer to a call that sent references asks for their bytes: the

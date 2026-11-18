@@ -1,5 +1,4 @@
 export interface SavingsReplay<T> {
-    bodyKey?: (bytes: Buffer) => string;
     prefix(): {
         count: number;
         prompt: T;
