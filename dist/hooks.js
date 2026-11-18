@@ -804,12 +804,12 @@ export function createSubagentHookPlugin(hookUrl, opts = {}) {
 }
 /**
  * SessionStart accepts only `command`/`mcp_tool` hooks, never `http`, so the
- * banner is baked into a static file the command simply cats. It must NOT be
+ * banner is baked into a static file the shell reads verbatim. It must NOT be
  * `echo`'d: sh and zsh expand backslash escapes, turning the JSON's \n into a
  * raw newline and silently corrupting the payload.
  */
 function startupBannerHook(hooksDir, message) {
-    fs.writeFileSync(path.join(hooksDir, STARTUP_NOTICE_FILE), JSON.stringify({ systemMessage: message }), { mode: 0o600 });
+    fs.writeFileSync(path.join(hooksDir, STARTUP_NOTICE_FILE), JSON.stringify({ systemMessage: message }) + "\n", { mode: 0o600 });
     return {
         // A compaction continues the same conversation; only real session
         // starts (fresh, --resume, /clear) re-show the banner.
@@ -817,7 +817,7 @@ function startupBannerHook(hooksDir, message) {
         hooks: [
             {
                 type: "command",
-                command: `cat ${singleQuoteForShell(path.join(hooksDir, STARTUP_NOTICE_FILE))}`,
+                command: `IFS= read -r banner < ${singleQuoteForShell(path.join(hooksDir, STARTUP_NOTICE_FILE))} && printf '%s' "$banner"`,
                 timeout: 5,
             },
         ],

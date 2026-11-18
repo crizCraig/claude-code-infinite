@@ -37,24 +37,31 @@ globalThis.fetch = async (url, init) => {
     env = {"HOME": directory, "PATH": directory, "CCC_NO_UPDATE_CHECK": "1",
            "REJECT": first if scenario == "rejected-key" else "",
            **{k: os.environ[k] for k in ("NO_COLOR", "FORCE_COLOR") if k in os.environ}}
-    proc = subprocess.Popen([node, "--import", str(mock), "dist/cli.js"],
-                            env=env, stdin=slave, stdout=slave, stderr=slave)
+    printing = scenario == "print-key"
+    args = [node, "--import", str(mock), "dist/cli.js"] + (["-p", "hi"] if printing else [])
+    proc = subprocess.Popen(args, env=env, stdin=slave,
+                            stdout=subprocess.PIPE if printing else slave,
+                            stderr=subprocess.PIPE if printing else slave)
+    output = proc.stderr.fileno() if printing else master
     os.close(slave)
     screen = bytearray()
+    transcript = bytearray()
 
     def until(token):
         while token not in screen:
-            assert select.select([master], [], [], 3)[0], f"timed out waiting for {token!r}"
-            chunk = os.read(master, 65536)
+            assert select.select([output], [], [], 3)[0], f"timed out waiting for {token!r}"
+            chunk = os.read(output, 65536)
             assert chunk, f"exited waiting for {token!r}"
             screen.extend(chunk)
+            transcript.extend(chunk)
         del screen[:screen.index(token) + len(token)]
 
     def stays_at_prompt(forbidden):
-        while select.select([master], [], [], 0.15)[0]:
-            chunk = os.read(master, 65536)
+        while select.select([output], [], [], 0.15)[0]:
+            chunk = os.read(output, 65536)
             assert chunk
             screen.extend(chunk)
+            transcript.extend(chunk)
         assert forbidden not in screen, "queued text answered a prompt"
 
     def enter(line):
@@ -75,16 +82,22 @@ globalThis.fetch = async (url, init) => {
             until(b"new MemTree key and paste it here")
             stays_at_prompt(b"[q] quit")
             enter(fresh)
-        until(b"[q] quit")
-        enter("q")
+        if not printing:
+            until(b"[q] quit")
+            enter("q")
         # Keep draining redraws while ccc flushes its diagnostics and exits.
-        while select.select([master], [], [], 3)[0]:
+        while select.select([output], [], [], 3)[0]:
             try:
-                if not os.read(master, 65536):
+                chunk = os.read(output, 65536)
+                transcript.extend(chunk)
+                if not chunk:
                     break
             except OSError:
                 break
         assert proc.wait(timeout=2) == 0
+        assert first.encode() not in transcript and fresh.encode() not in transcript, "key echoed in output"
+        if printing:
+            assert proc.stdout.read() == b""
         sent = (root / "sent").read_text().splitlines()
         saved = json.loads((root / ".claude-code-infinite" / "config.json").read_text())
         assert saved["polychatApiKey"] == (fresh if scenario == "rejected-key" else first)

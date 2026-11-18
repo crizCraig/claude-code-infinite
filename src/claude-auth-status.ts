@@ -178,7 +178,7 @@ function killOnSignals(kill: () => void): () => void {
 
 /**
  * Kill a timed-out probe and everything it started, never throwing. Windows:
- * taskkill /T /F (a .cmd shim runs cmd.exe, then node). POSIX: SIGKILL to its
+ * taskkill /T /F. POSIX: SIGKILL to its
  * process group, then to the process itself in case the group is gone.
  */
 function killTree(child: ReturnType<typeof spawnClaude>): void {

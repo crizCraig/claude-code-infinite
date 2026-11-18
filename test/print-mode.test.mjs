@@ -2,6 +2,7 @@
 // parse --output-format json|stream-json from it), and ccc gives the session
 // its memtree MCP tools by default, exactly as in interactive sessions.
 import test from "node:test";
+import { installNpmClaude } from "./fixtures/npm-claude.mjs";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -73,7 +74,7 @@ function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJso
     "process.stdout.write(JSON.stringify({ type: 'result', args, servers, hooks }) + '\\n');",
   ].join("\n"));
   if (process.platform === "win32") {
-    fs.writeFileSync(path.join(bin, "claude.cmd"), `@"${process.execPath}" "%~dp0claude.mjs" %*\r\n`);
+    installNpmClaude(bin, fs.readFileSync(script));
   } else {
     fs.writeFileSync(path.join(bin, "claude"), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/claude.mjs" "$@"\n`);
     fs.chmodSync(path.join(bin, "claude"), 0o755);
@@ -87,7 +88,7 @@ function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJso
   return { home, bin };
 }
 
-function runCcc(args, extraEnv = {}, home_ = {}) {
+function runCcc(args, extraEnv = {}, home_ = {}, nodeArgs = []) {
   const { home, bin } = fakeClaudeHome(home_);
   const env = {
     ...process.env, HOME: home, USERPROFILE: home, CCC_NO_DIAGNOSTICS: "1",
@@ -101,7 +102,7 @@ function runCcc(args, extraEnv = {}, home_ = {}) {
     "CLAUDE_CODE_USE_FOUNDRY"]) delete env[name];
   Object.assign(env, extraEnv);
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [...nodeArgs, CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => { stdout += d; });
@@ -153,6 +154,21 @@ test("ccc -p with no saved key and no terminal: fails on stderr, never prompts o
   assert.equal(stdout, "");
   assert.match(stderr, /MemTree API key is required/);
   assert.match(stderr, /run `ccc` in a terminal/);
+  assert.doesNotMatch(stderr, /Press Enter|paste it here/);
+});
+
+test("ccc -p with a legacy saved key warns once and launches Claude unattended", async () => {
+  const key = "old-saved-value";
+  const mock = `globalThis.fetch = async () => {
+    console.error("unexpected MemTree request");
+    return new Response("", { status: 401 });
+  };`;
+  const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, { key },
+    ["--import", "data:text/javascript," + encodeURIComponent(mock)]);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).args, ["-p", "hi"]);
+  assert.equal(stderr.split("Your MemTree key isn't valid").length - 1, 1);
+  assert.doesNotMatch(stderr, /old-saved-value|Press Enter|paste it here|unexpected MemTree request/);
 });
 
 const NO_PLAN = /^Claude Code is signed in for API billing \(an Anthropic Console account\), so Claude bills that account per token, not a Claude plan\. Your MemTree credit covers MemTree, not Claude itself\. To use Claude Pro or Max instead, run \/login in Claude Code and choose "Claude account with subscription"\.$/m;

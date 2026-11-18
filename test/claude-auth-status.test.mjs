@@ -126,8 +126,7 @@ test("the probe: an old Claude Code without `auth`, a hang, a missing command", 
   assert.ok(["failed", "unsupported"].includes(missing.result), missing.result);
 });
 
-// Codex r1 P2: a timed-out probe must not outlive ccc's wait, nor leave a child behind
-// (on Windows a .cmd shim runs cmd.exe, whose node child a plain kill would miss).
+// A timed-out probe must not outlive ccc's wait or leave a child behind.
 test("the probe: a timeout kills the whole process tree, SIGTERM ignored", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccc-stubborn-claude-"));
   const pids = join(dir, "pids.txt");

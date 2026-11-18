@@ -117,6 +117,7 @@ import {
 import {
   storedApiKey,
   memtreeBaseUrlFor,
+  savedKeyFor,
   setPolychatApiKey,
   setLocalPolychatApiKey,
   setStagingPolychatApiKey,
@@ -202,7 +203,7 @@ async function promptForApiKey(mode: Mode, output: NodeJS.WriteStream): Promise<
   // The label is a clickable link (OSC 8) where the terminal supports it, and
   // the URL is printed too, for other terminals and for opening it elsewhere.
   console.log(`\nGet your ${hyperlink("MemTree API key", url)}:\n  ${url}`);
-  if (await askAnswer("\nPress Enter to open it in your browser...", output) === null) return "";
+  await askFreshKeyLine("\nPress Enter to open it in your browser...", output);
   openUrl(url);
   for (;;) {
     const key = await askFreshKeyLine("Copy your API key and paste it here: ", output);
@@ -570,7 +571,8 @@ async function main() {
   const memtreeBaseUrl = memtreeBaseUrlFor(mode);
 
   // Get or prompt for the MemTree API key (separate keys per environment)
-  let polychatApiKey = storedApiKey(mode);
+  const savedKey = savedKeyFor(mode);
+  let polychatApiKey = savedKey || undefined;
 
   // Client diagnostics (diagnostics.ts): versions, OS and errors, never content.
   // Started before the key prompt so a signup that stalls there is visible too.
@@ -609,7 +611,7 @@ async function main() {
     : Promise.resolve(skippedProbe());
   if (isDebugMode) console.log(`[DEBUG] Claude Code: ${claude.command} (${claude.source})`);
 
-  if (!polychatApiKey) {
+  if (savedKey === undefined) {
     diagnostics.record("sign_in_prompt");
     // The user may quit at the prompt: send what is known now.
     diagnostics.flushNow();
@@ -637,7 +639,7 @@ async function main() {
   // call so sessions can be found by project; read once, never fails.
   const config = loadConfig();
   const [keyCheck, updateAvailable, projectMeta] = await Promise.all([
-    fetchKeyStatus(memtreeBaseUrl, polychatApiKey, { diagnostics }),
+    polychatApiKey ? fetchKeyStatus(memtreeBaseUrl, polychatApiKey, { diagnostics }) : "invalid" as const,
     interactiveUi
       ? checkForUpdate({
           currentVersion: CLIENT_VERSION,
@@ -650,9 +652,14 @@ async function main() {
   // A definite 401/403: the key is mistyped or revoked. Say so before claude
   // starts; interactive runs may paste a new one, others carry on without MemTree.
   const checked = await handleInvalidKey(keyCheck, {
-    mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey, interactive: interactiveUi, diagnostics,
+    mode, baseUrl: memtreeBaseUrl, apiKey: polychatApiKey ?? "", interactive: interactiveUi, diagnostics,
   });
   polychatApiKey = checked.apiKey;
+  // A legacy key with an unknown format was withheld even from diagnostics.
+  // Unless the user replaced it at the gate, launch plain Claude for this run.
+  if (!polychatApiKey) {
+    return runWithoutMemtree({ claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate: null });
+  }
   const paymentStatus = paymentOnly(checked.check);
   const linkKey = polychatApiKey;
   // The short checkout link (payment-link.ts): the gate's, and later the

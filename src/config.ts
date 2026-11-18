@@ -2,12 +2,13 @@ import type { CccEnvironment } from "./cli-args.js";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isMemtreeKey } from "./key-page.js";
+import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 
 export interface Config {
-  polychatApiKey?: string;
-  stagingPolychatApiKey?: string;
-  localPolychatApiKey?: string;
+  /** false remembers a legacy credential that was discarded on a subsequent write. */
+  polychatApiKey?: string | false;
+  stagingPolychatApiKey?: string | false;
+  localPolychatApiKey?: string | false;
   /** false turns off the startup check for a newer ccc on npm (update-check.ts). */
   updateCheck?: boolean;
   /** false keeps the update hint but never installs in the background (auto-update.ts). */
@@ -51,8 +52,14 @@ export function saveConfig(config: Config): void {
     mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
   }
 
+  // Keep the upgrade behavior for other environments without copying their
+  // malformed credentials into a newly written config.
+  const saved = { ...config };
+  for (const field of Object.values(keyFields)) {
+    saved[field] = savedKey(config[field]);
+  }
   restrictConfigPermissions(); // before writing, so a loose old file never gets new keys
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: CONFIG_FILE_MODE });
+  writeFileSync(CONFIG_FILE, JSON.stringify(saved, null, 2), { mode: CONFIG_FILE_MODE });
   restrictConfigPermissions();
 }
 
@@ -67,37 +74,50 @@ function restrictConfigPermissions(): void {
   }
 }
 
+const keyFields = {
+  production: "polychatApiKey",
+  staging: "stagingPolychatApiKey",
+  local: "localPolychatApiKey",
+} as const;
+
+function savedKey(value: unknown): string | false | undefined {
+  if (isMemtreeKey(value)) return value;
+  if (value === false || (typeof value === "string" && value.length > 0)) return false;
+  return undefined;
+}
+
+/** false lets startup continue without using a malformed legacy value as a credential. */
+export function savedKeyFor(mode: keyof typeof keyFields): string | false | undefined {
+  return savedKey(loadConfig()[keyFields[mode]]);
+}
+
+function setKeyFor(mode: keyof typeof keyFields, key: string): void {
+  if (!isMemtreeKey(key)) throw new Error(KEY_FORMAT_HINT);
+  saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
+}
+
 export function getPolychatApiKey(): string | undefined {
-  const key = loadConfig().polychatApiKey;
-  return isMemtreeKey(key) ? key : undefined;
+  return savedKeyFor("production") || undefined;
 }
 
 export function setPolychatApiKey(key: string): void {
-  const config = loadConfig();
-  config.polychatApiKey = key;
-  saveConfig(config);
+  setKeyFor("production", key);
 }
 
 export function getStagingPolychatApiKey(): string | undefined {
-  const key = loadConfig().stagingPolychatApiKey;
-  return isMemtreeKey(key) ? key : undefined;
+  return savedKeyFor("staging") || undefined;
 }
 
 export function setStagingPolychatApiKey(key: string): void {
-  const config = loadConfig();
-  config.stagingPolychatApiKey = key;
-  saveConfig(config);
+  setKeyFor("staging", key);
 }
 
 export function getLocalPolychatApiKey(): string | undefined {
-  const key = loadConfig().localPolychatApiKey;
-  return isMemtreeKey(key) ? key : undefined;
+  return savedKeyFor("local") || undefined;
 }
 
 export function setLocalPolychatApiKey(key: string): void {
-  const config = loadConfig();
-  config.localPolychatApiKey = key;
-  saveConfig(config);
+  setKeyFor("local", key);
 }
 
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.

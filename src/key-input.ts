@@ -14,15 +14,20 @@ export async function askFreshKeyLine(question: string, output: NodeJS.WriteStre
   const wasRaw = input.isRaw;
   input.setRawMode(true); // make even a partial line available to the drain
   try {
-    const rl = createInterface({ input, output, terminal: true });
+    // Raw mode disables tty echo. Give the line editor no output stream so
+    // pasted text and redraws cannot reach either the screen or a log.
+    const rl = createInterface({ input, terminal: true });
     try {
       return await new Promise<string>((resolve, reject) => {
         rl.once("close", () => reject(new Error("MemTree key entry cancelled.")));
         rl.once("SIGINT", () => rl.close());
-        rl.once("line", answer => { resolve(answer); rl.close(); });
-        rl.setPrompt(question);
+        rl.once("line", answer => {
+          output.write("\n");
+          resolve(answer);
+          rl.close();
+        });
         discardTerminalInput();
-        rl.prompt();
+        output.write(question);
       });
     } finally {
       rl.close();
@@ -53,9 +58,18 @@ function windowsConsoleLine(question: string, output: NodeJS.WriteStream): Promi
     "$ErrorActionPreference = 'Stop'",
     "$Host.UI.RawUI.FlushInputBuffer()",
     "[Console]::Error.Write($env:CCC_KEY_PROMPT)",
-    "$line = [Console]::ReadLine()",
-    "if ($null -eq $line) { exit 1 }",
-    "[Console]::Out.Write($line)",
+    "$line = [Text.StringBuilder]::new()",
+    `while ($true) {
+      $key = [Console]::ReadKey($true)
+      if ($key.Key -eq 'Enter') { break }
+      if ($key.Key -eq 'Backspace') {
+        if ($line.Length) { $line.Length-- }
+      } elseif (-not [char]::IsControl($key.KeyChar)) {
+        [void]$line.Append($key.KeyChar)
+      }
+    }`,
+    "[Console]::Error.WriteLine()",
+    "[Console]::Out.Write($line.ToString())",
   ].join("; ");
   const child = spawn(system32Path(process.env, "WindowsPowerShell", "v1.0", "powershell.exe"),
     ["-NoLogo", "-NoProfile", "-Command", script], {

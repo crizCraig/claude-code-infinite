@@ -683,6 +683,11 @@ without that yes, and without a terminal (`ccc -p`, a pipe) it only prints those
 To install it yourself: run the command, open a new terminal, run `claude` once to sign in,
 then run `ccc` again, from your project folder.
 
+On Windows, when ccc finds an npm shim, it reads the `claude` entry from the adjacent
+`@anthropic-ai/claude-code` package manifest. It runs a JavaScript entry with the absolute
+path of the Node executable running ccc, or launches a native `.exe` entry directly.
+Startup, sign-in checks, and resume all use the same launcher.
+
 ### "You've hit your Claude plan's usage limit" / "Anthropic is busy"
 
 When Anthropic answers a turn with 429 or 529, `ccc` tells the two apart the way Claude Code

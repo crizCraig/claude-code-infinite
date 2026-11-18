@@ -2,6 +2,7 @@
 // launch of the shapes Windows installs leave behind: npm's claude.cmd shim on
 // PATH and the native installer's claude.exe in %USERPROFILE%\.local\bin.
 import test from "node:test";
+import { installNpmClaude } from "./fixtures/npm-claude.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -235,7 +236,7 @@ function launch(location, env, outFile) {
 }
 
 const RECORD_ARGS =
-  "require('fs').writeFileSync(process.env.CLAUDE_OUT, JSON.stringify(process.argv.slice(2)))";
+  "fs.writeFileSync(process.env.CLAUDE_OUT, JSON.stringify(process.argv.slice(2)))";
 
 test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   skip: !isWindows && "Windows only",
@@ -243,12 +244,8 @@ test("Windows: npm's claude.cmd shim on PATH launches, arguments intact", {
   const dir = tmpdir();
   const npmDir = path.join(dir, "npm");
   fs.mkdirSync(npmDir);
-  const js = path.join(dir, "fake-claude.js");
-  fs.writeFileSync(js, `${RECORD_ARGS};\n`);
-  // The shape of npm's cmd-shim for a bin.
-  fs.writeFileSync(path.join(npmDir, "claude.cmd"),
-    `@ECHO off\r\n"${process.execPath}" "${js}" %*\r\n`);
-  const env = { ...process.env, Path: `${npmDir};${process.env.Path ?? process.env.PATH}` };
+  installNpmClaude(npmDir, "import fs from 'node:fs'; " + RECORD_ARGS);
+  const env = { ...process.env, Path: npmDir };
   delete env.PATH;
   const location = locateClaude({ env, registryPath: () => [] });
   assert.deepEqual(location, { command: path.join(npmDir, "claude.cmd"), source: "path" });
@@ -273,7 +270,7 @@ test("Windows: the native claude.exe in %USERPROFILE%\\.local\\bin, not on PATH,
   assert.equal(location?.source, "native", JSON.stringify(location));
   assert.equal(location.command.toLowerCase(), exe.toLowerCase());
   const out = path.join(profile, "out.json");
-  const record = RECORD_ARGS.replace("slice(2)", "slice(1)"); // `node -e`: no script path
+  const record = "const fs = require('node:fs'); " + RECORD_ARGS.replace("slice(2)", "slice(1)"); // `node -e`: no script path
   const result = spawnClaudeSync(location.command, ["-e", record, "--", "a b", "c&d"], {
     env: { ...withClaudeOnPath(env, location), CLAUDE_OUT: out }, encoding: "utf8",
   });
@@ -312,19 +309,24 @@ test("Windows: only the desktop app's claude.exe (on PATH, real files): not laun
   }), false);
 });
 
-test("Windows batch shims use System32 cmd directly and preserve cross-spawn argument escaping", async () => {
+test("Windows npm global and local shims launch the declared bin directly", async () => {
   const { claudeInvocation } = await import("../dist/claude-process.js");
-  const { default: escape } = await import("cross-spawn/lib/util/escape.js");
-  const file = "C:\\Tools With Spaces\\node_modules\\.bin\\claude.cmd";
   const args = ["--resume", "a & b", 'say "hello"'];
-  const env = { SystemRoot: "D:\\Windows", ComSpec: "cmd", Path: ".;C:\\project;C:\\Tools" };
-  const job = claudeInvocation(file, args, env, "win32", "C:\\project");
-  assert.equal(job.command, "D:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(job.args, ["/d", "/s", "/c", '"' +
-    [escape.command(file), ...args.map(a => escape.argument(a, true))].join(" ") + '"']);
-  assert.equal(job.options.windowsVerbatimArguments, true);
-  assert.equal(job.options.env.Path, "C:\\Tools");
-  assert.equal(job.options.env.NoDefaultCurrentDirectoryInExePath, "1");
-  assert.equal(claudeInvocation("C:\\Tools\\claude.exe", args, env, "win32").command, "C:\\Tools\\claude.exe");
-  assert.throws(() => claudeInvocation("claude.cmd", args, env, "win32"));
+  const modules = "C:\\Tools With Spaces\\node_modules";
+  const pkg = W.join(modules, "@anthropic-ai", "claude-code");
+  for (const shim of [W.join(W.dirname(modules), "claude.cmd"), W.join(modules, ".bin", "claude.cmd")]) {
+    for (const bin of ["./cli.js", "./bin/claude.exe"]) {
+      const job = claudeInvocation(shim, args, "win32", file => {
+        assert.equal(file, W.join(pkg, "package.json"));
+        return JSON.stringify({ bin: { claude: bin } });
+      });
+      const entry = W.join(pkg, bin);
+      assert.deepEqual(job, bin.endsWith(".js")
+        ? { command: process.execPath, args: [entry, ...args] }
+        : { command: entry, args });
+    }
+  }
+  assert.throws(() => claudeInvocation("claude.cmd", args, "win32"));
+  assert.deepEqual(claudeInvocation("C:\\Tools\\claude.exe", args, "win32"),
+    { command: "C:\\Tools\\claude.exe", args });
 });

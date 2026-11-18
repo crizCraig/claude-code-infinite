@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isMemtreeKey } from "./key-page.js";
+import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 // The config holds MemTree API keys: owner-only, so other users on a shared
@@ -28,8 +28,14 @@ export function saveConfig(config) {
     if (!existsSync(CONFIG_DIR)) {
         mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
     }
+    // Keep the upgrade behavior for other environments without copying their
+    // malformed credentials into a newly written config.
+    const saved = { ...config };
+    for (const field of Object.values(keyFields)) {
+        saved[field] = savedKey(config[field]);
+    }
     restrictConfigPermissions(); // before writing, so a loose old file never gets new keys
-    writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: CONFIG_FILE_MODE });
+    writeFileSync(CONFIG_FILE, JSON.stringify(saved, null, 2), { mode: CONFIG_FILE_MODE });
     restrictConfigPermissions();
 }
 /** Tighten a config written before keys were owner-only (the mode above applies on create). */
@@ -43,32 +49,44 @@ function restrictConfigPermissions() {
         }
     }
 }
+const keyFields = {
+    production: "polychatApiKey",
+    staging: "stagingPolychatApiKey",
+    local: "localPolychatApiKey",
+};
+function savedKey(value) {
+    if (isMemtreeKey(value))
+        return value;
+    if (value === false || (typeof value === "string" && value.length > 0))
+        return false;
+    return undefined;
+}
+/** false lets startup continue without using a malformed legacy value as a credential. */
+export function savedKeyFor(mode) {
+    return savedKey(loadConfig()[keyFields[mode]]);
+}
+function setKeyFor(mode, key) {
+    if (!isMemtreeKey(key))
+        throw new Error(KEY_FORMAT_HINT);
+    saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
+}
 export function getPolychatApiKey() {
-    const key = loadConfig().polychatApiKey;
-    return isMemtreeKey(key) ? key : undefined;
+    return savedKeyFor("production") || undefined;
 }
 export function setPolychatApiKey(key) {
-    const config = loadConfig();
-    config.polychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("production", key);
 }
 export function getStagingPolychatApiKey() {
-    const key = loadConfig().stagingPolychatApiKey;
-    return isMemtreeKey(key) ? key : undefined;
+    return savedKeyFor("staging") || undefined;
 }
 export function setStagingPolychatApiKey(key) {
-    const config = loadConfig();
-    config.stagingPolychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("staging", key);
 }
 export function getLocalPolychatApiKey() {
-    const key = loadConfig().localPolychatApiKey;
-    return isMemtreeKey(key) ? key : undefined;
+    return savedKeyFor("local") || undefined;
 }
 export function setLocalPolychatApiKey(key) {
-    const config = loadConfig();
-    config.localPolychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("local", key);
 }
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
