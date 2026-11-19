@@ -151,7 +151,7 @@ function whichClaude() {
   throw new Error("no native claude binary on PATH");
 }
 
-// npm's claude.cmd shim (cmd.exe) in a non-ASCII prefix: how cross-spawn runs a .cmd.
+// Resolve the installed package's bin in an npm prefix with non-ASCII characters.
 const shim = process.env.CCC_E2E_CLAUDE_SHIM;
 test("(f) Windows: npm's claude.cmd shim in a non-ASCII folder", { skip: !enabled || !shim },
   async () => {

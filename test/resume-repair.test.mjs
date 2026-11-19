@@ -332,3 +332,23 @@ test("the environment's model override is respected and unknown values skip", ()
     }
   }
 });
+
+test("Windows --resume with an existing transcript never probes POSIX processes", async t => {
+  const { default: cp } = await import("node:child_process");
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { options, cleanup } = fixture([]);
+  delete options.isQuiescent;
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const probe = t.mock.method(cp, "execFileSync", () => { throw Error("unexpected process probe"); });
+  syncBuiltinESMExports();
+  try {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    assert.equal(repairStrandedResume(["--resume", SESSION], options), undefined);
+    assert.equal(probe.mock.callCount(), 0);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    cleanup();
+  }
+});

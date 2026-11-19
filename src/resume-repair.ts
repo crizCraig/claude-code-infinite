@@ -5,7 +5,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import spawn from "cross-spawn";
+import { spawnClaudeSync } from "./claude-process.js";
 import { getConfigDir } from "./config.js";
 import { defaultProjectsDir, findTranscript } from "./transcript-usage.js";
 import { contextLimitForModel } from "./turns.js";
@@ -204,10 +204,10 @@ function lowerBuckets(usage: any, loweredTokens: number): void {
   }
 }
 
-/** cross-spawn, so npm's claude.cmd runs on Windows too. */
+/** Probe the same resolved CLI that will receive the resume arguments. */
 function installedVersion(command = "claude"): string {
   try {
-    const out = spawn.sync(command, ["--version"], { encoding: "utf8", timeout: 1500,
+    const out = spawnClaudeSync(command, ["--version"], { encoding: "utf8", timeout: 1500,
       stdio: ["ignore", "pipe", "ignore"] }).stdout;
     return String(out ?? "").match(/^(\d+\.\d+\.\d+)\b/)?.[1] ?? "unknown";
   } catch { return "unknown"; }

@@ -84,7 +84,7 @@ export const CLAUDE_PLANS = [
   "free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown",
 ] as const;
 export const CLAUDE_SOURCES = [
-  "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local",
+  "path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override",
 ] as const;
 /** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
 export const CLAUDE_FOUND = [...CLAUDE_SOURCES, "desktop_only"] as const;

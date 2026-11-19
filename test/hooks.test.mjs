@@ -450,7 +450,7 @@ test("startup banner rides a SessionStart command hook emitting systemMessage JS
         (shell) => shell === "/bin/sh" || fs.existsSync(shell)
       );
     for (const shell of shells) {
-      const stdout = execSync(hook.command, { shell, encoding: "utf-8" });
+      const stdout = execSync(`PATH=""; ${hook.command}`, { shell, encoding: "utf-8" });
       assert.deepEqual(
         JSON.parse(stdout),
         { systemMessage: message },

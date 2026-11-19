@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 const CONFIG_DIR = join(homedir(), ".claude-code-infinite");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 // The config holds MemTree API keys: owner-only, so other users on a shared
@@ -42,29 +43,46 @@ function restrictConfigPermissions() {
         }
     }
 }
+const keyFields = {
+    production: "polychatApiKey",
+    staging: "stagingPolychatApiKey",
+    local: "localPolychatApiKey",
+};
+let warnedLegacyKey = false;
+/** CLI callers warn once about legacy keys. A direct MCP server reads them quietly. */
+export function storedApiKey(mode, { warnOnLegacy = true } = {}) {
+    const key = loadConfig()[keyFields[mode]];
+    if (typeof key !== "string" || !key)
+        return undefined;
+    if (warnOnLegacy && !warnedLegacyKey && !isMemtreeKey(key)) {
+        console.warn("Your saved MemTree key uses a legacy format. Continuing with the saved key.");
+        warnedLegacyKey = true;
+    }
+    return key;
+}
+function setKeyFor(mode, value) {
+    const key = value.trim();
+    if (!isMemtreeKey(key))
+        throw new Error(KEY_FORMAT_HINT);
+    saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
+}
 export function getPolychatApiKey() {
-    return loadConfig().polychatApiKey;
+    return storedApiKey("production");
 }
 export function setPolychatApiKey(key) {
-    const config = loadConfig();
-    config.polychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("production", key);
 }
 export function getStagingPolychatApiKey() {
-    return loadConfig().stagingPolychatApiKey;
+    return storedApiKey("staging");
 }
 export function setStagingPolychatApiKey(key) {
-    const config = loadConfig();
-    config.stagingPolychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("staging", key);
 }
 export function getLocalPolychatApiKey() {
-    return loadConfig().localPolychatApiKey;
+    return storedApiKey("local");
 }
 export function setLocalPolychatApiKey(key) {
-    const config = loadConfig();
-    config.localPolychatApiKey = key;
-    saveConfig(config);
+    setKeyFor("local", key);
 }
 // MemTree (polychat) API hosts — /v1/context_memory lives at the app root.
 const POLYCHAT_BASE_URL = "https://api.polychat.co";
@@ -75,11 +93,5 @@ export function memtreeBaseUrlFor(mode, env = process.env) {
     return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
-}
-/** The saved MemTree key for a mode (separate keys per environment). */
-export function storedApiKey(mode) {
-    return mode === "local" ? getLocalPolychatApiKey() :
-        mode === "staging" ? getStagingPolychatApiKey() :
-            getPolychatApiKey();
 }
 //# sourceMappingURL=config.js.map

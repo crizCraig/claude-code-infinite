@@ -195,15 +195,23 @@ test("CI detection: flags that say false are not CI", () => {
   assert.equal(isDevInstall({}, ROOT), true, "this checkout has .git");
 });
 
-test("the postinstall script exits 0 whatever happens, without output", () => {
+test("the npm postinstall runs with npm’s Node executable when PATH is empty", t => {
   const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
-  assert.equal(pkg.scripts.postinstall, "node dist/postinstall.js || exit 0");
   const home = mkdtempSync(join(tmpdir(), "ccc-ping-home-"));
-  const env = { ...process.env, HOME: home, USERPROFILE: home, DO_NOT_TRACK: "1" };
-  const run = spawnSync(process.execPath, [join(ROOT, "dist", "postinstall.js")],
-    { env, encoding: "utf-8", timeout: 10_000 });
-  assert.equal(run.status, 0);
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const marker = join(home, "ran-postinstall");
+  const preload = join(home, "observe.cjs");
+  writeFileSync(preload, `if (require("node:path").basename(process.argv[1]) === "postinstall.js")
+    require("node:fs").writeFileSync(process.env.CCC_PING_MARKER, process.execPath);`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home, DO_NOT_TRACK: "1",
+    npm_node_execpath: process.execPath, NODE_OPTIONS: `--require="${preload.replaceAll("\\", "/")}"`, CCC_PING_MARKER: marker };
+  for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
+  env.PATH = "";
+  const run = spawnSync(pkg.scripts.postinstall, {
+    cwd: ROOT, env, shell: process.platform === "win32" ? process.env.ComSpec : "/bin/sh", encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stderr);
   assert.equal(run.stdout + run.stderr, "");
+  assert.equal(readFileSync(marker, "utf8"), process.execPath);
   assert.equal(existsSync(join(home, ".claude-code-infinite")), false);
-  rmSync(home, { recursive: true, force: true });
 });

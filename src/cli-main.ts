@@ -13,8 +13,9 @@
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
 
-import spawn from "cross-spawn";
-import { exec } from "node:child_process";
+import { ClaudeLocationError } from "./windows-claude-shim.js";
+import { spawnClaude, spawnClaudeSync } from "./claude-process.js";
+import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -172,7 +173,7 @@ import {
   SignInTracker,
 } from "./sign-in-notice.js";
 import { exitResumeHint } from "./resume-hint.js";
-import { urlOpenerFor } from "./open-url.js";
+import { browserOpener, urlOpenerFor } from "./open-url.js";
 import { desktopServiceDownLine, runDesktopCommand } from "./desktop-command.js";
 import { httpsProxyModeDecision, skippedNoticeText } from "./https-proxy-eligibility.js";
 import {
@@ -193,15 +194,7 @@ type Mode = "production" | "staging" | "local";
 /** This launch's diagnostics, for the top-level error handler. */
 let activeDiagnostics: Diagnostics | null = null;
 
-function openUrl(url: string): void {
-  const platform = process.platform;
-  const command =
-    platform === "darwin" ? "open" : platform === "win32" ? "explorer" : "xdg-open";
-
-  platform === "win32"
-    ? exec(`${command} "${url}"`, { shell: "cmd.exe" })
-    : exec(`${command} "${url}"`);
-}
+const openUrl = browserOpener(process.platform);
 
 async function promptForApiKey(mode: Mode, output: NodeJS.WritableStream): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output });
@@ -217,12 +210,16 @@ async function promptForApiKey(mode: Mode, output: NodeJS.WritableStream): Promi
 
   openUrl(url);
 
-  return new Promise((resolve) => {
-    rl.question("Copy your API key and paste it here: ", (answer) => {
+  for (;;) {
+    const key = (await new Promise<string>((resolve) => {
+      rl.question("Copy your API key and paste it here: ", resolve);
+    })).trim();
+    if (!key || isMemtreeKey(key)) {
       rl.close();
-      resolve(answer.trim());
-    });
-  });
+      return key;
+    }
+    output.write(KEY_FORMAT_HINT + "\n");
+  }
 }
 
 /**
@@ -471,13 +468,13 @@ function printVersions(): void {
     console.error(claudeDesktopInstalled() ? claudeDesktopOnlyText() : claudeMissingText());
     return;
   }
-  spawn.sync(claude.command, ["--version"], { stdio: "inherit" });
+  spawnClaudeSync(claude.command, ["--version"], { stdio: "inherit" });
 }
 
 /** Unknown/old versions get the longstanding Stop fallback only. */
 function installedClaudeSupportsMessageDisplay(command: string): boolean {
   try {
-    const result = spawn.sync(command, ["--version"], { encoding: "utf-8" });
+    const result = spawnClaudeSync(command, ["--version"], { encoding: "utf-8" });
     return supportsMessageDisplay(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
   } catch {
     return false;
@@ -592,6 +589,9 @@ async function main() {
 
   // Before the key prompt: someone without Claude Code learns that first.
   const found = locateClaude();
+  if (interactiveUi && found?.skippedWrapper && !mayBePrintInvocation(claudeArgs)) {
+    console.error(`Skipped unsupported Claude Code wrapper at ${found.skippedWrapper}. Using ${found.command}.`);
+  }
   // Only the desktop app (its Claude Code is not a terminal command) gets its own message.
   const desktopOnly = !found && claudeDesktopInstalled();
   // One read each of Claude Code's config files (~/.claude.json can be large).
@@ -993,7 +993,7 @@ async function main() {
   // native login and sends its own OAuth bearer to the local base URL.
   const claudeStartedAt = Date.now();
   proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
-  const child = spawn(claude.command, childArgs, {
+  const child = spawnClaude(claude.command, childArgs, {
     env: withClaudeOnPath(
       claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
       claude
@@ -1137,7 +1137,7 @@ async function main() {
 }
 
 main().catch(async (err) => {
-  console.error(err);
+  console.error(err instanceof ClaudeLocationError ? err.message : err);
   // A piped stderr may still have Node diagnostics queued ahead of the startup error.
   await writeStdout("", process.stderr);
   if (activeDiagnostics) {

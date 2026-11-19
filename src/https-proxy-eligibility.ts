@@ -18,6 +18,7 @@
  * These are read once, at startup: enabling the sandbox or a settings proxy mid-session
  * isn't seen here (https-proxy-session.ts warns when prompts then get no model call).
  */
+import { executablePath } from "./executable-path.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
@@ -204,7 +205,7 @@ function readTextFile(file: string): string | null {
   try {
     if (!file.endsWith(".plist")) return readFileSync(file, "utf8");
     if (!existsSync(file)) return null;
-    return execFileSync("/usr/bin/plutil", ["-convert", "json", "-o", "-", file],
+    return execFileSync(executablePath("/usr/bin/plutil"), ["-convert", "json", "-o", "-", file],
       { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return null;

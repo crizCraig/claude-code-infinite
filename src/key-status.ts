@@ -15,7 +15,7 @@ import { parsePaymentStatus, type PaymentStatus } from "./payment-gate.js";
 import { PAYMENT_CONTINUES_LINE } from "./payment-notice.js";
 import { recordError, type DiagnosticsRecorder } from "./diagnostics.js";
 
-import { isKeyRejected } from "./key-page.js";
+import { isKeyRejected, isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 
 export { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, isKeyRejected, keyPageUrl } from "./key-page.js";
 
@@ -106,7 +106,10 @@ export async function runKeyGate(deps: KeyGateDeps): Promise<KeyGateResult> {
     if (!opened) deps.open(deps.keyPageUrl);
     opened = true;
     const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
-    if (!apiKey) continue;
+    if (!isMemtreeKey(apiKey)) {
+      headline = KEY_FORMAT_HINT;
+      continue;
+    }
     const check = await deps.check(apiKey);
     if (check === "invalid") {
       headline = `⚠ ${KEY_STILL_INVALID} Get a new one at ${deps.keyPageUrl}`;

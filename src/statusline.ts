@@ -14,6 +14,8 @@
  * Loaded straight from cli.ts (no proxy, no update check): Claude Code runs a status line
  * after every message.
  */
+import { executablePath } from "./executable-path.js";
+import { system32Path, windowsShellEnv } from "./claude-locate.js";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -228,8 +230,13 @@ export function runWrapped(
 ): Promise<string> {
   return new Promise((resolve) => {
     // Not detached: a new session would lose the controlling terminal (`stty size </dev/tty`).
-    const child = spawn(command, { shell: true, stdio: ["pipe", "pipe", "ignore"],
-      env: { ...process.env, [WRAPPED_ENV]: "1" } });
+    const windows = process.platform === "win32";
+    const shell = windows ? system32Path(process.env, "cmd.exe") : "/bin/sh";
+    const args = windows ? ["/d", "/s", "/c", `"${command}"`] : ["-c", command];
+    const child = spawn(executablePath(shell), args, {
+      windowsVerbatimArguments: windows, stdio: ["pipe", "pipe", "ignore"],
+      env: { ...(windows ? windowsShellEnv(process.env, process.cwd()) : process.env), [WRAPPED_ENV]: "1" },
+    });
     const chunks: Buffer[] = [];
     let done = false;
     const finish = (text: string) => {
@@ -264,7 +271,7 @@ export function processTree(pid: number | undefined): number[] {
   if (pid === undefined) return [];
   const children = new Map<number, number[]>();
   if (process.platform !== "win32") {
-    const listing = spawnSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf-8", timeout: 2_000 });
+    const listing = spawnSync(executablePath("ps"), ["-A", "-o", "pid=,ppid="], { encoding: "utf-8", timeout: 2_000 });
     for (const line of (listing.stdout ?? "").split("\n")) {
       const [child, parent] = line.trim().split(/\s+/).map(Number);
       if (!Number.isFinite(child) || !Number.isFinite(parent)) continue;

@@ -398,12 +398,12 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   const { spawnImpl, calls } = mockSpawn({ pid: 777 });
   const result = startAutoUpdateInstall({
     decision, files, spawnImpl, env: { PATH: "/usr/bin" },
-    execPath: "/opt/node/bin/node", npmPath: "/opt/node/bin/npm",
+    execPath: process.execPath, npmPath: "/opt/node/bin/npm",
   });
   assert.equal(result, "started");
   assert.equal(calls.length, 1);
   const [{ command, args, options, child }] = calls;
-  assert.equal(command, "/opt/node/bin/node");
+  assert.equal(command, process.execPath);
   assert.equal(args[0], "-e");
   assert.equal(args[1], RUNNER_SOURCE);
   const config = JSON.parse(args[2]);
@@ -414,7 +414,7 @@ test("start: one detached runner via node -e, counted, holding the lock", () => 
   assert.equal(config.packageDir, g.packageDir);
   assert.equal(options.detached, true);
   assert.equal(options.stdio, "ignore");
-  assert.equal(options.env.PATH, `/opt/node/bin${path.delimiter}/usr/bin`, "npm's shebang finds this Node");
+  assert.equal(options.env.PATH, `${path.dirname(process.execPath)}${path.delimiter}/usr/bin`, "npm's shebang finds this Node");
   assert.ok(child.unrefCalled, "never keeps ccc alive");
   const state = readUpdateState(files.stateFile);
   assert.deepEqual(state.attempts, { "1.0.21": 1 });
@@ -682,7 +682,7 @@ test("runner: installs exactly that version into this prefix, records ok, frees 
   const { calls, state, lockLeft, files } = await runRunner({ global: g });
   assert.deepEqual(calls[0], ["root", "--global"]);
   assert.deepEqual(calls[1], [
-    "install", "--global", `--prefix=${g.prefix}`, `${PKG}@1.0.21`, "--no-fund", "--no-audit",
+    "install", "--global", `--prefix=${g.prefix}`, `${PKG}@1.0.21`, "--no-fund", "--no-audit", "--ignore-scripts",
   ]);
   assert.equal(state.last.status, "ok");
   assert.equal(state.last.version, "1.0.21");
@@ -859,6 +859,7 @@ test("runner: npm run as `node npm-cli.js` (Windows' way) installs the same", as
   const g = makeGlobal();
   const { calls, state } = await runRunner({ global: g, viaNode: true });
   assert.deepEqual(calls.map((c) => c[0]), ["root", "install"]);
+  assert.ok(calls[1].includes("--ignore-scripts"), "self-update must skip npm lifecycle scripts");
   assert.equal(state.last.status, "ok", state.last.error);
 });
 

@@ -16,7 +16,7 @@
  * Steps: re-validate the version; confirm `npm root -g` is the directory this
  * ccc lives in and that the entry there is not a symlink (an `npm link`); run
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
- * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
+ * --no-fund --no-audit --ignore-scripts` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
  * Windows (waitForPid): the runner first waits for the ccc that started it to
@@ -24,7 +24,7 @@
  * runs as `node npm-cli.js` (npmArgs), and its "group" is npm's own pid,
  * stopped with `taskkill /T /F` (its whole process tree) instead of signals
  * to a POSIX process group. Unlike a POSIX group, a descendant that outlives
- * npm is not tracked there (ccc and its dependency have no install scripts).
+ * npm is not tracked there. Self-update disables npm lifecycle scripts.
  *
  * Bounded: each npm command runs in its own process group, recorded in the
  * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,

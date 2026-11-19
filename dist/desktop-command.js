@@ -170,6 +170,10 @@ export async function runDesktopCommand(args, deps) {
         return await new Promise(() => { });
     }
     if (sub === "uninstall") {
+        if (process.platform !== "darwin") {
+            console.error("ccc desktop uninstall supports macOS only for now.");
+            return 1;
+        }
         uninstallLaunchAgent(deps.mode, paths);
         fs.rmSync(paths.dir, { recursive: true, force: true });
         const others = ["production", "staging", "local"].some((m) => m !== deps.mode && fs.existsSync(desktopPaths(getConfigDir(), m).state));

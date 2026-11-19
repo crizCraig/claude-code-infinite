@@ -32,6 +32,7 @@
  * files in its own temp plugin dir. See README "Automatic updates".
  */
 
+import { executablePath } from "./executable-path.js";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -325,7 +326,7 @@ export function startAutoUpdateInstall(opts: StartInstallOptions): StartInstallR
   const config = runnerConfig(opts, decision.method, version, token, npm);
   try {
     const child = opts.spawnImpl(
-      opts.execPath ?? process.execPath,
+      executablePath(opts.execPath ?? process.execPath),
       ["-e", RUNNER_SOURCE, JSON.stringify(config)],
       {
         detached: true, stdio: "ignore", windowsHide: true,
@@ -707,6 +708,8 @@ function windowsNpmCli(execPath: string, env: NodeJS.ProcessEnv): string | null 
     ...pathValue.split(";").map((d) => d.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean),
   ];
   for (const dir of dirs) {
+    if (!path.isAbsolute(dir) || path.relative(process.cwd(), dir) === "") continue;
+    if (process.platform === "win32" && path.win32.parse(dir).root.length < 2) continue;
     if (dir !== path.dirname(execPath) && !fs.existsSync(path.join(dir, "npm.cmd"))) continue;
     if (fs.existsSync(cliIn(dir))) return cliIn(dir);
   }

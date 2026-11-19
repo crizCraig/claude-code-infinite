@@ -1,6 +1,7 @@
 // MemTree paused and the user chose to continue (or a print run): plain Claude Code,
 // no proxy, no MemTree calls, Claude Code's own compaction and limits.
 import test from "node:test";
+import { installNpmClaude } from "./fixtures/npm-claude.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -53,7 +54,7 @@ test("the banner-only plugin has just a SessionStart hook, removed on close", ()
   assert.deepEqual(Object.keys(hooks.hooks), ["SessionStart"]);
   const [entry] = hooks.hooks.SessionStart;
   assert.equal(entry.matcher, "startup|resume|clear");
-  assert.match(entry.hooks[0].command, /^cat '/);
+  assert.doesNotMatch(entry.hooks[0].command, /^cat /);
   assert.ok(!JSON.stringify(hooks).includes("http"), "no hook needs ccc's local server");
   const banner = fs.readFileSync(path.join(plugin.dir, "hooks", "startup-notice.json"), "utf8");
   assert.deepEqual(JSON.parse(banner), { systemMessage: "hello" });
@@ -85,7 +86,7 @@ function runPaused({ interactive, exitCode = 0 }) {
   // A `claude` command (not `node script`), so `--plugin-dir` reaches the script.
   const command = process.platform === "win32" ? path.join(dir, "claude.cmd") : path.join(dir, "claude");
   if (process.platform === "win32") {
-    fs.writeFileSync(command, `@"${process.execPath}" "%~dp0claude.mjs" %*\r\n`);
+    installNpmClaude(dir, fs.readFileSync(fakeClaude));
   } else {
     fs.writeFileSync(command, `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/claude.mjs" "$@"\n`);
     fs.chmodSync(command, 0o755);

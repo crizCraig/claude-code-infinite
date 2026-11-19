@@ -12,8 +12,8 @@
 
 import { spawn as spawnPlain } from "node:child_process";
 import * as os from "node:os";
-import * as path from "node:path";
-import spawn from "cross-spawn";
+import { system32Path } from "./claude-locate.js";
+import { spawnClaude } from "./claude-process.js";
 import type { ApiKeySource, ClaudeAuthType, ClaudePlan } from "./claude-auth.js";
 import { planFrom } from "./claude-auth.js";
 
@@ -138,9 +138,9 @@ export function parseAuthStatus(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function startProbe(command: string, opts: ProbeOptions): ReturnType<typeof spawn> | undefined {
+function startProbe(command: string, opts: ProbeOptions): ReturnType<typeof spawnClaude> | undefined {
   try {
-    return spawn(command, [...(opts.leadingArgs ?? []), "auth", "status", "--json"], {
+    return spawnClaude(command, [...(opts.leadingArgs ?? []), "auth", "status", "--json"], {
       env: opts.env ?? process.env,
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
@@ -178,16 +178,15 @@ function killOnSignals(kill: () => void): () => void {
 
 /**
  * Kill a timed-out probe and everything it started, never throwing. Windows:
- * taskkill /T /F (a .cmd shim runs cmd.exe, then node). POSIX: SIGKILL to its
+ * taskkill /T /F. POSIX: SIGKILL to its
  * process group, then to the process itself in case the group is gone.
  */
-function killTree(child: ReturnType<typeof spawn>): void {
+function killTree(child: ReturnType<typeof spawnClaude>): void {
   const pid = child.pid;
   if (pid === undefined) return;
   try {
     if (process.platform === "win32") {
-      const root = process.env.SystemRoot ?? "C:\\Windows";
-      spawnPlain(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"],
+      spawnPlain(system32Path(process.env, "taskkill.exe"), ["/pid", String(pid), "/T", "/F"],
         { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
       return;
     }

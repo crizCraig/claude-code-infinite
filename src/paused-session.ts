@@ -12,7 +12,7 @@
  * Interactive sessions get one SessionStart banner (a static plugin, no proxy):
  * MemTree is off for this session, and how to turn it back on.
  */
-import spawn from "cross-spawn";
+import { spawnClaude } from "./claude-process.js";
 import type { AutoUpdateSetup } from "./auto-update-setup.js";
 import {
   claudeExitFields,
@@ -49,7 +49,7 @@ export async function runWithoutMemtree(opts: PausedSessionOptions): Promise<nev
   const plugin = opts.interactive && opts.banner ? bannerPlugin(opts.banner) : null;
   const args = plugin ? withSessionNoticePluginArgs(opts.claudeArgs, plugin.dir) : opts.claudeArgs;
   const startedAt = Date.now();
-  const child = spawn(opts.claude.command, args, {
+  const child = spawnClaude(opts.claude.command, args, {
     env: withClaudeOnPath(plainClaudeEnv(process.env), opts.claude),
     stdio: "inherit",
   });
@@ -129,7 +129,7 @@ function bannerPlugin(banner: string): SessionNoticePlugin | null {
 }
 
 function forwardSignals(
-  child: ReturnType<typeof spawn>, exited: Promise<number>, opts: PausedSessionOptions,
+  child: ReturnType<typeof spawnClaude>, exited: Promise<number>, opts: PausedSessionOptions,
   exit: (code: number) => void
 ): void {
   const handle = createSignalShutdownHandler({

@@ -1,4 +1,5 @@
-import { execSync } from "node:child_process";
+import { executablePath } from "./executable-path.js";
+import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { userInfo, homedir } from "node:os";
@@ -33,7 +34,7 @@ function getCredentialsFromMacOSKeychain(debug = false) {
         if (debug) {
             console.log(`[DEBUG] Reading keychain for user: ${username}`);
         }
-        const result = execSync(`security find-generic-password -s "Claude Code-credentials" -a "${username}" -w`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+        const result = execFileSync(executablePath("/usr/bin/security"), ["find-generic-password", "-s", "Claude Code-credentials", "-a", username, "-w"], { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
         const parsed = JSON.parse(result.trim());
         if (!parsed || typeof parsed !== "object" || !("claudeAiOauth" in parsed)) {
             console.error("Invalid keychain credentials: expected JSON object");

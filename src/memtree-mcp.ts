@@ -1509,7 +1509,7 @@ export function runMemtreeMcpServer(
         return;
       }
     }
-    const savedKey = storedApiKey(mode);
+    const savedKey = storedApiKey(mode, { warnOnLegacy: false });
     const apiKey = typeof savedKey === "string" ? savedKey.trim() : undefined;
     if (!apiKey) {
       throw new Error(`No MemTree key saved for ${mode}. Run ccc${mode === "staging" ? " staging" : ""} to save one.`);

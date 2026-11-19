@@ -1,4 +1,3 @@
-/** Conservative filesystem boundary for optional transcript repair. */
 import fs from "node:fs";
 /** Possible writers include Claude binaries and JS runtimes; uncertainty skips repair. */
 export declare function transcriptIsQuiescent(file: string): boolean;

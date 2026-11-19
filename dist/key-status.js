@@ -13,7 +13,7 @@ import { CLIENT_NAME, CLIENT_VERSION } from "./memtree.js";
 import { parsePaymentStatus } from "./payment-gate.js";
 import { PAYMENT_CONTINUES_LINE } from "./payment-notice.js";
 import { recordError } from "./diagnostics.js";
-import { isKeyRejected } from "./key-page.js";
+import { isKeyRejected, isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
 export { KEY_PAGE_URL, LOCAL_KEY_PAGE_URL, isKeyRejected, keyPageUrl } from "./key-page.js";
 export const KEY_INVALID_TEXT = "Your MemTree key isn't valid (revoked or mistyped)";
 export const KEY_GATE_PROMPT = "[Enter] paste a new key   [c] use claude without MemTree   [q] quit: ";
@@ -79,8 +79,10 @@ export async function runKeyGate(deps) {
             deps.open(deps.keyPageUrl);
         opened = true;
         const apiKey = (await deps.ask(KEY_PASTE_PROMPT)).trim();
-        if (!apiKey)
+        if (!isMemtreeKey(apiKey)) {
+            headline = KEY_FORMAT_HINT;
             continue;
+        }
         const check = await deps.check(apiKey);
         if (check === "invalid") {
             headline = `⚠ ${KEY_STILL_INVALID} Get a new one at ${deps.keyPageUrl}`;

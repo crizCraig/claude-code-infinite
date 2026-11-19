@@ -9,8 +9,9 @@
  * and nothing is opened. Only a MemTree page of the environment ccc talks to
  * is opened (memtreePageUrl): another URL, even from the server, is printed.
  */
+import { executablePath } from "./executable-path.js";
 import { spawn } from "node:child_process";
-import { win32 } from "node:path";
+import { system32Path } from "./claude-locate.js";
 import { isCi } from "./install-ping.js";
 import { usageDashboardUrl } from "./usage-link.js";
 /** Set by an SSH session; a browser opened there is on the remote machine. */
@@ -71,7 +72,7 @@ export function browserOpener(platform, spawnFn = spawn) {
         if (!open)
             return;
         try {
-            const child = spawnFn(open.command, open.args, { detached: true, stdio: "ignore", windowsHide: true });
+            const child = spawnFn(executablePath(open.command), open.args, { detached: true, stdio: "ignore", windowsHide: true });
             child.on("error", () => { });
             child.unref();
         }
@@ -92,8 +93,10 @@ export function browserOpenCommand(url, platform, env = process.env) {
         return { command: "open", args: [url] };
     if (platform === "win32") {
         // System32's own copy, never one found through PATH or the working directory.
-        const rundll32 = win32.join(env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe");
-        return { command: rundll32, args: ["url.dll,FileProtocolHandler", url] };
+        return {
+            command: system32Path(env, "rundll32.exe"),
+            args: [system32Path(env, "url.dll") + ",FileProtocolHandler", url],
+        };
     }
     return { command: "xdg-open", args: [url] };
 }

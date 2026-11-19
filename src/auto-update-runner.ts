@@ -16,7 +16,7 @@
  * Steps: re-validate the version; confirm `npm root -g` is the directory this
  * ccc lives in and that the entry there is not a symlink (an `npm link`); run
  * `npm install --global --prefix=<that prefix> claude-code-infinite@<version>
- * --no-fund --no-audit` (argv, never a shell); confirm the package.json now
+ * --no-fund --no-audit --ignore-scripts` (argv, never a shell); confirm the package.json now
  * says that version. Any failure is recorded with a short reason.
  *
  * Windows (waitForPid): the runner first waits for the ccc that started it to
@@ -24,7 +24,7 @@
  * runs as `node npm-cli.js` (npmArgs), and its "group" is npm's own pid,
  * stopped with `taskkill /T /F` (its whole process tree) instead of signals
  * to a POSIX process group. Unlike a POSIX group, a descendant that outlives
- * npm is not tracked there (ccc and its dependency have no install scripts).
+ * npm is not tracked there. Self-update disables npm lifecycle scripts.
  *
  * Bounded: each npm command runs in its own process group, recorded in the
  * lock entry. When it ends (or times out) the whole group is reaped: SIGTERM,
@@ -35,6 +35,9 @@
  * kill the group, record a failure and exit, so the lock's stale age is never
  * reached by a live runner.
  */
+
+import { executablePath } from "./executable-path.js";
+import { system32Path } from "./claude-locate.js";
 
 /** What ccc passes the runner, as JSON in argv[1]. */
 export interface RunnerConfig {
@@ -63,11 +66,14 @@ export interface RunnerConfig {
   pipeGraceMs?: number;
 }
 
+// The detached runner cannot import from the installation it replaces. Embed
+// the same executable check; its only module dependency is node:path below.
 export const RUNNER_SOURCE = String.raw`"use strict";
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const executablePath = ${executablePath.toString()};
 
 const VERSION_RE = /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/;
 const ROOT_TIMEOUT_MS = 60000;
@@ -120,8 +126,8 @@ function groupAlive(pgid) {
 function signalGroup(pgid, signal) {
   if (IS_WINDOWS) {
     try {
-      const taskkill = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
-      require("node:child_process").spawnSync(taskkill, ["/PID", String(pgid), "/T", "/F"], {
+      const taskkill = ${JSON.stringify(system32Path(process.env, "taskkill.exe"))};
+      require("node:child_process").spawnSync(executablePath(taskkill), ["/PID", String(pgid), "/T", "/F"], {
         stdio: "ignore", windowsHide: true, timeout: 10000,
       });
     } catch {}
@@ -233,7 +239,7 @@ function run(command, args, timeoutMs, capture) {
       return;
     }
     try {
-      child = spawn(command, args, {
+      child = spawn(executablePath(command), args, {
         cwd: os.homedir(),
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
@@ -308,7 +314,7 @@ async function install() {
   if (fs.lstatSync(entry).isSymbolicLink()) throw new Error(entry + " is a symlink (npm link)");
   if (!samePath(realpath(entry), realpath(cfg.packageDir))) throw new Error(entry + " is not this ccc");
   const spec = cfg.packageName + "@" + cfg.version;
-  const args = ["install", "--global", "--prefix=" + cfg.prefix, spec, "--no-fund", "--no-audit"];
+  const args = ["install", "--global", "--prefix=" + cfg.prefix, spec, "--no-fund", "--no-audit", "--ignore-scripts"];
   note("npm " + args.join(" "));
   const failure = describe(await runReaped(cfg.npm, npmArgs(args), cfg.timeoutMs, false), "npm install");
   if (failure) throw new Error(failure);

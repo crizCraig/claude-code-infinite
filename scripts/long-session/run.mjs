@@ -142,7 +142,7 @@ function writeConfigs() {
   const cccDir = path.join(HOME, ".claude-code-infinite");
   fs.mkdirSync(cccDir, { recursive: true });
   fs.writeFileSync(path.join(cccDir, "config.json"), JSON.stringify({
-    localPolychatApiKey: KEY || "mock-memtree-key", updateCheck: false, autoUpdate: false,
+    localPolychatApiKey: KEY || "sk-00000000000000000000000000000000", updateCheck: false, autoUpdate: false,
   }), { mode: 0o600 });
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   const project = { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true,

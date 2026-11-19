@@ -24,6 +24,9 @@ import {
   runKeyGate,
 } from "../dist/key-status.js";
 
+const accountKey = "sk-" + "1".repeat(32);
+const revokedKey = "sk-" + "2".repeat(32);
+
 async function serve(handler) {
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -143,7 +146,11 @@ function gateDeps(answers, checks = {}) {
     log,
     deps: {
       keyPageUrl: KEY_PAGE_URL,
-      ask: async (question) => { log.asked.push(question); return answers.shift() ?? "q"; },
+      ask: async (question) => {
+        log.asked.push(question);
+        assert.ok(answers.length, "unexpected prompt");
+        return answers.shift();
+      },
       open: (url) => log.opened.push(url),
       warn: (text) => log.warned.push(text),
       say: (text) => log.said.push(text),
@@ -171,16 +178,16 @@ test("gate: c starts claude without MemTree, as the payment gate does", async ()
 
 test("gate: a pasted key that works is saved and its status returned", async () => {
   const paid = { paid: true, message: null, url: null };
-  const { deps, log } = gateDeps(["", " good-key "], { "good-key": paid });
-  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: "good-key", check: paid });
+  const { deps, log } = gateDeps(["", `  ${accountKey}\t`], { [accountKey]: paid });
+  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: accountKey, check: paid });
   assert.deepEqual(log.opened, [KEY_PAGE_URL]);
-  assert.deepEqual(log.saved, ["good-key"]);
+  assert.deepEqual(log.saved, [accountKey]);
 });
 
 test("gate: an empty paste or another invalid key asks again; the bad key is never saved", async () => {
-  const { deps, log } = gateDeps(["", "", "p", "still-bad", "", "ok"], { "still-bad": "invalid" });
-  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: "ok", check: null });
-  assert.deepEqual(log.saved, ["ok"], "an unknown status (network) still saves the pasted key");
+  const { deps, log } = gateDeps(["", "", "p", revokedKey, "", accountKey], { [revokedKey]: "invalid" });
+  assert.deepEqual(await runKeyGate(deps), { action: "rekeyed", apiKey: accountKey, check: null });
+  assert.deepEqual(log.saved, [accountKey], "an unknown status (network) still saves the pasted key");
   assert.equal(log.warned.length, 3, "the headline again after each failed attempt");
   assert.deepEqual(log.opened, [KEY_PAGE_URL], "the key page opens once, not per attempt");
   assert.match(log.warned[2], /^⚠ That key isn't valid either\. Get a new one at /);
@@ -213,8 +220,8 @@ test("resolveInvalidKey: a known status passes through; interactive gates re-key
     { apiKey: "k", check: "invalid" });
   // A new key that is unpaid comes back unpaid, for the payment gate next.
   assert.deepEqual(await resolveInvalidKey("invalid", "k",
-    { ...gateDeps(["", "new"], { new: unpaid }).deps, ...base }),
-  { apiKey: "new", check: unpaid });
+    { ...gateDeps(["", accountKey], { [accountKey]: unpaid }).deps, ...base }),
+  { apiKey: accountKey, check: unpaid });
 });
 
 // ---------------------------------------------------------------- mid-session
@@ -456,4 +463,14 @@ test("an invalid-key refusal in a subagent's lane keeps the user's key notice du
     const shown = await display(h, "p1");
     assert.match(shown.body.hookSpecificOutput.displayContent, /isn't valid/);
   } finally { h.close(); }
+});
+
+test("malformed pasted keys never leave the recovery gate", async () => {
+  const key = "sk-" + "a".repeat(32);
+  for (const text of ["review files", "review", key.slice(0, 6) + " " + key.slice(6), key + "0", key.slice(0, -1), key.toUpperCase(), "sk-" + "A".repeat(32)]) {
+    const { deps, log } = gateDeps(["", text, "q"]);
+    deps.check = () => assert.fail("malformed key reached the status check");
+    assert.deepEqual(await runKeyGate(deps), { action: "quit" });
+    assert.deepEqual(log.saved, []);
+  }
 });

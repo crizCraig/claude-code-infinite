@@ -1,7 +1,7 @@
 /**
  * Finding Claude Code to launch, however it was installed.
  *
- * ccc launches `claude` through cross-spawn, which finds it on PATH (with
+ * ccc locates `claude` on PATH (with
  * PATHEXT on Windows, so npm's `claude.cmd` shim and the native `claude.exe`
  * both run). What it cannot do is find a Claude Code that is installed but not
  * on this terminal's PATH. On Windows that is the common case: the native
@@ -17,14 +17,16 @@
  * only when PATH has no `claude`.
  */
 /** Where Claude Code was found, for diagnostics (an enum, never a path). */
-export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
+export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override"];
 export type ClaudeSource = (typeof CLAUDE_SOURCES)[number];
 /** `claude_found` in diagnostics: a source, or `desktop_only` (only the desktop app is installed). */
-export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
+export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override", "desktop_only"];
 export interface ClaudeLocation {
-    /** What to spawn: `claude` when it is on PATH, else its absolute path. */
+    /** What to spawn: an absolute path, or `claude` on the POSIX PATH. */
     command: string;
     source: ClaudeSource;
+    /** First refused wrapper when a later Claude on PATH was selected. */
+    skippedWrapper?: string;
     /** Not on PATH: its directory, to put on the child's PATH. */
     dir?: string;
 }
@@ -34,6 +36,8 @@ export interface LocateClaudeOptions {
     homedir?: string;
     /** True when `file` exists and can be run. */
     isExecutable?: (file: string) => boolean;
+    /** Read a Windows package-manager shim. */
+    readFile?: (file: string) => string;
     /** Windows: the user's and the machine's PATH from the registry. */
     registryPath?: () => string[];
     /** Directory entries (winget's package folders); [] when unreadable. */
@@ -73,8 +77,18 @@ export declare function cwdHintText(cwd: string, opts?: {
     env?: NodeJS.ProcessEnv;
     homedir?: string;
 }): string | null;
+/** Resolve a helper without an implicit working-directory or relative PATH lookup. */
+export declare function findPathExecutable(filename: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, cwd: string, isExecutable?: (file: string) => boolean): string | undefined;
+/** cmd must not look up a shim's tools in the project, implicitly or via PATH. */
+export declare function windowsShellEnv(env: NodeJS.ProcessEnv, cwd: string): {
+    [x: string]: string | undefined;
+    NoDefaultCurrentDirectoryInExePath: string;
+    ComSpec: string;
+};
 /** `%USERPROFILE%\.local\bin` → its value; unknown names stay as written. */
 export declare function expandWindowsVars(value: string, env: NodeJS.ProcessEnv): string;
 /** The Path values in `reg query` output (REG_SZ or REG_EXPAND_SZ). */
 export declare function parseRegQueryPath(output: string): string | null;
+/** System tools always use a drive-qualified or UNC System32 directory. */
+export declare function system32Path(env: NodeJS.ProcessEnv, ...parts: string[]): string;
 //# sourceMappingURL=claude-locate.d.ts.map

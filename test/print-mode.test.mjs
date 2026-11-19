@@ -2,13 +2,15 @@
 // parse --output-format json|stream-json from it), and ccc gives the session
 // its memtree MCP tools by default, exactly as in interactive sessions.
 import test from "node:test";
+import { installNpmClaude } from "./fixtures/npm-claude.mjs";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { routeConsoleToStderr, stripAnsi } from "../dist/cli-output.js";
 import { subcommandArgs } from "../dist/cli-args.js";
 
@@ -50,7 +52,7 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } = {}) {
+function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
@@ -72,7 +74,7 @@ function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } =
     "process.stdout.write(JSON.stringify({ type: 'result', args, servers, hooks }) + '\\n');",
   ].join("\n"));
   if (process.platform === "win32") {
-    fs.writeFileSync(path.join(bin, "claude.cmd"), `@"${process.execPath}" "%~dp0claude.mjs" %*\r\n`);
+    installNpmClaude(bin, fs.readFileSync(script));
   } else {
     fs.writeFileSync(path.join(bin, "claude"), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/claude.mjs" "$@"\n`);
     fs.chmodSync(path.join(bin, "claude"), 0o755);
@@ -86,7 +88,7 @@ function fakeClaudeHome({ key = "test-key", claudeJson, seenAuth, authStatus } =
   return { home, bin };
 }
 
-function runCcc(args, extraEnv = {}, home_ = {}) {
+function runCcc(args, extraEnv = {}, home_ = {}, nodeArgs = []) {
   const { home, bin } = fakeClaudeHome(home_);
   const env = {
     ...process.env, HOME: home, USERPROFILE: home, CCC_NO_DIAGNOSTICS: "1",
@@ -100,7 +102,7 @@ function runCcc(args, extraEnv = {}, home_ = {}) {
     "CLAUDE_CODE_USE_FOUNDRY"]) delete env[name];
   Object.assign(env, extraEnv);
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [...nodeArgs, CLI, "local", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => { stdout += d; });
@@ -140,6 +142,35 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.doesNotMatch(stderr, /\x1b\[/);
 });
 
+test("Windows reports a skipped wrapper once on interactive stderr and stays quiet about it in print mode", {
+  skip: process.platform !== "win32",
+}, async t => {
+  const { home, bin } = fakeClaudeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const wrappers = path.join(home, "wrappers");
+  fs.mkdirSync(wrappers);
+  const wrapper = path.join(wrappers, "claude.bat");
+  fs.writeFileSync(wrapper, "@exit /b 42");
+  const env = {
+    USERPROFILE: home, Path: [wrappers, bin].join(";"), PATHEXT: ".EXE;.BAT;.CMD",
+    SystemRoot: process.env.SystemRoot, TEMP: home, TMP: home, CCC_NO_DIAGNOSTICS: "1",
+  };
+  const tty = "data:text/javascript,process.stdin.isTTY = process.stdout.isTTY = true";
+  for (const [nodeArgs, args, expectedNotes] of [
+    [["--import", tty], ["--help"], 1],
+    [["--import", tty], ["-p", "hi"], 0],
+    [["--import", tty], ["--print", "hi"], 0],
+    [[], ["--help"], 0],
+  ]) {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath,
+      [...nodeArgs, CLI, "local", ...args], { cwd: home, env, timeout: 15000 });
+    assert.ok(!stdout.includes(wrapper), stdout);
+    const notes = stderr.split(/\r?\n/).filter(line => line.includes(wrapper));
+    assert.equal(notes.length, expectedNotes, stderr);
+    if (expectedNotes) assert.match(notes[0], /skipped.*wrapper/i);
+  }
+});
+
 test("ccc -p with CCC_MEMTREE_MCP=0: Claude's argv is untouched", { timeout: 30_000 }, async () => {
   const { code, stdout, stderr } = await runCcc(["-p", "hi"], { CCC_MEMTREE_MCP: "0" });
   assert.equal(code, 0, stderr);
@@ -152,6 +183,24 @@ test("ccc -p with no saved key and no terminal: fails on stderr, never prompts o
   assert.equal(stdout, "");
   assert.match(stderr, /MemTree API key is required/);
   assert.match(stderr, /run `ccc` in a terminal/);
+  assert.doesNotMatch(stderr, /Press Enter|paste it here/);
+});
+
+test("ccc -p checks a legacy saved key and warns once without printing the key", async () => {
+  const key = "old-saved-value";
+  const mock = `globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/status") && new Headers(init.headers).get("authorization") === "Bearer ${key}") {
+      console.error("checked legacy credential");
+    }
+    return Response.json({ paid: false });
+  };`;
+  const { code, stdout, stderr } = await runCcc(["-p", "hi"], {}, { key },
+    ["--import", "data:text/javascript," + encodeURIComponent(mock)]);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).args, ["-p", "hi"]);
+  assert.match(stderr, /checked legacy credential/);
+  assert.equal(stderr.match(/legacy format/gi)?.length, 1);
+  assert.doesNotMatch(stderr, /old-saved-value|paste it here/);
 });
 
 const NO_PLAN = /^Claude Code is signed in for API billing \(an Anthropic Console account\), so Claude bills that account per token, not a Claude plan\. Your MemTree credit covers MemTree, not Claude itself\. To use Claude Pro or Max instead, run \/login in Claude Code and choose "Claude account with subscription"\.$/m;
@@ -259,4 +308,53 @@ test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session
   } finally {
     server.close();
   }
+});
+
+test("ccc --resume <id> forwards the existing session and uses absolute Windows executables", async t => {
+  const { home, bin } = fakeClaudeHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const projects = path.join(home, ".claude", "projects", "test-project");
+  fs.mkdirSync(projects, { recursive: true });
+  const id = "e32c1f3e-f811-468a-8d31-e4967cbf1219";
+  const transcript = path.join(projects, id + ".jsonl");
+  fs.writeFileSync(transcript, '{"type":"user"}\n');
+  fs.writeFileSync(path.join(home, ".claude-code-infinite", "config.json"),
+    JSON.stringify({ polychatApiKey: "sk-" + "1".repeat(32), diagnostics: false, updateCheck: false }));
+
+  const preload = path.join(home, "capture.mjs");
+  fs.writeFileSync(preload, `
+    import cp from "node:child_process";
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    import { Server } from "node:net";
+    Server.prototype.listen = function(port, host, ready) { queueMicrotask(ready); return this; };
+    Server.prototype.address = () => ({ port: 12345 });
+    globalThis.fetch = async () => Response.json({ paid: true });
+    for (const method of ["spawn", "spawnSync", "execFile", "execFileSync"]) {
+      const original = cp[method];
+      cp[method] = function(file, ...args) {
+        fs.appendFileSync(process.env.CCC_TEST_SPAWNS, JSON.stringify(file) + "\\n");
+        return original.call(this, file, ...args);
+      };
+    }
+    syncBuiltinESMExports();
+  `);
+  const log = path.join(home, "spawns");
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+    PATH: bin + path.delimiter + process.env.PATH, CCC_TEST_SPAWNS: log };
+  // Child env keys are case-insensitive on Windows. Keep one spelling of PATH.
+  for (const key of Object.keys(env)) if (key !== "PATH" && key.toUpperCase() === "PATH") delete env[key];
+  const { stdout } = await promisify(execFile)(process.execPath,
+    ["--import", pathToFileURL(preload).href, CLI, "--resume", id], { env, cwd: home, timeout: 10000 });
+  const args = JSON.parse(stdout).args;
+  assert.deepEqual(args.slice(args.indexOf("--resume")), ["--resume", id]);
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(calls.length > 0);
+  if (process.platform === "win32") {
+    for (const file of calls) {
+      assert.ok(path.isAbsolute(file) && path.parse(file).root.length > 1, file);
+      assert.doesNotMatch(path.basename(file), /^(ps|lsof)(\.exe)?$/i);
+    }
+  }
+  assert.equal(fs.readFileSync(transcript, "utf8"), '{"type":"user"}\n');
 });

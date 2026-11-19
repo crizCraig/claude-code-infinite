@@ -113,6 +113,8 @@ test("the installer per OS: PowerShell's one-liner on Windows, curl | bash elsew
   // Never by name: a search would try the current folder first.
   assert.equal(installerCommand("win32", {}).command,
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.equal(installerCommand("win32", { SystemRoot: "." }).command,
+    installerCommand("win32", {}).command);
   // PowerShell 7's module path breaks Windows PowerShell 5.1's own cmdlets: dropped.
   const fromPwsh = installerCommand("win32",
     { PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules", Path: "C:\\x" });

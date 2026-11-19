@@ -31,9 +31,9 @@ export declare const CLAUDE_AUTH_TYPES: readonly ["subscription", "api_key", "be
 export declare const AUTH_PROBE_RESULTS: readonly ["ok", "failed", "timeout", "unsupported", "skipped"];
 export declare const SIGN_IN_WARNING_KINDS: readonly ["not_signed_in", "api_billing", "unknown", "credit_reminder", "key_override"];
 export declare const CLAUDE_PLANS: readonly ["free", "pro", "max", "max_5x", "max_20x", "team", "enterprise", "unknown"];
-export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local"];
+export declare const CLAUDE_SOURCES: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override"];
 /** Where Claude Code was found, or `desktop_only`: only the Claude desktop app is installed. */
-export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "desktop_only"];
+export declare const CLAUDE_FOUND: readonly ["path", "registry-path", "native", "npm", "winget", "homebrew", "legacy-local", "override", "desktop_only"];
 /** claude-install.ts InstallFailure: couldn't start, failed, or finished but no claude found. */
 export declare const INSTALL_FAILURES: readonly ["spawn", "exit", "not_found"];
 /** rate-limit.ts RateLimitKind: the Claude plan's usage limit, or Anthropic busy (retried). */
