@@ -1,4 +1,7 @@
 // All Claude launches, including the auth probe and resume, use this resolution.
+// An untrusted working directory must never supply an executable. Pass user
+// arguments directly so a shell cannot reinterpret them. Like Claude Code, we
+// trust PATH directories because anyone who can write there can replace claude.exe.
 import { spawn, spawnSync, type SpawnOptions, type SpawnSyncOptions } from "node:child_process";
 import { executablePath } from "./executable-path.js";
 import { ClaudeLocationError, resolveWindowsClaude } from "./windows-claude-shim.js";
