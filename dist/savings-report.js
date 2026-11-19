@@ -1,5 +1,6 @@
 /** The only savings fields that may reach disk or the authenticated turn endpoint. */
 import { isSavingsSessionId } from './savings.js';
+const incompleteReasons = ['interrupted_dispatch', 'interrupted_stream', 'unmeasured_input', 'missing_usage'];
 function usage(value) {
     if (value === null)
         return null;
@@ -39,6 +40,11 @@ export function savingsReport(value) {
         return;
     const report = { ...identity, model: v.model, fast_mode: v.fast_mode,
         window_crossing: v.window_crossing, actual, plain };
+    if (actual === null || plain === null) {
+        const reason = incompleteReasons.find(allowed => allowed === v.incomplete_reason);
+        if (reason)
+            report.incomplete_reason = reason;
+    }
     for (const field of ['floor_read_possibly_uncached_tokens', 'floor_read_max_gap_seconds']) {
         const count = v[field];
         const max = field === 'floor_read_max_gap_seconds' ? Number.MAX_SAFE_INTEGER : plain?.cache_read ?? 1_000_000_000;

@@ -78,10 +78,11 @@ import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
+import { savingsRetainedRequest } from "./savings.js";
 import { claudeAuthFromHeaders, upstreamErrorCode } from "./claude-auth.js";
 import { rateLimitFromResponse } from "./rate-limit.js";
 import { requestThreadType, threadUnsupportedBody, ThreadRefusals, } from "./thread-backstop.js";
-import { approxTokensFromBytes, mergeUsageFromJsonBody, mergeUsageFromSseEvent, } from "./reqlog.js";
+import { approxTokensFromBytes, mergeUsageFromJsonBody, savingsResponseUsage, mergeUsageFromSseEvent, } from "./reqlog.js";
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 const HOOK_BODY_LIMIT = 64 * 1024;
 /**
@@ -1431,17 +1432,39 @@ async function handleMessages(req, res, opts, upstream, state) {
     const requestSessionKey = requestSessionId(req);
     const observed = opts.savings?.startTurn(requestSessionKey);
     const possiblyResumed = !!requestSessionKey && state.resumableMainSession === requestSessionKey;
+    const countSession = createCountTokensSession({
+        upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
+        signal: state.shutdownSignal,
+        onAttempt: (result) => {
+            (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
+                bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
+        },
+    }, state.countTokensCooldowns);
+    const countSavingsPrefix = opts.countTokens && observed ? async (messages) => {
+        const retained = savingsRetainedRequest(originalRequest, messages);
+        return (await countSession.count(Buffer.from(JSON.stringify(retained)))).tokens;
+    } : undefined;
+    const trackSavings = (lane, sizes) => {
+        const savings = opts.savings;
+        if (!savings || !observed)
+            return;
+        let requestModified = false;
+        const input = () => ({ ...sizes(), request: rawBody, model: originalRequest.model,
+            laneKey: lane, possiblyResumed, requestModified });
+        savingsDispatch.set(rec, {
+            announce: () => observed.announce(lane),
+            sent: (at, sentBody) => {
+                requestModified = sentBody !== rawBody;
+                observed.dispatched({ ...input(), nowMs: at });
+            },
+        });
+        settleSavings = () => savings.settle(observed, { ...input(), nowMs: observed.requestedAt,
+            ...savingsResponseUsage(rec) }, rec.upstreamStatus ?? 0, countSavingsPrefix);
+    };
     if (sideRequest && clientInfo) {
-        if (opts.savings && observed) {
-            const savings = opts.savings;
-            const lane = "side:" + body.model;
-            const input = { request: rawBody, model: body.model, requestModified: false, possiblyResumed,
-                contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false), laneKey: lane };
-            savingsDispatch.set(rec, { announce: () => observed.announce(lane),
-                sent: at => observed.dispatched({ ...input, nowMs: at }) });
-            settleSavings = () => savings.settle(observed, { ...input, nowMs: observed.requestedAt,
-                usage: rec.savingsUsageComplete ? rec.usage : undefined }, rec.upstreamStatus ?? 0);
-        }
+        trackSavings("side:" + body.model, () => ({
+            contextWindow: contextLimitForModel(body.model, headerText(req.headers, "anthropic-beta"), opts.nativeOneMillionContext !== false),
+        }));
         if (typeof body.model === "string")
             rec.model = body.model;
         rec.stream = body.stream === true;
@@ -1501,14 +1524,6 @@ async function handleMessages(req, res, opts, upstream, state) {
         rec.contextWindow = modelContextLimit;
     // Before anything reads the size sample: replace an unknown or stale
     // estimate with an exact count where it would decide the outcome.
-    const countSession = createCountTokensSession({
-        upstream, headers: forwardableRequestHeaders(req), requestUrl: req.url,
-        signal: state.shutdownSignal,
-        onAttempt: (result) => {
-            (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
-                bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
-        },
-    }, state.countTokensCooldowns);
     const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined);
     if (carriesServerTools(body))
         serverToolRecords.add(rec);
@@ -1526,17 +1541,11 @@ async function handleMessages(req, res, opts, upstream, state) {
     if (opts.savings && isMainRequest && !notConversation) {
         opts.savings.progress(requestSessionKey, originalCandidate.estimate.tokens, sizingLimits().budget);
     }
-    if (opts.savings && observed) {
-        const savings = opts.savings;
+    if (observed) {
         const lane = JSON.stringify([requestRouteLane, notConversation ?? null,
             isSubagentRequest ? agentAttributionId(req) : null]);
-        const input = () => ({ request: rawBody, model: originalRequest.model, contextWindow: modelContextLimit,
-            outputReserve: sizingLimits().output, requestModified: savingsModified.has(rec), possiblyResumed,
-            originalInputTokens: countSession.peekKey(originalCandidate.key)?.tokens, laneKey: lane });
-        savingsDispatch.set(rec, { announce: () => observed.announce(lane),
-            sent: at => observed.dispatched({ ...input(), nowMs: at }) });
-        settleSavings = () => savings.settle(observed, { ...input(), nowMs: observed.requestedAt,
-            usage: rec.savingsUsageComplete ? rec.usage : undefined }, rec.upstreamStatus ?? 0);
+        trackSavings(lane, () => ({ contextWindow: modelContextLimit, outputReserve: sizingLimits().output,
+            originalInputTokens: countSession.peekKey(originalCandidate.key)?.tokens }));
     }
     if (isMainRequest && requestSessionKey !== undefined) {
         adoptStoredPrefix(opts, state, rec, requestSessionKey, body, messages, modelContextLimit);
@@ -5721,8 +5730,6 @@ async function selectForwardCandidate(args) {
     if (preparedBase?.derived !== undefined && preparedBase.derived === candidate) {
         preparedBase.install();
     }
-    if (candidate.kind !== "original")
-        savingsModified.add(args.rec);
     const changed = candidate !== preferred || intended !== args.preferredBody;
     if (changed) {
         policy.allowed.delete(args.preferredBody);
@@ -6135,7 +6142,6 @@ function noteAwayWarmsMain(state, rec, sessionId, forkBody) {
 }
 /** Account the candidate delivery selected after sizing and fallbacks. */
 const savingsDispatch = new WeakMap();
-const savingsModified = new WeakSet();
 /** Per request: stamps its lane's cache clock as `sent` goes upstream (noteLaneCache). */
 const laneSendStamps = new WeakMap();
 /** Per cold request: the lane and the gap it arrived in, for the once-per-gap claim. */
@@ -6442,7 +6448,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
         }
         if (rec) {
             laneSendStamps.get(rec)?.(bodyBuffer);
-            savingsDispatch.get(rec)?.sent(Date.now());
+            savingsDispatch.get(rec)?.sent(Date.now(), bodyBuffer);
         }
         upstreamReq = upstream.module.request({
             host: upstream.host,

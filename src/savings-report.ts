@@ -15,10 +15,14 @@ interface SavingsIdentity {
   requested_at: string;
 }
 
+const incompleteReasons = ['interrupted_dispatch', 'interrupted_stream', 'unmeasured_input', 'missing_usage'] as const;
+type IncompleteReason = typeof incompleteReasons[number];
+
 type LegacyPreflight = SavingsIdentity & {outcome: 'not_dispatched'; expected_memtree_calls: number};
 
 export type SavingsRecord = LegacyPreflight | (SavingsIdentity & {
   model: string;
+  incomplete_reason?: IncompleteReason;
   fast_mode: boolean;
   window_crossing: boolean;
   floor_read_possibly_uncached_tokens?: number | null;
@@ -59,6 +63,10 @@ export function savingsReport(value: unknown): SavingsRecord | undefined {
   if (actual === undefined || plain === undefined) return;
   const report: SavingsRecord = {...identity, model:v.model, fast_mode:v.fast_mode,
     window_crossing:v.window_crossing, actual, plain};
+  if (actual === null || plain === null) {
+    const reason = incompleteReasons.find(allowed => allowed === v.incomplete_reason);
+    if (reason) report.incomplete_reason = reason;
+  }
   for (const field of ['floor_read_possibly_uncached_tokens','floor_read_max_gap_seconds'] as const) {
     const count = v[field];
     const max = field === 'floor_read_max_gap_seconds' ? Number.MAX_SAFE_INTEGER : plain?.cache_read ?? 1_000_000_000;

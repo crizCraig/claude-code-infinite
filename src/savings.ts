@@ -1,37 +1,27 @@
-/** Price plain Claude Code against its own dispatch history. */
-import { createHash } from 'node:crypto';
-import { DEFAULT_CACHE_TTL_MS, LONG_CACHE_TTL_MS } from './cold-cache.js';
-import type { SavingsReplay } from './savings-history.js';
-import type { SavingsUsage } from './savings-report.js';
+/** Plain Claude's structural conversation cursor contains no prompt content. */
+import {createHash} from 'node:crypto';
+import {DEFAULT_CACHE_TTL_MS, LONG_CACHE_TTL_MS} from './cold-cache.js';
+import type {SavingsUsage} from './savings-report.js';
 
-type SavingsTokens = SavingsUsage;
-// Every hash identifies the entire plain prefix up to one block. Keep previous
-// branches too: editing a turn and then restoring it is still a repeat send.
-interface SentPrefix {
-  at: number;
-  ttl: number;
-  exact?: number;
-  upper: number;
-}
+interface DurationRange { ttl: number; end: number | null }
 interface SavingsLane {
-  model: string;
-  full_hash: string;
-  removed: number;
-  sent: Record<string, SentPrefix>;
+  sequence: number; messages: number; at: number;
+  // Bounds coincide whenever all compaction decisions were measured.
+  minRemoved: number; maxRemoved: number;
+  writer?: string; total: number | null; durations: DurationRange[];
 }
-export interface SavingsState {
-  lanes: Record<string, SavingsLane>;
-  unknownHistory?: boolean;
-}
+export interface SavingsState { lanes: Record<string,SavingsLane>; unknownHistory?: boolean; evicted?: boolean }
 export interface SavingsTurnInput {
-  replay?: SavingsReplay<SavingsPromptCheckpoint>;
   request: unknown; usage: unknown; model?: string; contextWindow: number; outputReserve?: number;
   requestModified: boolean; originalInputTokens?: number; nowMs?: number; laneKey?: string;
+  prefixCount?: {messages:number; tokens:number}; interruptedStream?: boolean;
+  possiblyResumed?: boolean; writer?: string;
 }
 export interface SavingsTurn {
-  original_input_tokens: number; plain_input_tokens: number;
-  input_source: 'actual' | 'counted' | 'estimated'; compacted: boolean;
-  plain_tokens: SavingsTokens; actual_tokens?: SavingsTokens;
+  original_input_tokens: number | null; plain_input_tokens: number | null;
+  input_source: 'actual' | 'counted' | 'unmeasured'; compacted: boolean;
+  prefix_messages_to_count?: number;
+  plain_tokens: SavingsUsage | null; actual_tokens?: SavingsUsage;
   fast_mode: boolean; window_crossing: boolean;
   floor_read_possibly_uncached_tokens: number | null; floor_read_max_gap_seconds: number | null;
 }
@@ -41,29 +31,28 @@ export function isSavingsSessionId(value: unknown): value is string {
 }
 const MAX_TOKENS = 1_000_000_000;
 const MAX_LANES = 32;
-const MAX_PREFIXES = 65_536;
 const record = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
 const count = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= MAX_TOKENS;
-const hash = (s: string) => createHash('sha256').update(s).digest('hex');
-export const savingsLaneKey = hash;
-const totalInput = (v: SavingsTokens) => v.input + v.cache_read + v.cache_creation_5m + v.cache_creation_1h;
+export const savingsLaneKey = (s: string) => createHash('sha256').update(s).digest('hex');
+const totalInput = (v: SavingsUsage) => v.input + v.cache_read + v.cache_creation_5m + v.cache_creation_1h;
 
-const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 export function isSavingsState(value: unknown): value is SavingsState {
   if (!record(value) || !record(value.lanes) ||
+      (value.evicted !== undefined && typeof value.evicted !== 'boolean') ||
       (value.unknownHistory !== undefined && typeof value.unknownHistory !== 'boolean')) return false;
   const lanes = Object.entries(value.lanes);
   return lanes.length <= MAX_LANES && lanes.every(([key,lane]) =>
-    digest(key) && record(lane) && typeof lane.model === 'string' && digest(lane.full_hash) &&
-    count(lane.removed) && record(lane.sent) && Object.keys(lane.sent).length <= MAX_PREFIXES &&
-    Object.entries(lane.sent).every(([key,entry]) => digest(key) && record(entry) &&
-      Number.isSafeInteger(entry.at) && entry.at >= 0 && count(entry.upper) &&
-      [0,DEFAULT_CACHE_TTL_MS,LONG_CACHE_TTL_MS].includes(entry.ttl) &&
-      (entry.exact === undefined || count(entry.exact) && entry.exact <= entry.upper)));
+    /^[a-f0-9]{64}$/.test(key) && record(lane) && count(lane.messages) && count(lane.sequence) &&
+    Number.isSafeInteger(lane.at) && lane.at >= 0 && count(lane.minRemoved) &&
+    (lane.writer === undefined || typeof lane.writer === 'string') &&
+    count(lane.maxRemoved) && lane.minRemoved <= lane.maxRemoved &&
+    (lane.total === null || count(lane.total)) && Array.isArray(lane.durations) &&
+    lane.durations.every((r: unknown) => record(r) && [0,DEFAULT_CACHE_TTL_MS,LONG_CACHE_TTL_MS].includes(r.ttl)
+      && (r.end === null || count(r.end))));
 }
 
 /** Cache creation total includes its duration buckets; never count it twice. */
-export function normalizeSavingsUsage(value: unknown): SavingsTokens | undefined {
+export function normalizeSavingsUsage(value: unknown): SavingsUsage | undefined {
   if (!record(value) || !count(value.input_tokens) || !count(value.output_tokens)) return;
   const read = value.cache_read_input_tokens ?? 0;
   if (!count(read)) return;
@@ -85,92 +74,8 @@ export function createSavingsState(): SavingsState {
   return {lanes: {}};
 }
 
-/** A modest text estimate, intentionally unrelated to the high safety fit estimator.
- * Opaque media contributes zero; exclude API controls and base64 rather than inflate savings. */
-function textWeight(value: unknown): number {
-  if (typeof value === 'string') return value.length;
-  if (Array.isArray(value)) return value.reduce((n, v) => n + textWeight(v), 0);
-  if (!record(value)) return 0;
-  if (['image', 'document', 'audio', 'video'].includes(value.type)) return 0;
-  return Object.entries(value).reduce((n, [k, v]) => n + (['cache_control', 'source', 'signature'].includes(k) ? 0 : textWeight(v)), 0);
-}
-interface PromptPart { value: unknown; ttl?: number; cacheable: boolean }
 const cacheTtl = (value: unknown): number | undefined => record(value) && value.type === 'ephemeral'
   ? value.ttl === '1h' ? LONG_CACHE_TTL_MS : value.ttl === undefined || value.ttl === '5m' ? DEFAULT_CACHE_TTL_MS : undefined : undefined;
-/** Only API content blocks carry cache markers. Tool input/schema keys are prompt content. */
-function withoutControls(value: unknown): unknown {
-  if (!record(value)) return value;
-  const { cache_control, ...block } = value;
-  if (block.type === 'tool_result' && Array.isArray(block.content)) {
-    block.content = block.content.map(withoutControls);
-    return block;
-  }
-  return cache_control === undefined ? value : block;
-}
-interface SourcePrefix {
-  hash: string; history: string; weight: number; ttl: number; cacheable: boolean;
-}
-export interface SavingsPromptCheckpoint {
-  model: string; frame: string; prefixes: SourcePrefix[];
-}
-
-function promptPrefixes(request: Record<string, any>, model: string, replay?: SavingsReplay<SavingsPromptCheckpoint>) {
-  let prefixes: SourcePrefix[] = [];
-  const append = (part: PromptPart, message = false) => {
-    const last = prefixes.at(-1);
-    const content = hash(JSON.stringify(part.value));
-    const history = last?.history ?? '';
-    prefixes.push({hash:hash((last?.hash ?? '') + content),
-      history:message ? hash(history + content) : history,
-      weight:(last?.weight ?? 0) + (last ? textWeight(part.value) : 0), ttl:part.ttl ?? 0, cacheable:part.cacheable});
-  };
-  const blockPart = (value: unknown, role?: string, system = false) => {
-    if (system || role === 'system') {
-      const text = record(value) ? value.text : value;
-      if (typeof text === 'string' && text.startsWith('x-anthropic-billing-header:')) {
-        const stable = text.replace(/^x-anthropic-billing-header:(?:[ \t]*[a-z_]+=[^;\n]*;)+/, 'x-anthropic-billing-header:');
-        value = record(value) ? { ...value, text: stable } : stable;
-      }
-    }
-    const cacheable = !(record(value) && ['thinking', 'redacted_thinking'].includes(value.type)) &&
-      !(typeof value === 'string' && !value.length) && !(record(value) && value.type === 'text' && value.text === '');
-    append({ value: role === undefined ? withoutControls(value) : { role, content: withoutControls(value) },
-      ttl: cacheable && record(value) ? cacheTtl(value.cache_control) : undefined, cacheable }, role !== undefined);
-  };
-  const messages = Array.isArray(request.messages) ? request.messages : [];
-  const cached = replay?.prefix();
-  let frame: string;
-  if (cached?.sameFrame && cached.prompt.model === model) {
-    frame = cached.prompt.frame;
-  } else {
-    append({value:{model, tool_choice:request.tool_choice ?? null, thinking:request.thinking ?? null,
-      speed:request.speed ?? null},cacheable:false});
-    for (const tool of Array.isArray(request.tools) ? request.tools : []) blockPart(tool);
-    const system = Array.isArray(request.system) ? request.system : request.system ? [request.system] : [];
-    for (const block of system) blockPart(block, undefined, true);
-    frame = hash(JSON.stringify(prefixes.map(p => [p.hash,p.ttl])));
-  }
-  const reuse = cached && cached.prompt.frame === frame && cached.count <= messages.length ? cached : undefined;
-  if (reuse) prefixes = [...reuse.prompt.prefixes];
-  // Claude often moves the final message's explicit breakpoint on the next request.
-  const tail = replay && reuse?.count !== messages.length && messages.at(-1)?.content;
-  const movingMarker = Array.isArray(tail) && tail.some(p => record(p) && p.cache_control);
-  const stableCount = movingMarker && messages.length > 1 ? messages.length - 1 : messages.length;
-  const checkpoint = Math.max(reuse?.count ?? 0, stableCount);
-  for (let i = reuse?.count ?? 0; i < messages.length; i++) {
-    const message = messages[i];
-    for (const block of Array.isArray(message.content) ? message.content : [message.content]) blockPart(block, message.role);
-    if (replay && i+1 === checkpoint && prefixes.length <= MAX_PREFIXES) {
-      replay.remember(checkpoint, {model,frame,prefixes:[...prefixes]});
-    }
-  }
-  const automatic = cacheTtl(request.cache_control);
-  if (automatic !== undefined) {
-    const i = prefixes.findLastIndex(p => p.cacheable);
-    if (i >= 0 && !prefixes[i].ttl) prefixes[i] = {...prefixes[i],ttl:automatic};
-  }
-  return prefixes;
-}
 function minimumCacheTokens(model: string): number {
   model = model.toLowerCase();
   if (/^claude-(?:opus-4[-.]([56])|haiku-4[-.]5)(?:-|$)/.test(model)) return 4096;
@@ -179,171 +84,183 @@ function minimumCacheTokens(model: string): number {
   return 1024;
 }
 
-/** Sum contiguous expired ranges. If a change of TTL or send time puts the
- * dividing line inside an unmeasured span, its token count is unknown. */
-function gapDiagnostics(seen: (SentPrefix | undefined)[], exact: (number | undefined)[],
-                        match: number, matchedRead: number, now: number, missing: boolean) {
-  const unknown = {floor_read_possibly_uncached_tokens:null,floor_read_max_gap_seconds:null};
-  if (missing) return unknown;
-  let tokens: number | null = 0;
-  let maxGap = 0;
-  let start: number | undefined = 0;
-  let expired = false;
-  for (let i = 1; i <= match; i++) {
-    const last = seen[i];
-    if (!last || now < last.at) return unknown;
-    const gap = now-last.at;
-    const stale = gap > last.ttl;
-    const boundary = i === 1 ? 0 : exact[i-1];
-    if (stale !== expired) {
-      if (expired) tokens = addRange(tokens,start,boundary,matchedRead);
-      start = boundary;
-      expired = stale;
+// OpenAI-style role messages can carry the same frame as a top-level system
+// prompt. They travel with every prefix count, wherever the client put them.
+const framing = (message: any) => message?.role === 'system' || message?.role === 'developer';
+
+export function savingsRetainedRequest(request: Record<string,any>, retained: number) {
+  let position = 0;
+  return {...request,messages:request.messages.filter((m: unknown) => framing(m) || position++ < retained)};
+}
+
+// Only positional markers and measured token boundaries participate in price.
+function durationRanges(request: Record<string,any>, total: number, passthrough?: SavingsUsage): DurationRange[] {
+  const markers: {position:number; ttl:number}[] = [];
+  let position = 0, lastEligible = 0;
+  const block = (v: any) => {
+    ++position;
+    if (v === '' || v?.type === 'text' && v.text === '' || ['thinking','redacted_thinking'].includes(v?.type)) return;
+    lastEligible = position;
+    const ttl = cacheTtl(v?.cache_control);
+    if (ttl) markers.push({position,ttl});
+  };
+  for (const tool of request.tools ?? []) block(tool);
+  const content = (v: any) => Array.isArray(v) ? v.forEach(block) : block(v);
+  if (request.system) content(request.system);
+  for (const message of request.messages ?? []) content(message?.content);
+  const ttl = cacheTtl(request.cache_control);
+  if (ttl && lastEligible && lastEligible !== markers.at(-1)?.position) markers.push({position:lastEligible,ttl});
+  const hourMarkers = markers.filter(m => m.ttl === LONG_CACHE_TTL_MS).length;
+  const ranges: DurationRange[] = [];
+  for (const marker of markers) {
+    let end: number | null = marker.position === position ? total : null;
+    if (end === null && passthrough && marker.ttl === LONG_CACHE_TTL_MS && hourMarkers === 1 &&
+        passthrough.cache_creation_1h > 0) end = passthrough.cache_read + passthrough.cache_creation_1h;
+    if (end === null && passthrough && markers.length === 1 && passthrough.cache_creation_5m > 0)
+      end = total - passthrough.input;
+    if (ranges.at(-1)?.ttl === marker.ttl) ranges.pop();
+    ranges.push({ttl:marker.ttl,end});
+  }
+  if (!markers.length || markers.at(-1)!.position < position) ranges.push({ttl:0,end:total});
+  return ranges;
+}
+
+function gapDiagnostics(prior: SavingsLane | undefined, read: number, now: number, unknown: boolean) {
+  const missing = {floor_read_possibly_uncached_tokens:null,floor_read_max_gap_seconds:null};
+  if (!read) return {floor_read_possibly_uncached_tokens:0,floor_read_max_gap_seconds:0};
+  if (unknown || !prior || now < prior.at || !prior.durations.length) return missing;
+  const gap = now - prior.at;
+  const stale = prior.durations.map(r => gap > r.ttl);
+  if (stale.every(Boolean)) return {floor_read_possibly_uncached_tokens:read,floor_read_max_gap_seconds:Math.floor(gap/1000)};
+  let expired: number | null = 0;
+  let start: number | null = 0;
+  let any = false;
+  for (const [i,r] of prior.durations.entries()) {
+    const end = i === stale.length-1 ? read : r.end;
+    if (stale[i] && (start === null || start < read)) {
+      any = true;
+      expired = end === null || start === null || expired === null ? null :
+        expired + Math.max(0,Math.min(read,end)-start);
     }
-    if (stale && matchedRead > (boundary ?? 0)) maxGap = Math.max(maxGap,Math.floor(gap/1000));
+    start = end;
   }
-  if (expired) tokens = addRange(tokens,start,matchedRead,matchedRead);
-  return {floor_read_possibly_uncached_tokens:tokens,floor_read_max_gap_seconds:maxGap};
+  return {floor_read_possibly_uncached_tokens:expired,floor_read_max_gap_seconds:any ? Math.floor(gap/1000) : 0};
 }
 
-function addRange(total: number | null, start: number | undefined, end: number | undefined, limit: number) {
-  if (total === null || start === undefined || end === undefined) return null;
-  return total + Math.max(0,Math.min(limit,end) - Math.min(limit,start));
+/** Monotone bounds on removal, including the discontinuity at compaction.
+ * A lost count may hide a crossing. Following measured turns can use the
+ * shortest possible prompt at the read rate until the two cursors converge. */
+function compact(prior: SavingsLane | undefined, original: number | null, ceiling: number, gap: boolean) {
+  const low = gap ? 0 : prior?.minRemoved ?? 0;
+  const high = gap ? MAX_TOKENS : prior?.maxRemoved ?? 0;
+  if (original === null) return {minRemoved:0,maxRemoved:MAX_TOKENS,total:null,compacted:false};
+  const shortest = Math.max(0,original-high), longest = Math.max(0,original-low);
+  const retained = Math.min(1024,Math.floor(ceiling*.1)) + Math.floor(ceiling*.1);
+  if (shortest > ceiling)
+    return {minRemoved:original-retained,maxRemoved:original-retained,total:retained,compacted:true};
+  const max = Math.min(longest,ceiling);
+  const min = longest > ceiling ? Math.min(shortest,retained) : shortest;
+  return {minRemoved:original-max,maxRemoved:original-min,total:min,compacted:false};
 }
 
-/** Only a response to the original request can measure its token boundaries. */
-function measuredBoundaries(parts: SourcePrefix[], exact: (number | undefined)[], actual: SavingsUsage) {
-  const marked = parts.flatMap((p,i) => p.ttl ? [i] : []);
-  const hours = marked.filter(i => parts[i].ttl === LONG_CACHE_TTL_MS);
-  if (hours.length === 1 && actual.cache_creation_1h > 0) {
-    exact[hours[0]] = actual.cache_read + actual.cache_creation_1h;
-  }
-  const cached = totalInput(actual) - actual.input;
-  if (marked.length === 1 && actual.cache_creation_5m + actual.cache_creation_1h > 0) exact[marked[0]] = cached;
-}
-
-/** A settlement can improve the size of an already recorded dispatch. It
- * cannot change who last sent the prefix, its TTL, or the compaction cursor. */
 export function refineSavingsState(current: SavingsState, settled: SavingsState, dispatched: SavingsState): SavingsState {
   const lanes = {...current.lanes};
   for (const [key,lane] of Object.entries(settled.lanes)) {
-    if (!lanes[key]) continue;
-    const sent = {...lanes[key].sent};
-    for (const [hash,entry] of Object.entries(lane.sent)) {
-      if (entry.exact === undefined || entry.exact === dispatched.lanes[key]?.sent[hash]?.exact || !sent[hash]) continue;
-      sent[hash] = {...sent[hash], exact:entry.exact, upper:entry.exact};
-    }
-    lanes[key] = {...lanes[key],sent};
+    if (lanes[key]?.sequence === dispatched.lanes[key]?.sequence &&
+        lanes[key]?.writer === dispatched.lanes[key]?.writer) lanes[key] = lane;
   }
   return {...current,lanes};
 }
 
-export function accountSavingsTurn(previous: SavingsState, input: SavingsTurnInput): { state: SavingsState; turn: SavingsTurn } {
-  const request = record(input.request) ? input.request : {};
-  const model = input.model ?? (typeof request.model === 'string' ? request.model : '');
-  const actual = normalizeSavingsUsage(input.usage);
-  const laneKey = savingsLaneKey(input.laneKey ?? 'main');
-  const prior = previous.lanes[laneKey];
-  const parts = promptPrefixes(request, model, input.replay);
-  const weight = parts.at(-1)?.weight ?? 0;
-  const identical = input.requestModified ? undefined : actual;
-  const inputSource = identical ? 'actual' : count(input.originalInputTokens) ? 'counted' : 'estimated';
-  let removed = prior?.model === model && parts.some(p => p.history === prior.full_hash) ? prior.removed : 0;
-  let original: number;
-  if (identical) original = totalInput(identical);
-  else if (count(input.originalInputTokens)) original = input.originalInputTokens;
-  else {
-    // Estimate only the unseen suffix when an earlier send measured the
-    // identical head. A different text density cannot shrink that boundary.
-    const idx = parts.findLastIndex(p => prior?.sent[p.hash]?.exact !== undefined);
-    const boundary = idx >= 0 ? prior!.sent[parts[idx].hash].exact! : 0;
-    original = Math.min(MAX_TOKENS,boundary + Math.floor((weight - (parts[idx]?.weight ?? 0))/4));
-  }
-  const now = input.nowMs ?? Date.now();
-  const window = count(input.contextWindow) && input.contextWindow > 0 ? input.contextWindow : 200_000;
-  const reserveValue = input.outputReserve ?? request.max_tokens ?? Math.min(32_000, Math.floor(window * .2));
-  const reserve = count(reserveValue) ? Math.min(reserveValue, window - 1) : Math.min(32_000, window - 1);
-  const ceiling = Math.max(1, Math.floor(Math.min(window - reserve, window * .8)));
-  let plainInput = input.requestModified ? Math.max(0, original - removed) : original;
-  const compacted = input.requestModified && plainInput > ceiling;
-  if (compacted) {
-    // Free compaction and a deliberately small summary plus tail favor plain Claude.
-    plainInput = Math.min(plainInput, Math.min(1024, Math.floor(ceiling * .1)) + Math.floor(ceiling * .1));
-    removed = original - plainInput;
-  }
-  const reduction = original - plainInput;
-  const keys = parts.map(p => reduction ? hash(reduction + ':' + p.hash) : p.hash);
-  const seen = keys.map(key => prior?.sent[key]);
-  const exact = seen.map(p => p?.exact);
-  if (identical) measuredBoundaries(parts,exact,identical);
-  if (inputSource !== 'estimated') exact[parts.length-1] = plainInput;
-  // An exact full-prefix count also supersedes an unavailable current count.
-  if (inputSource === 'estimated' && exact.at(-1) !== undefined) plainInput = exact.at(-1)!;
-  // A write costs more than ordinary input, and a one-hour write costs more
-  // than a five-minute write. Promote only through a known boundary. An end
-  // marker covers the whole input, including when the total itself is estimated.
-  let lower = 0;
-  let cacheEnd = 0;
-  let hourEnd = 0;
-  const minimum = minimumCacheTokens(model);
-  for (let i = 0; i < parts.length; i++) {
-    lower = i === parts.length-1 ? plainInput : Math.min(plainInput,exact[i] ?? lower);
-    if (!parts[i].ttl || lower < minimum) continue;
-    cacheEnd = lower;
-    if (parts[i].ttl === LONG_CACHE_TTL_MS) hourEnd = lower;
-  }
-  const match = seen.findLastIndex((p,i) => !!p && i > 0);
-  // An unmeasured interior boundary may be anywhere up to the next measured
-  // boundary. Give the entire ambiguous span the cheaper price.
-  const upper = Array<number>(parts.length);
-  let nextBound = inputSource === 'estimated' ? MAX_TOKENS : plainInput;
-  for (let i = parts.length-1; i >= 0; i--) {
-    nextBound = exact[i] ?? nextBound;
-    upper[i] = nextBound;
-  }
-  const matchedRead = match < 0 ? 0 : match === parts.length-1 ? plainInput :
-    Math.min(plainInput, upper[match], seen[match]!.upper);
-  let read = previous.unknownHistory ? plainInput : matchedRead;
+function contextCeiling(window: number, requestedReserve: unknown): number {
+  const reserve = count(requestedReserve) ? requestedReserve : Math.min(32_000, Math.floor(window*.2));
+  return Math.max(1,Math.floor(Math.min(window*.8,window-Math.min(window-1,reserve))));
+}
 
-  // On a byte-identical passthrough the API directly measures the original
-  // request, including cache hits predating this launch and ignored markers.
-  // Its billed write ranges cap writes to previously unseen tokens.
+/** Price fresh input only through measured, cache-eligible boundaries.
+ * The unchanged upstream request can provide an even cheaper measured price. */
+function priceInput(total: number, read: number, durations: DurationRange[], model: string,
+                    output: number, identical?: SavingsUsage): SavingsUsage {
+  let cached = 0, hour = 0;
+  const minimum = minimumCacheTokens(model);
+  for (const range of durations) {
+    if (!range.ttl || range.end === null || range.end < minimum) continue;
+    cached = Math.max(cached,range.end);
+    if (range.ttl === LONG_CACHE_TTL_MS) hour = Math.max(hour,range.end);
+  }
   if (identical) {
     read = Math.max(read,identical.cache_read);
-    cacheEnd = Math.min(cacheEnd,totalInput(identical) - identical.input);
-    hourEnd = Math.min(hourEnd,identical.cache_read + identical.cache_creation_1h);
+    cached = Math.min(cached,total-identical.input);
+    hour = Math.min(hour,identical.cache_read+identical.cache_creation_1h);
   }
-  const longEnd = Math.max(read,hourEnd);
-  const writeEnd = Math.max(longEnd,cacheEnd);
-  const plain = {input:plainInput-writeEnd,cache_read:read,cache_creation_1h:longEnd-read,
-    cache_creation_5m:writeEnd-longEnd,output:actual?.output ?? 0};
+  hour = Math.max(read,hour);
+  cached = Math.max(hour,cached);
+  return {input:total-cached,cache_read:read,cache_creation_5m:cached-hour,
+    cache_creation_1h:hour-read,output};
+}
 
+export function accountSavingsTurn(previous: SavingsState, input: SavingsTurnInput): {state:SavingsState;turn:SavingsTurn} {
+  const request = record(input.request) ? input.request : {};
+  const messages = Array.isArray(request.messages) ? request.messages.filter(m => !framing(m)) : [];
+  const model = input.model ?? request.model ?? '';
+  const actual = normalizeSavingsUsage(input.usage);
+  const identical = input.requestModified ? undefined : actual;
+  const original = identical ? totalInput(identical) : count(input.originalInputTokens) ? input.originalInputTokens : null;
+  const key = savingsLaneKey(input.laneKey ?? 'main');
+  const prior = previous.lanes[key];
+  const window = count(input.contextWindow) && input.contextWindow > 0 ? input.contextWindow : 200_000;
+  const ceiling = contextCeiling(window,input.outputReserve ?? request.max_tokens);
+  const now = input.nowMs ?? Date.now();
+  const assistant = messages.findLastIndex(m => m?.role === 'assistant');
+  const gap = assistant > (prior?.messages ?? 0) || (!prior && (assistant >= 0 || input.possiblyResumed));
+  const unknown = !!(previous.unknownHistory || !prior && previous.evicted || gap || prior && (
+    prior.at > now || prior.writer !== input.writer));
+  const cursor = compact(prior,original,ceiling,unknown);
+  const total = cursor.total;
+  const continuation = !!prior || unknown;
+  const boundary = Math.min(messages.length,prior?.messages ?? Math.max(0,assistant));
+  let read: number | null = 0;
+  if (!cursor.compacted && continuation && total !== null) {
+    const measured = input.prefixCount;
+    if (cursor.minRemoved !== cursor.maxRemoved || previous.unknownHistory || boundary === messages.length ||
+        (!prior && !boundary)) read = total;
+    else if (measured?.messages === boundary && count(measured.tokens) && measured.tokens <= original!)
+      read = Math.max(0,measured.tokens-cursor.maxRemoved);
+    else read = null;
+  }
+  const durations = total === null ? [] : durationRanges(request,total,cursor.maxRemoved ? undefined : identical);
+  // An unobserved dispatch could be an identical retry or could already have
+  // compacted. Its UTC day has no publishable input count. For subsequent
+  // measured turns, the lower endpoint at the read rate bounds every cursor.
+  const ambiguous = cursor.minRemoved !== cursor.maxRemoved;
+  const plain = total === null || read === null || unknown && ambiguous ? null :
+    priceInput(total,read,durations,model,actual?.output ?? 0,cursor.maxRemoved ? undefined : identical);
+  // Reuse a measured duration split for timing diagnostics only. Its boundaries
+  // never determine reads, writes or compaction on a later request.
+  if (!unknown && prior?.total === total && prior.messages === messages.length &&
+      prior.durations.length === durations.length && durations.every((r,i) => r.ttl === prior.durations[i].ttl))
+    durations.forEach((r,i) => {r.end ??= prior.durations[i].end;});
   const lanes = {...previous.lanes};
-  let unknownHistory = previous.unknownHistory;
+  let evicted = previous.evicted;
   if (!prior && Object.keys(lanes).length >= MAX_LANES) {
     delete lanes[Object.keys(lanes)[0]];
-    unknownHistory = true;
+    evicted = true;
   }
-  const sent = {...prior?.sent};
-  let ttl = 0;
-  for (let i = parts.length-1; i > 0; i--) {
-    if (parts[i].ttl) ttl = parts[i].ttl;
-    // Concurrent launchers can finish registering an older send second.
-    const last = seen[i];
-    const newer = last && last.at > now;
-    sent[keys[i]] = {at:newer ? last.at : now,ttl:newer ? last.ttl : ttl,upper:upper[i],exact:exact[i]};
+  lanes[key] = {sequence:(prior?.sequence ?? 0)+1,messages:messages.length,at:now,
+    minRemoved:cursor.minRemoved,maxRemoved:cursor.maxRemoved,writer:input.writer,total,durations};
+  if (prior && prior.at > now) {
+    // The later send is still the structural predecessor. Its compaction
+    // decision may have depended on this previously unregistered request.
+    lanes[key] = {...prior,sequence:prior.sequence+1,minRemoved:0,maxRemoved:MAX_TOKENS,
+      total:null,durations:[]};
   }
-  if (Object.keys(sent).length > MAX_PREFIXES) {
-    // Once history is incomplete, future unknown prefix costs must favor plain.
-    unknownHistory = true;
-    for (const key of Object.keys(sent).slice(0,-MAX_PREFIXES)) delete sent[key];
-  }
-  lanes[laneKey] = {model,removed,full_hash:parts.at(-1)?.history || hash(''),sent};
-  const reportedSpeed = record(input.usage) ? input.usage.speed : undefined;
-  return { state:{lanes,...(unknownHistory && {unknownHistory})}, turn:{
-    original_input_tokens:original,plain_input_tokens:plainInput,input_source:inputSource,
-    compacted,plain_tokens:plain,actual_tokens:actual,fast_mode:(reportedSpeed ?? request.speed) === 'fast',
-    window_crossing:original > window,
-    ...gapDiagnostics(seen,exact,match,matchedRead,now,!!previous.unknownHistory && matchedRead < read),
+  const diagnostics = gapDiagnostics(prior,plain?.cache_read ?? 0,now,unknown);
+  return {state:{lanes,...(evicted && {evicted})},turn:{
+    ...(read === null && !unknown && {prefix_messages_to_count:boundary}),
+    original_input_tokens:original,plain_input_tokens:total,input_source:identical ? 'actual' : original === null ? 'unmeasured' : 'counted',
+    compacted:cursor.compacted,plain_tokens:plain,actual_tokens:actual,
+    fast_mode:((record(input.usage) ? input.usage.speed : undefined) ?? request.speed) === 'fast',
+    window_crossing:original !== null && original > window,...(plain && !unknown ? diagnostics :
+      {floor_read_possibly_uncached_tokens:null,floor_read_max_gap_seconds:null}),
   }};
 }

@@ -18,7 +18,7 @@
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
 
-import { SavingsOutbox } from "./savings-outbox.js";
+import { SavingsOutbox, type SavingsWriter } from "./savings-outbox.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
@@ -137,9 +137,9 @@ export class Diagnostics implements DiagnosticsRecorder {
   get savingsCacheDirectory(): string | undefined { return this.outbox?.cacheDirectory; }
 
   /** A turn that finishes after re-keying still belongs to the key it started with. */
-  bindSavings(): ((value: unknown) => void) | undefined {
+  bindSavings(): SavingsWriter | undefined {
     const outbox = this.outbox;
-    if (outbox?.enabled) return value => outbox.append(value);
+    if (outbox?.enabled) return outbox.writer();
   }
 
   suspendSavings(): void {

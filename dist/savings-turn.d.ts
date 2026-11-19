@@ -1,8 +1,13 @@
+import type { SavingsWriter } from './savings-outbox.js';
 import { type SavingsTurnInput } from './savings.js';
-type WorkerInput = Omit<SavingsTurnInput, 'replay'>;
-export type DispatchInput = Omit<WorkerInput, 'usage'> & {
+export type DispatchInput = Omit<SavingsTurnInput, 'usage'> & {
     possiblyResumed?: boolean;
 };
+export type CountSavingsPrefix = (messages: number) => Promise<number | undefined>;
+export interface SavingsReply {
+    report?: unknown;
+    countMessages?: number;
+}
 export type SavingsJob = {
     kind: 'dispatch';
     id: string;
@@ -18,6 +23,12 @@ export type SavingsJob = {
     id: string;
     usage: unknown;
     status: number;
+    canCount?: boolean;
+    prefixCount?: {
+        messages: number;
+        tokens: number;
+    };
+    interruptedStream?: boolean;
 };
 export declare class SavingsObservation {
     readonly sessionId: string;
@@ -29,12 +40,12 @@ export declare class SavingsObservation {
     private closed;
     private reservation?;
     private announcementFailed;
-    constructor(sessionId: string, report: (value: unknown) => void, scope: string, cacheDirectory?: string | undefined);
+    constructor(sessionId: string, report: SavingsWriter, scope: string, cacheDirectory?: string | undefined);
     /** Publish an empty, private reservation before sending. Another launcher's
      * worker can now see this dispatch even if our own worker is backlogged. */
     announce(laneKey: string): Promise<void>;
     dispatched(input: DispatchInput): void;
-    settle(input: WorkerInput, status: number): Promise<void>;
+    settle(input: SavingsTurnInput, status: number, countPrefix?: CountSavingsPrefix): Promise<void>;
+    private incomplete;
 }
-export {};
 //# sourceMappingURL=savings-turn.d.ts.map

@@ -628,6 +628,10 @@ export declare class RequestLogger implements RequestLogSink {
      */
     flush(timeoutMs?: number): Promise<boolean>;
 }
+export declare function savingsResponseUsage(rec: MessagesRecord): {
+    usage: string | UsageRecord | undefined;
+    interruptedStream: boolean;
+};
 export declare function mergeUsageFromSseEvent(data: any, rec: MessagesRecord): void;
 /** Merge usage from a non-streaming /v1/messages JSON response body. */
 export declare function mergeUsageFromJsonBody(body: Buffer, rec: MessagesRecord): void;

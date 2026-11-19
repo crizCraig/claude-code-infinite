@@ -100,7 +100,7 @@ export class Diagnostics {
     bindSavings() {
         const outbox = this.outbox;
         if (outbox?.enabled)
-            return value => outbox.append(value);
+            return outbox.writer();
     }
     suspendSavings() {
         this.outbox?.suspend();

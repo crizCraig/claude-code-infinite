@@ -17,6 +17,7 @@
  * DO_NOT_TRACK=1, or Claude Code's DISABLE_TELEMETRY /
  * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.
  */
+import { type SavingsWriter } from "./savings-outbox.js";
 import { type DiagnosticsErrorCode, type DiagnosticsEvent } from "./diagnostics-schema.js";
 import type { RequestLogSink, RequestRecord } from "./reqlog.js";
 import { type ClaudeAuthType } from "./claude-auth.js";
@@ -80,7 +81,7 @@ export declare class Diagnostics implements DiagnosticsRecorder {
     get savingsAccount(): object | undefined;
     get savingsCacheDirectory(): string | undefined;
     /** A turn that finishes after re-keying still belongs to the key it started with. */
-    bindSavings(): ((value: unknown) => void) | undefined;
+    bindSavings(): SavingsWriter | undefined;
     suspendSavings(): void;
     /** Add context fields (allowlisted; later values win). */
     setContext(fields: Record<string, unknown>): void;

@@ -11942,9 +11942,12 @@ test('savings includes same-session monitor and title passthrough usage', async 
       settle(observed,input){settled.push({id:observed.sessionId,input})}},
   });
   try {
+    const notice = '<cc-infinite-notice>⚠ MemTree is off</cc-infinite-notice>';
     for (const [system,content] of [
       ['You are a security monitor for autonomous AI coding agents.', '<transcript>\n{"user":"hello"}\n</transcript>'],
       ['You are naming a coding session', 'Give this session a title'],
+      ['You are a security monitor for autonomous AI coding agents.' + notice, '<transcript>\n{"user":"hello"}\n</transcript>'],
+      ['You are naming a coding session' + notice, 'Give this session a title'],
     ]) {
       const response=await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
         method:'POST',headers:{'content-type':'application/json','x-claude-code-session-id':'12345678-1234-4123-8123-123456789abc'},
@@ -11953,10 +11956,12 @@ test('savings includes same-session monitor and title passthrough usage', async 
             {type:'text',text:system}],messages:[{role:'user',content}]})});
       assert.equal(response.status,200); await response.text();
     }
-    await waitFor(()=>settled.length===2);
+    await waitFor(()=>settled.length===4);
     assert.ok(settled.every(({input}) => Number.isFinite(input.nowMs)));
     assert.equal(settled[0].input.requestModified,false);
     assert.equal(settled[1].input.requestModified,false);
+    assert.ok(settled.slice(2).every(({input}) => input.requestModified),
+      'legacy notice stripping modifies even a passthrough candidate');
     assert.equal(settled[0].input.usage.input_tokens,1);
     assert.equal(settled[1].input.usage.output_tokens,1);
     assert.deepEqual(starts,[]);
@@ -11986,7 +11991,7 @@ test('savings registers the original prompt on both a compression and a stable r
   } finally { h.close(); }
 });
 
-test('a resumed one-message conversation with missing savings history assumes a plain read', async () => {
+test('a resume with no compaction cursor records measured usage and leaves the baseline pending', async () => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const upstream = await mockUpstream();
   let report;
@@ -11999,7 +12004,8 @@ test('a resumed one-message conversation with missing savings history assumes a 
     await postMessages(proxy.port,[{role:'user',content:'retry'}],{'x-claude-code-session-id':session});
     await waitFor(()=>report);
     assert.equal(report.actual.input,1);
-    assert.equal(report.plain.cache_read,1);
+    assert.equal(report.plain,null);
+    assert.equal(report.incomplete_reason,'unmeasured_input');
     assert.equal(report.floor_read_max_gap_seconds,null);
   } finally { proxy.close(); upstream.close(); }
 });

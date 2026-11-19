@@ -270,7 +270,7 @@ test('shutdown drains a final turn queued while a previous batch is in flight', 
   assert.deepEqual(h.posts.map(p => p.turns),[[first],[last]]);
 });
 
-test('warm and expired conversation cache cost the same across launcher restarts', async t => {
+test('a new launcher cannot assume its recorded cursor covers the entire resume gap', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const {execFileSync} = await import('node:child_process');
   const h = await harness(t);
@@ -302,13 +302,14 @@ test('warm and expired conversation cache cost the same across launcher restarts
           await diagnostics.flush();
         }
         await tracker.settle(tracker.startTurn(session), {...input, nowMs:1000+gap,
-          originalInputTokens:80010, request:{...request,messages:[...messages,
+          originalInputTokens:80010, prefixCount:{messages:1,tokens:80000}, request:{...request,messages:[...messages,
             {role:'assistant',content:'done'},{role:'user',content:'continue'}]}}, 200);
         await diagnostics.flush();
         results.push(h.posts.at(-1).turns[0].plain);
       }
-      assert.deepEqual(results[0], results[1], ttl + ' gap ' + gap);
       assert.equal(results[0].cache_read,80000);
+      assert.equal(results[0]['cache_creation_'+ttl],10);
+      assert.equal(results[1],null,'a gap could hide an intervening dispatch or compaction');
     }
   }
 });
@@ -358,7 +359,7 @@ test('overlapping launchers use dispatch order and isolate credentials', async t
   const id = randomUUID();
   const older = start(id, 'A', 1000,'x');
   const later = await start(id, 'A', 301000,'y')();
-  assert.equal(later.cache_read,0,'a different prefix is new');
+  assert.equal(later.cache_read,2500,'same message position is a read across rewrites');
   await older();
   assert.equal((await start(id, 'A', 302000,'y')()).cache_read,2500);
   assert.equal((await start(id, 'A', 603000,'y')()).cache_read,2500);
@@ -379,15 +380,16 @@ test('an unreadable or legacy send history cannot turn a possible hit into a wri
   await tracker.settle(firstTurn,input,200);
   await diagnostics.flush();
   const paths = await readdir(h.configDir,{recursive:true});
-  const file = paths.find(f => f.endsWith('floor-v1.json'));
+  const file = paths.find(f => f.endsWith('floor-v2.json'));
   await writeFile(join(h.configDir,file), JSON.stringify({at:1000,prefixes:[null],model:first.model}));
   await tracker.settle(tracker.startTurn(session),{...input,nowMs:400000},200);
   await diagnostics.flush();
   assert.equal(h.posts.length,2);
-  assert.equal(h.posts[1].turns[0].plain.cache_read,2250);
+  assert.equal(h.posts[1].turns[0].plain,null);
+  assert.equal(h.posts[1].turns[0].floor_read_max_gap_seconds,null);
 });
 
-test('dispatch and settlement leave prompt hashing and history updates on the worker', async t => {
+test('dispatch and settlement leave request parsing and history updates on the worker', async t => {
   const {SavingsTracker} = await import('../dist/savings-tracker.js');
   const {existsSync} = await import('node:fs');
   const h = await harness(t), diagnostics = h.client();
@@ -418,7 +420,7 @@ test('a prefix sent before an intervening edit is still a read, even within one 
   const h = await harness(t), diagnostics = h.client();
   const tracker = new SavingsTracker({diagnostics});
   const prompt = text => ({model:first.model,cache_control:{type:'ephemeral'},messages:[
-    {role:'user',content:text.repeat(120000)},{role:'assistant',content:'ok'}]});
+    {role:'user',content:text.repeat(120000)}]});
   const input = {request:prompt('a'),requestModified:false,contextWindow:200000,nowMs:1000,
     usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}};
   for (const request of [prompt('a'),prompt('b')]) {
@@ -437,7 +439,7 @@ test('the floor includes matching in-flight sends', async t => {
   const tracker = new SavingsTracker({diagnostics});
   const pending = tracker.startTurn(first.session_id);
   const input = {request:{model:first.model,cache_control:{type:'ephemeral'},messages:[
-    {role:'user',content:'b'.repeat(120000)}, {role:'assistant',content:'ok'}]},
+    {role:'user',content:'b'.repeat(120000)}]},
     requestModified:true,contextWindow:200000,originalInputTokens:30000,
     usage:{input_tokens:20,output_tokens:1},nowMs:11000};
   pending.dispatched({...input,nowMs:1000});
@@ -479,11 +481,11 @@ test('the measured write, overlapping 429 and compressed retry have identical pr
   const h = await harness(t);
   const request = {model:first.model,cache_control:{type:'ephemeral'},
     messages:[{role:'user',content:'word'.repeat(30000)}]};
-  for (const order of ['012','021','102','120','201','210']) {
+  for (const counted of [false,true]) for (const order of ['012','021','102','120','201','210']) {
     const session = randomUUID(), diagnostics = h.client();
     const tracker = new SavingsTracker({diagnostics});
     const inputs = [
-      {nowMs:1000,requestModified:false,usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}},
+      {nowMs:1000,requestModified:false,originalInputTokens:counted ? 30000 : undefined,usage:{input_tokens:0,cache_creation_input_tokens:30000,output_tokens:1}},
       {nowMs:2000,requestModified:true,originalInputTokens:30000},
       {nowMs:3000,requestModified:true,originalInputTokens:30000,usage:{input_tokens:2000,output_tokens:1}},
     ].map(input => ({...input,request,contextWindow:200000}));
@@ -499,7 +501,7 @@ test('the measured write, overlapping 429 and compressed retry have identical pr
     const reports = h.posts.flatMap(post => post.turns);
     const retry = reports.find(turn => turn.turn_id === turns[2].id);
     const refusal = reports.find(turn => turn.turn_id === turns[1].id);
-    assert.equal(retry.plain.cache_read,30000,order);
+    assert.equal(retry.plain.cache_read,counted ? 30000 : 0,order);
     assert.equal(retry.plain.cache_creation_5m,0,order);
     assert.deepEqual(Object.values(refusal.plain),[0,0,0,0,0],order);
   }
@@ -542,7 +544,7 @@ test('a slow independent launcher cannot hide an earlier send from the floor', a
   const rewritten = {...input,nowMs:2000,usage:{input_tokens:2000,output_tokens:1}};
   retry.dispatched(rewritten);
   await retry.settle(rewritten,200);
-  assert.equal(report.plain.cache_read,30000);
+  assert.equal(report.plain,null,'the sibling may already have compacted');
   assert.equal(report.floor_read_max_gap_seconds,null);
   const exit = once(child,'exit');
   child.send('continue');
@@ -558,4 +560,202 @@ test('a worker accounting failure preserves an incomplete observation for the di
   await observation.settle(input,200);
   assert.equal(report.turn_id,observation.id);
   assert.equal(report.plain,null);
+});
+
+test('a killed launcher leaves the dispatched turn in its own account and UTC day', async t => {
+  const {spawn} = await import('node:child_process');
+  const {once} = await import('node:events');
+  const h = await harness(t);
+  const source = `
+    import {Diagnostics} from './dist/diagnostics.js';
+    import {SavingsTracker} from './dist/savings-tracker.js';
+    import {setTimeout as sleep} from 'node:timers/promises';
+    import {readdir} from 'node:fs/promises';
+    const [dir, sessionId, at] = process.argv.slice(1);
+    const diagnostics = new Diagnostics({configDir:dir, baseUrl:'https://example.test', apiKey:'A',
+      clientName:'ccc', clientVersion:'1.0.0', env:{}});
+    const tracker = new SavingsTracker({diagnostics});
+    const observation = tracker.startTurn(sessionId);
+    await observation.announce('main');
+    observation.dispatched({request:{model:'claude-sonnet-4-6',messages:[{role:'user',content:'private'}]},
+      requestModified:false, contextWindow:200000, nowMs:Date.parse(at)});
+    // Kill after the worker recorded the send but before the upstream response.
+    for (let i=0; i<500; ++i) {
+      const files = await readdir(diagnostics.savingsCacheDirectory,{recursive:true});
+      if (files.some(f => /floor[^/\\\\]*\\.json$/.test(f))) break;
+      if (i===499) throw Error('worker never registered dispatch');
+      await sleep(10);
+    }
+    process.send(observation.id);
+    setInterval(() => {}, 60000);
+  `;
+  const child = spawn(process.execPath, ['--input-type=module','-e',source,h.configDir,
+    first.session_id,first.requested_at], {cwd:new URL('../',import.meta.url),
+    stdio:['ignore','ignore','inherit','ipc']});
+  t.after(() => child.kill());
+  const [id] = await Promise.race([once(child,'message'),once(child,'exit')]);
+  assert.equal(typeof id,'string');
+  await h.client().flush();
+  assert.deepEqual(h.posts,[], 'another live launcher must leave the send alone');
+  const stopped = once(child,'exit');
+  child.kill('SIGKILL');
+  await stopped;
+  await h.client('B').flush();
+  assert.deepEqual(h.posts,[]);
+  await h.client().flush();
+  assert.equal(h.posts.length,1);
+  const [turn] = h.posts[0].turns;
+  assert.equal(turn.turn_id,id);
+  assert.equal(turn.session_id,first.session_id);
+  assert.equal(turn.requested_at,first.requested_at);
+  assert.equal(turn.model,first.model);
+  assert.equal(turn.incomplete_reason,'interrupted_dispatch');
+  assert.equal(turn.plain,null);
+  assert.equal(turn.actual,null);
+  await h.client().flush();
+  assert.equal(h.posts.length,1,'acknowledged recovery runs once');
+});
+
+test('incomplete reasons are allowlisted and limited to unmeasured observations', async t => {
+  const h = await harness(t), client = h.client();
+  const incomplete = {...first,actual:null,plain:null};
+  for (const reason of ['interrupted_dispatch','interrupted_stream','unmeasured_input','missing_usage']) {
+    const record = {...incomplete,turn_id:randomUUID(),incomplete_reason:reason};
+    client.reportSavings(record);
+    await client.flush();
+    assert.equal(h.posts.at(-1).turns[0].incomplete_reason,reason);
+  }
+  for (const record of [{...incomplete,incomplete_reason:'private'}, {...first,incomplete_reason:'missing_usage'}]) {
+    client.reportSavings({...record,turn_id:randomUUID()});
+    await client.flush();
+    assert.equal(h.posts.at(-1).turns[0].incomplete_reason,undefined);
+  }
+});
+
+test('settlement requests a prefix count only for the missing structural boundary', async t => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client(), session = randomUUID();
+  const tracker = new SavingsTracker({diagnostics}), requested = [];
+  const send = async (messages, callback, status=200) => {
+    const turn = tracker.startTurn(session);
+    const input = {request:{model:first.model,messages},requestModified:true,
+      originalInputTokens:31000,contextWindow:200000,nowMs:Date.now(),
+      usage:{input_tokens:100,output_tokens:1}};
+    await tracker.settle(turn,input,status,async n => {
+      requested.push(n);
+      return callback(n);
+    });
+    await diagnostics.flush();
+    return h.posts.at(-1).turns[0];
+  };
+  const user = {role:'user',content:'question'}, assistant = {role:'assistant',content:'answer'};
+  const firstMessages = [user];
+  const second = [user, assistant, user];
+  const measured = () => 30000;
+  await send(firstMessages,measured);
+  const append = await send(second,measured);
+  assert.deepEqual(requested,[1]);
+  assert.equal(append.plain.cache_read,30000);
+  await send(second,measured); // Identical retry: no structural append.
+  assert.deepEqual(requested,[1]);
+  // The proxy cannot infer this retained prefix by looking at the last assistant.
+  const failed = await send([...second,user],() => { throw Error('count unavailable'); });
+  assert.deepEqual(requested,[1,3]);
+  assert.equal(failed.actual.input,100);
+  assert.equal(failed.plain,null);
+  assert.equal(failed.incomplete_reason,'unmeasured_input');
+  await send([...second,user,user],measured,429);
+  assert.deepEqual(requested,[1,3]);
+});
+
+test('a 529 with incomplete usage evidence remains pending, an observed null usage is free', async t => {
+  const {SavingsObservation} = await import('../dist/savings-turn.js');
+  const reqlog = await import('../dist/reqlog.js');
+  for (const [payload,free] of [[{usage:{input_tokens:127}},false],[{usage:'invalid'},false],
+                                [{error:{type:'overloaded_error'},usage:null},true]]) {
+    const rec = {kind:'messages', requestBytes:1, turnType:'first', upstreamStatus:529};
+    reqlog.mergeUsageFromJsonBody(Buffer.from(JSON.stringify(payload)),rec);
+    let report;
+    const turn = new SavingsObservation(first.session_id,r=>report=r,randomUUID());
+    await turn.settle({request:{model:first.model,messages:[]},requestModified:false,nowMs:2000,
+      contextWindow:200000,...reqlog.savingsResponseUsage(rec)},529);
+    assert.equal(report.actual?.input,free ? 0 : undefined);
+    assert.equal(report.plain?.input,free ? 0 : undefined);
+  }
+});
+
+test('a reservation left before worker registration affects only the next dispatch', async t => {
+  const {spawn} = await import('node:child_process');
+  const {once} = await import('node:events');
+  const {Worker} = await import('node:worker_threads');
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  const h = await harness(t), diagnostics = h.client();
+  const tracker = new SavingsTracker({diagnostics});
+  const input = {request:{model:first.model,messages:[{role:'user',content:'same'}]},
+    requestModified:true,originalInputTokens:15000,usage:{input_tokens:150,output_tokens:1},
+    contextWindow:200000,nowMs:1000};
+  for (const interrupt of ['launcher','worker']) {
+    const session = randomUUID();
+    if (interrupt === 'launcher') {
+      const source = `
+        import {SavingsObservation} from './dist/savings-turn.js';
+        const [dir,session] = process.argv.slice(1);
+        await new SavingsObservation(session,()=>{},'child',dir).announce('main');
+        process.send('announced');
+        setInterval(()=>{},60000);
+      `;
+      const child = spawn(process.execPath,['--input-type=module','-e',source,
+        diagnostics.savingsCacheDirectory,session],{cwd:new URL('../',import.meta.url),
+        stdio:['ignore','ignore','inherit','ipc']});
+      t.after(()=>child.kill());
+      assert.equal((await Promise.race([once(child,'message'),once(child,'exit')]))[0],'announced');
+      const killed = once(child,'exit');
+      child.kill('SIGKILL');
+      await killed;
+    } else {
+      const lost = tracker.startTurn(session);
+      await lost.announce('main');
+      let killed;
+      const original = Worker.prototype.postMessage;
+      const mock = t.mock.method(Worker.prototype,'postMessage',function(job,...rest) {
+        if (job.kind === 'dispatch' && job.id === lost.id) {
+          killed = this.terminate(); // Drop the queued dispatch, keep the launcher running.
+          return;
+        }
+        return original.call(this,job,...rest);
+      });
+      lost.dispatched(input);
+      await killed;
+      mock.mock.restore();
+    }
+    const send = async nowMs => {
+      const observation = tracker.startTurn(session);
+      await tracker.settle(observation,{...input,nowMs},200);
+      await diagnostics.flush();
+      return h.posts.flatMap(post=>post.turns).find(r=>r.turn_id === observation.id);
+    };
+    const next = await send(2000), later = await send(86_402_000);
+    assert.equal(next.plain,null,'a lost reservation could have hidden a compaction');
+    assert.ok(later.plain,interrupt + ' left the later session-day pending');
+    assert.equal(later.actual.input,150);
+  }
+});
+
+test('an unavailable disk-backed cursor cannot trust a previous in-memory fallback', async t => {
+  const {writeFile} = await import('node:fs/promises');
+  const {SavingsObservation} = await import('../dist/savings-turn.js');
+  const dir = await mkdtemp(join(tmpdir(),'ccc-savings-unavailable-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const blocked = join(dir,'not-a-directory'), session = randomUUID();
+  await writeFile(blocked,'');
+  for (const nowMs of [1000,2000]) {
+    let report;
+    const observation = new SavingsObservation(session,r=>report=r,'scope',blocked);
+    const input = {request:{model:first.model,messages:[{role:'user',content:'hi'}]},
+      requestModified:false,usage:{input_tokens:100,output_tokens:1},contextWindow:200000,nowMs};
+    observation.dispatched(input);
+    await observation.settle(input,200);
+    assert.equal(report.plain,null,'a sibling may have changed the disk-backed conversation');
+    assert.equal(report.actual.input,100);
+  }
 });

@@ -1,4 +1,4 @@
-import { SavingsObservation } from './savings-turn.js';
+import { SavingsObservation, type CountSavingsPrefix } from './savings-turn.js';
 import type { Diagnostics } from './diagnostics.js';
 import type { SavingsView } from './savings-status.js';
 import { type SavingsTurnInput } from './savings.js';
@@ -20,7 +20,7 @@ export declare class SavingsTracker {
     progress(id: unknown, tokens: number, budget: number): void;
     startTurn(id: unknown): SavingsObservation | undefined;
     /** Only upstream dispatches contribute an API turn. Billing records MemTree independently. */
-    settle(observation: SavingsObservation, input: Omit<SavingsTurnInput, 'replay'>, status: number): Promise<void>;
+    settle(observation: SavingsObservation, input: SavingsTurnInput, status: number, countPrefix?: CountSavingsPrefix): Promise<void>;
     /** Called only by the status line. One fetch per session per ten seconds, including failures. */
     view(id: unknown): Promise<SavingsView | undefined>;
     private refresh;

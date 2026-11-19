@@ -61,47 +61,41 @@ billing adjustments are outside this comparison.
 
 ## Plain Claude counterfactual
 
-An unmodified request measures the original input directly. For a modified
-request, ccc uses the original Count Tokens value when available. Otherwise it
-retains known token boundaries and estimates the remaining text at four
-characters per token. Opaque media and base64 sources add zero to that estimate.
-Token density varies by language and content.
+ccc uses measured upstream input on passthroughs and the original Count Tokens
+result on rewrites. A missing original count leaves plain pending. On a
+continuation the previous dispatch's message count separates earlier messages
+from the append. ccc prices all earlier messages and the current request's
+system, tools and settings as reads, including after edits, encoding changes,
+retries, refusals or a long idle gap. A retry with no appended messages needs
+only the measured total. For an append, the accounting worker can request a
+count of the retained messages under the **current** framing after the response
+finishes. Subtracting that boundary from the current total isolates the append.
+An unavailable boundary leaves plain pending.
 
-Plain context is finite. Each lane has a ceiling equal to the smaller of 80% of
-the model window and the window minus reserved output. On crossing it, assume
-free plain compaction and retain a summary of at most 1,024 tokens (at most 10%
-of the ceiling), plus a 10% tail. Remember how much of the original transcript
-was removed; subsequent append-only requests grow from that smaller context.
-Another simulated threshold crossing compacts again. Observed edits or transcript replacement reset
-the virtual removal. Request framing and changing Claude Code billing attribution
-such as `cch` do not alter that conversation boundary. This deliberately inexpensive summary and free compaction
-favor plain Claude; actual Claude Code's trigger, summary size, generation cost,
-quality, and subsequent outputs can differ. The `window_crossing` flag indicates that the original input exceeded the full native model window. No baseline request is priced as
-an impossible unlimited context. Output tokens are held equal to the observed
-response because alternate plain outputs cannot be measured.
+On a first send or a newly compacted prompt, the full modeled input is new.
+New tokens covered by an eligible cache marker use the marked write duration.
+Remaining new tokens use ordinary input pricing. The actual side always keeps
+the response's measured buckets. Measured cache hits and ignored markers on an
+identical passthrough also bound its plain price. Output is held equal across
+the two sides.
 
-Plain pays the read rate for every matching prefix it has sent in this
-conversation lane. A long gap, a 429, an intervening edit, or a cold compressed
-request can all precede a plain read. New tokens covered by an eligible cache
-marker use the duration requested on the original prompt. Other new tokens
-use ordinary input pricing. The actual side uses the delivered response’s
-measured buckets. On a passthrough those measurements also bound the price
-of the identical original request.
+Plain compacts when its modeled input exceeds the smaller of 80% of the
+context window and the window minus reserved output. The model assumes free
+compaction with a summary of up to 1,024 tokens (at most 10% of the ceiling)
+and a 10% tail. It carries the removed-token count through subsequent requests,
+including passthroughs. The compacted prefix is new once. Its next send is a
+read. Window crossings use the full original input before compaction.
 
-A fully counted prefix keeps its token boundary when text is appended. Where
-an interior boundary is unknown, ccc prices ambiguous overlap as reads up to
-the nearest measured upper bound. It promotes new tokens to a more expensive
-write tier only through a known boundary. A final marker covers the entire
-input. These choices can under-credit savings.
-
-The worker records plain sends at dispatch, including refused and in-flight
-requests. Before forwarding, the launcher announces the send with a private
-empty file. A concurrent launcher can then assume reads while the first
-worker is still hashing the request. The private history contains cumulative block digests, token
-boundaries, send times and requested durations scoped by account, session and
-lane. Restarts can reuse that history. Incomplete or legacy history favors a
-read when an earlier send is possible. Settlement supplies measured usage for
-the immutable report. A definitive nonbillable refusal costs zero on both sides.
+A per-account, per-session, per-lane cursor stores positions, removal bounds,
+dispatch order and cache-duration metadata. It contains no transcript or
+content digests. A dispatch updates the cursor before settlement, including a
+429. A measured settlement can refine its own cursor while it is current.
+Unobserved sends, including a launcher change or extra assistant turns, may
+hide both a retry and a compaction. When that makes the retained size unknown,
+the turn stays pending. On subsequent measured turns, ccc tracks the smallest
+and largest possible removal. While those differ, it uses the shortest possible
+input at the read rate, a lower bound even if an intervening send compacted.
+A definite compaction brings the cursors back together.
 
 Two optional admin diagnostics count floor reads whose last send was longer ago
 than that send’s TTL and record the longest such gap in whole seconds. An
@@ -126,8 +120,12 @@ dispatch produces no API turn. MemTree billing handles compression, indexing,
 reads and searches independently, including work completing after cancellation.
 
 Each account log is a directory of private one-line JSONL segments. The directory
-is scoped by a digest of the service URL and credential. A writer exclusively creates a private segment, appends one line and syncs it. Readers
-consume only newline-terminated records. The
+is scoped by a digest of the service URL and credential. Before the upstream send,
+the launcher writes a private in-flight segment with its turn ID, session, model
+and dispatch time. At settlement it syncs the final record, atomically replaces
+the in-flight segment and promotes it for delivery. A restarted launcher recovers
+a dead writer’s segment even if the session has no further turns. An interrupted
+dispatch carries null usage and the reason `interrupted_dispatch`. The
 background sender can therefore remove individual acknowledged turns while another
 process appends or drains its own records. The original record never changes.
 Concurrent deliveries of the same ID are safe to replay.
@@ -136,7 +134,7 @@ The sender posts up to 50 turns to `/v1/ccc/savings/turns`. Only IDs in a readab
 `acked_turn_ids` response are removed. The filename records the next eligible retry
 time, starting at one minute and doubling to a maximum of 30 minutes. Missing
 acknowledgements survive restarts. An invalid credential suspends the sender.
-Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. A launcher worker hashes the original request and maintains the private send history.
+Savings reporting honors the existing diagnostics opt-outs. Uploads run in the background. A launcher worker maintains the private conversation cursor.
 
 ## Status line
 
@@ -165,7 +163,7 @@ In the first row, 30,000 plain tokens had a one-hour marker and 1,000 had a
 five-minute marker. The diagnostic flags only the latter 1,000 at a 600-second
 gap. Including the intermediate compressed turn adds another $0.001800
 gross, making the full three-dispatch sequence **−$0.046400** with the same
-$0.050 charge. In the second row, the 429 costs zero in every settlement order. In the third,
+$0.050 charge. In the second row, the original input was counted at dispatch. The 429 costs zero in every settlement order. In the third,
 the original prefix still measures 30,000 after the append takes the request to
 31,000. Both sides include one output token in this row. All three nets are
 negative and none qualifies for a savings email.

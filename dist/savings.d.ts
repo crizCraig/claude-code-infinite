@@ -1,24 +1,24 @@
-import type { SavingsReplay } from './savings-history.js';
 import type { SavingsUsage } from './savings-report.js';
-type SavingsTokens = SavingsUsage;
-interface SentPrefix {
-    at: number;
+interface DurationRange {
     ttl: number;
-    exact?: number;
-    upper: number;
+    end: number | null;
 }
 interface SavingsLane {
-    model: string;
-    full_hash: string;
-    removed: number;
-    sent: Record<string, SentPrefix>;
+    sequence: number;
+    messages: number;
+    at: number;
+    minRemoved: number;
+    maxRemoved: number;
+    writer?: string;
+    total: number | null;
+    durations: DurationRange[];
 }
 export interface SavingsState {
     lanes: Record<string, SavingsLane>;
     unknownHistory?: boolean;
+    evicted?: boolean;
 }
 export interface SavingsTurnInput {
-    replay?: SavingsReplay<SavingsPromptCheckpoint>;
     request: unknown;
     usage: unknown;
     model?: string;
@@ -28,14 +28,22 @@ export interface SavingsTurnInput {
     originalInputTokens?: number;
     nowMs?: number;
     laneKey?: string;
+    prefixCount?: {
+        messages: number;
+        tokens: number;
+    };
+    interruptedStream?: boolean;
+    possiblyResumed?: boolean;
+    writer?: string;
 }
 export interface SavingsTurn {
-    original_input_tokens: number;
-    plain_input_tokens: number;
-    input_source: 'actual' | 'counted' | 'estimated';
+    original_input_tokens: number | null;
+    plain_input_tokens: number | null;
+    input_source: 'actual' | 'counted' | 'unmeasured';
     compacted: boolean;
-    plain_tokens: SavingsTokens;
-    actual_tokens?: SavingsTokens;
+    prefix_messages_to_count?: number;
+    plain_tokens: SavingsUsage | null;
+    actual_tokens?: SavingsUsage;
     fast_mode: boolean;
     window_crossing: boolean;
     floor_read_possibly_uncached_tokens: number | null;
@@ -45,22 +53,11 @@ export declare function isSavingsSessionId(value: unknown): value is string;
 export declare const savingsLaneKey: (s: string) => string;
 export declare function isSavingsState(value: unknown): value is SavingsState;
 /** Cache creation total includes its duration buckets; never count it twice. */
-export declare function normalizeSavingsUsage(value: unknown): SavingsTokens | undefined;
+export declare function normalizeSavingsUsage(value: unknown): SavingsUsage | undefined;
 export declare function createSavingsState(): SavingsState;
-interface SourcePrefix {
-    hash: string;
-    history: string;
-    weight: number;
-    ttl: number;
-    cacheable: boolean;
-}
-export interface SavingsPromptCheckpoint {
-    model: string;
-    frame: string;
-    prefixes: SourcePrefix[];
-}
-/** A settlement can improve the size of an already recorded dispatch. It
- * cannot change who last sent the prefix, its TTL, or the compaction cursor. */
+export declare function savingsRetainedRequest(request: Record<string, any>, retained: number): {
+    messages: any;
+};
 export declare function refineSavingsState(current: SavingsState, settled: SavingsState, dispatched: SavingsState): SavingsState;
 export declare function accountSavingsTurn(previous: SavingsState, input: SavingsTurnInput): {
     state: SavingsState;

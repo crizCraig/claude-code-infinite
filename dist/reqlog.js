@@ -96,6 +96,15 @@ export class RequestLogger {
     }
 }
 const savingsUsageProtocols = new WeakMap();
+// A malformed or unreadable error body cannot establish that a 5xx was free.
+const observedWithoutUsage = new WeakSet();
+export function savingsResponseUsage(rec) {
+    const uncertainError = (rec.upstreamStatus ?? 0) >= 500 && !observedWithoutUsage.has(rec);
+    return {
+        usage: rec.savingsUsageComplete ? rec.usage : uncertainError ? 'incomplete' : undefined,
+        interruptedStream: rec.stream === true && rec.clientAborted === true && !rec.savingsUsageComplete,
+    };
+}
 export function mergeUsageFromSseEvent(data, rec) {
     const type = data?.type;
     let protocol = savingsUsageProtocols.get(rec);
@@ -103,6 +112,8 @@ export function mergeUsageFromSseEvent(data, rec) {
         protocol = { started: false, measuredInput: false, finalOutput: false, invalid: false };
         savingsUsageProtocols.set(rec, protocol);
     }
+    if (data?.message?.usage != null || data?.usage != null)
+        observedWithoutUsage.delete(rec);
     if (type === "message_start") {
         if (rec.savingsUsageComplete !== undefined)
             rec.savingsUsageComplete = false;
@@ -123,6 +134,8 @@ export function mergeUsageFromSseEvent(data, rec) {
         mergeUsage(usage, rec);
     }
     else if (type === "error") {
+        if (!protocol.started && !protocol.invalid && data.usage == null)
+            observedWithoutUsage.add(rec);
         protocol.invalid = true;
         rec.savingsUsageComplete = false;
     }
@@ -135,6 +148,9 @@ export function mergeUsageFromJsonBody(body, rec) {
     rec.savingsUsageComplete = false;
     try {
         const response = JSON.parse(body.toString("utf-8"));
+        if (response && typeof response === "object" && !Array.isArray(response) && response.usage == null) {
+            observedWithoutUsage.add(rec);
+        }
         mergeUsage(response?.usage, rec);
         rec.savingsUsageComplete = response?.type === "message" && Array.isArray(response.content) &&
             validSavingsUsage(response.usage) && validTokenCount(response.usage.input_tokens) &&

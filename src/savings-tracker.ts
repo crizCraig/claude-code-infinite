@@ -1,4 +1,4 @@
-import { SavingsObservation } from './savings-turn.js';
+import { SavingsObservation, type CountSavingsPrefix } from './savings-turn.js';
 import type { Diagnostics } from './diagnostics.js';
 import { randomUUID } from 'node:crypto';
 import type { SavingsView } from './savings-status.js';
@@ -9,7 +9,7 @@ interface Session {
   budget: number;
   refreshAt: number;
   pending?: Promise<void>;
-  total?: Pick<SavingsView, 'net_usd' | 'less_usage_percent' | 'costs_complete'>;
+  total?: Pick<SavingsView, 'net_usd' | 'less_usage_percent' | 'costs_complete' | 'status_day'>;
 }
 interface SavingsTrackerOptions {
   usageUrl?: string;
@@ -50,8 +50,9 @@ export class SavingsTracker {
   }
 
   /** Only upstream dispatches contribute an API turn. Billing records MemTree independently. */
-  settle(observation: SavingsObservation, input: Omit<SavingsTurnInput,'replay'>, status: number): Promise<void> {
-    return observation.settle(input,status);
+  settle(observation: SavingsObservation, input: SavingsTurnInput, status: number,
+         countPrefix?: CountSavingsPrefix): Promise<void> {
+    return observation.settle(input,status,countPrefix);
   }
 
   /** Called only by the status line. One fetch per session per ten seconds, including failures. */
@@ -78,6 +79,10 @@ export class SavingsTracker {
       } finally { clearTimeout(timer); }
     }
     if (this.account !== this.opts.diagnostics?.savingsAccount) return;
+    if (session.total?.status_day && session.total.status_day !== new Date(now).toISOString().slice(0,10)) {
+      session.total = undefined;
+      session.refreshAt = 0;
+    }
     return {
       ...(session.total ?? {net_usd:null, less_usage_percent:null, costs_complete:false}),
       progress_tokens:session.progress, budget_tokens:session.budget,
@@ -94,6 +99,7 @@ export class SavingsTracker {
           typeof row.costs_complete !== 'boolean') return;
       if (row.costs_complete && (typeof row.net_usd !== 'number' || !Number.isFinite(row.net_usd))) return;
       session.total = {
+        ...(typeof row.status_day === 'string' ? {status_day:row.status_day} : {}),
         costs_complete:row.costs_complete, net_usd:row.costs_complete ? row.net_usd as number : null,
         less_usage_percent:typeof row.net_percent === 'number' && Number.isFinite(row.net_percent)
           ? row.net_percent : null,

@@ -2,6 +2,7 @@ export interface SavingsView {
     net_usd: number | null;
     less_usage_percent: number | null;
     costs_complete: boolean;
+    status_day?: string;
     progress_tokens: number;
     budget_tokens: number;
     url?: string;

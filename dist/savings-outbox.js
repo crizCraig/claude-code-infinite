@@ -2,13 +2,16 @@
  * Multiple proxies can write and drain independently. A race to deliver is a server replay. */
 import { createHash } from 'node:crypto';
 import { isKeyRejected } from './key-page.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { LAUNCH_TIME, ownerExited } from './savings-owner.js';
 import { savingsReport } from './savings-report.js';
 const BATCH_SIZE = 50;
 const INITIAL_DELAY = 60_000;
 const MAX_DELAY = 30 * 60_000;
 const SEGMENT = /^([a-f0-9-]{36})(?:\.(\d+)\.(\d+))?\.jsonl$/;
+const IN_FLIGHT = /^([a-f0-9-]{36})\.([1-9]\d*)\.(\d+)\.inflight$/;
 export class SavingsOutbox {
     send;
     now;
@@ -30,7 +33,29 @@ export class SavingsOutbox {
     suspend() {
         this.suspended = true;
     }
-    append(value) {
+    /** Bind both phases to this account, including turns settled after a re-key. */
+    writer() {
+        let inFlight;
+        return Object.assign((value) => this.append(value, inFlight), {
+            dispatched: (value) => {
+                if (!this.enabled)
+                    return;
+                const record = savingsReport(value);
+                if (!record)
+                    return;
+                const path = join(this.directory, `${record.turn_id}.${process.pid}.${LAUNCH_TIME}.inflight`);
+                // The upstream send starts immediately after this callback. Only the
+                // small, allowlisted identity is journaled on the forwarding thread.
+                try {
+                    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+                    writeFileSync(path, JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
+                    inFlight = path;
+                }
+                catch { /* A final report may still be published on settlement. */ }
+            },
+        });
+    }
+    append(value, inFlight) {
         if (this.suspended)
             return;
         let record;
@@ -42,16 +67,17 @@ export class SavingsOutbox {
         }
         if (!record)
             return;
-        const writing = this.publish(record).catch(() => { });
+        const writing = this.publish(record, inFlight).catch(() => { });
         this.writes.add(writing);
         if (this.drain)
             this.appendedDuringDrain = true;
         void writing.then(() => this.writes.delete(writing));
     }
-    async publish(record) {
+    async publish(record, inFlight) {
         await mkdir(this.directory, { recursive: true, mode: 0o700 });
         const path = join(this.directory, record.turn_id + '.jsonl');
-        const file = await open(path, 'ax', 0o600);
+        const staging = inFlight ? inFlight + '.settling' : path;
+        const file = await open(staging, 'ax', 0o600);
         try {
             // One writer per segment. A reader only consumes a newline-terminated record.
             await file.appendFile(JSON.stringify(record) + '\n');
@@ -59,6 +85,12 @@ export class SavingsOutbox {
         }
         finally {
             await file.close();
+        }
+        if (inFlight) {
+            // Before the first rename, a crash recovers the incomplete turn. After
+            // it, the same recovery operation publishes the synced final observation.
+            await rename(staging, inFlight);
+            await rename(inFlight, path);
         }
     }
     flush() {
@@ -82,10 +114,23 @@ export class SavingsOutbox {
         for (const entry of files) {
             if (this.suspended)
                 break;
-            const match = SEGMENT.exec(entry.name);
+            let name = entry.name;
+            const interrupted = IN_FLIGHT.exec(name);
+            if (interrupted && entry.isFile() && ownerExited(Number(interrupted[2]), Number(interrupted[3]))) {
+                const from = join(this.directory, name);
+                name = interrupted[1] + '.jsonl';
+                try {
+                    await rename(from, join(this.directory, name));
+                }
+                catch {
+                    continue;
+                } // A sibling recovered it first.
+                await unlink(from + '.settling').catch(() => { });
+            }
+            const match = SEGMENT.exec(name);
             if (!match || !entry.isFile() || Number(match[3] ?? 0) > this.now())
                 continue;
-            const path = join(this.directory, entry.name);
+            const path = join(this.directory, name);
             try {
                 const line = await readFile(path, 'utf8');
                 if (!line.endsWith('\n'))

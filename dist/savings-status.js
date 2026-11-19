@@ -38,12 +38,14 @@ export function renderSavingsSegment(view, env = process.env, width = Infinity) 
         const osc8 = env.CCC_STATUSLINE_LINK === 'osc8' ||
             (env.CCC_STATUSLINE_LINK !== 'url' && terminalSupportsHyperlinks(env, { isTTY: true }));
         const link = osc8 ? `\x1b]8;;${url}\x1b\\savings\x1b]8;;\x1b\\` : url;
-        const dollars = `🌿 MemTree · $${net.toFixed(2)} saved`;
+        const amount = `$${net.toFixed(2)}`;
+        const scope = view.status_day ? ' today UTC' : '';
+        const dollars = `🌿 MemTree · ${amount} saved${scope}`;
         const percent = view.less_usage_percent;
         const detail = typeof percent === 'number' && Number.isFinite(percent) && percent > 0
             ? ` · ${percent < 1 ? '<1' : Math.min(100, Math.round(percent))}% less usage` : '';
         const full = `${dollars}${detail} · ${link}`;
-        return [full, `${dollars} · ${link}`, dollars, `$${net.toFixed(2)} saved`, `$${net.toFixed(2)}`]
+        return [full, `${dollars} · ${link}`, dollars, `${amount} saved${scope}`, amount + scope]
             .find(segment => visibleWidth(segment) <= width) ?? '';
     }
     if (!(view.budget_tokens > 0) || !Number.isFinite(view.progress_tokens))

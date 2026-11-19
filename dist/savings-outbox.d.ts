@@ -1,4 +1,8 @@
 import { type SavingsRecord } from './savings-report.js';
+export interface SavingsWriter {
+    (value: unknown): void;
+    dispatched?(value: unknown): void;
+}
 type Send = (turns: SavingsRecord[]) => Promise<Response>;
 export declare class SavingsOutbox {
     private readonly send;
@@ -12,7 +16,9 @@ export declare class SavingsOutbox {
     constructor(configDir: string, baseUrl: string, key: string, send: Send, now: () => number);
     get enabled(): boolean;
     suspend(): void;
-    append(value: unknown): void;
+    /** Bind both phases to this account, including turns settled after a re-key. */
+    writer(): SavingsWriter;
+    append(value: unknown, inFlight?: string): void;
     private publish;
     flush(): Promise<void>;
     private drainPending;

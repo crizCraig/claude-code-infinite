@@ -88,32 +88,6 @@ test('savings JSON completeness requires a message and valid full usage', () => 
   assert.equal(rec.savingsUsageComplete,true);
 });
 
-test('freshly parsed appends reuse a verified large message, edits rebuild it', async () => {
- const {SavingsHistory}=await import('../dist/savings-history.js');
- const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const history=new SavingsHistory();
- const make=(char,tail,header)=>({system:'x-anthropic-billing-header: cch='+header+';',
-   model:'claude-sonnet-4-6',messages:[{role:'user',content:char.repeat(90000)},...tail],
-   cache_control:{type:'ephemeral'}});
- let state=createSavingsState();
- const one=(req,expectedReuse)=>{
-   const bytes=Buffer.from(JSON.stringify(req));
-   const replay=history.request(sessionId,bytes);
-   const input={usage:{input_tokens:10,output_tokens:1},requestModified:true,contextWindow:200000,
-     request:JSON.parse(bytes),nowMs:1000};
-   const expected=accountSavingsTurn(state,input);
-   if(expectedReuse) Object.defineProperty(input.request.messages[0],'content',{
-     get(){throw Error('accounting traversed verified history');}});
-   const actual=accountSavingsTurn(state,{...input,replay});
-   assert.deepEqual(actual,expected);
-   state=actual.state;
- };
- const tail=[{role:'assistant',content:'hello'}];
- one(make('x',[],'a'),false);
- one(make('x',tail,'longer-changing-field'),true);
- one(make('y',tail,'again'),false);
-});
-
 test('response usage speed overrides requested speed for JSON and SSE', async () => {
  const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
  for(const stream of [true,false]){
@@ -130,51 +104,12 @@ test('response usage speed overrides requested speed for JSON and SSE', async ()
  }
 });
 
-test('a duplicate messages key cannot lend a digest to a different conversation', async () => {
- const {SavingsHistory}=await import('../dist/savings-history.js');
- const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const history=new SavingsHistory();
- const first=[{role:'user',content:'x'.repeat(90000)}];
- const changed=[{role:'user',content:'y'.repeat(30000)}];
- let state=createSavingsState();
- for(const raw of [JSON.stringify({messages:first}), '{"messages":'+JSON.stringify(first)+',"mess\\u0061ges":'+JSON.stringify(changed)+'}']){
-   const bytes=Buffer.from(raw);
-   const replay=history.request(sessionId,bytes);
-   const input={usage:{input_tokens:10,output_tokens:1},requestModified:true,model:'claude-sonnet-4-6',
-     contextWindow:200000,request:JSON.parse(raw),nowMs:1000};
-   const expected=accountSavingsTurn(state,input);
-   const actual=accountSavingsTurn(state,{...input,replay});
-   assert.deepEqual(actual,expected);
-   state=actual.state;
- }
-});
-
 test('terminal width accounts for wide text, combining marks and joined emoji', async () => {
  const {visibleWidth}=await import('../dist/savings-status.js');
  assert.equal(visibleWidth('樹木'),4);
  assert.equal(visibleWidth('e\u0301'),1);
  assert.equal(visibleWidth('👩‍💻'),2);
  assert.equal(visibleWidth('\x1b]8;;https://example.test\x1b\\樹\x1b]8;;\x1b\\'),2);
-});
-
-test('a verified append also reuses an unchanged system and tools frame', async () => {
- const {SavingsHistory}=await import('../dist/savings-history.js');
- const {accountSavingsTurn,createSavingsState}=await import('../dist/savings.js');
- const history=new SavingsHistory();
- const req={system:'s'.repeat(90000),messages:[{role:'user',content:'hi'}],tools:[{name:'a'}]};
- const input={requestModified:true,model:'claude-sonnet-4-6',contextWindow:200000,
-   usage:{input_tokens:10,output_tokens:1},nowMs:1000};
- let state=createSavingsState();
- for (const append of [false,true]) {
-   if(append) req.messages.push({role:'assistant',content:'ok'});
-   const bytes=Buffer.from(JSON.stringify(req)),request=JSON.parse(bytes);
-   const replay=history.request(sessionId,bytes);
-   const expected=accountSavingsTurn(state,{...input,request});
-   if(append) Object.defineProperty(request,'system',{get(){throw Error('reread verified system');}});
-   const result=accountSavingsTurn(state,{...input,request,replay});
-   assert.deepEqual(result,expected);
-   state=result.state;
- }
 });
 
 
@@ -467,4 +402,19 @@ test('a cold compressed request reads the mixed-TTL plain prefix in every settle
     assert.deepEqual(reports.get(turns[2].id).plain,
       {input:0,cache_read:31000,cache_creation_5m:0,cache_creation_1h:0,output:0},order);
   }
+});
+
+test("an interrupted previous day gives today's session savings an explicit label at every width", async () => {
+  const {SavingsTracker} = await import('../dist/savings-tracker.js');
+  let now = Date.parse('2026-11-18T23:59:59Z');
+  const tracker = new SavingsTracker({usageUrl:'https://example.test/usage', now:()=>now,
+    fetchTotal:async()=>({session_id:sessionId,net_usd:4.2,net_percent:38,
+      costs_complete:true,status_day:'2026-11-18'})});
+  const view = await tracker.view(sessionId);
+  for (const width of [15,32,140]) {
+    assert.match(renderSavingsSegment(view,{},width),/today/);
+  }
+  assert.equal(renderSavingsSegment(view,{},5),'');
+  now += 2000;
+  assert.equal((await tracker.view(sessionId)).net_usd,null,'midnight expires the cached day');
 });

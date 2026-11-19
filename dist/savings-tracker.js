@@ -36,8 +36,8 @@ export class SavingsTracker {
             return new SavingsObservation(id.toLowerCase(), report, this.scope, this.opts.diagnostics?.savingsCacheDirectory);
     }
     /** Only upstream dispatches contribute an API turn. Billing records MemTree independently. */
-    settle(observation, input, status) {
-        return observation.settle(input, status);
+    settle(observation, input, status, countPrefix) {
+        return observation.settle(input, status, countPrefix);
     }
     /** Called only by the status line. One fetch per session per ten seconds, including failures. */
     async view(id) {
@@ -69,6 +69,10 @@ export class SavingsTracker {
         }
         if (this.account !== this.opts.diagnostics?.savingsAccount)
             return;
+        if (session.total?.status_day && session.total.status_day !== new Date(now).toISOString().slice(0, 10)) {
+            session.total = undefined;
+            session.refreshAt = 0;
+        }
         return {
             ...(session.total ?? { net_usd: null, less_usage_percent: null, costs_complete: false }),
             progress_tokens: session.progress, budget_tokens: session.budget,
@@ -87,6 +91,7 @@ export class SavingsTracker {
             if (row.costs_complete && (typeof row.net_usd !== 'number' || !Number.isFinite(row.net_usd)))
                 return;
             session.total = {
+                ...(typeof row.status_day === 'string' ? { status_day: row.status_day } : {}),
                 costs_complete: row.costs_complete, net_usd: row.costs_complete ? row.net_usd : null,
                 less_usage_percent: typeof row.net_percent === 'number' && Number.isFinite(row.net_percent)
                     ? row.net_percent : null,
