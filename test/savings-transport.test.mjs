@@ -445,6 +445,8 @@ test('the floor includes matching in-flight sends', async t => {
   await diagnostics.flush();
   assert.equal(h.posts.at(-1).turns[0].plain.cache_read,30000);
   await tracker.settle(pending,{...input,nowMs:1000},200);
+  await diagnostics.flush();
+  assert.ok(h.posts.some(post => post.turns.some(turn => turn.turn_id === pending.id)));
 });
 
 test('a refused dispatch costs zero and its retry reads the prefix in a new launcher', async t => {
