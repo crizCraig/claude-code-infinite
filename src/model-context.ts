@@ -133,7 +133,7 @@ export class ModelContextNotices {
 }
 
 /**
- * The short checkout link, else the pricing page: the long `/payment?…` link
+ * The short checkout link, else the fallback subscribe link: the long `/payment?…` link
  * carries the user's email, and this text stays in the transcript.
  */
 function modelSubscribeUrl(detail: string): string {

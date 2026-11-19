@@ -151,3 +151,15 @@ test("MemTree production hosts accept the production key and reject look-alikes"
   }
   assert.equal(modeForUrl(new URL("https://account.memtree.dev/m/tree")), null);
 });
+
+test("fetch rejects nonstandard production ports before making a request", async () => {
+  for (const host of ["api.memtree.dev", "app.memtree.dev", "api.polychat.co", "app.polychat.co"]) {
+    assert.equal(modeForUrl(new URL(`https://${host}:443/m/tree`)), "production");
+    const code = await runMemtreeFetchCommand([`https://${host}:8443/m/tree`], {
+      keys: { production: "test-key" },
+      fetch: () => assert.fail("unexpected network request"),
+      stderr: () => {},
+    });
+    assert.equal(code, 2, host);
+  }
+});

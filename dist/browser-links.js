@@ -5,6 +5,6 @@ export const BROWSER_APP_BASE = LEGACY_BROWSER_LINKS
 export const KEY_BROWSER_URL = LEGACY_BROWSER_LINKS
     ? "https://polychat.co/auth?memtree=true&utm_source=ccc"
     : "https://app.memtree.dev/key?utm_source=ccc";
-export const PRICING_BROWSER_URL = LEGACY_BROWSER_LINKS
-    ? "https://polychat.co/pricing" : "https://app.memtree.dev/pricing";
+export const SUBSCRIBE_BROWSER_URL = LEGACY_BROWSER_LINKS
+    ? "https://polychat.co/pricing" : "https://app.memtree.dev/payment?source=ccc";
 //# sourceMappingURL=browser-links.js.map

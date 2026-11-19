@@ -99,7 +99,7 @@ export function modeForUrl(url) {
         return null;
     if (STAGING_HOSTS.has(url.hostname))
         return "staging";
-    if (PRODUCTION_HOSTS.has(url.hostname))
+    if (PRODUCTION_HOSTS.has(url.host))
         return "production";
     return null;
 }

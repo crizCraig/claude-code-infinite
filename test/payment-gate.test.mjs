@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  FALLBACK_SUBSCRIBE_URL,
   PAUSED_HEADLINE,
   PAUSED_FREE_CREDIT_HEADLINE,
   PAUSED_LOSS_LINES,
@@ -146,9 +145,9 @@ test("extractRecommendedPlan scrubs control characters and tolerates no emoji", 
   assert.equal(extractRecommendedPlan(null), null);
 });
 
-test("notice without a message or url still points at pricing", () => {
-  const text = formatPaymentNotice({ paid: false, message: null, url: null });
-  assert.ok(text.endsWith(`\nSubscribe: ${FALLBACK_SUBSCRIBE_URL}`), text);
+test("an unpaid response without a payment URL offers checkout", () => {
+  const text = formatPaymentNotice(parsePaymentStatus({ paid: false }));
+  assert.ok(text.endsWith("\nSubscribe: https://app.memtree.dev/payment?source=ccc"), text);
 });
 
 test("Enter subscribes, c continues, q quits, anything else continues", () => {

@@ -121,8 +121,8 @@ test("the paused refusal names the pause, the subscribe link and /clear, not mem
     "or start fresh with /clear (MemTree keeps what it indexed before the pause).");
   assert.ok(!text.includes("memtree-compact"));
   assert.ok(!text.includes("\n"), "one line");
-  // No checkout link in the detail: the pricing page.
-  assert.match(pausedRefusalMessage("Payment required"), /resume: https:\/\/app\.memtree\.dev\/pricing /);
+  // No checkout link in the detail: the fallback subscribe link.
+  assert.match(pausedRefusalMessage("Payment required"), /resume: https:\/\/app\.memtree\.dev\/payment\?source=ccc /);
 });
 
 for (const [lane, turn] of [["human", humanTurn], ["tool", toolTurn]]) {

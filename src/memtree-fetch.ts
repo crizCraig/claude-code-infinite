@@ -127,7 +127,7 @@ export function modeForUrl(url: URL): FetchMode | null {
   if (LOCAL_HOSTS.has(url.hostname)) return "local";
   if (url.protocol !== "https:") return null;
   if (STAGING_HOSTS.has(url.hostname)) return "staging";
-  if (PRODUCTION_HOSTS.has(url.hostname)) return "production";
+  if (PRODUCTION_HOSTS.has(url.host)) return "production";
   return null;
 }
 

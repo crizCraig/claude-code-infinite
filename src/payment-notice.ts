@@ -78,7 +78,7 @@ export function paymentNoticeText(
 /**
  * The checkout link in a 402 detail (the server's payment prompt carries a
  * `/payment?user_id=…&user_email=…` link), tagged `source=ccc` like the
- * startup gate's; the pricing page when the detail has none.
+ * startup gate's; the fallback subscribe link when the detail has none.
  */
 export function subscribeUrlFromDetail(detail: string): string {
   const url = extractPaymentUrl(detail);
