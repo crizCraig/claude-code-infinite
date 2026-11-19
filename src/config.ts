@@ -75,10 +75,11 @@ const keyFields = {
 
 let warnedLegacyKey = false;
 
-function savedKeyFor(mode: keyof typeof keyFields): string | undefined {
+/** CLI callers warn once about legacy keys. A direct MCP server reads them quietly. */
+export function storedApiKey(mode: CccEnvironment, { warnOnLegacy = true } = {}): string | undefined {
   const key = loadConfig()[keyFields[mode]];
   if (typeof key !== "string" || !key) return undefined;
-  if (!isMemtreeKey(key) && !warnedLegacyKey) {
+  if (warnOnLegacy && !warnedLegacyKey && !isMemtreeKey(key)) {
     console.warn("Your saved MemTree key uses a legacy format. Continuing with the saved key.");
     warnedLegacyKey = true;
   }
@@ -92,7 +93,7 @@ function setKeyFor(mode: keyof typeof keyFields, value: string): void {
 }
 
 export function getPolychatApiKey(): string | undefined {
-  return savedKeyFor("production");
+  return storedApiKey("production");
 }
 
 export function setPolychatApiKey(key: string): void {
@@ -100,7 +101,7 @@ export function setPolychatApiKey(key: string): void {
 }
 
 export function getStagingPolychatApiKey(): string | undefined {
-  return savedKeyFor("staging");
+  return storedApiKey("staging");
 }
 
 export function setStagingPolychatApiKey(key: string): void {
@@ -108,7 +109,7 @@ export function setStagingPolychatApiKey(key: string): void {
 }
 
 export function getLocalPolychatApiKey(): string | undefined {
-  return savedKeyFor("local");
+  return storedApiKey("local");
 }
 
 export function setLocalPolychatApiKey(key: string): void {
@@ -125,11 +126,4 @@ export function memtreeBaseUrlFor(mode: CccEnvironment, env: NodeJS.ProcessEnv =
   return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
     mode === "staging" ? STAGING_BASE_URL :
     POLYCHAT_BASE_URL;
-}
-
-/** The saved MemTree key for a mode (separate keys per environment). */
-export function storedApiKey(mode: CccEnvironment): string | undefined {
-  return mode === "local" ? getLocalPolychatApiKey() :
-    mode === "staging" ? getStagingPolychatApiKey() :
-    getPolychatApiKey();
 }

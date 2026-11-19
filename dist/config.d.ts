@@ -18,6 +18,10 @@ export interface Config {
 export declare function getConfigDir(): string;
 export declare function loadConfig(): Config;
 export declare function saveConfig(config: Config): void;
+/** CLI callers warn once about legacy keys. A direct MCP server reads them quietly. */
+export declare function storedApiKey(mode: CccEnvironment, { warnOnLegacy }?: {
+    warnOnLegacy?: boolean | undefined;
+}): string | undefined;
 export declare function getPolychatApiKey(): string | undefined;
 export declare function setPolychatApiKey(key: string): void;
 export declare function getStagingPolychatApiKey(): string | undefined;
@@ -26,6 +30,4 @@ export declare function getLocalPolychatApiKey(): string | undefined;
 export declare function setLocalPolychatApiKey(key: string): void;
 /** MemTree's API host for a mode; CCC_LOCAL_BASE_URL moves local mode's (tests: a free port). */
 export declare function memtreeBaseUrlFor(mode: CccEnvironment, env?: NodeJS.ProcessEnv): string;
-/** The saved MemTree key for a mode (separate keys per environment). */
-export declare function storedApiKey(mode: CccEnvironment): string | undefined;
 //# sourceMappingURL=config.d.ts.map

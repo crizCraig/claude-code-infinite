@@ -49,11 +49,12 @@ const keyFields = {
     local: "localPolychatApiKey",
 };
 let warnedLegacyKey = false;
-function savedKeyFor(mode) {
+/** CLI callers warn once about legacy keys. A direct MCP server reads them quietly. */
+export function storedApiKey(mode, { warnOnLegacy = true } = {}) {
     const key = loadConfig()[keyFields[mode]];
     if (typeof key !== "string" || !key)
         return undefined;
-    if (!isMemtreeKey(key) && !warnedLegacyKey) {
+    if (warnOnLegacy && !warnedLegacyKey && !isMemtreeKey(key)) {
         console.warn("Your saved MemTree key uses a legacy format. Continuing with the saved key.");
         warnedLegacyKey = true;
     }
@@ -66,19 +67,19 @@ function setKeyFor(mode, value) {
     saveConfig({ ...loadConfig(), [keyFields[mode]]: key });
 }
 export function getPolychatApiKey() {
-    return savedKeyFor("production");
+    return storedApiKey("production");
 }
 export function setPolychatApiKey(key) {
     setKeyFor("production", key);
 }
 export function getStagingPolychatApiKey() {
-    return savedKeyFor("staging");
+    return storedApiKey("staging");
 }
 export function setStagingPolychatApiKey(key) {
     setKeyFor("staging", key);
 }
 export function getLocalPolychatApiKey() {
-    return savedKeyFor("local");
+    return storedApiKey("local");
 }
 export function setLocalPolychatApiKey(key) {
     setKeyFor("local", key);
@@ -92,11 +93,5 @@ export function memtreeBaseUrlFor(mode, env = process.env) {
     return mode === "local" ? (env.CCC_LOCAL_BASE_URL || LOCAL_BASE_URL) :
         mode === "staging" ? STAGING_BASE_URL :
             POLYCHAT_BASE_URL;
-}
-/** The saved MemTree key for a mode (separate keys per environment). */
-export function storedApiKey(mode) {
-    return mode === "local" ? getLocalPolychatApiKey() :
-        mode === "staging" ? getStagingPolychatApiKey() :
-            getPolychatApiKey();
 }
 //# sourceMappingURL=config.js.map
