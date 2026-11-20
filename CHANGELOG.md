@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.39](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.38...v1.0.39) (2026-11-20)
+
+
+### Features
+
+* read MemTree from standalone MCP clients ([#92](https://github.com/crizCraig/claude-code-infinite/issues/92)) ([a121096](https://github.com/crizCraig/claude-code-infinite/commit/a12109657193e63eeb2fe05beeea41b13c904add))
+
+
+### Bug Fixes
+
+* search guidance makes hybrid the mode for finding things, text for known exact words ([2f6d5ab](https://github.com/crizCraig/claude-code-infinite/commit/2f6d5abb98721f11cbb900a0ebf9c4142ac8e052))
+* startup banner names Claude Code Infinite first ("∞ Claude Code Infinite · MemTree memory on") ([#89](https://github.com/crizCraig/claude-code-infinite/issues/89)) ([a6c2582](https://github.com/crizCraig/claude-code-infinite/commit/a6c25820bf9184e27af4ec8d2b4e4f04914886d5))
+* startup security: no bare-name spawns on Windows; typed-ahead text never becomes an API key ([#91](https://github.com/crizCraig/claude-code-infinite/issues/91)) ([e8cbd37](https://github.com/crizCraig/claude-code-infinite/commit/e8cbd376ee1423deccb84f339d0fa77735b2ba00))
+
 ## [1.0.38](https://github.com/crizCraig/claude-code-infinite/compare/v1.0.37...v1.0.38) (2026-11-15)
 
 
