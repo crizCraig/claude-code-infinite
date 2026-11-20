@@ -159,3 +159,37 @@ test("Enter subscribes, c continues, q quits, anything else continues", () => {
   assert.equal(parsePaymentChoice("quit"), "quit");
   assert.equal(parsePaymentChoice("zzz"), "continue");
 });
+
+test("highest-tier status shows the server's support instructions and offers only continue or quit", () => {
+  for (const address of ["support@polychat.co", "support@memtree.dev"]) {
+    const message = "Your usage has exceeded our highest tier limits. " +
+      `Please contact ${address} to discuss custom pricing options.`;
+    const status = parsePaymentStatus({ paid: false, payment_message: message, payment_url: null });
+    const text = formatPaymentNotice(status);
+    assert.ok(text.includes(message), text);
+    assert.doesNotMatch(text, /subscribe|choose a plan|https?:/i);
+    assert.doesNotMatch(paymentGatePrompt(null, false), /subscribe|upgrade/i);
+    for (const answer of ["", "s", "subscribe", "c"]) {
+      assert.equal(parsePaymentChoice(answer, false), "continue", answer);
+    }
+    assert.equal(parsePaymentChoice("q", false), "quit");
+  }
+});
+
+test("explicit and in-message checkout URLs share the short link's allowed hosts", () => {
+  for (const base of ["https://unrelated.example", "https://app.memtree.dev.example",
+    "https://app.polychat.co@elsewhere.example", "http://app.polychat.co",
+    "https://app.memtree.dev:8443"]) {
+    for (const path of ["/payment?user_id=u", "/p/Ab3xY9qwertyuiop"]) {
+      const url = base + path;
+      for (const fields of [{ payment_url: url }, { payment_message: `Pay at ${url}` }]) {
+        assert.equal(parsePaymentStatus({ paid: false, ...fields }).url, null, url);
+      }
+    }
+  }
+  for (const base of ["https://app.memtree.dev", "https://api.polychat.co",
+    "https://polychat-staging-1.us-west2.run.app", "http://local.polychat.co:8000"]) {
+    const url = `${base}/payment?user_id=u&user_email=a%40b.c`;
+    assert.equal(parsePaymentStatus({ paid: false, payment_url: url }).url, url + "&source=ccc");
+  }
+});

@@ -37,7 +37,7 @@ export declare const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
  */
 export declare function pausedRefusalMessage(detail: string): string;
 /** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
-export declare function pausedCompactionText(url: string): string;
+export declare function pausedCompactionText(detail: string, styleUrl: (url: string) => string): string;
 /**
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.

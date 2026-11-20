@@ -16,7 +16,6 @@
  * (memtree-mcp.ts) already say context is MemTree's job, with the paused case
  * as the exception these notices announce.
  */
-export declare const SUPPORT_EMAIL = "support@memtree.dev";
 /** A scan that has not found a marker by then restores nothing. */
 export declare const TRANSCRIPT_SCAN_MS = 1000;
 /** Told once MemTree answers again after a paused or refused-key notice. */

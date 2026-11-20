@@ -17,9 +17,8 @@
  * as the exception these notices announce.
  */
 import fs from "node:fs";
-import { FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE } from "./payment-gate.js";
+import { billingSupportEmail, customPricingInstructions, extractPaymentUrl, FALLBACK_SUBSCRIBE_URL, SHORT_PAYMENT_URL_RE, } from "./payment-gate.js";
 import { REASON_FREE_CREDIT_USED, REASON_PLAN_LIMIT } from "./payment-link.js";
-export const SUPPORT_EMAIL = "support@memtree.dev";
 const PAUSED_PREFIX = "ccc: MemTree is paused: ";
 const KEY_INVALID_PREFIX = "ccc: MemTree is off: ";
 const ACTIVE_AGAIN_PREFIX = "ccc: MemTree is working again";
@@ -50,8 +49,9 @@ export function pausedModelContext(detail, reason) {
         `${PAUSED_PREFIX}${pausedReasonText(reason)}.`,
         "This is MemTree's own billing, not Claude, the user's Claude plan or " +
             "Anthropic credits; Claude works normally.",
-        `Fix: ${reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe"} at ${modelSubscribeUrl(detail)}, ` +
-            `or for credit questions email ${SUPPORT_EMAIL}.`,
+        customPricingInstructions(detail) ??
+            `Fix: ${reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe"} at ${modelSubscribeUrl(detail)}, ` +
+                `or for credit questions email ${billingSupportEmail(detail)}.`,
         PAUSED_FALLBACK,
     ].join(" ");
 }
@@ -127,7 +127,8 @@ export class ModelContextNotices {
  * carries the user's email, and this text stays in the transcript.
  */
 function modelSubscribeUrl(detail) {
-    return SHORT_PAYMENT_URL_RE.exec(detail)?.[0] ?? FALLBACK_SUBSCRIBE_URL;
+    const url = extractPaymentUrl(detail);
+    return url && SHORT_PAYMENT_URL_RE.exec(url)?.[0] === url ? url : FALLBACK_SUBSCRIBE_URL;
 }
 /** Claude Code's marker in a transcript: what precedes it is no longer in the model's context. */
 const COMPACT_BOUNDARY = '"compact_boundary"';

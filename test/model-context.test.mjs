@@ -59,11 +59,18 @@ test("paused context: MemTree not Claude, why, the fix, and /compact as fallback
     new RegExp(`Fix: subscribe at ${short}, `));
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"), /Fix: upgrade at /);
   assert.match(text, /fresh session \(\/clear\) or, while the conversation still fits, \/compact/);
-  assert.match(text, /support@memtree\.dev/);
+  assert.match(text, /support@polychat\.co/);
   assert.match(text, /\/compact .* fallback/);
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"),
     /paused: the MemTree plan's usage limit is reached\./);
   assert.match(pausedModelContext(PAYMENT_DETAIL, null), /paused: MemTree usage limit reached\./);
+});
+
+test("billing contact follows the server's mailbox independently of browser links", () => {
+  const detail = `${ACCOUNT_LINE}\n\nPlease email support@memtree.dev if you have questions!`;
+  assert.match(pausedModelContext(detail, null), /credit questions email support@memtree\.dev/);
+  const accountOnly = "Payment required for support@memtree.dev for use of the MemTree API";
+  assert.match(pausedModelContext(accountOnly, null), /credit questions email support@polychat\.co/);
 });
 
 test("paused context quotes none of the server's text (controls, email or links)", () => {

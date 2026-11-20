@@ -47,6 +47,10 @@ export type PaymentStatus = {
 export type PaymentChoice = "subscribe" | "continue" | "quit";
 /** The short checkout link (payment-link.ts) that ccc puts in place of the `/payment?…` one. */
 export declare const SHORT_PAYMENT_URL_RE: RegExp;
+/** The server switches billing mail independently of the browser hosts. */
+export declare function billingSupportEmail(detail: string): string;
+/** The status endpoint expresses the support-only case in the recommender's plain text. */
+export declare function customPricingInstructions(detail: string | null): string | null;
 /**
  * Parse a status body. Returns null when the body does not carry a boolean
  * `paid` (old server, wrong shape): the caller treats that as "unknown" and
@@ -74,7 +78,7 @@ export declare function formatPaymentNotice(status: PaymentStatus, options?: {
     link?: PaymentLink | null;
 }): string;
 /** The prompt line, with the server's price when it gave one. */
-export declare function paymentGatePrompt(link?: PaymentLink | null): string;
+export declare function paymentGatePrompt(link?: PaymentLink | null, canSubscribe?: boolean): string;
 /** The first line: why MemTree is paused, as far as the server said. */
 export declare function pausedHeadline(reason: string | null): string;
 /** OSC 8 terminal hyperlink: `text` shown, `url` opened on click. */
@@ -82,5 +86,5 @@ export declare function hyperlink(text: string, url: string): string;
 /** "Starter plan, $5/month" from the recommender's prose, or null. */
 export declare function extractRecommendedPlan(message: string | null): string | null;
 /** Map a prompt answer to a choice. Enter (empty) or `s` subscribes. */
-export declare function parsePaymentChoice(answer: string): PaymentChoice;
+export declare function parsePaymentChoice(answer: string, canSubscribe?: boolean): PaymentChoice;
 //# sourceMappingURL=payment-gate.d.ts.map

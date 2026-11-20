@@ -31,7 +31,7 @@ import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDis
 import { CLIENT_NAME, CLIENT_VERSION, MemtreeClient } from "./memtree.js";
 import { RequestLogger } from "./reqlog.js";
 import { memtreeOffNoticeText, startupNoticeText, updateInstalledNoticeText, updateNoticeText, } from "./notices.js";
-import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
+import { FALLBACK_SUBSCRIBE_URL, MEMTREE_OFF_LINE, PRINT_PAUSED_LINE, RESUMED_PAUSED_LINE, formatPaymentNotice, customPricingInstructions, parsePaymentChoice, paymentGatePrompt, hyperlink, } from "./payment-gate.js";
 import { PaymentLinkCache, fetchPaymentLink } from "./payment-link.js";
 import { resumesSession, runWithoutMemtree } from "./paused-session.js";
 import { subagentHintFor } from "./subagent-hint.js";
@@ -153,10 +153,11 @@ function paymentOnly(check) {
  */
 async function runPaymentGate(status, recheck, links, diagnostics, resumed) {
     const color = terminalSupportsColor();
+    const canSubscribe = !customPricingInstructions(status.message);
     for (;;) {
-        const link = await links.get();
+        const link = canSubscribe ? await links.get() : null;
         console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
-        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
+        const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link, canSubscribe)), canSubscribe);
         diagnostics.record("payment_gate", { choice });
         if (choice === "quit") {
             await diagnostics.flush();
@@ -513,7 +514,9 @@ async function main() {
             memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics, resumesSession(claudeArgs)));
         }
         else {
-            console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
+            const support = customPricingInstructions(paymentStatus.message);
+            console.error(support ? `ccc: ${support} ${MEMTREE_OFF_LINE}` :
+                resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
             memtreeOff = true;
         }
     }

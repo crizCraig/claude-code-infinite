@@ -15,6 +15,7 @@
 
 import { sanitizeNoticeDetail } from "./notices.js";
 import {
+  customPricingInstructions,
   extractPaymentUrl,
   FALLBACK_SUBSCRIBE_URL,
   withCheckoutSource,
@@ -50,14 +51,16 @@ export const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
  * resume, and the one way on that needs no MemTree. One line, bare URL.
  */
 export function pausedRefusalMessage(detail: string): string {
+  const action = customPricingInstructions(detail) ?? `Subscribe to resume: ${subscribeUrlFromDetail(detail)}`;
   return `${MEMTREE_PAUSED}, so this long conversation can't be compressed to fit the ` +
-    `model's context window. Subscribe to resume: ${subscribeUrlFromDetail(detail)} · ` +
+    `model's context window. ${action} · ` +
     "or start fresh with /clear (MemTree keeps what it indexed before the pause).";
 }
 
 /** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
-export function pausedCompactionText(url: string): string {
-  return `${MEMTREE_PAUSED}, so compaction is unavailable. Subscribe to resume: ${url}`;
+export function pausedCompactionText(detail: string, styleUrl: (url: string) => string): string {
+  const action = customPricingInstructions(detail) ?? `Subscribe to resume: ${styleUrl(subscribeUrlFromDetail(detail))}`;
+  return `${MEMTREE_PAUSED}, so compaction is unavailable. ${action}`;
 }
 
 /**
@@ -67,7 +70,8 @@ export function pausedCompactionText(url: string): string {
 export function paymentNoticeText(
   detail: string, memtreeUrl?: string, options: { overBudget?: boolean } = {}
 ): string {
-  const lines = [PAYMENT_PAUSED_HEADLINE, `  ${subscribeUrlFromDetail(detail)}`];
+  const support = customPricingInstructions(detail);
+  const lines = support ? [`⚠ ${MEMTREE_PAUSED}. ${support}`] : [PAYMENT_PAUSED_HEADLINE, `  ${subscribeUrlFromDetail(detail)}`];
   const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "");
   lines.push(options.overBudget ? PAYMENT_OVER_BUDGET_LINE : PAYMENT_CONTINUES_LINE);
   if (account) lines.push(account);

@@ -115,12 +115,12 @@ test("startup check: a network error stays unknown", async () => {
 test("startup check: paid and unpaid bodies parse as before", async () => {
   const paid = await statusServer(200, { email: "a@b.c", paid: true, payment_message: null });
   const unpaid = await statusServer(200, { paid: false, payment_message: "Pay",
-    payment_url: "https://x/payment?u=1" });
+    payment_url: "https://app.polychat.co/payment?u=1" });
   try {
     assert.deepEqual(await fetchKeyStatus(paid.url, "k"), { paid: true, message: null, url: null });
     const status = await fetchKeyStatus(unpaid.url, "k");
     assert.equal(status.paid, false);
-    assert.equal(status.url, "https://x/payment?u=1&source=ccc");
+    assert.equal(status.url, "https://app.polychat.co/payment?u=1&source=ccc");
   } finally { paid.close(); unpaid.close(); }
 });
 

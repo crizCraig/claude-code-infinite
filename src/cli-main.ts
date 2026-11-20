@@ -51,6 +51,7 @@ import {
   PRINT_PAUSED_LINE,
   RESUMED_PAUSED_LINE,
   formatPaymentNotice,
+  customPricingInstructions,
   parsePaymentChoice,
   paymentGatePrompt,
   type PaymentStatus,
@@ -288,10 +289,11 @@ async function runPaymentGate(
   resumed: boolean
 ): Promise<boolean> {
   const color = terminalSupportsColor();
+  const canSubscribe = !customPricingInstructions(status.message);
   for (;;) {
-    const link = await links.get();
+    const link = canSubscribe ? await links.get() : null;
     console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
-    const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
+    const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link, canSubscribe)), canSubscribe);
     diagnostics.record("payment_gate", { choice });
     if (choice === "quit") {
       await diagnostics.flush();
@@ -686,7 +688,9 @@ async function main() {
         resumesSession(claudeArgs)
       ));
     } else {
-      console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
+      const support = customPricingInstructions(paymentStatus.message);
+      console.error(support ? `ccc: ${support} ${MEMTREE_OFF_LINE}` :
+        resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
       memtreeOff = true;
     }
   }
