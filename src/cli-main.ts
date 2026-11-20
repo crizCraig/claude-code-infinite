@@ -286,10 +286,10 @@ async function runPaymentGate(
   recheck: () => Promise<PaymentStatus | null>,
   links: PaymentLinkCache,
   diagnostics: Diagnostics,
-  resumed: boolean
+  resumed: boolean,
+  canSubscribe: boolean
 ): Promise<boolean> {
   const color = terminalSupportsColor();
-  const canSubscribe = !customPricingInstructions(status.message);
   for (;;) {
     const link = canSubscribe ? await links.get() : null;
     console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
@@ -670,6 +670,7 @@ async function main() {
   });
   polychatApiKey = checked.apiKey;
   const paymentStatus = paymentOnly(checked.check);
+  const support = customPricingInstructions(paymentStatus?.message ?? null);
   const linkKey = polychatApiKey;
   // The short checkout link (payment-link.ts): the gate's, and later the
   // in-session paused notices' when the key runs out mid-session.
@@ -685,10 +686,9 @@ async function main() {
     if (interactiveUi) {
       memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(
         await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics,
-        resumesSession(claudeArgs)
+        resumesSession(claudeArgs), support === null
       ));
     } else {
-      const support = customPricingInstructions(paymentStatus.message);
       console.error(support ? `ccc: ${support} ${MEMTREE_OFF_LINE}` :
         resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
       memtreeOff = true;
@@ -718,7 +718,7 @@ async function main() {
   if (memtreeOff && !resumesSession(claudeArgs)) {
     await runWithoutMemtree({
       claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
-      banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate)),
+      banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate), support),
     });
   }
 

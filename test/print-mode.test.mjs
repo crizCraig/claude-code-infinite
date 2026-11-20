@@ -71,7 +71,9 @@ function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJso
     "const pd = args.indexOf('--plugin-dir');",
     "const hooks = pd < 0 ? null : Object.keys(JSON.parse(fs.readFileSync(",
     "  args[pd + 1] + '/hooks/hooks.json', 'utf8')).hooks);",
-    "process.stdout.write(JSON.stringify({ type: 'result', args, servers, hooks }) + '\\n');",
+    "const bannerFile = pd < 0 ? null : args[pd + 1] + '/hooks/startup-notice.json';",
+    "const banner = bannerFile && fs.existsSync(bannerFile) ? JSON.parse(fs.readFileSync(bannerFile)).systemMessage : undefined;",
+    "process.stdout.write(JSON.stringify({ type: 'result', args, servers, hooks, banner }) + '\\n');",
   ].join("\n"));
   if (process.platform === "win32") {
     installNpmClaude(bin, fs.readFileSync(script));
@@ -257,14 +259,14 @@ test("ccc -p: the sign-in Claude Code last sent through ccc decides when the con
 });
 
 /** A fake MemTree server that says the key is unpaid, on a free port. */
-function fakeUnpaidServer(requests) {
+function fakeUnpaidServer(requests, message = "Please subscribe.") {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       requests.push(`${req.method} ${req.url}`);
       req.resume();
       res.setHeader("content-type", "application/json");
       if (req.url === "/v1/context_memory/status") {
-        res.end(JSON.stringify({ paid: false, payment_message: "Please subscribe." }));
+        res.end(JSON.stringify({ paid: false, payment_message: message }));
       } else {
         res.statusCode = 402;
         res.end(JSON.stringify({ detail: "Payment required" }));
@@ -291,6 +293,30 @@ test("ccc -p with an unpaid key: one stderr line, then plain Claude Code with no
   } finally {
     server.close();
   }
+});
+
+test("highest-tier Enter continues with support instructions in the gate and session banner", async t => {
+  const message = "Your usage has exceeded our highest tier limits. " +
+    "Please contact support@memtree.dev to discuss custom pricing options.";
+  const requests = [];
+  const server = await fakeUnpaidServer(requests, message);
+  t.after(() => server.close());
+  const terminal = `
+    import readline from "node:readline";
+    process.stdin.isTTY = process.stdout.isTTY = true;
+    readline.Interface.prototype.question = function (prompt, answer) {
+      console.log(prompt);
+      answer(prompt.includes("subscribe") ? "q" : "");
+    };
+  `;
+  const { code, stdout, stderr } = await runCcc([], localBase(server), {},
+    ["--import", "data:text/javascript," + encodeURIComponent(terminal)]);
+  assert.equal(code, 0, stderr);
+  assert.ok(stderr.includes(message), stderr);
+  assert.doesNotMatch(stdout, /subscribe|waiting for payment/i);
+  const result = JSON.parse(stdout.split(/\r?\n/).find(line => line.startsWith("{")));
+  assert.ok(result.banner.includes(message), result.banner);
+  assert.deepEqual(requests, ["GET /v1/context_memory/status"]);
 });
 
 test("ccc -p --resume with an unpaid key keeps ccc's handling (a resumed session may be past the window)", { timeout: 30_000 }, async () => {

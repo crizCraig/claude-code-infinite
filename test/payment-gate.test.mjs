@@ -58,8 +58,8 @@ test("server payment_url wins over the message link", () => {
 });
 
 test("a status link that isn't a plain http(s) URL is dropped (it is printed and opened)", () => {
-  for (const bad of ['https://x/payment?a="$(rm -rf ~)"', "https://x/payment?a=`id`",
-    "https://x/payment?a=\u001b]8;;", "file:///etc/passwd", "https://x/payment?a=%PATH%"]) {
+  for (const bad of ['https://app.polychat.co/payment?a="$(rm -rf ~)"', "https://app.polychat.co/payment?a=`id`",
+    "https://app.polychat.co/payment?a=\u001b]8;;", "file:///etc/passwd", "https://app.polychat.co/payment?a=%PATH%"]) {
     assert.equal(parsePaymentStatus({ paid: false, payment_url: bad }).url, null, bad);
   }
 });
