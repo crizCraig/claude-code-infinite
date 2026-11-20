@@ -24,6 +24,8 @@ export interface MemtreeNode {
     k?: number[];
     l?: [number, number, number];
     h?: string;
+    /** Original transcript size label from the indexed tree, when available. */
+    size?: string;
 }
 export interface MemtreePageJson {
     request_id?: string;
@@ -74,6 +76,7 @@ export interface LeafRange {
 }
 export interface SearchHit {
     id: number;
+    size?: string;
     depth?: number;
     leaf: boolean;
     summary: string;

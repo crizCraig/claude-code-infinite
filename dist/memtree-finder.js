@@ -246,6 +246,7 @@ function formatHit(hit, n, missing) {
         sessionLabel(hit.kind, hit.id, hit.session_id),
         hit.tree?.created_at ? `tree ${tree} of ${shortTime(hit.tree.created_at)}` : `tree ${tree}`,
         hit.leaf ? `leaf ${hit.leaf}` : undefined,
+        hit.size,
         range ? `block ${range.block} lines ${range.start}-${range.end}` : undefined,
         formatTimeSpan(hit.times) ?? missing.next(),
         typeof hit.score === "number" ? `score ${hit.score.toFixed(3)}` : undefined,

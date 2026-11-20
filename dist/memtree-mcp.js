@@ -247,7 +247,7 @@ export const MEMTREE_TOOLS = [
     },
     {
         name: "read_node",
-        description: "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, summary, leaf or branch) and, " +
+        description: "Read one MemTree node: its summary, its path from the root (ancestor summaries), its children (id, original transcript size when recorded, summary, leaf or branch) and, " +
             "for a leaf, the transcript line range it covers. Give node (an address from search) or id (0 is the root) with an optional tree. " +
             "Results show when the messages were written (a leaf: its own messages, where recorded).",
         inputSchema: {
@@ -690,7 +690,7 @@ export class CurrentTree {
         const query = params.toString() ? `?${params}` : "";
         const answer = await toolGet(this.deps, "/usage", `${encodeURIComponent(id)}/messages${query}`, "read_lines");
         if (answer.status === 404) {
-            return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails).";
+            return "No un-indexed messages after this tree: everything the server has recorded is in the tree (or the server predates tails). 0 tok returned.";
         }
         if (answer.status === 416) {
             throw new ToolInputError(`read_lines: ${(answer.error ?? "").replace(/^HTTP 416 /, "")}`);

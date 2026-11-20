@@ -9,6 +9,7 @@ import {
   formatNode,
   formatSearch,
   formatSearchHits,
+  formatTail,
   MemtreeIndex,
   parseNodeAddress,
   queryTerms,
@@ -235,10 +236,33 @@ test("read_node: summary, path from the root, children, leaf range", () => {
   assert.throws(() => formatNode(index(), 1.5), ToolInputError);
 });
 
+test("read_node and local search show the stored size beside its node, stable as blocks grow", () => {
+  const sizes = { 1: "~38k tok · 2 leaves", 2: "~700 tok" };
+  const nodes = PAGE.nodes.map((node) => ({ ...node, size: sizes[node.id] }));
+  for (const blocks of [PAGE.blocks, [...PAGE.blocks, "later turn".repeat(1000)]]) {
+    const tree = new MemtreeIndex({ ...PAGE, nodes, blocks });
+    assert.match(formatNode(tree, 0), /node 1 · ~38k tok · 2 leaves \(branch\)/);
+    assert.match(formatNode(tree, 1), /node 2 · ~700 tok \(leaf, block 0 lines 1-5\)/);
+    assert.match(formatSearch(tree, "billing"), /\[node 1 · ~38k tok · 2 leaves · branch/);
+    assert.match(formatSearch(tree, "billing"), /\[node 2 · ~700 tok · leaf/);
+    assert.match(formatNode(tree, 0), /node 4 \(branch\)/, "older node has no size");
+  }
+});
+
+test("one-tree and finder search show the matched node's size when the server supplies it", () => {
+  const one = serverSearchHits({ terms: ["billing"], hits: [{ id: 2, leaf: true, size: "~700 tok" }] });
+  assert.match(formatSearchHits(one.hits, "billing", one.terms), /\[node 2 · ~700 tok · leaf/);
+  const hit = { id: "session", tree: { request_id: "page" }, leaf: "L1", size: "~700 tok" };
+  for (const response of [{ hits: [hit] }, { groups: [{ embedding_model: "m", hits: [hit] }] },
+    { mode: "hybrid", hits: [hit] }]) {
+    assert.match(formatSearchResults(response, { query: "billing" }), /leaf L1 · ~700 tok/);
+  }
+});
+
 test("read_lines returns exact numbered lines and rejects bad bounds", () => {
   assert.equal(
     formatLines(index(), 0, 4, 5),
-    "block 0 [time not recorded] lines 4-5 (line number, tab, exact text):\n" +
+    "block 0 [time not recorded] lines 4-5 (line number, tab, exact text; ~28 tok returned):\n" +
       "4\tI created deploy.yaml with region us-west2 and bucket billing-artifacts-7731\n" +
       "5\tThe billing service port is 8443"
   );
@@ -254,6 +278,13 @@ test("read_lines returns exact numbered lines and rejects bad bounds", () => {
   );
 });
 
+test("read_lines matches the server's rounded-up characters/4 estimate for non-ASCII transcript", () => {
+  const body = "猫🐈".repeat(2000) + "猫";
+  const tree = new MemtreeIndex({ blocks: [body] });
+  assert.match(formatLines(tree, 0, 1, 1), /~1001 tok returned/);
+  assert.match(formatTail({ messages: [{ i: 1, x: body }] }), /~1001 tok returned/);
+});
+
 test("read_lines caps characters and lines, and says where to continue", () => {
   // Line 6 of block 1 is 50k chars: past the char cap after lines 1-5.
   const capped = formatLines(index(), 1, 1, 6);
@@ -263,6 +294,9 @@ test("read_lines caps characters and lines, and says where to continue", () => {
   const single = formatLines(index(), 1, 6, 6);
   assert.match(single, /\[line truncated: 50000 chars\]/);
   assert.ok(single.length < 41_000);
+  assert.match(single, /~10000 tok returned/, "only the 40000 transcript characters shown");
+  const shown = PAGE.blocks[1].split("\n").slice(0, 5).join("\n");
+  assert.ok(capped.includes(`~${Math.ceil(shown.length / 4)} tok returned`));
 
   const many = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join("\n");
   const big = new MemtreeIndex({ nodes: [{ id: 0, s: "r", k: [] }], blocks: [many] });
@@ -383,8 +417,7 @@ test("read_lines {tail: true} reads the un-indexed messages fresh from the serve
   assert.equal(readLines.inputSchema.properties.tail.type, "boolean");
 });
 
-test("formatTail shows which tail messages a newer tree already covers", async () => {
-  const { formatTail } = await import("../dist/memtree-tools.js");
+test("formatTail shows which tail messages a newer tree already covers", () => {
   const text = formatTail({
     tail_start: 10, tail_end: 12, not_indexed_from: 12,
     messages: [
@@ -392,6 +425,8 @@ test("formatTail shows which tail messages a newer tree already covers", async (
       { i: 12, k: "assistant", x: "PR opened", state: "not_indexed" },
     ],
   });
+  assert.match(text, /~5 tok returned/, "only the two returned message bodies");
+  assert.match(formatTail({ tail_start: 1, tail_end: 5, messages: [] }), /0 tok returned/);
   assert.match(text, /a newer tree covers it up to 11; from 12 on, no tree yet/);
   assert.match(text, /\[11\] assistant · in a newer tree\ncovered/);
   assert.match(text, /\[12\] assistant\nPR opened/);
@@ -1200,7 +1235,7 @@ test("read_node dates the node and each child by when its messages were written"
 test("read_lines dates its block in the header", () => {
   inZone("America/Los_Angeles", () => {
     const timed = new MemtreeIndex(TIMED);
-    assert.match(formatLines(timed, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2 \(line number, tab, exact text\):\n/);
+    assert.match(formatLines(timed, 1, 1, 2), /^block 1 \[2026-09-30 14:20–14:40 PT\] lines 1-2 \(line number, tab, exact text; ~\d+ tok returned\):\n/);
     assert.match(formatLines(index(), 1, 1, 2), /^block 1 \[time not recorded\] lines 1-2 \(line number/);
   });
 });

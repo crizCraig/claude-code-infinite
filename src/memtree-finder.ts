@@ -82,6 +82,7 @@ export interface FinderHit {
   session_id?: string | null;
   tree: { request_id: string; ref?: string; created_at?: string | null; links?: FinderTreeLinks | null };
   leaf?: string;
+  size?: string;
   range?: { block: number; start: number; end: number } | null;
   /** The lines joined; older servers send only this. */
   snippet?: string | null;
@@ -388,6 +389,7 @@ function formatHit(hit: FinderHit, n: number, missing: MissingTimeNote): string[
     sessionLabel(hit.kind, hit.id, hit.session_id),
     hit.tree?.created_at ? `tree ${tree} of ${shortTime(hit.tree.created_at)}` : `tree ${tree}`,
     hit.leaf ? `leaf ${hit.leaf}` : undefined,
+    hit.size,
     range ? `block ${range.block} lines ${range.start}-${range.end}` : undefined,
     formatTimeSpan(hit.times) ?? missing.next(),
     typeof hit.score === "number" ? `score ${hit.score.toFixed(3)}` : undefined,

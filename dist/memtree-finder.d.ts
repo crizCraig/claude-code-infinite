@@ -67,6 +67,7 @@ export interface FinderHit {
         links?: FinderTreeLinks | null;
     };
     leaf?: string;
+    size?: string;
     range?: {
         block: number;
         start: number;

@@ -39,6 +39,8 @@ export interface MemtreeNode {
   k?: number[];
   l?: [number, number, number];
   h?: string;
+  /** Original transcript size label from the indexed tree, when available. */
+  size?: string;
 }
 
 export interface MemtreePageJson {
@@ -222,6 +224,7 @@ export class MemtreeIndex {
     const times = this.times.get(node.id);
     return {
       id: node.id,
+      size: node.size,
       depth: this.depth.get(node.id),
       leaf: this.isLeaf(node),
       summary: truncate(summary, SUMMARY_CHARS),
@@ -248,6 +251,7 @@ interface LineMatch {
 
 export interface SearchHit {
   id: number;
+  size?: string;
   depth?: number;
   leaf: boolean;
   summary: string;
@@ -361,6 +365,7 @@ export function serverSearchHits(
     const range = raw.range as LeafRange | null | undefined;
     hits.push({
       id: raw.id as number,
+      size: typeof raw.size === "string" ? raw.size : undefined,
       depth: typeof raw.depth === "number" ? raw.depth : undefined,
       leaf: raw.leaf === true,
       summary: typeof raw.summary === "string" ? raw.summary : "",
@@ -420,6 +425,7 @@ export function formatSearchHits(
   for (const hit of hits) {
     const head = [
       `node ${hit.id}`,
+      hit.size,
       hit.leaf ? "leaf" : "branch",
       hit.depth !== undefined ? `depth ${hit.depth}` : undefined,
       hit.range ? `block ${hit.range.block} lines ${hit.range.start}-${hit.range.end}` : undefined,
@@ -459,7 +465,7 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
   }
   const missing = new MissingTimeNote();
   const out = [
-    `node ${id} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
+    `node ${id}${node.size ? ` · ${node.size}` : ""} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
       (index.depth.has(id) ? ` · depth ${index.depth.get(id)}` : "") +
       (bracketedSpan(index.times.get(id)) || ` [${missing.next()}]`),
     `summary: ${node.s ?? ""}`,
@@ -487,7 +493,7 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
       const tag = index.isLeaf(c) ? `leaf, block ${c.l![0]} lines ${c.l![1]}-${c.l![2]}` : "branch";
       const note = dated && !index.times.has(child) ? missing.next() : "";
       const when = dated ? bracketedSpan(index.times.get(child)) || (note ? ` [${note}]` : "") : "";
-      out.push(`  node ${child} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
+      out.push(`  node ${child}${c.size ? ` · ${c.size}` : ""} (${tag})${when}: ${truncate(c.s ?? "", SUMMARY_CHARS)}`);
     }
   }
   return out.join("\n");
@@ -549,18 +555,22 @@ export function formatLines(
   }
   const out: string[] = [];
   let chars = 0;
+  let sourceChars = 0;
   let shown = start - 1;
   const rows: [number, string][] = [];
   for (let n = start; n <= last; n++) {
     let text = lines[n - 1];
+    let note = "";
     const room = READ_LINES_MAX_CHARS - chars;
     if (text.length > room) {
       if (n > start) break;
       // A single line longer than the whole budget: show its head.
-      text = `${text.slice(0, room)}… [line truncated: ${lines[n - 1].length} chars]`;
+      note = `… [line truncated: ${text.length} chars]`;
+      text = text.slice(0, room);
     }
     chars += text.length + 1;
-    rows.push([n, text]);
+    sourceChars += characterCount(text) + (n > start ? 1 : 0);
+    rows.push([n, text + note]);
     shown = n;
   }
   const wanted = Math.min(end, lines.length);
@@ -577,7 +587,7 @@ export function formatLines(
   const when = span
     ? ` [${span}${leading ? `; lines ${leading[0]}-${leading[1]}: ${missing.next()}` : ""}]`
     : ` [${missing.next()}]`;
-  const header = `block ${block}${when} lines ${start}-${shown} (line number, tab, exact text):`;
+  const header = `block ${block}${when} lines ${start}-${shown} (line number, tab, exact text; ${returnedSize(sourceChars)}):`;
   // Each message header with its time; a message without one says so, once per read.
   const starts = new Map(entries);
   const clock = new ClockFormat();
@@ -587,6 +597,18 @@ export function formatLines(
     out.push(`${n}\t${match && when ? `${match[1]} · ${when}:` : text}`);
   }
   return [header, ...out, ...(notes.length ? ["", `[${notes.join("; ")}]`] : [])].join("\n");
+}
+
+/** Size of just the transcript returned, excluding display labels and continuation notes. */
+function returnedSize(chars: number): string {
+  return chars ? `~${Math.ceil(chars / 4)} tok returned` : "0 tok returned";
+}
+
+/** Python counts Unicode code points for the tree's transcript estimate. */
+function characterCount(text: string): number {
+  let length = 0;
+  for (const _ of text) length++;
+  return length;
 }
 
 const MESSAGE_HEADER_RE = /^(Message \d+ from [^:\s]+):$/;
@@ -671,7 +693,7 @@ export function formatTail(body: unknown, tree?: string): string {
   };
   const messages = Array.isArray(page?.messages) ? page.messages : [];
   if (!messages.length) {
-    return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}).`;
+    return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}; 0 tok returned).`;
   }
   const first = messages[0].i;
   const last = messages[messages.length - 1].i;
@@ -680,9 +702,10 @@ export function formatTail(body: unknown, tree?: string): string {
     from === undefined || from === page.tail_start ? "no tree covers it yet"
       : from === null ? "a newer tree of this conversation covers all of it (see later_trees)"
       : `a newer tree covers it up to ${from - 1}; from ${from} on, no tree yet`;
+  const chars = messages.reduce((sum, m) => sum + characterCount(m.x ?? ""), messages.length - 1);
   const out = [
     `After this tree: messages ${first}-${last} of the conversation's newest record ` +
-      `(the whole tail is ${page.tail_start}-${page.tail_end}; ${coverage}).`,
+      `(the whole tail is ${page.tail_start}-${page.tail_end}; ${coverage}; ${returnedSize(chars)}).`,
   ];
   for (const m of messages) {
     const state = m.state === "in_newer_tree" ? " · in a newer tree" : "";
