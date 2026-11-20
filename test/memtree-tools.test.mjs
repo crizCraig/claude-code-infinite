@@ -1006,6 +1006,11 @@ test("MCP instructions and search lead with when to use them, before any compres
     MEMTREE_MCP_INSTRUCTIONS.length + search.description.length);
 });
 
+test("after compression, even confident recall must be verified", () => {
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /After compression, your recollection of earlier conversation is unreliable/);
+  assert.match(MEMTREE_MCP_INSTRUCTIONS, /Before relying on anything from earlier work, check it in MemTree, even when you feel sure/);
+});
+
 test("MCP instructions mention the cross-session tools and stay constant", () => {
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /\blist\b/);
   assert.match(MEMTREE_MCP_INSTRUCTIONS, /"tree": "current"/);

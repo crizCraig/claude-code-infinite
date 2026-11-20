@@ -236,9 +236,8 @@ export const MEMTREE_MCP_INSTRUCTIONS =
   "session to free context: they discard what MemTree keeps (/ccc:memtree-compact compresses now if the " +
   "user asks). The exception is a ccc notice that MemTree is paused or off: it is not compressing then, " +
   "and that advice is the fallback.\n\n" +
-  "So once you see that memory message: when your answer depends on something said earlier (what the user asked " +
-  "for, ruled out or told you, decisions and why, facts, ids, paths, commands, what was tried and failed), search " +
-  "MemTree before guessing or re-deriving it. No hit is not proof it was never said: try other wordings, synonyms " +
+  "After compression, your recollection of earlier conversation is unreliable. Before relying on anything " +
+  "from earlier work, check it in MemTree, even when you feel sure. No hit is not proof it was never said: try other wordings, synonyms " +
   "and broader terms (vector matches meaning) first. Check exact values (numbers, names, dates) by reading " +
   "the lines (read_lines), not a summary.\n\n" +
   "search with \"tree\": \"current\" looks in this session's MemTree; without tree it searches all of the user's " +
