@@ -33,6 +33,8 @@ test("a server body becomes a link; anything off-shape is no link", () => {
     { ...BODY, url: "https://evil.example/p/Ab3xY9qwertyuiop" },
     { ...BODY, url: "http://app.polychat.co/p/Ab3xY9qwertyuiop" },
     { ...BODY, url: "https://polychat.co.evil.example/p/Ab3xY9qwertyuiop" },
+    { ...BODY, url: "https://polychat-staging-1.us-west2.run.app/p/Ab3xY9qwertyuiop" },
+    { ...BODY, url: "https://unlisted.polychat.co/p/Ab3xY9qwertyuiop" },
     { ...BODY, url: "https://someone-else.run.app/p/Ab3xY9qwertyuiop" },
   ]) assert.equal(parsePaymentLink(bad), null, JSON.stringify(bad));
   assert.ok(parsePaymentLink({ ...BODY, url: "http://local.polychat.co:8000/p/Ab3xY9qwertyuiop" }));
@@ -116,4 +118,14 @@ test("freshness and prices", () => {
   assert.ok(paymentLinkFresh(link, 1e15), "no expiry: always fresh");
   assert.equal(formatUsd(5), "$5");
   assert.equal(formatUsd(7.5), "$7.50");
+});
+
+
+test("MemTree short links allow only the app host over https", () => {
+  const suffix = "/p/Ab3xY9qwertyuiop";
+  assert.ok(parsePaymentLink({ ...BODY, url: "https://app.memtree.dev" + suffix }));
+  for (const base of ["https://app.memtree.dev.evil.example", "https://api.memtree.dev",
+      "http://app.memtree.dev", "https://account.memtree.dev", "https://evil.memtree.dev"]) {
+    assert.equal(parsePaymentLink({ ...BODY, url: base + suffix }), null);
+  }
 });

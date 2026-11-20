@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  FALLBACK_SUBSCRIBE_URL,
   PAUSED_HEADLINE,
   PAUSED_FREE_CREDIT_HEADLINE,
   PAUSED_LOSS_LINES,
@@ -59,8 +58,8 @@ test("server payment_url wins over the message link", () => {
 });
 
 test("a status link that isn't a plain http(s) URL is dropped (it is printed and opened)", () => {
-  for (const bad of ['https://x/payment?a="$(rm -rf ~)"', "https://x/payment?a=`id`",
-    "https://x/payment?a=\u001b]8;;", "file:///etc/passwd", "https://x/payment?a=%PATH%"]) {
+  for (const bad of ['https://app.polychat.co/payment?a="$(rm -rf ~)"', "https://app.polychat.co/payment?a=`id`",
+    "https://app.polychat.co/payment?a=\u001b]8;;", "file:///etc/passwd", "https://app.polychat.co/payment?a=%PATH%"]) {
     assert.equal(parsePaymentStatus({ paid: false, payment_url: bad }).url, null, bad);
   }
 });
@@ -146,9 +145,9 @@ test("extractRecommendedPlan scrubs control characters and tolerates no emoji", 
   assert.equal(extractRecommendedPlan(null), null);
 });
 
-test("notice without a message or url still points at pricing", () => {
-  const text = formatPaymentNotice({ paid: false, message: null, url: null });
-  assert.ok(text.endsWith(`\nSubscribe: ${FALLBACK_SUBSCRIBE_URL}`), text);
+test("an unpaid response without a payment URL asks the user to confirm their account and plan", () => {
+  const text = formatPaymentNotice(parsePaymentStatus({ paid: false, payment_message: "We recommend Basic plan for $10/month." }));
+  assert.ok(text.endsWith("\nConfirm your account and choose a plan: https://polychat.co/pricing"), text);
 });
 
 test("Enter subscribes, c continues, q quits, anything else continues", () => {
@@ -159,4 +158,39 @@ test("Enter subscribes, c continues, q quits, anything else continues", () => {
   assert.equal(parsePaymentChoice("Q"), "quit");
   assert.equal(parsePaymentChoice("quit"), "quit");
   assert.equal(parsePaymentChoice("zzz"), "continue");
+});
+
+test("highest-tier status shows the server's support instructions and offers only continue or quit", () => {
+  for (const address of ["support@polychat.co", "support@memtree.dev"]) {
+    const message = "Your usage has exceeded our highest tier limits. " +
+      `Please contact ${address} to discuss custom pricing options.`;
+    const status = parsePaymentStatus({ paid: false, payment_message: message, payment_url: null });
+    const text = formatPaymentNotice(status);
+    assert.ok(text.includes(message), text);
+    assert.doesNotMatch(text, /subscribe|choose a plan|https?:/i);
+    assert.doesNotMatch(paymentGatePrompt(null, false), /subscribe|upgrade/i);
+    for (const answer of ["", "s", "subscribe", "c"]) {
+      assert.equal(parsePaymentChoice(answer, false), "continue", answer);
+    }
+    assert.equal(parsePaymentChoice("q", false), "quit");
+  }
+});
+
+test("explicit and in-message checkout URLs share the short link's allowed hosts", () => {
+  for (const base of ["https://unrelated.example", "https://app.memtree.dev.example",
+    "https://app.polychat.co@elsewhere.example", "http://app.polychat.co",
+    "https://app.memtree.dev:8443", "https://polychat-staging-1.us-west2.run.app",
+    "https://unlisted.polychat.co"]) {
+    for (const path of ["/payment?user_id=u", "/p/Ab3xY9qwertyuiop"]) {
+      const url = base + path;
+      for (const fields of [{ payment_url: url }, { payment_message: `Pay at ${url}` }]) {
+        assert.equal(parsePaymentStatus({ paid: false, ...fields }).url, null, url);
+      }
+    }
+  }
+  for (const base of ["https://app.memtree.dev", "https://api.polychat.co",
+    "https://polychat-staging-421312241218.us-west2.run.app", "http://local.polychat.co:8000"]) {
+    const url = `${base}/payment?user_id=u&user_email=a%40b.c`;
+    assert.equal(parsePaymentStatus({ paid: false, payment_url: url }).url, url + "&source=ccc");
+  }
 });

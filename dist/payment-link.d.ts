@@ -38,6 +38,7 @@ export type PaymentLinkFetchOptions = {
     timeoutMs?: number;
     fetchImpl?: FetchLike;
 };
+export declare function isCheckoutUrl(url: string): boolean;
 /** Ask the server for a short link; null on any failure. Never throws. */
 export declare function fetchPaymentLink(opts: PaymentLinkFetchOptions): Promise<PaymentLink | null>;
 /** Validate the endpoint's body; null unless it carries a usable short link. */

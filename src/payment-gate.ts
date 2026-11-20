@@ -25,9 +25,12 @@ import {
   REASON_FREE_CREDIT_USED,
   REASON_PLAN_LIMIT,
   formatUsd,
+  isCheckoutUrl,
 } from "./payment-link.js";
 
-export const FALLBACK_SUBSCRIBE_URL = "https://polychat.co/pricing";
+import { SUBSCRIBE_BROWSER_URL } from "./browser-links.js";
+
+export const FALLBACK_SUBSCRIBE_URL = SUBSCRIBE_BROWSER_URL;
 
 /** Query flag on the checkout link so the server's success page says "go back to your terminal". */
 export const CHECKOUT_SOURCE_PARAM = "source=ccc";
@@ -68,10 +71,21 @@ const PAYMENT_URL_RE = /https?:\/\/\S+\/payment\?\S+/;
 export const SHORT_PAYMENT_URL_RE = /https?:\/\/[^\s/]+\/p\/[A-Za-z0-9]{12,64}(?![A-Za-z0-9])/;
 // "we recommend 🌱 Starter plan for $5/month" → plan name + price.
 const RECOMMENDED_PLAN_RE = /recommend\s+(?:\S+\s+)?([A-Za-z][\w ]*?plan)\s+for\s+(\$[\d.]+\/month)/i;
-// No quotes, `$`, backticks or bare `%` (cmd.exe expands %VAR% when Windows opens it).
-const SAFE_URL_RE = /^https?:\/\/(?:[^\s"'`$<>%\\\u0000-\u001f\u007f-\u009f]|%[0-9A-Fa-f]{2})+$/;
 // C0 controls, DEL, and C1 controls.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/** The server switches billing mail independently of the browser hosts. */
+export function billingSupportEmail(detail: string): string {
+  const contact = /\b(?:contact|email)\s+(support@(?:polychat\.co|memtree\.dev))(?=[.!?]?(?:\s|$))/i;
+  return contact.exec(detail)?.[1].toLowerCase() ?? "support@polychat.co";
+}
+
+/** The status endpoint expresses the support-only case in the recommender's plain text. */
+export function customPricingInstructions(detail: string | null): string | null {
+  if (!detail || !/\b(?:exceeded our highest tier limits|past our highest plan)\b/i.test(detail)) return null;
+  return "Your usage has exceeded our highest tier limits. " +
+    `Please contact ${billingSupportEmail(detail)} to discuss custom pricing options.`;
+}
 
 /**
  * Parse a status body. Returns null when the body does not carry a boolean
@@ -90,9 +104,8 @@ export function parsePaymentStatus(body: unknown): PaymentStatus | null {
     typeof record.payment_url === "string" && record.payment_url.trim()
       ? record.payment_url.trim()
       : null;
-  const found = explicitUrl ?? extractPaymentUrl(message);
-  // Printed and handed to the browser opener: a plain http(s) URL only.
-  const url = found && SAFE_URL_RE.test(found) ? found : null;
+  const url = explicitUrl === null ? extractPaymentUrl(message)
+    : isCheckoutUrl(explicitUrl) ? explicitUrl : null;
   return {
     paid: record.paid,
     message,
@@ -110,7 +123,8 @@ export function withCheckoutSource(url: string): string {
 export function extractPaymentUrl(message: string | null): string | null {
   if (!message) return null;
   const match = SHORT_PAYMENT_URL_RE.exec(message) ?? PAYMENT_URL_RE.exec(message);
-  return match ? match[0] : null;
+  const url = match?.[0];
+  return url && isCheckoutUrl(url) ? url : null;
 }
 
 /**
@@ -134,17 +148,19 @@ export function formatPaymentNotice(
 ): string {
   const link = options.link ?? null;
   const headline = pausedHeadline(link?.reason ?? null);
+  const support = customPricingInstructions(status.message);
   const url = link?.url ?? status.url ?? FALLBACK_SUBSCRIBE_URL;
   const shownUrl = options.hyperlinks ? hyperlink(url, url) : url;
   return [
     options.color ? `\x1b[1;33m${headline}\x1b[0m` : headline,
     PAUSED_LOSS_LINES,
-    `${offerLabel(status, link)}: ${shownUrl}`,
+    support ?? `${offerLabel(status, link)}: ${shownUrl}`,
   ].join("\n");
 }
 
 /** The prompt line, with the server's price when it gave one. */
-export function paymentGatePrompt(link: PaymentLink | null = null): string {
+export function paymentGatePrompt(link: PaymentLink | null = null, canSubscribe = true): string {
+  if (!canSubscribe) return "[Enter/c] continue without MemTree   [q] quit: ";
   const verb = link?.reason === REASON_PLAN_LIMIT ? "upgrade" : "subscribe";
   const price = link ? ` (${formatUsd(link.monthlyPriceUsd)}/mo)` : "";
   return `[Enter] ${verb}${price}   [c] continue without MemTree   [q] quit: `;
@@ -160,6 +176,7 @@ export function pausedHeadline(reason: string | null): string {
 /** "Starter is $5/month", else the old server's "Starter plan, $5/month", else "Subscribe". */
 function offerLabel(status: PaymentStatus, link: PaymentLink | null): string {
   if (link) return `${link.plan} is ${formatUsd(link.monthlyPriceUsd)}/month`;
+  if (!status.url) return "Confirm your account and choose a plan";
   return extractRecommendedPlan(status.message) ?? "Subscribe";
 }
 
@@ -176,9 +193,9 @@ export function extractRecommendedPlan(message: string | null): string | null {
 }
 
 /** Map a prompt answer to a choice. Enter (empty) or `s` subscribes. */
-export function parsePaymentChoice(answer: string): PaymentChoice {
+export function parsePaymentChoice(answer: string, canSubscribe = true): PaymentChoice {
   const key = answer.trim().toLowerCase();
-  if (key === "" || key === "s" || key === "subscribe") return "subscribe";
+  if (canSubscribe && (key === "" || key === "s" || key === "subscribe")) return "subscribe";
   if (key === "q" || key === "quit" || key === "exit") return "quit";
   return "continue";
 }

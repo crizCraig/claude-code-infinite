@@ -51,6 +51,7 @@ import {
   PRINT_PAUSED_LINE,
   RESUMED_PAUSED_LINE,
   formatPaymentNotice,
+  customPricingInstructions,
   parsePaymentChoice,
   paymentGatePrompt,
   type PaymentStatus,
@@ -285,13 +286,14 @@ async function runPaymentGate(
   recheck: () => Promise<PaymentStatus | null>,
   links: PaymentLinkCache,
   diagnostics: Diagnostics,
-  resumed: boolean
+  resumed: boolean,
+  canSubscribe: boolean
 ): Promise<boolean> {
   const color = terminalSupportsColor();
   for (;;) {
-    const link = await links.get();
+    const link = canSubscribe ? await links.get() : null;
     console.warn(`\n${formatPaymentNotice(status, { hyperlinks: true, color, link })}`);
-    const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link)));
+    const choice = parsePaymentChoice(await askLine(paymentGatePrompt(link, canSubscribe)), canSubscribe);
     diagnostics.record("payment_gate", { choice });
     if (choice === "quit") {
       await diagnostics.flush();
@@ -668,6 +670,7 @@ async function main() {
   });
   polychatApiKey = checked.apiKey;
   const paymentStatus = paymentOnly(checked.check);
+  const support = customPricingInstructions(paymentStatus?.message ?? null);
   const linkKey = polychatApiKey;
   // The short checkout link (payment-link.ts): the gate's, and later the
   // in-session paused notices' when the key runs out mid-session.
@@ -683,10 +686,11 @@ async function main() {
     if (interactiveUi) {
       memtreeOff = !(await runPaymentGate(paymentStatus, async () => paymentOnly(
         await fetchKeyStatus(memtreeBaseUrl, key)), paymentLinks, diagnostics,
-        resumesSession(claudeArgs)
+        resumesSession(claudeArgs), support === null
       ));
     } else {
-      console.error(resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
+      console.error(support ? `ccc: ${support} ${MEMTREE_OFF_LINE}` :
+        resumesSession(claudeArgs) ? `ccc: ${RESUMED_PAUSED_LINE}` : PRINT_PAUSED_LINE);
       memtreeOff = true;
     }
   }
@@ -714,7 +718,7 @@ async function main() {
   if (memtreeOff && !resumesSession(claudeArgs)) {
     await runWithoutMemtree({
       claude, claudeArgs, interactive: interactiveUi, diagnostics, autoUpdate,
-      banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate)),
+      banner: memtreeOffNoticeText(terminalSupportsColor(), pausedUpdateLine(autoUpdate), support),
     });
   }
 

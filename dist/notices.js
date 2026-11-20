@@ -58,7 +58,7 @@ export const MODEL_HIDDEN_NOTICE = "<model does not see this message>";
 export const DEGRADED_NOTICE = "⚠ MemTree degraded — this turn ran uncompressed";
 /** Repeated refusals of one lane while MemTree is slow (RefusalStreaks): Claude Code retries. */
 export const SLOW_RETRY_NOTICE = "MemTree is slow to answer; retrying";
-export const PAYMENT_REQUIRED_NOTICE = "⚠ MemTree is off — payment required (compression + indexing disabled). Visit polychat.co to enable.";
+export const PAYMENT_REQUIRED_NOTICE = "⚠ MemTree is off — payment required (compression + indexing disabled). Run ccc to get your payment link.";
 export const SLOW_FIRST_TOKEN_NOTICE = "✨ Something special is happening — please wait…";
 /** Leads with the product name users installed (Claude Code Infinite), then the feature. */
 export const STARTUP_NOTICE = "∞ Claude Code Infinite · MemTree memory on";
@@ -85,9 +85,9 @@ export function startupNoticeText(color, update = null, installedVersion = null)
  * SessionStart banner for a paused session that runs as plain Claude Code
  * (paused-session.ts): MemTree is off for it, and how to turn it back on.
  */
-export function memtreeOffNoticeText(color, updateLine = null) {
+export function memtreeOffNoticeText(color, updateLine = null, support = null) {
     // No link: the banner re-shows on /clear and resume for hours, past a link's hour.
-    const how = "Restart ccc to subscribe and turn it back on.";
+    const how = support ?? "Restart ccc to subscribe and turn it back on.";
     const banner = color
         ? "\n\n\x1b[2m·─╼\x1b[22m \x1b[33mMemTree is off for this session\x1b[39m " +
             `\x1b[2m╾─·\x1b[22m\n${how}`

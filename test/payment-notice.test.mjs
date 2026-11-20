@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { pausedModelContext } from "../dist/model-context.js";
 import { NoticeDeliveryQueue } from "../dist/hooks.js";
 import {
   PAYMENT_CONTINUES_LINE,
@@ -8,6 +9,8 @@ import {
   PAYMENT_PAUSED_HEADLINE,
   PaymentNoticeThrottle,
   paymentNoticeText,
+  pausedCompactionText,
+  pausedRefusalMessage,
   subscribeUrlFromDetail,
 } from "../dist/payment-notice.js";
 
@@ -68,4 +71,16 @@ test("warning styling leaves link lines bare in both colour modes", () => {
     assert.equal(out.includes("\x1b["), color);
     assert.equal(queue.warningText(text).includes("\x1b["), color);
   }
+});
+
+test("mid-session highest-tier guidance gives the support contact wherever payment is explained", () => {
+  const message = "Your usage has exceeded our highest tier limits. " +
+    "Please contact support@memtree.dev to discuss custom pricing options.";
+  const detail = `Payment required for a@b.c for use of the MemTree API\n\n${message}\n\nMemTree compresses.`;
+  for (const text of [paymentNoticeText(detail), pausedRefusalMessage(detail),
+    pausedCompactionText(detail, (url) => url), pausedModelContext(detail, null)]) {
+    assert.ok(text.includes(message), text);
+    assert.doesNotMatch(text, /subscribe|upgrade|https?:/i);
+  }
+  assert.doesNotMatch(pausedModelContext(detail, null), /a@b\.c/);
 });

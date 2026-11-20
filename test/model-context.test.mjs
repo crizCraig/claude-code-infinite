@@ -50,7 +50,7 @@ test("paused context: MemTree not Claude, why, the fix, and /compact as fallback
   assert.ok(!text.includes("user@example.com"), "no email: the notice stays in the transcript");
   assert.ok(!text.includes(ACCOUNT_LINE), "the server's text is not quoted");
   const longFirst = pausedModelContext(`Pay at ${SUBSCRIBE_URL}\n\nMore.`, null);
-  assert.ok(!longFirst.includes("/payment?"), "a long link on the first line is not quoted either");
+  assert.doesNotMatch(longFirst, /user_id=|user_email=|price_id=|user%40example.com/);
   assert.match(text, /not Claude, the user's Claude plan or Anthropic credits/);
   assert.ok(!text.includes(SUBSCRIBE_URL), "the long link carries the email");
   assert.match(text, /Fix: subscribe at https:\/\/polychat\.co\/pricing, /);
@@ -64,6 +64,13 @@ test("paused context: MemTree not Claude, why, the fix, and /compact as fallback
   assert.match(pausedModelContext(PAYMENT_DETAIL, "plan_limit"),
     /paused: the MemTree plan's usage limit is reached\./);
   assert.match(pausedModelContext(PAYMENT_DETAIL, null), /paused: MemTree usage limit reached\./);
+});
+
+test("billing contact follows the server's mailbox independently of browser links", () => {
+  const detail = `${ACCOUNT_LINE}\n\nPlease email support@memtree.dev if you have questions!`;
+  assert.match(pausedModelContext(detail, null), /credit questions email support@memtree\.dev/);
+  const accountOnly = "Payment required for support@memtree.dev for use of the MemTree API";
+  assert.match(pausedModelContext(accountOnly, null), /credit questions email support@polychat\.co/);
 });
 
 test("paused context quotes none of the server's text (controls, email or links)", () => {

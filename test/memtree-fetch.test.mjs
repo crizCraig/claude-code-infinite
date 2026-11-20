@@ -139,5 +139,27 @@ test("a host that is not Polychat's gets no key", async () => {
   });
   assert.equal(code, 2);
   assert.equal(fetched, false);
-  assert.match(err, /not a Polychat host/);
+  assert.match(err, /not a MemTree host/);
+});
+
+
+test("MemTree production hosts accept the production key and reject look-alikes", () => {
+  for (const host of ["app.memtree.dev", "api.memtree.dev"]) {
+    assert.equal(modeForUrl(new URL(`https://${host}/m/tree`)), "production");
+    assert.equal(modeForUrl(new URL(`http://${host}/m/tree`)), null);
+    assert.equal(modeForUrl(new URL(`https://${host}.evil.example/m/tree`)), null);
+  }
+  assert.equal(modeForUrl(new URL("https://account.memtree.dev/m/tree")), null);
+});
+
+test("fetch rejects nonstandard production ports before making a request", async () => {
+  for (const host of ["api.memtree.dev", "app.memtree.dev", "api.polychat.co", "app.polychat.co"]) {
+    assert.equal(modeForUrl(new URL(`https://${host}:443/m/tree`)), "production");
+    const code = await runMemtreeFetchCommand([`https://${host}:8443/m/tree`], {
+      keys: { production: "test-key" },
+      fetch: () => assert.fail("unexpected network request"),
+      stderr: () => {},
+    });
+    assert.equal(code, 2, host);
+  }
 });

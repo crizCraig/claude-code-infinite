@@ -34,7 +34,7 @@ by you and by Claude, within a session and across all of them.
   ccc
   ```
 
-This will guide you through setting up your PolyChat key which you can also get [here](https://polychat.co/auth?memtree=true).
+This will guide you through setting up your MemTree key which you can also get [here](https://polychat.co/auth?memtree=true&utm_source=ccc).
 
 Needs [Claude Code in your terminal](https://code.claude.com/docs/en/quickstart), signed in with
 Claude Pro or Max.
@@ -377,7 +377,7 @@ Claude Code ──▶ localhost proxy (ccc)
 ```
 
 - Only message content is sent to MemTree for indexing/compression — never credentials.
-- Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. PolyChat never sees that credential or Anthropic traffic.
+- Anthropic requests go directly from the local proxy to api.anthropic.com using the authentication Claude Code supplied. MemTree never sees that credential or Anthropic traffic.
 - If MemTree is unreachable, slow, or your MemTree plan needs payment, `ccc` degrades to a transparent passthrough so your session is never interrupted. While MemTree is paused (usage limit reached), a request that still fits the model's context window (by Anthropic's token count, or ccc's conservative estimate when counting is unavailable) goes out unchanged, as plain Claude Code would send it, and once the session reaches the compression budget the paused notice suggests Claude Code's own `/compact` while it still fits. A request that no longer fits is refused at once with "MemTree is paused (usage limit reached), so this long conversation can't be compressed…", your subscribe link, and `/clear` to start fresh (`/memtree-compact` needs MemTree, so it is not offered then). After you subscribe, the next request compresses again with no restart.
 
 ### Remote Control (`/remote-control`): HTTPS-proxy mode (opt-in, macOS and Linux)
@@ -746,7 +746,7 @@ Each ends with the session's MemTree link. `requests.jsonl` records the cause as
 
 ### MemTree degraded / passthrough mode
 
-If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the turn needed compression (over its budget, an explicit `/memtree-compact`, or a size ccc could not confirm fits) but the compression API could not be reached or answered too slowly, so the turn went out whole. Your session keeps working uncompressed. A turn still under the budget needs no compression, so a MemTree failure on it shows no notice (it is recorded in `~/.claude-code-infinite/logs/requests.jsonl`). Check your key at [polychat.co](https://polychat.co/auth?memtree=true), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
+If you see an inline "⚠ MemTree degraded — this turn ran uncompressed" notice, the turn needed compression (over its budget, an explicit `/memtree-compact`, or a size ccc could not confirm fits) but the compression API could not be reached or answered too slowly, so the turn went out whole. Your session keeps working uncompressed. A turn still under the budget needs no compression, so a MemTree failure on it shows no notice (it is recorded in `~/.claude-code-infinite/logs/requests.jsonl`). Check your key at [MemTree](https://polychat.co/auth?memtree=true&utm_source=ccc), or delete it from `~/.claude-code-infinite/config.json` and re-run `ccc` to re-enter it.
 
 ## Upgrading
 
@@ -834,3 +834,10 @@ reconnects it.
 - Claude Code's own `DISABLE_AUTOUPDATER=1`.
 
 The update-check opt-outs above turn off both the check and automatic updates.
+
+### Browser link cutover
+
+Browser links use the existing PolyChat pages by default. After the MemTree host is ready,
+start ccc with `CCC_MEMTREE_BROWSER_LINKS=1` to open key, usage and pricing pages on
+`app.memtree.dev`. Unset it or set `CCC_LEGACY_BROWSER_LINKS=1` and restart ccc to
+restore the previous links. The API default is `api.polychat.co`.

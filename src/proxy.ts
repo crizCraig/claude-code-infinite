@@ -149,8 +149,7 @@ import { hyperlink } from "./payment-gate.js";
 import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js";
 import { KEY_INVALID_KIND, type ModelNotice, ModelContextNotices, PAUSED_KIND,
   keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
-import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText,
-  subscribeUrlFromDetail } from "./payment-notice.js";
+import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText } from "./payment-notice.js";
 import type { MemtreeLinkPlacement } from "./cli-args.js";
 import { MEMTREE_LINKS_MAX_SESSIONS, type MemtreeLinkStore } from "./memtree-links.js";
 import type { PersistedEntry, StablePrefixStore } from "./prefix-store.js";
@@ -3884,7 +3883,7 @@ function sessionCommandReply(
   const unpaid = state.unpaidDetail();
   // Paused, compaction needs the MemTree it cannot reach: say how to resume instead.
   const paused = unpaid === null ? undefined
-    : pausedCompactionText(viewUrl(subscribeUrlFromDetail(unpaid)));
+    : pausedCompactionText(unpaid, viewUrl);
   if (sessionCommandArgs(prompt, MEMTREE_HELP_COMMAND) !== undefined) {
     return [
       "• /memtree-view · open this session's MemTree page and show its link",

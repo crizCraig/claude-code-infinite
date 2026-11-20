@@ -13,7 +13,7 @@
  * every turn.
  */
 import { sanitizeNoticeDetail } from "./notices.js";
-import { extractPaymentUrl, FALLBACK_SUBSCRIBE_URL, withCheckoutSource, } from "./payment-gate.js";
+import { customPricingInstructions, extractPaymentUrl, FALLBACK_SUBSCRIBE_URL, withCheckoutSource, } from "./payment-gate.js";
 /**
  * Re-show interval. Long enough that a busy session sees it a couple of times
  * an hour at most; short enough that someone who keeps working uncompressed
@@ -39,20 +39,23 @@ export const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
  * resume, and the one way on that needs no MemTree. One line, bare URL.
  */
 export function pausedRefusalMessage(detail) {
+    const action = customPricingInstructions(detail) ?? `Subscribe to resume: ${subscribeUrlFromDetail(detail)}`;
     return `${MEMTREE_PAUSED}, so this long conversation can't be compressed to fit the ` +
-        `model's context window. Subscribe to resume: ${subscribeUrlFromDetail(detail)} · ` +
+        `model's context window. ${action} · ` +
         "or start fresh with /clear (MemTree keeps what it indexed before the pause).";
 }
 /** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
-export function pausedCompactionText(url) {
-    return `${MEMTREE_PAUSED}, so compaction is unavailable. Subscribe to resume: ${url}`;
+export function pausedCompactionText(detail, styleUrl) {
+    const action = customPricingInstructions(detail) ?? `Subscribe to resume: ${styleUrl(subscribeUrlFromDetail(detail))}`;
+    return `${MEMTREE_PAUSED}, so compaction is unavailable. ${action}`;
 }
 /**
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.
  */
 export function paymentNoticeText(detail, memtreeUrl, options = {}) {
-    const lines = [PAYMENT_PAUSED_HEADLINE, `  ${subscribeUrlFromDetail(detail)}`];
+    const support = customPricingInstructions(detail);
+    const lines = support ? [`⚠ ${MEMTREE_PAUSED}. ${support}`] : [PAYMENT_PAUSED_HEADLINE, `  ${subscribeUrlFromDetail(detail)}`];
     const account = sanitizeNoticeDetail(detail.split(/[\r\n]/, 1)[0] ?? "");
     lines.push(options.overBudget ? PAYMENT_OVER_BUDGET_LINE : PAYMENT_CONTINUES_LINE);
     if (account)
@@ -64,7 +67,7 @@ export function paymentNoticeText(detail, memtreeUrl, options = {}) {
 /**
  * The checkout link in a 402 detail (the server's payment prompt carries a
  * `/payment?user_id=…&user_email=…` link), tagged `source=ccc` like the
- * startup gate's; the pricing page when the detail has none.
+ * startup gate's; the fallback subscribe link when the detail has none.
  */
 export function subscribeUrlFromDetail(detail) {
     const url = extractPaymentUrl(detail);

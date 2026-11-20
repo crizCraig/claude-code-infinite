@@ -37,7 +37,7 @@ export declare const MEMTREE_PAUSED = "MemTree is paused (usage limit reached)";
  */
 export declare function pausedRefusalMessage(detail: string): string;
 /** The `/memtree` help line and `/memtree-compact` reply while paused; `url` is styled by the caller. */
-export declare function pausedCompactionText(url: string): string;
+export declare function pausedCompactionText(detail: string, styleUrl: (url: string) => string): string;
 /**
  * The notice lines. URLs sit alone on indented lines (bare, so the terminal's
  * linkifier gets a clean link); the hook renderer styles only the text lines.
@@ -48,7 +48,7 @@ export declare function paymentNoticeText(detail: string, memtreeUrl?: string, o
 /**
  * The checkout link in a 402 detail (the server's payment prompt carries a
  * `/payment?user_id=…&user_email=…` link), tagged `source=ccc` like the
- * startup gate's; the pricing page when the detail has none.
+ * startup gate's; the fallback subscribe link when the detail has none.
  */
 export declare function subscribeUrlFromDetail(detail: string): string;
 /** When the payment notice may show again (one per ccc process). */
