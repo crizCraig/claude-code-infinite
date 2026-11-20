@@ -21,13 +21,29 @@ export const REASON_FREE_CREDIT_USED = "free_credit_used";
 export const REASON_PLAN_LIMIT = "plan_limit";
 // The link must be our short path on one of our hosts: a hostile or broken body
 // can't put an arbitrary URL (or terminal controls) on screen or into `open`.
-const PAYMENT_ORIGIN = /(?:https:\/\/(?:(?:[a-z0-9-]+\.)*polychat\.co|app\.memtree\.dev|polychat-[a-z0-9-]+(?:\.[a-z0-9-]+)?\.run\.app)|http:\/\/(?:local\.polychat\.co|localhost|127\.0\.0\.1)(?::\d+)?)/;
-const SHORT_LINK_RE = new RegExp(`^${PAYMENT_ORIGIN.source}/p/[A-Za-z0-9]{12,64}$`);
-const LEGACY_CHECKOUT_RE = new RegExp(`^${PAYMENT_ORIGIN.source}/payment(?:[?]|$)`);
+const PAYMENT_ORIGINS = new Set([
+    "https://app.memtree.dev",
+    "https://polychat.co",
+    "https://app.polychat.co",
+    "https://api.polychat.co",
+    "https://polychat-421312241218.us-west2.run.app",
+    "https://polychat-e2vnijozua-wl.a.run.app",
+    "https://polychat-staging-421312241218.us-west2.run.app",
+    "http://local.polychat.co:8000",
+]);
+function checkoutPath(url) {
+    const pathStart = url.indexOf("/", url.indexOf("://") + 3);
+    return pathStart >= 0 && PAYMENT_ORIGINS.has(url.slice(0, pathStart))
+        ? url.slice(pathStart)
+        : "";
+}
+const SHORT_PATH_RE = /^\/p\/[A-Za-z0-9]{12,64}$/;
+const LEGACY_CHECKOUT_PATH_RE = /^\/payment(?:[?]|$)/;
 // No quotes, `$`, backticks or bare `%` (cmd.exe expands %VAR% when Windows opens it).
 const SAFE_URL_RE = /^https?:\/\/(?:[^\s"'`$<>%\\\u0000-\u001f\u007f-\u009f]|%[0-9A-Fa-f]{2})+$/;
 export function isCheckoutUrl(url) {
-    return SHORT_LINK_RE.test(url) || (LEGACY_CHECKOUT_RE.test(url) && SAFE_URL_RE.test(url));
+    const path = checkoutPath(url);
+    return SHORT_PATH_RE.test(path) || (LEGACY_CHECKOUT_PATH_RE.test(path) && SAFE_URL_RE.test(url));
 }
 const PLAN_RE = /^[A-Za-z0-9 %.+-]{1,40}$/;
 /** Ask the server for a short link; null on any failure. Never throws. */
@@ -52,7 +68,7 @@ export function parsePaymentLink(body) {
         return null;
     const record = body;
     const { url, plan, monthly_price_usd: price } = record;
-    if (typeof url !== "string" || !SHORT_LINK_RE.test(url))
+    if (typeof url !== "string" || !SHORT_PATH_RE.test(checkoutPath(url)))
         return null;
     if (typeof plan !== "string" || !PLAN_RE.test(plan))
         return null;

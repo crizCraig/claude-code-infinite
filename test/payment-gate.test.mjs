@@ -179,7 +179,8 @@ test("highest-tier status shows the server's support instructions and offers onl
 test("explicit and in-message checkout URLs share the short link's allowed hosts", () => {
   for (const base of ["https://unrelated.example", "https://app.memtree.dev.example",
     "https://app.polychat.co@elsewhere.example", "http://app.polychat.co",
-    "https://app.memtree.dev:8443"]) {
+    "https://app.memtree.dev:8443", "https://polychat-staging-1.us-west2.run.app",
+    "https://unlisted.polychat.co"]) {
     for (const path of ["/payment?user_id=u", "/p/Ab3xY9qwertyuiop"]) {
       const url = base + path;
       for (const fields of [{ payment_url: url }, { payment_message: `Pay at ${url}` }]) {
@@ -188,7 +189,7 @@ test("explicit and in-message checkout URLs share the short link's allowed hosts
     }
   }
   for (const base of ["https://app.memtree.dev", "https://api.polychat.co",
-    "https://polychat-staging-1.us-west2.run.app", "http://local.polychat.co:8000"]) {
+    "https://polychat-staging-421312241218.us-west2.run.app", "http://local.polychat.co:8000"]) {
     const url = `${base}/payment?user_id=u&user_email=a%40b.c`;
     assert.equal(parsePaymentStatus({ paid: false, payment_url: url }).url, url + "&source=ccc");
   }
