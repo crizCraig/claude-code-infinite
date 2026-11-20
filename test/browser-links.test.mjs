@@ -26,11 +26,10 @@ test("release browser links and explicit process rollback preserve local routing
     "https://app.polychat.co/usage", "http://localhost:8080/usage", "https://polychat.co/pricing"]);
 });
 
-test("headless setup links to the interactive ccc key page", () => {
+test("headless guide uses the default client key and usage links", () => {
   const guide = readFileSync(new URL("../docs/headless.md", import.meta.url), "utf8");
-  for (const enabled of [false, true]) {
-    const [key, usage] = links(enabled);
-    assert.ok(guide.includes(key));
-    assert.ok(guide.includes(usage));
-  }
+  const [key, usage] = links(false);
+  assert.ok(guide.includes(key));
+  assert.ok(guide.includes(usage));
+  assert.doesNotMatch(guide, /https:\/\/app\.memtree\.dev\/(?:key|usage)\b/);
 });
