@@ -145,9 +145,9 @@ test("extractRecommendedPlan scrubs control characters and tolerates no emoji", 
   assert.equal(extractRecommendedPlan(null), null);
 });
 
-test("an unpaid response without a payment URL offers checkout", () => {
-  const text = formatPaymentNotice(parsePaymentStatus({ paid: false }));
-  assert.ok(text.endsWith("\nSubscribe: https://app.memtree.dev/payment?source=ccc"), text);
+test("an unpaid response without a payment URL asks the user to confirm their account and plan", () => {
+  const text = formatPaymentNotice(parsePaymentStatus({ paid: false, payment_message: "We recommend Basic plan for $10/month." }));
+  assert.ok(text.endsWith("\nConfirm your account and choose a plan: https://polychat.co/pricing"), text);
 });
 
 test("Enter subscribes, c continues, q quits, anything else continues", () => {

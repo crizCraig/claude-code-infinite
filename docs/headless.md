@@ -14,9 +14,10 @@ This guide is for ccc 1.0.23 and later. See [Older versions](#older-versions) fo
 ## 1. One-time setup (per person or machine)
 
 1. You need a **Claude Pro or Max subscription** (Claude Code logs in with it).
-2. Then, sign up for MemTree at https://app.memtree.dev/key?utm_source=ccc (a separate account from your Claude one)
-   and create a MemTree key. Use your own account and don't
-   share keys: every session on a key lands in that key's memory and search results.
+2. Create a MemTree key at https://polychat.co/auth?memtree=true&utm_source=ccc using your own account.
+   After cutover, clients started with `CCC_MEMTREE_BROWSER_LINKS=1` use https://app.memtree.dev/key?utm_source=ccc.
+   The dashboard links below use the new host. Older clients and clients with the default settings use https://app.polychat.co/usage.
+   Keep your key private. Every session using it shares the same memory and search results.
 3. Install ccc and run it once in a terminal, so it saves your MemTree key and Claude Code
    logs you in:
    ```bash
@@ -177,7 +178,7 @@ agents exchanging config values this way (2026-11-06), both finished in their se
 ## 4. Seeing an agent's memory
 
 Every session's memory is a tree you can open in the browser, search, share, or paste into any
-agent as context. Your sessions and trees are listed at https://app.polychat.co/usage.
+agent as context. Your sessions and trees are listed at https://app.memtree.dev/usage.
 
 A headless run doesn't print its tree link (stdout stays Claude Code's). After a run, call
 `ccc link` to show the agent's memory:
@@ -201,7 +202,7 @@ it finds only your own sessions, and gives up after 5 seconds. Exit status:
 The link can trail by one call: a `-p` run's newest tree is built as it exits, so right after a
 call `ccc link` may still show the tree from the call before (it catches up within a minute or
 two). Other ways to see a tree:
-- open the session from https://app.polychat.co/usage, or
+- open the session from https://app.memtree.dev/usage, or
 - ask the agent: `mcp__memtree__list` returns each session with its latest tree link.
 
 ## 5. Useful settings
@@ -216,7 +217,7 @@ two). Other ways to see a tree:
 ## 6. Costs and terms
 
 - Claude Code usage comes out of your Claude subscription, as with plain Claude Code.
-- MemTree is billed per use on your polychat account (see https://app.polychat.co/usage).
+- MemTree is billed per use on your MemTree account (see https://app.memtree.dev/usage).
 - Running your **own** agents on your own subscription is normal Claude Code headless use. If
   your platform runs agents **for other people**, check Anthropic's terms for your case: they may
   require an API key instead.
@@ -240,6 +241,6 @@ ccc 1.0.22 and earlier differ in four ways:
 - **No memory tools in `-p` runs.** The README's manual recipe (`--mcp-config` naming
   `ccc memtree-mcp`) works only without an environment word: `ccc staging memtree-mcp` starts a
   Claude session instead of the server and times out. Upgrade to get the tools by default.
-- **No `ccc link`.** Use https://app.polychat.co/usage or `mcp__memtree__list` for tree links.
+- **No `ccc link`.** Use the legacy dashboard at https://app.polychat.co/usage or `mcp__memtree__list` for tree links.
 - **No saved key.** A headless run prints the key prompt to stdout and exits with status 0;
   check for a `session_id` in the output.

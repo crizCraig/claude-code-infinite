@@ -53,7 +53,7 @@ test("paused context: MemTree not Claude, why, the fix, and /compact as fallback
   assert.doesNotMatch(longFirst, /user_id=|user_email=|price_id=|user%40example.com/);
   assert.match(text, /not Claude, the user's Claude plan or Anthropic credits/);
   assert.ok(!text.includes(SUBSCRIBE_URL), "the long link carries the email");
-  assert.match(text, /Fix: subscribe at https:\/\/app\.memtree\.dev\/payment\?source=ccc, /);
+  assert.match(text, /Fix: subscribe at https:\/\/polychat\.co\/pricing, /);
   const short = "https://app.polychat.co/p/Ab3xY9Ab3xY9Ab";
   assert.match(pausedModelContext(`${ACCOUNT_LINE}\n\nStarter: ${short}.`, null),
     new RegExp(`Fix: subscribe at ${short}, `));

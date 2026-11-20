@@ -3,9 +3,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 
-function links(legacy) {
+function links(enabled, legacy = false) {
   const env = { ...process.env };
+  delete env.CCC_MEMTREE_BROWSER_LINKS;
   delete env.CCC_LEGACY_BROWSER_LINKS;
+  if (enabled) env.CCC_MEMTREE_BROWSER_LINKS = "1";
   if (legacy) env.CCC_LEGACY_BROWSER_LINKS = "1";
   return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
     import { KEY_PAGE_URL } from './dist/key-page.js';
@@ -17,13 +19,18 @@ function links(legacy) {
 }
 
 test("release browser links and explicit process rollback preserve local routing", () => {
-  assert.deepEqual(links(false), ["https://app.memtree.dev/key?utm_source=ccc",
-    "https://app.memtree.dev/usage", "http://localhost:8080/usage", "https://app.memtree.dev/payment?source=ccc"]);
-  assert.deepEqual(links(true), ["https://polychat.co/auth?memtree=true&utm_source=ccc",
+  assert.deepEqual(links(true), ["https://app.memtree.dev/key?utm_source=ccc",
+    "https://app.memtree.dev/usage", "http://localhost:8080/usage", "https://app.memtree.dev/pricing?source=ccc"]);
+  assert.deepEqual(links(true, true), links(false));
+  assert.deepEqual(links(false), ["https://polychat.co/auth?memtree=true&utm_source=ccc",
     "https://app.polychat.co/usage", "http://localhost:8080/usage", "https://polychat.co/pricing"]);
 });
 
 test("headless setup links to the interactive ccc key page", () => {
   const guide = readFileSync(new URL("../docs/headless.md", import.meta.url), "utf8");
-  assert.ok(guide.includes(links(false)[0]));
+  for (const enabled of [false, true]) {
+    const [key, usage] = links(enabled);
+    assert.ok(guide.includes(key));
+    assert.ok(guide.includes(usage));
+  }
 });

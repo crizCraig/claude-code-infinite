@@ -51,7 +51,7 @@ function recorder() {
 // ---------------------------------------------------------------- startup check
 
 test("the key page is polychat's MemTree sign-in (local: the dev front end)", () => {
-  assert.equal(KEY_PAGE_URL, "https://app.memtree.dev/key?utm_source=ccc");
+  assert.equal(KEY_PAGE_URL, "https://polychat.co/auth?memtree=true&utm_source=ccc");
   assert.equal(keyPageUrl("https://api.polychat.co"), KEY_PAGE_URL);
   assert.equal(keyPageUrl("https://polychat-staging-1.us-west2.run.app"), KEY_PAGE_URL);
   assert.equal(keyPageUrl("http://localhost:8080"), LOCAL_KEY_PAGE_URL);
@@ -127,7 +127,7 @@ test("startup check: paid and unpaid bodies parse as before", async () => {
 test("the startup line says what is wrong, where to get a key and how to enter it", () => {
   assert.equal(keyInvalidLine(KEY_PAGE_URL, "ccc"),
     "⚠ Your MemTree key isn't valid (revoked or mistyped). Get a new one at " +
-    "https://app.memtree.dev/key?utm_source=ccc and run `ccc` in a terminal to paste it.");
+    "https://polychat.co/auth?memtree=true&utm_source=ccc and run `ccc` in a terminal to paste it.");
   assert.match(keyInvalidLine(LOCAL_KEY_PAGE_URL, "ccc local"), /run `ccc local` in a terminal/);
 });
 
@@ -165,7 +165,7 @@ test("gate: q quits without saving anything", async () => {
   assert.deepEqual(await runKeyGate(deps), { action: "quit" });
   assert.equal(log.warned.length, 1);
   assert.match(log.warned[0], /isn't valid \(revoked or mistyped\)/);
-  assert.match(log.warned[0], /app\.memtree\.dev\/key\?utm_source=ccc/);
+  assert.ok(log.warned[0].includes(KEY_PAGE_URL));
   assert.deepEqual(log.saved, []);
 });
 
@@ -294,7 +294,7 @@ test("the in-session notice: key invalid, the key page bare on its own line, ses
   assert.equal(keyInvalidNoticeText(KEY_PAGE_URL),
     "⚠ MemTree is off: your MemTree key isn't valid (revoked or mistyped). " +
     "Get a new one, then run `ccc` in a terminal to paste it:\n" +
-    "  https://app.memtree.dev/key?utm_source=ccc\n" +
+    "  https://polychat.co/auth?memtree=true&utm_source=ccc\n" +
     "Your session continues uncompressed.");
 });
 
@@ -303,7 +303,7 @@ test("the refusal names the invalid key and the key page, on one line", () => {
   assert.equal(text,
     "Your MemTree key isn't valid (revoked or mistyped), so this long conversation can't be " +
     "compressed to fit the model's context window. Get a new key at " +
-    "https://app.memtree.dev/key?utm_source=ccc, then run `ccc` in a terminal to paste " +
+    "https://polychat.co/auth?memtree=true&utm_source=ccc, then run `ccc` in a terminal to paste " +
     "it · " +
     "or start fresh with /clear.");
   assert.ok(!text.includes("\n"));

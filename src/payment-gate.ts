@@ -162,6 +162,7 @@ export function pausedHeadline(reason: string | null): string {
 /** "Starter is $5/month", else the old server's "Starter plan, $5/month", else "Subscribe". */
 function offerLabel(status: PaymentStatus, link: PaymentLink | null): string {
   if (link) return `${link.plan} is ${formatUsd(link.monthlyPriceUsd)}/month`;
+  if (!status.url) return "Confirm your account and choose a plan";
   return extractRecommendedPlan(status.message) ?? "Subscribe";
 }
 

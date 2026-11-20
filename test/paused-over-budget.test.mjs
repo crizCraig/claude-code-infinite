@@ -122,7 +122,7 @@ test("the paused refusal names the pause, the subscribe link and /clear, not mem
   assert.ok(!text.includes("memtree-compact"));
   assert.ok(!text.includes("\n"), "one line");
   // No checkout link in the detail: the fallback subscribe link.
-  assert.match(pausedRefusalMessage("Payment required"), /resume: https:\/\/app\.memtree\.dev\/payment\?source=ccc /);
+  assert.match(pausedRefusalMessage("Payment required"), /resume: https:\/\/polychat\.co\/pricing /);
 });
 
 for (const [lane, turn] of [["human", humanTurn], ["tool", toolTurn]]) {

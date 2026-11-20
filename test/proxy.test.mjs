@@ -4943,7 +4943,7 @@ test("402 payment becomes shown only when hook claims it, then later turns stay 
     assert.ok(text.includes(PAYMENT_CONTINUES_LINE));
     assert.ok(text.includes(DETAIL_FIRST_LINE));
     // No checkout link in this detail: the fallback subscribe link, bare on its own line.
-    assert.match(text, /\n  https:\/\/app\.memtree\.dev\/payment\?source=ccc(\n|$)/);
+    assert.match(text, /\n  https:\/\/polychat\.co\/pricing(\n|$)/);
     assert.ok(!text.includes(DEGRADED_NOTICE));
     assert.ok(!text.includes("Visit polychat.co to add payment."), "only detail first line");
 

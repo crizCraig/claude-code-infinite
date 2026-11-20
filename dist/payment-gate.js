@@ -132,6 +132,8 @@ export function pausedHeadline(reason) {
 function offerLabel(status, link) {
     if (link)
         return `${link.plan} is ${formatUsd(link.monthlyPriceUsd)}/month`;
+    if (!status.url)
+        return "Confirm your account and choose a plan";
     return extractRecommendedPlan(status.message) ?? "Subscribe";
 }
 /** OSC 8 terminal hyperlink: `text` shown, `url` opened on click. */
