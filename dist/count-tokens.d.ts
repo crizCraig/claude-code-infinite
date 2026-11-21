@@ -51,6 +51,8 @@ export interface SizeSample {
     model?: string;
     messageCount?: number;
     prefixDigest?: string;
+    /** Prefix digest with Claude Code's volatile billing text removed. */
+    billingDigest?: string;
 }
 /** Where a count call goes: the proxy's upstream. */
 export interface CountTokensUpstream {
@@ -117,9 +119,11 @@ export interface CountTokensSession {
     /**
      * Count `body` again, once per request, after its count ran out of time or lost its
      * connection (RETRYABLE_COUNT_OUTCOMES), with a fresh allowance for its size;
-     * undefined when it did not, or the retry was spent.
+     * an early retry with maxWaitMs shares the original allowance. Returns
+     * undefined when the failure is ineligible or that retry was spent. Each
+     * request gets one brief retry and one independent delivery retry.
      */
-    retry?(body: Buffer): Promise<CountTokensResult> | undefined;
+    retry?(body: Buffer, maxWaitMs?: number): Promise<CountTokensResult> | undefined;
 }
 /**
  * Outcomes a retry may follow: the count ran out of time or lost its connection, not
@@ -133,7 +137,9 @@ export declare const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome>;
  * (countDeadlineMs), spent only while a count is in flight, so time between
  * counts (a compression before the replacement is counted) is not charged.
  */
-export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
+export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns, rejectedSizes?: Set<string>): CountTokensSession & {
+    rejectMessageSize(body: Buffer): void;
+};
 /** All failures resolve without tokens, including synchronous request errors. */
 export declare function countUpstreamTokens(args: CountTokensSessionOptions & {
     body: Buffer;
@@ -142,4 +148,6 @@ export declare function countUpstreamTokens(args: CountTokensSessionOptions & {
 export declare function countTokensBody(body: Buffer): Buffer | null;
 /** The Messages request's path with `/count_tokens` appended, query kept. */
 export declare function countTokensPath(requestUrl: string | undefined): string;
+/** Recognize provider size errors from their code or message, including plain-text gateways. */
+export declare function isSizeRejection(status: number | undefined, body: string): boolean;
 //# sourceMappingURL=count-tokens.d.ts.map

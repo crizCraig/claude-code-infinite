@@ -562,6 +562,7 @@ interface ProxyState {
      */
     serverReportsBudget: boolean;
     countTokensCooldowns: CountTokensCooldowns;
+    rejectedMessageSizes: Set<string>;
     /**
      * Per session and model (sessionSizeKey): Anthropic's reported size of the
      * last main-thread request forwarded whole (no prefix), with its body bytes,

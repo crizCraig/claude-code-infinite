@@ -396,3 +396,57 @@ test("preparing each count body is charged to the shared allowance", async () =>
     assert.ok(last.timeoutMs <= 2_000 - spent + 5, `${last.timeoutMs} left after ${spent}ms`);
   } finally { srv.close(); }
 });
+
+test("a brief count retry and delivery retry each have one request-wide allowance", async () => {
+  const srv = await countServer(req => req.socket.destroy());
+  try {
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      timeoutMs: 5000 });
+    assert.equal((await session.count(messagesBody)).outcome, "network-error");
+    const brief = await session.retry(messagesBody, 1000);
+    assert.equal(brief.outcome, "network-error");
+    assert.ok(brief.timeoutMs <= 1000);
+    assert.equal(session.retry(messagesBody, 1000), undefined);
+    const delivery = await session.retry(messagesBody);
+    assert.equal(delivery?.outcome, "network-error");
+    assert.ok(delivery.timeoutMs > 1000);
+    const changed = Buffer.from('{"model":"other","messages":[]}');
+    assert.equal((await session.count(changed)).outcome, "network-error");
+    assert.equal(session.retry(changed, 1000), undefined);
+    assert.equal(session.retry(changed), undefined);
+    assert.equal(srv.seen.length, 4);
+  } finally { srv.close(); }
+});
+
+test("a slow error body retains the rejection already received", async () => {
+  const srv = await countServer((_req, res) => {
+    res.writeHead(400);
+    res.write('{"error":{"message":"prompt is too long"');
+  });
+  try {
+    const result = await countUpstreamTokens({ upstream: srv.upstream, headers: {},
+      body: messagesBody, timeoutMs: 200 });
+    assert.equal(result.outcome, "too-large");
+    assert.equal(result.status, 400);
+  } finally { srv.close(); }
+});
+
+test("a count size rejection disqualifies the same bytes on a later attempt in the same context", async () => {
+  const srv = await countServer((_req, res) => {
+    res.statusCode = srv.seen.length === 1 ? 413 : 200;
+    res.end('{"input_tokens":42}');
+  });
+  try {
+    const rejected = new Set();
+    const session = headers => counting.createCountTokensSession({ upstream: srv.upstream, headers },
+      undefined, rejected);
+    assert.equal((await session({}).count(messagesBody)).outcome, "too-large");
+    const repeated = session({});
+    assert.equal((await repeated.count(Buffer.from(messagesBody))).outcome, "too-large");
+    assert.equal(repeated.retry(messagesBody), undefined);
+    assert.equal(srv.seen.length, 1);
+    assert.equal((await session({ "anthropic-beta": "context-1m" }).count(messagesBody)).tokens, 42);
+    assert.equal((await session({ "x-api-key": "other" }).count(messagesBody)).tokens, 42);
+    assert.equal((await repeated.count(Buffer.from('{"model":"other","messages":[]}'))).tokens, 42);
+  } finally { srv.close(); }
+});

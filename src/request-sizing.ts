@@ -16,6 +16,11 @@ import { acceptsContextOverflow } from "./turns.js";
  * window, so the model can still answer a request that barely fits. */
 export const OUTPUT_FLOOR_TOKENS = 16_000;
 
+// The archived ~2 MB count typically returned in half a second. A retry
+// after a fast disconnect can use at most one second of the original deadline.
+const BRIEF_COUNT_RETRY_MS = 1_000;
+const BRIEF_COUNT_RETRY_MAX_BYTES = 4 * 1024 * 1024;
+
 export type CandidateKind = "original" | "ride" | "replacement";
 export interface SizingLimits {
   budget: number;
@@ -34,7 +39,7 @@ export interface CandidateMeasurement {
   /** Advisory estimate retained for compression and stale-estimate diagnostics. */
   estimatedTokens: number;
   count?: CountTokensResult;
-  /** Over Anthropic's request size limit: it cannot be sent natively at any size. */
+  /** The local byte limit or an upstream size rejection rules out these bytes. */
   tooLarge?: true;
 }
 export interface RequestCandidate {
@@ -52,6 +57,8 @@ export interface RequestCandidate {
 }
 
 export class RequestSizing {
+  /** Input allowances derived from a verified prefix after a count actually failed. */
+  private readonly failedCountSizes = new Map<RequestCandidate, number>();
   private readonly candidates = new Map<string, RequestCandidate>();
   private readonly excludedFallbacks = new Set<RequestCandidate>();
 
@@ -92,17 +99,18 @@ export class RequestSizing {
     return [...this.candidates.values()].filter(item => !this.excludedFallbacks.has(item));
   }
 
-  /** Planning and metadata consult the same exact count, else the snapshotted estimate. */
+  /** An exact count wins, then the guarded count-failure estimate, then the normal projection. */
   plan(candidate: RequestCandidate): PlannedSize {
     const exact = this.counts.peek(candidate.body)?.tokens;
-    return exact !== undefined ? { tokens: exact, source: "reported" } : candidate.estimate;
+    const tokens = exact ?? this.failedCountSizes.get(candidate);
+    return tokens !== undefined ? { tokens, source: "reported" } : candidate.estimate;
   }
 
   /** Whether this body could still get an exact count: counting is on and
    * no attempt for these bytes has completed (a failed one is reused). */
   canCount(candidate: RequestCandidate): boolean {
-    return this.enabled && this.counts.peek(candidate.body) === undefined &&
-      !this.exceedsRequestLimit(candidate);
+    return this.enabled && !exceedsRequestLimit(candidate.body.length) &&
+      this.counts.peek(candidate.body) === undefined;
   }
 
   /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
@@ -111,22 +119,42 @@ export class RequestSizing {
       RETRYABLE_COUNT_OUTCOMES.has(this.counts.peek(candidate.body)?.outcome ?? "success");
   }
 
-  /** Whether Anthropic would refuse this body's size (413) before reading it. */
+  /** Whether the byte limit or an upstream size rejection rules out this body. */
   exceedsRequestLimit(candidate: RequestCandidate): boolean {
-    return exceedsRequestLimit(candidate.body.length);
+    return exceedsRequestLimit(candidate.body.length) || this.counts.peek(candidate.body)?.outcome === "too-large";
   }
 
   /** Whether the conservative bound alone admits this body under `limits`. */
   boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean {
-    return !this.exceedsRequestLimit(candidate) &&
-      fitsNative(candidate.conservativeTokens, estimateLimits(limits));
+    const tokens = this.failedCountSizes.get(candidate) ?? candidate.conservativeTokens;
+    return !this.exceedsRequestLimit(candidate) && fitsNative(tokens, estimateLimits(limits));
   }
 
   /** Count a body at planning when only a count could admit it: no exact
    * count and its conservative bound does not fit. Delivery reuses the result. */
   async countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void> {
     if (this.isExact(candidate) || !this.canCount(candidate) || this.boundFits(candidate, limits)) return;
-    await this.counts.count(candidate.body);
+    await this.count(candidate);
+  }
+
+  failedCountTokens(candidate: RequestCandidate): number | undefined {
+    return this.failedCountSizes.get(candidate);
+  }
+
+  private async count(candidate: RequestCandidate): Promise<CountTokensResult> {
+    let count = await this.counts.count(candidate.body);
+    if (!permitsCountFallback(count)) {
+      return count;
+    }
+    const guarded = failedCountEstimate(candidate, this.model);
+    // Only spend the brief retry when planning could use the fallback.
+    if (guarded === undefined) return count;
+    if (count.outcome === "network-error" && count.ms < BRIEF_COUNT_RETRY_MS &&
+        candidate.body.length <= BRIEF_COUNT_RETRY_MAX_BYTES) {
+      count = await this.counts.retry?.(candidate.body, BRIEF_COUNT_RETRY_MS) ?? count;
+    }
+    if (permitsCountFallback(count)) this.failedCountSizes.set(candidate, guarded);
+    return count;
   }
 
   /** Whether this body's size is an exact Count Tokens result. */
@@ -140,7 +168,9 @@ export class RequestSizing {
   }
 
   clientInputTokens(candidate: RequestCandidate): number | undefined {
-    const size = this.plan(candidate);
+    const exact = this.exactTokensFor(candidate.body);
+    if (exact !== undefined) return exact;
+    const size = candidate.estimate;
     return size.source === "reported" ? size.tokens : undefined;
   }
 
@@ -149,20 +179,25 @@ export class RequestSizing {
     phase: "plan" | "delivery" = "delivery"): Promise<CandidateMeasurement> {
     let count = this.counts.peek(candidate.body);
     const estimate = candidate.estimate.tokens;
-    if (this.exceedsRequestLimit(candidate)) return {
-      tokens: Math.max(estimate, candidate.conservativeTokens), source: "bytes",
-      estimatedTokens: estimate, ...(count ? { count } : {}), tooLarge: true,
-    };
     // Delivery counts whenever an estimate is all that says the body fits: the
     // learned estimate, or the conservative bound, does not fit on its own.
     const needed = shouldCountTokens(candidate.sample, candidate.body.length, estimate, limits.budget,
       bodyImages(candidate.body, this.model)) ||
       (phase === "delivery" && !(fitsNative(estimate, estimateLimits(limits)) &&
         fitsNative(candidate.conservativeTokens, estimateLimits(limits))));
-    if (!count && this.enabled && needed) count = await this.counts.count(candidate.body);
+    const overByteLimit = exceedsRequestLimit(candidate.body.length);
+    if (!overByteLimit && !count && this.enabled && needed) count = await this.count(candidate);
+    if (overByteLimit || count?.outcome === "too-large") return {
+      tokens: Math.max(estimate, candidate.conservativeTokens), source: "bytes",
+      estimatedTokens: estimate, ...(count ? { count } : {}), tooLarge: true,
+    };
     if (count?.tokens !== undefined) return {
       tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,
     };
+    const guarded = this.failedCountSizes.get(candidate);
+    if (guarded !== undefined) {
+      return { tokens: guarded, source: "reported", estimatedTokens: estimate, count };
+    }
     // A learned ratio can request compression, but cannot veto a body whose
     // conservative per-model bound fits when counting is unavailable or
     // disabled; nor can it admit one whose bound does not (2026-10-15: bytes/4
@@ -312,8 +347,15 @@ export const ANCHOR_MARGIN = 0.1;
  * written literally) could shrink to hide new content (Codex r2 P1).
  */
 export function anchoredBound(
-  sample: SizeSample | undefined, shape: BodyShape, model: string | undefined,
+  sample: SizeSample | undefined, shape: BodyShape, model: string | undefined, margin = ANCHOR_MARGIN,
 ): number | undefined {
+  const parts = anchoredParts(sample, shape, model);
+  if (!parts) return undefined;
+  return Math.ceil(parts.measuredText * (1 + margin)) +
+    conservativeTokensFromBytes(parts.newBytes, model) + parts.imageTokens;
+}
+
+function anchoredParts(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined) {
   if (!plausibleSample(sample) || sample.imageBytes === undefined ||
       sample.imageTokens === undefined || sample.messageCount === undefined) return undefined;
   // Documents, URL images and other blocks it cannot bound never anchor (Codex r4-r6 P1s);
@@ -323,10 +365,38 @@ export function anchoredBound(
   const sampled = textBytes(shape, 0, sample.messageCount);
   const appended = textBytes(shape, sample.messageCount);
   if (sampled < ANCHOR_MIN_COVERAGE * (sampled + appended)) return undefined;
-  const sampleTextTokens = Math.max(0, sample.tokens - sample.imageTokens);
-  return Math.ceil(sampleTextTokens * (1 + ANCHOR_MARGIN)) +
-    conservativeTokensFromBytes(appended + shape.unhashedBytes, model) +
-    shapeImageTokens(shape, model);
+  return { measuredText: Math.max(0, sample.tokens - sample.imageTokens),
+    newBytes: appended + shape.unhashedBytes, imageTokens: shapeImageTokens(shape, model) };
+}
+
+/** The worst observed projection shortfall in the small-growth archive was 2.84%. */
+const COUNT_FAILURE_MARGIN = 0.05;
+
+function permitsCountFallback(count: CountTokensResult): boolean {
+  return count.outcome === "server-error" || RETRYABLE_COUNT_OUTCOMES.has(count.outcome);
+}
+
+function failedCountEstimate(candidate: RequestCandidate, model: string | undefined): number | undefined {
+  const { sample, body } = candidate;
+  if (!sample?.prefixDigest || sample.messageCount === undefined || !model || sample.model !== model) {
+    return undefined;
+  }
+  const shape = bodyShape(body);
+  if (!shape || shape.serverEdits) return undefined;
+  let billingBytes = 0;
+  if (prefixDigest(shape, sample.messageCount) !== sample.prefixDigest) {
+    if (!sample.billingDigest || !shape.billingFrame ||
+        prefixDigest(shape, sample.messageCount, shape.billingFrame) !== sample.billingDigest) {
+      return undefined;
+    }
+    billingBytes = shape.billingBytes ?? 0;
+  }
+  const parts = anchoredParts(sample, shape, model);
+  if (!parts) return undefined;
+  // New content may be denser than the archived tool steps. Charge each new
+  // text byte at one token, including changed billing and unhashed fields.
+  const anchored = parts.measuredText + parts.newBytes + billingBytes + parts.imageTokens;
+  return Math.ceil(Math.max(anchored, candidate.estimate.tokens) * (1 + COUNT_FAILURE_MARGIN));
 }
 
 /** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */

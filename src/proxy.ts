@@ -58,6 +58,7 @@ import {
 import {
   createCountTokensSession,
   CountTokensCooldowns,
+  isSizeRejection,
   plausibleSample,
   type SizeSample,
 } from "./count-tokens.js";
@@ -157,6 +158,7 @@ import type { NewestTreeLookup } from "./memtree-newest.js";
 import {
   describeClaudeCodeRequest,
   inspectMonitorTranscript,
+  isClaudeCodeBillingHeader as isRouteBillingHeader,
   knownSideRequestKind,
   transcriptWarning,
   isClaudeCodeSideRequest,
@@ -740,6 +742,7 @@ interface ProxyState {
    */
   serverReportsBudget: boolean;
   countTokensCooldowns: CountTokensCooldowns;
+  rejectedMessageSizes: Set<string>;
   /**
    * Per session and model (sessionSizeKey): Anthropic's reported size of the
    * last main-thread request forwarded whole (no prefix), with its body bytes,
@@ -1251,6 +1254,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
+    rejectedMessageSizes: new Set(),
     passthroughSizes: new Map(),
     laneSizes: new Map(),
   };
@@ -2425,7 +2429,7 @@ async function handleMessages(
       (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
         bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
     },
-  }, state.countTokensCooldowns);
+  }, state.countTokensCooldowns, state.rejectedMessageSizes);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true,
     typeof body.model === "string" ? body.model : undefined);
   if (carriesServerTools(body)) serverToolRecords.add(rec);
@@ -2510,6 +2514,7 @@ async function handleMessages(
     failedRebuild: false,
     allowed: new WeakSet<Buffer>(),
     sizing: requestSizing,
+    rejectMessageSize: countSession.rejectMessageSize,
     select: (buffer) => selectForwardCandidate({
       opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
       preferredBody: buffer, limits: sizingLimits(),
@@ -4720,8 +4725,7 @@ function calibratedSizeExceedsLimits(
   body: Record<string, any>,
   modelContextLimit: number
 ): boolean {
-  return (record.sizeSource === "reported" &&
-    (record.estimatedTokens ?? 0) >= record.budgetTokens) ||
+  return (record.sizeSource === "reported" && reachedBudget(record)) ||
     calibratedSizeExceedsWindow(record, body, modelContextLimit);
 }
 
@@ -4839,8 +4843,10 @@ function sizeSampleOf(sent: Buffer, tokens: number, model: unknown): SizeSample 
 function sampleLineage(sent: Buffer, model: string | undefined): Partial<SizeSample> {
   const shape = bodyShape(sent);
   const digest = shape && prefixDigest(shape, shape.messages.length);
+  const billingDigest = shape?.billingFrame && prefixDigest(shape, shape.messages.length, shape.billingFrame);
   return shape && digest && model
-    ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
+    ? { model, messageCount: shape.messages.length, prefixDigest: digest,
+        ...(billingDigest ? { billingDigest } : {}) } : {};
 }
 
 /**
@@ -5076,7 +5082,7 @@ async function planEdgeCompaction(args: {
     ) {
       return forced("target-change", fallback);
     }
-    if (size.tokens >= budget.tokens || overWindow) {
+    if (reachedBudget(compaction) || overWindow) {
       const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
         waitMs: opts.memtree.longCompressBudgetMs });
       if (adopted) return { kind: "ride", ...adopted };
@@ -5113,10 +5119,12 @@ async function planEdgeCompaction(args: {
   }
   if (state.serverReportsBudget) {
     // The server measures the request and compresses only past the budget.
-    const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
-    compaction.thresholdTokens = threshold;
-    if (clearlyUnderBudget(opts, state, budget, size, compaction)) return { kind: "pass" };
-    return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
+    compaction.thresholdTokens = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
+  }
+  if (clearlyUnderBudget(opts, state, budget, size, compaction)) return { kind: "pass" };
+  if (compaction.thresholdTokens !== undefined) {
+    return { kind: "compress", target: targetTokens, threshold: compaction.thresholdTokens,
+      targetTokens, explicitTarget };
   }
   // Without calibrated usage or threshold support, let the server decide
   // against its own model budget rather than forcing from transport bytes.
@@ -5250,7 +5258,7 @@ async function planToolCompaction(args: {
     if (overWindow) return { kind: "pass", original: true };
     return ride ? { kind: "ride", ride } : { kind: "pass" };
   }
-  const underBudget = size.tokens < budget.tokens && !overWindow;
+  const underBudget = !reachedBudget(compaction) && !overWindow;
   const cold = underBudget && coldCacheCompress(state, rec, size, targetTokens);
   if (underBudget && !cold) {
     return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -5312,7 +5320,8 @@ function clearlyUnderBudget(
 ): boolean {
   // A known payment or key failure keeps the blocking path: it gives the notice.
   if (opts.memtree.paymentRequiredDetail !== null || state.keyInvalid()) return false;
-  return budget.source !== "window-ratio" && size.source === "reported" &&
+  if (compaction.countFailure?.decision === "within-limits") return true;
+  return state.serverReportsBudget && budget.source !== "window-ratio" && size.source === "reported" &&
     compaction.uncountedOverWindow !== true &&
     size.tokens <= Math.floor(budget.tokens * CLEARLY_UNDER_BUDGET_RATIO);
 }
@@ -5921,8 +5930,15 @@ function noteUncountedBound(
     exactSizedRecords.add(record);
     return;
   }
-  if (sizing.exceedsRequestLimit(candidate) ||
-      candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
+  const guarded = sizing.failedCountTokens(candidate);
+  const limits = { budget: record.budgetTokens, context: modelContextLimit,
+    output: bodyOutputReservation(body, false) };
+  const fits = sizing.boundFits(candidate, limits);
+  if (guarded !== undefined) {
+    record.countFailure = { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
+      decision: !fits ? "over-window" : guarded >= record.budgetTokens ? "over-budget" : "within-limits" };
+  }
+  if (!fits) {
     record.uncountedOverWindow = true;
   }
 }
@@ -5956,9 +5972,10 @@ function bodyOutputReservation(body: Record<string, any>, exact = true): number 
 
 /** A planned size as a measurement, exact only when Count Tokens measured it. */
 function plannedMeasurement(sizing: RequestSizing, candidate: RequestCandidate):
-  { tokens: number; source: "exact" | "reported" | "bytes" } {
+  Pick<CandidateMeasurement, "tokens" | "source" | "tooLarge"> {
   const planned = sizing.plan(candidate);
-  return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source };
+  return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source,
+    ...(sizing.exceedsRequestLimit(candidate) ? { tooLarge: true } : {}) };
 }
 
 function regrantSmallerWindowRecovery(
@@ -6029,7 +6046,6 @@ function normalizeReminderContent(content: unknown): unknown {
   });
 }
 
-const ROUTE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const ROUTE_BILLING_HEADER_PLACEHOLDER =
   "x-anthropic-billing-header: <dynamic>";
 
@@ -6087,20 +6103,6 @@ function routeBillingHeaders(value: unknown): string[] {
     }
   }
   return headers;
-}
-
-function isRouteBillingHeader(text: string): boolean {
-  if (
-    /[\r\n]/.test(text) ||
-    !text.startsWith(ROUTE_BILLING_HEADER_PREFIX)
-  ) {
-    return false;
-  }
-  const fields = text.slice(ROUTE_BILLING_HEADER_PREFIX.length).trim();
-  return (
-    /^cc_version=[^;]+;/.test(fields) &&
-    /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields)
-  );
 }
 
 function replaceSingleRouteBillingHeader(
@@ -7714,7 +7716,8 @@ function lateRecoveryPlan(
     const target = Math.floor(oversized.target - excess - oversized.target * SMALLER_TARGET_MARGIN);
     return target >= SERVER_MIN_TARGET_TOKENS ? { tokens: oversized.tokens, target } : undefined;
   }
-  if (rec.compress || measured.source !== "exact" || !(measured.tokens > limits.budget)) {
+  const countedOverBudget = measured.source === "exact" && measured.tokens > limits.budget;
+  if (rec.compress || (!countedOverBudget && !measured.tooLarge)) {
     return undefined;
   }
   // Another request of this lane is compressing (rec.routeRecovery "in-flight"):
@@ -8146,7 +8149,8 @@ function nearWindowWarned(state: ProxyState, sessionId: string | undefined): boo
 
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction: CompactionRecord | undefined): boolean {
-  return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
+  if (compaction?.estimatedTokens === undefined) return false;
+  return compaction.estimatedTokens >= compaction.budgetTokens;
 }
 
 /**
@@ -8161,7 +8165,7 @@ function compressionNeeded(compaction: CompactionRecord | undefined): boolean {
   // A cold-cache compression is optional: under the budget, whole is the normal outcome.
   if (compaction.reason !== undefined && compaction.reason !== "cold-cache") return true;
   if (compaction.estimatedTokens === undefined) return true;
-  return compaction.estimatedTokens >= compaction.budgetTokens;
+  return reachedBudget(compaction);
 }
 
 /**
@@ -8184,6 +8188,7 @@ const candidateSizeOwners = new WeakMap<RequestCandidate, SizeHolder | SizeSlot>
 const requestSendPolicies = new WeakMap<http.IncomingMessage, {
   original: Buffer; failedRebuild: boolean; allowed: WeakSet<Buffer>;
   sizing: RequestSizing;
+  rejectMessageSize: (body: Buffer) => void;
   fitsNative: (body: Buffer) => Promise<boolean>;
   /** Recompress the ORIGINAL conversation after a ride counted `tokens` late. */
   recoverLate: (ride: Buffer, tokens: number, target?: number) => Promise<Buffer | undefined>;
@@ -8360,6 +8365,7 @@ function forwardAccepted(
       (upstreamRes) => {
         upstream.unreachable = undefined;
         activeUpstreamRes = upstreamRes;
+        if (upstreamRes.statusCode === 413) policy?.rejectMessageSize(bodyBuffer);
         const contentType = String(upstreamRes.headers["content-type"] ?? "");
         const isSse = contentType.includes("text/event-stream");
         const contentEncoding = String(
@@ -8593,6 +8599,10 @@ function forwardAccepted(
               mergeUsageFromJsonBody(observed, rec);
               if ((upstreamRes.statusCode ?? 0) >= 400) {
                 rec.upstreamError = upstreamErrorCode(observed);
+                if (upstreamRes.statusCode !== 413 &&
+                    isSizeRejection(upstreamRes.statusCode, observed.toString("utf8"))) {
+                  policy?.rejectMessageSize(bodyBuffer);
+                }
               }
             }
           }

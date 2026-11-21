@@ -15,6 +15,7 @@
  * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
+import { isClaudeCodeBillingHeader } from "./cc-request.js";
 import { imageDimensions } from "./image-tokens.js";
 
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
@@ -23,6 +24,10 @@ export const SHAPE_MIN_BYTES = 256 * 1024;
 export interface BodyShape {
   /** Hash of the body without `messages` (system, tools, thinking, ...). */
   frame: string;
+  /** Same frame with the per-request billing text removed. Only the failed-count
+   * fallback uses it and charges the current billing text in full. */
+  billingFrame?: string;
+  billingBytes?: number;
   /** One hash per message, in order. */
   messages: string[];
   /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
@@ -77,9 +82,9 @@ export function rememberShape(body: Buffer, shape: BodyShape | undefined): void 
 }
 
 /** Digest of the frame and the first `count` messages; undefined past the end. */
-export function prefixDigest(shape: BodyShape, count: number): string | undefined {
+export function prefixDigest(shape: BodyShape, count: number, frame = shape.frame): string | undefined {
   if (!Number.isInteger(count) || count < 0 || count > shape.messages.length) return undefined;
-  const hash = createHash("sha256").update(shape.frame);
+  const hash = createHash("sha256").update(frame);
   for (let i = 0; i < count; i++) hash.update(shape.messages[i]);
   return hash.digest("hex");
 }
@@ -105,11 +110,25 @@ function computeShape(body: Buffer): BodyShape | null {
   if (!Array.isArray(messages)) return null;
   const unhashed = UNHASHED_FIELDS.filter((key) => frame[key] !== undefined)
     .map((key) => JSON.stringify(frame[key])).join("");
-  const shape: BodyShape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
+  const canonical = canonicalFrame(frame);
+  const shape: BodyShape = { frame: hash(JSON.stringify(canonical)),
     messages: [], sizes: [], imageChars: [],
     serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
     imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
     unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
+  if (Array.isArray(canonical.system)) {
+    let billingBytes = 0;
+    const system = canonical.system.map(block => {
+      if (block?.type !== "text" || typeof block.text !== "string" ||
+          !isClaudeCodeBillingHeader(block.text)) return block;
+      billingBytes += Buffer.byteLength(JSON.stringify(block.text));
+      return { ...block, text: "" };
+    });
+    if (billingBytes) {
+      shape.billingFrame = hash(JSON.stringify({ ...canonical, system }));
+      shape.billingBytes = billingBytes;
+    }
+  }
   for (const message of messages) {
     const text = JSON.stringify(canonicalMessage(message)) ?? "";
     shape.messages.push(hash(text));
