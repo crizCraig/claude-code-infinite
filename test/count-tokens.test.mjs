@@ -321,7 +321,7 @@ test("initial disconnect keeps delivery retry eligible after transient 503 plann
   } finally { srv.close(); }
 });
 
-test("initial disconnect followed by non-transient HTTP 400 stops and disables delivery retry", async () => {
+test("initial disconnect followed by HTTP 400 stops planning retries but keeps delivery's retry, as on main", async () => {
   let calls = 0;
   const srv = await countServer((req, res) => {
     calls++;
@@ -334,9 +334,13 @@ test("initial disconnect followed by non-transient HTTP 400 stops and disables d
     const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
       requestUrl: "/v1/messages", onAttempt: (result) => attempts.push(result.outcome) });
     const planned = await session.count(messagesBody);
-    assert.equal(planned.outcome, "http-error");
+    // Only a successful planning retry replaces the first outcome, so the
+    // network error stands and delivery keeps its own retry (main's behaviour).
+    assert.equal(planned.outcome, "network-error");
     assert.deepEqual(attempts, ["network-error", "http-error"]);
-    assert.equal(session.retry(messagesBody), undefined);
+    const retried = session.retry(messagesBody);
+    assert.notEqual(retried, undefined);
+    assert.equal((await retried).outcome, "http-error");
   } finally { srv.close(); }
 });
 

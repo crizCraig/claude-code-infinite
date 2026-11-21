@@ -198,10 +198,10 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
                 break;
             result = await countOnce(body, left);
         }
-        // Preserve the initial outcome's delivery-retry eligibility when brief
-        // planning retries also fail transiently (or run out of retry window).
-        return TRANSIENT_COUNT_OUTCOMES.has(result.outcome) || result.outcome === "deadline"
-            ? initial : result;
+        // Only a successful retry replaces the first outcome. Any other retry result
+        // (transient, deadline, 4xx, 429, malformed) keeps the initial outcome, so
+        // delivery's own retry and fallback behave exactly as on main.
+        return result.outcome === "success" ? result : initial;
     }
     return {
         peek: (body) => completed.get(bodyHash(body)),
