@@ -130,6 +130,7 @@ export interface MessageDisplayHookInput {
     agent_id?: string;
 }
 export interface StopHookInput {
+    cwd?: string;
     hook_event_name: "Stop";
     session_id: string;
     stop_hook_active?: boolean;
@@ -246,7 +247,7 @@ export declare class NoticeDeliveryQueue {
      * Claim eligible notice parts atomically for one hook invocation. Subagent
      * hooks share the plugin but must never consume the main turn's notice.
      */
-    claim(input: NoticeHookInput): NoticeHookOutput | null;
+    claim(input: NoticeHookInput, statusLineShows?: (url: string) => boolean): NoticeHookOutput | null;
     private claimForDisplay;
     private promptMatches;
     private styleSuccess;

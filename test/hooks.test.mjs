@@ -256,6 +256,28 @@ test("trailer placement 'stop' shows it once per turn on Stop only", () => {
   assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn\n• MemTree\n  https://x/m/1 ↗" });
 });
 
+test("a status line link suppresses only the routine Stop trailer in every placement", () => {
+  const link = { key: "k", link: "https://x/m/1" };
+  for (const placement of ["message", "stop", "turn"]) {
+    const queue = new NoticeDeliveryQueue(undefined, undefined, false);
+    queue.setTrailer(() => link, placement);
+    if (placement === "turn") queue.setLink(() => link);
+    assert.equal(queue.claim(stop(), () => true), null, placement);
+    queue.queueSuffix("⚠ warn");
+    assert.deepEqual(queue.claim(stop(), () => true), { systemMessage: "⚠ warn" });
+    queue.queuePrefix("optimized");
+    assert.deepEqual(queue.claim(stop(), () => true), {
+      systemMessage: placement === "turn" ? "optimized\n  https://x/m/1 ↗" : "optimized",
+    });
+    const output = queue.claim(display({ final: true }));
+    if (placement === "message") {
+      assert.match(output.hookSpecificOutput.displayContent, /answer\n\n• MemTree .*\n  https:\/\/x\/m\/1 ↗$/);
+    } else {
+      assert.equal(output, null);
+    }
+  }
+});
+
 test("subagent hooks cannot claim and expired notices are dropped", () => {
   let now = 100;
   const queue = new NoticeDeliveryQueue(10, () => now, true);

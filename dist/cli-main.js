@@ -24,7 +24,7 @@ import { StablePrefixStore } from "./prefix-store.js";
 import { ToolOutputStore } from "./tool-output-store.js";
 import { NewestTreeLookup } from "./memtree-newest.js";
 import { StatusLinkFiles } from "./status-link.js";
-import { statusLineWantsLink, statuslinePaths } from "./statusline.js";
+import { statuslinePaths, statusLineWantsLink } from "./statusline.js";
 import { autoInstallStatusline } from "./statusline-auto.js";
 import { ClaudeTranscriptUsage } from "./transcript-usage.js";
 import { createSessionNoticePlugin, createSubagentHookPlugin, supportsMessageDisplay, terminalSupportsColor, withSessionNoticePluginArgs, } from "./hooks.js";
@@ -565,10 +565,11 @@ async function main() {
     const signInSessionLine = {};
     // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
     // Claude Code reads its settings; what changed is said at the first SessionStart.
-    const statuslineSessionLine = {
-        text: interactiveUi && !mayBePrintInvocation(claudeArgs)
-            ? autoInstallStatusline(statuslinePaths()) : undefined,
-    };
+    const interactiveTerminal = interactiveUi && !mayBePrintInvocation(claudeArgs);
+    const paths = interactiveTerminal && process.env.CCC_STATUSLINE_AUTO !== "0" ? statuslinePaths() : undefined;
+    const statusline = { text: paths ? autoInstallStatusline(paths) : undefined };
+    // Check after auto-install so a newly installed status line gets its link this session.
+    const statusLinkEnabled = paths !== undefined && statusLineWantsLink(paths.settings);
     // A sign-in completed after ccc's warning, between launches or mid-session.
     const signInTracker = new SignInTracker(getConfigDir(), (event) => diagnostics.record("sign_in_completed", { ...event }));
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
@@ -686,15 +687,12 @@ async function main() {
         toolOutputs: new ToolOutputStore(),
         // The link shown to the user follows the session's newest tree on the server.
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
-        // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
-        statusLinks: new StatusLinkFiles(),
-        // Per-request refreshes (a sessions lookup a minute) only for status lines that show it.
-        statusLinkRefresh: process.env.CCC_STATUSLINE_REFRESH === "1" || statusLineWantsLink(),
+        ...(statusLinkEnabled ? { statusLinks: new StatusLinkFiles(), statusLineSince: Date.now() } : {}),
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
         // install) on a later SessionStart of this session, once.
-        sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine, statuslineSessionLine),
+        sessionStartNotice: sessionStartLines(autoUpdate, signInSessionLine, statusline),
         promptSubmitNotice: interactiveUi
             ? () => joinPromptLines(rateLimits.promptLine(), proxyModeChild ? httpsProxy?.promptLine() : undefined)
             : undefined,
@@ -702,7 +700,7 @@ async function main() {
         // front of the user: interactive (also not `-pc`-style print), not SSH
         // or CI (open-url.ts).
         openUrl: urlOpenerFor({
-            interactive: interactiveUi && !mayBePrintInvocation(claudeArgs),
+            interactive: interactiveTerminal,
             env: process.env, platform: process.platform,
             memtreeBaseUrl,
         }),

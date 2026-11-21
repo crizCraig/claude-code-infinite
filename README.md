@@ -280,10 +280,11 @@ tree with its newest messages, so it never goes stale; to share a tree with some
 page's Share control, not this link); otherwise the newest tree's link,
 updated in the background as trees finish. Claude Code's status line can show it as a clickable `🌿 tree` (the plain URL in
 terminals without OSC 8 links; `CCC_STATUSLINE_LINK=url` or `osc8` forces either). The status
-line only reads that file, so it never waits on the server. While the status line uses it,
-`ccc` refreshes the link about once a minute; with a status-line script `ccc` can't see in
-settings.json, set `CCC_STATUSLINE_REFRESH=1` (otherwise it refreshes at prompts and turn
-ends).
+line reads that file, so it never waits on the server. During active sessions, `ccc`
+refreshes the link in the background about once a minute. Stop omits the routine link
+only when `ccc statusline` printed the current tree URL or the stable session URL in
+this interactive session within the last minute. A blank or broken status line keeps
+the Stop fallback. The first tree is always announced.
 
 - **On by default:** the first interactive `ccc` run (after installing or upgrading) runs
   `ccc statusline install` once and says so in the session's first message. It points

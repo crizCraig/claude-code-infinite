@@ -228,11 +228,8 @@ export interface ProxyOptions {
     newestTrees?: NewestTreeLookup;
     /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
     statusLinks?: StatusLinkFiles;
-    /**
-     * The status line shows that link (statusline.ts statusLineWantsLink): refresh the newest
-     * tree on every request, not only at prompts and turn ends.
-     */
-    statusLinkRefresh?: boolean;
+    /** Earliest status-line render from this run, when its status line is enabled. */
+    statusLineSince?: number;
     /**
      * Per-response token usage (thinking share on the MemTree page), read from
      * Claude Code's transcript. Omitted means none is sent (tests); the CLI
@@ -502,7 +499,7 @@ interface ProxyState {
     statusLinks?: StatusLinkFiles;
     /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
     stableSessionLinks: Map<string, string>;
-    statusLinkRefresh: boolean;
+    statusLineSince?: number;
     memtreeLinkPlacement: MemtreeLinkPlacement;
     /**
      * `/memtree-compact` targets by Claude Code session: every compression for
