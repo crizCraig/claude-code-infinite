@@ -130,8 +130,8 @@ export declare const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome>;
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's
- * (countDeadlineMs), spent only while a count is in flight, so time between
- * counts (a compression before the replacement is counted) is not charged.
+ * (countDeadlineMs). Transient retries share a five-second window, including
+ * attempts and backoff. Time spent compressing between counts is not charged.
  */
 export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
 /** All failures resolve without tokens, including synchronous request errors. */

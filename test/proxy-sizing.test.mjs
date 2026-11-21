@@ -12,6 +12,7 @@ async function listen(handler) {
 }
 
 const HANG = Symbol('hang');
+const DISCONNECT = Symbol('disconnect');
 
 async function until(condition, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
@@ -36,7 +37,9 @@ async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () =>
         // `count` may answer HANG: that one call never answers (a timeout).
         const result = count(body, counts.length);
         if (result === HANG) return;
-        res.writeHead(countStatus, { 'content-type': 'application/json' });
+        if (result === DISCONNECT) return req.socket.destroy();
+        const status = typeof countStatus === 'function' ? countStatus(counts.length) : countStatus;
+        res.writeHead(status, { 'content-type': 'application/json' });
         res.end(typeof result === 'string' ? result : JSON.stringify(result));
       } else {
         forwards.push(body);
@@ -163,9 +166,9 @@ for (const mode of ['disabled', '500', '401', '403', 'malformed', 'timeout']) {
       // token-estimate.ts) while the stale 0.9 tokens/byte sample says 270k.
       // (469,550 bytes, the size this test used under bytes/4, no longer does.)
       assert.equal(await h.post(300_000), 200);
-      assert.ok(Date.now() - start < 4_000, 'one total 3s Count deadline');
+      assert.ok(Date.now() - start < 6_000, 'bounded Count retry window');
       assert.equal(h.forwards.length, 2);
-      assert.ok(h.counts.length <= 1, 'failed count not immediately retried');
+      assert.equal(h.counts.length, { disabled: 0, 500: 3, timeout: 2 }[mode] ?? 1);
       assert.ok(h.records.filter(r => r.kind === 'messages').at(-1).overBudgetForward);
     } finally { h.close(); }
   });
@@ -848,6 +851,55 @@ const toolRound = (id, chars) => [
   { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'y'.repeat(chars) }] }];
 const nearWindowTurn = () => [{ role: 'user', content: 'task' }, ...toolRound('t1', 3_520_000)];
 const quarterToken = body => ({ input_tokens: Math.floor(JSON.stringify(body).length / 4) });
+
+// Round 3, request 17: the billing header changed after a ~796k tool turn.
+for (const [scenario, outcomes] of [
+  ['retry fits', ['network-error', 'success']],
+  ['all disconnected', ['network-error', 'network-error', 'network-error']],
+  ['HTTP 400', ['http-error']],
+  ['delivery retry', ['network-error', 'network-error', 'network-error', 'success']],
+  ['delivery retry after disconnect then 503s',
+    ['network-error', 'server-error', 'server-error', 'success']],
+]) {
+  test(`round 3 count failure: ${scenario}`, async () => {
+    const h = await harness({ budget: null, usage: () => 796_129,
+      countStatus: n => outcomes[n - 2] === 'http-error' ? 400
+        : outcomes[n - 2] === 'server-error' ? 503 : 200,
+      count: (_body, n) => {
+        if (n === 1) return { input_tokens: 796_263 };
+        if (outcomes[n - 2] === 'http-error') return { error: 'invalid request' };
+        if (outcomes[n - 2] === 'server-error') return { error: 'service unavailable' };
+        if (outcomes[n - 2] === 'success') return { input_tokens: 798_362 };
+        return DISCONNECT;
+      },
+      compress: () => scenario.startsWith('delivery retry')
+        ? { status: 503, body: { detail: 'MemTree unavailable' } } : compressedReply(4000, 960_000) });
+    const first = [{ role: 'user', content: 'task' }, ...toolRound('a', 2_215_000)];
+    const next = [...first, ...toolRound('b', 6_000)];
+    const system = id => [{ type: 'text', text:
+      `x-anthropic-billing-header: cc_version=2.1.327; cc_entrypoint=sdk-cli; cc_turn_origin=sdk; cch=${id};` }];
+    try {
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: first, system: system('a') }), 200);
+      assert.equal(await h.post(0, { ...OPUS_1M, messages: next, system: system('b') }), 200);
+      const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+      const attempts = rec.countTokens.map(c => c.statusClass);
+      assert.equal(rec.compaction.budgetTokens, 960_000);
+      assert.deepEqual(attempts, outcomes);
+      const blocking = h.compressions.filter(c => !c.prepare && c.compression_target_tokens !== -1);
+      if (outcomes.at(-1) === 'success') {
+        assert.deepEqual(h.forwards.at(-1).messages, next);
+        assert.equal(rec.forwardedBytes, rec.requestBytes);
+        if (scenario === 'retry fits') {
+          assert.equal(rec.compaction.estimatedTokens, 798_362);
+          assert.equal(blocking.length, 0);
+        }
+      } else {
+        assert.equal(blocking.length, 1);
+        assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+      }
+    } finally { h.close(); }
+  });
+}
 
 for (const outcome of ['compressed', 'failed']) {
   test(`960k budget: a tool round jumping from 880k past the 1M window is compressed mid-turn (${outcome})`, async () => {

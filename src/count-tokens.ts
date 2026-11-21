@@ -34,6 +34,8 @@ export const COUNT_TOKENS_TIMEOUT_MS = 3_000;
  * a timed-out attempt would otherwise leave a sliver for a pointless second one.
  */
 const MIN_COUNT_ATTEMPT_MS = 5;
+const COUNT_RETRY_WINDOW_MS = 5_000;
+const COUNT_RETRY_BACKOFF_MS = [100, 200];
 /** Upload rate the allowance still covers, in bytes per ms (1 MB/s). */
 export const COUNT_UPLOAD_BYTES_PER_MS = 1_000;
 /** Most a request waits on counting, however large its bodies. */
@@ -229,11 +231,15 @@ export interface CountTokensSession {
 export const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
   new Set(["timeout", "deadline", "network-error"]);
 
+/** Transient failures retried briefly during planning within COUNT_RETRY_WINDOW_MS. */
+const TRANSIENT_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
+  new Set(["network-error", "timeout", "server-error"]);
+
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's
- * (countDeadlineMs), spent only while a count is in flight, so time between
- * counts (a compression before the replacement is counted) is not charged.
+ * (countDeadlineMs). Transient retries share a five-second window, including
+ * attempts and backoff. Time spent compressing between counts is not charged.
  */
 export function createCountTokensSession(
   options: CountTokensSessionOptions,
@@ -242,9 +248,41 @@ export function createCountTokensSession(
   const pending = new Map<string, Promise<CountTokensResult>>();
   const completed = new Map<string, CountTokensResult>();
   const account = countAccountKey(options);
-  const clock = new CountingClock();
+  const initialCounts = new CountingClock();
+  const allCounts = new CountingClock();
+  // A caller-specified deadline covers retries too. With the default policy,
+  // retry time must not spend the initial allowance of a replacement body.
+  const customDeadline = options.timeoutMs !== undefined || options.deadlineMs !== undefined;
+  const allowanceClock = customDeadline ? allCounts : initialCounts;
   let allowance = 0;
   let retried = false;
+
+  async function countOnce(body: Buffer, timeoutMs: number): Promise<CountTokensResult> {
+    const result = await countUpstreamTokens({ ...options, body, timeoutMs });
+    return recordAttempt(options, cooldowns, account, result);
+  }
+
+  // Keep the size-scaled initial timeout for slow, large uploads. A retry can
+  // use only what remains of the shared five seconds of counting time.
+  async function countWithRetries(body: Buffer, remaining: number) {
+    const window = COUNT_RETRY_WINDOW_MS - allCounts.spent();
+    const deadline = Date.now() + (customDeadline ? Math.min(window, remaining) : window);
+    const initial = await initialCounts.track(() => countOnce(body, remaining));
+    let result = initial;
+    for (const backoff of COUNT_RETRY_BACKOFF_MS) {
+      if (!TRANSIENT_COUNT_OUTCOMES.has(result.outcome)) break;
+      if (deadline - Date.now() < backoff + MIN_COUNT_ATTEMPT_MS || options.signal?.aborted) break;
+      await new Promise(resolve => setTimeout(resolve, backoff));
+      const left = deadline - Date.now();
+      if (left < MIN_COUNT_ATTEMPT_MS || options.signal?.aborted || cooldowns.active(account)) break;
+      result = await countOnce(body, left);
+    }
+    // Only a successful retry replaces the first outcome. Any other retry result
+    // (transient, deadline, 4xx, 429, malformed) keeps the initial outcome, so
+    // delivery's own retry and fallback behave exactly as on main.
+    return result.outcome === "success" ? result : initial;
+  }
+
   return {
     peek: (body) => completed.get(bodyHash(body)),
     retry: (body) => {
@@ -254,8 +292,7 @@ export function createCountTokensSession(
           options.signal?.aborted || cooldowns.active(account)) return undefined;
       retried = true;
       const timeoutMs = requestAllowance(options, body.length);
-      const attempt = clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
-        .then((result) => recordAttempt(options, cooldowns, account, result))
+      const attempt = allowanceClock.track(() => countOnce(body, timeoutMs))
         .then((result) => { completed.set(key, result); return result; });
       pending.set(key, attempt);
       return attempt;
@@ -266,14 +303,13 @@ export function createCountTokensSession(
       if (existing) return existing;
       const tooLarge = exceedsRequestLimit(body.length);
       if (!tooLarge) allowance = Math.max(allowance, requestAllowance(options, body.length));
-      const remaining = allowance - clock.spent();
+      const remaining = allowance - allowanceClock.spent();
       const skipped: CountTokensOutcome | undefined = options.signal?.aborted ? "aborted"
         : tooLarge ? "too-large" : cooldowns.active(account) ? "cooldown"
           : remaining < MIN_COUNT_ATTEMPT_MS ? "deadline" : undefined;
       const attempt = skipped
         ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped, bytes: body.length })
-        : clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs: remaining }))
-          .then((result) => recordAttempt(options, cooldowns, account, result));
+        : allCounts.track(() => countWithRetries(body, remaining));
       if (skipped === "too-large") attempt.then((result) => notifyAttempt(options, result));
       const saved = attempt.then((result) => { completed.set(key, result); return result; });
       pending.set(key, saved);
@@ -375,7 +411,7 @@ function readCount(
   res.on("aborted", () => done({ outcome: "network-error", status }));
   if (status !== 200) {
     const outcome = status === 401 || status === 403 ? "auth"
-      : status === 429 ? "rate-limit" : status !== undefined && status >= 500
+      : status === 429 ? "rate-limit" : status !== undefined && status >= 500 && status < 600
         ? "server-error" : "http-error";
     done({ outcome, status, retryAfter: res.headers["retry-after"] });
     res.destroy();

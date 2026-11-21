@@ -279,7 +279,7 @@ test("abort and diagnostic callback failure cannot reject or duplicate an attemp
   } finally { srv.close(); }
 });
 
-test("failed HTTP count is cached within its request, without a second upload", async () => {
+test("persistent 500 retries twice and caches the final failure", async () => {
   const srv = await countServer((_req, res) => { res.writeHead(500); res.end("{}"); });
   try {
     const attempts = [];
@@ -290,8 +290,57 @@ test("failed HTTP count is cached within its request, without a second upload", 
     assert.equal(first.tokens, undefined);
     assert.equal(await session.count(Buffer.from(messagesBody)), first);
     assert.equal(session.peek(messagesBody), first);
-    assert.equal(srv.seen.length, 1);
-    assert.equal(attempts.length, 1);
+    assert.equal(session.retry(messagesBody), undefined, "500-only stays ineligible for delivery retry");
+    assert.equal(srv.seen.length, 3);
+    assert.equal(attempts.length, 3);
+  } finally { srv.close(); }
+});
+
+test("initial disconnect keeps delivery retry eligible after transient 503 planning retries", async () => {
+  let calls = 0;
+  const srv = await countServer((req, res) => {
+    calls++;
+    if (calls === 1) return req.socket.destroy();
+    if (calls <= 3) { res.writeHead(503); res.end("{}"); return; }
+    res.end('{"input_tokens":42}');
+  });
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", onAttempt: (result) => attempts.push(result.outcome) });
+    const planned = await session.count(messagesBody);
+    assert.equal(planned.tokens, undefined);
+    assert.deepEqual(attempts, ["network-error", "server-error", "server-error"]);
+    const retryPromise = session.retry(messagesBody);
+    assert.ok(retryPromise, "delivery retry remains eligible after disconnect then 503s");
+    const retried = await retryPromise;
+    assert.equal(retried.tokens, 42);
+    assert.equal(session.peek(messagesBody).tokens, 42);
+    assert.equal(session.retry(messagesBody), undefined, "delivery retry is spent once");
+    assert.deepEqual(attempts, ["network-error", "server-error", "server-error", "success"]);
+  } finally { srv.close(); }
+});
+
+test("initial disconnect followed by HTTP 400 stops planning retries but keeps delivery's retry, as on main", async () => {
+  let calls = 0;
+  const srv = await countServer((req, res) => {
+    calls++;
+    if (calls === 1) return req.socket.destroy();
+    res.writeHead(400);
+    res.end("{}");
+  });
+  try {
+    const attempts = [];
+    const session = counting.createCountTokensSession({ upstream: srv.upstream, headers: {},
+      requestUrl: "/v1/messages", onAttempt: (result) => attempts.push(result.outcome) });
+    const planned = await session.count(messagesBody);
+    // Only a successful planning retry replaces the first outcome, so the
+    // network error stands and delivery keeps its own retry (main's behaviour).
+    assert.equal(planned.outcome, "network-error");
+    assert.deepEqual(attempts, ["network-error", "http-error"]);
+    const retried = session.retry(messagesBody);
+    assert.notEqual(retried, undefined);
+    assert.equal((await retried).outcome, "http-error");
   } finally { srv.close(); }
 });
 
