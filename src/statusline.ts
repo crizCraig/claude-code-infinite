@@ -4,7 +4,7 @@
  * - `ccc statusline` is a status-line command: it reads Claude Code's JSON from stdin,
  *   runs the user's own status-line command (if `install` wrapped one) with the same
  *   input, and appends ` | 🌿 tree` (an OSC 8 link to the session's newest MemTree page;
- *   the bare URL where the terminal has no hyperlinks). It only reads the cached link the
+ *   the bare URL where the terminal has no hyperlinks). It reads the cached link the
  *   proxy writes (status-link.ts): never a server call, so the status line stays fast.
  * - `ccc statusline install` points Claude Code's `statusLine` at it, keeping the existing
  *   command, which it wraps rather than replaces; settings.json is backed up first. The
@@ -23,7 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import { getConfigDir } from "./config.js";
 import { terminalSupportsHyperlinks } from "./hooks.js";
-import { readStatusLink } from "./status-link.js";
+import { readStatusLink, recordStatuslineRender } from "./status-link.js";
 
 /** What `install` puts in settings.json. */
 export const STATUSLINE_COMMAND = "ccc statusline";
@@ -62,16 +62,18 @@ export function statuslinePaths(env: NodeJS.ProcessEnv = process.env): Statuslin
 
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
 export async function statuslineMain(
-  args: string[], paths = statuslinePaths(), out = (text: string) => process.stdout.write(text)
+  args: string[], paths = statuslinePaths(), out: (text: string) => unknown = writeStdout
 ): Promise<number> {
   const command = args[0];
   if (command === "install") return report(installStatusline(paths), out);
   if (command === "uninstall") return report(uninstallStatusline(paths), out);
   if (command !== undefined) {
-    out("Usage: ccc statusline [install|uninstall]\n");
+    await out("Usage: ccc statusline [install|uninstall]\n");
     return 2;
   }
-  out(await renderStatusline(await readStdin(), paths));
+  const { text, sessionId, url } = await statuslineOutput(await readStdin(), paths, process.env);
+  await out(text);
+  recordStatuslineRender(sessionId, url, paths.links);
   return 0;
 }
 
@@ -79,19 +81,28 @@ export async function statuslineMain(
 export async function renderStatusline(
   input: string, paths: StatuslinePaths, env: NodeJS.ProcessEnv = process.env
 ): Promise<string> {
-  if (env[WRAPPED_ENV]) return "";
+  return (await statuslineOutput(input, paths, env)).text;
+}
+
+async function statuslineOutput(input: string, paths: StatuslinePaths, env: NodeJS.ProcessEnv):
+  Promise<{ text: string; sessionId?: unknown; url?: string }> {
+  const sessionId = sessionIdOf(input);
+  if (env[WRAPPED_ENV]) return { text: "", sessionId };
   const wrapped = savedStatusLine(savedFile(paths));
   const base = wrapped ? await runWrapped(wrapped.command, input) : "";
-  const segment = linkSegment(sessionIdOf(input), env, paths.links);
-  if (!segment) return base;
-  return base ? `${base}${STATUSLINE_SEPARATOR}${segment}` : segment;
+  const url = readStatusLink(sessionId, paths.links);
+  const segment = formatLink(url, env);
+  return { sessionId, url, text: base && segment ? `${base}${STATUSLINE_SEPARATOR}${segment}` : base || segment };
 }
 
 /** ` 🌿 tree` linked to the session's page, or the URL; "" with no cached link. */
 export function linkSegment(
   sessionId: unknown, env: NodeJS.ProcessEnv = process.env, dir?: string
 ): string {
-  const url = readStatusLink(sessionId, dir);
+  return formatLink(readStatusLink(sessionId, dir), env);
+}
+
+function formatLink(url: string | undefined, env: NodeJS.ProcessEnv): string {
   if (!url) return "";
   const mode = env.CCC_STATUSLINE_LINK;
   const osc8 = mode === "osc8" || (mode !== "url" && terminalSupportsHyperlinks(env, { isTTY: true }));
@@ -381,22 +392,21 @@ function backup(file: string): void {
 }
 
 /**
- * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
- * only then does the proxy keep the link fresh in the background. Read at startup.
+ * Whether auto-install should preserve a command that already includes ccc's link.
  */
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings): boolean {
   const command = ((readJson(settingsFile) as { statusLine?: { command?: unknown } } | undefined)
     ?.statusLine)?.command;
-  return commandWantsLink(command);
-}
-
-export function commandWantsLink(command: unknown): boolean {
   return typeof command === "string" &&
     (CCC_STATUSLINE.test(command) || command.includes(".claude-code-infinite/statusline"));
 }
 
-function report(result: { ok: boolean; message: string }, out: (text: string) => void): number {
-  out(`${result.message}\n`);
+function writeStdout(text: string): Promise<void> {
+  return new Promise((resolve, reject) => process.stdout.write(text, err => err ? reject(err) : resolve()));
+}
+
+async function report(result: { ok: boolean; message: string }, out: (text: string) => unknown): Promise<number> {
+  await out(`${result.message}\n`);
   return result.ok ? 0 : 1;
 }
 

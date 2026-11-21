@@ -47,7 +47,7 @@ import { refusalCause, refusalMessage } from "./refusal-reason.js";
 import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
-import { readStatusLink } from "./status-link.js";
+import { readStatusLink, recentlyRenderedLink } from "./status-link.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
 import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
 import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
@@ -415,10 +415,7 @@ export function startProxy(opts) {
         newestTrees: opts.newestTrees,
         statusLinks: opts.statusLinks,
         stableSessionLinks: new Map(),
-        statusLinkRefresh: typeof opts.statusLinkRefresh === "function"
-            ? opts.statusLinkRefresh : () => opts.statusLinkRefresh === true,
-        statusLineShowsLink: typeof opts.statusLineShowsLink === "function"
-            ? opts.statusLineShowsLink : () => opts.statusLineShowsLink === true,
+        statusLineSince: opts.statusLineSince,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
         defaultCompactOff: opts.defaultCompactTarget === null,
@@ -1229,11 +1226,11 @@ onlyEvent) {
         // The lookup publishes the newest URL to the status line in the background.
         // It is TTL-gated and independent of whether this turn prints a trailer.
         state.newestTrees?.peek(parsed.session_id);
-        if (state.statusLineShowsLink(parsed.cwd) && state.statusLinks) {
-            const dir = state.statusLinks.dir;
+        const { statusLineSince, statusLinks } = state;
+        if (statusLineSince !== undefined && statusLinks) {
             statusLineShows = url => {
-                const cached = readStatusLink(parsed.session_id, dir);
-                return cached !== undefined && (cached === url || cached === state.stableSessionLinks.get(parsed.session_id));
+                const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
+                return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
             };
         }
     }
@@ -1446,7 +1443,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
     }
-    else if (state.statusLinks && state.statusLinkRefresh()) {
+    else if (state.statusLinks) {
         // Keeps the status line's link fresh through long tool runs: answers from the cache,
         // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
         // whose stable link is known needs no lookup (that link never changes), only its file

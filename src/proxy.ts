@@ -51,7 +51,7 @@ import { refusalCause, refusalMessage, type RefusalCause } from "./refusal-reaso
 import { AGENT_RESULT_WAITING_LINE, LaneActivity, heavyRequestNoticeText } from "./lane-activity.js";
 import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./cold-cache.js";
 import { SlowUploads } from "./slow-upload.js";
-import { readStatusLink, type StatusLinkFiles } from "./status-link.js";
+import { readStatusLink, recentlyRenderedLink, type StatusLinkFiles } from "./status-link.js";
 import {
   freshFailure, networkFailureOf, unreachableMessage, type NetworkFailure,
 } from "./network-failure.js";
@@ -402,13 +402,8 @@ export interface ProxyOptions {
   newestTrees?: NewestTreeLookup;
   /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
-  /**
-   * The status line shows that link (statusline.ts statusLineWantsLink): refresh the newest
-   * tree on every request, not only at prompts and turn ends.
-   */
-  statusLinkRefresh?: boolean | (() => boolean);
-  /** This session has an interactive status line that shows its MemTree link. */
-  statusLineShowsLink?: boolean | ((cwd?: string) => boolean);
+  /** Earliest status-line render from this interactive run. Omitted in headless mode. */
+  statusLineSince?: number;
   /**
    * Per-response token usage (thinking share on the MemTree page), read from
    * Claude Code's transcript. Omitted means none is sent (tests); the CLI
@@ -684,8 +679,7 @@ interface ProxyState {
   statusLinks?: StatusLinkFiles;
   /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
   stableSessionLinks: Map<string, string>;
-  statusLinkRefresh: () => boolean;
-  statusLineShowsLink: (cwd?: string) => boolean;
+  statusLineSince?: number;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
    * `/memtree-compact` targets by Claude Code session: every compression for
@@ -1242,10 +1236,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
     stableSessionLinks: new Map(),
-    statusLinkRefresh: typeof opts.statusLinkRefresh === "function"
-      ? opts.statusLinkRefresh : () => opts.statusLinkRefresh === true,
-    statusLineShowsLink: typeof opts.statusLineShowsLink === "function"
-      ? opts.statusLineShowsLink : () => opts.statusLineShowsLink === true,
+    statusLineSince: opts.statusLineSince,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
     defaultCompactOff: opts.defaultCompactTarget === null,
@@ -2164,11 +2155,11 @@ async function handleNoticeHook(
     // The lookup publishes the newest URL to the status line in the background.
     // It is TTL-gated and independent of whether this turn prints a trailer.
     state.newestTrees?.peek(parsed.session_id);
-    if (state.statusLineShowsLink(parsed.cwd) && state.statusLinks) {
-      const dir = state.statusLinks.dir;
+    const { statusLineSince, statusLinks } = state;
+    if (statusLineSince !== undefined && statusLinks) {
       statusLineShows = url => {
-        const cached = readStatusLink(parsed.session_id, dir);
-        return cached !== undefined && (cached === url || cached === state.stableSessionLinks.get(parsed.session_id));
+        const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
+        return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
       };
     }
   }
@@ -2393,7 +2384,7 @@ async function handleMessages(
       const link = recapLink(state, sessionId);
       return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
     });
-  } else if (state.statusLinks && state.statusLinkRefresh()) {
+  } else if (state.statusLinks) {
     // Keeps the status line's link fresh through long tool runs: answers from the cache,
     // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
     // whose stable link is known needs no lookup (that link never changes), only its file

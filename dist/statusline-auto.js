@@ -18,62 +18,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { watchStatuslineSettings } from "./statusline-settings.js";
 import { getConfigDir } from "./config.js";
-import { STATUSLINE_COMMAND, commandWantsLink, installStatusline, statusLineWantsLink } from "./statusline.js";
+import { STATUSLINE_COMMAND, installStatusline, statusLineWantsLink } from "./statusline.js";
 export const AUTO_MARKER = "statusline-auto.json";
 const UNDO = "Undo: ccc statusline uninstall.";
-/** Install once, then recheck the effective configuration when Stop considers a link. */
-export function prepareSessionStatusline(interactive, paths, options = {}) {
-    const text = interactive ? autoInstallStatusline(paths, options) : undefined;
-    const settings = watchStatuslineSettings(paths.settings, options);
-    const env = options.env ?? process.env;
-    let current = settings();
-    return {
-        text,
-        get showsLink() {
-            current = settings();
-            if (!interactive || current?.statusLine?.type !== "command" || typeof current.statusLine.command !== "string") {
-                return false;
-            }
-            // A command that merely mentions ccc can leave the line blank. Only trust
-            // the installed command when the shell will find this version of ccc.
-            // Windows runs these through Git Bash and can supply policy from the registry.
-            // The Unix executable identity check below cannot verify that renderer.
-            if ((options.platform ?? process.platform) === "win32" || env.CLAUDE_CODE_SAFE_MODE === "1")
-                return false;
-            if (current.env?.CCC_STATUSLINE_WRAPPED ?? env.CCC_STATUSLINE_WRAPPED)
-                return false;
-            if (current.env?.HOME && current.env.HOME !== env.HOME)
-                return false;
-            const command = current.statusLine.command.trim();
-            if (command === STATUSLINE_COMMAND) {
-                return options.cccOnPath?.() ?? isRunningCcc(pathExecutable("ccc", current.env?.PATH ?? env.PATH));
-            }
-            // A plain absolute executable (possibly quoted) can also be verified without
-            // interpreting or executing an arbitrary shell program.
-            const match = /^(?:"([^"$`\\]+)"|'([^']+)'|([^\s'"$`;&|<>\\]+))\s+statusline$/.exec(command);
-            const file = match?.[1] ?? match?.[2] ?? match?.[3];
-            return !!file && path.isAbsolute(file) && isRunningCcc(file);
-        },
-        get refresh() {
-            return env.CCC_STATUSLINE_REFRESH === "1" || commandWantsLink(current?.statusLine?.command);
-        },
-    };
-}
-const CLI = fileURLToPath(new URL("./cli.js", import.meta.url));
-function isRunningCcc(found) {
-    try {
-        if (!found)
-            return false;
-        fs.accessSync(found, fs.constants.X_OK);
-        return fs.realpathSync(found) === fs.realpathSync(CLI);
-    }
-    catch {
-        return false;
-    }
-}
 /** Install or wrap the status line once; the line to tell the user, if any. */
 export function autoInstallStatusline(paths, options = {}) {
     const env = options.env ?? process.env;
@@ -149,12 +97,7 @@ function isCommand(statusLine) {
 }
 /** Whether an executable `name` is in one of PATH's directories. */
 export function onPath(name, env = process.env) {
-    return pathExecutable(name, env.PATH) !== undefined;
-}
-function pathExecutable(name, searchPath) {
-    if (typeof searchPath !== "string")
-        return undefined;
-    for (const dir of searchPath.split(path.delimiter)) {
+    for (const dir of (env.PATH ?? "").split(path.delimiter)) {
         if (!dir)
             continue;
         try {
@@ -162,13 +105,13 @@ function pathExecutable(name, searchPath) {
             // A directory is "executable" (searchable) too; Codex r5 P2.
             fs.accessSync(candidate, fs.constants.X_OK);
             if (fs.statSync(candidate).isFile())
-                return candidate;
+                return true;
         }
         catch {
             // Not here.
         }
     }
-    return undefined;
+    return false;
 }
 function writeMarker(file, outcome) {
     try {

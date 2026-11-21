@@ -3,6 +3,8 @@ export declare const STATUS_LINK_SUFFIX = ".url";
 export declare function statusLinkDir(): string;
 /** The cached link for `sessionId`, or undefined. Never throws. */
 export declare function readStatusLink(sessionId: unknown, dir?: string): string | undefined;
+export declare function recordStatuslineRender(sessionId: unknown, url: string | undefined, dir?: string): void;
+export declare function recentlyRenderedLink(sessionId: string, since: number, dir: string): string | undefined;
 export declare class StatusLinkFiles {
     readonly dir: string;
     private readonly maxFiles;

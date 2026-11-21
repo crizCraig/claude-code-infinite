@@ -6,7 +6,7 @@
  * take 7-22 s on the server. A status line must never wait on that: Claude Code runs it
  * after every message. So the proxy writes the link to one small file per session whenever
  * it learns a newer one (a compress answer's page, or the newest-tree lookup answering in
- * the background), and the status line only reads that file (statusline.ts, or the shell
+ * the background), and the status line reads that file (statusline.ts, or the shell
  * one-liner in the README).
  *
  * `<config dir>/statusline/<session id>.url`: the URL and a newline. Written then renamed,
@@ -41,6 +41,39 @@ export function readStatusLink(sessionId: unknown, dir = statusLinkDir()): strin
   }
 }
 
+/** A render counts for one minute, and only in the interactive run that observed it. */
+const HEARTBEAT_TTL_MS = 60_000;
+
+export function recordStatuslineRender(sessionId: unknown, url: string | undefined, dir = statusLinkDir()): void {
+  if (typeof sessionId !== "string" || !SESSION_ID.test(sessionId)) return;
+  const file = path.join(dir, `${sessionId}.heartbeat`);
+  try {
+    if (url === undefined) {
+      fs.unlinkSync(file);
+      return;
+    }
+    // The adjacent .url file already exists if we just printed its link.
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ sessionId, url, at: Date.now() }), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch {
+    // Stop falls back to printing when the renderer cannot record a heartbeat.
+  }
+}
+
+export function recentlyRenderedLink(sessionId: string, since: number, dir: string): string | undefined {
+  if (!SESSION_ID.test(sessionId)) return undefined;
+  try {
+    const { sessionId: id, url, at } = JSON.parse(fs.readFileSync(path.join(dir, `${sessionId}.heartbeat`), "utf8"));
+    const now = Date.now();
+    if (id === sessionId && typeof url === "string" && typeof at === "number" &&
+        at >= since && at <= now && now - at < HEARTBEAT_TTL_MS) return url;
+  } catch {
+    // Missing or unreadable evidence keeps the Stop link.
+  }
+  return undefined;
+}
+
 export class StatusLinkFiles {
   private readonly written = new Map<string, string>();
   private writes = 0;
@@ -70,6 +103,7 @@ export class StatusLinkFiles {
   remove(sessionId: string): void {
     if (!SESSION_ID.test(sessionId)) return;
     this.written.delete(sessionId);
+    recordStatuslineRender(sessionId, undefined, this.dir);
     try {
       fs.unlinkSync(path.join(this.dir, `${sessionId}${STATUS_LINK_SUFFIX}`));
     } catch {
@@ -90,11 +124,7 @@ export class StatusLinkFiles {
       .map((name) => ({ name, at: mtime(path.join(this.dir, name)) }))
       .sort((a, b) => b.at - a.at);
     for (const { name } of files.slice(this.maxFiles)) {
-      try {
-        fs.unlinkSync(path.join(this.dir, name));
-      } catch {
-        // Another process pruned it first.
-      }
+      this.remove(name.slice(0, -STATUS_LINK_SUFFIX.length));
     }
   }
 }

@@ -26,10 +26,6 @@ export declare function httpsProxyModeDecision(input: EligibilityInput): HttpsPr
 export declare function httpsProxyModeRequested(env: NodeJS.ProcessEnv, configured?: boolean): boolean;
 /** The one-line notice for a requested mode that was skipped. */
 export declare function skippedNoticeText(reason: string): string;
-export declare function managedSettingsDir(platform: NodeJS.Platform): string;
-export declare function managedPreferencesFiles(platform: NodeJS.Platform): string[];
 /** Every `--settings <value>` / `--settings=<value>` before a `--`. */
-export declare function settingsArgs(args: readonly string[], option?: string): string[];
-/** A settings file's text; a property list (MDM) as JSON through plutil. */
-export declare function readTextFile(file: string): string | null;
+export declare function settingsArgs(args: readonly string[]): string[];
 //# sourceMappingURL=https-proxy-eligibility.d.ts.map

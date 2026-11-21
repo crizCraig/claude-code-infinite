@@ -18,7 +18,7 @@ export interface StatuslinePaths {
 }
 export declare function statuslinePaths(env?: NodeJS.ProcessEnv): StatuslinePaths;
 /** `ccc statusline [install|uninstall]`; returns the exit code. */
-export declare function statuslineMain(args: string[], paths?: StatuslinePaths, out?: (text: string) => boolean): Promise<number>;
+export declare function statuslineMain(args: string[], paths?: StatuslinePaths, out?: (text: string) => unknown): Promise<number>;
 /** The status line: the wrapped command's output, then the session's link. */
 export declare function renderStatusline(input: string, paths: StatuslinePaths, env?: NodeJS.ProcessEnv): Promise<string>;
 /** ` 🌿 tree` linked to the session's page, or the URL; "" with no cached link. */
@@ -44,9 +44,7 @@ export declare function runWrapped(command: string, input: string, timeoutMs?: n
 /** `pid` and every descendant (from `ps`; just `pid` where there is none, e.g. Windows). */
 export declare function processTree(pid: number | undefined): number[];
 /**
- * Whether Claude Code's status line reads ccc's link (installed, or the README snippet):
- * only then does the proxy keep the link fresh in the background. Read at startup.
+ * Whether auto-install should preserve a command that already includes ccc's link.
  */
 export declare function statusLineWantsLink(settingsFile?: string): boolean;
-export declare function commandWantsLink(command: unknown): boolean;
 //# sourceMappingURL=statusline.d.ts.map
