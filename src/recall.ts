@@ -227,8 +227,9 @@ const countWrites = new RecallWork();
 export const wrappedRecallWork = new RecallWork();
 
 export async function settleRecallWork(): Promise<void> {
-  // Verification can start count writes, so take the count snapshot second.
-  await wrappedRecallWork.settle();
+  // PreToolUse starts ticket publication immediately to invalidate stale tickets.
+  // Verification can start count writes, so take the count snapshot last.
+  await Promise.all([Promise.allSettled(publishingTickets.values()), wrappedRecallWork.settle()]);
   await countWrites.settle();
 }
 
