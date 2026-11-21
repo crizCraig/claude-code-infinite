@@ -19,15 +19,19 @@ export class RequestSizing {
     counts;
     enabled;
     model;
+    lastExact;
+    rememberExact;
     /** Input allowances derived from a verified prefix after a count actually failed. */
     failedCountSizes = new Map();
     candidates = new Map();
     excludedFallbacks = new Set();
     /** `model` is the request's model: it picks the tokenizer family's ratio. */
-    constructor(counts, enabled, model) {
+    constructor(counts, enabled, model, lastExact, rememberExact) {
         this.counts = counts;
         this.enabled = enabled;
         this.model = model;
+        this.lastExact = lastExact;
+        this.rememberExact = rememberExact;
     }
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body, kind, sample) {
@@ -75,14 +79,15 @@ export class RequestSizing {
         return this.enabled && this.counts.retry !== undefined && !this.exceedsRequestLimit(candidate) &&
             RETRYABLE_COUNT_OUTCOMES.has(this.counts.peek(candidate.body)?.outcome ?? "success");
     }
-    /** Whether the byte limit or an upstream size rejection rules out this body. */
+    /** Whether the transport byte limit rules out this body. */
     exceedsRequestLimit(candidate) {
-        return exceedsRequestLimit(candidate.body.length) || this.counts.peek(candidate.body)?.outcome === "too-large";
+        return exceedsRequestLimit(candidate.body.length);
     }
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate, limits) {
         const tokens = this.failedCountSizes.get(candidate) ?? candidate.conservativeTokens;
-        return !this.exceedsRequestLimit(candidate) && fitsNative(tokens, estimateLimits(limits));
+        return !this.exceedsRequestLimit(candidate) && !this.failedOriginalNeedsCompression(candidate, limits) &&
+            fitsNative(tokens, estimateLimits(limits));
     }
     /** Count a body at planning when only a count could admit it: no exact
      * count and its conservative bound does not fit. Delivery reuses the result. */
@@ -96,22 +101,35 @@ export class RequestSizing {
     }
     async count(candidate) {
         let count = await this.counts.count(candidate.body);
-        if (!permitsCountFallback(count)) {
-            return count;
-        }
-        const guarded = failedCountEstimate(candidate, this.model);
-        // Only spend the brief retry when planning could use the fallback.
-        if (guarded === undefined)
-            return count;
-        if (count.outcome === "network-error" && count.ms < BRIEF_COUNT_RETRY_MS &&
+        const guarded = count.tokens === undefined && candidate.kind === "original"
+            ? failedCountEstimate(this.lastExact, candidate.body, this.model) : undefined;
+        if (guarded !== undefined && count.outcome === "network-error" && count.ms < BRIEF_COUNT_RETRY_MS &&
             candidate.body.length <= BRIEF_COUNT_RETRY_MAX_BYTES) {
             count = await this.counts.retry?.(candidate.body, BRIEF_COUNT_RETRY_MS) ?? count;
         }
-        if (permitsCountFallback(count))
+        if (count.tokens !== undefined)
+            this.recordExact(candidate, count.tokens);
+        else if (candidate.kind === "original")
             this.failedCountSizes.set(candidate, guarded);
         return count;
     }
-    /** Whether this body's size is an exact Count Tokens result. */
+    recordExact(candidate, tokens) {
+        this.failedCountSizes.delete(candidate);
+        if (!this.rememberExact || !this.model)
+            return;
+        const shape = bodyShape(candidate.body, true);
+        if (!shape || !shape.frameAnchorable || shape.serverEdits)
+            return;
+        const messageCount = shape.messages.length;
+        this.rememberExact({ tokens, messageCount, model: this.model, at: Date.now(),
+            prefixDigest: prefixDigest(shape, messageCount),
+            billingDigest: shape.billingFrame && prefixDigest(shape, messageCount, shape.billingFrame),
+            images: shape.imageDims.length });
+    }
+    failedOriginalNeedsCompression(candidate, limits) {
+        return this.failedCountSizes.has(candidate) &&
+            (this.failedCountSizes.get(candidate) ?? Infinity) >= limits.budget;
+    }
     /** An exact count already made for these bytes, if any; never counts. */
     exactTokensFor(body) {
         return this.counts.peek(body)?.tokens;
@@ -138,7 +156,7 @@ export class RequestSizing {
         const overByteLimit = exceedsRequestLimit(candidate.body.length);
         if (!overByteLimit && !count && this.enabled && needed)
             count = await this.count(candidate);
-        if (overByteLimit || count?.outcome === "too-large")
+        if (overByteLimit)
             return {
                 tokens: Math.max(estimate, candidate.conservativeTokens), source: "bytes",
                 estimatedTokens: estimate, ...(count ? { count } : {}), tooLarge: true,
@@ -148,8 +166,10 @@ export class RequestSizing {
                 tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,
             };
         const guarded = this.failedCountSizes.get(candidate);
-        if (guarded !== undefined) {
-            return { tokens: guarded, source: "reported", estimatedTokens: estimate, count };
+        if (this.failedCountSizes.has(candidate)) {
+            return { tokens: guarded ?? candidate.conservativeTokens,
+                source: guarded === undefined ? "bytes" : "reported", estimatedTokens: estimate, count,
+                ...(this.failedOriginalNeedsCompression(candidate, limits) ? { tooLarge: true } : {}) };
         }
         // A learned ratio can request compression, but cannot veto a body whose
         // conservative per-model bound fits when counting is unavailable or
@@ -179,6 +199,7 @@ export class RequestSizing {
         const count = await this.counts.retry(smallest.body);
         if (count?.tokens === undefined)
             return undefined;
+        this.recordExact(smallest, count.tokens);
         const measurement = await this.measure(smallest, limits);
         return fitsMeasured(measurement, limits) ? { candidate: smallest, measurement } : undefined;
     }
@@ -309,32 +330,29 @@ function anchoredParts(sample, shape, model) {
 }
 /** The worst observed projection shortfall in the small-growth archive was 2.84%. */
 const COUNT_FAILURE_MARGIN = 0.05;
-function permitsCountFallback(count) {
-    return count.outcome === "server-error" || RETRYABLE_COUNT_OUTCOMES.has(count.outcome);
-}
-function failedCountEstimate(candidate, model) {
-    const { sample, body } = candidate;
-    if (!sample?.prefixDigest || sample.messageCount === undefined || !model || sample.model !== model) {
+const EXACT_PREFIX_TTL_MS = 5 * 60_000;
+function failedCountEstimate(sample, body, model) {
+    if (!sample || model !== sample.model || Date.now() - sample.at >= EXACT_PREFIX_TTL_MS)
         return undefined;
-    }
-    const shape = bodyShape(body);
-    if (!shape || shape.serverEdits)
+    const shape = bodyShape(body, true);
+    if (!shape || shape.serverEdits || !shape.frameAnchorable || shape.messages.length <= sample.messageCount ||
+        shape.lastUnsized >= sample.messageCount || shape.lastExpanding >= sample.messageCount)
         return undefined;
-    let billingBytes = 0;
+    let addedBytes = textBytes(shape, sample.messageCount) + shape.unhashedBytes;
     if (prefixDigest(shape, sample.messageCount) !== sample.prefixDigest) {
         if (!sample.billingDigest || !shape.billingFrame ||
-            prefixDigest(shape, sample.messageCount, shape.billingFrame) !== sample.billingDigest) {
+            prefixDigest(shape, sample.messageCount, shape.billingFrame) !== sample.billingDigest)
             return undefined;
-        }
-        billingBytes = shape.billingBytes ?? 0;
+        addedBytes += shape.billingBytes ?? 0;
     }
-    const parts = anchoredParts(sample, shape, model);
-    if (!parts)
-        return undefined;
-    // New content may be denser than the archived tool steps. Charge each new
-    // text byte at one token, including changed billing and unhashed fields.
-    const anchored = parts.measuredText + parts.newBytes + billingBytes + parts.imageTokens;
-    return Math.ceil(Math.max(anchored, candidate.estimate.tokens) * (1 + COUNT_FAILURE_MARGIN));
+    const tier = imageTier(model);
+    let addedTokens = addedBytes; // A new text byte can cost a whole token.
+    for (const size of shape.imageDims.slice(sample.images)) {
+        if (!size)
+            return undefined;
+        addedTokens += visualTokens(size[0], size[1], tier);
+    }
+    return sample.tokens + Math.ceil(addedTokens * (1 + COUNT_FAILURE_MARGIN));
 }
 /** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */
 function shapeImageTokens(shape, model) {

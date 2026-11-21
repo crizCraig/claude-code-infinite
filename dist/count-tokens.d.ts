@@ -51,8 +51,6 @@ export interface SizeSample {
     model?: string;
     messageCount?: number;
     prefixDigest?: string;
-    /** Prefix digest with Claude Code's volatile billing text removed. */
-    billingDigest?: string;
 }
 /** Where a count call goes: the proxy's upstream. */
 export interface CountTokensUpstream {
@@ -137,9 +135,7 @@ export declare const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome>;
  * (countDeadlineMs), spent only while a count is in flight, so time between
  * counts (a compression before the replacement is counted) is not charged.
  */
-export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns, rejectedSizes?: Set<string>): CountTokensSession & {
-    rejectMessageSize(body: Buffer): void;
-};
+export declare function createCountTokensSession(options: CountTokensSessionOptions, cooldowns?: CountTokensCooldowns): CountTokensSession;
 /** All failures resolve without tokens, including synchronous request errors. */
 export declare function countUpstreamTokens(args: CountTokensSessionOptions & {
     body: Buffer;
@@ -148,6 +144,4 @@ export declare function countUpstreamTokens(args: CountTokensSessionOptions & {
 export declare function countTokensBody(body: Buffer): Buffer | null;
 /** The Messages request's path with `/count_tokens` appended, query kept. */
 export declare function countTokensPath(requestUrl: string | undefined): string;
-/** Recognize provider size errors from their code or message, including plain-text gateways. */
-export declare function isSizeRejection(status: number | undefined, body: string): boolean;
 //# sourceMappingURL=count-tokens.d.ts.map

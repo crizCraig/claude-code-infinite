@@ -25,7 +25,7 @@ export interface CandidateMeasurement {
     /** Advisory estimate retained for compression and stale-estimate diagnostics. */
     estimatedTokens: number;
     count?: CountTokensResult;
-    /** The local byte limit or an upstream size rejection rules out these bytes. */
+    /** The local byte limit or an unverified count failure rules out these bytes. */
     tooLarge?: true;
 }
 export interface RequestCandidate {
@@ -45,12 +45,14 @@ export declare class RequestSizing {
     private readonly counts;
     private readonly enabled;
     private readonly model?;
+    private readonly lastExact?;
+    private readonly rememberExact?;
     /** Input allowances derived from a verified prefix after a count actually failed. */
     private readonly failedCountSizes;
     private readonly candidates;
     private readonly excludedFallbacks;
     /** `model` is the request's model: it picks the tokenizer family's ratio. */
-    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined);
+    constructor(counts: CountTokensSession, enabled: boolean, model?: string | undefined, lastExact?: CountedPrefix | undefined, rememberExact?: ((prefix: CountedPrefix) => void) | undefined);
     /** The first registration fixes both bytes and learned sample for this request. */
     register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate;
     /** Eligibility belongs to route planning, not to a later byte-size guess. */
@@ -64,7 +66,7 @@ export declare class RequestSizing {
     canCount(candidate: RequestCandidate): boolean;
     /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
     canRetryCount(candidate: RequestCandidate): boolean;
-    /** Whether the byte limit or an upstream size rejection rules out this body. */
+    /** Whether the transport byte limit rules out this body. */
     exceedsRequestLimit(candidate: RequestCandidate): boolean;
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean;
@@ -73,7 +75,8 @@ export declare class RequestSizing {
     countIfOverBound(candidate: RequestCandidate, limits: SizingLimits): Promise<void>;
     failedCountTokens(candidate: RequestCandidate): number | undefined;
     private count;
-    /** Whether this body's size is an exact Count Tokens result. */
+    private recordExact;
+    private failedOriginalNeedsCompression;
     /** An exact count already made for these bytes, if any; never counts. */
     exactTokensFor(body: Buffer): number | undefined;
     isExact(candidate: RequestCandidate): boolean;
@@ -143,6 +146,16 @@ export declare const ANCHOR_MARGIN = 0.1;
  * written literally) could shrink to hide new content (Codex r2 P1).
  */
 export declare function anchoredBound(sample: SizeSample | undefined, shape: BodyShape, model: string | undefined, margin?: number): number | undefined;
+/** Most recent Count Tokens success for this session, lane and model. */
+export interface CountedPrefix {
+    tokens: number;
+    model: string;
+    messageCount: number;
+    prefixDigest: string;
+    billingDigest?: string;
+    images: number;
+    at: number;
+}
 /**
  * Whether `body` extends the body `sample` measured, on the same model: the sample's
  * frame (system, tools, ...) and messages unchanged at its start (body-shape.ts). Only

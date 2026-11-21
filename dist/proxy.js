@@ -49,8 +49,8 @@ import { LaneCacheClock, coldCacheSample, coldCacheWorthCompressing } from "./co
 import { SlowUploads } from "./slow-upload.js";
 import { readStatusLink } from "./status-link.js";
 import { freshFailure, networkFailureOf, unreachableMessage, } from "./network-failure.js";
-import { createCountTokensSession, CountTokensCooldowns, isSizeRejection, plausibleSample, } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
+import { createCountTokensSession, CountTokensCooldowns, plausibleSample, } from "./count-tokens.js";
+import { RequestSizing, estimateLimits, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation } from "./request-sizing.js";
 import { extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, } from "./route-identity.js";
 import { COMPRESSION_RESERVE_TOKENS, compressionTrigger, PreparedCompressions, prepareStartTokens } from "./prepared-compression.js";
 import { truncateToolResults } from "./tool-result-truncation.js";
@@ -58,6 +58,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
+import { Readable } from "node:stream";
 import { brotliDecompressSync, createBrotliDecompress, createGunzip, createInflate, gunzipSync, inflateSync, } from "node:zlib";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -427,7 +428,7 @@ export function startProxy(opts) {
         serverBudgets: new Map(),
         serverReportsBudget: false,
         countTokensCooldowns: new CountTokensCooldowns(),
-        rejectedMessageSizes: new Set(),
+        exactPrefixes: new Map(),
         passthroughSizes: new Map(),
         laneSizes: new Map(),
     };
@@ -1480,8 +1481,9 @@ async function handleMessages(req, res, opts, upstream, state) {
             (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
                 bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
         },
-    }, state.countTokensCooldowns, state.rejectedMessageSizes);
-    const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined);
+    }, state.countTokensCooldowns);
+    const keepExact = requestSessionKey !== undefined && !notConversation;
+    const requestSizing = new RequestSizing(countSession, opts.countTokens === true, typeof body.model === "string" ? body.model : undefined, keepExact ? state.exactPrefixes.get(requestSizeKey) : undefined, keepExact ? prefix => boundedSet(state.exactPrefixes, requestSizeKey, prefix) : undefined);
     if (carriesServerTools(body))
         serverToolRecords.add(rec);
     const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey, body.model);
@@ -1556,7 +1558,27 @@ async function handleMessages(req, res, opts, upstream, state) {
         failedRebuild: false,
         allowed: new WeakSet(),
         sizing: requestSizing,
-        rejectMessageSize: countSession.rejectMessageSize,
+        recoverOverflow: async () => {
+            if (rec.lateCountRecovery || state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight)
+                return;
+            const policy = requestSendPolicies.get(req);
+            rec.lateCountRecovery = { outcome: "refused" };
+            const replacement = await holdingLane(state, requestRouteKey, () => policy.recoverLate(modelContextLimit, undefined, true));
+            if (!replacement)
+                return;
+            const candidate = requestSizing.register(replacement, "replacement");
+            const limits = sizingLimits();
+            if (candidate.kind !== "replacement" || !fitsMeasured(await requestSizing.measure(candidate, limits), limits)) {
+                lateRouteInstalls.get(rec)?.settle(false);
+                lateRouteInstalls.delete(rec);
+                return;
+            }
+            selectedCandidates.set(rec, candidate);
+            changedDeliveryRecords.add(rec);
+            recordTurn(rec, rec.turnType, candidate.body);
+            rec.lateCountRecovery.outcome = "compressed";
+            return candidate.body;
+        },
         select: (buffer) => selectForwardCandidate({
             opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
             preferredBody: buffer, limits: sizingLimits(),
@@ -1570,12 +1592,12 @@ async function handleMessages(req, res, opts, upstream, state) {
         },
         // The ride's bytes are only what failed; recovery always compresses the
         // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
-        recoverLate: async (_ride, rideTokens, target) => {
+        recoverLate: async (rideTokens, target, upstreamRejected = false) => {
             // A compression already made may be redone only to a smaller target.
-            if (notConversation || (rec.compress && target === undefined) ||
+            if (notConversation || (!upstreamRejected && rec.compress && target === undefined) ||
                 compactionMode(opts, state, requestSessionKey, requestRouteLane).mode === "off" ||
                 !hasEarlierNonToolUserMessage(messages) ||
-                (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
+                (!upstreamRejected && rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false))
                 return undefined;
             return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
                 modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
@@ -3511,10 +3533,7 @@ function sizeSampleOf(sent, tokens, model) {
 function sampleLineage(sent, model) {
     const shape = bodyShape(sent);
     const digest = shape && prefixDigest(shape, shape.messages.length);
-    const billingDigest = shape?.billingFrame && prefixDigest(shape, shape.messages.length, shape.billingFrame);
-    return shape && digest && model
-        ? { model, messageCount: shape.messages.length, prefixDigest: digest,
-            ...(billingDigest ? { billingDigest } : {}) } : {};
+    return shape && digest && model ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
 }
 /**
  * Anthropic's input tokens for the body this request forwarded, when its usage
@@ -4329,17 +4348,22 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
         exactSizedRecords.add(record);
         return;
     }
-    const guarded = sizing.failedCountTokens(candidate);
     const limits = { budget: record.budgetTokens, context: modelContextLimit,
         output: bodyOutputReservation(body, false) };
-    const fits = sizing.boundFits(candidate, limits);
-    if (guarded !== undefined) {
-        record.countFailure = { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
-            decision: !fits ? "over-window" : guarded >= record.budgetTokens ? "over-budget" : "within-limits" };
-    }
-    if (!fits) {
+    const failure = countFailureDecision(sizing, candidate, limits);
+    if (failure)
+        record.countFailure = failure;
+    if (!sizing.boundFits(candidate, limits) && failure?.decision !== "over-budget") {
         record.uncountedOverWindow = true;
     }
+}
+function countFailureDecision(sizing, candidate, limits) {
+    const guarded = sizing.failedCountTokens(candidate);
+    if (guarded === undefined)
+        return undefined;
+    return { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
+        decision: !fitsNative(guarded, estimateLimits(limits)) ? "over-window"
+            : guarded >= limits.budget ? "over-budget" : "within-limits" };
 }
 /**
  * Whether a forwarded compressed body still overflows the window: its exact
@@ -5650,11 +5674,16 @@ async function selectForwardCandidate(args) {
         ? policy.original : args.preferredBody;
     const preferred = policy.sizing.register(intended, policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
     const measured = await policy.sizing.measure(preferred, args.limits);
+    if (!args.rec.compaction?.countFailure) {
+        const failure = countFailureDecision(policy.sizing, preferred, args.limits);
+        if (failure)
+            args.rec.countFailure = failure;
+    }
     let target = preferred;
     const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits, args.routeKey);
     if (late) {
         args.rec.lateCountRecovery = { outcome: "forwarded" };
-        const replacement = await holdingLane(args.state, args.routeKey, () => policy.recoverLate(preferred.body, late.tokens, late.target));
+        const replacement = await holdingLane(args.state, args.routeKey, () => policy.recoverLate(late.tokens, late.target));
         if (replacement)
             target = policy.sizing.register(replacement, "replacement");
     }
@@ -5716,7 +5745,10 @@ async function selectForwardCandidate(args) {
     else if (degraded) {
         delete args.rec.degradedNotice;
     }
-    return changed ? candidate.body : intended;
+    const selected = changed ? candidate.body : intended;
+    if (policy.sizing.failedCountTokens(candidate) !== undefined)
+        policy.guardedBody = selected;
+    return selected;
 }
 /** MemTree's answer when the conversation cannot fit the window even compressed. */
 const OVER_CONTEXT_STATUS = 413;
@@ -6253,10 +6285,27 @@ async function forwardRaw(req, res, bodyBuffer, opts, upstream, shutdownSignal, 
     const lateInstall = rec && selected !== bodyBuffer ? lateRouteInstalls.get(rec) : undefined;
     if (rec)
         lateRouteInstalls.delete(rec);
-    const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate);
+    const recover = policy?.guardedBody === selected ? policy.recoverOverflow : undefined;
+    const first = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec, selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate, recover);
+    let delivered = first === true;
     lateInstall?.settle(delivered, selected);
-    if (delivered && rec)
-        noteSelectedCandidateSize(rec);
+    if (Buffer.isBuffer(first) && rec) {
+        const install = lateRouteInstalls.get(rec);
+        lateRouteInstalls.delete(rec);
+        try {
+            if (!res.destroyed && !shutdownSignal.aborted) {
+                delivered = await forwardAccepted(req, res, first, opts, upstream, shutdownSignal, rec, install?.activate) === true;
+            }
+        }
+        finally {
+            install?.settle(delivered, first);
+        }
+    }
+    if (delivered) {
+        policy?.delivered();
+        if (rec)
+            noteSelectedCandidateSize(rec);
+    }
     return delivered;
 }
 /** Attribute a fallback response only to the body and size owner actually sent. */
@@ -6278,9 +6327,9 @@ function noteSelectedCandidateSize(rec) {
         owner.lastSize = sample;
     }
 }
-/** forwardRaw once the request's send policy (if any) accepted the body. */
-function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete) {
-    const policy = requestSendPolicies.get(req);
+/** Forward one attempt. A verified replacement returns to forwardRaw before the
+ * rejected response commits headers, so the caller can send it once. */
+function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, rec, onProtocolComplete, recoverOverflow) {
     return new Promise((resolve) => {
         const headers = forwardableRequestHeaders(req);
         headers["content-length"] = String(bodyBuffer.length);
@@ -6320,16 +6369,14 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                 // Route/observer bookkeeping can never affect byte delivery.
             }
         };
-        const settle = (ok) => {
+        const settle = (result) => {
             if (settled)
                 return;
             settled = true;
-            if (ok)
-                policy?.delivered();
             res.off("finish", onResponseFinish);
             res.off("close", onResponseClose);
             shutdownSignal.removeEventListener("abort", cancelForShutdown);
-            resolve(ok);
+            resolve(result);
         };
         const maybeSettle = () => {
             if (upstreamCompleted && responseFinished) {
@@ -6403,15 +6450,41 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
             method: req.method,
             path: req.url, // path + query string verbatim (?beta=true etc.)
             headers,
-        }, (upstreamRes) => {
+        }, async (upstreamRes) => {
             upstream.unreachable = undefined;
             activeUpstreamRes = upstreamRes;
-            if (upstreamRes.statusCode === 413)
-                policy?.rejectMessageSize(bodyBuffer);
             const contentType = String(upstreamRes.headers["content-type"] ?? "");
             const isSse = contentType.includes("text/event-stream");
             const contentEncoding = String(upstreamRes.headers["content-encoding"] ?? "identity").trim().toLowerCase();
             const compressed = contentEncoding !== "" && contentEncoding !== "identity";
+            let responseBody = upstreamRes;
+            if (recoverOverflow && rec && !res.headersSent) {
+                try {
+                    const inspected = await inspectMessagesResponse(upstreamRes, isSse, contentEncoding);
+                    responseBody = inspected.stream;
+                    if (inspected.overflow && !settled) {
+                        const replacement = await recoverOverflow();
+                        if (replacement) {
+                            if (settled) {
+                                lateRouteInstalls.get(rec)?.settle(false);
+                                lateRouteInstalls.delete(rec);
+                            }
+                            else {
+                                settle(replacement);
+                            }
+                            upstreamRes.destroy();
+                            return;
+                        }
+                    }
+                    if (settled)
+                        return;
+                }
+                catch {
+                    res.destroy();
+                    settle(false);
+                    return;
+                }
+            }
             let sawFirstByte = false;
             let sawMessageStop = false;
             let observerFailed = false;
@@ -6496,13 +6569,13 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         return false;
                     }
                     if (res.write(chunk))
-                        upstreamRes.resume();
+                        responseBody.resume();
                     else
-                        res.once("drain", () => upstreamRes.resume());
+                        res.once("drain", () => responseBody.resume());
                     return true;
                 };
-                upstreamRes.on("data", (chunk) => {
-                    upstreamRes.pause();
+                responseBody.on("data", (chunk) => {
+                    responseBody.pause();
                     observeRawChunk(chunk);
                     if (decoderFailed) {
                         forwardEncoded(chunk);
@@ -6542,7 +6615,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         forwardOnce();
                     }
                 });
-                upstreamRes.on("end", () => {
+                responseBody.on("end", () => {
                     let finished = false;
                     const finish = () => {
                         if (finished)
@@ -6566,12 +6639,12 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         finish();
                     }
                 });
-                upstreamRes.on("error", () => {
+                responseBody.on("error", () => {
                     incrementalDecoder.destroy();
                     res.destroy();
                     settle(false);
                 });
-                upstreamRes.on("aborted", () => {
+                responseBody.on("aborted", () => {
                     incrementalDecoder.destroy();
                     res.destroy();
                     settle(false);
@@ -6582,7 +6655,7 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                 // Same observation as below, but the client gets the rewriter's
                 // output (original frames plus the appended block) instead of the
                 // raw bytes. Backpressure mirrors pipe().
-                upstreamRes.on("data", (chunk) => {
+                responseBody.on("data", (chunk) => {
                     if (rec && !sawFirstByte) {
                         sawFirstByte = true;
                         rec.ttfbMs = Date.now() - forwardStarted;
@@ -6591,14 +6664,14 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                     if (!out || res.destroyed || res.writableEnded)
                         return;
                     if (!res.write(out)) {
-                        upstreamRes.pause();
-                        res.once("drain", () => upstreamRes.resume());
+                        responseBody.pause();
+                        res.once("drain", () => responseBody.resume());
                     }
                     if (sawMessageStop && !observerFailed && !res.destroyed) {
                         notifyProtocolComplete();
                     }
                 });
-                upstreamRes.on("end", () => {
+                responseBody.on("end", () => {
                     const rest = sseObserver.flush();
                     if (rest && !res.destroyed && !res.writableEnded)
                         res.write(rest);
@@ -6606,30 +6679,30 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         res.end();
                     completeUpstream(!observerFailed && sawMessageStop);
                 });
-                upstreamRes.on("error", () => {
+                responseBody.on("error", () => {
                     res.destroy();
                     settle(false);
                 });
-                upstreamRes.on("aborted", () => {
+                responseBody.on("aborted", () => {
                     res.destroy();
                     settle(false);
                 });
                 return;
             }
-            upstreamRes.on("data", observeRawChunk);
-            upstreamRes.pipe(res);
+            responseBody.on("data", observeRawChunk);
+            responseBody.pipe(res);
             if (isSse && !compressed) {
                 // Registered after pipe(), so this runs only after the raw chunk
                 // containing the complete message_stop frame has been accepted by
                 // ServerResponse. The callback still runs synchronously before a
                 // client can issue the resulting tool request.
-                upstreamRes.on("data", () => {
+                responseBody.on("data", () => {
                     if (sawMessageStop && !observerFailed && !res.destroyed) {
                         notifyProtocolComplete();
                     }
                 });
             }
-            upstreamRes.on("end", () => {
+            responseBody.on("end", () => {
                 let observed = null;
                 if (observedChunks) {
                     observed = decodeForObservation(Buffer.concat(observedChunks), contentEncoding);
@@ -6637,10 +6710,6 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                         mergeUsageFromJsonBody(observed, rec);
                         if ((upstreamRes.statusCode ?? 0) >= 400) {
                             rec.upstreamError = upstreamErrorCode(observed);
-                            if (upstreamRes.statusCode !== 413 &&
-                                isSizeRejection(upstreamRes.statusCode, observed.toString("utf8"))) {
-                                policy?.rejectMessageSize(bodyBuffer);
-                            }
                         }
                     }
                 }
@@ -6658,23 +6727,100 @@ function forwardAccepted(req, res, bodyBuffer, opts, upstream, shutdownSignal, r
                     completeUpstream(observed !== null && isCompleteJsonResponse(req.url, observed));
                 }
             });
-            upstreamRes.on("error", () => {
+            responseBody.on("error", () => {
                 res.destroy();
                 settle(false);
             });
-            upstreamRes.on("aborted", () => {
+            responseBody.on("aborted", () => {
                 res.destroy();
                 settle(false);
             });
         });
         upstreamReq.on("error", (err) => {
-            if (!shutdownCancelled) {
+            if (!settled && !shutdownCancelled) {
                 sendAnthropicError(res, upstreamFailureMessage(upstream, err, !activeUpstreamRes));
             }
             settle(false);
         });
         upstreamReq.end(bodyBuffer);
     });
+}
+/** Inspect only the response to a guarded send. Keep the wire bytes so an unrelated
+ * error can pass through verbatim. Once SSE starts producing content, stream normally. */
+async function inspectMessagesResponse(response, sse, encoding) {
+    const status = response.statusCode ?? 502;
+    if (status === 429 || status === 402)
+        return { overflow: false, stream: response };
+    if (!sse) {
+        const raw = await readAll(response);
+        const decoded = decodeForObservation(raw, encoding);
+        const overflow = messagesOverflow(status, decoded?.toString("utf8") ?? "");
+        return { overflow, stream: Readable.from([raw]) };
+    }
+    const chunks = [];
+    const iterator = response[Symbol.asyncIterator]();
+    let overflow = false;
+    let decided = false;
+    const events = new SseNoticeRewriter({ onEvent: data => {
+            if (data?.type === "error") {
+                overflow = messagesOverflow(status, data);
+                decided = true;
+            }
+            else if (data?.type === "content_block_delta" || data?.type === "message_stop") {
+                decided = true;
+            }
+        } });
+    const decoder = createObservationDecoder(encoding);
+    decoder?.on("data", chunk => events.push(chunk));
+    decoder?.on("error", () => { decided = true; });
+    try {
+        while (!decided) {
+            const next = await iterator.next();
+            if (next.done)
+                break;
+            const raw = next.value;
+            chunks.push(raw);
+            if (decoder)
+                await new Promise(resolve => decoder.write(raw, () => resolve()));
+            else
+                events.push(raw);
+        }
+    }
+    finally {
+        decoder?.destroy();
+    }
+    return { overflow, stream: Readable.from((async function* () {
+            yield* chunks;
+            yield* { [Symbol.asyncIterator]: () => iterator };
+        })()) };
+}
+/** Only a Messages rejection can trigger a compressed retry. A quota may mention a
+ * token limit in exactly the same words as a context error. */
+function messagesOverflow(status, payload) {
+    if (status === 429)
+        return false;
+    if (typeof payload === "string") {
+        try {
+            payload = JSON.parse(payload);
+        }
+        catch { /* Plain-text gateway error. */ }
+    }
+    const envelope = payload;
+    if (status < 400 && envelope?.type !== "error" && !envelope?.error)
+        return false;
+    const error = envelope?.error ?? payload;
+    const fields = error;
+    const detail = (typeof error === "string" ? error :
+        [fields?.type, fields?.code, fields?.message, fields?.detail].join(" "))
+        .toLowerCase().replace(/`/g, "").replace(/[_-]/g, " ");
+    if (envelope?.status === 429 || fields?.status === 429 || /quota|rate limit|usage limit|billing error|credit balance|too many requests/.test(detail) ||
+        /(?:per |\/)(?:minute|second|hour|day)|\b(?:[io]?tpm|rpm)\b/.test(detail))
+        return false;
+    return status === 413 || /(?:prompt|input|request|payload|body)(?: length| size)? (?:is )?too (?:long|large)/.test(detail) ||
+        /input length and max tokens exceed context limit|maximum context length|context (?:length|window|limit) exceeded/.test(detail) ||
+        /exceeds? (?:the )?(?:max(?:imum)? |allowed )*(?:context (?:length|window|limit)|number of tokens|input length)/.test(detail) ||
+        /(?:prompt|input|request|payload)(?: length| size)? exceeds (?:the )?(?:maximum|max|limit)/.test(detail) ||
+        /token (?:count|limit) exceeded|too many (?:input |prompt )?tokens/.test(detail);
 }
 function isCompleteJsonResponse(requestUrl, body) {
     try {

@@ -418,7 +418,7 @@ test("a brief count retry and delivery retry each have one request-wide allowanc
   } finally { srv.close(); }
 });
 
-test("a slow error body retains the rejection already received", async () => {
+test("the size text in a slow count error body does not affect delivery eligibility", async () => {
   const srv = await countServer((_req, res) => {
     res.writeHead(400);
     res.write('{"error":{"message":"prompt is too long"');
@@ -426,27 +426,7 @@ test("a slow error body retains the rejection already received", async () => {
   try {
     const result = await countUpstreamTokens({ upstream: srv.upstream, headers: {},
       body: messagesBody, timeoutMs: 200 });
-    assert.equal(result.outcome, "too-large");
+    assert.equal(result.outcome, "http-error");
     assert.equal(result.status, 400);
-  } finally { srv.close(); }
-});
-
-test("a count size rejection disqualifies the same bytes on a later attempt in the same context", async () => {
-  const srv = await countServer((_req, res) => {
-    res.statusCode = srv.seen.length === 1 ? 413 : 200;
-    res.end('{"input_tokens":42}');
-  });
-  try {
-    const rejected = new Set();
-    const session = headers => counting.createCountTokensSession({ upstream: srv.upstream, headers },
-      undefined, rejected);
-    assert.equal((await session({}).count(messagesBody)).outcome, "too-large");
-    const repeated = session({});
-    assert.equal((await repeated.count(Buffer.from(messagesBody))).outcome, "too-large");
-    assert.equal(repeated.retry(messagesBody), undefined);
-    assert.equal(srv.seen.length, 1);
-    assert.equal((await session({ "anthropic-beta": "context-1m" }).count(messagesBody)).tokens, 42);
-    assert.equal((await session({ "x-api-key": "other" }).count(messagesBody)).tokens, 42);
-    assert.equal((await repeated.count(Buffer.from('{"model":"other","messages":[]}'))).tokens, 42);
   } finally { srv.close(); }
 });

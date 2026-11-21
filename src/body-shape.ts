@@ -54,6 +54,9 @@ export interface BodyShape {
    * Anthropic counted expanded; one appended disables the anchor.
    */
   lastExpanding: number;
+  /** Last message with content that cannot be sized from its bytes or image dimensions. */
+  lastUnsized: number;
+  frameAnchorable: boolean;
   /**
    * Canonical bytes of the frame fields left out of the hash because Claude Code rewrites
    * them every turn (UNHASHED_FIELDS): an anchored bound charges them in full each time, on
@@ -65,8 +68,8 @@ export interface BodyShape {
 const shapes = new WeakMap<Buffer, BodyShape | null>();
 
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
-export function bodyShape(body: Buffer): BodyShape | undefined {
-  if (body.length < SHAPE_MIN_BYTES) return undefined;
+export function bodyShape(body: Buffer, includeSmall = false): BodyShape | undefined {
+  if (!includeSmall && body.length < SHAPE_MIN_BYTES) return undefined;
   if (!shapes.has(body)) shapes.set(body, computeShape(body));
   return shapes.get(body) ?? undefined;
 }
@@ -114,7 +117,7 @@ function computeShape(body: Buffer): BodyShape | null {
   const shape: BodyShape = { frame: hash(JSON.stringify(canonical)),
     messages: [], sizes: [], imageChars: [],
     serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
-    imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
+    imageDims: [], unanchorable: false, frameAnchorable: frameAnchorable(frame), lastUnsized: -1, lastExpanding: -1,
     unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
   if (Array.isArray(canonical.system)) {
     let billingBytes = 0;
@@ -135,9 +138,10 @@ function computeShape(body: Buffer): BodyShape | null {
     shape.sizes.push(Buffer.byteLength(text, "utf-8"));
     shape.imageChars.push(imageCharsOf(message, shape));
     if (!message || typeof message !== "object" ||
-        !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key))) shape.unanchorable = true;
+        !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key))) shape.lastUnsized = shape.messages.length - 1;
     if (text.includes('"type":"tool_reference"')) shape.lastExpanding = shape.messages.length - 1;
   }
+  shape.unanchorable = !shape.frameAnchorable || shape.lastUnsized >= 0;
   return shape;
 }
 
@@ -182,14 +186,19 @@ function withoutMarker(block: unknown): unknown {
  * image's dimensions, and any image that is not inline, are noted on `shape`. */
 function imageCharsOf(message: unknown, shape: BodyShape): number {
   const content = (message as { content?: unknown } | null)?.content;
-  return Array.isArray(content) ? blockImageChars(content, shape) : 0;
+  if (Array.isArray(content)) return blockImageChars(content, shape);
+  if (typeof content !== "string") shape.lastUnsized = shape.messages.length - 1;
+  return 0;
 }
 
 function blockImageChars(blocks: unknown[], shape: BodyShape, nested = false): number {
   let total = 0;
   for (const item of blocks) {
     const block = item as Record<string, unknown> | null;
-    if (!block || typeof block !== "object") continue;
+    if (!block || typeof block !== "object") {
+      shape.lastUnsized = shape.messages.length - 1;
+      continue;
+    }
     const source = block.source as Record<string, unknown> | undefined;
     if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
       total += source.data.length;
@@ -197,10 +206,10 @@ function blockImageChars(blocks: unknown[], shape: BodyShape, nested = false): n
     } else if (block.type === "tool_result" && !nested) {
       if (Array.isArray(block.content)) total += blockImageChars(block.content, shape, true);
       else if (block.content !== undefined && typeof block.content !== "string") {
-        shape.unanchorable = true;
+        shape.lastUnsized = shape.messages.length - 1;
       }
     } else if (!(nested ? NESTED_BLOCKS : MESSAGE_BLOCKS).has(String(block.type))) {
-      shape.unanchorable = true;
+      shape.lastUnsized = shape.messages.length - 1;
     }
   }
   return total;

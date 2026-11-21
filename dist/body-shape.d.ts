@@ -33,6 +33,9 @@ export interface BodyShape {
      * Anthropic counted expanded; one appended disables the anchor.
      */
     lastExpanding: number;
+    /** Last message with content that cannot be sized from its bytes or image dimensions. */
+    lastUnsized: number;
+    frameAnchorable: boolean;
     /**
      * Canonical bytes of the frame fields left out of the hash because Claude Code rewrites
      * them every turn (UNHASHED_FIELDS): an anchored bound charges them in full each time, on
@@ -41,7 +44,7 @@ export interface BodyShape {
     unhashedBytes: number;
 }
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
-export declare function bodyShape(body: Buffer): BodyShape | undefined;
+export declare function bodyShape(body: Buffer, includeSmall?: boolean): BodyShape | undefined;
 /** The shape already worked out for `body`, if any; never computes one. */
 export declare function knownShape(body: Buffer): BodyShape | undefined;
 /** Remember `shape` for another copy of the same bytes. */

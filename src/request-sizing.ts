@@ -39,7 +39,7 @@ export interface CandidateMeasurement {
   /** Advisory estimate retained for compression and stale-estimate diagnostics. */
   estimatedTokens: number;
   count?: CountTokensResult;
-  /** The local byte limit or an upstream size rejection rules out these bytes. */
+  /** The local byte limit or an unverified count failure rules out these bytes. */
   tooLarge?: true;
 }
 export interface RequestCandidate {
@@ -58,13 +58,14 @@ export interface RequestCandidate {
 
 export class RequestSizing {
   /** Input allowances derived from a verified prefix after a count actually failed. */
-  private readonly failedCountSizes = new Map<RequestCandidate, number>();
+  private readonly failedCountSizes = new Map<RequestCandidate, number | undefined>();
   private readonly candidates = new Map<string, RequestCandidate>();
   private readonly excludedFallbacks = new Set<RequestCandidate>();
 
   /** `model` is the request's model: it picks the tokenizer family's ratio. */
   constructor(private readonly counts: CountTokensSession, private readonly enabled: boolean,
-    private readonly model?: string) {}
+    private readonly model?: string, private readonly lastExact?: CountedPrefix,
+    private readonly rememberExact?: (prefix: CountedPrefix) => void) {}
 
   /** The first registration fixes both bytes and learned sample for this request. */
   register(body: Buffer, kind: CandidateKind, sample?: SizeSample): RequestCandidate {
@@ -119,15 +120,16 @@ export class RequestSizing {
       RETRYABLE_COUNT_OUTCOMES.has(this.counts.peek(candidate.body)?.outcome ?? "success");
   }
 
-  /** Whether the byte limit or an upstream size rejection rules out this body. */
+  /** Whether the transport byte limit rules out this body. */
   exceedsRequestLimit(candidate: RequestCandidate): boolean {
-    return exceedsRequestLimit(candidate.body.length) || this.counts.peek(candidate.body)?.outcome === "too-large";
+    return exceedsRequestLimit(candidate.body.length);
   }
 
   /** Whether the conservative bound alone admits this body under `limits`. */
   boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean {
     const tokens = this.failedCountSizes.get(candidate) ?? candidate.conservativeTokens;
-    return !this.exceedsRequestLimit(candidate) && fitsNative(tokens, estimateLimits(limits));
+    return !this.exceedsRequestLimit(candidate) && !this.failedOriginalNeedsCompression(candidate, limits) &&
+      fitsNative(tokens, estimateLimits(limits));
   }
 
   /** Count a body at planning when only a count could admit it: no exact
@@ -143,21 +145,34 @@ export class RequestSizing {
 
   private async count(candidate: RequestCandidate): Promise<CountTokensResult> {
     let count = await this.counts.count(candidate.body);
-    if (!permitsCountFallback(count)) {
-      return count;
-    }
-    const guarded = failedCountEstimate(candidate, this.model);
-    // Only spend the brief retry when planning could use the fallback.
-    if (guarded === undefined) return count;
-    if (count.outcome === "network-error" && count.ms < BRIEF_COUNT_RETRY_MS &&
+    const guarded = count.tokens === undefined && candidate.kind === "original"
+      ? failedCountEstimate(this.lastExact, candidate.body, this.model) : undefined;
+    if (guarded !== undefined && count.outcome === "network-error" && count.ms < BRIEF_COUNT_RETRY_MS &&
         candidate.body.length <= BRIEF_COUNT_RETRY_MAX_BYTES) {
       count = await this.counts.retry?.(candidate.body, BRIEF_COUNT_RETRY_MS) ?? count;
     }
-    if (permitsCountFallback(count)) this.failedCountSizes.set(candidate, guarded);
+    if (count.tokens !== undefined) this.recordExact(candidate, count.tokens);
+    else if (candidate.kind === "original") this.failedCountSizes.set(candidate, guarded);
     return count;
   }
 
-  /** Whether this body's size is an exact Count Tokens result. */
+  private recordExact(candidate: RequestCandidate, tokens: number): void {
+    this.failedCountSizes.delete(candidate);
+    if (!this.rememberExact || !this.model) return;
+    const shape = bodyShape(candidate.body, true);
+    if (!shape || !shape.frameAnchorable || shape.serverEdits) return;
+    const messageCount = shape.messages.length;
+    this.rememberExact({ tokens, messageCount, model: this.model, at: Date.now(),
+      prefixDigest: prefixDigest(shape, messageCount)!,
+      billingDigest: shape.billingFrame && prefixDigest(shape, messageCount, shape.billingFrame),
+      images: shape.imageDims.length });
+  }
+
+  private failedOriginalNeedsCompression(candidate: RequestCandidate, limits: SizingLimits): boolean {
+    return this.failedCountSizes.has(candidate) &&
+      (this.failedCountSizes.get(candidate) ?? Infinity) >= limits.budget;
+  }
+
   /** An exact count already made for these bytes, if any; never counts. */
   exactTokensFor(body: Buffer): number | undefined {
     return this.counts.peek(body)?.tokens;
@@ -187,7 +202,7 @@ export class RequestSizing {
         fitsNative(candidate.conservativeTokens, estimateLimits(limits))));
     const overByteLimit = exceedsRequestLimit(candidate.body.length);
     if (!overByteLimit && !count && this.enabled && needed) count = await this.count(candidate);
-    if (overByteLimit || count?.outcome === "too-large") return {
+    if (overByteLimit) return {
       tokens: Math.max(estimate, candidate.conservativeTokens), source: "bytes",
       estimatedTokens: estimate, ...(count ? { count } : {}), tooLarge: true,
     };
@@ -195,8 +210,10 @@ export class RequestSizing {
       tokens: count.tokens, source: "exact", estimatedTokens: estimate, count,
     };
     const guarded = this.failedCountSizes.get(candidate);
-    if (guarded !== undefined) {
-      return { tokens: guarded, source: "reported", estimatedTokens: estimate, count };
+    if (this.failedCountSizes.has(candidate)) {
+      return { tokens: guarded ?? candidate.conservativeTokens,
+        source: guarded === undefined ? "bytes" : "reported", estimatedTokens: estimate, count,
+        ...(this.failedOriginalNeedsCompression(candidate, limits) ? { tooLarge: true } : {}) };
     }
     // A learned ratio can request compression, but cannot veto a body whose
     // conservative per-model bound fits when counting is unavailable or
@@ -226,6 +243,7 @@ export class RequestSizing {
     if (!smallest) return undefined;
     const count = await this.counts.retry(smallest.body);
     if (count?.tokens === undefined) return undefined;
+    this.recordExact(smallest, count.tokens);
     const measurement = await this.measure(smallest, limits);
     return fitsMeasured(measurement, limits) ? { candidate: smallest, measurement } : undefined;
   }
@@ -372,31 +390,37 @@ function anchoredParts(sample: SizeSample | undefined, shape: BodyShape, model: 
 /** The worst observed projection shortfall in the small-growth archive was 2.84%. */
 const COUNT_FAILURE_MARGIN = 0.05;
 
-function permitsCountFallback(count: CountTokensResult): boolean {
-  return count.outcome === "server-error" || RETRYABLE_COUNT_OUTCOMES.has(count.outcome);
+/** Most recent Count Tokens success for this session, lane and model. */
+export interface CountedPrefix {
+  tokens: number;
+  model: string;
+  messageCount: number;
+  prefixDigest: string;
+  billingDigest?: string;
+  images: number;
+  at: number;
 }
 
-function failedCountEstimate(candidate: RequestCandidate, model: string | undefined): number | undefined {
-  const { sample, body } = candidate;
-  if (!sample?.prefixDigest || sample.messageCount === undefined || !model || sample.model !== model) {
-    return undefined;
-  }
-  const shape = bodyShape(body);
-  if (!shape || shape.serverEdits) return undefined;
-  let billingBytes = 0;
+const EXACT_PREFIX_TTL_MS = 5 * 60_000;
+
+function failedCountEstimate(sample: CountedPrefix | undefined, body: Buffer, model?: string): number | undefined {
+  if (!sample || model !== sample.model || Date.now() - sample.at >= EXACT_PREFIX_TTL_MS) return undefined;
+  const shape = bodyShape(body, true);
+  if (!shape || shape.serverEdits || !shape.frameAnchorable || shape.messages.length <= sample.messageCount ||
+      shape.lastUnsized >= sample.messageCount || shape.lastExpanding >= sample.messageCount) return undefined;
+  let addedBytes = textBytes(shape, sample.messageCount) + shape.unhashedBytes;
   if (prefixDigest(shape, sample.messageCount) !== sample.prefixDigest) {
     if (!sample.billingDigest || !shape.billingFrame ||
-        prefixDigest(shape, sample.messageCount, shape.billingFrame) !== sample.billingDigest) {
-      return undefined;
-    }
-    billingBytes = shape.billingBytes ?? 0;
+        prefixDigest(shape, sample.messageCount, shape.billingFrame) !== sample.billingDigest) return undefined;
+    addedBytes += shape.billingBytes ?? 0;
   }
-  const parts = anchoredParts(sample, shape, model);
-  if (!parts) return undefined;
-  // New content may be denser than the archived tool steps. Charge each new
-  // text byte at one token, including changed billing and unhashed fields.
-  const anchored = parts.measuredText + parts.newBytes + billingBytes + parts.imageTokens;
-  return Math.ceil(Math.max(anchored, candidate.estimate.tokens) * (1 + COUNT_FAILURE_MARGIN));
+  const tier = imageTier(model);
+  let addedTokens = addedBytes; // A new text byte can cost a whole token.
+  for (const size of shape.imageDims.slice(sample.images)) {
+    if (!size) return undefined;
+    addedTokens += visualTokens(size[0], size[1], tier);
+  }
+  return sample.tokens + Math.ceil(addedTokens * (1 + COUNT_FAILURE_MARGIN));
 }
 
 /** Visual tokens of the shape's inline images (the tier cap for an unreadable one). */

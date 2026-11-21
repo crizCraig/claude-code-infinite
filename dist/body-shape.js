@@ -21,8 +21,8 @@ import { imageDimensions } from "./image-tokens.js";
 export const SHAPE_MIN_BYTES = 256 * 1024;
 const shapes = new WeakMap();
 /** The body's shape; undefined when it is small or not a JSON request with messages. */
-export function bodyShape(body) {
-    if (body.length < SHAPE_MIN_BYTES)
+export function bodyShape(body, includeSmall = false) {
+    if (!includeSmall && body.length < SHAPE_MIN_BYTES)
         return undefined;
     if (!shapes.has(body))
         shapes.set(body, computeShape(body));
@@ -73,7 +73,7 @@ function computeShape(body) {
     const shape = { frame: hash(JSON.stringify(canonical)),
         messages: [], sizes: [], imageChars: [],
         serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
-        imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
+        imageDims: [], unanchorable: false, frameAnchorable: frameAnchorable(frame), lastUnsized: -1, lastExpanding: -1,
         unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
     if (Array.isArray(canonical.system)) {
         let billingBytes = 0;
@@ -96,10 +96,11 @@ function computeShape(body) {
         shape.imageChars.push(imageCharsOf(message, shape));
         if (!message || typeof message !== "object" ||
             !Object.keys(message).every((key) => MESSAGE_FIELDS.has(key)))
-            shape.unanchorable = true;
+            shape.lastUnsized = shape.messages.length - 1;
         if (text.includes('"type":"tool_reference"'))
             shape.lastExpanding = shape.messages.length - 1;
     }
+    shape.unanchorable = !shape.frameAnchorable || shape.lastUnsized >= 0;
     return shape;
 }
 function hash(text) {
@@ -145,14 +146,20 @@ function withoutMarker(block) {
  * image's dimensions, and any image that is not inline, are noted on `shape`. */
 function imageCharsOf(message, shape) {
     const content = message?.content;
-    return Array.isArray(content) ? blockImageChars(content, shape) : 0;
+    if (Array.isArray(content))
+        return blockImageChars(content, shape);
+    if (typeof content !== "string")
+        shape.lastUnsized = shape.messages.length - 1;
+    return 0;
 }
 function blockImageChars(blocks, shape, nested = false) {
     let total = 0;
     for (const item of blocks) {
         const block = item;
-        if (!block || typeof block !== "object")
+        if (!block || typeof block !== "object") {
+            shape.lastUnsized = shape.messages.length - 1;
             continue;
+        }
         const source = block.source;
         if (block.type === "image" && source?.type === "base64" && typeof source.data === "string") {
             total += source.data.length;
@@ -162,11 +169,11 @@ function blockImageChars(blocks, shape, nested = false) {
             if (Array.isArray(block.content))
                 total += blockImageChars(block.content, shape, true);
             else if (block.content !== undefined && typeof block.content !== "string") {
-                shape.unanchorable = true;
+                shape.lastUnsized = shape.messages.length - 1;
             }
         }
         else if (!(nested ? NESTED_BLOCKS : MESSAGE_BLOCKS).has(String(block.type))) {
-            shape.unanchorable = true;
+            shape.lastUnsized = shape.messages.length - 1;
         }
     }
     return total;

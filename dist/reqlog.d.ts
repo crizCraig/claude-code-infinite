@@ -295,6 +295,8 @@ export interface MessagesRecord {
      * the CCC_TOOL_ROUTE_RECOVERY=0 kill switch.
      */
     compaction?: CompactionRecord;
+    /** A count-failure decision made only at delivery. */
+    countFailure?: CompactionRecord["countFailure"];
     /**
      * Main thread near the budget: what preparing a compressed prefix decided
      * (prepared-compression.ts): "prepare" started a background call; "fresh",

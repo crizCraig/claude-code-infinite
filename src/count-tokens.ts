@@ -47,7 +47,6 @@ export const COUNT_DEADLINE_MAX_MS = 30_000;
 export const ANTHROPIC_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MAX_COUNT_RESPONSE_BYTES = 64 * 1024;
 const MAX_COUNT_COOLDOWNS = 128;
-const MAX_SIZE_REJECTIONS = 128;
 const COUNT_COOLDOWN_MS = 60_000;
 /**
  * Plausible tokens per byte for a sample. Text runs ~0.25-0.5. Above 1 the
@@ -92,8 +91,6 @@ export interface SizeSample {
   model?: string;
   messageCount?: number;
   prefixDigest?: string;
-  /** Prefix digest with Claude Code's volatile billing text removed. */
-  billingDigest?: string;
 }
 
 /** Where a count call goes: the proxy's upstream. */
@@ -243,60 +240,37 @@ export const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
 export function createCountTokensSession(
   options: CountTokensSessionOptions,
   cooldowns = new CountTokensCooldowns(),
-  rejectedSizes = new Set<string>(),
-): CountTokensSession & { rejectMessageSize(body: Buffer): void } {
+): CountTokensSession {
   const pending = new Map<string, Promise<CountTokensResult>>();
   const completed = new Map<string, CountTokensResult>();
   const account = countAccountKey(options);
   const clock = new CountingClock();
   let allowance = 0;
   const retries = new Set<"brief" | "delivery">();
-  // The same bytes can fit under a different account, beta or API version.
-  const scope = JSON.stringify([account, options.requestUrl, options.headers["anthropic-beta"],
-    options.headers["anthropic-version"]]);
-  const rejectedKey = (digest: string) => bodyHash(Buffer.from(scope + digest));
-  const wasRejected = (digest: string) =>
-    rejectedSizes.size > 0 && rejectedSizes.has(rejectedKey(digest));
-  function rememberRejection(digest: string): void {
-    const key = rejectedKey(digest);
-    rejectedSizes.delete(key);
-    rejectedSizes.add(key);
-    if (rejectedSizes.size > MAX_SIZE_REJECTIONS) {
-      rejectedSizes.delete(rejectedSizes.values().next().value!);
-    }
-  }
-  function attemptCount(key: string, body: Buffer, timeoutMs: number): Promise<CountTokensResult> {
-    return clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs })).then(result => {
-      if (result.outcome === "too-large") rememberRejection(key);
-      return recordAttempt(options, cooldowns, account, result);
-    });
+  function attemptCount(body: Buffer, timeoutMs: number): Promise<CountTokensResult> {
+    return clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
+      .then(result => recordAttempt(options, cooldowns, account, result));
   }
   return {
-    rejectMessageSize: body => rememberRejection(bodyHash(body)),
-    peek(body) {
-      const digest = bodyHash(body);
-      return wasRejected(digest)
-        ? { ms: 0, outcome: "too-large" } : completed.get(digest);
-    },
+    peek: body => completed.get(bodyHash(body)),
     retry: (body, maxWaitMs) => {
       const key = bodyHash(body);
       const prior = completed.get(key);
       const kind = maxWaitMs === undefined ? "delivery" : "brief";
-      if (retries.has(kind) || wasRejected(key) || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
+      if (retries.has(kind) || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
           options.signal?.aborted || cooldowns.active(account)) return undefined;
       const timeoutMs = maxWaitMs === undefined ? requestAllowance(options, body.length)
         : Math.min(maxWaitMs, allowance - clock.spent());
       if (timeoutMs < MIN_COUNT_ATTEMPT_MS) return undefined;
       retries.add(kind);
       completed.delete(key);
-      const attempt = attemptCount(key, body, timeoutMs)
+      const attempt = attemptCount(body, timeoutMs)
         .then((result) => { completed.set(key, result); return result; });
       pending.set(key, attempt);
       return attempt;
     },
     count: (body) => {
       const key = bodyHash(body);
-      if (wasRejected(key)) return Promise.resolve({ ms: 0, outcome: "too-large" });
       const existing = pending.get(key);
       if (existing) return existing;
       const tooLarge = exceedsRequestLimit(body.length);
@@ -307,7 +281,7 @@ export function createCountTokensSession(
           : remaining < MIN_COUNT_ATTEMPT_MS ? "deadline" : undefined;
       const attempt = skipped
         ? Promise.resolve<CountTokensResult>({ ms: 0, outcome: skipped, bytes: body.length })
-        : attemptCount(key, body, remaining);
+        : attemptCount(body, remaining);
       if (skipped === "too-large") attempt.then((result) => notifyAttempt(options, result));
       const saved = attempt.then((result) => { completed.set(key, result); return result; });
       pending.set(key, saved);
@@ -343,8 +317,7 @@ export function countUpstreamTokens(
       request?.destroy();
     };
     const abort = () => finish({ outcome: "aborted" });
-    let interrupted = (outcome: "network-error" | "timeout") => finish({ outcome });
-    timer = setTimeout(() => interrupted("timeout"), remaining);
+    timer = setTimeout(() => finish({ outcome: "timeout" }), remaining);
     args.signal?.addEventListener("abort", abort, { once: true });
     try {
       request = args.upstream.module.request({
@@ -353,8 +326,8 @@ export function countUpstreamTokens(
         method: "POST",
         path: countTokensPath(args.requestUrl),
         headers: countTokensHeaders(args.headers, payload.length),
-      }, (res) => { interrupted = readCount(res, finish); });
-      request.on("error", () => interrupted("network-error"));
+      }, (res) => readCount(res, finish));
+      request.on("error", () => finish({ outcome: "network-error" }));
       if (args.signal?.aborted) abort();
       else request.end(payload);
     } catch {
@@ -404,43 +377,30 @@ function countTokensHeaders(
 function readCount(
   res: http.IncomingMessage,
   done: (result: Omit<CountTokensResult, "ms">) => void,
-): (outcome: "network-error" | "timeout") => void {
+): void {
   const status = res.statusCode;
-  const httpFailure = status === 401 || status === 403 ? "auth" : status === 429 ? "rate-limit"
-    : status === 408 ? "timeout" : status && status >= 500 ? "server-error" : "http-error";
-  const chunks: Buffer[] = [];
-  const errorResult = () => {
-    const outcome = isSizeRejection(status, Buffer.concat(chunks).toString("utf-8"))
-      ? "too-large" : httpFailure;
+  res.on("error", () => done({ outcome: "network-error", status }));
+  res.on("aborted", () => done({ outcome: "network-error", status }));
+  if (status !== 200) {
+    const outcome = status === 401 || status === 403 ? "auth"
+      : status === 429 ? "rate-limit" : status !== undefined && status >= 500
+        ? "server-error" : "http-error";
     done({ outcome, status, retryAfter: res.headers["retry-after"] });
-  };
-  // A timeout or socket close after error headers must preserve the HTTP
-  // rejection and any size evidence already received.
-  const interrupted = (outcome: "network-error" | "timeout") =>
-    status === 200 ? done({ outcome, status }) : errorResult();
-  res.on("error", () => interrupted("network-error"));
-  res.on("aborted", () => interrupted("network-error"));
-  if (status === 413) {
-    done({ outcome: "too-large", status });
-    return interrupted;
+    res.destroy();
+    return;
   }
+  const chunks: Buffer[] = [];
   let bytes = 0;
   res.on("data", (chunk: Buffer) => {
-    if (bytes + chunk.length > MAX_COUNT_RESPONSE_BYTES) {
-      chunks.push(chunk.subarray(0, MAX_COUNT_RESPONSE_BYTES - bytes));
-      if (status === 200) done({ outcome: "invalid-response", status });
-      else errorResult();
+    bytes += chunk.length;
+    if (bytes > MAX_COUNT_RESPONSE_BYTES) {
+      done({ outcome: "invalid-response", status });
       res.destroy();
-    } else {
-      chunks.push(chunk);
-      bytes += chunk.length;
-    }
+    } else chunks.push(chunk);
   });
   res.on("end", () => {
-    if (status !== 200) return errorResult();
-    const body = Buffer.concat(chunks).toString("utf-8");
     try {
-      const tokens = JSON.parse(body)?.input_tokens;
+      const tokens = JSON.parse(Buffer.concat(chunks).toString("utf-8"))?.input_tokens;
       if (typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0) {
         done({ tokens, outcome: "success", status });
       } else done({ outcome: "invalid-response", status });
@@ -448,28 +408,6 @@ function readCount(
       done({ outcome: "invalid-response", status });
     }
   });
-  return interrupted;
-}
-
-/** Recognize provider size errors from their code or message, including plain-text gateways. */
-export function isSizeRejection(status: number | undefined, body: string): boolean {
-  if (status === 413) return true;
-  if (!status || status < 400) return false;
-  let detail = body;
-  try {
-    const parsed = JSON.parse(body);
-    const error = parsed?.error ?? parsed;
-    detail = typeof error === "string" ? error :
-      [error?.code, error?.type, error?.message, error?.detail].filter(v => typeof v === "string").join(" ");
-  } catch { /* Plain-text upstream. */ }
-  detail = detail.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().replace(/[_-]/g, " ");
-  if (/(?:prompt|input|context|request|payload|content|entity|body|message|string)(?: (?:size|length|window))? (?:is |was )?too (?:long|large|big)/.test(detail)) return true;
-  if (/maximum context length|(?:context (?:length|window|limit)|token (?:count|limit)|input tokens|request size) exceeded/.test(detail)) return true;
-  if (/(?:prompt|input|payload|request) (?:length |size )?exceeds (?:the )?(?:maximum|max|limit)/.test(detail)) return true;
-  // Some gateways report the measured token count between the subject and the limit.
-  if (/exceeds? (?:the )?(?:max(?:imum)? |allowed )*(?:context (?:length|window)|number of tokens|input length)/.test(detail)) return true;
-  // A quota per minute is independent of whether this request fits the window.
-  return /too many (?:input |prompt )?tokens/.test(detail) && !/rate limit|tokens per (?:minute|second|day)/.test(detail);
 }
 
 function bodyHash(body: Buffer): string {

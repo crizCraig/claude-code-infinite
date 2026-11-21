@@ -58,12 +58,11 @@ import {
 import {
   createCountTokensSession,
   CountTokensCooldowns,
-  isSizeRejection,
   plausibleSample,
   type SizeSample,
 } from "./count-tokens.js";
-import { RequestSizing, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation,
-  type CandidateMeasurement, type PlannedSize, type RequestCandidate, type SizingLimits }
+import { RequestSizing, estimateLimits, estimateRequestTokens, fitsMeasured, fitsNative, outputReservation,
+  type CandidateMeasurement, type CountedPrefix, type PlannedSize, type RequestCandidate, type SizingLimits }
   from "./request-sizing.js";
 import {
   extendsHistory, mediaFreeMessageHash, prefixIdentity, prefixMessageMatches, type PrefixIdentity,
@@ -76,7 +75,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { CLAUDE_PID_HEADER, HOST_TOKEN_HEADER } from "./host-session.js";
-import type { Transform } from "node:stream";
+import { Readable, type Transform } from "node:stream";
 import {
   brotliDecompressSync,
   createBrotliDecompress,
@@ -742,7 +741,7 @@ interface ProxyState {
    */
   serverReportsBudget: boolean;
   countTokensCooldowns: CountTokensCooldowns;
-  rejectedMessageSizes: Set<string>;
+  exactPrefixes: Map<string, CountedPrefix>;
   /**
    * Per session and model (sessionSizeKey): Anthropic's reported size of the
    * last main-thread request forwarded whole (no prefix), with its body bytes,
@@ -1254,7 +1253,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
-    rejectedMessageSizes: new Set(),
+    exactPrefixes: new Map(),
     passthroughSizes: new Map(),
     laneSizes: new Map(),
   };
@@ -2429,9 +2428,12 @@ async function handleMessages(
       (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
         bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
     },
-  }, state.countTokensCooldowns, state.rejectedMessageSizes);
+  }, state.countTokensCooldowns);
+  const keepExact = requestSessionKey !== undefined && !notConversation;
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true,
-    typeof body.model === "string" ? body.model : undefined);
+    typeof body.model === "string" ? body.model : undefined,
+    keepExact ? state.exactPrefixes.get(requestSizeKey) : undefined,
+    keepExact ? prefix => boundedSet(state.exactPrefixes, requestSizeKey, prefix) : undefined);
   if (carriesServerTools(body)) serverToolRecords.add(rec);
   const sizeSlot = wholeRequestSizeSlot(state, isMainRequest, requestSessionKey, requestSizeKey,
     body.model);
@@ -2514,7 +2516,26 @@ async function handleMessages(
     failedRebuild: false,
     allowed: new WeakSet<Buffer>(),
     sizing: requestSizing,
-    rejectMessageSize: countSession.rejectMessageSize,
+    recoverOverflow: async () => {
+      if (rec.lateCountRecovery || state.toolRecoveryAttemptedLanes.get(requestRouteKey)?.inFlight) return;
+      const policy = requestSendPolicies.get(req)!;
+      rec.lateCountRecovery = { outcome: "refused" };
+      const replacement = await holdingLane(state, requestRouteKey,
+        () => policy.recoverLate(modelContextLimit, undefined, true));
+      if (!replacement) return;
+      const candidate = requestSizing.register(replacement, "replacement");
+      const limits = sizingLimits();
+      if (candidate.kind !== "replacement" || !fitsMeasured(await requestSizing.measure(candidate, limits), limits)) {
+        lateRouteInstalls.get(rec)?.settle(false);
+        lateRouteInstalls.delete(rec);
+        return;
+      }
+      selectedCandidates.set(rec, candidate);
+      changedDeliveryRecords.add(rec);
+      recordTurn(rec, rec.turnType, candidate.body);
+      rec.lateCountRecovery.outcome = "compressed";
+      return candidate.body;
+    },
     select: (buffer) => selectForwardCandidate({
       opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
       preferredBody: buffer, limits: sizingLimits(),
@@ -2528,12 +2549,12 @@ async function handleMessages(
     },
     // The ride's bytes are only what failed; recovery always compresses the
     // ORIGINAL conversation (the one MemTree indexed), never the ride itself.
-    recoverLate: async (_ride, rideTokens, target) => {
+    recoverLate: async (rideTokens, target, upstreamRejected = false) => {
       // A compression already made may be redone only to a smaller target.
-      if (notConversation || (rec.compress && target === undefined) ||
+      if (notConversation || (!upstreamRejected && rec.compress && target === undefined) ||
           compactionMode(opts, state, requestSessionKey, requestRouteLane).mode === "off" ||
           !hasEarlierNonToolUserMessage(messages) ||
-          (rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false)) return undefined;
+          (!upstreamRejected && rec.turnType.startsWith("tool") && opts.toolRouteRecovery === false)) return undefined;
       return recoverLateCount({ opts, state, req, rec, body, msgsForMemtree, hash, rideTokens,
         modelContextLimit, clientMeta, sizing: requestSizing, inputCandidate: forwardCandidate,
         route: { key: requestRouteKey, messages, epoch: routeEpoch,
@@ -4843,10 +4864,7 @@ function sizeSampleOf(sent: Buffer, tokens: number, model: unknown): SizeSample 
 function sampleLineage(sent: Buffer, model: string | undefined): Partial<SizeSample> {
   const shape = bodyShape(sent);
   const digest = shape && prefixDigest(shape, shape.messages.length);
-  const billingDigest = shape?.billingFrame && prefixDigest(shape, shape.messages.length, shape.billingFrame);
-  return shape && digest && model
-    ? { model, messageCount: shape.messages.length, prefixDigest: digest,
-        ...(billingDigest ? { billingDigest } : {}) } : {};
+  return shape && digest && model ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
 }
 
 /**
@@ -5930,17 +5948,22 @@ function noteUncountedBound(
     exactSizedRecords.add(record);
     return;
   }
-  const guarded = sizing.failedCountTokens(candidate);
   const limits = { budget: record.budgetTokens, context: modelContextLimit,
     output: bodyOutputReservation(body, false) };
-  const fits = sizing.boundFits(candidate, limits);
-  if (guarded !== undefined) {
-    record.countFailure = { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
-      decision: !fits ? "over-window" : guarded >= record.budgetTokens ? "over-budget" : "within-limits" };
-  }
-  if (!fits) {
+  const failure = countFailureDecision(sizing, candidate, limits);
+  if (failure) record.countFailure = failure;
+  if (!sizing.boundFits(candidate, limits) && failure?.decision !== "over-budget") {
     record.uncountedOverWindow = true;
   }
+}
+
+function countFailureDecision(sizing: RequestSizing, candidate: RequestCandidate,
+  limits: SizingLimits): CompactionRecord["countFailure"] {
+  const guarded = sizing.failedCountTokens(candidate);
+  if (guarded === undefined) return undefined;
+  return { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
+    decision: !fitsNative(guarded, estimateLimits(limits)) ? "over-window"
+      : guarded >= limits.budget ? "over-budget" : "within-limits" };
 }
 
 /**
@@ -7545,13 +7568,17 @@ async function selectForwardCandidate(args: {
   const preferred = policy.sizing.register(intended,
     policy.allowed.has(intended) ? args.rec.compress ? "replacement" : "ride" : "original");
   const measured = await policy.sizing.measure(preferred, args.limits);
+  if (!args.rec.compaction?.countFailure) {
+    const failure = countFailureDecision(policy.sizing, preferred, args.limits);
+    if (failure) args.rec.countFailure = failure;
+  }
   let target = preferred;
   const late = lateRecoveryPlan(args.state, args.rec, preferred, measured, args.limits,
     args.routeKey);
   if (late) {
     args.rec.lateCountRecovery = { outcome: "forwarded" };
     const replacement = await holdingLane(args.state, args.routeKey,
-      () => policy.recoverLate(preferred.body, late.tokens, late.target));
+      () => policy.recoverLate(late.tokens, late.target));
     if (replacement) target = policy.sizing.register(replacement, "replacement");
   }
   const selection = await policy.sizing.select(target, args.limits) ??
@@ -7608,7 +7635,9 @@ async function selectForwardCandidate(args: {
   } else if (degraded) {
     delete args.rec.degradedNotice;
   }
-  return changed ? candidate.body : intended;
+  const selected = changed ? candidate.body : intended;
+  if (policy.sizing.failedCountTokens(candidate) !== undefined) policy.guardedBody = selected;
+  return selected;
 }
 
 /** MemTree's answer when the conversation cannot fit the window even compressed. */
@@ -8188,10 +8217,11 @@ const candidateSizeOwners = new WeakMap<RequestCandidate, SizeHolder | SizeSlot>
 const requestSendPolicies = new WeakMap<http.IncomingMessage, {
   original: Buffer; failedRebuild: boolean; allowed: WeakSet<Buffer>;
   sizing: RequestSizing;
-  rejectMessageSize: (body: Buffer) => void;
+  guardedBody?: Buffer;
+  recoverOverflow: () => Promise<Buffer | undefined>;
   fitsNative: (body: Buffer) => Promise<boolean>;
   /** Recompress the ORIGINAL conversation after a ride counted `tokens` late. */
-  recoverLate: (ride: Buffer, tokens: number, target?: number) => Promise<Buffer | undefined>;
+  recoverLate: (tokens: number, target?: number, upstreamRejected?: boolean) => Promise<Buffer | undefined>;
   /** The exact body selected for delivery, or undefined after a refusal. */
   select: (body: Buffer) => Promise<Buffer | undefined>;
   delivered: () => void;
@@ -8208,10 +8238,26 @@ async function forwardRaw(
   // A late recovery's replacement went out instead: it installs as its route.
   const lateInstall = rec && selected !== bodyBuffer ? lateRouteInstalls.get(rec) : undefined;
   if (rec) lateRouteInstalls.delete(rec);
-  const delivered = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec,
-    selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate);
+  const recover = policy?.guardedBody === selected ? policy.recoverOverflow : undefined;
+  const first = await forwardAccepted(req, res, selected, opts, upstream, shutdownSignal, rec,
+    selected === bodyBuffer ? onProtocolComplete : lateInstall?.activate, recover);
+  let delivered = first === true;
   lateInstall?.settle(delivered, selected);
-  if (delivered && rec) noteSelectedCandidateSize(rec);
+  if (Buffer.isBuffer(first) && rec) {
+    const install = lateRouteInstalls.get(rec);
+    lateRouteInstalls.delete(rec);
+    try {
+      if (!res.destroyed && !shutdownSignal.aborted) {
+        delivered = await forwardAccepted(req, res, first, opts, upstream, shutdownSignal, rec, install?.activate) === true;
+      }
+    } finally {
+      install?.settle(delivered, first);
+    }
+  }
+  if (delivered) {
+    policy?.delivered();
+    if (rec) noteSelectedCandidateSize(rec);
+  }
   return delivered;
 }
 
@@ -8231,7 +8277,8 @@ function noteSelectedCandidateSize(rec: MessagesRecord): void {
   }
 }
 
-/** forwardRaw once the request's send policy (if any) accepted the body. */
+/** Forward one attempt. A verified replacement returns to forwardRaw before the
+ * rejected response commits headers, so the caller can send it once. */
 function forwardAccepted(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -8240,9 +8287,9 @@ function forwardAccepted(
   upstream: Upstream,
   shutdownSignal: AbortSignal,
   rec?: MessagesRecord,
-  onProtocolComplete?: () => void
-): Promise<boolean> {
-  const policy = requestSendPolicies.get(req);
+  onProtocolComplete?: () => void,
+  recoverOverflow?: () => Promise<Buffer | undefined>
+): Promise<boolean | Buffer> {
   return new Promise((resolve) => {
     const headers = forwardableRequestHeaders(req);
     headers["content-length"] = String(bodyBuffer.length);
@@ -8285,14 +8332,13 @@ function forwardAccepted(
         // Route/observer bookkeeping can never affect byte delivery.
       }
     };
-    const settle = (ok: boolean) => {
+    const settle = (result: boolean | Buffer) => {
       if (settled) return;
       settled = true;
-      if (ok) policy?.delivered();
       res.off("finish", onResponseFinish);
       res.off("close", onResponseClose);
       shutdownSignal.removeEventListener("abort", cancelForShutdown);
-      resolve(ok);
+      resolve(result);
     };
     const maybeSettle = () => {
       if (upstreamCompleted && responseFinished) {
@@ -8362,10 +8408,9 @@ function forwardAccepted(
         path: req.url, // path + query string verbatim (?beta=true etc.)
         headers,
       },
-      (upstreamRes) => {
+      async (upstreamRes) => {
         upstream.unreachable = undefined;
         activeUpstreamRes = upstreamRes;
-        if (upstreamRes.statusCode === 413) policy?.rejectMessageSize(bodyBuffer);
         const contentType = String(upstreamRes.headers["content-type"] ?? "");
         const isSse = contentType.includes("text/event-stream");
         const contentEncoding = String(
@@ -8373,6 +8418,31 @@ function forwardAccepted(
         ).trim().toLowerCase();
         const compressed =
           contentEncoding !== "" && contentEncoding !== "identity";
+        let responseBody: Readable = upstreamRes;
+        if (recoverOverflow && rec && !res.headersSent) {
+          try {
+            const inspected = await inspectMessagesResponse(upstreamRes, isSse, contentEncoding);
+            responseBody = inspected.stream;
+            if (inspected.overflow && !settled) {
+              const replacement = await recoverOverflow();
+              if (replacement) {
+                if (settled) {
+                  lateRouteInstalls.get(rec)?.settle(false);
+                  lateRouteInstalls.delete(rec);
+                } else {
+                  settle(replacement);
+                }
+                upstreamRes.destroy();
+                return;
+              }
+            }
+            if (settled) return;
+          } catch {
+            res.destroy();
+            settle(false);
+            return;
+          }
+        }
         let sawFirstByte = false;
         let sawMessageStop = false;
         let observerFailed = false;
@@ -8461,13 +8531,13 @@ function forwardAccepted(
               upstreamRes.destroy();
               return false;
             }
-            if (res.write(chunk)) upstreamRes.resume();
-            else res.once("drain", () => upstreamRes.resume());
+            if (res.write(chunk)) responseBody.resume();
+            else res.once("drain", () => responseBody.resume());
             return true;
           };
 
-          upstreamRes.on("data", (chunk: Buffer) => {
-            upstreamRes.pause();
+          responseBody.on("data", (chunk: Buffer) => {
+            responseBody.pause();
             observeRawChunk(chunk);
             if (decoderFailed) {
               forwardEncoded(chunk);
@@ -8505,7 +8575,7 @@ function forwardAccepted(
               forwardOnce();
             }
           });
-          upstreamRes.on("end", () => {
+          responseBody.on("end", () => {
             let finished = false;
             const finish = () => {
               if (finished) return;
@@ -8526,12 +8596,12 @@ function forwardAccepted(
               finish();
             }
           });
-          upstreamRes.on("error", () => {
+          responseBody.on("error", () => {
             incrementalDecoder.destroy();
             res.destroy();
             settle(false);
           });
-          upstreamRes.on("aborted", () => {
+          responseBody.on("aborted", () => {
             incrementalDecoder.destroy();
             res.destroy();
             settle(false);
@@ -8543,7 +8613,7 @@ function forwardAccepted(
           // Same observation as below, but the client gets the rewriter's
           // output (original frames plus the appended block) instead of the
           // raw bytes. Backpressure mirrors pipe().
-          upstreamRes.on("data", (chunk: Buffer) => {
+          responseBody.on("data", (chunk: Buffer) => {
             if (rec && !sawFirstByte) {
               sawFirstByte = true;
               rec.ttfbMs = Date.now() - forwardStarted;
@@ -8551,44 +8621,44 @@ function forwardAccepted(
             const out = sseObserver.push(chunk);
             if (!out || res.destroyed || res.writableEnded) return;
             if (!res.write(out)) {
-              upstreamRes.pause();
-              res.once("drain", () => upstreamRes.resume());
+              responseBody.pause();
+              res.once("drain", () => responseBody.resume());
             }
             if (sawMessageStop && !observerFailed && !res.destroyed) {
               notifyProtocolComplete();
             }
           });
-          upstreamRes.on("end", () => {
+          responseBody.on("end", () => {
             const rest = sseObserver.flush();
             if (rest && !res.destroyed && !res.writableEnded) res.write(rest);
             if (!res.destroyed && !res.writableEnded) res.end();
             completeUpstream(!observerFailed && sawMessageStop);
           });
-          upstreamRes.on("error", () => {
+          responseBody.on("error", () => {
             res.destroy();
             settle(false);
           });
-          upstreamRes.on("aborted", () => {
+          responseBody.on("aborted", () => {
             res.destroy();
             settle(false);
           });
           return;
         }
 
-        upstreamRes.on("data", observeRawChunk);
-        upstreamRes.pipe(res);
+        responseBody.on("data", observeRawChunk);
+        responseBody.pipe(res);
         if (isSse && !compressed) {
           // Registered after pipe(), so this runs only after the raw chunk
           // containing the complete message_stop frame has been accepted by
           // ServerResponse. The callback still runs synchronously before a
           // client can issue the resulting tool request.
-          upstreamRes.on("data", () => {
+          responseBody.on("data", () => {
             if (sawMessageStop && !observerFailed && !res.destroyed) {
               notifyProtocolComplete();
             }
           });
         }
-        upstreamRes.on("end", () => {
+        responseBody.on("end", () => {
           let observed: Buffer | null = null;
           if (observedChunks) {
             observed = decodeForObservation(
@@ -8599,10 +8669,6 @@ function forwardAccepted(
               mergeUsageFromJsonBody(observed, rec);
               if ((upstreamRes.statusCode ?? 0) >= 400) {
                 rec.upstreamError = upstreamErrorCode(observed);
-                if (upstreamRes.statusCode !== 413 &&
-                    isSizeRejection(upstreamRes.statusCode, observed.toString("utf8"))) {
-                  policy?.rejectMessageSize(bodyBuffer);
-                }
               }
             }
           }
@@ -8619,11 +8685,11 @@ function forwardAccepted(
             );
           }
         });
-        upstreamRes.on("error", () => {
+        responseBody.on("error", () => {
           res.destroy();
           settle(false);
         });
-        upstreamRes.on("aborted", () => {
+        responseBody.on("aborted", () => {
           res.destroy();
           settle(false);
         });
@@ -8631,7 +8697,7 @@ function forwardAccepted(
     );
 
     upstreamReq.on("error", (err) => {
-      if (!shutdownCancelled) {
+      if (!settled && !shutdownCancelled) {
         sendAnthropicError(res, upstreamFailureMessage(upstream, err, !activeUpstreamRes));
       }
       settle(false);
@@ -8639,6 +8705,74 @@ function forwardAccepted(
 
     upstreamReq.end(bodyBuffer);
   });
+}
+
+/** Inspect only the response to a guarded send. Keep the wire bytes so an unrelated
+ * error can pass through verbatim. Once SSE starts producing content, stream normally. */
+async function inspectMessagesResponse(response: http.IncomingMessage, sse: boolean, encoding: string):
+Promise<{ overflow: boolean; stream: Readable }> {
+  const status = response.statusCode ?? 502;
+  if (status === 429 || status === 402) return { overflow: false, stream: response };
+  if (!sse) {
+    const raw = await readAll(response);
+    const decoded = decodeForObservation(raw, encoding);
+    const overflow = messagesOverflow(status, decoded?.toString("utf8") ?? "");
+    return { overflow, stream: Readable.from([raw]) };
+  }
+  const chunks: Buffer[] = [];
+  const iterator = response[Symbol.asyncIterator]();
+  let overflow = false;
+  let decided = false;
+  const events = new SseNoticeRewriter({ onEvent: data => {
+    if (data?.type === "error") {
+      overflow = messagesOverflow(status, data);
+      decided = true;
+    } else if (data?.type === "content_block_delta" || data?.type === "message_stop") {
+      decided = true;
+    }
+  } });
+  const decoder = createObservationDecoder(encoding);
+  decoder?.on("data", chunk => events.push(chunk));
+  decoder?.on("error", () => { decided = true; });
+  try {
+    while (!decided) {
+      const next = await iterator.next();
+      if (next.done) break;
+      const raw: Buffer = next.value;
+      chunks.push(raw);
+      if (decoder) await new Promise<void>(resolve => decoder.write(raw, () => resolve()));
+      else events.push(raw);
+    }
+  } finally {
+    decoder?.destroy();
+  }
+  return { overflow, stream: Readable.from((async function* () {
+    yield* chunks;
+    yield* { [Symbol.asyncIterator]: () => iterator };
+  })()) };
+}
+
+/** Only a Messages rejection can trigger a compressed retry. A quota may mention a
+ * token limit in exactly the same words as a context error. */
+function messagesOverflow(status: number, payload: unknown): boolean {
+  if (status === 429) return false;
+  if (typeof payload === "string") {
+    try { payload = JSON.parse(payload); } catch { /* Plain-text gateway error. */ }
+  }
+  const envelope = payload as { type?: string; error?: unknown; status?: number } | null;
+  if (status < 400 && envelope?.type !== "error" && !envelope?.error) return false;
+  const error = envelope?.error ?? payload;
+  const fields = error as { type?: string; code?: string; message?: string; detail?: string; status?: number };
+  const detail = (typeof error === "string" ? error :
+    [fields?.type, fields?.code, fields?.message, fields?.detail].join(" "))
+    .toLowerCase().replace(/`/g, "").replace(/[_-]/g, " ");
+  if (envelope?.status === 429 || fields?.status === 429 || /quota|rate limit|usage limit|billing error|credit balance|too many requests/.test(detail) ||
+      /(?:per |\/)(?:minute|second|hour|day)|\b(?:[io]?tpm|rpm)\b/.test(detail)) return false;
+  return status === 413 || /(?:prompt|input|request|payload|body)(?: length| size)? (?:is )?too (?:long|large)/.test(detail) ||
+    /input length and max tokens exceed context limit|maximum context length|context (?:length|window|limit) exceeded/.test(detail) ||
+    /exceeds? (?:the )?(?:max(?:imum)? |allowed )*(?:context (?:length|window|limit)|number of tokens|input length)/.test(detail) ||
+    /(?:prompt|input|request|payload)(?: length| size)? exceeds (?:the )?(?:maximum|max|limit)/.test(detail) ||
+    /token (?:count|limit) exceeded|too many (?:input |prompt )?tokens/.test(detail);
 }
 
 function isCompleteJsonResponse(
