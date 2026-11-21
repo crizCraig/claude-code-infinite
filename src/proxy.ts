@@ -58,6 +58,7 @@ import {
 import {
   createCountTokensSession,
   CountTokensCooldowns,
+  isSizeRejection,
   plausibleSample,
   type SizeSample,
 } from "./count-tokens.js";
@@ -741,6 +742,7 @@ interface ProxyState {
    */
   serverReportsBudget: boolean;
   countTokensCooldowns: CountTokensCooldowns;
+  rejectedMessageSizes: Set<string>;
   /**
    * Per session and model (sessionSizeKey): Anthropic's reported size of the
    * last main-thread request forwarded whole (no prefix), with its body bytes,
@@ -1252,6 +1254,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     serverBudgets: new Map(),
     serverReportsBudget: false,
     countTokensCooldowns: new CountTokensCooldowns(),
+    rejectedMessageSizes: new Set(),
     passthroughSizes: new Map(),
     laneSizes: new Map(),
   };
@@ -2426,7 +2429,7 @@ async function handleMessages(
       (rec.countTokens ??= []).push({ statusClass: result.outcome, ms: result.ms,
         bytes: result.bytes ?? 0, timeoutMs: result.timeoutMs ?? 0 });
     },
-  }, state.countTokensCooldowns);
+  }, state.countTokensCooldowns, state.rejectedMessageSizes);
   const requestSizing = new RequestSizing(countSession, opts.countTokens === true,
     typeof body.model === "string" ? body.model : undefined);
   if (carriesServerTools(body)) serverToolRecords.add(rec);
@@ -2511,6 +2514,7 @@ async function handleMessages(
     failedRebuild: false,
     allowed: new WeakSet<Buffer>(),
     sizing: requestSizing,
+    rejectMessageSize: countSession.rejectMessageSize,
     select: (buffer) => selectForwardCandidate({
       opts, state, res, rec, body, modelContextLimit, req, routeKey: requestRouteKey,
       preferredBody: buffer, limits: sizingLimits(),
@@ -5932,7 +5936,7 @@ function noteUncountedBound(
   const fits = sizing.boundFits(candidate, limits);
   if (guarded !== undefined) {
     record.countFailure = { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
-      decision: !fits ? "over-window" : guarded > record.budgetTokens ? "over-budget" : "within-limits" };
+      decision: !fits ? "over-window" : guarded >= record.budgetTokens ? "over-budget" : "within-limits" };
   }
   if (!fits) {
     record.uncountedOverWindow = true;
@@ -5968,9 +5972,10 @@ function bodyOutputReservation(body: Record<string, any>, exact = true): number 
 
 /** A planned size as a measurement, exact only when Count Tokens measured it. */
 function plannedMeasurement(sizing: RequestSizing, candidate: RequestCandidate):
-  { tokens: number; source: "exact" | "reported" | "bytes" } {
+  Pick<CandidateMeasurement, "tokens" | "source" | "tooLarge"> {
   const planned = sizing.plan(candidate);
-  return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source };
+  return { tokens: planned.tokens, source: sizing.isExact(candidate) ? "exact" : planned.source,
+    ...(sizing.exceedsRequestLimit(candidate) ? { tooLarge: true } : {}) };
 }
 
 function regrantSmallerWindowRecovery(
@@ -7711,7 +7716,8 @@ function lateRecoveryPlan(
     const target = Math.floor(oversized.target - excess - oversized.target * SMALLER_TARGET_MARGIN);
     return target >= SERVER_MIN_TARGET_TOKENS ? { tokens: oversized.tokens, target } : undefined;
   }
-  if (rec.compress || measured.source !== "exact" || !(measured.tokens > limits.budget)) {
+  const countedOverBudget = measured.source === "exact" && measured.tokens > limits.budget;
+  if (rec.compress || (!countedOverBudget && !measured.tooLarge)) {
     return undefined;
   }
   // Another request of this lane is compressing (rec.routeRecovery "in-flight"):
@@ -8144,8 +8150,7 @@ function nearWindowWarned(state: ProxyState, sessionId: string | undefined): boo
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction: CompactionRecord | undefined): boolean {
   if (compaction?.estimatedTokens === undefined) return false;
-  return compaction.countFailure ? compaction.estimatedTokens > compaction.budgetTokens
-    : compaction.estimatedTokens >= compaction.budgetTokens;
+  return compaction.estimatedTokens >= compaction.budgetTokens;
 }
 
 /**
@@ -8183,6 +8188,7 @@ const candidateSizeOwners = new WeakMap<RequestCandidate, SizeHolder | SizeSlot>
 const requestSendPolicies = new WeakMap<http.IncomingMessage, {
   original: Buffer; failedRebuild: boolean; allowed: WeakSet<Buffer>;
   sizing: RequestSizing;
+  rejectMessageSize: (body: Buffer) => void;
   fitsNative: (body: Buffer) => Promise<boolean>;
   /** Recompress the ORIGINAL conversation after a ride counted `tokens` late. */
   recoverLate: (ride: Buffer, tokens: number, target?: number) => Promise<Buffer | undefined>;
@@ -8359,6 +8365,7 @@ function forwardAccepted(
       (upstreamRes) => {
         upstream.unreachable = undefined;
         activeUpstreamRes = upstreamRes;
+        if (upstreamRes.statusCode === 413) policy?.rejectMessageSize(bodyBuffer);
         const contentType = String(upstreamRes.headers["content-type"] ?? "");
         const isSse = contentType.includes("text/event-stream");
         const contentEncoding = String(
@@ -8592,6 +8599,10 @@ function forwardAccepted(
               mergeUsageFromJsonBody(observed, rec);
               if ((upstreamRes.statusCode ?? 0) >= 400) {
                 rec.upstreamError = upstreamErrorCode(observed);
+                if (upstreamRes.statusCode !== 413 &&
+                    isSizeRejection(upstreamRes.statusCode, observed.toString("utf8"))) {
+                  policy?.rejectMessageSize(bodyBuffer);
+                }
               }
             }
           }

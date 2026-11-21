@@ -24,24 +24,30 @@ async function until(condition, timeoutMs = 3_000) {
 
 async function harness({ count = () => ({ input_tokens: 10_000 }), usage = () => 10_000,
   countStatus = 200, budget = 200_000, enabled = true, compress, timeout = false,
-  compressBudgetMs, longCompressBudgetMs, messageThreads } = {}) {
+  compressBudgetMs, longCompressBudgetMs, messageThreads, messageError } = {}) {
   const counts = [], forwards = [], compressions = [], records = [];
   const upstream = await listen((req, res) => {
     let raw = '';
     req.on('data', chunk => { raw += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       const body = JSON.parse(raw);
       if (req.url.includes('/count_tokens')) {
         counts.push(body);
         if (timeout) return;
         // `count` may answer HANG: that one call never answers (a timeout).
-        const result = count(body, counts.length);
+        const result = await count(body, counts.length);
         if (result === HANG) return;
         if (result === DISCONNECT) return req.socket.destroy();
-        res.writeHead(countStatus, { 'content-type': 'application/json' });
+        res.writeHead(typeof countStatus === 'function' ? countStatus(counts.length) : countStatus, { 'content-type': 'application/json' });
         res.end(typeof result === 'string' ? result : JSON.stringify(result));
       } else {
         forwards.push(body);
+        const error = messageError?.(body, forwards.length);
+        if (error) {
+          res.writeHead(error.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(error.body));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ type: 'message', role: 'assistant',
           content: [{ type: 'text', text: 'ok' }],
@@ -992,4 +998,81 @@ test('the fallback budget mirrors the server: every Claude model near its window
   for (const model of ['claude-x', 'gpt-6', undefined]) {
     assert.equal(fallbackBudgetTokens(model, 1_000_000), 800_000, String(model));
   }
+});
+
+const billing = id => [{ type: 'text', text:
+  `x-anthropic-billing-header: cc_version=2.1.327; cc_entrypoint=sdk-cli; cc_turn_origin=sdk; cch=${id};` }];
+
+async function postSampleAndStep(h, prefixBytes, appendedBytes) {
+  const messages = [{ role: 'user', content: 'task' }, ...toolRound('first', prefixBytes)];
+  assert.equal(await h.post(0, { ...OPUS_1M, messages, system: billing('a') }), 200);
+  return h.post(0, { ...OPUS_1M, messages: [...messages, ...toolRound('next', appendedBytes)],
+    system: billing('b') });
+}
+
+for (const [status, body, disconnectFirst] of [
+  [413, {}, false],
+  [400, { error: { type: 'invalid_request_error', message: 'prompt is too long: 1000100 tokens' } }, true],
+  [422, { error: { code: 'context_length_exceeded' } }, false],
+  [503, 'request payload too large', false],
+]) {
+  test(`count size rejection ${status} forces compression of those bytes`, async () => {
+    const h = await harness({ budget: 960_000, usage: () => 796_129,
+      countStatus: n => n === 1 ? 200 : status,
+      count: (_body, n) => n === 1 ? { input_tokens: 796_129 }
+        : n === 2 && disconnectFirst ? DISCONNECT : body,
+      compress: () => compressedReply(4000, 960_000) });
+    try {
+      assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
+      assert.match(JSON.stringify(h.forwards.at(-1).messages), /memory m/);
+      assert.equal(h.records.filter(r => r.kind === 'messages').at(-1).countTokens.at(-1).statusClass,
+        'too-large');
+    } finally { h.close(); }
+  });
+}
+
+test('a Messages size rejection forces compression when the client repeats those bytes', async () => {
+  const h = await harness({ messageError: (_body, n) => n === 1 ? { status: 400,
+    body: { error: { message: 'prompt is too long' } } } : undefined,
+    compress: () => compressedReply(4000) });
+  try {
+    assert.equal(await h.post(10_000), 400);
+    assert.equal(await h.post(10_000), 200);
+    assert.match(JSON.stringify(h.forwards[1].messages), /memory m/);
+  } finally { h.close(); }
+});
+
+test('guarded size at the soft budget triggers compression and logs over-budget', async () => {
+  async function run(budget) {
+    const h = await harness({ budget, usage: () => 796_129,
+      count: (_body, n) => n === 1 ? { input_tokens: 796_129 } : DISCONNECT,
+      compress: () => compressedReply(4000, budget) });
+    try {
+      assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
+      return { decision: h.records.filter(r => r.kind === 'messages').at(-1).compaction.countFailure,
+        blocking: h.compressions.filter(c => !c.prepare && c.compression_target_tokens !== -1).length };
+    } finally { h.close(); }
+  }
+  const first = await run(960_000);
+  const equal = await run(first.decision.guardedTokens);
+  assert.equal(equal.decision.guardedTokens, first.decision.guardedTokens);
+  assert.equal(equal.decision.decision, 'over-budget');
+  assert.equal(equal.blocking, 1);
+});
+
+test('delivery still counts a fitting request after planning exhausts its brief retry', async () => {
+  const tokens = 850_000;
+  const h = await harness({ budget: 960_000, usage: () => tokens, count: async (_body, n) => {
+    if (n === 2) return DISCONNECT;
+    if (n >= 3) await new Promise(resolve => setTimeout(resolve, 1250));
+    return { input_tokens: tokens };
+  }, compress: () => ({ status: 503, body: { detail: 'MemTree unavailable' } }) });
+  try {
+    assert.equal(await postSampleAndStep(h, 2_215_000, 6_000), 200);
+    const rec = h.records.filter(r => r.kind === 'messages').at(-1);
+    assert.deepEqual(rec.countTokens.map(c => c.statusClass), ['network-error', 'timeout', 'success']);
+    assert.ok(rec.countTokens[1].timeoutMs <= 1000);
+    assert.ok(rec.countTokens[2].timeoutMs > 1250);
+    assert.equal(rec.requestBytes, rec.forwardedBytes);
+  } finally { h.close(); }
 });

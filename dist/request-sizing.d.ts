@@ -25,7 +25,7 @@ export interface CandidateMeasurement {
     /** Advisory estimate retained for compression and stale-estimate diagnostics. */
     estimatedTokens: number;
     count?: CountTokensResult;
-    /** Over Anthropic's request size limit: it cannot be sent natively at any size. */
+    /** The local byte limit or an upstream size rejection rules out these bytes. */
     tooLarge?: true;
 }
 export interface RequestCandidate {
@@ -64,7 +64,7 @@ export declare class RequestSizing {
     canCount(candidate: RequestCandidate): boolean;
     /** Whether delivery's one retry (retryTimedOutCount) could still count this body. */
     canRetryCount(candidate: RequestCandidate): boolean;
-    /** Whether Anthropic would refuse this body's size (413) before reading it. */
+    /** Whether the byte limit or an upstream size rejection rules out this body. */
     exceedsRequestLimit(candidate: RequestCandidate): boolean;
     /** Whether the conservative bound alone admits this body under `limits`. */
     boundFits(candidate: RequestCandidate, limits: SizingLimits): boolean;
