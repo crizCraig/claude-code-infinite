@@ -66,6 +66,9 @@ test("a ticket that misses its deadline during a slow tool cannot authorize a no
   await beginRecall({ ...stop, hook_event_name: "PreToolUse", tool_name: "mcp__memtree__search", tool_use_id: id }, account);
   let finishTool;
   const toolResult = new Promise(resolve => { finishTool = resolve; });
+  // A real pending tool has live I/O. AbortSignal.timeout alone lets Node 20 exit.
+  const watchdog = setTimeout(finishTool, 2000, "ticket deadline never fired");
+  t.after(() => clearTimeout(watchdog));
   t.mock.method(fs.promises, "readFile", async (file, { signal }) => {
     await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
     setImmediate(finishTool, "tool answer");
