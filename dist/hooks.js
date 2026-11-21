@@ -196,7 +196,6 @@ export class NoticeDeliveryQueue {
     delivered = new Map();
     trailer = null;
     trailerPlacement = "message";
-    statusLineShowsLink = false;
     firstTreeIntro = null;
     /** Key of the last trailer shown; a different key is announced as new. */
     constructor(ttlMs = DEFAULT_NOTICE_TTL_MS, now = Date.now, color = terminalSupportsColor()) {
@@ -238,8 +237,7 @@ export class NoticeDeliveryQueue {
      * new. Not once-per-key like the success-line link: the point is that the
      * link is always at the bottom of the screen.
      */
-    setTrailer(resolve, placement = "message", statusLineShowsLink = false) {
-        this.statusLineShowsLink = statusLineShowsLink;
+    setTrailer(resolve, placement = "message") {
         this.trailer = resolve;
         this.trailerPlacement = placement;
     }
@@ -284,7 +282,7 @@ export class NoticeDeliveryQueue {
      * Claim eligible notice parts atomically for one hook invocation. Subagent
      * hooks share the plugin but must never consume the main turn's notice.
      */
-    claim(input) {
+    claim(input, statusLineShows) {
         if (input.agent_id !== undefined)
             return null;
         if (input.hook_event_name === "MessageDisplay") {
@@ -301,9 +299,7 @@ export class NoticeDeliveryQueue {
         // Stop is the turn's last hook: the trailer lands here when the turn
         // rendered no message to carry it ("message"), or always ("stop").
         const trailerDue = this.trailerPlacement !== "message" || !this.deliveryFor(input.session_id).shown;
-        // The first-tree announcement still belongs in the conversation.
-        const showStopLink = !this.statusLineShowsLink || this.isFirstLink(input.session_id);
-        const trailer = trailerDue && showStopLink ? this.renderTrailer(input.session_id) : undefined;
+        const trailer = trailerDue ? this.renderTrailer(input.session_id, statusLineShows) : undefined;
         this.deliveryFor(input.session_id).shown = false;
         delete this.deliveryFor(input.session_id).successPage;
         if (!prefix && !suffix && trailer === undefined)
@@ -455,7 +451,7 @@ export class NoticeDeliveryQueue {
      * label is dim. The URL stays bare either way (linkifier-safe). Rendering
      * marks the key as seen. Resolver failures never break a hook.
      */
-    renderTrailer(sessionId) {
+    renderTrailer(sessionId, statusLineShows) {
         if (!this.trailer)
             return undefined;
         let link;
@@ -475,6 +471,8 @@ export class NoticeDeliveryQueue {
         if (this.trailerPlacement === "turn" && !isNew)
             return undefined;
         const first = this.isFirstLink(sessionId);
+        if (!first && statusLineShows?.(link.link))
+            return undefined;
         delivered.trailer = link.key;
         delivered.trailerUrl = link.link;
         if (first)

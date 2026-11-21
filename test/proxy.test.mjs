@@ -3036,7 +3036,14 @@ test(`a short session's first tree is announced once on Stop (status line link $
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const shown = [];
   const firstTreeIntro = { isFirstEver: () => shown.length === 0, markShown: (id) => shown.push(id) };
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, firstTreeIntro, statusLineShowsLink });
+  const { StatusLinkFiles } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-first-tree-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, firstTreeIntro,
+    statusLinks: new StatusLinkFiles(dir), statusLineShowsLink });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postSessionMessages(proxy.port, followupTurn("turn two"));
@@ -11074,7 +11081,7 @@ const sessionsItem = (sessionId, requestId) => ({
 });
 
 /** A NewestTreeLookup over a scripted server: `answer(q)` is a body or a status. */
-async function newestLookup(answer) {
+async function newestLookup(answer, now) {
   const { NewestTreeLookup } = await import("../dist/memtree-newest.js");
   const asked = [];
   const lookup = new NewestTreeLookup(async (path) => {
@@ -11083,7 +11090,7 @@ async function newestLookup(answer) {
     const a = answer(q);
     if (typeof a === "number") return { status: a, body: Buffer.from('{"detail":"Not Found"}') };
     return { status: 200, body: Buffer.from(JSON.stringify(a)) };
-  });
+  }, now);
   return { lookup, asked };
 }
 
@@ -11381,6 +11388,78 @@ test("the status line's link file follows the session's page, then its newest tr
     upstream.close();
     memtreeSrv.close();
   }
+});
+
+test("a suppressed Stop refreshes an expired pinned link and prints if the cache is unavailable", async (t) => {
+  const { StatusLinkFiles, readStatusLink } = await import("../dist/status-link.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-stop-refresh-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let now = 1;
+  let tree = NEWEST_REQUEST_ID;
+  const { lookup, asked } = await newestLookup(q => ({ sessions: [sessionsItem(q, tree)] }), () => now);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
+    newestTrees: lookup, statusLinks: new StatusLinkFiles(dir), statusLineShowsLink: true,
+  });
+  t.after(() => proxy.close());
+  await lookup.settle("session-1");
+  assert.equal(readStatusLink("session-1", dir), NEWEST_URL);
+  tree = OTHER_REQUEST_ID;
+  now += 60_001;
+  assert.equal((await postHook(proxy, stopHook("prompt-1"))).status, 204);
+  assert.equal(asked.length, 2, "Stop started a refresh without waiting for a prompt");
+  assert.equal(readStatusLink("session-1", dir), OTHER_URL);
+  fs.writeFileSync(path.join(dir, "session-1.url"), NEWEST_URL);
+  assert.match((await postHook(proxy, stopHook("prompt-2"))).body.systemMessage, /0badc0de/,
+    "the cached link is stale");
+  tree = NEWEST_REQUEST_ID;
+  now += 60_001;
+  fs.rmSync(dir, { recursive: true });
+  fs.writeFileSync(dir, "blocks the cache directory");
+  await lookup.settle("session-1");
+  assert.match((await postHook(proxy, stopHook("prompt-3"))).body.systemMessage, /229f05e7/,
+    "a failed cache write keeps the new link in Stop");
+});
+
+test("one proxy's Stop follows effective settings through a late install, override and uninstall", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { StatusLinkFiles } = await import("../dist/status-link.js");
+  const { prepareSessionStatusline } = await import("../dist/statusline-auto.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-stop-settings-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const user = path.join(dir, "settings.json");
+  const project = path.join(dir, ".claude");
+  fs.mkdirSync(project);
+  const session = prepareSessionStatusline(true, { settings: user, saved: path.join(dir, "saved") }, {
+    cwd: dir, managedDir: path.join(dir, "policy"), env: { CCC_STATUSLINE_AUTO: "0" },
+    platform: "darwin", cccOnPath: () => true,
+  });
+  const { lookup } = await newestLookup(q => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }));
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
+    newestTrees: lookup, memtreeLinkPlacement: "stop", statusLinks: new StatusLinkFiles(dir),
+    statusLineShowsLink: () => session.showsLink,
+  });
+  t.after(() => proxy.close());
+  const stop = () => postHook(proxy, stopHook("prompt"));
+  await lookup.settle("session-1");
+  assert.equal((await stop()).status, 200);
+  fs.writeFileSync(user, JSON.stringify({ statusLine: { type: "command", command: "ccc statusline" } }));
+  assert.equal((await stop()).status, 204);
+  assert.equal(session.refresh, true);
+  const override = path.join(project, "settings.local.json");
+  fs.writeFileSync(override, JSON.stringify({ statusLine: { type: "command", command: "echo custom" } }));
+  assert.equal((await stop()).status, 200);
+  assert.equal(session.refresh, false);
+  fs.unlinkSync(override);
+  assert.equal((await stop()).status, 204);
+  fs.unlinkSync(user);
+  assert.equal((await stop()).status, 200);
 });
 
 test("the status line links the session's stable page once the server names one", async () => {

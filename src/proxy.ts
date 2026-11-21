@@ -406,9 +406,9 @@ export interface ProxyOptions {
    * The status line shows that link (statusline.ts statusLineWantsLink): refresh the newest
    * tree on every request, not only at prompts and turn ends.
    */
-  statusLinkRefresh?: boolean;
+  statusLinkRefresh?: boolean | (() => boolean);
   /** This session has an interactive status line that shows its MemTree link. */
-  statusLineShowsLink?: boolean;
+  statusLineShowsLink?: boolean | ((cwd?: string) => boolean);
   /**
    * Per-response token usage (thinking share on the MemTree page), read from
    * Claude Code's transcript. Omitted means none is sent (tests); the CLI
@@ -684,7 +684,8 @@ interface ProxyState {
   statusLinks?: StatusLinkFiles;
   /** Session → its stable link (`/m/sessions/<id>`), once a lookup named it. Bounded. */
   stableSessionLinks: Map<string, string>;
-  statusLinkRefresh: boolean;
+  statusLinkRefresh: () => boolean;
+  statusLineShowsLink: (cwd?: string) => boolean;
   memtreeLinkPlacement: MemtreeLinkPlacement;
   /**
    * `/memtree-compact` targets by Claude Code session: every compression for
@@ -1241,7 +1242,10 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     newestTrees: opts.newestTrees,
     statusLinks: opts.statusLinks,
     stableSessionLinks: new Map(),
-    statusLinkRefresh: opts.statusLinkRefresh === true,
+    statusLinkRefresh: typeof opts.statusLinkRefresh === "function"
+      ? opts.statusLinkRefresh : () => opts.statusLinkRefresh === true,
+    statusLineShowsLink: typeof opts.statusLineShowsLink === "function"
+      ? opts.statusLineShowsLink : () => opts.statusLineShowsLink === true,
     memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
     compactTargets: new Map(),
     defaultCompactOff: opts.defaultCompactTarget === null,
@@ -1256,7 +1260,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     passthroughSizes: new Map(),
     laneSizes: new Map(),
   };
-  installMemtreeLink(state, state.memtreeLinkPlacement, opts.statusLineShowsLink === true);
+  installMemtreeLink(state, state.memtreeLinkPlacement);
   // A newer tree from the background lookup reaches the status line without a turn ending.
   opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
   opts.newestTrees?.onSessionLink((sessionId) => publishStatusLink(state, sessionId));
@@ -2155,10 +2159,23 @@ async function handleNoticeHook(
       parsed.prompt_id === undefined ||
       state.mainPromptId === parsed.prompt_id ||
       (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
+  let statusLineShows: ((url: string) => boolean) | undefined;
+  if (stopMatchesMainPrompt) {
+    // The lookup publishes the newest URL to the status line in the background.
+    // It is TTL-gated and independent of whether this turn prints a trailer.
+    state.newestTrees?.peek(parsed.session_id);
+    if (state.statusLineShowsLink(parsed.cwd) && state.statusLinks) {
+      const dir = state.statusLinks.dir;
+      statusLineShows = url => {
+        const cached = readStatusLink(parsed.session_id, dir);
+        return cached !== undefined && (cached === url || cached === state.stableSessionLinks.get(parsed.session_id));
+      };
+    }
+  }
   const output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
       ? null
-      : state.notices.claim(parsed);
+      : state.notices.claim(parsed, statusLineShows);
   if (stopMatchesMainPrompt) {
     onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
     state.mainNoticePending = false;
@@ -2376,7 +2393,7 @@ async function handleMessages(
       const link = recapLink(state, sessionId);
       return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
     });
-  } else if (state.statusLinks && state.statusLinkRefresh) {
+  } else if (state.statusLinks && state.statusLinkRefresh()) {
     // Keeps the status line's link fresh through long tool runs: answers from the cache,
     // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
     // whose stable link is known needs no lookup (that link never changes), only its file
@@ -3639,8 +3656,7 @@ function compressionTotals(
  */
 function installMemtreeLink(
   state: ProxyState,
-  placement: MemtreeLinkPlacement,
-  statusLineShowsLink: boolean
+  placement: MemtreeLinkPlacement
 ): void {
   const resolve = (sessionId: string | undefined) =>
     sessionLink(state, sessionId, currentMemtreePage(state, sessionId));
@@ -3652,12 +3668,12 @@ function installMemtreeLink(
       // The success line carries the current page on the line below it; the
       // end-of-turn trailer then skips a link that line already showed.
       state.notices.setLink(resolve);
-      state.notices.setTrailer(resolve, placement, statusLineShowsLink);
+      state.notices.setTrailer(resolve, placement);
       break;
     case "message":
     case "stop":
       // These trailers show on every message or every Stop; no second copy.
-      state.notices.setTrailer(resolve, placement, statusLineShowsLink);
+      state.notices.setTrailer(resolve, placement);
       break;
     case "off":
       break;

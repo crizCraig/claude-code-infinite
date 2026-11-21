@@ -387,6 +387,10 @@ function backup(file: string): void {
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings): boolean {
   const command = ((readJson(settingsFile) as { statusLine?: { command?: unknown } } | undefined)
     ?.statusLine)?.command;
+  return commandWantsLink(command);
+}
+
+export function commandWantsLink(command: unknown): boolean {
   return typeof command === "string" &&
     (CCC_STATUSLINE.test(command) || command.includes(".claude-code-infinite/statusline"));
 }

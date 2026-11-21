@@ -283,8 +283,10 @@ terminals without OSC 8 links; `CCC_STATUSLINE_LINK=url` or `osc8` forces either
 line only reads that file, so it never waits on the server. While the status line uses it,
 `ccc` refreshes the link about once a minute; with a status-line script `ccc` can't see in
 settings.json, set `CCC_STATUSLINE_REFRESH=1` (otherwise it refreshes at prompts and turn
-ends). When ccc detects the link in an interactive session's status line at startup, it
-omits the routine end-of-turn link. The first-tree announcement still appears.
+ends). At the end of each interactive turn, ccc checks which status-line command Claude
+Code's settings select. It omits the routine link when that command resolves to this ccc
+installation and its cache holds the current tree or stable session URL. A custom shell
+script or an unverifiable policy keeps the Stop link. The first tree is always announced.
 
 - **On by default:** the first interactive `ccc` run (after installing or upgrading) runs
   `ccc statusline install` once and says so in the session's first message. It points

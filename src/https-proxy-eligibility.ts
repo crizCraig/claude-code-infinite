@@ -155,19 +155,26 @@ function projectSettingsFiles(cwd: string): string[] {
 function managedSettingsFiles(
   platform: NodeJS.Platform, listDir: (dir: string) => string[]
 ): string[] {
-  const dir = platform === "darwin"
-    ? "/Library/Application Support/ClaudeCode"
-    : "/etc/claude-code";
+  const dir = managedSettingsDir(platform);
   const dropIns = path.join(dir, "managed-settings.d");
   return [
     path.join(dir, "managed-settings.json"),
     ...listDir(dropIns).map((name) => path.join(dropIns, name)),
     // macOS MDM profiles (managed preferences), machine-wide or for this user.
-    ...(platform === "darwin" ? [
-      `/Library/Managed Preferences/${MDM_DOMAIN}.plist`,
-      `/Library/Managed Preferences/${userName()}/${MDM_DOMAIN}.plist`,
-    ] : []),
+    ...managedPreferencesFiles(platform),
   ];
+}
+
+export function managedSettingsDir(platform: NodeJS.Platform): string {
+  if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+  return platform === "darwin" ? "/Library/Application Support/ClaudeCode" : "/etc/claude-code";
+}
+
+export function managedPreferencesFiles(platform: NodeJS.Platform): string[] {
+  return platform === "darwin" ? [
+    `/Library/Managed Preferences/${MDM_DOMAIN}.plist`,
+    `/Library/Managed Preferences/${userName()}/${MDM_DOMAIN}.plist`,
+  ] : [];
 }
 
 const MDM_DOMAIN = "com.anthropic.claudecode";
@@ -181,13 +188,13 @@ function userName(): string {
 }
 
 /** Every `--settings <value>` / `--settings=<value>` before a `--`. */
-export function settingsArgs(args: readonly string[]): string[] {
+export function settingsArgs(args: readonly string[], option = "--settings"): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--") break;
-    if (arg === "--settings" && i + 1 < args.length) out.push(args[++i]);
-    else if (arg.startsWith("--settings=")) out.push(arg.slice("--settings=".length));
+    if (arg === option && i + 1 < args.length) out.push(args[++i]);
+    else if (arg.startsWith(`${option}=`)) out.push(arg.slice(option.length + 1));
   }
   return out;
 }
@@ -201,7 +208,7 @@ function listJsonFiles(dir: string): string[] {
 }
 
 /** A settings file's text; a property list (MDM) as JSON through plutil. */
-function readTextFile(file: string): string | null {
+export function readTextFile(file: string): string | null {
   try {
     if (!file.endsWith(".plist")) return readFileSync(file, "utf8");
     if (!existsSync(file)) return null;

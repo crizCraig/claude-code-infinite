@@ -1,14 +1,14 @@
+import { type StatuslineSettingsOptions } from "./statusline-settings.js";
 import { type StatuslinePaths } from "./statusline.js";
 export declare const AUTO_MARKER = "statusline-auto.json";
-export interface AutoStatuslineOptions {
-    platform?: NodeJS.Platform;
+export interface AutoStatuslineOptions extends StatuslineSettingsOptions {
     env?: NodeJS.ProcessEnv;
     /** Where the once-only record lives (ccc's config dir). */
     markerDir?: string;
     /** Whether Claude Code's shell can run `ccc` (defaults to a PATH search). */
     cccOnPath?: () => boolean;
 }
-/** Snapshot the link settings after any first-run install, before Claude starts. */
+/** Install once, then recheck the effective configuration when Stop considers a link. */
 export declare function prepareSessionStatusline(interactive: boolean, paths: StatuslinePaths, options?: AutoStatuslineOptions): {
     text?: string;
     showsLink: boolean;

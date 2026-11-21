@@ -369,6 +369,9 @@ function backup(file) {
 export function statusLineWantsLink(settingsFile = statuslinePaths().settings) {
     const command = (readJson(settingsFile)
         ?.statusLine)?.command;
+    return commandWantsLink(command);
+}
+export function commandWantsLink(command) {
     return typeof command === "string" &&
         (CCC_STATUSLINE.test(command) || command.includes(".claude-code-infinite/statusline"));
 }

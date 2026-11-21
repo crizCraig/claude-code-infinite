@@ -260,13 +260,13 @@ test("a status line link suppresses only the routine Stop trailer in every place
   const link = { key: "k", link: "https://x/m/1" };
   for (const placement of ["message", "stop", "turn"]) {
     const queue = new NoticeDeliveryQueue(undefined, undefined, false);
-    queue.setTrailer(() => link, placement, true);
+    queue.setTrailer(() => link, placement);
     if (placement === "turn") queue.setLink(() => link);
-    assert.equal(queue.claim(stop()), null, placement);
+    assert.equal(queue.claim(stop(), () => true), null, placement);
     queue.queueSuffix("⚠ warn");
-    assert.deepEqual(queue.claim(stop()), { systemMessage: "⚠ warn" });
+    assert.deepEqual(queue.claim(stop(), () => true), { systemMessage: "⚠ warn" });
     queue.queuePrefix("optimized");
-    assert.deepEqual(queue.claim(stop()), {
+    assert.deepEqual(queue.claim(stop(), () => true), {
       systemMessage: placement === "turn" ? "optimized\n  https://x/m/1 ↗" : "optimized",
     });
     const output = queue.claim(display({ final: true }));

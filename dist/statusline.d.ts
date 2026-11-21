@@ -48,4 +48,5 @@ export declare function processTree(pid: number | undefined): number[];
  * only then does the proxy keep the link fresh in the background. Read at startup.
  */
 export declare function statusLineWantsLink(settingsFile?: string): boolean;
+export declare function commandWantsLink(command: unknown): boolean;
 //# sourceMappingURL=statusline.d.ts.map

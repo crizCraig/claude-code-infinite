@@ -566,7 +566,7 @@ async function main() {
     // ccc's status line (the MemTree link) on by default: installed or wrapped once, before
     // Claude Code reads its settings; what changed is said at the first SessionStart.
     const interactiveTerminal = interactiveUi && !mayBePrintInvocation(claudeArgs);
-    const statusline = prepareSessionStatusline(interactiveTerminal, statuslinePaths());
+    const statusline = prepareSessionStatusline(interactiveTerminal, statuslinePaths(), { claudeArgs });
     // A sign-in completed after ccc's warning, between launches or mid-session.
     const signInTracker = new SignInTracker(getConfigDir(), (event) => diagnostics.record("sign_in_completed", { ...event }));
     const observedLog = new DiagnosticsRequestSink(reqlog, diagnostics, (auth) => {
@@ -687,8 +687,8 @@ async function main() {
         // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
         statusLinks: new StatusLinkFiles(),
         // Per-request refreshes (a sessions lookup a minute) only for status lines that show it.
-        statusLinkRefresh: statusline.refresh,
-        statusLineShowsLink: statusline.showsLink,
+        statusLinkRefresh: () => statusline.refresh,
+        statusLineShowsLink: cwd => (!cwd || cwd === process.cwd()) && statusline.showsLink,
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed
