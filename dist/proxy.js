@@ -75,7 +75,7 @@ import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKi
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX, } from "./hooks.js";
-import { beginRecall, recalled, waitForRecall, WrappedRecallHistory, recallLine } from "./recall.js";
+import { beginRecall, recalled, wrappedRecallWork, settleRecallWork, waitForRecall, WrappedRecallHistory, recallLine } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -515,7 +515,8 @@ export function startProxy(opts) {
             while (activeRequests.size > 0) {
                 await Promise.allSettled([...activeRequests]);
             }
-            await state.recallHistory.writes.settle();
+            if (state.recall)
+                await waitForRecall(settleRecallWork());
         })();
         let timer;
         const completed = await Promise.race([
@@ -608,16 +609,20 @@ async function handleRequest(req, res, opts, upstream, state, hookPath, intercep
                 if (session && (input.agent_id ? session.agents.has(input.agent_id) : input.prompt_id === session.prompt)) {
                     const call = { agent: input.agent_id, verifying: true };
                     const prompt = session.prompt;
-                    session.pending.push(call);
-                    await waitForRecall(recalled(input, opts.memtree.storageIdentity).then(async (batch) => {
-                        if (batch) {
-                            if (input.agent_id)
-                                await state.recallHistory.prepareAgent(input.session_id);
-                            if (prompt)
-                                await state.recallHistory.prepare(input.session_id, prompt);
-                            call.batch = batch;
-                        }
-                    }).finally(() => { call.verifying = false; }), 50);
+                    const task = wrappedRecallWork.start(async (signal) => {
+                        const batch = await recalled(input, opts.memtree.storageIdentity);
+                        if (!batch || signal.aborted || !session.pending.includes(call))
+                            return;
+                        if (input.agent_id)
+                            await state.recallHistory.prepareAgent(input.session_id);
+                        if (prompt)
+                            await state.recallHistory.prepare(input.session_id, prompt, signal);
+                        call.batch = batch;
+                    });
+                    if (task) {
+                        session.pending.push(call);
+                        void task.then(() => { call.verifying = false; });
+                    }
                 }
             }
             catch { /* Optional UI; never return hook feedback to the model. */ }

@@ -44,7 +44,7 @@ import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import { memtreeStorageIdentity } from "./config.js";
-import { recallToolEnabled, RecallWrites, withRecallReceipt } from "./recall.js";
+import { recallToolEnabled, RecallWork, waitForRecall, withRecallReceipt } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1303,7 +1303,7 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     let buffer = "";
     // Replies go out in arrival order even though tool calls are async.
     let queue = Promise.resolve();
-    const receipts = new RecallWrites();
+    const receipts = new RecallWork();
     // An upstream error or transcript may echo the saved credential.
     const key = deps.direct?.apiKey;
     const redactKey = (_name, value) => key && typeof value === "string" ? redact(value, key) : value;
@@ -1358,7 +1358,7 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
         }
     });
     process.stdin.on("end", () => {
-        void queue.then(() => receipts.settle()).then(() => process.exit(0));
+        void queue.then(() => waitForRecall(receipts.settle())).then(() => process.exit(0));
     });
 }
 function isToolCall(message) {

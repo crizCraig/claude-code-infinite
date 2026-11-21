@@ -18,8 +18,8 @@ export interface RecallHook {
     agent_id?: string;
     tool_response?: unknown;
 }
-export declare function waitForRecall(work: Promise<unknown>, ms?: number): Promise<void>;
-export declare class RecallWrites {
+export declare function waitForRecall(work: Promise<unknown>): Promise<void>;
+export declare class RecallWork {
     private readonly pending;
     start(write: (signal: AbortSignal) => Promise<void>): Promise<void> | undefined;
     settle(): Promise<void>;
@@ -37,6 +37,8 @@ export declare function recallPassage(session: unknown, summary: unknown, at: un
 export interface RecallBatch extends Passage {
     count: number;
 }
+export declare const wrappedRecallWork: RecallWork;
+export declare function settleRecallWork(): Promise<void>;
 export declare function recalled(input: RecallHook, account: string): Promise<RecallBatch | undefined>;
 export declare function pastRecallCount(session: string | undefined, account: string): number;
 export declare function recallLine(batches: RecallBatch[], now?: Date): string | undefined;
@@ -48,8 +50,7 @@ export declare class WrappedRecallHistory {
     private readonly reservations;
     private readonly ready;
     private readonly shown;
-    readonly writes: RecallWrites;
-    prepare(session: string, prompt: string): Promise<void>;
+    prepare(session: string, prompt: string, signal: AbortSignal): Promise<void>;
     prepareAgent(session: string): Promise<void>;
     claim(session: string, prompt: string): boolean;
 }

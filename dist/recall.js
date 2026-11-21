@@ -48,35 +48,31 @@ async function prune(dir) {
         catch { /* Claimed concurrently. */ }
     }
 }
-const writeDeadlineMs = 250;
-export async function waitForRecall(work, ms = writeDeadlineMs) {
+// Only shutdown grants optional work a grace period. Hooks and the MCP queue never drain it.
+export async function waitForRecall(work) {
     let timer;
     try {
-        await Promise.race([work, new Promise(resolve => { timer = setTimeout(resolve, ms); })]);
+        await Promise.race([work, new Promise(resolve => { timer = setTimeout(resolve, 250); })]);
     }
     finally {
         clearTimeout(timer);
     }
 }
 // An in-flight rename cannot be cancelled. Keep its slot until it actually settles.
-export class RecallWrites {
+export class RecallWork {
     pending = new Set();
     start(write) {
         if (this.pending.size >= 8)
             return;
-        const signal = AbortSignal.timeout(writeDeadlineMs);
         const task = new Promise(resolve => setImmediate(resolve))
-            .then(() => { if (!signal.aborted)
-            return write(signal); })
+            .then(() => write(AbortSignal.timeout(1000)))
             .catch(() => { })
             .finally(() => this.pending.delete(task));
         this.pending.add(task);
         return task;
     }
     async settle() {
-        if (!this.pending.size)
-            return;
-        await waitForRecall(Promise.all(this.pending));
+        await Promise.all(this.pending);
     }
 }
 async function publishFile(file, data, signal) {
@@ -223,7 +219,13 @@ async function matchesAnswer(input, receipt) {
     const stat = await files.stat(actual);
     return stat.isFile() && stat.size === receipt.size && digest(await files.readFile(actual)) === receipt.digest;
 }
-const countWrites = new RecallWrites();
+const countWrites = new RecallWork();
+export const wrappedRecallWork = new RecallWork();
+export async function settleRecallWork() {
+    // Verification can start count writes, so take the count snapshot second.
+    await wrappedRecallWork.settle();
+    await countWrites.settle();
+}
 export async function recalled(input, account) {
     if (!account || process.env.CCC_RECALL_NOTICE === "0" || input?.hook_event_name !== "PostToolUse" ||
         !input.tool_name || !matcher.test(input.tool_name) || !input.session_id || !input.prompt_id ||
@@ -304,8 +306,7 @@ export class WrappedRecallHistory {
     reservations = new Map();
     ready = new Set();
     shown = new Set();
-    writes = new RecallWrites();
-    prepare(session, prompt) {
+    prepare(session, prompt, signal) {
         const file = shownFile(session, prompt);
         const pending = this.reservations.get(file);
         if (pending)
@@ -313,12 +314,10 @@ export class WrappedRecallHistory {
         if (this.shown.has(file))
             return Promise.resolve();
         this.shown.add(file);
-        const task = this.writes.start(async (signal) => {
-            if (await claimRecallPrompt(session, prompt, signal))
+        const task = claimRecallPrompt(session, prompt, signal).then(won => {
+            if (won)
                 this.ready.add(file);
         });
-        if (!task)
-            return Promise.resolve();
         this.reservations.set(file, task);
         return task.finally(() => this.reservations.delete(file));
     }
@@ -340,7 +339,7 @@ export class WrappedRecallHistory {
         if (this.shown.has(file))
             return false;
         this.shown.add(file);
-        this.writes.start(async (signal) => { await claimRecallPrompt(session, prompt, signal); });
+        wrappedRecallWork.start(async (signal) => { await claimRecallPrompt(session, prompt, signal); });
         return true;
     }
 }

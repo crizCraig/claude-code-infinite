@@ -1,5 +1,5 @@
 // Use a disposable ccc home for both sides of the MCP/hook handoff.
-import test, { after, beforeEach } from "node:test";
+import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -16,7 +16,10 @@ after(() => fs.rmSync(home, { recursive: true, force: true }));
 // Each scenario may reuse the same simulated Claude prompt and session IDs.
 beforeEach(() => fs.rmSync(path.join(home, ".claude-code-infinite"), { recursive: true, force: true }));
 
-const { beginRecall, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
+const { beginRecall, settleRecallWork, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
+// Some cases reuse prompt IDs and remove their home. Finish detached filesystem
+// work before resetting it, particularly on Windows where open files cannot be removed.
+afterEach(settleRecallWork);
 const { handleMcpMessage } = await import("../dist/memtree-mcp.js");
 const { MemtreeIndex, formatTail } = await import("../dist/memtree-tools.js");
 const { formatSearchResults } = await import("../dist/memtree-finder.js");
@@ -161,6 +164,7 @@ test("direct Claude settings preserve paths as separate Windows arguments; separ
   for (const input of await Promise.all([read("past", 4), tool("read_node", { node: "past#3" })])) {
     assert.equal(await standaloneRecall(input), undefined);
   }
+  await settleRecallWork();
   assert.equal(pastRecallCount(current, account), before + 2);
   assert.equal(pastRecallCount("other-session", account), 0);
   const line = await standaloneRecall(stop);
@@ -178,6 +182,7 @@ test("ccc's interactive HTTP hooks merge recalls at Stop and discard interrupted
     const recallHook = config.hooks.PostToolUse.find(h => new RegExp(h.matcher).test("mcp__memtree__search"));
     const post = async (input, url = proxy.hookUrl) => {
       const res = await fetch(url, { method: "POST", body: JSON.stringify(input) });
+      if (input.hook_event_name === "PostToolUse") await settleRecallWork();
       return res.status === 204 ? null : res.json();
     };
     const prompt = id => post({ hook_event_name: "UserPromptSubmit", session_id: current, prompt_id: id, prompt: "hello" });
@@ -287,6 +292,7 @@ for (const scenario of ["teammate prompt", "late background agent", "late backgr
       memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) });
     const post = async (event, suffix = "") => {
       const response = await fetch(proxy.hookUrl + suffix, { method: "POST", body: JSON.stringify(event) });
+      if (event.hook_event_name === "PostToolUse") await settleRecallWork();
       return response.status === 204 ? undefined : (await response.json()).systemMessage;
     };
     const prompt = { ...stop, hook_event_name: "UserPromptSubmit", prompt: "hello" };
@@ -337,6 +343,7 @@ test("exit counts are isolated when accounts resume the same Claude session", as
   for (const scope of [account, "another-account", account]) {
     await directHook(await read("past", 4, 4, { session, scope }), scope);
   }
+  await settleRecallWork();
   assert.equal(pastRecallCount(session, account), 2);
   assert.equal(pastRecallCount(session, "another-account"), 1);
 });
@@ -393,9 +400,10 @@ for (const stalled of ["count", "prompt marker", "receipt claim"]) {
         return original(...args);
       });
       await post(hook, "/recall");
-      const [output] = await Promise.all([post(event), Promise.race([started, new Promise((_, reject) => {
+      await Promise.race([started, new Promise((_, reject) => {
         setTimeout(() => reject(new Error("recall operation never started")), 1500).unref();
-      })])]);
+      })]);
+      const output = await post(event);
       assert.equal(output.status, 200);
       assert.ok((await output.json()).systemMessage.includes(url));
     } finally {

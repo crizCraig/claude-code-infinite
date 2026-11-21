@@ -56,23 +56,22 @@ async function prune(dir: string) {
   }
 }
 
-const writeDeadlineMs = 250;
-export async function waitForRecall(work: Promise<unknown>, ms = writeDeadlineMs): Promise<void> {
+// Only shutdown grants optional work a grace period. Hooks and the MCP queue never drain it.
+export async function waitForRecall(work: Promise<unknown>): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    await Promise.race([work, new Promise<void>(resolve => { timer = setTimeout(resolve, ms); })]);
+    await Promise.race([work, new Promise<void>(resolve => { timer = setTimeout(resolve, 250); })]);
   } finally { clearTimeout(timer); }
 }
 
 // An in-flight rename cannot be cancelled. Keep its slot until it actually settles.
-export class RecallWrites {
+export class RecallWork {
   private readonly pending = new Set<Promise<void>>();
 
   start(write: (signal: AbortSignal) => Promise<void>): Promise<void> | undefined {
     if (this.pending.size >= 8) return;
-    const signal = AbortSignal.timeout(writeDeadlineMs);
     const task = new Promise<void>(resolve => setImmediate(resolve))
-      .then(() => { if (!signal.aborted) return write(signal); })
+      .then(() => write(AbortSignal.timeout(1000)))
       .catch(() => {})
       .finally(() => this.pending.delete(task));
     this.pending.add(task);
@@ -80,8 +79,7 @@ export class RecallWrites {
   }
 
   async settle(): Promise<void> {
-    if (!this.pending.size) return;
-    await waitForRecall(Promise.all(this.pending));
+    await Promise.all(this.pending);
   }
 }
 
@@ -225,7 +223,14 @@ async function matchesAnswer(input: RecallHook, receipt: Receipt): Promise<boole
   return stat.isFile() && stat.size === receipt.size && digest(await files.readFile(actual)) === receipt.digest;
 }
 
-const countWrites = new RecallWrites();
+const countWrites = new RecallWork();
+export const wrappedRecallWork = new RecallWork();
+
+export async function settleRecallWork(): Promise<void> {
+  // Verification can start count writes, so take the count snapshot second.
+  await wrappedRecallWork.settle();
+  await countWrites.settle();
+}
 
 export async function recalled(input: RecallHook, account: string): Promise<RecallBatch | undefined> {
   if (!account || process.env.CCC_RECALL_NOTICE === "0" || input?.hook_event_name !== "PostToolUse" ||
@@ -295,18 +300,16 @@ export class WrappedRecallHistory {
   private readonly reservations = new Map<string, Promise<void>>();
   private readonly ready = new Set<string>();
   private readonly shown = new Set<string>();
-  readonly writes = new RecallWrites();
 
-  prepare(session: string, prompt: string): Promise<void> {
+  prepare(session: string, prompt: string, signal: AbortSignal): Promise<void> {
     const file = shownFile(session, prompt);
     const pending = this.reservations.get(file);
     if (pending) return pending;
     if (this.shown.has(file)) return Promise.resolve();
     this.shown.add(file);
-    const task = this.writes.start(async signal => {
-      if (await claimRecallPrompt(session, prompt, signal)) this.ready.add(file);
+    const task = claimRecallPrompt(session, prompt, signal).then(won => {
+      if (won) this.ready.add(file);
     });
-    if (!task) return Promise.resolve();
     this.reservations.set(file, task);
     return task.finally(() => this.reservations.delete(file));
   }
@@ -323,7 +326,7 @@ export class WrappedRecallHistory {
     if (this.ready.delete(file)) return true;
     if (this.shown.has(file)) return false;
     this.shown.add(file);
-    this.writes.start(async signal => { await claimRecallPrompt(session, prompt, signal); });
+    wrappedRecallWork.start(async signal => { await claimRecallPrompt(session, prompt, signal); });
     return true;
   }
 }
