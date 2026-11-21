@@ -3,6 +3,10 @@ export declare const SHAPE_MIN_BYTES: number;
 export interface BodyShape {
     /** Hash of the body without `messages` (system, tools, thinking, ...). */
     frame: string;
+    /** Same frame with the per-request billing text removed. Only the failed-count
+     * fallback uses it and charges the current billing text in full. */
+    billingFrame?: string;
+    billingBytes?: number;
     /** One hash per message, in order. */
     messages: string[];
     /** Each message's canonical JSON length (UTF-8 bytes, as the per-model ratios assume). */
@@ -43,7 +47,7 @@ export declare function knownShape(body: Buffer): BodyShape | undefined;
 /** Remember `shape` for another copy of the same bytes. */
 export declare function rememberShape(body: Buffer, shape: BodyShape | undefined): void;
 /** Digest of the frame and the first `count` messages; undefined past the end. */
-export declare function prefixDigest(shape: BodyShape, count: number): string | undefined;
+export declare function prefixDigest(shape: BodyShape, count: number, frame?: string): string | undefined;
 /** Canonical text bytes (images left out) of messages [from, to). */
 export declare function textBytes(shape: BodyShape, from: number, to?: number): number;
 //# sourceMappingURL=body-shape.d.ts.map

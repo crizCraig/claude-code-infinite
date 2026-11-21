@@ -522,6 +522,13 @@ export interface CompactionRecord {
     /** The planned candidate's conservative bound was anchored on an earlier count of the
      * body it extends (request-sizing.ts anchoredBound), not the plain bytes bound. */
     anchoredBound?: true;
+    /** Failed count judged from the sampled prefix. estimatedTokens above includes
+     * the margin; this estimate is the projection before the margin. */
+    countFailure?: {
+        estimatedTokens: number;
+        guardedTokens: number;
+        decision: "within-limits" | "over-budget" | "over-window";
+    };
     /** Set when the turn compressed (or tried to) for one of these reasons. */
     reason?: RecompressReason;
     /** For "prefix-mismatch": which check failed. */

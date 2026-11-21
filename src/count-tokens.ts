@@ -91,6 +91,8 @@ export interface SizeSample {
   model?: string;
   messageCount?: number;
   prefixDigest?: string;
+  /** Prefix digest with Claude Code's volatile billing text removed. */
+  billingDigest?: string;
 }
 
 /** Where a count call goes: the proxy's upstream. */
@@ -216,9 +218,10 @@ export interface CountTokensSession {
   /**
    * Count `body` again, once per request, after its count ran out of time or lost its
    * connection (RETRYABLE_COUNT_OUTCOMES), with a fresh allowance for its size;
-   * undefined when it did not, or the retry was spent.
+   * an early retry with maxWaitMs shares the original allowance. Returns
+   * undefined when the failure is ineligible or the retry was spent.
    */
-  retry?(body: Buffer): Promise<CountTokensResult> | undefined;
+  retry?(body: Buffer, maxWaitMs?: number): Promise<CountTokensResult> | undefined;
 }
 
 /**
@@ -247,13 +250,15 @@ export function createCountTokensSession(
   let retried = false;
   return {
     peek: (body) => completed.get(bodyHash(body)),
-    retry: (body) => {
+    retry: (body, maxWaitMs) => {
       const key = bodyHash(body);
       const prior = completed.get(key);
       if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
           options.signal?.aborted || cooldowns.active(account)) return undefined;
+      const timeoutMs = maxWaitMs === undefined ? requestAllowance(options, body.length)
+        : Math.min(maxWaitMs, allowance - clock.spent());
+      if (timeoutMs < MIN_COUNT_ATTEMPT_MS) return undefined;
       retried = true;
-      const timeoutMs = requestAllowance(options, body.length);
       const attempt = clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
         .then((result) => recordAttempt(options, cooldowns, account, result))
         .then((result) => { completed.set(key, result); return result; });

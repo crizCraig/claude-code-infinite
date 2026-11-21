@@ -71,7 +71,7 @@ import { keyInvalidNoticeText, keyInvalidRefusalMessage } from "./key-status.js"
 import { KEY_INVALID_KIND, ModelContextNotices, PAUSED_KIND, keyInvalidModelContext, lastToldKindInFile, pausedModelContext } from "./model-context.js";
 import { PaymentNoticeThrottle, pausedCompactionText, pausedRefusalMessage, paymentNoticeText } from "./payment-notice.js";
 import { MEMTREE_LINKS_MAX_SESSIONS } from "./memtree-links.js";
-import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
+import { describeClaudeCodeRequest, inspectMonitorTranscript, isClaudeCodeBillingHeader as isRouteBillingHeader, knownSideRequestKind, transcriptWarning, isClaudeCodeSideRequest, memtreeClientMeta, notSessionConversation, sessionTag, } from "./cc-request.js";
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, } from "./hooks.js";
@@ -3426,8 +3426,7 @@ function uncountedOnlyOverWindow(record, body, modelContextLimit) {
         (record.estimatedTokens ?? 0) + bodyOutputReservation(body, false) <= modelContextLimit;
 }
 function calibratedSizeExceedsLimits(record, body, modelContextLimit) {
-    return (record.sizeSource === "reported" &&
-        (record.estimatedTokens ?? 0) >= record.budgetTokens) ||
+    return (record.sizeSource === "reported" && reachedBudget(record)) ||
         calibratedSizeExceedsWindow(record, body, modelContextLimit);
 }
 /** Only calibrated usage may force an estimate-driven compaction. */
@@ -3510,8 +3509,10 @@ function sizeSampleOf(sent, tokens, model) {
 function sampleLineage(sent, model) {
     const shape = bodyShape(sent);
     const digest = shape && prefixDigest(shape, shape.messages.length);
+    const billingDigest = shape?.billingFrame && prefixDigest(shape, shape.messages.length, shape.billingFrame);
     return shape && digest && model
-        ? { model, messageCount: shape.messages.length, prefixDigest: digest } : {};
+        ? { model, messageCount: shape.messages.length, prefixDigest: digest,
+            ...(billingDigest ? { billingDigest } : {}) } : {};
 }
 /**
  * Anthropic's input tokens for the body this request forwarded, when its usage
@@ -3668,7 +3669,7 @@ async function planEdgeCompaction(args) {
             (explicitTarget && prefix.targetTokens !== targetTokens)) {
             return forced("target-change", fallback);
         }
-        if (size.tokens >= budget.tokens || overWindow) {
+        if (reachedBudget(compaction) || overWindow) {
             const adopted = await adoptPreparedPrefix({ ...args, budgetTokens: budget.tokens, compaction,
                 waitMs: opts.memtree.longCompressBudgetMs });
             if (adopted)
@@ -3709,11 +3710,13 @@ async function planEdgeCompaction(args) {
     }
     if (state.serverReportsBudget) {
         // The server measures the request and compresses only past the budget.
-        const threshold = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
-        compaction.thresholdTokens = threshold;
-        if (clearlyUnderBudget(opts, state, budget, size, compaction))
-            return { kind: "pass" };
-        return { kind: "compress", target: targetTokens, threshold, targetTokens, explicitTarget };
+        compaction.thresholdTokens = Math.max(SERVER_MIN_TARGET_TOKENS, budget.tokens);
+    }
+    if (clearlyUnderBudget(opts, state, budget, size, compaction))
+        return { kind: "pass" };
+    if (compaction.thresholdTokens !== undefined) {
+        return { kind: "compress", target: targetTokens, threshold: compaction.thresholdTokens,
+            targetTokens, explicitTarget };
     }
     // Without calibrated usage or threshold support, let the server decide
     // against its own model budget rather than forcing from transport bytes.
@@ -3788,7 +3791,7 @@ async function planToolCompaction(args) {
             return { kind: "pass", original: true };
         return ride ? { kind: "ride", ride } : { kind: "pass" };
     }
-    const underBudget = size.tokens < budget.tokens && !overWindow;
+    const underBudget = !reachedBudget(compaction) && !overWindow;
     const cold = underBudget && coldCacheCompress(state, rec, size, targetTokens);
     if (underBudget && !cold) {
         return ride ? { kind: "ride", ride } : { kind: "pass" };
@@ -3848,7 +3851,9 @@ function clearlyUnderBudget(opts, state, budget, size, compaction) {
     // A known payment or key failure keeps the blocking path: it gives the notice.
     if (opts.memtree.paymentRequiredDetail !== null || state.keyInvalid())
         return false;
-    return budget.source !== "window-ratio" && size.source === "reported" &&
+    if (compaction.countFailure?.decision === "within-limits")
+        return true;
+    return state.serverReportsBudget && budget.source !== "window-ratio" && size.source === "reported" &&
         compaction.uncountedOverWindow !== true &&
         size.tokens <= Math.floor(budget.tokens * CLEARLY_UNDER_BUDGET_RATIO);
 }
@@ -4322,8 +4327,15 @@ function noteUncountedBound(record, sizing, candidate, body, modelContextLimit) 
         exactSizedRecords.add(record);
         return;
     }
-    if (sizing.exceedsRequestLimit(candidate) ||
-        candidate.conservativeTokens + bodyOutputReservation(body, false) > modelContextLimit) {
+    const guarded = sizing.failedCountTokens(candidate);
+    const limits = { budget: record.budgetTokens, context: modelContextLimit,
+        output: bodyOutputReservation(body, false) };
+    const fits = sizing.boundFits(candidate, limits);
+    if (guarded !== undefined) {
+        record.countFailure = { estimatedTokens: candidate.estimate.tokens, guardedTokens: guarded,
+            decision: !fits ? "over-window" : guarded > record.budgetTokens ? "over-budget" : "within-limits" };
+    }
+    if (!fits) {
         record.uncountedOverWindow = true;
     }
 }
@@ -4409,7 +4421,6 @@ function normalizeReminderContent(content) {
         return copy;
     });
 }
-const ROUTE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
 const ROUTE_BILLING_HEADER_PLACEHOLDER = "x-anthropic-billing-header: <dynamic>";
 function normalizeRouteText(text) {
     return stripSystemReminderText(text);
@@ -4457,15 +4468,6 @@ function routeBillingHeaders(value) {
         }
     }
     return headers;
-}
-function isRouteBillingHeader(text) {
-    if (/[\r\n]/.test(text) ||
-        !text.startsWith(ROUTE_BILLING_HEADER_PREFIX)) {
-        return false;
-    }
-    const fields = text.slice(ROUTE_BILLING_HEADER_PREFIX.length).trim();
-    return (/^cc_version=[^;]+;/.test(fields) &&
-        /(?:^|;\s*)cc_entrypoint=[^;]+;/.test(fields));
 }
 function replaceSingleRouteBillingHeader(value, replacement) {
     if (typeof value === "string") {
@@ -6201,7 +6203,10 @@ function nearWindowWarned(state, sessionId) {
 }
 /** Whether this turn's own size estimate reached its whole-request budget. */
 function reachedBudget(compaction) {
-    return compaction !== undefined && (compaction.estimatedTokens ?? 0) >= compaction.budgetTokens;
+    if (compaction?.estimatedTokens === undefined)
+        return false;
+    return compaction.countFailure ? compaction.estimatedTokens > compaction.budgetTokens
+        : compaction.estimatedTokens >= compaction.budgetTokens;
 }
 /**
  * Whether the planned size says a turn needed MemTree to compress it: a
@@ -6218,7 +6223,7 @@ function compressionNeeded(compaction) {
         return true;
     if (compaction.estimatedTokens === undefined)
         return true;
-    return compaction.estimatedTokens >= compaction.budgetTokens;
+    return reachedBudget(compaction);
 }
 /**
  * A degraded turn's notice, queued by delivery only when the whole request

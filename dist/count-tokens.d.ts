@@ -51,6 +51,8 @@ export interface SizeSample {
     model?: string;
     messageCount?: number;
     prefixDigest?: string;
+    /** Prefix digest with Claude Code's volatile billing text removed. */
+    billingDigest?: string;
 }
 /** Where a count call goes: the proxy's upstream. */
 export interface CountTokensUpstream {
@@ -117,9 +119,10 @@ export interface CountTokensSession {
     /**
      * Count `body` again, once per request, after its count ran out of time or lost its
      * connection (RETRYABLE_COUNT_OUTCOMES), with a fresh allowance for its size;
-     * undefined when it did not, or the retry was spent.
+     * an early retry with maxWaitMs shares the original allowance. Returns
+     * undefined when the failure is ineligible or the retry was spent.
      */
-    retry?(body: Buffer): Promise<CountTokensResult> | undefined;
+    retry?(body: Buffer, maxWaitMs?: number): Promise<CountTokensResult> | undefined;
 }
 /**
  * Outcomes a retry may follow: the count ran out of time or lost its connection, not

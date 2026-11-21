@@ -169,14 +169,17 @@ export function createCountTokensSession(options, cooldowns = new CountTokensCoo
     let retried = false;
     return {
         peek: (body) => completed.get(bodyHash(body)),
-        retry: (body) => {
+        retry: (body, maxWaitMs) => {
             const key = bodyHash(body);
             const prior = completed.get(key);
             if (retried || !prior || !RETRYABLE_COUNT_OUTCOMES.has(prior.outcome) ||
                 options.signal?.aborted || cooldowns.active(account))
                 return undefined;
+            const timeoutMs = maxWaitMs === undefined ? requestAllowance(options, body.length)
+                : Math.min(maxWaitMs, allowance - clock.spent());
+            if (timeoutMs < MIN_COUNT_ATTEMPT_MS)
+                return undefined;
             retried = true;
-            const timeoutMs = requestAllowance(options, body.length);
             const attempt = clock.track(() => countUpstreamTokens({ ...options, body, timeoutMs }))
                 .then((result) => recordAttempt(options, cooldowns, account, result))
                 .then((result) => { completed.set(key, result); return result; });

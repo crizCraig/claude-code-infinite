@@ -15,6 +15,7 @@
  * (Codex r2 P1).
  */
 import { createHash } from "node:crypto";
+import { isClaudeCodeBillingHeader } from "./cc-request.js";
 import { imageDimensions } from "./image-tokens.js";
 /** Below this a body is never anchored (its plain bound is small): no parse, no hashing. */
 export const SHAPE_MIN_BYTES = 256 * 1024;
@@ -37,10 +38,10 @@ export function rememberShape(body, shape) {
         shapes.set(body, shape);
 }
 /** Digest of the frame and the first `count` messages; undefined past the end. */
-export function prefixDigest(shape, count) {
+export function prefixDigest(shape, count, frame = shape.frame) {
     if (!Number.isInteger(count) || count < 0 || count > shape.messages.length)
         return undefined;
-    const hash = createHash("sha256").update(shape.frame);
+    const hash = createHash("sha256").update(frame);
     for (let i = 0; i < count; i++)
         hash.update(shape.messages[i]);
     return hash.digest("hex");
@@ -68,11 +69,26 @@ function computeShape(body) {
         return null;
     const unhashed = UNHASHED_FIELDS.filter((key) => frame[key] !== undefined)
         .map((key) => JSON.stringify(frame[key])).join("");
-    const shape = { frame: hash(JSON.stringify(canonicalFrame(frame))),
+    const canonical = canonicalFrame(frame);
+    const shape = { frame: hash(JSON.stringify(canonical)),
         messages: [], sizes: [], imageChars: [],
         serverEdits: !noOpEdits(frame.context_management) || frame.compaction !== undefined,
         imageDims: [], unanchorable: !frameAnchorable(frame), lastExpanding: -1,
         unhashedBytes: Buffer.byteLength(unhashed, "utf-8") };
+    if (Array.isArray(canonical.system)) {
+        let billingBytes = 0;
+        const system = canonical.system.map(block => {
+            if (block?.type !== "text" || typeof block.text !== "string" ||
+                !isClaudeCodeBillingHeader(block.text))
+                return block;
+            billingBytes += Buffer.byteLength(JSON.stringify(block.text));
+            return { ...block, text: "" };
+        });
+        if (billingBytes) {
+            shape.billingFrame = hash(JSON.stringify({ ...canonical, system }));
+            shape.billingBytes = billingBytes;
+        }
+    }
     for (const message of messages) {
         const text = JSON.stringify(canonicalMessage(message)) ?? "";
         shape.messages.push(hash(text));
