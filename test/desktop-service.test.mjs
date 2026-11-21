@@ -367,19 +367,28 @@ test("the agent gets the user's extra CAs for its own upstream TLS (Codex r1 P2)
 });
 
 test("the desktop MCP server follows its Claude Code's session file after /clear (review r1 P2)", async (t) => {
-  const { refreshSessionFromClaudePidFile } = await import("../dist/memtree-mcp.js");
+  const { watchClaudeSession } = await import("../dist/memtree-mcp.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-pidfile-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(dir, "sessions"));
-  const deps = { sessionId: "launch-0" };
-  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
-  assert.equal(deps.sessionId, "launch-0", "no record: kept");
-  fs.writeFileSync(path.join(dir, "sessions", "4242.json"), JSON.stringify({ pid: 4242, sessionId: "cleared-1" }));
-  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
-  assert.equal(deps.sessionId, "cleared-1");
-  fs.writeFileSync(path.join(dir, "sessions", "4242.json"), JSON.stringify({ pid: 1, sessionId: "other" }));
-  refreshSessionFromClaudePidFile(deps, { CLAUDE_CONFIG_DIR: dir }, 4242);
-  assert.equal(deps.sessionId, "cleared-1", "a record for another pid is ignored");
+  const file = path.join(dir, "sessions", "4242.json");
+  const session = watchClaudeSession({ CLAUDE_CONFIG_DIR: dir }, 4242);
+  t.after(() => session.close());
+  assert.equal(await session.snapshot(), undefined);
+  const untilChanged = async previous => {
+    const deadline = Date.now() + 5000;
+    while (session.snapshot() === previous) {
+      assert.ok(Date.now() < deadline, "the session watcher missed the PID file change");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    return session.snapshot();
+  };
+  const initial = session.snapshot();
+  fs.writeFileSync(file, JSON.stringify({ pid: 4242, sessionId: "cleared-1" }));
+  assert.equal(await untilChanged(initial), "cleared-1");
+  const cleared = session.snapshot();
+  fs.writeFileSync(file, JSON.stringify({ pid: 1, sessionId: "other" }));
+  assert.equal(await untilChanged(cleared), "cleared-1", "a record for another pid is ignored");
 });
 
 test("status and terminal ccc flag a certificate near or past expiry (review r1 P2)", async () => {

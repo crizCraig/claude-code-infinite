@@ -18,7 +18,7 @@ export interface RecallHook {
     agent_id?: string;
     tool_response?: unknown;
 }
-export declare function waitForRecall(work: Promise<unknown>): Promise<void>;
+export declare function waitForRecall<T>(work: Promise<T>, timeoutMs?: number): Promise<T | undefined>;
 export declare class RecallWork {
     private readonly pending;
     start(write: (signal: AbortSignal) => Promise<void>): Promise<void> | undefined;
@@ -26,9 +26,8 @@ export declare class RecallWork {
 }
 export interface RecallInvocation {
     account: string;
-    session: string;
-    /** stdio sends the unmodified answer before publishing its receipt. */
-    afterReply?: (write: (signal?: AbortSignal) => Promise<void>) => void;
+    session(): string | undefined | Promise<string | undefined>;
+    afterReply(write: (signal?: AbortSignal) => Promise<void>): void;
 }
 export declare function beginRecall(input: RecallHook, account: string): Promise<void>;
 export declare function recallToolEnabled(tool: unknown, id: unknown, env: NodeJS.ProcessEnv): id is string;

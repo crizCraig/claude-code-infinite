@@ -44,7 +44,7 @@ import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import { memtreeStorageIdentity } from "./config.js";
-import { recallToolEnabled, RecallWork, waitForRecall, withRecallReceipt } from "./recall.js";
+import { RecallWork, waitForRecall, withRecallReceipt } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -550,15 +550,32 @@ export async function refreshHostSession(deps, hostPid = process.ppid) {
  * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
-export function refreshSessionFromClaudePidFile(deps, env, hostPid = process.ppid) {
+export function watchClaudeSession(env, hostPid = process.ppid) {
     const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
-    try {
-        const record = JSON.parse(fs.readFileSync(path.join(dir, "sessions", `${hostPid}.json`), "utf8"));
-        if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
-            deps.sessionId = record.sessionId;
+    const file = path.join(dir, "sessions", `${hostPid}.json`);
+    let lastKnown;
+    async function read() {
+        try {
+            const record = JSON.parse(await fs.promises.readFile(file, "utf8"));
+            if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
+                lastKnown = record.sessionId;
+            }
         }
+        catch { /* Missing or partially written PID record: keep the last known session. */ }
+        return lastKnown;
     }
-    catch { /* no record: keep the launch id */ }
+    let current = read();
+    // watchFile also follows atomic replacement and a file first created after MCP startup.
+    const changed = (stat) => {
+        if (stat.nlink)
+            current = current.then(read);
+    };
+    fs.watchFile(file, { persistent: false, interval: 250 }, changed);
+    return {
+        get latest() { return lastKnown; },
+        snapshot: () => current,
+        close: () => fs.unwatchFile(file, changed),
+    };
 }
 function proxyBase(deps) {
     const base = deps.proxyUrl?.replace(/\/$/, "");
@@ -1304,10 +1321,20 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     // Replies go out in arrival order even though tool calls are async.
     let queue = Promise.resolve();
     const receipts = new RecallWork();
+    let pidSession = desktop && !inert ? watchClaudeSession(env) : undefined;
+    const recallSession = () => {
+        // Direct mode uses the PID file only for notices. Never send its id upstream.
+        if (direct)
+            pidSession ??= watchClaudeSession(env);
+        const fallback = deps.sessionId ?? env.CLAUDE_CODE_SESSION_ID;
+        return pidSession ? pidSession.snapshot().then(id => id ?? fallback) : fallback;
+    };
     // An upstream error or transcript may echo the saved credential.
     const key = deps.direct?.apiKey;
     const redactKey = (_name, value) => key && typeof value === "string" ? redact(value, key) : value;
-    const send = (message) => process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`);
+    const send = (message) => new Promise(resolve => {
+        process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`, error => resolve(!error));
+    });
     process.stdin.setEncoding("utf-8");
     process.stdin.on("data", (chunk) => {
         buffer += chunk;
@@ -1329,20 +1356,12 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                 // Calls run one at a time, so each reads the session its process is on now.
                 if (isToolCall(message) && !direct && !inert) {
                     await refreshHostSession(deps);
-                    if (desktop)
-                        refreshSessionFromClaudePidFile(deps, env);
-                }
-                // Direct tools still have no implicit current tree. This id belongs only to the hook handoff.
-                const caller = { sessionId: deps.sessionId || env.CLAUDE_CODE_SESSION_ID };
-                if (direct && account && isToolCall(message)) {
-                    const meta = message.params?._meta;
-                    if (recallToolEnabled(message.params?.name, meta?.["claudecode/toolUseId"], env)) {
-                        refreshSessionFromClaudePidFile(caller, env);
-                    }
+                    if (pidSession?.latest)
+                        deps.sessionId = pidSession.latest;
                 }
                 let publish;
-                const invocation = account && caller.sessionId ? {
-                    account, session: caller.sessionId, afterReply: write => { publish = write; },
+                const invocation = account ? {
+                    account, session: recallSession, afterReply: write => { publish = write; },
                 } : undefined;
                 const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct, invocation)
                     .catch((err) => ({
@@ -1350,15 +1369,23 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                     id: isRpcRequest(message) ? message.id ?? null : null,
                     error: { code: -32603, message: String(err) },
                 }));
-                if (response)
-                    send(response);
-                if (publish)
-                    receipts.start(publish);
+                if (!response)
+                    return;
+                const sent = send(response);
+                const writeReceipt = publish;
+                if (writeReceipt)
+                    receipts.start(async (signal) => {
+                        if (await sent)
+                            await writeReceipt(signal);
+                    });
             });
         }
     });
     process.stdin.on("end", () => {
-        void queue.then(() => waitForRecall(receipts.settle())).then(() => process.exit(0));
+        void queue.then(() => {
+            pidSession?.close();
+            return waitForRecall(receipts.settle());
+        }).then(() => process.exit(0));
     });
 }
 function isToolCall(message) {

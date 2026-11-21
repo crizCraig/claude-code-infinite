@@ -48,11 +48,14 @@ async function prune(dir) {
         catch { /* Claimed concurrently. */ }
     }
 }
-// Only shutdown grants optional work a grace period. Hooks and the MCP queue never drain it.
-export async function waitForRecall(work) {
+// Bound optional work after a reply or during shutdown.
+export async function waitForRecall(work, timeoutMs = 250) {
     let timer;
     try {
-        await Promise.race([work, new Promise(resolve => { timer = setTimeout(resolve, 250); })]);
+        const deadline = new Promise(resolve => {
+            timer = setTimeout(() => resolve(undefined), timeoutMs);
+        });
+        return await Promise.race([work, deadline]);
     }
     finally {
         clearTimeout(timer);
@@ -87,6 +90,8 @@ async function publishFile(file, data, signal) {
         await files.rm(tmp, { force: true });
     }
 }
+// Tickets and dispatches may fall in the same millisecond, including a replay.
+const ticketTime = () => performance.timeOrigin + performance.now();
 function ticketFile(session, tool, id) {
     return path.join(receiptsDir(), key("call", session, tool, id));
 }
@@ -98,7 +103,7 @@ export async function beginRecall(input, account) {
         !input.session_id || !input.prompt_id || !input.tool_use_id || !input.tool_name || !matcher.test(input.tool_name))
         return;
     const file = ticketFile(input.session_id, input.tool_name, input.tool_use_id);
-    const ticket = { account, nonce: randomUUID(), at: Date.now(), prompt: input.prompt_id, agent: input.agent_id };
+    const ticket = { account, nonce: randomUUID(), at: ticketTime(), prompt: input.prompt_id, agent: input.agent_id };
     const write = () => publishFile(file, ticket);
     const previous = publishingTickets.get(file);
     const pending = previous ? previous.then(write, write) : write();
@@ -124,8 +129,9 @@ async function readTicket(account, session, tool, id, signal) {
             return;
         const ticket = JSON.parse(await files.readFile(file, { encoding: "utf8", signal }));
         signal?.throwIfAborted();
+        const now = ticketTime();
         if (ticket.account === account && typeof ticket.nonce === "string" &&
-            ticket.at <= Date.now() && ticket.at >= Date.now() - ttl)
+            ticket.at <= now && ticket.at >= now - ttl)
             return ticket;
     }
     catch { /* No matching PreToolUse. */ }
@@ -138,32 +144,42 @@ export function recallToolEnabled(tool, id, env) {
         typeof id === "string" && !!id && typeof tool === "string" && matcher.test("mcp__memtree__" + tool);
 }
 export async function withRecallReceipt(tool, id, answer, invocation) {
-    if (!invocation?.account || !invocation.session || !recallToolEnabled(tool, id, process.env))
+    if (!invocation || !recallToolEnabled(tool, id, process.env))
         return answer();
-    const passages = [];
     const name = "mcp__memtree__" + tool;
-    // Start the lookup with this invocation so a replay cannot supply its ticket later.
-    let ticket;
-    void readTicket(invocation.account, invocation.session, name, id, AbortSignal.timeout(100)).then(found => {
-        ticket = found;
-        if (found)
-            void prune(receiptsDir()).catch(() => { });
-    });
-    const text = await collecting.run({ session: invocation.session, passages }, answer);
-    // Use only a ticket that arrived during the tool call. A late read cannot publish.
-    if (!ticket || !passages.length)
-        return text;
-    const file = receiptFile(invocation.account, invocation.session, name, id, ticket.nonce);
-    const write = async (signal) => {
-        try {
-            await publishFile(file, { at: Date.now(), digest: digest(text), size: Buffer.byteLength(text), passages }, signal);
-        }
-        catch { /* Delivery of the tool result is independent of the optional UI. */ }
-    };
-    if (invocation.afterReply)
-        invocation.afterReply(write);
-    else
-        await write();
+    const started = ticketTime();
+    // Capture this call's session before the next queued request or /resume can change it.
+    const caller = Promise.resolve().then(() => invocation.session()).catch(() => undefined);
+    const passages = [];
+    const text = await collecting.run(passages, answer);
+    if (passages.length)
+        invocation.afterReply(async (signal) => {
+            const lookup = new AbortController();
+            const findReceipt = async () => {
+                const session = await caller;
+                if (!session || lookup.signal.aborted)
+                    return;
+                const past = passages.filter(p => p.session !== session);
+                if (!past.length)
+                    return;
+                const ticket = await readTicket(invocation.account, session, name, id, lookup.signal);
+                if (!ticket || ticket.at > started)
+                    return;
+                return { file: receiptFile(invocation.account, session, name, id, ticket.nonce), past };
+            };
+            try {
+                const authorization = await waitForRecall(findReceipt(), 200);
+                if (!authorization)
+                    return;
+                void prune(receiptsDir()).catch(() => { });
+                await publishFile(authorization.file, {
+                    at: Date.now(), digest: digest(text), size: Buffer.byteLength(text), passages: authorization.past,
+                }, signal);
+            }
+            finally {
+                lookup.abort();
+            }
+        });
     return text;
 }
 function shortLabel(value) {
@@ -177,13 +193,13 @@ function digest(bytes) {
     return createHash("sha256").update(bytes).digest("hex");
 }
 export function recallPassage(session, summary, at) {
-    const call = collecting.getStore();
-    if (!call || typeof session !== "string" || !session || session.length > 128 || session === call.session)
+    const passages = collecting.getStore();
+    if (!passages || typeof session !== "string" || !session || session.length > 128)
         return;
     // Older page headers use the server's UTC display format.
     const instant = typeof at === "string" ? at.replace(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC$/, "$1T$2Z") : at;
     const date = timeSpan([instant, instant])?.[0];
-    call.passages.push({ session, label: shortLabel(summary), at: date });
+    passages.push({ session, label: shortLabel(summary), at: date });
 }
 /** Rename claims one complete file even when multiple hooks race. */
 async function claim(file) {

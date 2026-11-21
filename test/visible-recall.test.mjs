@@ -16,17 +16,6 @@ after(() => fs.rmSync(home, { recursive: true, force: true }));
 // Each scenario may reuse the same simulated Claude prompt and session IDs.
 beforeEach(() => fs.rmSync(path.join(home, ".claude-code-infinite"), { recursive: true, force: true }));
 
-// The in-memory tool fixtures return immediately. Supply ready ticket reads for
-// notice-delivery cases. The direct MCP tests exercise both orders with real tools.
-beforeEach(t => {
-  const read = fs.promises.readFile;
-  t.mock.method(fs.promises, "readFile", async (file, options) => {
-    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices" &&
-        /^[a-f0-9]{64}$/.test(path.basename(file))) return fs.readFileSync(file, options);
-    return read(file, options);
-  });
-});
-
 const { beginRecall, withRecallReceipt, recallPassage, settleRecallWork, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
 // Some cases reuse prompt IDs and remove their home. Finish detached filesystem
 // work before resetting it, particularly on Windows where open files cannot be removed.
@@ -54,37 +43,44 @@ async function tool(name, args, finder, { id = randomUUID(), session = current, 
   await beginRecall({ ...hook, hook_event_name: "PreToolUse" }, scope);
   const plain = await handleMcpMessage(call, tree, finder);
   call.params._meta = { "claudecode/toolUseId": id };
-  const actual = await handleMcpMessage(call, tree, finder, undefined, undefined, false, false, { account: scope, session });
+  let publish;
+  const actual = await handleMcpMessage(call, tree, finder, undefined, undefined, false, false, {
+    account: scope, session: () => session, afterReply: write => { publish = write; },
+  });
+  await publish?.();
   assert.deepEqual(actual, plain, "notice tracking preserves the entire MCP reply");
   return { ...hook, hook_event_name: "PostToolUse", tool_response: actual.result.content };
 }
 const read = (tree, start, end = start, caller) => tool("read_lines", { tree, block: 0, start, end }, undefined, caller);
 const stop = { hook_event_name: "Stop", session_id: current, prompt_id: "turn" };
 
-test("a ticket that misses its deadline during a slow tool cannot authorize a notice", { timeout: 3000 }, async t => {
-  const id = randomUUID();
-  await beginRecall({ ...stop, hook_event_name: "PreToolUse", tool_name: "mcp__memtree__search", tool_use_id: id }, account);
-  let finishTool;
-  const toolResult = new Promise(resolve => { finishTool = resolve; });
-  // A real pending tool has live I/O. AbortSignal.timeout alone lets Node 20 exit.
-  const watchdog = setTimeout(finishTool, 2000, "ticket deadline never fired");
-  t.after(() => clearTimeout(watchdog));
-  t.mock.method(fs.promises, "readFile", async (file, { signal }) => {
-    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
-    setImmediate(finishTool, "tool answer");
-    return fs.readFileSync(file, "utf8");
+for (const stalled of ["identity", "ticket"]) {
+  test("the post-reply deadline drops a stalled " + stalled + " without a late receipt", { timeout: 3000 }, async t => {
+    const id = randomUUID();
+    const hook = { ...stop, tool_name: "mcp__memtree__search", tool_use_id: id };
+    await beginRecall({ ...hook, hook_event_name: "PreToolUse" }, account);
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const read = fs.promises.readFile;
+    const mock = t.mock.method(fs.promises, "readFile", async (...args) => {
+      if (stalled === "ticket") await gate;
+      return read(...args);
+    });
+    const rename = t.mock.method(fs.promises, "rename");
+    let publish;
+    const text = await withRecallReceipt("search", id, async () => {
+      recallPassage("past", "Bucket renamed.", undefined);
+      return "tool answer";
+    }, { account, session: () => stalled === "identity" ? gate : current, afterReply: write => { publish = write; } });
+    assert.equal(text, "tool answer");
+    await publish();
+    release(current);
+    mock.mock.restore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(rename.mock.callCount(), 0);
+    assert.equal(await recalled({ ...hook, hook_event_name: "PostToolUse", tool_response: text }), undefined);
   });
-  let started = false;
-  let publish;
-  const result = withRecallReceipt("search", id, () => {
-    started = true;
-    recallPassage("past", "Bucket renamed.", undefined);
-    return toolResult;
-  }, { account, session: current, afterReply: write => { publish = write; } });
-  assert.ok(started, "the tool starts before the ticket read settles");
-  assert.equal(await result, "tool answer");
-  assert.equal(publish, undefined);
-});
+}
 
 test("search, read_node and read_lines stay silent for the calling session", async () => {
   for (const input of [
@@ -118,6 +114,20 @@ test("a new invocation cannot reuse an interrupted receipt even for byte-identic
   await standaloneRecall({ ...input, hook_event_name: "PreToolUse" });
   // The replacement MCP registration produced the same answer without writing a matching receipt.
   assert.equal(await recalled(input), undefined);
+});
+
+test("a ticket replaced between dispatch and publication cannot authorize the earlier call", async () => {
+  const hook = { ...stop, tool_name: "mcp__memtree__search", tool_use_id: randomUUID() };
+  await beginRecall({ ...hook, hook_event_name: "PreToolUse" }, account);
+  let publish;
+  const text = await withRecallReceipt("search", hook.tool_use_id, async () => {
+    recallPassage("past", "earlier call", undefined);
+    return "identical answer";
+  }, { account, session: () => current, afterReply: write => { publish = write; } });
+  const replay = { ...hook, prompt_id: "replay" };
+  await beginRecall({ ...replay, hook_event_name: "PreToolUse" }, account);
+  await publish();
+  assert.equal(await recalled({ ...replay, hook_event_name: "PostToolUse", tool_response: text }), undefined);
 });
 
 test("a mismatched answer, an empty replay and an expired receipt stay silent", async () => {
@@ -257,7 +267,7 @@ test("wrapped hooks skip missing receipts even if they arrive later", async () =
     const reply = await handleMcpMessage({ id: 1, method: "tools/call", params: {
       name: "read_node", arguments: { node: "past#3" }, _meta: { "claudecode/toolUseId": hook.tool_use_id },
     } }, source, undefined, undefined, undefined, false, false, {
-      account, session: current, afterReply: write => { publish = write; },
+      account, session: () => current, afterReply: write => { publish = write; },
     });
     assert.equal((await post(proxy.hookUrl + "/recall", {
       ...hook, hook_event_name: "PostToolUse", tool_response: reply.result.content,

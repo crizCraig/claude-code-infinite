@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -165,25 +166,69 @@ function recallHook(home, event, fields = {}) {
   return child.stdout;
 }
 
-test("the tool and queued MCP ping complete while the recall ticket read is stalled", t => {
-  const msg = call("read_node", { node: tree + "#3" });
-  const expected = results(run(t, ["--direct"], [msg, { method: "ping" }]));
-  const fields = { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_slow_ticket" };
-  msg.params._meta = { "claudecode/toolUseId": fields.tool_use_id };
-  const proc = run(t, ["--direct"], [msg, { method: "ping" }], {
-    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_TICKET: "1",
-  }, undefined, [], home => { recallHook(home, "PreToolUse", fields); });
-
-  assert.deepEqual(results(proc), expected);
-  recallHook(proc.home, "PostToolUse", { ...fields, tool_response: expected[0].content });
-  assert.equal(recallHook(proc.home, "Stop"), "");
+test("each successive prompt gets its notice from one live MCP tree cache", { timeout: 15000 }, async t => {
+  const home = mkdtempSync(path.join(tmpdir(), "ccc-live-recall-"));
+  const dir = path.join(home, ".claude-code-infinite");
+  mkdirSync(dir);
+  writeFileSync(path.join(dir, "config.json"), JSON.stringify({ polychatApiKey: "fixture-production-key" }));
+  const server = spawn(process.execPath, [cli, "memtree-mcp", "--direct"], {
+    cwd: home, stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+      CLAUDE_CODE_SESSION_ID: session, CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1" },
+  });
+  const closed = new Promise(resolve => server.once("close", resolve));
+  t.after(async () => {
+    server.stdin.end();
+    await closed;
+    rmSync(home, { recursive: true, force: true });
+  });
+  const replies = createInterface({ input: server.stdout })[Symbol.asyncIterator]();
+  for (let i = 0; i < 6; i++) {
+    const name = i % 2 ? "read_lines" : "read_node";
+    const field = { tool_name: "mcp__memtree__" + name, tool_use_id: "live-" + i, prompt_id: "prompt-" + i };
+    recallHook(home, "PreToolUse", field);
+    const msg = call(name, { node: tree + "#3" });
+    msg.params._meta = { "claudecode/toolUseId": field.tool_use_id };
+    server.stdin.write(JSON.stringify({ ...msg, jsonrpc: "2.0", id: i }) + "\n");
+    const { result } = JSON.parse((await replies.next()).value);
+    assert.ok(!result.isError);
+    recallHook(home, "PostToolUse", { ...field, tool_response: result.content });
+    assert.match(recallHook(home, "Stop", field), /Bucket renamed/, field.prompt_id);
+  }
 });
+
+for (const lookup of ["ticket", "pid"]) {
+  test("cached reads across six prompts get notices while the tool and queued ping bypass a stalled " + lookup, t => {
+    const calls = Array.from({ length: 6 }, (_, i) => call(i % 2 ? "read_lines" : "read_node", { node: tree + "#3" }));
+    const fields = calls.map((msg, i) => {
+      const id = "toolu_fast_" + i;
+      msg.params._meta = { "claudecode/toolUseId": id };
+      return { tool_name: "mcp__memtree__" + msg.params.name, tool_use_id: id, prompt_id: "prompt-" + i };
+    });
+    const expected = results(run(t, ["--direct"], calls));
+    const proc = run(t, ["--direct"], [...calls, { method: "ping", id: "ping" }], {
+      CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECALL_READ: lookup,
+      CLAUDE_CONFIG_DIR: "", CLAUDE_CODE_SESSION_ID: "stale-launch-id",
+    }, undefined, [], home => {
+      const dir = path.join(home, ".claude", "sessions");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, process.pid + ".json"), JSON.stringify({ pid: process.pid, sessionId: session }));
+      for (const field of fields) recallHook(home, "PreToolUse", field);
+    });
+    assert.deepEqual(results(proc), [...expected, {}]);
+    for (const [i, field] of fields.entries()) {
+      assert.ok(!expected[i].isError);
+      recallHook(proc.home, "PostToolUse", { ...field, tool_response: expected[i].content });
+      assert.match(recallHook(proc.home, "Stop", field), /Bucket renamed/, field.prompt_id);
+    }
+  });
+}
 
 test("a queued MCP ping and EOF complete while receipt publication is stalled", t => {
   const msg = call("read_node", { node: tree + "#3" });
   msg.params._meta = { "claudecode/toolUseId": "toolu_stalled" };
   const proc = run(t, ["--direct"], [msg, { method: "ping" }], {
-    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECEIPT: "1", WAIT_FOR_TICKET: "1",
+    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECEIPT: "1",
   }, undefined, [], home => { recallHook(home, "PreToolUse", {
     tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_stalled",
   }); });
@@ -208,7 +253,7 @@ test("direct MCP recall reaches Claude's Stop hook while its tool result stays i
   const expected = results(run(t, ["--direct"], [msg]));
   msg.params._meta = { "claudecode/toolUseId": "toolu_recall" };
   const fields = { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_recall" };
-  const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", WAIT_FOR_TICKET: "1" },
+  const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1" },
     undefined, [], home => { recallHook(home, "PreToolUse", fields); });
   assert.deepEqual(results(proc), expected);
   const hook = (event, fields) => recallHook(proc.home, event, fields);

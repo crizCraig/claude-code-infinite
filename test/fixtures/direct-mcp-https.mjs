@@ -14,36 +14,36 @@ import { rootCertificates } from "node:tls";
 
 if (process.env.TEST_INSPECTOR_LISTENING === "1") inspector.url = () => "ws://127.0.0.1:9229/test";
 
-// For delivery tests, let the real ticket read finish before returning the tool data.
-let ticketRead;
-if (process.env.WAIT_FOR_TICKET === "1") {
-  const read = fs.promises.readFile;
-  fs.promises.readFile = (file, ...args) => {
-    const result = read(file, ...args);
-    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices") ticketRead = result;
-    return result;
+// Keep the selected lookup pending until every tool and the queued ping have replied.
+if (process.env.STALL_RECALL_READ) {
+  const kind = process.env.STALL_RECALL_READ;
+  const matches = file => typeof file === "string" && (kind === "pid"
+    ? path.basename(file) === process.ppid + ".json" : path.basename(path.dirname(file)) === "recall-notices");
+  const sync = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    if (matches(file)) throw new Error("synchronous " + kind + " read");
+    return sync(file, ...args);
   };
-}
-
-if (process.env.STALL_TICKET === "1") {
-  const read = fs.promises.readFile;
   let release;
+  const ping = new Promise(resolve => { release = resolve; });
+  let reads = 0;
+  const read = fs.promises.readFile;
   fs.promises.readFile = async (file, ...args) => {
-    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices") {
-      await new Promise(resolve => { release = resolve; });
+    if (matches(file)) {
+      reads++;
+      await ping;
     }
     return read(file, ...args);
   };
-  const watchdog = setTimeout(() => { throw new Error("ticket read blocked the queued ping"); }, 3000);
   const write = process.stdout.write.bind(process.stdout);
   process.stdout.write = (line, ...args) => {
-    if (JSON.parse(line).id === 1) {
-      assert.ok(release, "the tool never attempted the ticket read");
-      clearTimeout(watchdog);
-      release();
-    }
-    return write(line, ...args);
+    const flushed = write(line, ...args);
+    if (JSON.parse(line).id === "ping") release();
+    return flushed;
   };
+  process.on("exit", () => {
+    assert.equal(reads, kind === "pid" ? 1 : 6, "lookup count for " + kind);
+  });
 }
 
 if (process.env.STALL_RECEIPT === "1") {
@@ -52,12 +52,19 @@ if (process.env.STALL_RECEIPT === "1") {
   let ping = false;
   const write = process.stdout.write.bind(process.stdout);
   process.stdout.write = (line, ...args) => {
-    if (JSON.parse(line).id === 0) replied = true;
+    if (JSON.parse(line).id === 0) {
+      const callback = args.at(-1);
+      // Simulate backpressure on a large result. Later requests can still run.
+      return write(line, () => setTimeout(() => {
+        replied = true;
+        callback?.();
+      }, 40));
+    }
     if (JSON.parse(line).id === 1) ping = true;
     return write(line, ...args);
   };
   fs.promises.rename = async () => {
-    assert.ok(replied, "publication started before the tool reply");
+    assert.ok(replied, "publication started before stdout flushed the tool reply");
     stalled = true;
     setTimeout(() => process.exit(88), 2000);
     await new Promise(() => {});
@@ -69,11 +76,13 @@ if (process.env.STALL_RECEIPT === "1") {
 }
 
 if (process.env.CHECK_PID_UNREAD === "1") {
-  const read = fs.readFileSync;
-  fs.readFileSync = (file, ...args) => {
-    if (typeof file === "string" && path.basename(file) === process.ppid + ".json") process.exit(85);
-    return read(file, ...args);
-  };
+  for (const [api, method] of [[fs, "readFileSync"], [fs.promises, "readFile"]]) {
+    const read = api[method];
+    api[method] = (file, ...args) => {
+      if (typeof file === "string" && path.basename(file) === process.ppid + ".json") process.exit(85);
+      return read(file, ...args);
+    };
+  }
 }
 
 if (process.env.CHECK_NO_SPAWN === "1") {
@@ -110,7 +119,6 @@ const server = http.createServer(async (req, res) => {
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(inspector.url(), undefined);
   }
-  await ticketRead;
   const response = fixtureResponse(new URL(req.url, "https://" + req.headers.host), req.method, new Headers(req.headers));
   res.writeHead(response.status, Object.fromEntries(response.headers));
   res.end(await response.text());

@@ -45,7 +45,7 @@ import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import type { CccEnvironment } from "./cli-args.js";
 import { memtreeStorageIdentity } from "./config.js";
-import { recallToolEnabled, RecallWork, waitForRecall, withRecallReceipt, type RecallInvocation } from "./recall.js";
+import { RecallWork, waitForRecall, withRecallReceipt, type RecallInvocation } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -649,16 +649,30 @@ export async function refreshHostSession(
  * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
-export function refreshSessionFromClaudePidFile(
-  deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid: number = process.ppid
-): void {
+export function watchClaudeSession(env: NodeJS.ProcessEnv, hostPid = process.ppid) {
   const dir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
-  try {
-    const record = JSON.parse(fs.readFileSync(path.join(dir, "sessions", `${hostPid}.json`), "utf8"));
-    if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
-      deps.sessionId = record.sessionId;
-    }
-  } catch { /* no record: keep the launch id */ }
+  const file = path.join(dir, "sessions", `${hostPid}.json`);
+  let lastKnown: string | undefined;
+  async function read() {
+    try {
+      const record = JSON.parse(await fs.promises.readFile(file, "utf8"));
+      if (record?.pid === hostPid && typeof record.sessionId === "string" && record.sessionId) {
+        lastKnown = record.sessionId;
+      }
+    } catch { /* Missing or partially written PID record: keep the last known session. */ }
+    return lastKnown;
+  }
+  let current = read();
+  // watchFile also follows atomic replacement and a file first created after MCP startup.
+  const changed = (stat: fs.Stats) => {
+    if (stat.nlink) current = current.then(read);
+  };
+  fs.watchFile(file, { persistent: false, interval: 250 }, changed);
+  return {
+    get latest() { return lastKnown; },
+    snapshot: () => current,
+    close: () => fs.unwatchFile(file, changed),
+  };
 }
 
 function proxyBase(deps: MemtreeMcpDeps): string {
@@ -1476,12 +1490,20 @@ export function runMemtreeMcpServer(
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
   const receipts = new RecallWork();
+  let pidSession = desktop && !inert ? watchClaudeSession(env) : undefined;
+  const recallSession = () => {
+    // Direct mode uses the PID file only for notices. Never send its id upstream.
+    if (direct) pidSession ??= watchClaudeSession(env);
+    const fallback = deps.sessionId ?? env.CLAUDE_CODE_SESSION_ID;
+    return pidSession ? pidSession.snapshot().then(id => id ?? fallback) : fallback;
+  };
   // An upstream error or transcript may echo the saved credential.
   const key = deps.direct?.apiKey;
   const redactKey = (_name: string, value: unknown) =>
     key && typeof value === "string" ? redact(value, key) : value;
-  const send = (message: object) =>
-    process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`);
+  const send = (message: object) => new Promise<boolean>(resolve => {
+    process.stdout.write(`${JSON.stringify(message, key ? redactKey : undefined)}\n`, error => resolve(!error));
+  });
   process.stdin.setEncoding("utf-8");
   process.stdin.on("data", (chunk: string) => {
     buffer += chunk;
@@ -1501,19 +1523,11 @@ export function runMemtreeMcpServer(
         // Calls run one at a time, so each reads the session its process is on now.
         if (isToolCall(message) && !direct && !inert) {
           await refreshHostSession(deps);
-          if (desktop) refreshSessionFromClaudePidFile(deps, env);
-        }
-        // Direct tools still have no implicit current tree. This id belongs only to the hook handoff.
-        const caller = { sessionId: deps.sessionId || env.CLAUDE_CODE_SESSION_ID };
-        if (direct && account && isToolCall(message)) {
-          const meta = message.params?._meta as Record<string, unknown> | undefined;
-          if (recallToolEnabled(message.params?.name, meta?.["claudecode/toolUseId"], env)) {
-            refreshSessionFromClaudePidFile(caller, env);
-          }
+          if (pidSession?.latest) deps.sessionId = pidSession.latest;
         }
         let publish: ((signal?: AbortSignal) => Promise<void>) | undefined;
-        const invocation: RecallInvocation | undefined = account && caller.sessionId ? {
-          account, session: caller.sessionId, afterReply: write => { publish = write; },
+        const invocation: RecallInvocation | undefined = account ? {
+          account, session: recallSession, afterReply: write => { publish = write; },
         } : undefined;
         const response = await handleMcpMessage(message, tree, finder, versionNote, notice, inert, direct, invocation)
           .catch((err) => ({
@@ -1521,13 +1535,20 @@ export function runMemtreeMcpServer(
           id: isRpcRequest(message) ? message.id ?? null : null,
           error: { code: -32603, message: String(err) },
         }));
-        if (response) send(response);
-        if (publish) receipts.start(publish);
+        if (!response) return;
+        const sent = send(response);
+        const writeReceipt = publish;
+        if (writeReceipt) receipts.start(async signal => {
+          if (await sent) await writeReceipt(signal);
+        });
       });
     }
   });
   process.stdin.on("end", () => {
-    void queue.then(() => waitForRecall(receipts.settle())).then(() => process.exit(0));
+    void queue.then(() => {
+      pidSession?.close();
+      return waitForRecall(receipts.settle());
+    }).then(() => process.exit(0));
   });
 }
 

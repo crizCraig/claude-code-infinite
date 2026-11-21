@@ -409,7 +409,11 @@ export declare function refreshHostSession(deps: MemtreeMcpDeps, hostPid?: numbe
  * dir>/sessions/<pid>.json`, which follows /clear and /resume; Claude Code 2.1.3xx).
  * Best effort: anything unreadable keeps the current id (review r1 P2).
  */
-export declare function refreshSessionFromClaudePidFile(deps: MemtreeMcpDeps, env: NodeJS.ProcessEnv, hostPid?: number): void;
+export declare function watchClaudeSession(env: NodeJS.ProcessEnv, hostPid?: number): {
+    readonly latest: string | undefined;
+    snapshot: () => Promise<string | undefined>;
+    close: () => void;
+};
 /** What the tree tools read: this session's current tree, or another one by id. */
 export interface TreeSource {
     get(tree?: string): Promise<MemtreeIndex>;
