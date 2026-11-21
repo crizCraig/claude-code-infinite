@@ -13,6 +13,7 @@
  * for compression/indexing, authenticated by the user's MemTree API key.
  */
 
+import { pastRecallCount, RECALL_WRAPPED, RECALL_ACTIVE } from "./recall.js";
 import { ClaudeLocationError } from "./windows-claude-shim.js";
 import { spawnClaude, spawnClaudeSync } from "./claude-process.js";
 import { isMemtreeKey, KEY_FORMAT_HINT } from "./key-page.js";
@@ -817,7 +818,9 @@ async function main() {
   // Set just before Claude Code starts: undefined if it runs in base-URL mode after all,
   // whose model calls never pass the interception (so no missing-call warning then).
   let proxyModeChild: HttpsProxyChild | undefined;
+  const visibleRecall = interactiveUi && !mayBePrintInvocation(claudeArgs) && process.env.CCC_RECALL_NOTICE !== "0";
   const proxy = await startProxy({
+    visibleRecall,
     ...(httpsProxy ? { httpsProxyMode: httpsProxy.proxyOptions } : {}),
     memtree,
     debug: isDebugMode,
@@ -937,6 +940,7 @@ async function main() {
   if (interactiveUi) {
     try {
       noticePlugin = createSessionNoticePlugin(proxy.hookUrl, {
+        recall: visibleRecall,
         messageDisplay: installedClaudeSupportsMessageDisplay(claude.command),
         startupMessage: startupNoticeText(
           terminalSupportsColor(),
@@ -999,7 +1003,8 @@ async function main() {
   proxyModeChild = httpsProxyChild(httpsProxy, proxy.port, isDebugMode);
   const child = spawnClaude(claude.command, childArgs, {
     env: withClaudeOnPath(
-      claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
+      { ...claudeChildEnv(process.env, `http://127.0.0.1:${proxy.port}`, proxyModeChild),
+        [RECALL_WRAPPED]: "1", [RECALL_ACTIVE]: visibleRecall && noticePlugin ? "1" : "0" },
       claude
     ),
     stdio: "inherit",
@@ -1133,7 +1138,9 @@ async function main() {
       ? `${creditNoticeText(terminalSupportsColor(), source)}\n`
       : "";
     const limit = interactiveUi ? rateLimits.exitLine() : undefined;
-    const exitText = `${limit ? `${limit}\n` : ""}${credit}${hint ?? ""}`;
+    const recalls = visibleRecall ? pastRecallCount(proxy.mainSessionId()) : 0;
+    const recallSummary = recalls ? `MemTree recalled ${recalls} ${recalls === 1 ? "thing" : "things"} from past sessions\n` : "";
+    const exitText = `${recallSummary}${limit ? `${limit}\n` : ""}${credit}${hint ?? ""}`;
     // Writes to a Windows console or a pipe are asynchronous: let it land before exit.
     void (exitText ? writeStdout(exitText) : Promise.resolve()).then(markChildDone);
     void shutdown(exitCodeForChild(code, signal));

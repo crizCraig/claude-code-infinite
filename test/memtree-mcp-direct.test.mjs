@@ -148,6 +148,26 @@ test("direct CLI reads all six tools with the saved production key, including by
   for (const result of tools.slice(-2)) assert.match(result.content[0].text, /fixture message/);
 });
 
+test("direct MCP recall reaches Claude's Stop hook while its tool result stays identical", t => {
+  const msg = call("read_node", { node: tree + "#3" });
+  const expected = results(run(t, ["--direct"], [msg]));
+  msg.params._meta = { "claudecode/toolUseId": "toolu_recall" };
+  const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1" });
+  assert.deepEqual(results(proc), expected);
+  const hook = (event, fields = {}) => {
+    const child = spawnSync(process.execPath, [installedCli, "recall-hook"], {
+      env: { ...process.env, HOME: proc.home, USERPROFILE: proc.home, CCC_RECALL_WRAPPED: "", CCC_RECALL_NOTICE: "1" },
+      input: JSON.stringify({ hook_event_name: event, session_id: "new-session", prompt_id: "p", ...fields }),
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    return child.stdout;
+  };
+  assert.equal(hook("PostToolUse", { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_recall" }), "");
+  assert.deepEqual(JSON.parse(hook("Stop")), { systemMessage: "🌿 MemTree recalled from a past session: Bucket renamed." });
+  assert.equal(hook("Stop"), "");
+});
+
 test("explicit direct mode selects the saved staging key and keeps it out of errors", t => {
   const [list, error] = results(run(t, ["--direct", "--env", "staging"], [call("list", {}), call("list", { q: "denied" })],
     { EXPECT_STAGING: "1", CCC_MEMTREE_MCP_DESKTOP: "1" }));

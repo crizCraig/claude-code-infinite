@@ -7,6 +7,7 @@
  * rendered delta. Stop's top-level systemMessage is the fallback for turns
  * that never render text (for example, a tool-only response).
  */
+import { RECALL_MATCHER } from "./recall.js";
 import { CLAUDE_PID_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,6 +20,8 @@ export const RESUME_GUIDANCE_HOOK_SUFFIX = "/resume-guidance";
  * earlier-sessions block, never a user-facing line.
  */
 export const PROJECT_TREES_HOOK_SUFFIX = "/project-trees";
+/** PostToolUse for the three recall tools. */
+export const RECALL_HOOK_SUFFIX = "/recall";
 /** The PostToolUse(Agent|Task) hook's path (subagent-hint.ts): notice path plus this. */
 export const SUBAGENT_RESULT_HOOK_SUFFIX = "/subagent-result";
 /** PostToolUse on a subagent call (Agent|Task), answered with SUBAGENT_RESULT_HINT. */
@@ -675,6 +678,11 @@ export function createSessionNoticePlugin(hookUrl, opts = {}) {
     }
     if (opts.subagentResult)
         hooks.PostToolUse = [subagentResultHook(hookUrl)];
+    if (opts.recall) {
+        hooks.PostToolUse = [...(hooks.PostToolUse ?? []), {
+                matcher: RECALL_MATCHER, hooks: [{ ...hook, url: hookUrl + RECALL_HOOK_SUFFIX }],
+            }];
+    }
     if (opts.interceptCompact !== false) {
         hooks.PreCompact = [{ matcher: "manual", hooks: [compactHook] }];
     }

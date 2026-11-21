@@ -179,8 +179,9 @@ import {
 } from "./subagent-hint.js";
 import type { ResumeGuidance } from "./resume-guidance.js";
 import {
-  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX,
+  PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX,
 } from "./hooks.js";
+import { recalled, recallLine, type RecallContext, type RecallBatch } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -248,6 +249,7 @@ const SKIP_RESPONSE_HEADERS = new Set([
 ]);
 
 export interface ProxyOptions {
+  visibleRecall?: boolean;
   memtree: MemtreeClient;
   /**
    * Treat current native-1M Anthropic model ids as 1M without requiring the
@@ -545,6 +547,13 @@ interface MemtreePage {
 
 /** Per-server mutable state (one server per ccc process). */
 interface ProxyState {
+  recall?: {
+    session?: string;
+    prompt?: string;
+    contexts: Map<string | undefined, RecallContext>;
+    agents: Set<string>;
+    batches: RecallBatch[];
+  };
   /** Sessions whose first refused `thread` request was logged (thread-backstop.ts). */
   threadRefusals: ThreadRefusals;
   /** Unpaid-key notice throttle; marked only when a hook delivers the notice. */
@@ -1182,6 +1191,7 @@ export function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   const shutdownAbort = new AbortController();
   const backgroundAbort = new AbortController();
   const state: ProxyState = {
+    recall: opts.visibleRecall ? { contexts: new Map(), agents: new Set(), batches: [] } : undefined,
     threadRefusals: new ThreadRefusals(),
     paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
     keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
@@ -1415,6 +1425,23 @@ async function handleRequest(
   }
   if (url.pathname === `${hookPath}${RESUME_GUIDANCE_HOOK_SUFFIX}`) {
     return handleSessionStartContextHook(req, res, (input) => resumeGuidanceContext(state, input));
+  }
+  if (url.pathname === hookPath + RECALL_HOOK_SUFFIX) {
+    const raw = req.method === "POST" ? await readBodyWithin(req, LARGE_HOOK_BODY_LIMIT) : undefined;
+    if (!raw) req.resume();
+    const recall = state.recall;
+    if (raw && recall) {
+      try {
+        const input = JSON.parse(raw.toString("utf8"));
+        if (recall.prompt && input.session_id === recall.session &&
+            (input.prompt_id === recall.prompt || recall.agents.has(input.agent_id))) {
+          const batch = recalled(input, recall.contexts.get(input.agent_id));
+          if (batch) recall.batches.push(batch);
+        }
+      } catch { /* Optional UI; never return hook feedback to the model. */ }
+    }
+    res.writeHead(204).end();
+    return;
   }
   if (url.pathname === `${hookPath}${SUBAGENT_RESULT_HOOK_SUFFIX}`) {
     return handleSubagentResultHook(req, res, state);
@@ -2100,6 +2127,13 @@ async function handleNoticeHook(
       return;
     }
     if (parsed.agent_id === undefined) {
+      if (state.recall) {
+        state.recall.session = parsed.session_id;
+        state.recall.prompt = parsed.prompt_id;
+        state.recall.contexts.clear();
+        state.recall.agents.clear();
+        state.recall.batches = [];
+      }
       state.promptAccounting.add(parsed.session_id, parsed.prompt_id, parsed.prompt);
       recordMainPromptNotice(state, parsed.prompt_id, parsed.prompt);
     }
@@ -2122,6 +2156,7 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStart") {
+    if (state.recall?.prompt && state.recall.session === parsed.session_id) state.recall.agents.add(parsed.agent_id);
     state.activeSubagents.add(parsed.agent_id);
     const hint = await subagentHintContext(state, parsed.session_id);
     if (hint === undefined) {
@@ -2139,6 +2174,8 @@ async function handleNoticeHook(
     return;
   }
   if (parsed.hook_event_name === "SubagentStop") {
+    state.recall?.agents.delete(parsed.agent_id);
+    state.recall?.contexts.delete(parsed.agent_id);
     state.activeSubagents.delete(parsed.agent_id);
     sendDeferredAgentIndex(state, parsed.agent_id);
     res.writeHead(204);
@@ -2153,11 +2190,23 @@ async function handleNoticeHook(
       parsed.prompt_id === undefined ||
       state.mainPromptId === parsed.prompt_id ||
       (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
-  const output =
+  let output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
       ? null
       : state.notices.claim(parsed);
   if (stopMatchesMainPrompt) {
+    const recall = state.recall;
+    if (recall && parsed.session_id === recall.session && parsed.prompt_id === recall.prompt) {
+      const line = recallLine(recall.batches);
+      if (line) {
+        const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
+        output = { systemMessage: joinNoticeLines(line, existing)! };
+      }
+      recall.contexts.clear();
+      recall.agents.clear();
+      recall.batches = [];
+      recall.prompt = undefined;
+    }
     onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
     state.mainNoticePending = false;
     state.mainPromptId = undefined;
@@ -7596,6 +7645,29 @@ async function selectForwardCandidate(args: {
   // Uncompressed only when the whole history goes out (or a truncation of
   // it), not a compressed ride.
   const whole = candidate.kind === "original" || wholeHistoryCandidates.has(candidate);
+  // Only the conversation actually selected for this prompt can establish
+  // a current-session recall. An index or a prepared compression proves nothing.
+  const recall = args.state.recall;
+  if (recall?.prompt && !args.rec.notConversation && args.rec.routeLane !== "away" &&
+      recall.session === requestSessionId(args.req)) {
+    const agent = agentAttributionId(args.req);
+    if (whole) recall.contexts.delete(agent);
+    else if (!agent || recall.agents.has(agent)) {
+      const session = recall.session!;
+      const timesFor = transcriptTimesFor(args.opts, session, agent);
+      const messages = args.body.messages as Message[];
+      let times: MessageTimes | undefined;
+      recall.contexts.set(agent, { original: policy.original, sent: candidate.body, sourceAt(at) {
+        if (!timesFor) return [];
+        times ??= timesFor(messages);
+        const timestamp = Date.parse(at);
+        const index = Object.keys(times).find(i => Date.parse(times![i]) === timestamp);
+        const content = index === undefined ? undefined : messages[Number(index)]?.content;
+        if (typeof content === "string") return [content];
+        return Array.isArray(content) ? content.filter(part => part?.type === "text").map(part => part.text) : [];
+      } });
+    }
+  }
   if (degraded && whole) {
     // A failed compress's ride that delivery could not send went out whole.
     if (args.rec.turnType === "followup-prefix") {

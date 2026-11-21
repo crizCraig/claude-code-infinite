@@ -32,6 +32,7 @@ import {
   type LineEntry,
   type TimeSpan,
 } from "./memtree-times.js";
+import { collectRecalls, recallPassage } from "./recall.js";
 
 export interface MemtreeNode {
   id: number;
@@ -131,6 +132,27 @@ export class MemtreeIndex {
 
   blockLines(block: number): string[] | undefined {
     return this.lines[block];
+  }
+
+  /** Representative source lines beneath a summary, including branch reads. */
+  *recallLines(id: number): Iterable<string> {
+    const seen = new Set<number>();
+    const stack = [id];
+    while (stack.length) {
+      const next = stack.pop()!;
+      const node = this.nodes.get(next);
+      if (!node || seen.has(next)) continue;
+      seen.add(next);
+      if (this.isLeaf(node)) {
+        const [block, start, end] = node.l!;
+        const lines = this.lines[block] ?? [];
+        for (let i = Math.max(1, start); i <= Math.min(end, lines.length); i++) {
+          if (lines[i - 1].trim() && !MESSAGE_HEADER_RE.test(lines[i - 1])) yield lines[i - 1];
+        }
+      } else {
+        for (const child of node.k ?? []) stack.push(child);
+      }
+    }
   }
 
   /** Root first, the node's parent last. */
@@ -342,7 +364,7 @@ function treeArg(tree?: string): string {
 export function formatSearch(index: MemtreeIndex, query: string, limit?: number, tree?: string): string {
   const terms = queryTerms(query);
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
-  return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree, [], index.times.get(0));
+  return formatSearchHits(index.search(query, limit ?? SEARCH_DEFAULT_LIMIT), query, terms, tree, [], index.times.get(0), index.page.session_id, index);
 }
 
 /**
@@ -396,9 +418,20 @@ export function formatSearchHits(
   tree?: string,
   tailHits: TailHit[] = [],
   /** When the tree's messages were written, first to last: said in the header. */
-  treeTimes?: TimeSpan
+  treeTimes?: TimeSpan,
+  session?: unknown,
+  index?: MemtreeIndex,
 ): string {
   if (!terms.length) throw new ToolInputError("search: the query has no searchable terms");
+  collectRecalls(() => {
+    for (const hit of hits) {
+      recallPassage(session, hit.summary, hit.times?.[0] ?? treeTimes?.[0] ?? index?.page.tree_created_at,
+        hit.snippets.length ? hit.snippets.map(s => s.text) : index?.recallLines(hit.id) ?? [], hit.times?.[0]);
+    }
+    for (const hit of tailHits) {
+      if (hit.snippets.length) recallPassage(session, "", hit.at, hit.snippets.map(s => s.text));
+    }
+  });
   if (!hits.length && tailHits.length) {
     return [`No node of the tree matches ${JSON.stringify(query)} (terms: ${terms.join(", ")}).`,
       ...formatTailHits(tailHits, tree)].join("\n");
@@ -457,6 +490,11 @@ export function formatNode(index: MemtreeIndex, id: number, tree?: string): stri
       `read_node: no node ${id} (this tree has ${index.nodes.size} nodes; node 0 is the root)`
     );
   }
+  collectRecalls(() => {
+    if (!node.s?.trim() && !node.k?.length && !node.l) return;
+    recallPassage(index.page.session_id, node.s || index.page.title, index.times.get(id)?.[0] ?? index.page.tree_created_at,
+      index.recallLines(id), index.times.get(id)?.[0]);
+  });
   const missing = new MissingTimeNote();
   const out = [
     `node ${id} · ${index.isLeaf(node) ? "leaf" : "branch"}` +
@@ -563,6 +601,14 @@ export function formatLines(
     rows.push([n, text]);
     shown = n;
   }
+  collectRecalls(() => {
+    const excerpts = rows.map(([, text]) => text).filter(text => text.trim() && !MESSAGE_HEADER_RE.test(text));
+    if (!excerpts.length) return;
+    const leaf = Array.from(index.nodes.values()).find(n => n.l?.[0] === block && n.l[1] <= start && n.l[2] >= start);
+    recallPassage(index.page.session_id, leaf?.s || index.nodes.get(0)?.s || index.page.title,
+      index.rangeSpan(block, start, shown)?.[0] ?? index.page.tree_created_at,
+      excerpts);
+  });
   const wanted = Math.min(end, lines.length);
   if (shown < wanted) {
     notes.unshift(
@@ -667,12 +713,16 @@ export function formatTailHits(hits: TailHit[], tree?: string): string[] {
  */
 export function formatTail(body: unknown, tree?: string): string {
   const page = body as {
-    messages?: TailMessage[]; tail_start?: number; tail_end?: number; start?: number; end?: number | null;
+    session_id?: string; title?: string; messages?: TailMessage[]; tail_start?: number; tail_end?: number; start?: number; end?: number | null;
   };
   const messages = Array.isArray(page?.messages) ? page.messages : [];
   if (!messages.length) {
     return `No un-indexed messages in that range (the tail is messages ${page?.tail_start}-${page?.tail_end}).`;
   }
+  collectRecalls(() => {
+    const useful = messages.filter(m => typeof m.x === "string" && m.x.trim());
+    if (useful.length) recallPassage(page.session_id, page.title, useful[0].at, useful.map(m => m.x!));
+  });
   const first = messages[0].i;
   const last = messages[messages.length - 1].i;
   const from = (page as { not_indexed_from?: number | null }).not_indexed_from;

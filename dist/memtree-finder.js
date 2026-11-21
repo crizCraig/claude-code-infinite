@@ -13,7 +13,8 @@
  * and says which `read_lines` / `read_node`
  * call opens it: those tools take the tree id as `tree`.
  */
-import { bracketedSpan, formatTime, formatTimeSpan, MissingTimeNote } from "./memtree-times.js";
+import { bracketedSpan, formatTime, formatTimeSpan, timeSpan, MissingTimeNote } from "./memtree-times.js";
+import { collectRecalls, recallPassage } from "./recall.js";
 import { ToolInputError } from "./memtree-tools.js";
 export const SESSIONS_DEFAULT_LIMIT = 20;
 export const SESSIONS_MAX_LIMIT = 100;
@@ -239,6 +240,15 @@ export const HYBRID_NOTE = "(Text and vector matches fused by rank: each hit say
 const OPEN_NOTE = "Snippets are excerpts (L<n>: the line in the hit's block). read_node {\"node\": <address>} opens a hit's node (its children and path; the path's " +
     "addresses lead to parents and siblings); read_lines {\"node\": <address>} returns its exact transcript lines.";
 function formatHit(hit, n, missing) {
+    collectRecalls(() => {
+        const lines = Array.isArray(hit.snippets) ? hit.snippets.filter(s => typeof s?.text === "string").map(s => s.text) : [];
+        const excerpts = lines.length ? lines : typeof hit.snippet === "string" ? [hit.snippet] : [];
+        const summary = hit.summary || hit.path?.at(-1)?.summary;
+        const sourceTime = timeSpan(hit.times)?.[0];
+        if (summary || excerpts.some(s => s?.trim())) {
+            recallPassage(hit.session_id || (hit.kind === "claude_code_session" ? hit.id : undefined), summary, sourceTime ?? hit.tree?.created_at, excerpts.map(s => s.replace(/<\/?b>|\*\*/gi, "")), sourceTime);
+        }
+    });
     const tree = hit.tree?.request_id;
     const ref = hit.tree?.ref ?? tree;
     const range = hit.range;

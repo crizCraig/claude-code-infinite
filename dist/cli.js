@@ -9,7 +9,10 @@ if (!(major > 20 || (major === 20 && minor >= 3))) {
 }
 // `ccc statusline`: Claude Code runs it after every message, so it loads only itself
 // (statusline.ts): no proxy, no update check, no wait for an update to finish.
-if (process.argv[2] === "statusline") {
+if (process.argv[2] === "recall-hook") {
+    void import("./recall.js").then(m => m.standaloneRecallHook()).catch(() => { });
+}
+else if (process.argv[2] === "statusline") {
     import("./statusline.js")
         .then((m) => m.statuslineMain(process.argv.slice(3)))
         .then((code) => { process.exitCode = code; })

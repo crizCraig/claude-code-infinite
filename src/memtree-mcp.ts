@@ -45,6 +45,7 @@ import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import type { CccEnvironment } from "./cli-args.js";
 import { memtreeBaseUrlFor, storedApiKey } from "./config.js";
+import { withRecallReceipt } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -779,7 +780,7 @@ export class CurrentTree implements TreeSource {
         const session = (answer.body as { session_id?: unknown }).session_id;
         if (!other && session !== undefined) this.checkSession(session, this.requireSessionId());
         if (other || session !== undefined) {
-          return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes);
+          return formatSearchHits(parsed.hits, query, parsed.terms, other, serverTailHits(answer.body), parsed.treeTimes, session);
         }
         // Older servers omit identity: search only the session-validated page.
       }
@@ -1177,7 +1178,8 @@ export async function handleMcpMessage(
         return note ? `${text}\n\n${note}` : text;
       };
       try {
-        const text = await callTool(String(name), args, tree, finder);
+        const meta = message.params?._meta as Record<string, unknown> | undefined;
+        const text = await withRecallReceipt(String(name), meta?.["claudecode/toolUseId"], () => callTool(String(name), args, tree, finder));
         return reply({ content: [{ type: "text", text: withNotice(text) }] });
       } catch (err) {
         if (err instanceof UnknownToolError) return fail(-32602, err.message);
