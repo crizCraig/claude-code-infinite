@@ -684,9 +684,8 @@ async function main() {
         toolOutputs: new ToolOutputStore(),
         // The link shown to the user follows the session's newest tree on the server.
         newestTrees: new NewestTreeLookup((path, signal) => memtree.fetchMemTree(path, "application/json", signal)),
-        // The link Claude Code's status line shows (`ccc statusline`), refreshed as trees finish.
-        statusLinks: new StatusLinkFiles(),
-        statusLineSince: interactiveTerminal ? Date.now() : undefined,
+        // Only the interactive UI renders the link file and acknowledges it with a heartbeat.
+        ...(interactiveTerminal ? { statusLinks: new StatusLinkFiles(), statusLineSince: Date.now() } : {}),
         transcriptUsage,
         projectMeta,
         // "✔ ccc X installed · restart ccc to use it" (or the hint after a failed

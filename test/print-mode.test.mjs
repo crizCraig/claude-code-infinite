@@ -52,7 +52,9 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 });
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
-function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus } = {}) {
+function fakeClaudeHome({
+  key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus, sessionScript = "",
+} = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
   const bin = path.join(home, "bin");
@@ -66,6 +68,7 @@ function fakeClaudeHome({ key = "sk-00000000000000000000000000000000", claudeJso
     ...(authStatus ? [`if (args[0] === 'auth') { console.log(${JSON.stringify(
       JSON.stringify(authStatus))}); process.exit(authStatus.loggedIn ? 0 : 1); }`
       .replace("authStatus.loggedIn", String(authStatus.loggedIn))] : []),
+    sessionScript,
     "const cfg = args.find((a) => a.startsWith('--mcp-config='));",
     "const servers = cfg ? Object.keys(JSON.parse(fs.readFileSync(cfg.slice(13), 'utf8')).mcpServers) : [];",
     "const pd = args.indexOf('--plugin-dir');",
@@ -142,6 +145,62 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.match(stderr, /Claude Code Infinite/);
   assert.match(stderr, /LOCAL MODE/);
   assert.doesNotMatch(stderr, /\x1b\[/);
+});
+
+test("print and non-TTY model calls do no status-link filesystem work", async t => {
+  let modelCalls = 0;
+  let treeLookups = 0;
+  const session = { session_id: "session-1", links: { url: "https://example.org/m/sessions/session-1" } };
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/messages") {
+      modelCalls++;
+      res.end(JSON.stringify({ type: "message", content: [{ type: "text", text: "ok" }] }));
+    } else if (req.url.startsWith("/v1/memtree/sessions?")) {
+      treeLookups++;
+      res.end(JSON.stringify({ sessions: [session] }));
+    } else {
+      res.end(JSON.stringify({ paid: true }));
+    }
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const env = { CCC_LOCAL_BASE_URL: origin, CCC_ANTHROPIC_UPSTREAM: origin, CCC_HTTPS_PROXY_MODE: "0",
+    CCC_MEMTREE_MCP: "0", CCC_MEMTREE_LINK: "off" };
+  const sessionScript = `
+    for (let i = 0; i < 3; i++) {
+      const reply = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "session-1" },
+        body: JSON.stringify({ model: "claude-x", max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+      });
+      if ((await reply.json()).content[0].text !== "ok") throw Error("unexpected model reply");
+    }
+  `;
+  const trace = `
+    import fs from "node:fs";
+    for (const op of ["readFileSync", "writeFileSync", "renameSync", "unlinkSync", "statSync"]) {
+      const original = fs[op];
+      fs[op] = function(file, ...args) {
+        if (/session-1[.](url|heartbeat)/.test(String(file))) console.error("status-link I/O", op, file);
+        return original.call(this, file, ...args);
+      };
+    }
+  `;
+  const home = { sessionScript, authStatus: { loggedIn: false } };
+  for (const [args, tty] of [[[], false], [["-p", "hi"], true], [["-pc", "hi"], true]]) {
+    const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
+    const before = modelCalls;
+    const lookupsBefore = treeLookups;
+    const { code, stderr } = await runCcc(args, env, home,
+      ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
+    assert.equal(code, 0, stderr);
+    assert.equal(modelCalls - before, 3);
+    assert.equal(treeLookups - lookupsBefore, 1, "the background lookup still runs");
+    assert.doesNotMatch(stderr, /status-link I\/O/);
+  }
 });
 
 test("Windows reports a skipped wrapper once on interactive stderr and stays quiet about it in print mode", {

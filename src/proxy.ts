@@ -2384,14 +2384,15 @@ async function handleMessages(
       const link = recapLink(state, sessionId);
       return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
     });
-  } else if (state.statusLinks) {
-    // Keeps the status line's link fresh through long tool runs: answers from the cache,
-    // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
-    // whose stable link is known needs no lookup (that link never changes), only its file
-    // written again if another ccc process pruned it (a local read; Codex r9).
+  } else if (state.newestTrees || state.statusLinks) {
+    // Keep the tree lookup warm through long tool runs. Once the stable URL is known,
+    // only an interactive status line needs its file restored if another process pruned it.
     const sessionId = requestSessionId(req);
-    if (sessionId && state.stableSessionLinks.has(sessionId)) publishStatusLink(state, sessionId);
-    else state.newestTrees?.peek(sessionId);
+    if (sessionId && (state.stableSessionLinks.has(sessionId) || state.newestTrees?.sessionUrl(sessionId))) {
+      publishStatusLink(state, sessionId);
+    } else {
+      state.newestTrees?.peek(sessionId);
+    }
   }
   const isLocalBashCommand = isLocalBashCommandTurn(messages);
   // CC 2.1.207 identifies agent API calls explicitly. Use that wire-level
