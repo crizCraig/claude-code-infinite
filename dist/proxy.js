@@ -415,7 +415,10 @@ export function startProxy(opts) {
         newestTrees: opts.newestTrees,
         statusLinks: opts.statusLinks,
         stableSessionLinks: new Map(),
-        statusLinkRefresh: opts.statusLinkRefresh === true,
+        statusLinkRefresh: typeof opts.statusLinkRefresh === "function"
+            ? opts.statusLinkRefresh : () => opts.statusLinkRefresh === true,
+        statusLineShowsLink: typeof opts.statusLineShowsLink === "function"
+            ? opts.statusLineShowsLink : () => opts.statusLineShowsLink === true,
         memtreeLinkPlacement: opts.memtreeLinkPlacement ?? "turn",
         compactTargets: new Map(),
         defaultCompactOff: opts.defaultCompactTarget === null,
@@ -1221,9 +1224,22 @@ onlyEvent) {
             parsed.prompt_id === undefined ||
             state.mainPromptId === parsed.prompt_id ||
             (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
+    let statusLineShows;
+    if (stopMatchesMainPrompt) {
+        // The lookup publishes the newest URL to the status line in the background.
+        // It is TTL-gated and independent of whether this turn prints a trailer.
+        state.newestTrees?.peek(parsed.session_id);
+        if (state.statusLineShowsLink(parsed.cwd) && state.statusLinks) {
+            const dir = state.statusLinks.dir;
+            statusLineShows = url => {
+                const cached = readStatusLink(parsed.session_id, dir);
+                return cached !== undefined && (cached === url || cached === state.stableSessionLinks.get(parsed.session_id));
+            };
+        }
+    }
     const output = parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
         ? null
-        : state.notices.claim(parsed);
+        : state.notices.claim(parsed, statusLineShows);
     if (stopMatchesMainPrompt) {
         onMainStop?.(typeof parsed.session_id === "string" ? parsed.session_id : undefined);
         state.mainNoticePending = false;
@@ -1430,7 +1446,7 @@ async function handleMessages(req, res, opts, upstream, state) {
             return link ? recapLinkText(link.link, streamedTextChars, link.note) : undefined;
         });
     }
-    else if (state.statusLinks && state.statusLinkRefresh) {
+    else if (state.statusLinks && state.statusLinkRefresh()) {
         // Keeps the status line's link fresh through long tool runs: answers from the cache,
         // refreshing in the background at most once a minute (NEWEST_TREE_TTL_MS). A session
         // whose stable link is known needs no lookup (that link never changes), only its file
