@@ -11411,6 +11411,20 @@ test("the status line's link file follows the session's page, then its newest tr
   }
 });
 
+test("Stop skips the expired lookup when links are off and there is no status line", async t => {
+  let now = 1;
+  const { lookup, asked } = await newestLookup(q => ({ sessions: [sessionsItem(q, NEWEST_REQUEST_ID)] }), () => now);
+  const proxy = await startProxy({
+    memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "k" }),
+    newestTrees: lookup, memtreeLinkPlacement: "off",
+  });
+  t.after(() => proxy.close());
+  await lookup.settle("session-1");
+  now += 60_001;
+  assert.equal((await postHook(proxy, stopHook("prompt"))).status, 204);
+  assert.equal(asked.length, 1);
+});
+
 test("a suppressed Stop refreshes an expired pinned link and prints if the cache is unavailable", async (t) => {
   const { readStatusLink } = await import("../dist/status-link.js");
   const { files, render, dir } = statuslineFixture(t);

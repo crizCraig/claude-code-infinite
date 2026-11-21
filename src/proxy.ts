@@ -402,7 +402,7 @@ export interface ProxyOptions {
   newestTrees?: NewestTreeLookup;
   /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
   statusLinks?: StatusLinkFiles;
-  /** Earliest status-line render from this interactive run. Omitted in headless mode. */
+  /** Earliest status-line render from this run, when its status line is enabled. */
   statusLineSince?: number;
   /**
    * Per-response token usage (thinking share on the MemTree page), read from
@@ -2151,17 +2151,15 @@ async function handleNoticeHook(
       state.mainPromptId === parsed.prompt_id ||
       (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
   let statusLineShows: ((url: string) => boolean) | undefined;
-  if (stopMatchesMainPrompt) {
-    // The lookup publishes the newest URL to the status line in the background.
-    // It is TTL-gated and independent of whether this turn prints a trailer.
+  const { statusLineSince, statusLinks } = state;
+  if (stopMatchesMainPrompt && statusLineSince !== undefined && statusLinks) {
+    // Refresh the status line even when Stop has no trailer. A Stop trailer's own
+    // link resolver already refreshes the lookup when it needs a link.
     state.newestTrees?.peek(parsed.session_id);
-    const { statusLineSince, statusLinks } = state;
-    if (statusLineSince !== undefined && statusLinks) {
-      statusLineShows = url => {
-        const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
-        return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
-      };
-    }
+    statusLineShows = url => {
+      const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
+      return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
+    };
   }
   const output =
     parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt

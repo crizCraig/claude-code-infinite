@@ -228,7 +228,7 @@ export interface ProxyOptions {
     newestTrees?: NewestTreeLookup;
     /** Where the session's current link is written for Claude Code's status line (status-link.ts). */
     statusLinks?: StatusLinkFiles;
-    /** Earliest status-line render from this interactive run. Omitted in headless mode. */
+    /** Earliest status-line render from this run, when its status line is enabled. */
     statusLineSince?: number;
     /**
      * Per-response token usage (thinking share on the MemTree page), read from

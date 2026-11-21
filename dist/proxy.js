@@ -1222,17 +1222,15 @@ onlyEvent) {
             state.mainPromptId === parsed.prompt_id ||
             (parsed.prompt_id !== undefined && state.promptAccounting.hasId(parsed.prompt_id)));
     let statusLineShows;
-    if (stopMatchesMainPrompt) {
-        // The lookup publishes the newest URL to the status line in the background.
-        // It is TTL-gated and independent of whether this turn prints a trailer.
+    const { statusLineSince, statusLinks } = state;
+    if (stopMatchesMainPrompt && statusLineSince !== undefined && statusLinks) {
+        // Refresh the status line even when Stop has no trailer. A Stop trailer's own
+        // link resolver already refreshes the lookup when it needs a link.
         state.newestTrees?.peek(parsed.session_id);
-        const { statusLineSince, statusLinks } = state;
-        if (statusLineSince !== undefined && statusLinks) {
-            statusLineShows = url => {
-                const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
-                return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
-            };
-        }
+        statusLineShows = url => {
+            const rendered = recentlyRenderedLink(parsed.session_id, statusLineSince, statusLinks.dir);
+            return rendered !== undefined && (rendered === url || rendered === state.stableSessionLinks.get(parsed.session_id));
+        };
     }
     const output = parsed.hook_event_name === "Stop" && !stopMatchesMainPrompt
         ? null

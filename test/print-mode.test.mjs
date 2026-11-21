@@ -53,10 +53,15 @@ test("subcommands are found after an environment word too (ccc staging memtree-m
 
 /** A fake `claude` on PATH that prints one JSON line naming its argv. */
 function fakeClaudeHome({
-  key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus, sessionScript = "",
+  key = "sk-00000000000000000000000000000000", claudeJson, seenAuth, authStatus, statusLine, sessionScript = "",
 } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccc-print-"));
   if (claudeJson) fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(claudeJson));
+  if (statusLine) {
+    const dir = path.join(home, ".claude");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ statusLine }));
+  }
   const bin = path.join(home, "bin");
   fs.mkdirSync(bin);
   const script = path.join(bin, "claude.mjs");
@@ -147,7 +152,7 @@ test("ccc -p: stdout is exactly Claude's output, and the memtree tools are regis
   assert.doesNotMatch(stderr, /\x1b\[/);
 });
 
-test("print and non-TTY model calls do no status-link filesystem work", async t => {
+test("model calls use status-link files only for an enabled, configured interactive status line", async t => {
   let modelCalls = 0;
   let treeLookups = 0;
   const session = { session_id: "session-1", links: { url: "https://example.org/m/sessions/session-1" } };
@@ -189,17 +194,28 @@ test("print and non-TTY model calls do no status-link filesystem work", async t 
       };
     }
   `;
-  const home = { sessionScript, authStatus: { loggedIn: false } };
-  for (const [args, tty] of [[[], false], [["-p", "hi"], true], [["-pc", "hi"], true]]) {
-    const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
-    const before = modelCalls;
-    const lookupsBefore = treeLookups;
-    const { code, stderr } = await runCcc(args, env, home,
-      ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
-    assert.equal(code, 0, stderr);
-    assert.equal(modelCalls - before, 3);
-    assert.equal(treeLookups - lookupsBefore, 1, "the background lookup still runs");
-    assert.doesNotMatch(stderr, /status-link I\/O/);
+  const configured = { type: "command", command: "ccc statusline" };
+  for (const { name, args = [], tty = true, auto = "1", statusLine = configured, cache = false } of [
+    { name: "non-TTY", tty: false },
+    { name: "print", args: ["-p", "hi"] },
+    { name: "combined print flag", args: ["-pc", "hi"] },
+    { name: "interactive with auto-install off", auto: "0" },
+    { name: "interactive with an unsupported status line", statusLine: { type: "unsupported" } },
+    { name: "interactive with ccc configured", cache: true },
+  ]) {
+    await t.test(name, async () => {
+      const preload = trace + (tty ? "process.stdin.isTTY = process.stdout.isTTY = true;" : "");
+      const before = modelCalls;
+      const lookupsBefore = treeLookups;
+      const { code, stderr } = await runCcc(args, { ...env, CCC_STATUSLINE_AUTO: auto },
+        { sessionScript, statusLine, authStatus: { loggedIn: false } },
+        ["--import", "data:text/javascript," + encodeURIComponent(preload)]);
+      assert.equal(code, 0, stderr);
+      assert.equal(modelCalls - before, 3);
+      assert.equal(treeLookups - lookupsBefore, 1, "the background lookup still runs");
+      if (cache) assert.match(stderr, /status-link I\/O writeFileSync/);
+      else assert.doesNotMatch(stderr, /status-link I\/O/);
+    });
   }
 });
 
