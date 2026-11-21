@@ -231,6 +231,10 @@ export interface CountTokensSession {
 export const RETRYABLE_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
   new Set(["timeout", "deadline", "network-error"]);
 
+/** Transient failures retried briefly during planning within COUNT_RETRY_WINDOW_MS. */
+const TRANSIENT_COUNT_OUTCOMES: ReadonlySet<CountTokensOutcome> =
+  new Set(["network-error", "timeout", "server-error"]);
+
 /**
  * Exact results belong to this request and body, never a shared sample slot.
  * All counts of one request share one allowance: the largest body's
@@ -263,17 +267,20 @@ export function createCountTokensSession(
   async function countWithRetries(body: Buffer, remaining: number) {
     const window = COUNT_RETRY_WINDOW_MS - allCounts.spent();
     const deadline = Date.now() + (customDeadline ? Math.min(window, remaining) : window);
-    let result = await initialCounts.track(() => countOnce(body, remaining));
+    const initial = await initialCounts.track(() => countOnce(body, remaining));
+    let result = initial;
     for (const backoff of COUNT_RETRY_BACKOFF_MS) {
-      if (result.outcome !== "network-error" && result.outcome !== "timeout" &&
-          result.outcome !== "server-error") break;
+      if (!TRANSIENT_COUNT_OUTCOMES.has(result.outcome)) break;
       if (deadline - Date.now() < backoff + MIN_COUNT_ATTEMPT_MS || options.signal?.aborted) break;
       await new Promise(resolve => setTimeout(resolve, backoff));
       const left = deadline - Date.now();
       if (left < MIN_COUNT_ATTEMPT_MS || options.signal?.aborted || cooldowns.active(account)) break;
       result = await countOnce(body, left);
     }
-    return result;
+    // Preserve the initial outcome's delivery-retry eligibility when brief
+    // planning retries also fail transiently (or run out of retry window).
+    return TRANSIENT_COUNT_OUTCOMES.has(result.outcome) || result.outcome === "deadline"
+      ? initial : result;
   }
 
   return {

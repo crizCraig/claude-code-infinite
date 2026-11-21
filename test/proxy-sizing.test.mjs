@@ -858,17 +858,21 @@ for (const [scenario, outcomes] of [
   ['all disconnected', ['network-error', 'network-error', 'network-error']],
   ['HTTP 400', ['http-error']],
   ['delivery retry', ['network-error', 'network-error', 'network-error', 'success']],
+  ['delivery retry after disconnect then 503s',
+    ['network-error', 'server-error', 'server-error', 'success']],
 ]) {
   test(`round 3 count failure: ${scenario}`, async () => {
     const h = await harness({ budget: null, usage: () => 796_129,
-      countStatus: n => outcomes[n - 2] === 'http-error' ? 400 : 200,
+      countStatus: n => outcomes[n - 2] === 'http-error' ? 400
+        : outcomes[n - 2] === 'server-error' ? 503 : 200,
       count: (_body, n) => {
         if (n === 1) return { input_tokens: 796_263 };
         if (outcomes[n - 2] === 'http-error') return { error: 'invalid request' };
+        if (outcomes[n - 2] === 'server-error') return { error: 'service unavailable' };
         if (outcomes[n - 2] === 'success') return { input_tokens: 798_362 };
         return DISCONNECT;
       },
-      compress: () => scenario === 'delivery retry'
+      compress: () => scenario.startsWith('delivery retry')
         ? { status: 503, body: { detail: 'MemTree unavailable' } } : compressedReply(4000, 960_000) });
     const first = [{ role: 'user', content: 'task' }, ...toolRound('a', 2_215_000)];
     const next = [...first, ...toolRound('b', 6_000)];
