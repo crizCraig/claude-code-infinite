@@ -430,7 +430,7 @@ export function startProxy(opts) {
         passthroughSizes: new Map(),
         laneSizes: new Map(),
     };
-    installMemtreeLink(state, state.memtreeLinkPlacement);
+    installMemtreeLink(state, state.memtreeLinkPlacement, opts.statusLineShowsLink === true);
     // A newer tree from the background lookup reaches the status line without a turn ending.
     opts.newestTrees?.onTree((sessionId) => publishStatusLink(state, sessionId));
     opts.newestTrees?.onSessionLink((sessionId) => publishStatusLink(state, sessionId));
@@ -2523,7 +2523,7 @@ function compressionTotals(rec, result) {
  * out its short spelling (`/m/<leading hex of the request id>`), which is
  * permanent — it outlives this proxy — and fits a terminal line.
  */
-function installMemtreeLink(state, placement) {
+function installMemtreeLink(state, placement, statusLineShowsLink) {
     const resolve = (sessionId) => sessionLink(state, sessionId, currentMemtreePage(state, sessionId));
     switch (placement) {
         case "success":
@@ -2533,12 +2533,12 @@ function installMemtreeLink(state, placement) {
             // The success line carries the current page on the line below it; the
             // end-of-turn trailer then skips a link that line already showed.
             state.notices.setLink(resolve);
-            state.notices.setTrailer(resolve, placement);
+            state.notices.setTrailer(resolve, placement, statusLineShowsLink);
             break;
         case "message":
         case "stop":
             // These trailers show on every message or every Stop; no second copy.
-            state.notices.setTrailer(resolve, placement);
+            state.notices.setTrailer(resolve, placement, statusLineShowsLink);
             break;
         case "off":
             break;

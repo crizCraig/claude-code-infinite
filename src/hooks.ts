@@ -342,6 +342,7 @@ export class NoticeDeliveryQueue {
   }>();
   private trailer: LinkResolver | null = null;
   private trailerPlacement: TrailerPlacement = "message";
+  private statusLineShowsLink = false;
   private firstTreeIntro: FirstTreeIntro | null = null;
   /** Key of the last trailer shown; a different key is announced as new. */
 
@@ -391,8 +392,10 @@ export class NoticeDeliveryQueue {
    */
   setTrailer(
     resolve: LinkResolver | null,
-    placement: TrailerPlacement = "message"
+    placement: TrailerPlacement = "message",
+    statusLineShowsLink = false
   ): void {
+    this.statusLineShowsLink = statusLineShowsLink;
     this.trailer = resolve;
     this.trailerPlacement = placement;
   }
@@ -469,7 +472,9 @@ export class NoticeDeliveryQueue {
     // rendered no message to carry it ("message"), or always ("stop").
     const trailerDue =
       this.trailerPlacement !== "message" || !this.deliveryFor(input.session_id).shown;
-    const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
+    // The first-tree announcement still belongs in the conversation.
+    const showStopLink = !this.statusLineShowsLink || this.isFirstLink(input.session_id);
+    const trailer = trailerDue && showStopLink ? this.renderTrailer(input.session_id) : undefined;
     this.deliveryFor(input.session_id).shown = false;
     delete this.deliveryFor(input.session_id).successPage;
     if (!prefix && !suffix && trailer === undefined) return null;

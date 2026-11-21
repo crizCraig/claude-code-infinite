@@ -3025,8 +3025,9 @@ test("a turn MemTree passed through whole names the unused index next to its lin
   }
 });
 
+for (const statusLineShowsLink of [false, true]) {
 for (const color of [false, true]) {
-test(`a short session's first tree is announced once on Stop, first ever with a how-to (${color ? "color" : "NO_COLOR"})`, async (t) => {
+test(`a short session's first tree is announced once on Stop (status line link ${statusLineShowsLink}, ${color ? "color" : "NO_COLOR"})`, async (t) => {
   setNoticeColorMode(t, color);
   const upstream = await mockUpstream();
   const stamps = [pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_1, "index-a"), pageHeaders(PAGE_URL_2, "index-b")];
@@ -3035,7 +3036,7 @@ test(`a short session's first tree is announced once on Stop, first ever with a 
   const memtree = new MemtreeClient({ baseUrl: memtreeSrv.origin, apiKey: "k" });
   const shown = [];
   const firstTreeIntro = { isFirstEver: () => shown.length === 0, markShown: (id) => shown.push(id) };
-  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, firstTreeIntro });
+  const proxy = await startProxy({ memtree, upstreamOrigin: upstream.origin, firstTreeIntro, statusLineShowsLink });
   try {
     await armMainTurn(proxy, "turn two", "prompt-1");
     await postSessionMessages(proxy.port, followupTurn("turn two"));
@@ -3055,11 +3056,12 @@ test(`a short session's first tree is announced once on Stop, first ever with a 
     await postSessionMessages(proxy.port, followupTurn("turn three"));
     assert.equal((await postHook(proxy, stopHook("prompt-2"))).status, 204);
 
-    // A newer tree: the routine, labelled link.
+    // The routine link for a newer tree is a fallback for the status line.
     await armMainTurn(proxy, "turn four", "prompt-3");
     await postSessionMessages(proxy.port, followupTurn("turn four"));
-    const routine = (await postHook(proxy, stopHook("prompt-3"))).body.systemMessage;
-    assert.equal(stripAnsi(routine), `• MemTree · this session's memory map · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2} ↗`);
+    const routine = await postHook(proxy, stopHook("prompt-3"));
+    if (statusLineShowsLink) assert.equal(routine.status, 204);
+    else assert.equal(stripAnsi(routine.body.systemMessage), `• MemTree · this session's memory map · ${NOT_COMPRESSED_NOTE}\n  ${PAGE_URL_2} ↗`);
     assert.deepEqual(shown, ["session-1"]);
   } finally {
     proxy.close();
@@ -3067,6 +3069,7 @@ test(`a short session's first tree is announced once on Stop, first ever with a 
     memtreeSrv.close();
   }
 });
+}
 }
 
 test("a resumed session shows its link at SessionStart, from memory or from disk", async () => {

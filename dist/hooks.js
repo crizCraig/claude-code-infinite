@@ -196,6 +196,7 @@ export class NoticeDeliveryQueue {
     delivered = new Map();
     trailer = null;
     trailerPlacement = "message";
+    statusLineShowsLink = false;
     firstTreeIntro = null;
     /** Key of the last trailer shown; a different key is announced as new. */
     constructor(ttlMs = DEFAULT_NOTICE_TTL_MS, now = Date.now, color = terminalSupportsColor()) {
@@ -237,7 +238,8 @@ export class NoticeDeliveryQueue {
      * new. Not once-per-key like the success-line link: the point is that the
      * link is always at the bottom of the screen.
      */
-    setTrailer(resolve, placement = "message") {
+    setTrailer(resolve, placement = "message", statusLineShowsLink = false) {
+        this.statusLineShowsLink = statusLineShowsLink;
         this.trailer = resolve;
         this.trailerPlacement = placement;
     }
@@ -299,7 +301,9 @@ export class NoticeDeliveryQueue {
         // Stop is the turn's last hook: the trailer lands here when the turn
         // rendered no message to carry it ("message"), or always ("stop").
         const trailerDue = this.trailerPlacement !== "message" || !this.deliveryFor(input.session_id).shown;
-        const trailer = trailerDue ? this.renderTrailer(input.session_id) : undefined;
+        // The first-tree announcement still belongs in the conversation.
+        const showStopLink = !this.statusLineShowsLink || this.isFirstLink(input.session_id);
+        const trailer = trailerDue && showStopLink ? this.renderTrailer(input.session_id) : undefined;
         this.deliveryFor(input.session_id).shown = false;
         delete this.deliveryFor(input.session_id).successPage;
         if (!prefix && !suffix && trailer === undefined)

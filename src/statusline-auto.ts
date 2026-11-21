@@ -34,6 +34,19 @@ export interface AutoStatuslineOptions {
   cccOnPath?: () => boolean;
 }
 
+/** Snapshot the link settings after any first-run install, before Claude starts. */
+export function prepareSessionStatusline(
+  interactive: boolean, paths: StatuslinePaths, options: AutoStatuslineOptions = {}
+): { text?: string; showsLink: boolean; refresh: boolean } {
+  const text = interactive ? autoInstallStatusline(paths, options) : undefined;
+  const wantsLink = statusLineWantsLink(paths.settings);
+  return {
+    text,
+    showsLink: interactive && wantsLink,
+    refresh: wantsLink || (options.env ?? process.env).CCC_STATUSLINE_REFRESH === "1",
+  };
+}
+
 /** Install or wrap the status line once; the line to tell the user, if any. */
 export function autoInstallStatusline(
   paths: StatuslinePaths, options: AutoStatuslineOptions = {}

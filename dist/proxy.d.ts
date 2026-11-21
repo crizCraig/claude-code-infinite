@@ -233,6 +233,8 @@ export interface ProxyOptions {
      * tree on every request, not only at prompts and turn ends.
      */
     statusLinkRefresh?: boolean;
+    /** This session has an interactive status line that shows its MemTree link. */
+    statusLineShowsLink?: boolean;
     /**
      * Per-response token usage (thinking share on the MemTree page), read from
      * Claude Code's transcript. Omitted means none is sent (tests); the CLI

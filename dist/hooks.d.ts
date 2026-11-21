@@ -201,6 +201,7 @@ export declare class NoticeDeliveryQueue {
     private readonly delivered;
     private trailer;
     private trailerPlacement;
+    private statusLineShowsLink;
     private firstTreeIntro;
     /** Key of the last trailer shown; a different key is announced as new. */
     constructor(ttlMs?: number, now?: () => number, color?: boolean);
@@ -227,7 +228,7 @@ export declare class NoticeDeliveryQueue {
      * new. Not once-per-key like the success-line link: the point is that the
      * link is always at the bottom of the screen.
      */
-    setTrailer(resolve: LinkResolver | null, placement?: TrailerPlacement): void;
+    setTrailer(resolve: LinkResolver | null, placement?: TrailerPlacement, statusLineShowsLink?: boolean): void;
     /**
      * Announce the first link a session shows with the one-time first-tree
      * notice instead of the routine trailer. Off (null) by default.

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AUTO_MARKER, autoInstallStatusline, onPath } from "../dist/statusline-auto.js";
+import { AUTO_MARKER, autoInstallStatusline, onPath, prepareSessionStatusline } from "../dist/statusline-auto.js";
 import { STATUSLINE_COMMAND, uninstallStatusline } from "../dist/statusline.js";
 
 const OWN = { type: "command", command: "input=$(cat); echo mine", padding: 0 };
@@ -27,7 +27,9 @@ const backups = (dir) => fs.readdirSync(dir).filter((n) => n.includes(".ccc-back
 
 test("no status line: ccc's is installed, once", () => {
   const { file, paths, options } = setup({ model: "opus" });
-  const notice = autoInstallStatusline(paths, options);
+  const session = prepareSessionStatusline(true, paths, options);
+  assert.equal(session.showsLink, true);
+  const notice = session.text;
   assert.match(notice, /added this session's MemTree link/);
   assert.match(notice, /Undo: ccc statusline uninstall\./);
   assert.equal(read(file).statusLine.command, STATUSLINE_COMMAND);
@@ -54,6 +56,7 @@ test("the user's own status line is wrapped, backed up, said once; uninstall sta
   assert.deepEqual(read(file).statusLine, OWN);
   assert.equal(autoInstallStatusline(paths, options), undefined, "an uninstall is not undone");
   assert.deepEqual(read(file).statusLine, OWN);
+  assert.equal(prepareSessionStatusline(true, paths, options).showsLink, false);
 });
 
 for (const [name, settings, why] of [
@@ -93,14 +96,29 @@ test("already showing the link, Windows, or CCC_STATUSLINE_AUTO=0: nothing chang
   assert.equal(autoInstallStatusline(ours.paths, ours.options), undefined);
   assert.equal(read(ours.file).statusLine.command, "npx ccc statusline");
   const win = setup({ statusLine: OWN });
-  assert.equal(autoInstallStatusline(win.paths, { ...win.options, platform: "win32" }), undefined);
+  const windows = prepareSessionStatusline(true, win.paths, { ...win.options, platform: "win32" });
+  assert.equal(windows.text, undefined);
+  assert.equal(windows.showsLink, false);
   assert.deepEqual(read(win.file).statusLine, OWN);
   assert.ok(fs.existsSync(path.join(win.options.markerDir, AUTO_MARKER)));
   const off = setup({ statusLine: OWN });
-  assert.equal(autoInstallStatusline(off.paths,
-    { ...off.options, env: { CCC_STATUSLINE_AUTO: "0" } }), undefined);
+  const disabled = prepareSessionStatusline(true, off.paths,
+    { ...off.options, env: { CCC_STATUSLINE_AUTO: "0", CCC_STATUSLINE_REFRESH: "1" } });
+  assert.deepEqual(disabled, { text: undefined, showsLink: false, refresh: true });
   assert.deepEqual(read(off.file).statusLine, OWN);
   assert.ok(!fs.existsSync(path.join(off.options.markerDir, AUTO_MARKER)), "not recorded");
+});
+
+test("only an interactive session can show a configured link, even with auto-install disabled", () => {
+  const { paths, options } = setup({ statusLine: { type: "command", command: STATUSLINE_COMMAND } });
+  const disabled = { ...options, env: { CCC_STATUSLINE_AUTO: "0" } };
+  const interactive = prepareSessionStatusline(true, paths, disabled);
+  assert.equal(interactive.showsLink, true);
+  assert.deepEqual(prepareSessionStatusline(false, paths, disabled),
+    { text: undefined, showsLink: false, refresh: true });
+  fs.writeFileSync(paths.settings, JSON.stringify({ statusLine: OWN }));
+  assert.equal(interactive.showsLink, true, "the running session keeps its startup decision");
+  assert.equal(prepareSessionStatusline(true, paths, disabled).showsLink, false);
 });
 
 test("PATH search finds an executable and ignores a missing one",
