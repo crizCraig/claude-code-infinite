@@ -75,7 +75,7 @@ import { describeClaudeCodeRequest, inspectMonitorTranscript, knownSideRequestKi
 import { isResumableSessionId } from "./resume-hint.js";
 import { isSubagentCall, postToolUseOutput, SUBAGENT_RESULT_HINT, subagentMemoryHintText, subagentStartOutput, } from "./subagent-hint.js";
 import { PROJECT_TREES_HOOK_SUFFIX, RESUME_GUIDANCE_HOOK_SUFFIX, SUBAGENT_RESULT_HOOK_SUFFIX, RECALL_HOOK_SUFFIX, } from "./hooks.js";
-import { beginRecall, recalled, claimRecallPrompt, recallLine } from "./recall.js";
+import { beginRecall, recalled, waitForRecall, WrappedRecallHistory, recallLine } from "./recall.js";
 import { conservativeBodyTokens } from "./token-estimate.js";
 import { bodyImages } from "./image-tokens.js";
 import { bodyShape, prefixDigest } from "./body-shape.js";
@@ -369,6 +369,7 @@ export function startProxy(opts) {
     const backgroundAbort = new AbortController();
     const state = {
         recall: opts.visibleRecall ? new Map() : undefined,
+        recallHistory: new WrappedRecallHistory(),
         threadRefusals: new ThreadRefusals(),
         paymentNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
         keyNotice: new PaymentNoticeThrottle(opts.paymentNoticeIntervalMs),
@@ -514,6 +515,7 @@ export function startProxy(opts) {
             while (activeRequests.size > 0) {
                 await Promise.allSettled([...activeRequests]);
             }
+            await state.recallHistory.writes.settle();
         })();
         let timer;
         const completed = await Promise.race([
@@ -604,8 +606,18 @@ async function handleRequest(req, res, opts, upstream, state, hookPath, intercep
                 }
                 const session = recall.get(input.session_id);
                 if (session && (input.agent_id ? session.agents.has(input.agent_id) : input.prompt_id === session.prompt)) {
-                    const batch = recalled(input, opts.memtree.storageIdentity);
-                    session.pending.push({ agent: input.agent_id, batch: batch.catch(() => undefined) });
+                    const call = { agent: input.agent_id, verifying: true };
+                    const prompt = session.prompt;
+                    session.pending.push(call);
+                    await waitForRecall(recalled(input, opts.memtree.storageIdentity).then(async (batch) => {
+                        if (batch) {
+                            if (input.agent_id)
+                                await state.recallHistory.prepareAgent(input.session_id);
+                            if (prompt)
+                                await state.recallHistory.prepare(input.session_id, prompt);
+                            call.batch = batch;
+                        }
+                    }).finally(() => { call.verifying = false; }), 50);
                 }
             }
             catch { /* Optional UI; never return hook feedback to the model. */ }
@@ -1290,23 +1302,23 @@ onlyEvent) {
     if (parsed.hook_event_name === "Stop" && !parsed.agent_id && parsed.prompt_id) {
         const session = state.recall?.get(parsed.session_id);
         if (session && (!session.prompt || session.prompt === parsed.prompt_id)) {
-            // Detach synchronously. An agent completing during this await belongs to the next Stop.
+            // Stop only consumes verified batches. A late host result belongs to the finished prompt.
             const pending = session.pending;
-            session.pending = [];
             session.prompt = undefined;
-            if (!session.agents.size)
+            const batches = pending.flatMap(call => call.batch ?? []);
+            let displayed = false;
+            try {
+                const line = recallLine(batches);
+                if (line && state.recallHistory.claim(parsed.session_id, parsed.prompt_id)) {
+                    const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
+                    output = { systemMessage: joinNoticeLines(line, existing) };
+                    displayed = true;
+                }
+            }
+            catch { /* Preserve the ordinary Stop output on any recall formatting error. */ }
+            session.pending = pending.filter(call => call.agent && (call.verifying || (!displayed && call.batch)));
+            if (!session.agents.size && !session.pending.length)
                 state.recall?.delete(parsed.session_id);
-            const batches = (await Promise.all(pending.map(call => call.batch))).filter((b) => !!b);
-            const line = recallLine(batches);
-            if (line && await claimRecallPrompt(parsed.session_id, parsed.prompt_id)) {
-                const existing = output && "systemMessage" in output ? output.systemMessage : undefined;
-                output = { systemMessage: joinNoticeLines(line, existing) };
-            }
-            else if (line) {
-                const agents = pending.filter(call => call.agent);
-                if (agents.length)
-                    sessionRecalls(state.recall, parsed.session_id).pending.unshift(...agents);
-            }
         }
     }
     if (!output) {

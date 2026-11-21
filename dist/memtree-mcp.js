@@ -44,7 +44,7 @@ import { rootCertificates } from "node:tls";
 import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import { memtreeStorageIdentity } from "./config.js";
-import { withRecallReceipt } from "./recall.js";
+import { recallToolEnabled, RecallWrites, withRecallReceipt } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1303,6 +1303,7 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
     let buffer = "";
     // Replies go out in arrival order even though tool calls are async.
     let queue = Promise.resolve();
+    const receipts = new RecallWrites();
     // An upstream error or transcript may echo the saved credential.
     const key = deps.direct?.apiKey;
     const redactKey = (_name, value) => key && typeof value === "string" ? redact(value, key) : value;
@@ -1333,8 +1334,11 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                 }
                 // Direct tools still have no implicit current tree. This id belongs only to the hook handoff.
                 const caller = { sessionId: deps.sessionId || env.CLAUDE_CODE_SESSION_ID };
-                if (direct && account && env.CCC_RECALL_HOOKS_ACTIVE === "1" && isToolCall(message)) {
-                    refreshSessionFromClaudePidFile(caller, env);
+                if (direct && account && isToolCall(message)) {
+                    const meta = message.params?._meta;
+                    if (recallToolEnabled(message.params?.name, meta?.["claudecode/toolUseId"], env)) {
+                        refreshSessionFromClaudePidFile(caller, env);
+                    }
                 }
                 let publish;
                 const invocation = account && caller.sessionId ? {
@@ -1348,12 +1352,13 @@ export function runMemtreeMcpServer(env = process.env, args = [], defaultEnv = "
                 }));
                 if (response)
                     send(response);
-                await publish?.();
+                if (publish)
+                    receipts.start(publish);
             });
         }
     });
     process.stdin.on("end", () => {
-        void queue.then(() => process.exit(0));
+        void queue.then(() => receipts.settle()).then(() => process.exit(0));
     });
 }
 function isToolCall(message) {

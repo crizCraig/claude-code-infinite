@@ -48,11 +48,43 @@ async function prune(dir) {
         catch { /* Claimed concurrently. */ }
     }
 }
-async function publishFile(file, data) {
+const writeDeadlineMs = 250;
+export async function waitForRecall(work, ms = writeDeadlineMs) {
+    let timer;
+    try {
+        await Promise.race([work, new Promise(resolve => { timer = setTimeout(resolve, ms); })]);
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+// An in-flight rename cannot be cancelled. Keep its slot until it actually settles.
+export class RecallWrites {
+    pending = new Set();
+    start(write) {
+        if (this.pending.size >= 8)
+            return;
+        const signal = AbortSignal.timeout(writeDeadlineMs);
+        const task = new Promise(resolve => setImmediate(resolve))
+            .then(() => { if (!signal.aborted)
+            return write(signal); })
+            .catch(() => { })
+            .finally(() => this.pending.delete(task));
+        this.pending.add(task);
+        return task;
+    }
+    async settle() {
+        if (!this.pending.size)
+            return;
+        await waitForRecall(Promise.all(this.pending));
+    }
+}
+async function publishFile(file, data, signal) {
     const tmp = file + "." + randomUUID();
     await files.mkdir(path.dirname(file), { mode: 0o700, recursive: true });
     try {
-        await files.writeFile(tmp, JSON.stringify(data), { mode: 0o600, flag: "wx" });
+        await files.writeFile(tmp, JSON.stringify(data), { mode: 0o600, flag: "wx", signal });
+        signal?.throwIfAborted();
         await files.rename(tmp, file);
     }
     finally {
@@ -104,10 +136,12 @@ async function readTicket(account, session, tool, id) {
 function receiptFile(account, session, tool, id, nonce) {
     return path.join(receiptsDir(), key("receipt", account, session, tool, id, nonce));
 }
+export function recallToolEnabled(tool, id, env) {
+    return env[RECALL_ACTIVE] === "1" && env.CCC_RECALL_NOTICE !== "0" &&
+        typeof id === "string" && !!id && typeof tool === "string" && matcher.test("mcp__memtree__" + tool);
+}
 export async function withRecallReceipt(tool, id, answer, invocation) {
-    if (process.env[RECALL_ACTIVE] !== "1" || process.env.CCC_RECALL_NOTICE === "0" ||
-        !invocation?.account || !invocation.session || typeof id !== "string" || !id ||
-        !matcher.test("mcp__memtree__" + tool))
+    if (!invocation?.account || !invocation.session || !recallToolEnabled(tool, id, process.env))
         return answer();
     const passages = [];
     const name = "mcp__memtree__" + tool;
@@ -121,9 +155,9 @@ export async function withRecallReceipt(tool, id, answer, invocation) {
     if (!passages.length)
         return text;
     const file = receiptFile(invocation.account, invocation.session, name, id, ticket.nonce);
-    const write = async () => {
+    const write = async (signal) => {
         try {
-            await publishFile(file, { at: Date.now(), digest: digest(text), size: Buffer.byteLength(text), passages });
+            await publishFile(file, { at: Date.now(), digest: digest(text), size: Buffer.byteLength(text), passages }, signal);
         }
         catch { /* Delivery of the tool result is independent of the optional UI. */ }
     };
@@ -189,6 +223,7 @@ async function matchesAnswer(input, receipt) {
     const stat = await files.stat(actual);
     return stat.isFile() && stat.size === receipt.size && digest(await files.readFile(actual)) === receipt.digest;
 }
+const countWrites = new RecallWrites();
 export async function recalled(input, account) {
     if (!account || process.env.CCC_RECALL_NOTICE === "0" || input?.hook_event_name !== "PostToolUse" ||
         !input.tool_name || !matcher.test(input.tool_name) || !input.session_id || !input.prompt_id ||
@@ -215,12 +250,13 @@ export async function recalled(input, account) {
         return;
     const at = first.at ?? past.find(p => p.session === first.session && p.at)?.at;
     const batch = { session: first.session, label: shortLabel(first.label), at, count: past.length };
-    try {
+    const session = input.session_id;
+    countWrites.start(async (signal) => {
         const dir = path.join(getConfigDir(), "recall-counts");
         await files.mkdir(dir, { recursive: true, mode: 0o700 });
-        await files.appendFile(path.join(dir, key(account, input.session_id)), batch.count + "\n", { mode: 0o600 });
-    }
-    catch { /* The display can still succeed without the lifetime total. */ }
+        const options = { mode: 0o600, signal };
+        await files.appendFile(path.join(dir, key(account, session)), batch.count + "\n", options);
+    });
     return batch;
 }
 export function pastRecallCount(session, account) {
@@ -260,13 +296,61 @@ export function recallLine(batches, now = new Date()) {
 function shownFile(session, prompt) {
     return path.join(getConfigDir(), "recall-shown", key(session), key(prompt));
 }
+/** Reserve known prompts during receipt verification. Even two proxies
+ * processing the same host prompt must win its exclusive on-disk marker first.
+ * Late agents have no parent prompt ID until Stop, so load display history for
+ * their session in advance and remember their eventual assignment in memory. */
+export class WrappedRecallHistory {
+    reservations = new Map();
+    ready = new Set();
+    shown = new Set();
+    writes = new RecallWrites();
+    prepare(session, prompt) {
+        const file = shownFile(session, prompt);
+        const pending = this.reservations.get(file);
+        if (pending)
+            return pending;
+        if (this.shown.has(file))
+            return Promise.resolve();
+        this.shown.add(file);
+        const task = this.writes.start(async (signal) => {
+            if (await claimRecallPrompt(session, prompt, signal))
+                this.ready.add(file);
+        });
+        if (!task)
+            return Promise.resolve();
+        this.reservations.set(file, task);
+        return task.finally(() => this.reservations.delete(file));
+    }
+    async prepareAgent(session) {
+        const dir = path.dirname(shownFile(session, ""));
+        try {
+            for (const name of await files.readdir(dir))
+                this.shown.add(path.join(dir, name));
+        }
+        catch (err) {
+            if (err.code !== "ENOENT")
+                throw err;
+        }
+    }
+    claim(session, prompt) {
+        const file = shownFile(session, prompt);
+        if (this.ready.delete(file))
+            return true;
+        if (this.shown.has(file))
+            return false;
+        this.shown.add(file);
+        this.writes.start(async (signal) => { await claimRecallPrompt(session, prompt, signal); });
+        return true;
+    }
+}
 /** Direct hooks run in separate processes. Only the Stop that creates this
  * marker can announce the prompt, including after a resume. */
-export async function claimRecallPrompt(session, prompt) {
+export async function claimRecallPrompt(session, prompt, signal) {
     const file = shownFile(session, prompt);
     try {
         await files.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-        await files.writeFile(file, "", { flag: "wx", mode: 0o600 });
+        await files.writeFile(file, "", { flag: "wx", mode: 0o600, signal });
         return true;
     }
     catch {

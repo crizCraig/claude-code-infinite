@@ -45,7 +45,7 @@ import { parseArgs } from "node:util";
 import { memtreeClientMeta } from "./cc-request.js";
 import type { CccEnvironment } from "./cli-args.js";
 import { memtreeStorageIdentity } from "./config.js";
-import { withRecallReceipt, type RecallInvocation } from "./recall.js";
+import { recallToolEnabled, RecallWrites, withRecallReceipt, type RecallInvocation } from "./recall.js";
 import { HOST_TOKEN_ENV, HOST_TOKEN_HEADER } from "./host-session.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1475,6 +1475,7 @@ export function runMemtreeMcpServer(
   let buffer = "";
   // Replies go out in arrival order even though tool calls are async.
   let queue: Promise<void> = Promise.resolve();
+  const receipts = new RecallWrites();
   // An upstream error or transcript may echo the saved credential.
   const key = deps.direct?.apiKey;
   const redactKey = (_name: string, value: unknown) =>
@@ -1504,10 +1505,13 @@ export function runMemtreeMcpServer(
         }
         // Direct tools still have no implicit current tree. This id belongs only to the hook handoff.
         const caller = { sessionId: deps.sessionId || env.CLAUDE_CODE_SESSION_ID };
-        if (direct && account && env.CCC_RECALL_HOOKS_ACTIVE === "1" && isToolCall(message)) {
-          refreshSessionFromClaudePidFile(caller, env);
+        if (direct && account && isToolCall(message)) {
+          const meta = message.params?._meta as Record<string, unknown> | undefined;
+          if (recallToolEnabled(message.params?.name, meta?.["claudecode/toolUseId"], env)) {
+            refreshSessionFromClaudePidFile(caller, env);
+          }
         }
-        let publish: (() => Promise<void>) | undefined;
+        let publish: ((signal?: AbortSignal) => Promise<void>) | undefined;
         const invocation: RecallInvocation | undefined = account && caller.sessionId ? {
           account, session: caller.sessionId, afterReply: write => { publish = write; },
         } : undefined;
@@ -1518,16 +1522,16 @@ export function runMemtreeMcpServer(
           error: { code: -32603, message: String(err) },
         }));
         if (response) send(response);
-        await publish?.();
+        if (publish) receipts.start(publish);
       });
     }
   });
   process.stdin.on("end", () => {
-    void queue.then(() => process.exit(0));
+    void queue.then(() => receipts.settle()).then(() => process.exit(0));
   });
 }
 
-function isToolCall(message: unknown): boolean {
+function isToolCall(message: unknown): message is JsonRpcRequest {
   return isRpcRequest(message) && message.method === "tools/call";
 }
 

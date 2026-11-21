@@ -369,3 +369,38 @@ test("wrapped PreToolUse releases Claude while ticket publication is blocked", a
     await proxy.drain();
   }
 });
+
+for (const stalled of ["count", "prompt marker", "receipt claim"]) {
+  test("Stop delivers its tree link with a stalled " + stalled, async t => {
+    const event = { ...stop, prompt_id: randomUUID() };
+    const url = "https://app.polychat.co/m/abc123";
+    const proxy = await startProxy({ visibleRecall: true, memtreeLinkPlacement: "stop",
+      memtreeLinkStore: { get: () => ({ url, index: "index", compressed: true }) },
+      memtree: new MemtreeClient({ baseUrl: "http://127.0.0.1:1", apiKey: "fixture" }) });
+    const post = (input, suffix = "") => fetch(proxy.hookUrl + suffix, { method: "POST",
+      body: JSON.stringify(input), signal: AbortSignal.timeout(1500) });
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    try {
+      const hook = await read("past", 4, 4, { prompt: event.prompt_id });
+      await post({ ...event, hook_event_name: "UserPromptSubmit", prompt: "question" });
+      const method = { count: "appendFile", "prompt marker": "writeFile", "receipt claim": "rename" }[stalled];
+      const original = fs.promises[method];
+      t.mock.method(fs.promises, method, async (...args) => {
+        entered();
+        await gate;
+        return original(...args);
+      });
+      await post(hook, "/recall");
+      const [output] = await Promise.all([post(event), Promise.race([started, new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("recall operation never started")), 1500).unref();
+      })])]);
+      assert.equal(output.status, 200);
+      assert.ok((await output.json()).systemMessage.includes(url));
+    } finally {
+      release();
+      await proxy.drain();
+    }
+  });
+}

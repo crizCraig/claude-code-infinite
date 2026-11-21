@@ -155,24 +155,49 @@ test("direct CLI reads all six tools with the saved production key, including by
   for (const result of tools.slice(-2)) assert.match(result.content[0].text, /fixture message/);
 });
 
+function recallHook(home, event, fields = {}) {
+  const child = spawnSync(process.execPath, [installedCli, "recall-hook"], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, CCC_RECALL_WRAPPED: "", CCC_RECALL_NOTICE: "1" },
+    input: JSON.stringify({ hook_event_name: event, session_id: session, prompt_id: "p", ...fields }),
+    encoding: "utf8",
+  });
+  assert.equal(child.status, 0, child.stderr);
+  return child.stdout;
+}
+
+test("a queued MCP ping and EOF complete while receipt publication is stalled", t => {
+  const msg = call("read_node", { node: tree + "#3" });
+  msg.params._meta = { "claudecode/toolUseId": "toolu_stalled" };
+  const proc = run(t, ["--direct"], [msg, { method: "ping" }], {
+    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECEIPT: "1",
+  }, undefined, [], home => { recallHook(home, "PreToolUse", {
+    tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_stalled",
+  }); });
+  const [answer, ping] = results(proc);
+  assert.ok(!answer.isError);
+  assert.deepEqual(ping, {});
+});
+
+test("direct PID lookup runs only for an enabled recall tool", t => {
+  for (const [name, notice] of [["list", "1"], ["read_node", "0"]]) {
+    const msg = call(name, name === "list" ? {} : { node: tree + "#3" });
+    msg.params._meta = { "claudecode/toolUseId": "toolu_pid" };
+    const [result] = results(run(t, ["--direct"], [msg], {
+      CHECK_PID_UNREAD: "1", CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: notice,
+    }));
+    assert.ok(!result.isError);
+  }
+});
+
 test("direct MCP recall reaches Claude's Stop hook while its tool result stays identical", t => {
   const msg = call("read_node", { node: tree + "#3" });
   const expected = results(run(t, ["--direct"], [msg]));
   msg.params._meta = { "claudecode/toolUseId": "toolu_recall" };
-  const hookIn = (home, event, fields = {}) => {
-    const child = spawnSync(process.execPath, [installedCli, "recall-hook"], {
-      env: { ...process.env, HOME: home, USERPROFILE: home, CCC_RECALL_WRAPPED: "", CCC_RECALL_NOTICE: "1" },
-      input: JSON.stringify({ hook_event_name: event, session_id: session, prompt_id: "p", ...fields }),
-      encoding: "utf8",
-    });
-    assert.equal(child.status, 0, child.stderr);
-    return child.stdout;
-  };
   const fields = { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_recall" };
   const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1" },
-    undefined, [], home => { hookIn(home, "PreToolUse", fields); });
+    undefined, [], home => { recallHook(home, "PreToolUse", fields); });
   assert.deepEqual(results(proc), expected);
-  const hook = (event, fields) => hookIn(proc.home, event, fields);
+  const hook = (event, fields) => recallHook(proc.home, event, fields);
   assert.equal(hook("PostToolUse", { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_recall", tool_response: expected[0].content }), "");
   assert.deepEqual(JSON.parse(hook("Stop")), { systemMessage: "🌿 MemTree recalled from a past session: Bucket renamed." });
   assert.equal(hook("Stop"), "");

@@ -14,6 +14,36 @@ import { rootCertificates } from "node:tls";
 
 if (process.env.TEST_INSPECTOR_LISTENING === "1") inspector.url = () => "ws://127.0.0.1:9229/test";
 
+if (process.env.STALL_RECEIPT === "1") {
+  let replied = false;
+  let stalled = false;
+  let ping = false;
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (line, ...args) => {
+    if (JSON.parse(line).id === 0) replied = true;
+    if (JSON.parse(line).id === 1) ping = true;
+    return write(line, ...args);
+  };
+  fs.promises.rename = async () => {
+    assert.ok(replied, "publication started before the tool reply");
+    stalled = true;
+    setTimeout(() => process.exit(88), 2000);
+    await new Promise(() => {});
+  };
+  process.on("exit", () => {
+    assert.ok(stalled, "the fixture never attempted publication");
+    assert.ok(ping, "receipt publication blocked the queued ping");
+  });
+}
+
+if (process.env.CHECK_PID_UNREAD === "1") {
+  const read = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    if (typeof file === "string" && path.basename(file) === process.ppid + ".json") process.exit(85);
+    return read(file, ...args);
+  };
+}
+
 if (process.env.CHECK_NO_SPAWN === "1") {
   for (const method of ["exec", "execFile", "execSync", "execFileSync", "fork", "spawn", "spawnSync"]) {
     childProcess[method] = () => {
