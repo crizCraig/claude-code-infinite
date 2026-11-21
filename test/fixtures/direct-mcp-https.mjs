@@ -14,6 +14,38 @@ import { rootCertificates } from "node:tls";
 
 if (process.env.TEST_INSPECTOR_LISTENING === "1") inspector.url = () => "ws://127.0.0.1:9229/test";
 
+// For delivery tests, let the real ticket read finish before returning the tool data.
+let ticketRead;
+if (process.env.WAIT_FOR_TICKET === "1") {
+  const read = fs.promises.readFile;
+  fs.promises.readFile = (file, ...args) => {
+    const result = read(file, ...args);
+    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices") ticketRead = result;
+    return result;
+  };
+}
+
+if (process.env.STALL_TICKET === "1") {
+  const read = fs.promises.readFile;
+  let release;
+  fs.promises.readFile = async (file, ...args) => {
+    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices") {
+      await new Promise(resolve => { release = resolve; });
+    }
+    return read(file, ...args);
+  };
+  const watchdog = setTimeout(() => { throw new Error("ticket read blocked the queued ping"); }, 3000);
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (line, ...args) => {
+    if (JSON.parse(line).id === 1) {
+      assert.ok(release, "the tool never attempted the ticket read");
+      clearTimeout(watchdog);
+      release();
+    }
+    return write(line, ...args);
+  };
+}
+
 if (process.env.STALL_RECEIPT === "1") {
   let replied = false;
   let stalled = false;
@@ -78,6 +110,7 @@ const server = http.createServer(async (req, res) => {
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(inspector.url(), undefined);
   }
+  await ticketRead;
   const response = fixtureResponse(new URL(req.url, "https://" + req.headers.host), req.method, new Headers(req.headers));
   res.writeHead(response.status, Object.fromEntries(response.headers));
   res.end(await response.text());

@@ -16,7 +16,18 @@ after(() => fs.rmSync(home, { recursive: true, force: true }));
 // Each scenario may reuse the same simulated Claude prompt and session IDs.
 beforeEach(() => fs.rmSync(path.join(home, ".claude-code-infinite"), { recursive: true, force: true }));
 
-const { beginRecall, settleRecallWork, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
+// The in-memory tool fixtures return immediately. Supply ready ticket reads for
+// notice-delivery cases. The direct MCP tests exercise both orders with real tools.
+beforeEach(t => {
+  const read = fs.promises.readFile;
+  t.mock.method(fs.promises, "readFile", async (file, options) => {
+    if (typeof file === "string" && path.basename(path.dirname(file)) === "recall-notices" &&
+        /^[a-f0-9]{64}$/.test(path.basename(file))) return fs.readFileSync(file, options);
+    return read(file, options);
+  });
+});
+
+const { beginRecall, withRecallReceipt, recallPassage, settleRecallWork, recalled: consume, recallLine, pastRecallCount, standaloneRecall: directHook } = await import("../dist/recall.js");
 // Some cases reuse prompt IDs and remove their home. Finish detached filesystem
 // work before resetting it, particularly on Windows where open files cannot be removed.
 afterEach(settleRecallWork);
@@ -49,6 +60,28 @@ async function tool(name, args, finder, { id = randomUUID(), session = current, 
 }
 const read = (tree, start, end = start, caller) => tool("read_lines", { tree, block: 0, start, end }, undefined, caller);
 const stop = { hook_event_name: "Stop", session_id: current, prompt_id: "turn" };
+
+test("a ticket that misses its deadline during a slow tool cannot authorize a notice", { timeout: 3000 }, async t => {
+  const id = randomUUID();
+  await beginRecall({ ...stop, hook_event_name: "PreToolUse", tool_name: "mcp__memtree__search", tool_use_id: id }, account);
+  let finishTool;
+  const toolResult = new Promise(resolve => { finishTool = resolve; });
+  t.mock.method(fs.promises, "readFile", async (file, { signal }) => {
+    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+    setImmediate(finishTool, "tool answer");
+    return fs.readFileSync(file, "utf8");
+  });
+  let started = false;
+  let publish;
+  const result = withRecallReceipt("search", id, () => {
+    started = true;
+    recallPassage("past", "Bucket renamed.", undefined);
+    return toolResult;
+  }, { account, session: current, afterReply: write => { publish = write; } });
+  assert.ok(started, "the tool starts before the ticket read settles");
+  assert.equal(await result, "tool answer");
+  assert.equal(publish, undefined);
+});
 
 test("search, read_node and read_lines stay silent for the calling session", async () => {
   for (const input of [

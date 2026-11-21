@@ -131,11 +131,12 @@ export async function beginRecall(input: RecallHook, account: string): Promise<v
   if (publishingTickets.get(file) === pending) publishingTickets.delete(file);
 }
 
-async function readTicket(account: string, session: string, tool: string, id: string): Promise<InvocationTicket | undefined> {
-  const file = ticketFile(session, tool, id);
-  if (publishingTickets.has(file)) return;
+async function readTicket(account: string, session: string, tool: string, id: string, signal?: AbortSignal): Promise<InvocationTicket | undefined> {
   try {
-    const ticket = JSON.parse(await files.readFile(file, "utf8")) as InvocationTicket;
+    const file = ticketFile(session, tool, id);
+    if (publishingTickets.has(file)) return;
+    const ticket = JSON.parse(await files.readFile(file, { encoding: "utf8", signal })) as InvocationTicket;
+    signal?.throwIfAborted();
     if (ticket.account === account && typeof ticket.nonce === "string" &&
         ticket.at <= Date.now() && ticket.at >= Date.now() - ttl) return ticket;
   } catch { /* No matching PreToolUse. */ }
@@ -155,13 +156,15 @@ export async function withRecallReceipt(tool: string, id: unknown, answer: () =>
   if (!invocation?.account || !invocation.session || !recallToolEnabled(tool, id, process.env)) return answer();
   const passages: Passage[] = [];
   const name = "mcp__memtree__" + tool;
-  // Capture the ticket before running the tool. A replay gets a fresh nonce even
-  // if it returns identical text, fails, or uses a different registration.
-  const ticket = await readTicket(invocation.account, invocation.session, name, id);
-  if (!ticket) return answer();
-  void prune(receiptsDir()).catch(() => {});
+  // Start the lookup with this invocation so a replay cannot supply its ticket later.
+  let ticket: InvocationTicket | undefined;
+  void readTicket(invocation.account, invocation.session, name, id, AbortSignal.timeout(100)).then(found => {
+    ticket = found;
+    if (found) void prune(receiptsDir()).catch(() => {});
+  });
   const text = await collecting.run({ session: invocation.session, passages }, answer);
-  if (!passages.length) return text;
+  // Use only a ticket that arrived during the tool call. A late read cannot publish.
+  if (!ticket || !passages.length) return text;
   const file = receiptFile(invocation.account, invocation.session, name, id, ticket.nonce);
   const write = async (signal?: AbortSignal) => {
     try {

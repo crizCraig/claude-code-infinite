@@ -165,11 +165,25 @@ function recallHook(home, event, fields = {}) {
   return child.stdout;
 }
 
+test("the tool and queued MCP ping complete while the recall ticket read is stalled", t => {
+  const msg = call("read_node", { node: tree + "#3" });
+  const expected = results(run(t, ["--direct"], [msg, { method: "ping" }]));
+  const fields = { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_slow_ticket" };
+  msg.params._meta = { "claudecode/toolUseId": fields.tool_use_id };
+  const proc = run(t, ["--direct"], [msg, { method: "ping" }], {
+    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_TICKET: "1",
+  }, undefined, [], home => { recallHook(home, "PreToolUse", fields); });
+
+  assert.deepEqual(results(proc), expected);
+  recallHook(proc.home, "PostToolUse", { ...fields, tool_response: expected[0].content });
+  assert.equal(recallHook(proc.home, "Stop"), "");
+});
+
 test("a queued MCP ping and EOF complete while receipt publication is stalled", t => {
   const msg = call("read_node", { node: tree + "#3" });
   msg.params._meta = { "claudecode/toolUseId": "toolu_stalled" };
   const proc = run(t, ["--direct"], [msg, { method: "ping" }], {
-    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECEIPT: "1",
+    CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", STALL_RECEIPT: "1", WAIT_FOR_TICKET: "1",
   }, undefined, [], home => { recallHook(home, "PreToolUse", {
     tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_stalled",
   }); });
@@ -194,7 +208,7 @@ test("direct MCP recall reaches Claude's Stop hook while its tool result stays i
   const expected = results(run(t, ["--direct"], [msg]));
   msg.params._meta = { "claudecode/toolUseId": "toolu_recall" };
   const fields = { tool_name: "mcp__memtree__read_node", tool_use_id: "toolu_recall" };
-  const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1" },
+  const proc = run(t, ["--direct"], [msg], { CCC_RECALL_HOOKS_ACTIVE: "1", CCC_RECALL_NOTICE: "1", WAIT_FOR_TICKET: "1" },
     undefined, [], home => { recallHook(home, "PreToolUse", fields); });
   assert.deepEqual(results(proc), expected);
   const hook = (event, fields) => recallHook(proc.home, event, fields);
